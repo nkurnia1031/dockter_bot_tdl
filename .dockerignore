@@ -1,0 +1,8 @@
+﻿.env
+.tdl
+__pycache__/
+tests/__pycache__/
+exports/
+download/
+downloads/
+state.json

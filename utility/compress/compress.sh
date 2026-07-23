@@ -1,0 +1,1 @@
+for folder in "$PWD/"*; do   if [ -d "$folder" ]; then     output_file="${folder##*/}.7z";     7z a "$output_file" "$folder" -v4g -mx=0 -mhe=on -pA1031@bokep@1031A -sdel;   fi; done

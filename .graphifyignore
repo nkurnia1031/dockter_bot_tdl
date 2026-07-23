@@ -1,0 +1,27 @@
+# Secrets and runtime state
+.env
+.env.*
+.tdl/
+profiles/*/root/
+profiles/*/user1/
+identity.json
+state.json
+max.json
+profile_state.json
+labels.json
+utility_folders.json
+
+# Generated or user data
+download/
+downloads/
+exports/
+tmp/
+*.zip
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Agent/tool installation internals are not application architecture
+.codex/
+.agents/
+graphify-out/cache/

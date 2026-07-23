@@ -1,0 +1,12 @@
+﻿services:
+  tme3bot:
+    image: ${IMAGE_NAME:-tme3bot-local}:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ${PROFILE_ROOT}:/data
+      - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}
