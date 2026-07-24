@@ -532,7 +532,9 @@ def run_docker(args: list[str], dotenv: dict[str, str]) -> None:
     subprocess.run(command, cwd=PROJECT_DIR, env=compose_env(dotenv), check=True)
 
 
-def deploy_application(env: dict[str, str], arguments: list[str]) -> None:
+def deploy_application(
+    env: dict[str, str], arguments: list[str], *, start_services: bool = True
+) -> None:
     """Deploy source pulled from Git using the already-installed base image.
 
     The immutable Go/TDL base is deliberately never built here. Docker will
@@ -564,6 +566,9 @@ def deploy_application(env: dict[str, str], arguments: list[str]) -> None:
             flush=True,
         )
         run_compose(["build"], deploy_env)
+    if not start_services:
+        print("Build selesai; service tidak dijalankan karena mode publish.", flush=True)
+        return
     run_compose(["up", "-d", "--remove-orphans"], deploy_env)
     run_compose(["ps"], deploy_env)
 
@@ -571,7 +576,7 @@ def deploy_application(env: dict[str, str], arguments: list[str]) -> None:
 def publish_application(env: dict[str, str], arguments: list[str]) -> None:
     """Build on a capable builder and publish compose images to a registry."""
     target_args = [item for item in arguments if item != "--pull"]
-    deploy_application(env, target_args)
+    deploy_application(env, target_args, start_services=False)
     target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
     publish_env = dict(env)
     if target == "gateway":

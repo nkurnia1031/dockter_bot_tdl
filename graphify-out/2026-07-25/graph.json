@@ -680,7 +680,7 @@
       "label": "publish_application()",
       "file_type": "code",
       "source_file": "run.py",
-      "source_location": "L576",
+      "source_location": "L571",
       "_origin": "ast",
       "id": "run_publish_application",
       "community": 9,
@@ -691,7 +691,7 @@
       "label": "migrate_images()",
       "file_type": "code",
       "source_file": "run.py",
-      "source_location": "L591",
+      "source_location": "L586",
       "_origin": "ast",
       "id": "run_migrate_images",
       "community": 9,
@@ -702,7 +702,7 @@
       "label": "validate_local_base_image()",
       "file_type": "code",
       "source_file": "run.py",
-      "source_location": "L660",
+      "source_location": "L655",
       "_origin": "ast",
       "id": "run_validate_local_base_image",
       "community": 9,
@@ -713,7 +713,7 @@
       "label": "build_base_image()",
       "file_type": "code",
       "source_file": "run.py",
-      "source_location": "L684",
+      "source_location": "L679",
       "_origin": "ast",
       "id": "run_build_base_image",
       "community": 9,
@@ -724,7 +724,7 @@
       "label": "add_profile()",
       "file_type": "code",
       "source_file": "run.py",
-      "source_location": "L744",
+      "source_location": "L739",
       "_origin": "ast",
       "id": "run_add_profile",
       "community": 9,
@@ -735,7 +735,7 @@
       "label": "ensure_container_profile_dirs()",
       "file_type": "code",
       "source_file": "run.py",
-      "source_location": "L763",
+      "source_location": "L758",
       "_origin": "ast",
       "id": "run_ensure_container_profile_dirs",
       "community": 9,
@@ -746,9 +746,9 @@
       "label": "Deploy source pulled from Git using the already-installed base image.      The i",
       "file_type": "rationale",
       "source_file": "run.py",
-      "source_location": "L538",
+      "source_location": "L536",
       "_origin": "ast",
-      "id": "run_rationale_538",
+      "id": "run_rationale_536",
       "community": 9,
       "community_name": "ProfileManager",
       "norm_label": "deploy source pulled from git using the already-installed base image.      the i"
@@ -757,9 +757,9 @@
       "label": "Build on a capable builder and publish compose images to a registry.",
       "file_type": "rationale",
       "source_file": "run.py",
-      "source_location": "L577",
+      "source_location": "L572",
       "_origin": "ast",
-      "id": "run_rationale_577",
+      "id": "run_rationale_572",
       "community": 9,
       "community_name": "ProfileManager",
       "norm_label": "build on a capable builder and publish compose images to a registry."
@@ -768,9 +768,9 @@
       "label": "Build both split deployment images and package them for an offline load.",
       "file_type": "rationale",
       "source_file": "run.py",
-      "source_location": "L592",
+      "source_location": "L587",
       "_origin": "ast",
-      "id": "run_rationale_592",
+      "id": "run_rationale_587",
       "community": 9,
       "community_name": "ProfileManager",
       "norm_label": "build both split deployment images and package them for an offline load."
@@ -779,9 +779,9 @@
       "label": "Stop early when extracted base artifacts no longer match the source.",
       "file_type": "rationale",
       "source_file": "run.py",
-      "source_location": "L661",
+      "source_location": "L656",
       "_origin": "ast",
-      "id": "run_rationale_661",
+      "id": "run_rationale_656",
       "community": 9,
       "community_name": "ProfileManager",
       "norm_label": "stop early when extracted base artifacts no longer match the source."
@@ -790,9 +790,9 @@
       "label": "Build and export the expensive immutable runtime/Go base image once.",
       "file_type": "rationale",
       "source_file": "run.py",
-      "source_location": "L685",
+      "source_location": "L680",
       "_origin": "ast",
-      "id": "run_rationale_685",
+      "id": "run_rationale_680",
       "community": 9,
       "community_name": "ProfileManager",
       "norm_label": "build and export the expensive immutable runtime/go base image once."
@@ -914,8 +914,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_auth_service",
-      "community": 58,
-      "community_name": "SqliteAuthRepository",
+      "community": 41,
+      "community_name": "DomainError",
       "norm_label": "test_auth_service.py"
     },
     {
@@ -991,8 +991,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_backend_api",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 58,
+      "community_name": "SqliteAuthRepository",
       "norm_label": "test_backend_api.py"
     },
     {
@@ -1002,8 +1002,8 @@
       "source_location": "L16",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "fakeprofiles"
     },
     {
@@ -1013,8 +1013,8 @@
       "source_location": "L17",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles_init",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".__init__()"
     },
     {
@@ -1024,8 +1024,8 @@
       "source_location": "L20",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles_profile_for_user",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".profile_for_user()"
     },
     {
@@ -1035,8 +1035,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles_worker_route",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".worker_route()"
     },
     {
@@ -1046,8 +1046,8 @@
       "source_location": "L26",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles_set_worker_route",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".set_worker_route()"
     },
     {
@@ -1057,8 +1057,8 @@
       "source_location": "L30",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles_download_mode",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".download_mode()"
     },
     {
@@ -1068,8 +1068,8 @@
       "source_location": "L33",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeprofiles_list_profiles",
-      "community": 64,
-      "community_name": "FakeProfiles",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".list_profiles()"
     },
     {
@@ -1167,8 +1167,8 @@
       "source_location": "L59",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers_get",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".get()"
     },
     {
@@ -1200,8 +1200,8 @@
       "source_location": "L70",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": "backendapitests"
     },
     {
@@ -1222,8 +1222,8 @@
       "source_location": "L127",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_teardown",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".teardown()"
     },
     {
@@ -1233,8 +1233,8 @@
       "source_location": "L130",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_login",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".login()"
     },
     {
@@ -1244,8 +1244,8 @@
       "source_location": "L147",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_insert_storage_item",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".insert_storage_item()"
     },
     {
@@ -1255,8 +1255,8 @@
       "source_location": "L165",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_test_login_and_openapi_hide_internal_routes",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".test_login_and_openapi_hide_internal_routes()"
     },
     {
@@ -1266,8 +1266,8 @@
       "source_location": "L180",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_test_authorized_browser_can_select_any_existing_profile_by_header",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".test_authorized_browser_can_select_any_existing_profile_by_header()"
     },
     {
@@ -1277,8 +1277,8 @@
       "source_location": "L192",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_test_submit_job_and_worker_events_are_json_only",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".test_submit_job_and_worker_events_are_json_only()"
     },
     {
@@ -1288,8 +1288,8 @@
       "source_location": "L238",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_test_error_envelope_is_stable",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".test_error_envelope_is_stable()"
     },
     {
@@ -1299,8 +1299,8 @@
       "source_location": "L245",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_test_storage_rename_is_shared_but_owned_metadata_is_atomic",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".test_storage_rename_is_shared_but_owned_metadata_is_atomic()"
     },
     {
@@ -1728,8 +1728,8 @@
       "source_location": "L10",
       "_origin": "ast",
       "id": "tests_test_job_store_jobstoretests",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 5,
+      "community_name": "organize_media_from_json.py",
       "norm_label": "jobstoretests"
     },
     {
@@ -1739,8 +1739,8 @@
       "source_location": "L11",
       "_origin": "ast",
       "id": "tests_test_job_store_jobstoretests_make_job",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 5,
+      "community_name": "organize_media_from_json.py",
       "norm_label": ".make_job()"
     },
     {
@@ -1750,8 +1750,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tests_test_job_store_py_job",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 5,
+      "community_name": "organize_media_from_json.py",
       "norm_label": "job"
     },
     {
@@ -1761,8 +1761,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "tests_test_job_store_jobstoretests_test_events_are_idempotent_and_persist_job_state",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 5,
+      "community_name": "organize_media_from_json.py",
       "norm_label": ".test_events_are_idempotent_and_persist_job_state()"
     },
     {
@@ -1772,8 +1772,8 @@
       "source_location": "L60",
       "_origin": "ast",
       "id": "tests_test_job_store_jobstoretests_test_invalid_transition_is_rejected",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 5,
+      "community_name": "organize_media_from_json.py",
       "norm_label": ".test_invalid_transition_is_rejected()"
     },
     {
@@ -1783,8 +1783,8 @@
       "source_location": "L72",
       "_origin": "ast",
       "id": "tests_test_job_store_jobstoretests_test_filters_archive_restore_and_purge_terminal_jobs",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 5,
+      "community_name": "organize_media_from_json.py",
       "norm_label": ".test_filters_archive_restore_and_purge_terminal_jobs()"
     },
     {
@@ -4159,8 +4159,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_application_control_plane",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "control_plane.py"
     },
     {
@@ -4181,8 +4181,8 @@
       "source_location": "L14",
       "_origin": "ast",
       "id": "tme3bot_application_control_plane_controlplane_init",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".__init__()"
     },
     {
@@ -4192,8 +4192,8 @@
       "source_location": "L42",
       "_origin": "ast",
       "id": "tme3bot_application_control_plane_controlplane_actor",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 41,
+      "community_name": "DomainError",
       "norm_label": ".actor()"
     },
     {
@@ -4346,8 +4346,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_application_ports",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "ports.py"
     },
     {
@@ -4357,8 +4357,8 @@
       "source_location": "L8",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "jobrepository"
     },
     {
@@ -4368,8 +4368,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "protocol",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "protocol"
     },
     {
@@ -4379,8 +4379,8 @@
       "source_location": "L9",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository_create",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".create()"
     },
     {
@@ -4390,8 +4390,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_application_ports_py_job",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "job"
     },
     {
@@ -4401,8 +4401,8 @@
       "source_location": "L11",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository_get",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".get()"
     },
     {
@@ -4412,8 +4412,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository_list",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".list()"
     },
     {
@@ -4423,8 +4423,8 @@
       "source_location": "L17",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository_append_event",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".append_event()"
     },
     {
@@ -4434,8 +4434,8 @@
       "source_location": "L19",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository_events",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".events()"
     },
     {
@@ -4445,8 +4445,8 @@
       "source_location": "L21",
       "_origin": "ast",
       "id": "tme3bot_application_ports_jobrepository_has_active",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".has_active()"
     },
     {
@@ -4456,8 +4456,8 @@
       "source_location": "L24",
       "_origin": "ast",
       "id": "tme3bot_application_ports_workerdispatcher",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "workerdispatcher"
     },
     {
@@ -4467,8 +4467,8 @@
       "source_location": "L25",
       "_origin": "ast",
       "id": "tme3bot_application_ports_workerdispatcher_dispatch",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".dispatch()"
     },
     {
@@ -4478,8 +4478,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_application_ports_py_any",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "any"
     },
     {
@@ -4489,8 +4489,8 @@
       "source_location": "L27",
       "_origin": "ast",
       "id": "tme3bot_application_ports_workerdispatcher_cancel",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".cancel()"
     },
     {
@@ -4500,8 +4500,8 @@
       "source_location": "L30",
       "_origin": "ast",
       "id": "tme3bot_application_ports_actorresolver",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "actorresolver"
     },
     {
@@ -4511,8 +4511,8 @@
       "source_location": "L31",
       "_origin": "ast",
       "id": "tme3bot_application_ports_actorresolver_resolve",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".resolve()"
     },
     {
@@ -4522,8 +4522,8 @@
       "source_location": "L34",
       "_origin": "ast",
       "id": "tme3bot_application_ports_storagedelivery",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "storagedelivery"
     },
     {
@@ -4533,8 +4533,8 @@
       "source_location": "L35",
       "_origin": "ast",
       "id": "tme3bot_application_ports_storagedelivery_deliver",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".deliver()"
     },
     {
@@ -5303,8 +5303,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "tme3bot_domain_models_domainerror",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 41,
+      "community_name": "DomainError",
       "norm_label": "domainerror"
     },
     {
@@ -5314,8 +5314,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_domain_models_py_runtimeerror",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 41,
+      "community_name": "DomainError",
       "norm_label": "runtimeerror"
     },
     {
@@ -5325,8 +5325,8 @@
       "source_location": "L14",
       "_origin": "ast",
       "id": "tme3bot_domain_models_domainerror_init",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 41,
+      "community_name": "DomainError",
       "norm_label": ".__init__()"
     },
     {
@@ -5336,8 +5336,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_domain_models_py_any",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 41,
+      "community_name": "DomainError",
       "norm_label": "any"
     },
     {
@@ -5391,8 +5391,8 @@
       "source_location": "L69",
       "_origin": "ast",
       "id": "tme3bot_domain_models_authchallengestatus",
-      "community": 58,
-      "community_name": "SqliteAuthRepository",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "authchallengestatus"
     },
     {
@@ -5435,8 +5435,8 @@
       "source_location": "L111",
       "_origin": "ast",
       "id": "tme3bot_domain_models_jobevent",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "jobevent"
     },
     {
@@ -5875,8 +5875,8 @@
       "source_location": "L49",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_pendinginput",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "pendinginput"
     },
     {
@@ -6216,8 +6216,8 @@
       "source_location": "L441",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_storage_callback",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._storage_callback()"
     },
     {
@@ -6227,8 +6227,8 @@
       "source_location": "L517",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_show_storage_results",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._show_storage_results()"
     },
     {
@@ -6238,8 +6238,8 @@
       "source_location": "L544",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_show_storage_detail",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._show_storage_detail()"
     },
     {
@@ -6249,8 +6249,8 @@
       "source_location": "L556",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_utility_callback",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._utility_callback()"
     },
     {
@@ -6260,8 +6260,8 @@
       "source_location": "L618",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_show_utility_folders",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._show_utility_folders()"
     },
     {
@@ -6271,8 +6271,8 @@
       "source_location": "L628",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_submit_utility",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._submit_utility()"
     },
     {
@@ -6381,8 +6381,8 @@
       "source_location": "L935",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_handle_pending",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "._handle_pending()"
     },
     {
@@ -6491,8 +6491,8 @@
       "source_location": "L41",
       "_origin": "ast",
       "id": "tme3bot_frontend_telegram_keyboards_storage_menu_markup",
-      "community": 38,
-      "community_name": "edit_menu_message",
+      "community": 27,
+      "community_name": "telegram/app.py",
       "norm_label": "storage_menu_markup()"
     },
     {
@@ -12854,8 +12854,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "web_package_dependencies_lucide_react",
-      "community": 67,
-      "community_name": "lucide-react",
+      "community": 30,
+      "community_name": "dependencies",
       "norm_label": "lucide-react"
     },
     {
@@ -12865,8 +12865,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "lucide_react",
-      "community": 67,
-      "community_name": "lucide-react",
+      "community": 30,
+      "community_name": "dependencies",
       "norm_label": "lucide-react"
     },
     {
@@ -12876,8 +12876,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "web_package_dependencies_next",
-      "community": 30,
-      "community_name": "dependencies",
+      "community": 68,
+      "community_name": "next",
       "norm_label": "next"
     },
     {
@@ -12887,8 +12887,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "next",
-      "community": 30,
-      "community_name": "dependencies",
+      "community": 68,
+      "community_name": "next",
       "norm_label": "next"
     },
     {
@@ -15759,7 +15759,7 @@
       "context": "import",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L715",
+      "source_location": "L710",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -15771,7 +15771,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L720",
+      "source_location": "L715",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_build_base_image",
@@ -15794,7 +15794,7 @@
       "context": "import",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L667",
+      "source_location": "L662",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -15806,7 +15806,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L670",
+      "source_location": "L665",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_validate_local_base_image",
@@ -16081,7 +16081,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L744",
+      "source_location": "L739",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -16114,7 +16114,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L684",
+      "source_location": "L679",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -16202,7 +16202,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L763",
+      "source_location": "L758",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -16301,7 +16301,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L591",
+      "source_location": "L586",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -16345,7 +16345,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L576",
+      "source_location": "L571",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -16400,7 +16400,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L660",
+      "source_location": "L655",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run",
@@ -16686,7 +16686,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L544",
+      "source_location": "L542",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_deploy_application",
@@ -16722,7 +16722,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L593",
+      "source_location": "L588",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -16842,7 +16842,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L753",
+      "source_location": "L748",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_add_profile",
@@ -16866,7 +16866,7 @@
       "context": "return_type",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L684",
+      "source_location": "L679",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_build_base_image",
@@ -16938,7 +16938,7 @@
       "context": "return_type",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L591",
+      "source_location": "L586",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -16962,7 +16962,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L648",
+      "source_location": "L643",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -16974,7 +16974,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L727",
+      "source_location": "L722",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_build_base_image",
@@ -16998,7 +16998,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L557",
+      "source_location": "L555",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_deploy_application",
@@ -17082,7 +17082,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L752",
+      "source_location": "L747",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_add_profile",
@@ -17142,7 +17142,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L790",
+      "source_location": "L785",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_ensure_container_profile_dirs",
@@ -17154,7 +17154,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L753",
+      "source_location": "L748",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_add_profile",
@@ -17166,7 +17166,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L686",
+      "source_location": "L681",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_build_base_image",
@@ -17178,7 +17178,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L563",
+      "source_location": "L561",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_deploy_application",
@@ -17190,7 +17190,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L595",
+      "source_location": "L590",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -17250,7 +17250,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L560",
+      "source_location": "L558",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_deploy_application",
@@ -17262,7 +17262,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L790",
+      "source_location": "L785",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_ensure_container_profile_dirs",
@@ -17274,7 +17274,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L622",
+      "source_location": "L617",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -17286,7 +17286,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L586",
+      "source_location": "L581",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_publish_application",
@@ -17298,7 +17298,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L623",
+      "source_location": "L618",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -17310,7 +17310,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L696",
+      "source_location": "L691",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_build_base_image",
@@ -17322,7 +17322,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L643",
+      "source_location": "L638",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -17334,7 +17334,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L562",
+      "source_location": "L560",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_deploy_application",
@@ -17346,7 +17346,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L579",
+      "source_location": "L574",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_publish_application",
@@ -17357,10 +17357,10 @@
       "relation": "rationale_for",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L538",
+      "source_location": "L536",
       "weight": 1.0,
       "_origin": "ast",
-      "source": "run_rationale_538",
+      "source": "run_rationale_536",
       "target": "run_deploy_application",
       "confidence_score": 1.0
     },
@@ -17368,10 +17368,10 @@
       "relation": "rationale_for",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L577",
+      "source_location": "L572",
       "weight": 1.0,
       "_origin": "ast",
-      "source": "run_rationale_577",
+      "source": "run_rationale_572",
       "target": "run_publish_application",
       "confidence_score": 1.0
     },
@@ -17380,7 +17380,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L594",
+      "source_location": "L589",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_migrate_images",
@@ -17391,10 +17391,10 @@
       "relation": "rationale_for",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L592",
+      "source_location": "L587",
       "weight": 1.0,
       "_origin": "ast",
-      "source": "run_rationale_592",
+      "source": "run_rationale_587",
       "target": "run_migrate_images",
       "confidence_score": 1.0
     },
@@ -17402,10 +17402,10 @@
       "relation": "rationale_for",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L661",
+      "source_location": "L656",
       "weight": 1.0,
       "_origin": "ast",
-      "source": "run_rationale_661",
+      "source": "run_rationale_656",
       "target": "run_validate_local_base_image",
       "confidence_score": 1.0
     },
@@ -17413,10 +17413,10 @@
       "relation": "rationale_for",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L685",
+      "source_location": "L680",
       "weight": 1.0,
       "_origin": "ast",
-      "source": "run_rationale_685",
+      "source": "run_rationale_680",
       "target": "run_build_base_image",
       "confidence_score": 1.0
     },
@@ -17425,7 +17425,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L751",
+      "source_location": "L746",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_add_profile",
@@ -17437,7 +17437,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L745",
+      "source_location": "L740",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_add_profile",
@@ -17449,7 +17449,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "run.py",
-      "source_location": "L765",
+      "source_location": "L760",
       "weight": 1.0,
       "_origin": "ast",
       "source": "run_ensure_container_profile_dirs",
@@ -56555,5 +56555,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "a0416b4db1f7daa7f5bb580e5f1dcb9920ce8336"
+  "built_at_commit": "86f7660d72fc7efd0804b41f041146b996d59472"
 }
