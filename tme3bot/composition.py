@@ -124,6 +124,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         label_store=labels,
         backup_coordinator=coordinator,
         bot=bot,
+        worker_dispatcher=dispatcher,
     )
     return context, scheduler
 

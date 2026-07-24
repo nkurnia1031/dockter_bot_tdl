@@ -16,6 +16,9 @@ class FakeExecutor:
     def cancel(self, job_id):
         return job_id == "known"
 
+    def workspace_tree(self, path):
+        return {"path": path, "items": [{"name": "biasa", "path": "/workspace/biasa", "kind": "directory"}]}
+
 
 class WorkerApiTests(unittest.TestCase):
     def setUp(self):
@@ -49,6 +52,16 @@ class WorkerApiTests(unittest.TestCase):
     def test_worker_has_no_openapi_surface(self):
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 404)
+
+    def test_workspace_tree_requires_token(self):
+        denied = self.client.get("/internal/v1/workspace/tree")
+        self.assertEqual(denied.status_code, 401)
+        accepted = self.client.get(
+            "/internal/v1/workspace/tree?path=%2Fworkspace%2Fbiasa",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["path"], "/workspace/biasa")
 
 
 if __name__ == "__main__":

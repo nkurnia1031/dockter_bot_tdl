@@ -70,6 +70,7 @@ class BackendContext:
     label_store: Any = None
     backup_coordinator: Any = None
     bot: Any = None
+    worker_dispatcher: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -627,6 +628,17 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     def utility_folders(actor=Depends(current_actor)):
         del actor
         return {"items": context.utility_folders.list()}
+
+    @app.get("/api/v1/utility/tree", response_model=ObjectResponse)
+    def utility_tree(path: str = "/workspace", actor=Depends(current_actor)):
+        worker = context.profile_manager.worker_route(actor.profile)
+        if context.worker_dispatcher is None:
+            raise DomainError(
+                "WORKER_INVENTORY_UNAVAILABLE",
+                "Inventory workspace worker belum tersedia.",
+                status_code=503,
+            )
+        return context.worker_dispatcher.workspace_tree(worker, path)
 
     @app.post("/api/v1/utility/folders", response_model=ObjectResponse)
     def add_utility_folder(body: UtilityFolderRequest, actor=Depends(current_actor)):

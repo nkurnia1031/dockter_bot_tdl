@@ -29,7 +29,7 @@ export function Field({label, hint, children}: {label: string; hint?: string; ch
   return <label className="grid gap-1.5 text-sm font-medium">{label}{children}{hint && <span className="muted text-xs font-normal">{hint}</span>}</label>;
 }
 
-export const inputClass = "min-h-11 w-full rounded-xl border bg-transparent px-3 text-sm outline-none transition focus:border-[var(--brand)]";
+export const inputClass = "min-h-11 w-full rounded-xl border bg-[var(--panel)] text-[var(--ink)] px-3 text-sm outline-none transition focus:border-[var(--brand)]";
 
 export function ConfirmDialog({title, description, trigger, onConfirm}: {title: string; description: string; trigger: React.ReactNode; onConfirm: () => void}) {
   return <Dialog.Root><Dialog.Trigger asChild>{trigger}</Dialog.Trigger><Dialog.Portal>
