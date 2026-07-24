@@ -1,7 +1,7 @@
 # Graph Report - dockter_bot_tdl  (2026-07-24)
 
 ## Corpus Check
-- 126 files · ~48,134 words
+- 126 files · ~48,130 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -218,7 +218,7 @@ Nodes (65): BaseModel, StorageLinkTests, _add_internal_state_routes(), _add_mana
 
 ### Community 29 - "Path"
 Cohesion: 0.08
-Nodes (25): @axe-core/playwright, jsdom, openapi-typescript, tailwindcss, @tailwindcss/postcss, @testing-library/jest-dom, @testing-library/react, @types/node (+17 more)
+Nodes (25): @axe-core/playwright, jsdom, openapi-typescript, @playwright/test, tailwindcss, @tailwindcss/postcss, @testing-library/react, @types/node (+17 more)
 
 ### Community 30 - "dependencies"
 Cohesion: 0.09

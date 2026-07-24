@@ -1,7 +1,7 @@
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
 
-test("login shell works below /ui and has no serious accessibility violations", async ({page}) => {
+test("login shell works at the web domain root and has no serious accessibility violations", async ({page}) => {
   await page.goto("/");
   await expect(page).toHaveTitle(/tme3 Control Center/);
   await expect(page.getByRole("button", {name: "Login dengan Telegram"})).toBeVisible();

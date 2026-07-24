@@ -5,7 +5,7 @@ import { NextRequest, NextResponse } from "next/server";
 const backend = process.env.BACKEND_API_URL || "http://backend:8080";
 const cookieSecret = process.env.WEB_COOKIE_SECRET || process.env.AUTH_JWT_SECRET || "";
 const secure = process.env.NODE_ENV === "production";
-const options = {httpOnly: true, secure, sameSite: "lax" as const, path: "/ui"};
+const options = {httpOnly: true, secure, sameSite: "lax" as const, path: "/"};
 
 export async function backendFetch(path: string, init: RequestInit = {}, retry = true) {
   const jar = await cookies();

@@ -10,15 +10,15 @@ import { cn } from "@/lib/cn";
 import { Login } from "./login";
 
 const links = [
-  ["/ui", "Ringkasan", LayoutDashboard],
-  ["/ui/exports", "Export", FileOutput],
-  ["/ui/downloads", "Download", CloudDownload],
-  ["/ui/utility", "Utility", WandSparkles],
-  ["/ui/storage", "Storage", Archive],
-  ["/ui/activity", "Aktivitas", Activity],
-  ["/ui/workers", "Workers", Boxes],
-  ["/ui/backups", "Backup", DatabaseBackup],
-  ["/ui/settings", "Pengaturan", Settings],
+  ["/", "Ringkasan", LayoutDashboard],
+  ["/exports", "Export", FileOutput],
+  ["/downloads", "Download", CloudDownload],
+  ["/utility", "Utility", WandSparkles],
+  ["/storage", "Storage", Archive],
+  ["/activity", "Aktivitas", Activity],
+  ["/workers", "Workers", Boxes],
+  ["/backups", "Backup", DatabaseBackup],
+  ["/settings", "Pengaturan", Settings],
 ] as const;
 
 type Session = {actor: {telegram_user_id: number; profile: string; worker_route: string}; profiles: {name: string; selected: boolean; worker_route: string}[]};
@@ -31,7 +31,7 @@ export function AppShell({children}: {children: React.ReactNode}) {
   const session = useQuery<Session>({
     queryKey: ["session"],
     queryFn: async () => {
-      const response = await fetch("/ui/api/session", {cache: "no-store"});
+      const response = await fetch("/api/session", {cache: "no-store"});
       if (!response.ok) throw new Error("unauthorized");
       return response.json();
     },
@@ -43,21 +43,21 @@ export function AppShell({children}: {children: React.ReactNode}) {
 
   async function switchProfile(profile: string) {
     const csrf = document.cookie.split("; ").find((item) => item.startsWith("tme3_csrf="))?.split("=")[1] || "";
-    await fetch("/ui/api/session", {method: "PUT", headers: {"Content-Type": "application/json", "X-CSRF-Token": decodeURIComponent(csrf)}, body: JSON.stringify({profile})});
+    await fetch("/api/session", {method: "PUT", headers: {"Content-Type": "application/json", "X-CSRF-Token": decodeURIComponent(csrf)}, body: JSON.stringify({profile})});
     await client.invalidateQueries();
     location.reload();
   }
   async function logout() {
     const csrf = document.cookie.split("; ").find((item) => item.startsWith("tme3_csrf="))?.split("=")[1] || "";
-    await fetch("/ui/api/auth/logout", {method: "POST", headers: {"X-CSRF-Token": decodeURIComponent(csrf)}});
+    await fetch("/api/auth/logout", {method: "POST", headers: {"X-CSRF-Token": decodeURIComponent(csrf)}});
     location.reload();
   }
 
   const sidebar = <aside className="flex h-full w-64 flex-col border-r bg-[var(--panel)] p-4">
-    <Link href="/ui" className="mb-7 flex items-center gap-3 px-2"><span className="grid size-10 place-items-center rounded-2xl bg-[var(--brand)] text-white"><Bot className="size-5"/></span><span><b className="block">tme3</b><small className="muted">Control center</small></span></Link>
+    <Link href="/" className="mb-7 flex items-center gap-3 px-2"><span className="grid size-10 place-items-center rounded-2xl bg-[var(--brand)] text-white"><Bot className="size-5"/></span><span><b className="block">tme3</b><small className="muted">Control center</small></span></Link>
     <nav className="grid gap-1" aria-label="Navigasi utama">
       {links.map(([href, label, Icon]) => {
-        const active = href === "/ui" ? path === href : path.startsWith(href);
+        const active = href === "/" ? path === href : path.startsWith(href);
         return <Link key={href} href={href} onClick={() => setOpen(false)} className={cn("flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition", active ? "bg-[var(--brand-soft)] text-[var(--brand)]" : "muted hover:bg-[var(--surface)] hover:text-[var(--ink)]")}><Icon className="size-[18px]"/>{label}</Link>;
       })}
     </nav>

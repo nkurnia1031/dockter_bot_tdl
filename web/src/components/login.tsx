@@ -11,7 +11,7 @@ export function Login() {
 
   async function begin() {
     setStatus("loading");
-    const response = await fetch("/ui/api/auth/challenge", {method: "POST"});
+    const response = await fetch("/api/auth/challenge", {method: "POST"});
     const data = await response.json();
     if (!response.ok) { setError(data?.error?.message || "Gagal membuat login."); setStatus("idle"); return; }
     setChallenge(data); setStatus("waiting");
@@ -22,7 +22,7 @@ export function Login() {
   async function poll() {
     for (let attempt = 0; attempt < 100; attempt++) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
-      const response = await fetch("/ui/api/auth/poll", {method: "POST"});
+      const response = await fetch("/api/auth/poll", {method: "POST"});
       if (response.ok) { location.reload(); return; }
       if (response.status !== 202) {
         const data = await response.json().catch(() => ({}));

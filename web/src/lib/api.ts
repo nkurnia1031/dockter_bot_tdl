@@ -8,7 +8,7 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}): Pr
   const headers = new Headers(init.headers);
   if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method)) headers.set("X-CSRF-Token", decodeURIComponent(csrf()));
-  const response = await fetch(`/ui/api/backend${path}`, {...init, headers, cache: "no-store"});
+  const response = await fetch(`/api/backend${path}`, {...init, headers, cache: "no-store"});
   const payload = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error((payload as ApiError).error?.message || `HTTP ${response.status}`);
   return payload as T;

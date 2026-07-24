@@ -5,12 +5,12 @@ export default defineConfig({
   fullyParallel: true,
   retries: 1,
   use: {
-    baseURL: "http://127.0.0.1:3000/ui",
+    baseURL: "http://127.0.0.1:3000",
     trace: "on-first-retry",
   },
   webServer: {
     command: "pnpm dev",
-    url: "http://127.0.0.1:3000/ui",
+    url: "http://127.0.0.1:3000",
     reuseExistingServer: true,
   },
   projects: [

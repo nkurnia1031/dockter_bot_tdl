@@ -225,8 +225,8 @@
     "semantic_hash": ""
   },
   "docker-compose.gateway.yml": {
-    "mtime": 1784908544.4190183,
-    "ast_hash": "c5068f13c80a23cffa9d8439c3e8bfdb",
+    "mtime": 1784899308.2236133,
+    "ast_hash": "f513cd8fda859f3c1c3008b71b700e0c",
     "semantic_hash": ""
   },
   "docker-compose.worker.yml": {
@@ -405,8 +405,8 @@
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
-    "mtime": 1784908731.2077374,
-    "ast_hash": "3797d807e07a06b1d5df31cf904ccd47",
+    "mtime": 1784900565.9953024,
+    "ast_hash": "94d330165439e12d97ea6b39db356bd7",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/__init__.py": {
@@ -465,8 +465,8 @@
     "semantic_hash": ""
   },
   "web/e2e/login.spec.ts": {
-    "mtime": 1784908544.4240277,
-    "ast_hash": "29c47e2e6696cf09f72451d9fe212fd9",
+    "mtime": 1784901094.9517443,
+    "ast_hash": "cedaaebf29578688d3dc730c5ba289ea",
     "semantic_hash": ""
   },
   "web/next-env.d.ts": {
@@ -475,8 +475,8 @@
     "semantic_hash": ""
   },
   "web/next.config.ts": {
-    "mtime": 1784908544.40907,
-    "ast_hash": "fc23ef60614cdcf0a0049dab6120f5d6",
+    "mtime": 1784898992.142363,
+    "ast_hash": "1e773aeb264b081642d18a6011dde665",
     "semantic_hash": ""
   },
   "web/package.json": {
@@ -485,8 +485,8 @@
     "semantic_hash": ""
   },
   "web/playwright.config.ts": {
-    "mtime": 1784908544.4229286,
-    "ast_hash": "525397c14faf0bd2ded36c8543b7ee3e",
+    "mtime": 1784901094.9492786,
+    "ast_hash": "c59920a448af63c43e8190956e4b069b",
     "semantic_hash": ""
   },
   "web/postcss.config.mjs": {
@@ -575,8 +575,8 @@
     "semantic_hash": ""
   },
   "web/src/components/app-shell.tsx": {
-    "mtime": 1784908544.418006,
-    "ast_hash": "b1b38800419e602dc318661b5d83272b",
+    "mtime": 1784899086.5670714,
+    "ast_hash": "4a3e48a99973096032358a207948ac45",
     "semantic_hash": ""
   },
   "web/src/components/downloads.tsx": {
@@ -590,8 +590,8 @@
     "semantic_hash": ""
   },
   "web/src/components/login.tsx": {
-    "mtime": 1784908544.415767,
-    "ast_hash": "ac86424adb2534e79e8a03b72504ad51",
+    "mtime": 1784899086.5660565,
+    "ast_hash": "73ba2a18ffeba0c59a251f00926c4f1f",
     "semantic_hash": ""
   },
   "web/src/components/overview.tsx": {
@@ -625,13 +625,13 @@
     "semantic_hash": ""
   },
   "web/src/lib/api.ts": {
-    "mtime": 1784908544.412454,
-    "ast_hash": "810efc2b508c0df4144571bc1f1faed6",
+    "mtime": 1784899086.5639114,
+    "ast_hash": "9db0a405073c7c8561eed097258b362f",
     "semantic_hash": ""
   },
   "web/src/lib/bff.ts": {
-    "mtime": 1784908544.4114032,
-    "ast_hash": "2f07582d67038779a1f868905d23eb5d",
+    "mtime": 1784898992.148029,
+    "ast_hash": "38b7b195fe1063345f72ca51f3e212b7",
     "semantic_hash": ""
   },
   "web/src/lib/cn.ts": {
@@ -645,8 +645,8 @@
     "semantic_hash": ""
   },
   "web/public/robots.txt": {
-    "mtime": 1784908544.4215443,
-    "ast_hash": "f71d20196d4caf35b6a670db8c70b03d",
+    "mtime": 1784899313.733359,
+    "ast_hash": "34327ebf7c47ae9d59d28d8a5d3ef490",
     "semantic_hash": ""
   },
   "web/components.json": {

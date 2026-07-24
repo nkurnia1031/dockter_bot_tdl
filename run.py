@@ -557,21 +557,35 @@ def migrate_images(env: dict[str, str]) -> Path:
         build_env["COMPOSE_FILE"] = compose_file
         run_compose(["build"], build_env)
         output = capture_compose(["config", "--images"], build_env)
-        for image in output.splitlines():
-            image = image.strip()
+        resolved = [line.strip() for line in output.splitlines() if line.strip()]
+        print(
+            f"Compose images ({compose_file}): {', '.join(resolved) or '(none)'}",
+            flush=True,
+        )
+        for image in resolved:
             if image and image not in image_names:
                 image_names.append(image)
 
     if not image_names:
-        raise RuntimeError("Tidak ada image Docker yang ditemukan dari compose split.")
+        raise RuntimeError(
+            "Tidak ada image Docker yang ditemukan dari compose split. "
+            "Pastikan run.py dan docker-compose*.yml berasal dari project yang sama."
+        )
 
-    output = PROJECT_DIR / "migrate.zip"
+    output = (PROJECT_DIR / "migrate.zip").resolve()
+    print(f"Packaging Docker images to: {output}", flush=True)
     with tempfile.TemporaryDirectory(prefix=".migrate-", dir=PROJECT_DIR) as temp_dir:
         image_tar = Path(temp_dir) / "tme3bot-images.tar"
         run_docker(["save", "-o", str(image_tar), *image_names], env)
+        if not image_tar.is_file() or image_tar.stat().st_size == 0:
+            raise RuntimeError(
+                f"docker save selesai tetapi arsip image tidak ditemukan: {image_tar}"
+            )
         count, size = build_migration_archive(output, image_tar)
 
-    print(f"Migration archive: {output}")
+    if not output.is_file() or output.stat().st_size == 0:
+        raise RuntimeError(f"Arsip migrasi tidak berhasil dibuat: {output}")
+    print(f"Migration archive: {output}", flush=True)
     print(f"Docker images: {', '.join(image_names)}")
     print(f"Files: {count}")
     print(f"Size: {size / 1024 / 1024:.2f} MB")

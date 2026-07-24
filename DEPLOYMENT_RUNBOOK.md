@@ -7,12 +7,12 @@ Dokumen ini adalah instruksi operasional utama setiap kali source code berubah.
 Jika arsitektur, nama service, env, atau proses build berubah, file ini wajib
 diperbarui bersamaan dengan perubahan code.
 
-## Catatan update 2.0 — Web Admin `/ui`
+## Catatan update 2.1 — Web Admin subdomain root
 
 Update ini menambahkan container keempat pada gateway:
 
 - `web`: Next.js 16 + BFF, hanya bind ke `127.0.0.1:3000`.
-- UI dibuka dari domain utama pada path `/ui`.
+- UI dibuka dari subdomain web pada root domain, tanpa prefix `/ui`.
 - API publik tetap di `/api/v1`.
 - Browser tidak memegang JWT di JavaScript; access/refresh token berada dalam
   cookie HttpOnly.
@@ -92,7 +92,7 @@ VPS besar / builder
 Komponen:
 
 - `backend`: API FastAPI, SQLite, state, scheduler, worker routing.
-- `web`: Next.js BFF dan admin dashboard `/ui`; tidak mount `/data`.
+- `web`: Next.js BFF dan admin dashboard pada root subdomain; tidak mount `/data`.
 - `telegram`: UI Telegram. Menggunakan image gateway yang sama dengan backend.
 - `worker-local`: worker TDL lokal, hanya dijalankan jika gateway juga menjadi
   worker.
@@ -330,18 +330,15 @@ docker compose --env-file .env \
 Pada update biasa gunakan `--no-build`. Image baru sudah berasal dari
 `migrate.zip`.
 
-### C5. Reverse proxy domain utama
+### C5. Reverse proxy web dan API
 
 Web hanya membuka `127.0.0.1:3000`; jangan membuka port 3000 di firewall.
-Tambahkan location berikut pada server HTTPS domain utama. Jangan beri trailing
-slash pada nilai `proxy_pass`, agar prefix `/ui` tetap diteruskan ke Next.js.
+Gunakan subdomain terpisah untuk web dan API. BFF web meneruskan request ke
+backend melalui jaringan Docker, sehingga browser tidak menerima token backend.
 
 ```nginx
-location = /ui {
-    return 308 /ui/;
-}
-
-location /ui/ {
+# web.example.com
+location / {
     proxy_pass http://127.0.0.1:3000;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -350,6 +347,7 @@ location /ui/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 
+# api.example.com
 location /api/v1/ {
     proxy_pass http://127.0.0.1:8080;
     proxy_http_version 1.1;
@@ -364,8 +362,8 @@ Validasi dan reload:
 ```bash
 nginx -t
 systemctl reload nginx
-curl -I https://DOMAIN-UTAMA/ui/
-curl -fsS https://DOMAIN-UTAMA/api/v1/openapi.json >/dev/null
+curl -I https://WEB-DOMAIN/
+curl -fsS https://API-DOMAIN/api/v1/openapi.json >/dev/null
 ```
 
 Gunakan HTTPS. Cookie login produksi memakai atribut `Secure` dan tidak akan
@@ -514,7 +512,7 @@ Gateway:
 docker compose --env-file .env -f docker-compose.gateway.yml ps
 docker compose --env-file .env -f docker-compose.gateway.yml logs --tail=100 backend
 docker compose --env-file .env -f docker-compose.gateway.yml logs --tail=100 web
-curl -fsS https://DOMAIN-UTAMA/ui/ >/dev/null
+curl -fsS https://WEB-DOMAIN/ >/dev/null
 ```
 
 Worker remote:

@@ -60,13 +60,22 @@ class RunScriptTests(unittest.TestCase):
 
     def test_migrate_builds_both_compose_files_and_saves_images(self) -> None:
         env = {}
+
+        def fake_docker(args, _env):
+            if args[:2] == ["save", "-o"]:
+                Path(args[2]).write_bytes(b"docker images")
+
+        def fake_archive(output, _image_tar):
+            output.write_bytes(b"migration archive")
+            return 10, output.stat().st_size
+
         with (
             patch.object(run, "require_env_file"),
             patch.object(run, "prepare_tdl_build_asset"),
             patch.object(run, "run_compose") as run_compose,
             patch.object(run, "capture_compose", side_effect=["gateway-image\nworker-image\n", "worker-image\n"]),
-            patch.object(run, "run_docker") as run_docker,
-            patch.object(run, "build_migration_archive", return_value=(10, 20)),
+            patch.object(run, "run_docker", side_effect=fake_docker) as run_docker,
+            patch.object(run, "build_migration_archive", side_effect=fake_archive),
         ):
             output = run.migrate_images(env)
 
