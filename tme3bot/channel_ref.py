@@ -25,7 +25,12 @@ def channel_chat_id(raw: str) -> int:
 
 
 def channel_tdl_ref(raw: str) -> str:
+    """Return the peer reference format expected by tdl.
+
+    Bot API uses `-100<peer id>` for private channels, while tdl's upload
+    command expects the compact numeric peer id without that prefix.
+    """
     value = compact_channel_ref(raw)
     if value.isdigit():
-        return str(channel_chat_id(value))
+        return value
     return value
