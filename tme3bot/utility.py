@@ -20,6 +20,29 @@ DEFAULT_UTILITY_SETTINGS = {
     "compress_size": "4g",
     "compress_password": "A1031@bokep@1031A",
 }
+UTILITY_SETTING_SPECS = {
+    "move_size": {
+        "label": "Batas ukuran grup pindah",
+        "description": "Ukuran maksimum setiap grup hasil operasi Pindah / group.",
+        "format": "Angka positif dengan satuan B, K, M, G, atau T.",
+        "examples": ("500m", "4g", "1.5g"),
+        "secret": False,
+    },
+    "compress_size": {
+        "label": "Ukuran volume arsip 7z",
+        "description": "Ukuran maksimum setiap part arsip saat Compress 7z.",
+        "format": "Angka positif dengan satuan B, K, M, G, atau T.",
+        "examples": ("500m", "4g", "1.5g"),
+        "secret": False,
+    },
+    "compress_password": {
+        "label": "Password arsip dan backup",
+        "description": "Dipakai untuk arsip 7z dan backup terenkripsi. Nilai lama tidak ditampilkan kembali.",
+        "format": "8–128 karakter.",
+        "examples": (),
+        "secret": True,
+    },
+}
 
 
 class UtilityPathError(ValueError):
@@ -43,7 +66,9 @@ class UtilitySettingsStore:
         value = value.strip()
         if not value:
             raise ValueError("Nilai pengaturan tidak boleh kosong.")
-        if key != "compress_password":
+        if key == "compress_password":
+            _validate_password(value)
+        else:
             _validate_size(value)
         with self._lock:
             self._load()
@@ -77,9 +102,23 @@ class UtilitySettingsStore:
 
 
 def _validate_size(value: str) -> None:
-    import re
-    if not re.fullmatch(r"(?:[0-9]+(?:\.[0-9]+)?)(?:[kmgt]i?b?|b)?", value.lower()):
-        raise ValueError("Ukuran harus seperti 500m, 4g, atau 1.5g.")
+    if not re.fullmatch(r"[1-9][0-9]{0,5}(?:\.[0-9]{1,2})?(?:[kmgt]i?b?|b)", value.lower()):
+        raise ValueError(
+            "Ukuran harus berupa angka positif dengan satuan, misalnya 500m, 4g, atau 1.5g."
+        )
+
+
+def _validate_password(value: str) -> None:
+    if not 8 <= len(value) <= 128:
+        raise ValueError("Password compress harus terdiri dari 8 sampai 128 karakter.")
+
+
+def utility_setting_specs() -> list[dict[str, object]]:
+    """Public metadata for clients; never contains a setting value or secret."""
+    return [
+        {"key": key, **spec, "examples": list(spec["examples"])}
+        for key, spec in UTILITY_SETTING_SPECS.items()
+    ]
 
 
 class UtilityFolderStore:
@@ -182,6 +221,11 @@ class UtilityRunner:
         for folder in folders:
             try:
                 path = Path(folder)
+                if not path.is_absolute():
+                    raise UtilityPathError("Path utility harus absolut dan berasal dari folder pilihan workspace.")
+                path = path.resolve()
+                if not path.is_dir():
+                    raise UtilityPathError(f"Folder utility tidak ditemukan: {path}")
                 before = self._snapshot(path)
                 self._run_folder(utility, path, password, settings or DEFAULT_UTILITY_SETTINGS)
                 after = self._snapshot(path)
@@ -196,7 +240,7 @@ class UtilityRunner:
                 }
                 if utility == "export":
                     detail["organizer"] = self._organizer_log_summary(path)
-                succeeded.append(folder)
+                succeeded.append(str(path))
                 details.append(detail)
             except Exception as exc:
                 failed[folder] = str(exc)

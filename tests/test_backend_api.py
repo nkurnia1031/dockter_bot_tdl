@@ -242,6 +242,25 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(payload["code"], "TOKEN_REQUIRED")
         self.assertTrue(payload["request_id"])
 
+    def test_utility_settings_explain_allowed_values_without_exposing_password(self):
+        headers = self.login()
+        settings = self.client.get("/api/v1/utility/settings", headers=headers)
+        self.assertEqual(settings.status_code, 200)
+        self.assertNotIn("compress_password", settings.json())
+        self.assertTrue(settings.json()["compress_password_configured"])
+
+        metadata = self.client.get("/api/v1/utility/settings/meta", headers=headers)
+        self.assertEqual(metadata.status_code, 200)
+        move = next(item for item in metadata.json()["items"] if item["key"] == "move_size")
+        self.assertIn("500m", move["examples"])
+
+        invalid = self.client.put(
+            "/api/v1/utility/settings/compress_size",
+            headers=headers,
+            json={"value": "4"},
+        )
+        self.assertEqual(invalid.status_code, 400)
+
     def test_storage_rename_is_shared_but_owned_metadata_is_atomic(self):
         item = self.insert_storage_item()
         headers = self.login(43)

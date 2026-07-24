@@ -23,6 +23,7 @@ class FakeRunner:
         self.commands: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
         self.caption_contents: list[str] = []
+        self.export_calls = 0
 
     def run(
         self,
@@ -53,6 +54,17 @@ class FakeRunner:
                         }
                     ]
                 }
+            if self.mode == "delayed_upload" and self.export_calls >= 2:
+                payload = {
+                    "messages": [
+                        {
+                            "id": 4321,
+                            "type": "document",
+                            "caption": "Backup node=local run=abc Part: backup.7z.001",
+                        }
+                    ]
+                }
+            self.export_calls += 1
             output_path.write_text(json.dumps(payload), encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "ok", "")
 
@@ -62,6 +74,8 @@ class FakeRunner:
             return subprocess.CompletedProcess(command, 0, "ok", "")
 
         if "up" in command:
+            if self.mode == "delayed_upload":
+                return subprocess.CompletedProcess(command, 0, "... done! [394.96 KB]", "")
             return subprocess.CompletedProcess(command, 0, "Upload File(1):987 -> /tmp/a.pdf ... done!", "")
 
         raise AssertionError(f"Unexpected command: {command}")
@@ -231,6 +245,31 @@ class TDLClientTests(unittest.TestCase):
         ])
         self.assertTrue(command[-1].endswith(".txt"))
         self.assertEqual(json.loads(runner.caption_contents[0]), "caption")
+
+    def test_upload_waits_for_delayed_message_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "backup.7z.001"
+            source.write_bytes(b"backup")
+            runner = FakeRunner("delayed_upload")
+            client = TDLClient(
+                root / "tdl",
+                "default",
+                runner=runner,
+                upload_resolve_timeout_seconds=1,
+                upload_resolve_interval_seconds=0,
+            )
+            result = client.upload(
+                source,
+                "1511596877",
+                "Backup node=local run=abc\nPart: backup.7z.001",
+            )
+
+        self.assertEqual(result.message_id, 4321)
+        self.assertGreaterEqual(runner.export_calls, 2)
+        resolve_command = next(command for command in runner.commands if "export" in command)
+        self.assertIn("--with-content", resolve_command)
+        self.assertIn("last", resolve_command)
 
 
 if __name__ == "__main__":

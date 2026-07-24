@@ -51,6 +51,7 @@ from tme3bot.api.schemas import (
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
+from tme3bot.utility import utility_setting_specs
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -653,13 +654,30 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.get("/api/v1/utility/settings", response_model=ObjectResponse)
     def utility_settings(actor=Depends(current_actor)):
         del actor
-        return context.utility_settings.get()
+        values = context.utility_settings.get()
+        # The dashboard only needs to know whether a password exists. Never
+        # return the actual archive/backup password to a browser.
+        return {
+            "move_size": values["move_size"],
+            "compress_size": values["compress_size"],
+            "compress_password_configured": bool(values.get("compress_password")),
+        }
+
+    @app.get("/api/v1/utility/settings/meta", response_model=ItemListResponse)
+    def utility_settings_meta(actor=Depends(current_actor)):
+        del actor
+        return {"items": utility_setting_specs()}
 
     @app.put("/api/v1/utility/settings/{key}", response_model=ObjectResponse)
     def set_utility_setting(key: str, body: SettingRequest, actor=Depends(current_actor)):
         del actor
         context.utility_settings.set(key, body.value)
-        return context.utility_settings.get()
+        values = context.utility_settings.get()
+        return {
+            "move_size": values["move_size"],
+            "compress_size": values["compress_size"],
+            "compress_password_configured": bool(values.get("compress_password")),
+        }
 
     @app.post("/api/v1/utility/jobs", response_model=JobResponse)
     def submit_utility(body: UtilityJobRequest, actor=Depends(current_actor)):

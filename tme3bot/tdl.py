@@ -317,6 +317,27 @@ def parse_terminal_size(value: str | None, default: int, minimum: int) -> int:
     return max(parsed, minimum)
 
 
+def _normalize_upload_caption(value: str) -> str:
+    return " ".join(str(value).split()).strip().casefold()
+
+
+def _message_contains_caption(message: dict[str, Any], normalized_caption: str) -> bool:
+    """Match captions across the different JSON shapes emitted by TDL."""
+    if not normalized_caption:
+        return False
+
+    def visit(value: Any) -> bool:
+        if isinstance(value, str):
+            return normalized_caption in _normalize_upload_caption(value)
+        if isinstance(value, dict):
+            return any(visit(item) for item in value.values())
+        if isinstance(value, list):
+            return any(visit(item) for item in value)
+        return False
+
+    return visit(message)
+
+
 class TDLClient:
     def __init__(
         self,
@@ -329,6 +350,8 @@ class TDLClient:
         log_prefix: str = "tdl",
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
+        upload_resolve_timeout_seconds: float | None = None,
+        upload_resolve_interval_seconds: float | None = None,
     ) -> None:
         self.storage_root = storage_root
         self.namespace = namespace
@@ -339,27 +362,37 @@ class TDLClient:
         self.log_prefix = log_prefix
         self.stall_timeout_seconds = stall_timeout_seconds
         self.progress_callback = progress_callback
+        self.upload_resolve_timeout_seconds = (
+            float(upload_resolve_timeout_seconds)
+            if upload_resolve_timeout_seconds is not None
+            else float(os.getenv("TDL_UPLOAD_RESOLVE_TIMEOUT_SECONDS", "300"))
+        )
+        self.upload_resolve_interval_seconds = (
+            float(upload_resolve_interval_seconds)
+            if upload_resolve_interval_seconds is not None
+            else float(os.getenv("TDL_UPLOAD_RESOLVE_INTERVAL_SECONDS", "5"))
+        )
 
     def export_messages(
-        self, chat_ref: str, start_id: int, export_path: Path
+        self,
+        chat_ref: str,
+        start_id: int,
+        export_path: Path,
+        *,
+        with_content: bool = False,
+        last_count: int | None = None,
     ) -> ExportResult:
         export_path.parent.mkdir(parents=True, exist_ok=True)
 
-        command = self._wrap_command(
-            self._base_command()
-            + [
-                "chat",
-                "export",
-                "-c",
-                chat_ref,
-                "-T",
-                "id",
-                "-i",
-                f"{start_id},999999999",
-                "-o",
-                str(export_path),
-            ]
-        )
+        export_args = ["chat", "export", "-c", chat_ref]
+        if last_count is not None:
+            export_args.extend(["-T", "last", "-i", str(max(1, last_count))])
+        else:
+            export_args.extend(["-T", "id", "-i", f"{start_id},999999999"])
+        export_args.extend(["-o", str(export_path)])
+        if with_content:
+            export_args.append("--with-content")
+        command = self._wrap_command(self._base_command() + export_args)
         result = self.runner.run(
             command,
             env=self._command_env(),
@@ -454,7 +487,13 @@ class TDLClient:
         self._ensure_success(command, result)
         return result
 
-    def upload(self, file_path: Path, chat_ref: str, caption: str) -> UploadResult:
+    def upload(
+        self,
+        file_path: Path,
+        chat_ref: str,
+        caption: str,
+        resolve_after_id: int | None = None,
+    ) -> UploadResult:
         """Upload exactly one file and return its Telegram channel message id."""
         if not file_path.is_file():
             raise TDLDataError(f"File upload tidak ditemukan: {file_path}")
@@ -490,11 +529,83 @@ class TDLClient:
             self._ensure_success(command, result)
             message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")
             if message_id is None:
-                raise TDLDataError("TDL upload selesai tetapi channel message ID tidak ditemukan.")
+                message_id = self._wait_for_upload_message_id(
+                    chat_ref,
+                    caption,
+                    resolve_after_id=resolve_after_id,
+                )
+            if message_id is None:
+                raise TDLDataError(
+                    "TDL upload selesai tetapi channel message ID tidak ditemukan "
+                    f"dalam {self.upload_resolve_timeout_seconds:g} detik."
+                )
             return UploadResult(message_id=message_id, output=f"{result.stdout}\n{result.stderr}")
         finally:
             if caption_path is not None:
                 caption_path.unlink(missing_ok=True)
+
+    def _wait_for_upload_message_id(
+        self,
+        chat_ref: str,
+        caption: str,
+        *,
+        resolve_after_id: int | None = None,
+    ) -> int | None:
+        """Resolve delayed TDL upload results by polling channel history.
+
+        Some TDL versions return exit code 0 and ``done!`` but omit the
+        message id.  The upload itself is still valid; exporting the channel
+        history lets us find the message once Telegram has committed it.
+        The timeout is deliberately bounded so a genuinely broken upload does
+        not leave a worker job running forever.
+        """
+        timeout = max(0.0, self.upload_resolve_timeout_seconds)
+        interval = max(0.0, self.upload_resolve_interval_seconds)
+        deadline = time.monotonic() + timeout
+        start_id = max(1, int(resolve_after_id or 0) + 1)
+        normalized_caption = _normalize_upload_caption(caption)
+
+        while True:
+            export_path: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json", prefix="tme3bot-upload-resolve-", delete=False
+                ) as handle:
+                    export_path = Path(handle.name)
+                exported = self.export_messages(
+                    chat_ref,
+                    start_id,
+                    export_path,
+                    with_content=True,
+                    last_count=(
+                        None
+                        if resolve_after_id is not None
+                        else max(
+                            1,
+                            int(os.getenv("TDL_UPLOAD_RESOLVE_LAST_COUNT", "100")),
+                        )
+                    ),
+                )
+                for message in reversed(exported.messages):
+                    message_id = message.get("id")
+                    if isinstance(message_id, int) and _message_contains_caption(
+                        message, normalized_caption
+                    ):
+                        LOGGER.info(
+                            "%s upload message id resolved after delayed TDL result: %s",
+                            self.log_prefix,
+                            message_id,
+                        )
+                        return message_id
+            except (TDLCommandError, TDLDataError, OSError, json.JSONDecodeError) as exc:
+                LOGGER.warning("%s upload result lookup failed; retrying: %s", self.log_prefix, exc)
+            finally:
+                if export_path is not None:
+                    export_path.unlink(missing_ok=True)
+
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
     def cancel_current(self) -> bool:
         return self.runner.cancel_current()

@@ -367,9 +367,15 @@ class WorkerJobExecutor:
 
     def _utility(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
-        folders = [self._workspace_path(item) for item in payload.get("folders", [])]
+        folders = [
+            self._workspace_path(item, require_absolute=True)
+            for item in payload.get("folders", [])
+        ]
         if not folders:
             raise ValueError("Folder utility belum dipilih.")
+        missing = [str(folder) for folder in folders if not folder.is_dir()]
+        if missing:
+            raise ValueError(f"Folder utility tidak ditemukan: {', '.join(missing)}")
 
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
@@ -501,9 +507,11 @@ class WorkerJobExecutor:
                 LOGGER.warning("Could not remove backup staging %s", part)
         return {"parts": sent, "run_id": payload["backup_run_id"]}
 
-    def _workspace_path(self, raw: str) -> Path:
+    def _workspace_path(self, raw: str, *, require_absolute: bool = False) -> Path:
         root = Path(self.config.utility_workspace_root).resolve()
         path = Path(raw)
+        if require_absolute and not path.is_absolute():
+            raise ValueError("Path utility harus absolut dan berasal dari pilihan workspace.")
         if not path.is_absolute():
             path = root / path
         resolved = path.resolve()

@@ -65,8 +65,8 @@
     "semantic_hash": "9f1a8f961cb1453f0b315d5d45285471"
   },
   "tests/test_tdl.py": {
-    "mtime": 1784918151.6055217,
-    "ast_hash": "ca3f05000337bed24b80df3b7158df25",
+    "mtime": 1784919454.4494963,
+    "ast_hash": "b02860697c62000de1d5d5536454da7b",
     "semantic_hash": ""
   },
   "tests/test_url_parser.py": {
@@ -140,8 +140,8 @@
     "semantic_hash": ""
   },
   "tme3bot/tdl.py": {
-    "mtime": 1784918157.9278593,
-    "ast_hash": "7815d279eaa3ec48fef4015aa011d6ac",
+    "mtime": 1784919427.1899157,
+    "ast_hash": "c0d7402129dd467ff3d4a13ced8fa21e",
     "semantic_hash": ""
   },
   "tme3bot/tdl_output.py": {
@@ -265,8 +265,8 @@
     "semantic_hash": ""
   },
   "tests/test_channel_ref.py": {
-    "mtime": 1784882999.735246,
-    "ast_hash": "a6bb6b409543302aaaeb9a27a0879e23",
+    "mtime": 1784918576.0877974,
+    "ast_hash": "9b239daf79ba6eb65513a8086924dbbf",
     "semantic_hash": ""
   },
   "tme3bot/backup_coordinator.py": {
@@ -280,8 +280,8 @@
     "semantic_hash": ""
   },
   "tme3bot/channel_ref.py": {
-    "mtime": 1784879257.4045014,
-    "ast_hash": "de9ae8e306b0683644e2520db43d3b1c",
+    "mtime": 1784918576.0848517,
+    "ast_hash": "0397877dd40a8533b60c38a90e75a3eb",
     "semantic_hash": ""
   },
   "tests/test_architecture_boundaries.py": {

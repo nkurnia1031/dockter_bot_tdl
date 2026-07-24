@@ -27,10 +27,11 @@ export function UtilityPage() {
   });
 
   function toggleFolder(path: string) {
+    if (!path.startsWith("/workspace/")) return;
     setSelected((old) => old.includes(path) ? old.filter((item) => item !== path) : [...old, path]);
   }
 
-  return <><PageHeader eyebrow="Utility" title="Operasi workspace" description="Workspace dipindai oleh worker yang sedang dipilih. Buka folder untuk menjelajah, lalu pilih beberapa folder sekaligus."/>
+  return <><PageHeader eyebrow="Utility" title="Operasi workspace" description="Workspace dipindai oleh worker yang sedang dipilih. Folder yang dikirim selalu memakai path absolut /workspace/… dari pilihan ini."/>
     <div className="grid gap-5 xl:grid-cols-[.8fr_1.2fr]"><Card>
       <div className="grid gap-5">
         <Field label="Jenis operasi"><select className={`${inputClass} dark:[color-scheme:dark]`} value={utility} onChange={(event) => setUtility(event.target.value)}><option value="pindah">Pindah / group</option><option value="compress">Compress 7z</option><option value="extract">Extract</option><option value="export">Organizer export</option></select></Field>
@@ -39,7 +40,7 @@ export function UtilityPage() {
           <div className="mb-3 flex items-center gap-2"><button className="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium disabled:opacity-40" disabled={!parentPath} onClick={() => parentPath && setCurrentPath(parentPath)}><ChevronLeft className="size-3.5"/>Naik</button><Badge>{selected.length} dipilih</Badge></div>
           {tree.isLoading ? <div className="grid min-h-40 place-items-center muted text-sm">Memindai workspace worker…</div> : tree.isError ? <Empty title="Workspace tidak dapat dibaca" description="Pastikan worker aktif dan route profile benar."/> : !folders.length ? <Empty title="Tidak ada folder" description="Folder workspace ini belum memiliki subfolder."/> : <div className="grid max-h-[28rem] gap-2 overflow-y-auto pr-1">{folders.map((folder) => <div key={folder.path} className={`flex items-center gap-2 rounded-xl border p-3 transition ${selected.includes(folder.path) ? "border-[var(--brand)] bg-[var(--brand-soft)]" : ""}`}><input type="checkbox" checked={selected.includes(folder.path)} onChange={() => toggleFolder(folder.path)} aria-label={`Pilih ${folder.name}`}/><Folder className="size-4 shrink-0 text-[var(--brand)]"/><button type="button" className="min-w-0 flex-1 text-left" onClick={() => setCurrentPath(folder.path)}><span className="block truncate text-sm font-medium">{folder.name}</span><span className="muted text-xs">{folder.directories || 0} folder · {folder.files || 0} file</span></button><ChevronRight className="size-4 muted"/></div>)}</div>}
         </div>
-        {selected.length > 0 && <div><p className="mb-2 text-sm font-semibold">Folder terpilih</p><div className="flex flex-wrap gap-2">{selected.map((path) => <button key={path} type="button" className="inline-flex max-w-full items-center gap-1 rounded-full bg-[var(--brand-soft)] px-2.5 py-1 text-xs text-[var(--brand)]" onClick={() => toggleFolder(path)}><span className="truncate">{path.replace("/workspace/", "")}</span><X className="size-3"/></button>)}</div></div>}
+        {selected.length > 0 && <div><p className="mb-2 text-sm font-semibold">Folder terpilih</p><p className="muted mb-2 text-xs">Path absolut ini akan diteruskan ke worker aktif.</p><div className="flex flex-wrap gap-2">{selected.map((path) => <button key={path} type="button" className="inline-flex max-w-full items-center gap-1 rounded-full bg-[var(--brand-soft)] px-2.5 py-1 text-xs text-[var(--brand)]" onClick={() => toggleFolder(path)}><span className="truncate font-mono">{path}</span><X className="size-3"/></button>)}</div></div>}
         <Button disabled={!selected.length} busy={submit.isPending} onClick={() => submit.mutate()}><Play className="size-4"/>Jalankan Utility</Button>{submit.error && <p className="text-sm text-rose-600">{submit.error.message}</p>}
       </div>
     </Card><JobList kind="utility" title="Progress & history utility" limit={20}/></div>

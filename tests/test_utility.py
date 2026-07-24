@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tme3bot.utility import UtilityRunner
+from tme3bot.utility import UtilityRunner, UtilitySettingsStore
 
 
 class UtilitySummaryTests(unittest.TestCase):
@@ -30,6 +30,23 @@ class UtilitySummaryTests(unittest.TestCase):
                     "log_lines": 4,
                 },
             )
+
+    def test_settings_validate_sizes_and_password_length(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = UtilitySettingsStore(Path(temp_dir) / "utility-settings.json")
+            store.set("move_size", "1.5g")
+            self.assertEqual(store.get()["move_size"], "1.5g")
+            with self.assertRaisesRegex(ValueError, "angka positif"):
+                store.set("compress_size", "4")
+            with self.assertRaisesRegex(ValueError, "8 sampai 128"):
+                store.set("compress_password", "short")
+
+    def test_runner_rejects_relative_folder_path(self):
+        runner = UtilityRunner(Path("utility"))
+        result = runner.run("pindah", ["relative-folder"])
+        self.assertFalse(result.succeeded)
+        self.assertIn("relative-folder", result.failed)
+        self.assertIn("absolut", result.failed["relative-folder"])
 
 
 if __name__ == "__main__":
