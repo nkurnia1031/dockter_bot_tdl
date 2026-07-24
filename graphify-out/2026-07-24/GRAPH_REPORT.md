@@ -1,16 +1,16 @@
 # Graph Report - dockter_bot_tdl  (2026-07-24)
 
 ## Corpus Check
-- 126 files · ~48,130 words
+- 126 files · ~48,230 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1386 nodes · 3540 edges · 71 communities (49 shown, 22 thin omitted)
+- 1387 nodes · 3541 edges · 72 communities (49 shown, 23 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 363 edges (avg confidence: 0.54)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `4630fe38`
+- Built from commit: `cf80297d`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -78,8 +78,9 @@
 - FakeProfiles
 - ServiceTests
 - next
+- service.py
+- next
 - tme3bot
-- WorkerHandler
 - ArchitectureBoundaryTests
 - infrastructure/__init__.py
 
@@ -110,11 +111,11 @@
 ## Import Cycles
 - None detected.
 
-## Communities (71 total, 22 thin omitted)
+## Communities (72 total, 23 thin omitted)
 
 ### Community 0 - "ProfileManager"
-Cohesion: 0.21
-Nodes (11): has_downloadable_media(), is_image_message(), Any, BatchDownloadResult, BatchDownloadService, DownloadedJsonResult, media_ids_in_export(), Any (+3 more)
+Cohesion: 0.36
+Nodes (5): BatchDownloadResult, BatchDownloadService, Path, Download selected opaque filenames after strict directory validation., unique_path()
 
 ### Community 1 - "TelegramBotApp"
 Cohesion: 0.60
@@ -125,68 +126,68 @@ Cohesion: 0.10
 Nodes (11): Message, PanelViewStoreTests, FakeBot, FakeMessage, TelegramPanelRecoveryTests, PanelManager, Bot, InlineKeyboardMarkup (+3 more)
 
 ### Community 3 - "SerialPerKeyQueue"
-Cohesion: 0.07
-Nodes (31): Popen, ProgressCallback, Queue, FakeRunner, TDLClientTests, decode_process_output(), clean_tdl_output_line(), CommandProgress (+23 more)
+Cohesion: 0.16
+Nodes (11): FakeRunner, TDLClientTests, decode_process_output(), CompletedProcess, Path, RuntimeError, Raised when TDL returns unusable or malformed export data., Upload exactly one file and return its Telegram channel message id. (+3 more)
 
 ### Community 4 - "telegram_messages_to_json.py"
-Cohesion: 0.09
-Nodes (58): HTMLParser, cleanup_empty_directories(), collect_potential_folder_names(), collect_referenced_media(), collect_referenced_media_from_html(), crosscheck_unreferenced_media(), discover_json_files(), ensure_target_directory() (+50 more)
+Cohesion: 0.15
+Nodes (28): HTMLParser, build_orphan_group_entry(), build_reply_group_entry(), build_root_catalog(), build_root_entries(), discover_html_files(), entry_sort_key(), first_text_line() (+20 more)
 
 ### Community 5 - "organize_media_from_json.py"
 Cohesion: 0.15
 Nodes (9): JobStoreTests, Job, _dump(), _load(), Connection, Job, Path, Row (+1 more)
 
 ### Community 6 - "LabelStore"
-Cohesion: 0.16
-Nodes (9): UtilitySettingsTests, Path, ValueError, UtilityFolderStore, UtilityPathError, UtilityResult, UtilityRunner, UtilitySettingsStore (+1 more)
-
-### Community 7 - "bot_text.py"
-Cohesion: 0.12
-Nodes (11): BackupCoordinator, BackupNodeJob, BackupScheduler, datetime, Gateway orchestration, channel upload, scheduling, and retention., Worker-neutral command payload for one node backup., build_backend_context(), ControlPlaneBackupRouter (+3 more)
+Cohesion: 0.13
+Nodes (10): FakeDispatcher, UtilitySettingsTests, Path, ValueError, UtilityFolderStore, UtilityPathError, UtilityResult, UtilityRunner (+2 more)
 
 ### Community 8 - "UtilityHandler"
 Cohesion: 0.07
-Nodes (38): metadata, Providers(), ActivityPage(), Backup, BackupsPage(), SettingsPage(), Worker, WorkersPage() (+30 more)
+Nodes (39): metadata, Providers(), ActivityPage(), Backup, BackupsPage(), SettingsPage(), Worker, WorkersPage() (+31 more)
 
 ### Community 9 - "ProfileManager"
 Cohesion: 0.08
 Nodes (49): base_fingerprint(), base_manifest_is_current(), build_archive(), build_base_archive(), build_migration_archive(), is_excluded(), iter_files(), main() (+41 more)
 
 ### Community 11 - "run.py"
-Cohesion: 0.19
-Nodes (9): FakeExecutor, WorkerApiTests, WorkerJobRequest, create_worker_app(), _error(), FastAPI, JSONResponse, Request (+1 more)
+Cohesion: 0.15
+Nodes (13): FakeExecutor, WorkerApiTests, WorkerJobRequest, create_worker_app(), _error(), FastAPI, JSONResponse, Request (+5 more)
 
 ### Community 12 - "SerialPerKeyQueue"
-Cohesion: 0.13
-Nodes (17): ProfileTests, Path, AppConfig, Fail fast when a production role is missing its trust boundary., normalize_profile_name(), build_profile_config(), build_profile_runtime(), chown_paths() (+9 more)
+Cohesion: 0.08
+Nodes (19): ChannelRefTests, ProfileTests, Path, channel_chat_id(), channel_tdl_ref(), compact_channel_ref(), Normalize Telegram private channel links and compact numeric references., load_dotenv() (+11 more)
 
 ### Community 13 - "boltStorage"
 Cohesion: 0.18
 Nodes (10): Client, Context, DB, boltStorage, fail(), leave(), main(), openStorage() (+2 more)
 
 ### Community 14 - "TDLClient"
-Cohesion: 0.12
-Nodes (8): StateStoreTests, HttpStateStore, Any, Path, StateStore-compatible client used by a worker without a local state file., SourceState, StateSnapshot, StateStore
+Cohesion: 0.11
+Nodes (10): StateStoreTests, utc_now_iso(), DownloadedJsonResult, HttpStateStore, Any, Path, StateStore-compatible client used by a worker without a local state file., SourceState (+2 more)
 
 ### Community 15 - "WorkerRegistry"
 Cohesion: 0.20
-Nodes (9): BackupServiceTests, make_config(), Path, BackupArchive, BackupService, Path, Create encrypted, runtime-only per-node backup archives., safe_node_name() (+1 more)
+Nodes (10): BackupNodeJob, Gateway orchestration, channel upload, scheduling, and retention., Worker-neutral command payload for one node backup., BackupArchive, BackupService, Path, Create encrypted, runtime-only per-node backup archives., safe_node_name() (+2 more)
 
 ### Community 16 - "StorageCatalog"
-Cohesion: 0.11
-Nodes (15): item_values(), StorageCatalogTests, build_storage_caption(), _caption_value(), Connection, Path, Row, Persistent catalog for the shared Telegram storage channel. (+7 more)
+Cohesion: 0.09
+Nodes (18): BackupServiceTests, make_config(), Path, item_values(), StorageCatalogTests, build_storage_caption(), _caption_value(), Connection (+10 more)
 
 ### Community 17 - "find_best_combination"
 Cohesion: 0.08
-Nodes (20): LabelStoreTests, ParseTme3UrlTests, WorkerRegistryTests, label_digest(), LabelStore, Path, SavedLabel, Any (+12 more)
+Nodes (19): LabelStoreTests, ParseTme3UrlTests, WorkerRegistryTests, label_digest(), LabelStore, Path, SavedLabel, Any (+11 more)
 
 ### Community 18 - "config.py"
-Cohesion: 0.27
-Nodes (7): ChannelRefTests, channel_chat_id(), channel_tdl_ref(), compact_channel_ref(), Normalize Telegram private channel links and compact numeric references., load_dotenv(), _parse_named_values()
+Cohesion: 0.19
+Nodes (30): cleanup_empty_directories(), collect_potential_folder_names(), collect_referenced_media(), collect_referenced_media_from_html(), crosscheck_unreferenced_media(), discover_json_files(), ensure_target_directory(), entry_identity() (+22 more)
 
 ### Community 19 - "ProfileManager"
 Cohesion: 0.07
 Nodes (27): dom, dom.iterable, esnext, .next/dev/types/**/*.ts, next-env.d.ts, .next/types/**/*.ts, node_modules, **/*.ts (+19 more)
+
+### Community 20 - "DownloadProgressTracker"
+Cohesion: 0.29
+Nodes (3): DownloadProgressSnapshot, DownloadProgressTracker, CommandProgress
 
 ### Community 21 - "SerialPerKeyQueue"
 Cohesion: 0.12
@@ -197,8 +198,8 @@ Cohesion: 0.18
 Nodes (9): ExportArtifactCatalogTests, ExportArtifactCatalog, inspect_export_json(), Any, Connection, Path, Gateway-owned catalog for export JSON artifacts.  The worker owns the physical J, Return safe media statistics without assuming a single TDL JSON shape. (+1 more)
 
 ### Community 24 - "DomainError"
-Cohesion: 0.24
-Nodes (5): LeaveResult, LeaveService, ProfileSelectionStore, Path, TDLCommandError
+Cohesion: 0.19
+Nodes (8): Popen, ProgressCallback, Queue, LeaveResult, LeaveService, Any, SubprocessRunner, TDLCommandError
 
 ### Community 25 - "tme3bot Agent Context"
 Cohesion: 0.18
@@ -209,8 +210,8 @@ Cohesion: 0.36
 Nodes (10): cleanup_empty_directory(), extract_archive(), get_extract_folder_name(), get_folder_password(), get_multipart_group(), is_main_part(), main(), run_extract() (+2 more)
 
 ### Community 27 - "tme3bot/app.py"
-Cohesion: 0.60
-Nodes (4): configure_logging(), main(), run_backend(), run_worker()
+Cohesion: 0.17
+Nodes (12): clean_tdl_output_line(), is_nonsemantic_tdl_output_line(), is_standalone_tdl_progress_bar(), is_tdl_telemetry_line(), parse_file_name(), parse_fraction(), parse_message_id(), parse_percent() (+4 more)
 
 ### Community 28 - "RunScriptTests"
 Cohesion: 0.09
@@ -218,11 +219,11 @@ Nodes (65): BaseModel, StorageLinkTests, _add_internal_state_routes(), _add_mana
 
 ### Community 29 - "Path"
 Cohesion: 0.08
-Nodes (25): @axe-core/playwright, jsdom, openapi-typescript, @playwright/test, tailwindcss, @tailwindcss/postcss, @testing-library/react, @types/node (+17 more)
+Nodes (25): @axe-core/playwright, jsdom, openapi-typescript, tailwindcss, @tailwindcss/postcss, @testing-library/jest-dom, @testing-library/react, @types/node (+17 more)
 
 ### Community 30 - "dependencies"
 Cohesion: 0.09
-Nodes (23): clsx, @hookform/resolvers, next, @radix-ui/react-dialog, @radix-ui/react-tabs, react, react-dom, react-hook-form (+15 more)
+Nodes (23): clsx, @hookform/resolvers, lucide-react, @radix-ui/react-dialog, @radix-ui/react-tabs, react, react-dom, react-hook-form (+15 more)
 
 ### Community 34 - "bff.ts"
 Cohesion: 0.24
@@ -233,15 +234,15 @@ Cohesion: 0.18
 Nodes (9): ErrorHandler, JobHandler, JobT, KeyT, PriorityQueue, SerialPerKeyQueueTests, Runs different keys concurrently while keeping each key serial., SerialPerKeyQueue (+1 more)
 
 ### Community 36 - "composition.py"
-Cohesion: 0.25
-Nodes (3): sha256_file(), WorkerEventPublisher, Framework-independent worker execution adapter.
+Cohesion: 0.17
+Nodes (8): BackupScheduler, build_backend_context(), ControlPlaneBackupRouter, _first_actor(), _NullCoordinator, WorkerHttpDispatcher, WorkerEventPublisher, Framework-independent worker execution adapter.
 
 ### Community 37 - "ExportService"
-Cohesion: 0.47
-Nodes (3): ExportJobResult, ExportService, ParsedTme3Url
+Cohesion: 0.17
+Nodes (3): ControlPlaneTests, FakeDispatcher, FakeProfiles
 
 ### Community 38 - "DomainError"
-Cohesion: 0.33
+Cohesion: 0.29
 Nodes (5): AuthServiceTests, Path, DomainError, Any, RuntimeError
 
 ### Community 39 - "scripts"
@@ -261,8 +262,8 @@ Cohesion: 0.19
 Nodes (6): json_value(), Any, Exception, Path, Executes domain jobs and publishes JSON events; no UI dependency., WorkerJobExecutor
 
 ### Community 52 - "SourceState"
-Cohesion: 0.27
-Nodes (6): FakeDownloadTDLClient, FakeExportTDLClient, Path, ServiceTests, build_telegram_message_url(), ExportResult
+Cohesion: 0.19
+Nodes (9): FakeDownloadTDLClient, FakeExportTDLClient, Path, ServiceTests, build_telegram_message_url(), ExportJobResult, ExportService, ExportResult (+1 more)
 
 ### Community 53 - "BatchDownloadService"
 Cohesion: 0.09
@@ -274,37 +275,37 @@ Nodes (8): RunScriptTests, CompletedProcess, BackendApiClient, Any, Frontend ada
 
 ### Community 58 - "SqliteAuthRepository"
 Cohesion: 0.15
-Nodes (9): BotAuthService, _hash_secret(), _now(), Any, Connection, datetime, Path, SqliteAuthRepository (+1 more)
+Nodes (11): str, AuthChallengeStatus, BotAuthService, _hash_secret(), _now(), Any, Connection, datetime (+3 more)
 
 ### Community 59 - "DomainError"
-Cohesion: 0.08
-Nodes (19): Protocol, ControlPlaneTests, FakeDispatcher, FakeProfiles, ControlPlane, Any, Job, Application facade used by every frontend adapter. (+11 more)
+Cohesion: 0.10
+Nodes (22): Enum, Protocol, ControlPlane, Any, Job, Application facade used by every frontend adapter., _redact_secrets(), serializable() (+14 more)
 
-### Community 65 - "ServiceTests"
-Cohesion: 0.11
-Nodes (3): FakeDispatcher, FakeProfiles, FakeWorkers
+### Community 66 - "next"
+Cohesion: 0.33
+Nodes (7): AppConfig, Fail fast when a production role is missing its trust boundary., build_profile_runtime(), chown_paths(), chown_tree(), ensure_profile_runtime_dirs(), ProfileRuntime
+
+### Community 67 - "service.py"
+Cohesion: 0.33
+Nodes (7): has_downloadable_media(), is_image_message(), Any, media_ids_in_export(), Any, parse_terminal_size(), prepare_subprocess_command()
 
 ### Community 72 - "tme3bot"
 Cohesion: 0.05
 Nodes (39): A1. Kirim source terbaru ke VPS besar, A2. Siapkan source di VPS besar, A3. Build base image satu kali, A. Kondisi pertama: membuat base image di VPS besar, Aturan dasar, B1. Di project lokal, B2. Ekstrak base image dengan aman di project lokal, B3. Kirim source ke VPS besar (+31 more)
 
-### Community 74 - "WorkerHandler"
-Cohesion: 0.29
-Nodes (8): Enum, str, Framework-independent domain model for the tme3bot control plane., AuthChallengeStatus, Job, JobStatus, datetime, utc_now()
-
 ## Knowledge Gaps
-- **140 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `$schema`, `style` (+135 more)
+- **141 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `$schema`, `style` (+136 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **22 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **23 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `TelegramFrontendApp` connect `BatchDownloadService` to `request_json`, `TDLClient`, `tme3bot/app.py`?**
+- **Why does `TelegramFrontendApp` connect `BatchDownloadService` to `request_json`, `TDLClient`, `run.py`?**
   _High betweenness centrality (0.068) - this node is a cross-community bridge._
-- **Why does `AppConfig` connect `SerialPerKeyQueue` to `ProfileManager`, `ExportService`, `bot_text.py`, `TDLClient`, `WorkerRegistry`, `config.py`, `SourceState`, `DownloadProgressTracker`, `DomainError`, `tme3bot/app.py`?**
+- **Why does `AppConfig` connect `next` to `ProfileManager`, `service.py`, `composition.py`, `run.py`, `SerialPerKeyQueue`, `TDLClient`, `StorageCatalog`, `SourceState`, `DownloadProgressTracker`?**
   _High betweenness centrality (0.068) - this node is a cross-community bridge._
-- **Why does `StorageCatalog` connect `StorageCatalog` to `FakeProfiles`, `ServiceTests`, `bot_text.py`, `WorkerRegistry`, `SqliteAuthRepository`?**
+- **Why does `StorageCatalog` connect `StorageCatalog` to `FakeProfiles`, `ServiceTests`, `composition.py`, `LabelStore`, `WorkerRegistry`, `DomainError`?**
   _High betweenness centrality (0.060) - this node is a cross-community bridge._
 - **Are the 47 inferred relationships involving `BackendContext` (e.g. with `BackendApiTests` and `FakeDispatcher`) actually correct?**
   _`BackendContext` has 47 INFERRED edges - model-reasoned connections that need verification._

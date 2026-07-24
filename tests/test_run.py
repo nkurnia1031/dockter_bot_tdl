@@ -58,6 +58,27 @@ class RunScriptTests(unittest.TestCase):
             "docker", "compose", "-f", "docker-compose.gateway.yml", "ps"
         ])
 
+    def test_deploy_gateway_reuses_base_and_recreates_services(self) -> None:
+        env = {"COMPOSE_FILE": "docker-compose.worker.yml"}
+        with (
+            patch.object(run, "require_env_file"),
+            patch.object(run, "validate_local_base_image") as validate_base,
+            patch.object(run, "ensure_profile_root") as ensure_root,
+            patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
+            patch.object(run, "run_compose") as run_compose,
+        ):
+            run.deploy_application(env, ["gateway"])
+
+        validate_base.assert_called_once_with()
+        ensure_root.assert_called_once()
+        prepare_tdl.assert_called_once()
+        self.assertEqual([call.args[0] for call in run_compose.call_args_list], [
+            ["build"],
+            ["up", "-d", "--remove-orphans"],
+            ["ps"],
+        ])
+        self.assertEqual(run_compose.call_args_list[0].args[1]["COMPOSE_FILE"], "docker-compose.gateway.yml")
+
     def test_migrate_builds_both_compose_files_and_saves_images(self) -> None:
         env = {}
 

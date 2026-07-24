@@ -7,6 +7,56 @@ Dokumen ini adalah instruksi operasional utama setiap kali source code berubah.
 Jika arsitektur, nama service, env, atau proses build berubah, file ini wajib
 diperbarui bersamaan dengan perubahan code.
 
+## Update harian melalui Git
+
+Untuk update biasa, repository menjadi jalur distribusi source. Data Docker,
+secret, sesi `.tdl`, dan file `.env` tetap berada di luar repository.
+
+Di komputer lokal:
+
+```bash
+git status
+git add .
+git commit -m "jelaskan perubahan"
+git push origin main
+```
+
+Di VPS gateway:
+
+```bash
+cd /opt/tme3bot
+git pull --ff-only origin main
+python3 run.py deploy gateway
+```
+
+Di setiap VPS worker remote:
+
+```bash
+cd /opt/tme3bot
+git pull --ff-only origin main
+python3 run.py deploy worker
+```
+
+`deploy` tidak menjalankan `Dockerfile.base`, Go build, atau membuat
+`migrate.zip`. Docker memakai image base yang sudah ada dan hanya membangun
+layer aplikasi yang berubah. Jika base image belum tersedia atau fingerprint
+base berubah, command berhenti dan meminta proses `build-base` di VPS besar.
+
+Rollback aman:
+
+```bash
+git log --oneline -5
+git checkout <commit-yang-stabil>
+python3 run.py deploy gateway   # atau worker
+```
+
+Untuk kembali mengikuti branch utama setelah rollback:
+
+```bash
+git switch main
+git pull --ff-only origin main
+```
+
 ## Catatan update 2.1 — Web Admin subdomain root
 
 Update ini menambahkan container keempat pada gateway:

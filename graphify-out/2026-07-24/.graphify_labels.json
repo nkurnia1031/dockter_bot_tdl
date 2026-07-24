@@ -66,8 +66,9 @@
   "64": "FakeProfiles",
   "65": "ServiceTests",
   "66": "next",
+  "67": "service.py",
+  "68": "next",
   "72": "tme3bot",
-  "74": "WorkerHandler",
   "75": "ArchitectureBoundaryTests",
   "78": "infrastructure/__init__.py"
 }

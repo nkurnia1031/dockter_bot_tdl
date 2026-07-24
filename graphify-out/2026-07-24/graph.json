@@ -10,8 +10,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "bot_py_bot",
-      "community": 27,
-      "community_name": "tme3bot/app.py",
+      "community": 11,
+      "community_name": "run.py",
       "norm_label": "bot.py"
     },
     {
@@ -947,8 +947,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_backend_api",
-      "community": 58,
-      "community_name": "SqliteAuthRepository",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "test_backend_api.py"
     },
     {
@@ -1035,8 +1035,8 @@
       "source_location": "L37",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakedispatcher",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 6,
+      "community_name": "LabelStore",
       "norm_label": "fakedispatcher"
     },
     {
@@ -1046,8 +1046,8 @@
       "source_location": "L38",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakedispatcher_init",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 6,
+      "community_name": "LabelStore",
       "norm_label": ".__init__()"
     },
     {
@@ -1057,8 +1057,8 @@
       "source_location": "L41",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakedispatcher_dispatch",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 6,
+      "community_name": "LabelStore",
       "norm_label": ".dispatch()"
     },
     {
@@ -1068,8 +1068,8 @@
       "source_location": "L45",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakedispatcher_cancel",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 6,
+      "community_name": "LabelStore",
       "norm_label": ".cancel()"
     },
     {
@@ -1079,8 +1079,8 @@
       "source_location": "L49",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": "fakeworkers"
     },
     {
@@ -1090,8 +1090,8 @@
       "source_location": "L50",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers_init",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".__init__()"
     },
     {
@@ -1101,8 +1101,8 @@
       "source_location": "L53",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers_list",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".list()"
     },
     {
@@ -1112,8 +1112,8 @@
       "source_location": "L56",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers_names",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".names()"
     },
     {
@@ -1134,8 +1134,8 @@
       "source_location": "L62",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers_upsert",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".upsert()"
     },
     {
@@ -1145,8 +1145,8 @@
       "source_location": "L66",
       "_origin": "ast",
       "id": "tests_test_backend_api_fakeworkers_remove",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".remove()"
     },
     {
@@ -1167,8 +1167,8 @@
       "source_location": "L71",
       "_origin": "ast",
       "id": "tests_test_backend_api_backendapitests_setup",
-      "community": 65,
-      "community_name": "ServiceTests",
+      "community": 64,
+      "community_name": "FakeProfiles",
       "norm_label": ".setup()"
     },
     {
@@ -1266,8 +1266,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_backup_service",
-      "community": 15,
-      "community_name": "WorkerRegistry",
+      "community": 16,
+      "community_name": "StorageCatalog",
       "norm_label": "test_backup_service.py"
     },
     {
@@ -1277,8 +1277,8 @@
       "source_location": "L12",
       "_origin": "ast",
       "id": "tests_test_backup_service_make_config",
-      "community": 15,
-      "community_name": "WorkerRegistry",
+      "community": 16,
+      "community_name": "StorageCatalog",
       "norm_label": "make_config()"
     },
     {
@@ -1288,8 +1288,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tests_test_backup_service_py_path",
-      "community": 15,
-      "community_name": "WorkerRegistry",
+      "community": 16,
+      "community_name": "StorageCatalog",
       "norm_label": "path"
     },
     {
@@ -1299,8 +1299,8 @@
       "source_location": "L28",
       "_origin": "ast",
       "id": "tests_test_backup_service_backupservicetests",
-      "community": 15,
-      "community_name": "WorkerRegistry",
+      "community": 16,
+      "community_name": "StorageCatalog",
       "norm_label": "backupservicetests"
     },
     {
@@ -1310,8 +1310,8 @@
       "source_location": "L29",
       "_origin": "ast",
       "id": "tests_test_backup_service_backupservicetests_test_runtime_staging_includes_json_and_excludes_workspace_media",
-      "community": 15,
-      "community_name": "WorkerRegistry",
+      "community": 16,
+      "community_name": "StorageCatalog",
       "norm_label": ".test_runtime_staging_includes_json_and_excludes_workspace_media()"
     },
     {
@@ -1321,8 +1321,8 @@
       "source_location": "L51",
       "_origin": "ast",
       "id": "tests_test_backup_service_backupservicetests_test_archive_command_encrypts_headers_and_does_not_log_password",
-      "community": 15,
-      "community_name": "WorkerRegistry",
+      "community": 16,
+      "community_name": "StorageCatalog",
       "norm_label": ".test_archive_command_encrypts_headers_and_does_not_log_password()"
     },
     {
@@ -1332,8 +1332,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_channel_ref",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "test_channel_ref.py"
     },
     {
@@ -1343,8 +1343,8 @@
       "source_location": "L7",
       "_origin": "ast",
       "id": "tests_test_channel_ref_channelreftests",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "channelreftests"
     },
     {
@@ -1354,8 +1354,8 @@
       "source_location": "L8",
       "_origin": "ast",
       "id": "tests_test_channel_ref_channelreftests_test_link_and_compact_id_share_one_canonical_value",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".test_link_and_compact_id_share_one_canonical_value()"
     },
     {
@@ -1365,8 +1365,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "tests_test_channel_ref_channelreftests_test_app_config_accepts_one_compact_storage_and_backup_value",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".test_app_config_accepts_one_compact_storage_and_backup_value()"
     },
     {
@@ -1486,8 +1486,8 @@
       "source_location": "L10",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakeprofiles",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "fakeprofiles"
     },
     {
@@ -1497,8 +1497,8 @@
       "source_location": "L11",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakeprofiles_init",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".__init__()"
     },
     {
@@ -1508,8 +1508,8 @@
       "source_location": "L14",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakeprofiles_worker_route",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".worker_route()"
     },
     {
@@ -1519,8 +1519,8 @@
       "source_location": "L17",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakeprofiles_set_worker_route",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".set_worker_route()"
     },
     {
@@ -1530,8 +1530,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakedispatcher",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "fakedispatcher"
     },
     {
@@ -1541,8 +1541,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakedispatcher_init",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".__init__()"
     },
     {
@@ -1552,8 +1552,8 @@
       "source_location": "L26",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakedispatcher_dispatch",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".dispatch()"
     },
     {
@@ -1563,8 +1563,8 @@
       "source_location": "L29",
       "_origin": "ast",
       "id": "tests_test_control_plane_fakedispatcher_cancel",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".cancel()"
     },
     {
@@ -1574,8 +1574,8 @@
       "source_location": "L33",
       "_origin": "ast",
       "id": "tests_test_control_plane_controlplanetests",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": "controlplanetests"
     },
     {
@@ -1585,8 +1585,8 @@
       "source_location": "L34",
       "_origin": "ast",
       "id": "tests_test_control_plane_controlplanetests_setup",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".setup()"
     },
     {
@@ -1596,8 +1596,8 @@
       "source_location": "L42",
       "_origin": "ast",
       "id": "tests_test_control_plane_controlplanetests_teardown",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".teardown()"
     },
     {
@@ -1607,8 +1607,8 @@
       "source_location": "L45",
       "_origin": "ast",
       "id": "tests_test_control_plane_controlplanetests_test_active_job_locks_worker_route",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".test_active_job_locks_worker_route()"
     },
     {
@@ -1618,8 +1618,8 @@
       "source_location": "L56",
       "_origin": "ast",
       "id": "tests_test_control_plane_controlplanetests_test_nested_utility_secrets_are_not_persisted",
-      "community": 59,
-      "community_name": "DomainError",
+      "community": 37,
+      "community_name": "ExportService",
       "norm_label": ".test_nested_utility_secrets_are_not_persisted()"
     },
     {
@@ -1673,8 +1673,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_job_store",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "test_job_store.py"
     },
     {
@@ -1992,8 +1992,8 @@
       "source_location": "L109",
       "_origin": "ast",
       "id": "tests_test_profiles_profiletests_test_app_config_uses_container_profile_root_not_compose_host_path",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".test_app_config_uses_container_profile_root_not_compose_host_path()"
     },
     {
@@ -2003,8 +2003,8 @@
       "source_location": "L123",
       "_origin": "ast",
       "id": "tests_test_profiles_profiletests_test_app_config_accepts_custom_gateway_and_worker_ports",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".test_app_config_accepts_custom_gateway_and_worker_ports()"
     },
     {
@@ -2014,8 +2014,8 @@
       "source_location": "L134",
       "_origin": "ast",
       "id": "tests_test_profiles_profiletests_test_app_config_parses_multiple_named_worker_endpoints",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".test_app_config_parses_multiple_named_worker_endpoints()"
     },
     {
@@ -2377,8 +2377,8 @@
       "source_location": "L247",
       "_origin": "ast",
       "id": "tests_test_service_servicetests_test_progress_tracker_maps_descending_tdl_message_id_to_forward_media_position",
-      "community": 20,
-      "community_name": "DownloadProgressTracker",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": ".test_progress_tracker_maps_descending_tdl_message_id_to_forward_media_position()"
     },
     {
@@ -2751,8 +2751,8 @@
       "source_location": "L158",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_parses_tdl_progress_line",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": ".test_parses_tdl_progress_line()"
     },
     {
@@ -2762,8 +2762,8 @@
       "source_location": "L167",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_parses_tdl_done_line_message_id_and_speed",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": ".test_parses_tdl_done_line_message_id_and_speed()"
     },
     {
@@ -2773,8 +2773,8 @@
       "source_location": "L176",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_cleans_ansi_cursor_output_from_docker_logs",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": ".test_cleans_ansi_cursor_output_from_docker_logs()"
     },
     {
@@ -2784,8 +2784,8 @@
       "source_location": "L190",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_identifies_tdl_nonsemantic_status_lines",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": ".test_identifies_tdl_nonsemantic_status_lines()"
     },
     {
@@ -2795,8 +2795,8 @@
       "source_location": "L205",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_parses_full_upload_progress_line",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": ".test_parses_full_upload_progress_line()"
     },
     {
@@ -4049,8 +4049,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_app",
-      "community": 27,
-      "community_name": "tme3bot/app.py",
+      "community": 11,
+      "community_name": "run.py",
       "norm_label": "tme3bot/app.py"
     },
     {
@@ -4060,8 +4060,8 @@
       "source_location": "L8",
       "_origin": "ast",
       "id": "tme3bot_app_configure_logging",
-      "community": 27,
-      "community_name": "tme3bot/app.py",
+      "community": 11,
+      "community_name": "run.py",
       "norm_label": "configure_logging()"
     },
     {
@@ -4071,8 +4071,8 @@
       "source_location": "L15",
       "_origin": "ast",
       "id": "tme3bot_app_main",
-      "community": 27,
-      "community_name": "tme3bot/app.py",
+      "community": 11,
+      "community_name": "run.py",
       "norm_label": "main()"
     },
     {
@@ -4214,7 +4214,7 @@
       "source_location": "L129",
       "_origin": "ast",
       "id": "tme3bot_application_control_plane_controlplane_set_worker_route",
-      "community": 59,
+      "community": 38,
       "community_name": "DomainError",
       "norm_label": ".set_worker_route()"
     },
@@ -4489,8 +4489,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_backup_coordinator",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 15,
+      "community_name": "WorkerRegistry",
       "norm_label": "backup_coordinator.py"
     },
     {
@@ -4500,8 +4500,8 @@
       "source_location": "L19",
       "_origin": "ast",
       "id": "tme3bot_backup_coordinator_backupnodejob",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 15,
+      "community_name": "WorkerRegistry",
       "norm_label": "backupnodejob"
     },
     {
@@ -4643,8 +4643,8 @@
       "source_location": "L181",
       "_origin": "ast",
       "id": "tme3bot_backup_coordinator_backupscheduler",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "backupscheduler"
     },
     {
@@ -4676,8 +4676,8 @@
       "source_location": "L194",
       "_origin": "ast",
       "id": "tme3bot_backup_coordinator_backupscheduler_stop",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".stop()"
     },
     {
@@ -4698,8 +4698,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_backup_coordinator_rationale_1",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 15,
+      "community_name": "WorkerRegistry",
       "norm_label": "gateway orchestration, channel upload, scheduling, and retention."
     },
     {
@@ -4709,8 +4709,8 @@
       "source_location": "L20",
       "_origin": "ast",
       "id": "tme3bot_backup_coordinator_rationale_20",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 15,
+      "community_name": "WorkerRegistry",
       "norm_label": "worker-neutral command payload for one node backup."
     },
     {
@@ -4764,8 +4764,8 @@
       "source_location": "L60",
       "_origin": "ast",
       "id": "tme3bot_backup_service_sha256_file",
-      "community": 36,
-      "community_name": "composition.py",
+      "community": 15,
+      "community_name": "WorkerRegistry",
       "norm_label": "sha256_file()"
     },
     {
@@ -4940,8 +4940,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_channel_ref",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "channel_ref.py"
     },
     {
@@ -4951,8 +4951,8 @@
       "source_location": "L8",
       "_origin": "ast",
       "id": "tme3bot_channel_ref_compact_channel_ref",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "compact_channel_ref()"
     },
     {
@@ -4962,8 +4962,8 @@
       "source_location": "L18",
       "_origin": "ast",
       "id": "tme3bot_channel_ref_channel_chat_id",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "channel_chat_id()"
     },
     {
@@ -4973,8 +4973,8 @@
       "source_location": "L27",
       "_origin": "ast",
       "id": "tme3bot_channel_ref_channel_tdl_ref",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "channel_tdl_ref()"
     },
     {
@@ -4984,8 +4984,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_channel_ref_rationale_1",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "normalize telegram private channel links and compact numeric references."
     },
     {
@@ -4995,8 +4995,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_composition",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "composition.py"
     },
     {
@@ -5006,8 +5006,8 @@
       "source_location": "L28",
       "_origin": "ast",
       "id": "tme3bot_composition_controlplanebackuprouter",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "controlplanebackuprouter"
     },
     {
@@ -5017,8 +5017,8 @@
       "source_location": "L29",
       "_origin": "ast",
       "id": "tme3bot_composition_controlplanebackuprouter_init",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".__init__()"
     },
     {
@@ -5028,8 +5028,8 @@
       "source_location": "L33",
       "_origin": "ast",
       "id": "tme3bot_composition_controlplanebackuprouter_enqueue_backup",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".enqueue_backup()"
     },
     {
@@ -5039,8 +5039,8 @@
       "source_location": "L44",
       "_origin": "ast",
       "id": "tme3bot_composition_build_backend_context",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "build_backend_context()"
     },
     {
@@ -5050,8 +5050,8 @@
       "source_location": "L131",
       "_origin": "ast",
       "id": "tme3bot_composition_run_backend",
-      "community": 27,
-      "community_name": "tme3bot/app.py",
+      "community": 11,
+      "community_name": "run.py",
       "norm_label": "run_backend()"
     },
     {
@@ -5061,8 +5061,8 @@
       "source_location": "L142",
       "_origin": "ast",
       "id": "tme3bot_composition_run_worker",
-      "community": 27,
-      "community_name": "tme3bot/app.py",
+      "community": 11,
+      "community_name": "run.py",
       "norm_label": "run_worker()"
     },
     {
@@ -5072,8 +5072,8 @@
       "source_location": "L157",
       "_origin": "ast",
       "id": "tme3bot_composition_first_actor",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "_first_actor()"
     },
     {
@@ -5083,8 +5083,8 @@
       "source_location": "L172",
       "_origin": "ast",
       "id": "tme3bot_composition_nullcoordinator",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "_nullcoordinator"
     },
     {
@@ -5094,8 +5094,8 @@
       "source_location": "L173",
       "_origin": "ast",
       "id": "tme3bot_composition_nullcoordinator_next_run",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".next_run()"
     },
     {
@@ -5105,8 +5105,8 @@
       "source_location": "L176",
       "_origin": "ast",
       "id": "tme3bot_composition_nullcoordinator_start_now",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": ".start_now()"
     },
     {
@@ -5116,8 +5116,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_config",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "config.py"
     },
     {
@@ -5127,8 +5127,8 @@
       "source_location": "L16",
       "_origin": "ast",
       "id": "tme3bot_config_load_dotenv",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "load_dotenv()"
     },
     {
@@ -5138,8 +5138,8 @@
       "source_location": "L21",
       "_origin": "ast",
       "id": "tme3bot_config_appconfig",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "appconfig"
     },
     {
@@ -5149,8 +5149,8 @@
       "source_location": "L89",
       "_origin": "ast",
       "id": "tme3bot_config_appconfig_validate_runtime",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": ".validate_runtime()"
     },
     {
@@ -5160,8 +5160,8 @@
       "source_location": "L124",
       "_origin": "ast",
       "id": "tme3bot_config_appconfig_from_env",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".from_env()"
     },
     {
@@ -5171,8 +5171,8 @@
       "source_location": "L299",
       "_origin": "ast",
       "id": "tme3bot_config_parse_named_values",
-      "community": 18,
-      "community_name": "config.py",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "_parse_named_values()"
     },
     {
@@ -5182,8 +5182,8 @@
       "source_location": "L90",
       "_origin": "ast",
       "id": "tme3bot_config_rationale_90",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "fail fast when a production role is missing its trust boundary."
     },
     {
@@ -5193,8 +5193,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_domain_init",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "domain/__init__.py"
     },
     {
@@ -5204,8 +5204,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_domain_init_rationale_1",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "framework-independent domain model for the tme3bot control plane."
     },
     {
@@ -5215,8 +5215,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_domain_models",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "models.py"
     },
     {
@@ -5226,8 +5226,8 @@
       "source_location": "L9",
       "_origin": "ast",
       "id": "tme3bot_domain_models_utc_now",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "utc_now()"
     },
     {
@@ -5237,8 +5237,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_domain_models_py_datetime",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "datetime"
     },
     {
@@ -5292,8 +5292,8 @@
       "source_location": "L29",
       "_origin": "ast",
       "id": "tme3bot_domain_models_jobstatus",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "jobstatus"
     },
     {
@@ -5303,8 +5303,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "str",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 58,
+      "community_name": "SqliteAuthRepository",
       "norm_label": "str"
     },
     {
@@ -5314,8 +5314,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "enum",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "enum"
     },
     {
@@ -5325,8 +5325,8 @@
       "source_location": "L38",
       "_origin": "ast",
       "id": "tme3bot_domain_models_jobstatus_terminal",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": ".terminal()"
     },
     {
@@ -5336,8 +5336,8 @@
       "source_location": "L69",
       "_origin": "ast",
       "id": "tme3bot_domain_models_authchallengestatus",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 58,
+      "community_name": "SqliteAuthRepository",
       "norm_label": "authchallengestatus"
     },
     {
@@ -5358,8 +5358,8 @@
       "source_location": "L84",
       "_origin": "ast",
       "id": "tme3bot_domain_models_job",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "job"
     },
     {
@@ -5369,8 +5369,8 @@
       "source_location": "L99",
       "_origin": "ast",
       "id": "tme3bot_domain_models_job_ensure_transition",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": ".ensure_transition()"
     },
     {
@@ -7316,8 +7316,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_infrastructure_http_client",
-      "community": 56,
-      "community_name": "request_json",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "http_client.py"
     },
     {
@@ -7382,8 +7382,8 @@
       "source_location": "L55",
       "_origin": "ast",
       "id": "tme3bot_infrastructure_http_client_workerhttpdispatcher",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 36,
+      "community_name": "composition.py",
       "norm_label": "workerhttpdispatcher"
     },
     {
@@ -7426,8 +7426,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_infrastructure_job_store",
-      "community": 74,
-      "community_name": "WorkerHandler",
+      "community": 59,
+      "community_name": "DomainError",
       "norm_label": "job_store.py"
     },
     {
@@ -7833,8 +7833,8 @@
       "source_location": "L21",
       "_origin": "ast",
       "id": "tme3bot_leave_leaveservice_init",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": ".__init__()"
     },
     {
@@ -7855,8 +7855,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_media",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "media.py"
     },
     {
@@ -7866,8 +7866,8 @@
       "source_location": "L39",
       "_origin": "ast",
       "id": "tme3bot_media_has_downloadable_media",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "has_downloadable_media()"
     },
     {
@@ -7877,8 +7877,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_media_py_any",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "any"
     },
     {
@@ -7888,8 +7888,8 @@
       "source_location": "L45",
       "_origin": "ast",
       "id": "tme3bot_media_is_image_message",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "is_image_message()"
     },
     {
@@ -7921,8 +7921,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_persistence",
-      "community": 17,
-      "community_name": "find_best_combination",
+      "community": 14,
+      "community_name": "TDLClient",
       "norm_label": "persistence.py"
     },
     {
@@ -7932,8 +7932,8 @@
       "source_location": "L9",
       "_origin": "ast",
       "id": "tme3bot_persistence_utc_now_iso",
-      "community": 17,
-      "community_name": "find_best_combination",
+      "community": 14,
+      "community_name": "TDLClient",
       "norm_label": "utc_now_iso()"
     },
     {
@@ -8141,8 +8141,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_profiles",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "profiles.py"
     },
     {
@@ -8152,8 +8152,8 @@
       "source_location": "L32",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileruntime",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "profileruntime"
     },
     {
@@ -8163,8 +8163,8 @@
       "source_location": "L46",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileselectionstore",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "profileselectionstore"
     },
     {
@@ -8174,8 +8174,8 @@
       "source_location": "L47",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileselectionstore_init",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".__init__()"
     },
     {
@@ -8185,8 +8185,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_profiles_py_path",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "path"
     },
     {
@@ -8196,8 +8196,8 @@
       "source_location": "L53",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileselectionstore_get_chat_profile",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".get_chat_profile()"
     },
     {
@@ -8207,8 +8207,8 @@
       "source_location": "L59",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileselectionstore_set_chat_profile",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".set_chat_profile()"
     },
     {
@@ -8218,8 +8218,8 @@
       "source_location": "L66",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileselectionstore_load_locked",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "._load_locked()"
     },
     {
@@ -8229,8 +8229,8 @@
       "source_location": "L87",
       "_origin": "ast",
       "id": "tme3bot_profiles_profileselectionstore_save_locked",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": "._save_locked()"
     },
     {
@@ -8251,8 +8251,8 @@
       "source_location": "L92",
       "_origin": "ast",
       "id": "tme3bot_profiles_profilemanager_init",
-      "community": 24,
-      "community_name": "DomainError",
+      "community": 12,
+      "community_name": "SerialPerKeyQueue",
       "norm_label": ".__init__()"
     },
     {
@@ -8383,8 +8383,8 @@
       "source_location": "L215",
       "_origin": "ast",
       "id": "tme3bot_profiles_profilemanager_runtime",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": ".runtime()"
     },
     {
@@ -8449,8 +8449,8 @@
       "source_location": "L289",
       "_origin": "ast",
       "id": "tme3bot_profiles_describe_download_mode",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "describe_download_mode()"
     },
     {
@@ -8460,8 +8460,8 @@
       "source_location": "L297",
       "_origin": "ast",
       "id": "tme3bot_profiles_build_profile_runtime",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "build_profile_runtime()"
     },
     {
@@ -8482,8 +8482,8 @@
       "source_location": "L378",
       "_origin": "ast",
       "id": "tme3bot_profiles_ensure_profile_runtime_dirs",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "ensure_profile_runtime_dirs()"
     },
     {
@@ -8493,8 +8493,8 @@
       "source_location": "L407",
       "_origin": "ast",
       "id": "tme3bot_profiles_chown_paths",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "chown_paths()"
     },
     {
@@ -8504,8 +8504,8 @@
       "source_location": "L419",
       "_origin": "ast",
       "id": "tme3bot_profiles_chown_tree",
-      "community": 12,
-      "community_name": "SerialPerKeyQueue",
+      "community": 66,
+      "community_name": "next",
       "norm_label": "chown_tree()"
     },
     {
@@ -8647,8 +8647,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_service",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "service.py"
     },
     {
@@ -8658,8 +8658,8 @@
       "source_location": "L19",
       "_origin": "ast",
       "id": "tme3bot_service_exportjobresult",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "exportjobresult"
     },
     {
@@ -8669,8 +8669,8 @@
       "source_location": "L33",
       "_origin": "ast",
       "id": "tme3bot_service_downloadedjsonresult",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 14,
+      "community_name": "TDLClient",
       "norm_label": "downloadedjsonresult"
     },
     {
@@ -8691,8 +8691,8 @@
       "source_location": "L48",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "exportservice"
     },
     {
@@ -8713,8 +8713,8 @@
       "source_location": "L56",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_validate_url",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": ".validate_url()"
     },
     {
@@ -8724,8 +8724,8 @@
       "source_location": "L59",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_export_from_url",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": ".export_from_url()"
     },
     {
@@ -8735,8 +8735,8 @@
       "source_location": "L113",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_resolve_start_id",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "._resolve_start_id()"
     },
     {
@@ -8746,8 +8746,8 @@
       "source_location": "L123",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_next_export_path",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "._next_export_path()"
     },
     {
@@ -8768,8 +8768,8 @@
       "source_location": "L132",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_next_temp_path",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "._next_temp_path()"
     },
     {
@@ -8779,8 +8779,8 @@
       "source_location": "L136",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_select_warmup_url",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "._select_warmup_url()"
     },
     {
@@ -8790,8 +8790,8 @@
       "source_location": "L149",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_select_warmup_message",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "._select_warmup_message()"
     },
     {
@@ -8801,8 +8801,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_service_py_any",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "any"
     },
     {
@@ -8812,8 +8812,8 @@
       "source_location": "L166",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_write_export_metadata",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "._write_export_metadata()"
     },
     {
@@ -8966,8 +8966,8 @@
       "source_location": "L367",
       "_origin": "ast",
       "id": "tme3bot_service_media_ids_in_export",
-      "community": 0,
-      "community_name": "ProfileManager",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "media_ids_in_export()"
     },
     {
@@ -9802,8 +9802,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_tdl",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "tdl.py"
     },
     {
@@ -9835,8 +9835,8 @@
       "source_location": "L28",
       "_origin": "ast",
       "id": "tme3bot_tdl_tdlcommanderror_init",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": ".__init__()"
     },
     {
@@ -9879,8 +9879,8 @@
       "source_location": "L61",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "subprocessrunner"
     },
     {
@@ -9890,8 +9890,8 @@
       "source_location": "L62",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_init",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": ".__init__()"
     },
     {
@@ -9901,8 +9901,8 @@
       "source_location": "L68",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_run",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": ".run()"
     },
     {
@@ -9912,8 +9912,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "progresscallback",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "progresscallback"
     },
     {
@@ -9934,8 +9934,8 @@
       "source_location": "L159",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_cancel_current",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": ".cancel_current()"
     },
     {
@@ -9945,8 +9945,8 @@
       "source_location": "L171",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_read_stream",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "._read_stream()"
     },
     {
@@ -9956,8 +9956,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_tdl_py_any",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "any"
     },
     {
@@ -9967,8 +9967,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "queue",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "queue"
     },
     {
@@ -9978,8 +9978,8 @@
       "source_location": "L193",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_drain_output",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "._drain_output()"
     },
     {
@@ -9989,8 +9989,8 @@
       "source_location": "L242",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_log_failure_output",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "._log_failure_output()"
     },
     {
@@ -10000,8 +10000,8 @@
       "source_location": "L264",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_is_stalled",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "._is_stalled()"
     },
     {
@@ -10011,8 +10011,8 @@
       "source_location": "L272",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_terminate_process",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "._terminate_process()"
     },
     {
@@ -10022,8 +10022,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "popen",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": "popen"
     },
     {
@@ -10033,8 +10033,8 @@
       "source_location": "L284",
       "_origin": "ast",
       "id": "tme3bot_tdl_prepare_subprocess_command",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "prepare_subprocess_command()"
     },
     {
@@ -10055,8 +10055,8 @@
       "source_location": "L311",
       "_origin": "ast",
       "id": "tme3bot_tdl_parse_terminal_size",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 67,
+      "community_name": "service.py",
       "norm_label": "parse_terminal_size()"
     },
     {
@@ -10077,8 +10077,8 @@
       "source_location": "L320",
       "_origin": "ast",
       "id": "tme3bot_tdl_tdlclient_init",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 24,
+      "community_name": "DomainError",
       "norm_label": ".__init__()"
     },
     {
@@ -10220,8 +10220,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_tdl_output",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "tdl_output.py"
     },
     {
@@ -10231,8 +10231,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_commandprogress",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 20,
+      "community_name": "DownloadProgressTracker",
       "norm_label": "commandprogress"
     },
     {
@@ -10242,8 +10242,8 @@
       "source_location": "L25",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_is_nonsemantic_tdl_output_line",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "is_nonsemantic_tdl_output_line()"
     },
     {
@@ -10253,8 +10253,8 @@
       "source_location": "L29",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_is_tdl_telemetry_line",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "is_tdl_telemetry_line()"
     },
     {
@@ -10264,8 +10264,8 @@
       "source_location": "L33",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_is_standalone_tdl_progress_bar",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "is_standalone_tdl_progress_bar()"
     },
     {
@@ -10275,8 +10275,8 @@
       "source_location": "L41",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_clean_tdl_output_line",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "clean_tdl_output_line()"
     },
     {
@@ -10286,8 +10286,8 @@
       "source_location": "L52",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_tdl_progress_line",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_tdl_progress_line()"
     },
     {
@@ -10297,8 +10297,8 @@
       "source_location": "L68",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_percent",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_percent()"
     },
     {
@@ -10308,8 +10308,8 @@
       "source_location": "L73",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_speed",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_speed()"
     },
     {
@@ -10319,8 +10319,8 @@
       "source_location": "L85",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_fraction",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_fraction()"
     },
     {
@@ -10330,8 +10330,8 @@
       "source_location": "L95",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_message_id",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_message_id()"
     },
     {
@@ -10341,8 +10341,8 @@
       "source_location": "L101",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_upload_message_id",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_upload_message_id()"
     },
     {
@@ -10352,8 +10352,8 @@
       "source_location": "L108",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_parse_file_name",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "parse_file_name()"
     },
     {
@@ -10363,8 +10363,8 @@
       "source_location": "L102",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_rationale_102",
-      "community": 3,
-      "community_name": "SerialPerKeyQueue",
+      "community": 27,
+      "community_name": "tme3bot/app.py",
       "norm_label": "return the last telegram message id emitted by ``tdl up``."
     },
     {
@@ -10407,8 +10407,8 @@
       "source_location": "L14",
       "_origin": "ast",
       "id": "tme3bot_url_parser_parsedtme3url",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 52,
+      "community_name": "SourceState",
       "norm_label": "parsedtme3url"
     },
     {
@@ -11262,8 +11262,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "organize_media_from_json.py"
     },
     {
@@ -11273,8 +11273,8 @@
       "source_location": "L18",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_ordered_dedupe",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "ordered_dedupe()"
     },
     {
@@ -11284,8 +11284,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_sanitize_folder_name",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "sanitize_folder_name()"
     },
     {
@@ -11295,8 +11295,8 @@
       "source_location": "L28",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_part_sort_key",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "part_sort_key()"
     },
     {
@@ -11306,8 +11306,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_py_path",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "path"
     },
     {
@@ -11317,8 +11317,8 @@
       "source_location": "L37",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_discover_json_files",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "discover_json_files()"
     },
     {
@@ -11328,8 +11328,8 @@
       "source_location": "L42",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_json_to_source_html",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "json_to_source_html()"
     },
     {
@@ -11339,8 +11339,8 @@
       "source_location": "L51",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_read_payload",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "read_payload()"
     },
     {
@@ -11350,8 +11350,8 @@
       "source_location": "L70",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_write_payload",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "write_payload()"
     },
     {
@@ -11361,8 +11361,8 @@
       "source_location": "L74",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_unique_file_path",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "unique_file_path()"
     },
     {
@@ -11372,8 +11372,8 @@
       "source_location": "L90",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_href_to_path",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "href_to_path()"
     },
     {
@@ -11383,8 +11383,8 @@
       "source_location": "L95",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_flatten_media",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "flatten_media()"
     },
     {
@@ -11394,8 +11394,8 @@
       "source_location": "L101",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_is_thumb_file",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "is_thumb_file()"
     },
     {
@@ -11405,8 +11405,8 @@
       "source_location": "L106",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_normalize_href_key",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "normalize_href_key()"
     },
     {
@@ -11416,8 +11416,8 @@
       "source_location": "L110",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_collect_referenced_media_from_html",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "collect_referenced_media_from_html()"
     },
     {
@@ -11427,8 +11427,8 @@
       "source_location": "L125",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_entry_media_hrefs",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "entry_media_hrefs()"
     },
     {
@@ -11438,8 +11438,8 @@
       "source_location": "L129",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_entry_identity",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "entry_identity()"
     },
     {
@@ -11449,8 +11449,8 @@
       "source_location": "L137",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_entry_label",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "entry_label()"
     },
     {
@@ -11460,8 +11460,8 @@
       "source_location": "L142",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_entry_photo_count",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "entry_photo_count()"
     },
     {
@@ -11471,8 +11471,8 @@
       "source_location": "L146",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_target_folder_name",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "target_folder_name()"
     },
     {
@@ -11482,8 +11482,8 @@
       "source_location": "L153",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_ensure_target_directory",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "ensure_target_directory()"
     },
     {
@@ -11493,8 +11493,8 @@
       "source_location": "L179",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_move_media_items",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "move_media_items()"
     },
     {
@@ -11504,8 +11504,8 @@
       "source_location": "L208",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_register_skipped_media",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "register_skipped_media()"
     },
     {
@@ -11515,8 +11515,8 @@
       "source_location": "L248",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_serialize_skipped_entries",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "serialize_skipped_entries()"
     },
     {
@@ -11526,8 +11526,8 @@
       "source_location": "L267",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_cleanup_empty_directories",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "cleanup_empty_directories()"
     },
     {
@@ -11537,8 +11537,8 @@
       "source_location": "L286",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_collect_referenced_media",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "collect_referenced_media()"
     },
     {
@@ -11548,8 +11548,8 @@
       "source_location": "L298",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_collect_potential_folder_names",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "collect_potential_folder_names()"
     },
     {
@@ -11559,8 +11559,8 @@
       "source_location": "L313",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_crosscheck_unreferenced_media",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "crosscheck_unreferenced_media()"
     },
     {
@@ -11570,8 +11570,8 @@
       "source_location": "L350",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_organize_single_payload",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "organize_single_payload()"
     },
     {
@@ -11581,8 +11581,8 @@
       "source_location": "L393",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_organize_batch",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "organize_batch()"
     },
     {
@@ -11592,8 +11592,8 @@
       "source_location": "L450",
       "_origin": "ast",
       "id": "utility_export_organize_media_from_json_main",
-      "community": 4,
-      "community_name": "telegram_messages_to_json.py",
+      "community": 18,
+      "community_name": "config.py",
       "norm_label": "main()"
     },
     {
@@ -12799,8 +12799,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "web_package_dependencies_lucide_react",
-      "community": 66,
-      "community_name": "next",
+      "community": 30,
+      "community_name": "dependencies",
       "norm_label": "lucide-react"
     },
     {
@@ -12810,8 +12810,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "lucide_react",
-      "community": 66,
-      "community_name": "next",
+      "community": 30,
+      "community_name": "dependencies",
       "norm_label": "lucide-react"
     },
     {
@@ -12821,8 +12821,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "web_package_dependencies_next",
-      "community": 30,
-      "community_name": "dependencies",
+      "community": 68,
+      "community_name": "next",
       "norm_label": "next"
     },
     {
@@ -12832,8 +12832,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "next",
-      "community": 30,
-      "community_name": "dependencies",
+      "community": 68,
+      "community_name": "next",
       "norm_label": "next"
     },
     {
@@ -13030,8 +13030,8 @@
       "source_location": "L34",
       "_origin": "ast",
       "id": "web_package_devdependencies_testing_library_jest_dom",
-      "community": 43,
-      "community_name": "@playwright/test",
+      "community": 29,
+      "community_name": "Path",
       "norm_label": "@testing-library/jest-dom"
     },
     {
@@ -13041,8 +13041,8 @@
       "source_location": "L34",
       "_origin": "ast",
       "id": "testing_library_jest_dom",
-      "community": 43,
-      "community_name": "@playwright/test",
+      "community": 29,
+      "community_name": "Path",
       "norm_label": "@testing-library/jest-dom"
     },
     {
@@ -13096,8 +13096,8 @@
       "source_location": "L37",
       "_origin": "ast",
       "id": "web_package_devdependencies_playwright_test",
-      "community": 29,
-      "community_name": "Path",
+      "community": 43,
+      "community_name": "@playwright/test",
       "norm_label": "@playwright/test"
     },
     {
@@ -13107,8 +13107,8 @@
       "source_location": "L37",
       "_origin": "ast",
       "id": "playwright_test",
-      "community": 29,
-      "community_name": "Path",
+      "community": 43,
+      "community_name": "@playwright/test",
       "norm_label": "@playwright/test"
     },
     {
@@ -13882,10 +13882,21 @@
       "norm_label": "source"
     },
     {
+      "label": "SavedLabel",
+      "file_type": "code",
+      "source_file": "web/src/components/exports.tsx",
+      "source_location": "L15",
+      "_origin": "ast",
+      "id": "web_src_components_exports_savedlabel",
+      "community": 8,
+      "community_name": "UtilityHandler",
+      "norm_label": "savedlabel"
+    },
+    {
       "label": "ExportsPage()",
       "file_type": "code",
       "source_file": "web/src/components/exports.tsx",
-      "source_location": "L16",
+      "source_location": "L17",
       "_origin": "ast",
       "id": "web_src_components_exports_exportspage",
       "community": 8,
@@ -14784,15 +14795,15 @@
       "norm_label": "tme3bot deployment runbook"
     },
     {
-      "label": "Catatan update 2.0 \u2014 Web Admin `/ui`",
+      "label": "Catatan update 2.1 \u2014 Web Admin subdomain root",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
       "source_location": "L10",
       "_origin": "ast",
-      "id": "deployment_runbook_catatan_update_2_0_web_admin_ui",
+      "id": "deployment_runbook_catatan_update_2_1_web_admin_subdomain_root",
       "community": 72,
       "community_name": "tme3bot",
-      "norm_label": "catatan update 2.0 \u2014 web admin `/ui`"
+      "norm_label": "catatan update 2.1 \u2014 web admin subdomain root"
     },
     {
       "label": "Catatan update 1.3",
@@ -15004,21 +15015,21 @@
       "norm_label": "c4. gateway plus worker-local"
     },
     {
-      "label": "C5. Reverse proxy domain utama",
+      "label": "C5. Reverse proxy web dan API",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
       "source_location": "L333",
       "_origin": "ast",
-      "id": "deployment_runbook_c5_reverse_proxy_domain_utama",
+      "id": "deployment_runbook_c5_reverse_proxy_web_dan_api",
       "community": 72,
       "community_name": "tme3bot",
-      "norm_label": "c5. reverse proxy domain utama"
+      "norm_label": "c5. reverse proxy web dan api"
     },
     {
       "label": "D. Instal atau update VPS worker remote",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L374",
+      "source_location": "L372",
       "_origin": "ast",
       "id": "deployment_runbook_d_instal_atau_update_vps_worker_remote",
       "community": 72,
@@ -15029,7 +15040,7 @@
       "label": "D1. Extract dan load image",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L376",
+      "source_location": "L374",
       "_origin": "ast",
       "id": "deployment_runbook_d1_extract_dan_load_image",
       "community": 72,
@@ -15040,7 +15051,7 @@
       "label": "D2. Siapkan env pada instalasi pertama",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L384",
+      "source_location": "L382",
       "_origin": "ast",
       "id": "deployment_runbook_d2_siapkan_env_pada_instalasi_pertama",
       "community": 72,
@@ -15051,7 +15062,7 @@
       "label": "D3. Jalankan worker",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L403",
+      "source_location": "L401",
       "_origin": "ast",
       "id": "deployment_runbook_d3_jalankan_worker",
       "community": 72,
@@ -15062,7 +15073,7 @@
       "label": "D4. Daftarkan worker dari gateway",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L428",
+      "source_location": "L426",
       "_origin": "ast",
       "id": "deployment_runbook_d4_daftarkan_worker_dari_gateway",
       "community": 72,
@@ -15073,7 +15084,7 @@
       "label": "E. Menentukan apakah base perlu dibuat ulang",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L444",
+      "source_location": "L442",
       "_origin": "ast",
       "id": "deployment_runbook_e_menentukan_apakah_base_perlu_dibuat_ulang",
       "community": 72,
@@ -15084,7 +15095,7 @@
       "label": "F. Rollback",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L488",
+      "source_location": "L486",
       "_origin": "ast",
       "id": "deployment_runbook_f_rollback",
       "community": 72,
@@ -15095,7 +15106,7 @@
       "label": "G. Pemeriksaan akhir setelah update",
       "file_type": "document",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L509",
+      "source_location": "L507",
       "_origin": "ast",
       "id": "deployment_runbook_g_pemeriksaan_akhir_setelah_update",
       "community": 72,
@@ -54227,7 +54238,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "web/src/components/exports.tsx",
-      "source_location": "L16",
+      "source_location": "L17",
       "weight": 1.0,
       "_origin": "ast",
       "source": "web_src_components_exports",
@@ -54243,6 +54254,17 @@
       "_origin": "ast",
       "source": "web_src_components_exports",
       "target": "web_src_components_exports_form",
+      "confidence_score": 1.0
+    },
+    {
+      "relation": "contains",
+      "confidence": "EXTRACTED",
+      "source_file": "web/src/components/exports.tsx",
+      "source_location": "L15",
+      "weight": 1.0,
+      "_origin": "ast",
+      "source": "web_src_components_exports",
+      "target": "web_src_components_exports_savedlabel",
       "confidence_score": 1.0
     },
     {
@@ -54405,7 +54427,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "web/src/components/exports.tsx",
-      "source_location": "L18",
+      "source_location": "L19",
       "weight": 1.0,
       "_origin": "ast",
       "source": "web_src_components_exports_exportspage",
@@ -55924,14 +55946,14 @@
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_tme3bot_deployment_runbook",
-      "target": "deployment_runbook_catatan_update_2_0_web_admin_ui",
+      "target": "deployment_runbook_catatan_update_2_1_web_admin_subdomain_root",
       "confidence_score": 1.0
     },
     {
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L374",
+      "source_location": "L372",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_tme3bot_deployment_runbook",
@@ -55942,7 +55964,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L444",
+      "source_location": "L442",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_tme3bot_deployment_runbook",
@@ -55953,7 +55975,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L488",
+      "source_location": "L486",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_tme3bot_deployment_runbook",
@@ -55964,7 +55986,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L509",
+      "source_location": "L507",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_tme3bot_deployment_runbook",
@@ -56111,14 +56133,14 @@
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_c_instal_atau_update_vps_gateway",
-      "target": "deployment_runbook_c5_reverse_proxy_domain_utama",
+      "target": "deployment_runbook_c5_reverse_proxy_web_dan_api",
       "confidence_score": 1.0
     },
     {
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L376",
+      "source_location": "L374",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_d_instal_atau_update_vps_worker_remote",
@@ -56129,7 +56151,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L384",
+      "source_location": "L382",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_d_instal_atau_update_vps_worker_remote",
@@ -56140,7 +56162,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L403",
+      "source_location": "L401",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_d_instal_atau_update_vps_worker_remote",
@@ -56151,7 +56173,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "DEPLOYMENT_RUNBOOK.md",
-      "source_location": "L428",
+      "source_location": "L426",
       "weight": 1.0,
       "_origin": "ast",
       "source": "deployment_runbook_d_instal_atau_update_vps_worker_remote",
@@ -56259,5 +56281,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "4630fe38d7d871427dc4e78db1d7336254a518c4"
+  "built_at_commit": "cf80297d6e3b52bc01687acb972562e87c4d344b"
 }
