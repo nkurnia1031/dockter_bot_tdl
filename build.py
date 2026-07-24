@@ -28,6 +28,7 @@ INCLUDE_ROOTS = (
     "bot.py",
     "Dockerfile",
     "Dockerfile.base",
+    "Dockerfile.web",
     "base-image-manifest.json",
     "docker-compose.yml",
     "docker-compose.gateway.yml",
@@ -39,6 +40,7 @@ INCLUDE_ROOTS = (
     ".env.telegram.example",
     ".env.worker.example",
     ".env.worker.local.example",
+    ".env.web.example",
     "requirements.txt",
     "build.py",
     "run.py",
@@ -48,6 +50,7 @@ INCLUDE_ROOTS = (
     "tme3bot",
     "utility",
     "leave-helper",
+    "web",
 )
 
 EXCLUDED_NAMES = {
@@ -57,6 +60,10 @@ EXCLUDED_NAMES = {
     ".agents",
     ".tdl",
     ".venv",
+    "node_modules",
+    ".next",
+    "test-results",
+    "playwright-report",
     "__pycache__",
     ".pytest_cache",
     ".ruff_cache",
@@ -149,6 +156,7 @@ def build_migration_archive(output: Path, image_tar: Path) -> tuple[int, int]:
     return build_archive(
         output,
         extra_files=((image_tar, "images/tme3bot-images.tar"),),
+        include_base_image=False,
     )
 
 

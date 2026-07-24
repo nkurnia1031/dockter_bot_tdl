@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --surface: #f7f8fb;
+  --panel: #ffffff;
+  --ink: #121826;
+  --muted: #667085;
+  --line: #e6e9ef;
+  --brand: #5b5ce2;
+  --brand-soft: #eeefff;
+}
+
+.dark {
+  --surface: #0c1019;
+  --panel: #121824;
+  --ink: #f3f5f9;
+  --muted: #929bad;
+  --line: #252d3c;
+  --brand: #8b8cff;
+  --brand-soft: #222348;
+}
+
+* { border-color: var(--line); }
+html { background: var(--surface); }
+body {
+  margin: 0;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 75% -10%, color-mix(in srgb, var(--brand) 11%, transparent), transparent 30rem),
+    var(--surface);
+  font-family: Arial, Helvetica, sans-serif;
+}
+button, input, select, textarea { font: inherit; }
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--brand) 35%, transparent);
+  outline-offset: 2px;
+}
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 1rem; }
+.muted { color: var(--muted); }
+.scrollbar { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}

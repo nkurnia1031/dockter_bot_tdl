@@ -59,7 +59,7 @@ class RunScriptTests(unittest.TestCase):
         ])
 
     def test_migrate_builds_both_compose_files_and_saves_images(self) -> None:
-        env = {"PROFILE_ROOT": "/srv/bot"}
+        env = {}
         with (
             patch.object(run, "require_env_file"),
             patch.object(run, "prepare_tdl_build_asset"),
@@ -72,6 +72,10 @@ class RunScriptTests(unittest.TestCase):
 
         self.assertEqual(output, run.PROJECT_DIR / "migrate.zip")
         self.assertEqual(run_compose.call_count, 2)
+        worker_build_env = run_compose.call_args_list[1].args[1]
+        self.assertEqual(
+            worker_build_env["PROFILE_ROOT"], "/tmp/tme3bot-worker-build"
+        )
         run_docker.assert_called_once()
         self.assertEqual(run_docker.call_args.args[0][:2], ["save", "-o"])
 

@@ -16,3 +16,8 @@ output.zip
 worker_routes.json
 workers.json
 /images
+web/node_modules/
+web/.next/
+web/*.tsbuildinfo
+web/playwright-report/
+web/test-results/

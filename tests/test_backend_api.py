@@ -31,7 +31,7 @@ class FakeProfiles:
         return "shared"
 
     def list_profiles(self):
-        return ["default"]
+        return ["default", "archive"]
 
 
 class FakeDispatcher:
@@ -167,7 +167,7 @@ class BackendApiTests(unittest.TestCase):
         me = self.client.get("/api/v1/me", headers=headers)
         self.assertEqual(me.status_code, 200)
         self.assertEqual(me.json()["telegram_user_id"], 42)
-        paths = self.client.get("/openapi.json").json()["paths"]
+        paths = self.client.get("/api/v1/openapi.json").json()["paths"]
         self.assertIn("/api/v1/me", paths)
         self.assertFalse(any(path.startswith("/internal/") for path in paths))
         job_schema = paths["/api/v1/jobs"]["get"]["responses"]["200"][
@@ -175,6 +175,18 @@ class BackendApiTests(unittest.TestCase):
         ]["application/json"]["schema"]
         self.assertEqual(
             job_schema["$ref"], "#/components/schemas/JobListResponse"
+        )
+
+    def test_authorized_browser_can_select_any_existing_profile_by_header(self):
+        headers = self.login()
+        headers["X-Profile"] = "archive"
+        me = self.client.get("/api/v1/me", headers=headers)
+        self.assertEqual(me.status_code, 200)
+        self.assertEqual(me.json()["profile"], "archive")
+        missing = dict(headers)
+        missing["X-Profile"] = "missing"
+        self.assertEqual(
+            self.client.get("/api/v1/me", headers=missing).status_code, 404
         )
 
     def test_submit_job_and_worker_events_are_json_only(self):

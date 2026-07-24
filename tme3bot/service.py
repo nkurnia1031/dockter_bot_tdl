@@ -200,6 +200,26 @@ class BatchDownloadService:
         moved_files = [self._move_to_processing(path) for path in pending_files]
         return self._download_files(moved_files, mode="download")
 
+    def download_selected_exports(
+        self, artifact_keys: list[str]
+    ) -> BatchDownloadResult:
+        """Download selected opaque filenames after strict directory validation."""
+        selected: list[Path] = []
+        pending_root = self.config.export_pending_dir.resolve()
+        for key in artifact_keys:
+            if Path(key).name != key or not key.lower().endswith(".json"):
+                raise ValueError("Artifact key tidak valid.")
+            path = (pending_root / key).resolve()
+            try:
+                path.relative_to(pending_root)
+            except ValueError as exc:
+                raise ValueError("Artifact key keluar dari direktori export.") from exc
+            if not path.is_file():
+                raise FileNotFoundError(f"Artifact tidak ditemukan: {key}")
+            selected.append(path)
+        moved_files = [self._move_to_processing(path) for path in selected]
+        return self._download_files(moved_files, mode="selected")
+
     def retry_failed_exports(self) -> BatchDownloadResult:
         failed_files = sorted(self.config.export_failed_dir.glob("*.json"))
         moved_files = [self._move_to_processing(path) for path in failed_files]
@@ -247,14 +267,15 @@ class BatchDownloadService:
                     )
                     continue
 
-                deleted_path = export_json
-                export_json.unlink()
+                done_path = unique_path(self.config.export_done_dir / export_json.name)
+                done_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(export_json), str(done_path))
                 self.progress_tracker.finish_json(True)
                 results.append(
                     DownloadedJsonResult(
-                        json_path=deleted_path,
+                        json_path=done_path,
                         download_dir=download_dir,
-                        status="success_deleted",
+                        status="success",
                     )
                 )
         finally:

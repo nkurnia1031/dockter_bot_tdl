@@ -153,6 +153,15 @@ class StorageCatalog:
                 CREATE INDEX IF NOT EXISTS idx_backup_parts_run ON backup_parts(run_id, node_name);
                 """
             )
+            try:
+                db.execute(
+                    """CREATE VIRTUAL TABLE IF NOT EXISTS storage_items_trigram
+                       USING fts5(display_name, original_name, folder, keywords,
+                                  caption, item_id UNINDEXED, tokenize='trigram')"""
+                )
+                self._trigram_enabled = True
+            except sqlite3.OperationalError:
+                self._trigram_enabled = False
             db.execute("CREATE INDEX IF NOT EXISTS idx_storage_owner ON storage_items(owner_user_id, status)")
             db.execute("CREATE INDEX IF NOT EXISTS idx_storage_status ON storage_items(status)")
             self._rebuild_fts_locked(db)
@@ -164,6 +173,15 @@ class StorageCatalog:
                SELECT display_name, original_name, folder, keywords, caption, id
                FROM storage_items WHERE status != 'deleted'"""
         )
+        if getattr(self, "_trigram_enabled", False):
+            db.execute("DELETE FROM storage_items_trigram")
+            db.execute(
+                """INSERT INTO storage_items_trigram(
+                       display_name, original_name, folder, keywords, caption, item_id
+                   )
+                   SELECT display_name, original_name, folder, keywords, caption, id
+                   FROM storage_items WHERE status != 'deleted'"""
+            )
 
     @staticmethod
     def _item(row: sqlite3.Row | None) -> StorageItem | None:
@@ -217,6 +235,16 @@ class StorageCatalog:
                SELECT display_name, original_name, folder, keywords, caption, id
                FROM storage_items WHERE id = ? AND status != 'deleted'""", (item_id,)
         )
+        if getattr(self, "_trigram_enabled", False):
+            db.execute("DELETE FROM storage_items_trigram WHERE item_id = ?", (item_id,))
+            db.execute(
+                """INSERT INTO storage_items_trigram(
+                       display_name, original_name, folder, keywords, caption, item_id
+                   )
+                   SELECT display_name, original_name, folder, keywords, caption, id
+                   FROM storage_items WHERE id = ? AND status != 'deleted'""",
+                (item_id,),
+            )
 
     def search(self, query: str = "", *, owner_user_id: int | None = None, limit: int = 10, offset: int = 0) -> list[StorageItem]:
         limit, offset = max(1, min(int(limit), 100)), max(0, int(offset))
@@ -227,8 +255,19 @@ class StorageCatalog:
                 terms = [term for term in terms if term]
                 if not terms:
                     return []
-                where = "i.id IN (SELECT item_id FROM storage_items_fts WHERE storage_items_fts MATCH ?)"
-                params.append(" AND ".join(f'"{term}"*' for term in terms))
+                exact_query = " AND ".join(f'"{term}"*' for term in terms)
+                if getattr(self, "_trigram_enabled", False) and len(query.strip()) >= 3:
+                    where = """i.id IN (
+                        SELECT item_id FROM storage_items_fts
+                        WHERE storage_items_fts MATCH ?
+                        UNION
+                        SELECT item_id FROM storage_items_trigram
+                        WHERE storage_items_trigram MATCH ?
+                    )"""
+                    params.extend([exact_query, query.strip()])
+                else:
+                    where = "i.id IN (SELECT item_id FROM storage_items_fts WHERE storage_items_fts MATCH ?)"
+                    params.append(exact_query)
             else:
                 where = "1=1"
             where += " AND i.status = 'active'"
@@ -238,6 +277,16 @@ class StorageCatalog:
             params.extend([limit, offset])
             rows = db.execute(f"SELECT i.* FROM storage_items i WHERE {where} ORDER BY i.id DESC LIMIT ? OFFSET ?", params).fetchall()
             return [self._item(row) for row in rows]  # type: ignore[misc]
+
+    def count(self, query: str = "", *, owner_user_id: int | None = None) -> int:
+        total = 0
+        while True:
+            page = self.search(
+                query, owner_user_id=owner_user_id, limit=100, offset=total
+            )
+            total += len(page)
+            if len(page) < 100:
+                return total
 
     def _owned_update(self, item_id: int, owner_user_id: int, changes: dict[str, object]) -> StorageItem:
         with self._lock, self._db() as db:

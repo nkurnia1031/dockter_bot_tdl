@@ -92,6 +92,7 @@ class Job:
     progress: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    archived_at: datetime | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
 

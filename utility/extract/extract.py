@@ -127,7 +127,7 @@ def try_extract_with_prompt(filepath, cmd_builder, default_password, allow_promp
 
         print('=' * 60)
         print(f'[+] Extracting : {filename}')
-        print(f'[+] Password   : {password}')
+        print('[+] Password   : [REDACTED]')
         print('-' * 60)
 
         success = run_extract(cmd, folder)
@@ -149,7 +149,7 @@ def try_extract_with_prompt(filepath, cmd_builder, default_password, allow_promp
 
                 # Pastikan password dari .pass tidak kosong dan belum pernah dicoba
                 if dot_password and dot_password not in tried:
-                    print(f'[!] Menemukan file .pass, mencoba password: {dot_password}')
+                    print('[!] Menemukan file .pass, mencoba password tersimpan.')
                     password = dot_password
                     continue
             except Exception as e:

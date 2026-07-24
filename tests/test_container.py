@@ -40,6 +40,8 @@ class ContainerBuildTests(unittest.TestCase):
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn("backend:", gateway)
+        self.assertIn("web:", gateway)
+        self.assertIn("127.0.0.1:${WEB_PORT:-3000}:3000", gateway)
         self.assertIn("telegram:", gateway)
         self.assertEqual(gateway.count("target: gateway"), 1)
         telegram_service = gateway.split("  telegram:", 1)[1].split(
@@ -55,6 +57,7 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("APP_ROLE=worker", (PROJECT_ROOT / ".env.worker.example").read_text(encoding="utf-8"))
         self.assertIn("FROM runtime-base AS gateway", dockerfile)
         self.assertIn("FROM runtime-base AS worker", dockerfile)
+        self.assertTrue((PROJECT_ROOT / "Dockerfile.web").is_file())
 
     def test_deployment_archive_includes_split_configs(self) -> None:
         names = {path.name for path in build.iter_files()}
@@ -63,6 +66,9 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn(".env.backend.example", names)
         self.assertIn(".env.telegram.example", names)
         self.assertIn(".env.worker.example", names)
+        self.assertIn(".env.web.example", names)
+        self.assertIn("Dockerfile.web", names)
+        self.assertIn("package.json", names)
         self.assertIn("DEPLOYMENT_RUNBOOK.md", names)
 
     def test_migration_archive_contains_prebuilt_images(self) -> None:

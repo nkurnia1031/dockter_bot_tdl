@@ -289,7 +289,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(result.failed_count, 0)
             self.assertFalse(first.exists())
             self.assertFalse((config.export_processing_dir / "first.json").exists())
-            self.assertFalse((config.export_done_dir / "first.json").exists())
+            self.assertTrue((config.export_done_dir / "first.json").exists())
             self.assertEqual(
                 client.download_calls[0][1], config.download_root / "biasa" / "first"
             )

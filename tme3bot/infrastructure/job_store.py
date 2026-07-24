@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from tme3bot.domain.models import Job, JobEvent, JobStatus
@@ -63,6 +63,7 @@ class SqliteJobRepository:
                     progress TEXT NOT NULL DEFAULT '{}',
                     result TEXT,
                     error TEXT,
+                    archived_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -84,6 +85,12 @@ class SqliteJobRepository:
                 );
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "archived_at" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
 
     def create(self, job: Job) -> Job:
         with self._db() as db:
@@ -91,8 +98,8 @@ class SqliteJobRepository:
                 """
                 INSERT INTO jobs(
                     id, kind, profile, actor_user_id, worker, status, payload,
-                    progress, result, error, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    progress, result, error, archived_at, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -105,6 +112,7 @@ class SqliteJobRepository:
                     _dump(job.progress),
                     _dump(job.result) if job.result is not None else None,
                     _dump(job.error) if job.error is not None else None,
+                    job.archived_at.isoformat() if job.archived_at else None,
                     job.created_at.isoformat(),
                     job.updated_at.isoformat(),
                 ),
@@ -121,6 +129,11 @@ class SqliteJobRepository:
         *,
         actor_user_id: int | None = None,
         profile: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        worker: str | None = None,
+        archived: bool | None = None,
+        offset: int = 0,
         limit: int = 50,
     ) -> list[Job]:
         clauses, values = [], []
@@ -130,14 +143,81 @@ class SqliteJobRepository:
         if profile is not None:
             clauses.append("profile = ?")
             values.append(profile)
+        if kind:
+            clauses.append("kind = ?")
+            values.append(kind)
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        if worker:
+            clauses.append("worker = ?")
+            values.append(worker)
+        if archived is True:
+            clauses.append("archived_at IS NOT NULL")
+        elif archived is False:
+            clauses.append("archived_at IS NULL")
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         values.append(max(1, min(int(limit), 200)))
+        values.append(max(0, int(offset)))
         with self._db() as db:
             rows = db.execute(
-                f"SELECT * FROM jobs{where} ORDER BY updated_at DESC LIMIT ?",
+                f"SELECT * FROM jobs{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
                 values,
             ).fetchall()
         return [job for row in rows if (job := self._job(row)) is not None]
+
+    def count(
+        self,
+        *,
+        profile: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        archived: bool | None = None,
+    ) -> int:
+        clauses, values = [], []
+        for column, value in (
+            ("profile", profile),
+            ("kind", kind),
+            ("status", status),
+        ):
+            if value:
+                clauses.append(f"{column} = ?")
+                values.append(value)
+        if archived is True:
+            clauses.append("archived_at IS NOT NULL")
+        elif archived is False:
+            clauses.append("archived_at IS NULL")
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        with self._db() as db:
+            return int(db.execute(f"SELECT COUNT(*) FROM jobs{where}", values).fetchone()[0])
+
+    def set_archived(self, job_id: str, archived: bool) -> Job:
+        now = datetime.now(timezone.utc).isoformat() if archived else None
+        with self._db() as db:
+            row = db.execute("SELECT status FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            if not JobStatus(str(row["status"])).terminal:
+                raise ValueError("Hanya job terminal yang dapat diarsipkan.")
+            db.execute(
+                "UPDATE jobs SET archived_at = ?, updated_at = ? WHERE id = ?",
+                (now, datetime.now(timezone.utc).isoformat(), job_id),
+            )
+        result = self.get(job_id)
+        assert result is not None
+        return result
+
+    def purge(self, job_id: str) -> bool:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT status, archived_at FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            if not JobStatus(str(row["status"])).terminal or not row["archived_at"]:
+                raise ValueError("Job harus terminal dan diarsipkan sebelum purge.")
+            db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        return True
 
     def append_event(self, event: JobEvent) -> tuple[Job, bool]:
         with self._db() as db:
@@ -240,6 +320,11 @@ class SqliteJobRepository:
             progress=_load(row["progress"], {}),
             result=_load(row["result"], None),
             error=_load(row["error"], None),
+            archived_at=(
+                datetime.fromisoformat(row["archived_at"])
+                if row["archived_at"]
+                else None
+            ),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )

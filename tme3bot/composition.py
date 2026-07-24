@@ -14,6 +14,7 @@ from tme3bot.config import AppConfig
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
 from tme3bot.storage_catalog import StorageCatalog
@@ -56,6 +57,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     )
     profiles = ProfileManager(config, registry)
     catalog = StorageCatalog(config.storage_db_file)
+    export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
     dispatcher = WorkerHttpDispatcher(registry)
     folders = UtilityFolderStore(
@@ -68,6 +70,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         dispatcher,
         profiles,
         storage_catalog=catalog,
+        export_catalog=export_catalog,
         worker_registry=registry,
         utility_folders=folders,
         utility_settings=settings,
@@ -114,6 +117,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         auth=auth,
         profile_manager=profiles,
         storage_catalog=catalog,
+        export_catalog=export_catalog,
         worker_registry=registry,
         utility_folders=folders,
         utility_settings=settings,

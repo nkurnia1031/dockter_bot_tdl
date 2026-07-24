@@ -18,6 +18,7 @@ class ControlPlane:
         profile_manager,
         *,
         storage_catalog=None,
+        export_catalog=None,
         worker_registry=None,
         utility_folders=None,
         utility_settings=None,
@@ -29,6 +30,7 @@ class ControlPlane:
         self.dispatcher = dispatcher
         self.profile_manager = profile_manager
         self.storage_catalog = storage_catalog
+        self.export_catalog = export_catalog
         self.worker_registry = worker_registry
         self.utility_folders = utility_folders
         self.utility_settings = utility_settings
@@ -168,6 +170,26 @@ class ControlPlane:
             item = result.get("item")
             if isinstance(item, dict):
                 self.storage_catalog.insert_item(**item)
+        if event.event_type == "artifact.discovered" and self.export_catalog is not None:
+            artifact = result.get("artifact")
+            if isinstance(artifact, dict):
+                self.export_catalog.upsert(**artifact)
+        if event.event_type in {"artifact.downloaded", "artifact.failed"} and self.export_catalog is not None:
+            artifact = result.get("artifact")
+            if isinstance(artifact, dict):
+                existing = self.export_catalog.get_by_key(
+                    str(artifact["profile"]),
+                    str(artifact["worker"]),
+                    str(artifact["artifact_key"]),
+                )
+                if existing is not None:
+                    self.export_catalog.update_status(
+                        str(existing["id"]),
+                        str(artifact["status"]),
+                        download_directory=artifact.get("download_directory"),
+                        error=artifact.get("error"),
+                        completed_at=event.created_at.isoformat(),
+                    )
         if event.event_type == "backup.part_uploaded" and self.storage_catalog is not None:
             part = result.get("part")
             if isinstance(part, dict):

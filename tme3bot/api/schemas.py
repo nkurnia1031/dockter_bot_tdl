@@ -69,12 +69,16 @@ class JobResponse(ApiResponse):
     progress: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
+    archived_at: datetime | None = None
+    queue_position: int | None = None
     created_at: datetime
     updated_at: datetime
 
 
 class JobListResponse(ApiResponse):
     items: list[JobResponse]
+    total: int | None = None
+    next_offset: int | None = None
 
 
 class JobEventResponse(ApiResponse):
@@ -138,6 +142,7 @@ class StorageItemResponse(ApiResponse):
 
 class StorageItemListResponse(ApiResponse):
     items: list[StorageItemResponse]
+    total: int | None = None
 
 
 class StorageSettingsResponse(ApiResponse):
@@ -178,12 +183,24 @@ class SubmitJobRequest(BaseModel):
 
 
 class ExportRequest(BaseModel):
-    url: str
+    url: str | None = None
+    chat_ref: str | None = None
+    start_id: int | None = Field(default=None, ge=1)
+    label: str | None = None
     use_url_message_id: bool = False
+
+
+class DownloadRequest(BaseModel):
+    artifact_ids: list[str] = Field(default_factory=list)
+    priority: str = "normal"
 
 
 class BatchSourcesRequest(BaseModel):
     chat_refs: list[str]
+
+
+class SourceUpdateRequest(BaseModel):
+    label: str | None = None
 
 
 class UtilityJobRequest(BaseModel):

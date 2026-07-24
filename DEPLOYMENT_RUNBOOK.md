@@ -1,11 +1,62 @@
 # TME3Bot Deployment Runbook
 
-Versi: 1.1  
+Versi: 2.0
 Tanggal: 2026-07-24
 
 Dokumen ini adalah instruksi operasional utama setiap kali source code berubah.
 Jika arsitektur, nama service, env, atau proses build berubah, file ini wajib
 diperbarui bersamaan dengan perubahan code.
+
+## Catatan update 2.0 — Web Admin `/ui`
+
+Update ini menambahkan container keempat pada gateway:
+
+- `web`: Next.js 16 + BFF, hanya bind ke `127.0.0.1:3000`.
+- UI dibuka dari domain utama pada path `/ui`.
+- API publik tetap di `/api/v1`.
+- Browser tidak memegang JWT di JavaScript; access/refresh token berada dalam
+  cookie HttpOnly.
+- Tambahkan file `.env.web` dari `.env.web.example`.
+- `run.py migrate` sekarang membangun dan memasukkan image
+  `tme3bot-web:latest` ke `migrate.zip`.
+- Base Go/TDL tidak berubah dan tidak perlu dibangun ulang.
+
+Backend juga menambah katalog artifact JSON, job archive/restore/purge,
+reconciliation worker, profile switch per sesi browser, antrean prioritas
+`next`, dan mempertahankan JSON sukses di folder `exports/done`.
+
+Urutan wajib update kali ini:
+
+1. Jalankan verifikasi lokal bagian B1, termasuk `pnpm` di folder `web`.
+2. Buat `output.zip`.
+3. Di VPS builder, extract lalu jalankan `python3 run.py migrate`.
+4. Kirim `migrate.zip` ke gateway dan seluruh worker.
+5. Di gateway buat `.env.web`, load image, jalankan compose, kemudian pasang
+   reverse proxy pada bagian C.
+
+## Catatan update 1.3
+
+Hotfix ini memperbaiki recovery panel Telegram:
+
+- Panel bot tidak lagi ikut dihapus setelah callback memulai job.
+- Jika panel memang sudah dihapus atau tidak dapat diedit, frontend otomatis
+  mengirim panel pengganti.
+- Polling progress berpindah ke panel pengganti dan menyimpan message ID baru.
+- Tidak perlu build base ulang. Buat `output.zip`, jalankan `run.py migrate` di
+  VPS builder, lalu update image gateway seperti update biasa.
+
+## Catatan update 1.2
+
+Hotfix ini memperbaiki `python3 run.py migrate` pada VPS builder ketika
+`PROFILE_ROOT` tidak ada di `.env`. Proses build sekarang memakai path
+placeholder internal hanya saat membaca `docker-compose.worker.yml`.
+
+- Tidak perlu menambahkan `PROFILE_ROOT` ke `.env` milik VPS builder.
+- `PROFILE_ROOT` tetap wajib di `.env.worker` pada VPS worker remote.
+- Tidak perlu build base ulang; kirim `output.zip` terbaru ke VPS builder dan
+  jalankan ulang `python3 run.py migrate`.
+- Build gateway yang sudah selesai akan menggunakan cache, sehingga pengulangan
+  seharusnya cepat.
 
 ## Catatan update 1.1
 
@@ -41,6 +92,7 @@ VPS besar / builder
 Komponen:
 
 - `backend`: API FastAPI, SQLite, state, scheduler, worker routing.
+- `web`: Next.js BFF dan admin dashboard `/ui`; tidak mount `/data`.
 - `telegram`: UI Telegram. Menggunakan image gateway yang sama dengan backend.
 - `worker-local`: worker TDL lokal, hanya dijalankan jika gateway juga menjadi
   worker.
@@ -128,6 +180,12 @@ Setiap ada perubahan code:
 python -m compileall -q tme3bot utility bot.py run.py build.py
 python -m unittest discover -s tests -v
 git diff --check
+cd web
+pnpm install --frozen-lockfile
+pnpm lint
+pnpm test
+pnpm build
+cd ..
 ```
 
 Jika project memakai graphify:
@@ -184,7 +242,7 @@ Outputnya:
 migrate.zip
 ```
 
-`migrate.zip` berisi image aplikasi terbaru untuk gateway dan worker.
+`migrate.zip` berisi image aplikasi terbaru untuk gateway, web, dan worker.
 
 ### B4. Kirim migration archive ke mesin target
 
@@ -219,6 +277,7 @@ cp .env.example .env
 cp .env.backend.example .env.backend
 cp .env.telegram.example .env.telegram
 cp .env.worker.local.example .env.worker.local
+cp .env.web.example .env.web
 ```
 
 Isi secret dan konfigurasi. File env yang sudah berjalan jangan ditimpa saat
@@ -233,6 +292,10 @@ Pastikan:
 - `AUTH_JWT_SECRET` minimal 32 karakter.
 - `GATEWAY_DATA_ROOT` menunjuk volume data gateway.
 - `LOCAL_WORKER_DATA_ROOT` menunjuk volume worker-local jika service itu aktif.
+- `WEB_COOKIE_SECRET` pada `.env.web` minimal 32 random bytes dan tidak sama
+  dengan token worker. Buat dengan `openssl rand -hex 32`.
+- `AUTH_JWT_SECRET` pada `.env.web` sama dengan backend.
+- `BACKEND_API_URL=http://backend:8080` pada `.env.web`.
 
 ### C3. Gateway-only
 
@@ -241,7 +304,7 @@ Jika mesin ini hanya menjalankan backend dan Telegram:
 ```bash
 docker compose --env-file .env \
   -f docker-compose.gateway.yml \
-  up -d --no-build backend telegram
+  up -d --no-build backend telegram web
 ```
 
 ### C4. Gateway plus worker-local
@@ -251,7 +314,7 @@ Jika mesin ini juga menjadi worker utama:
 ```bash
 docker compose --env-file .env \
   -f docker-compose.gateway.yml \
-  up -d --no-build backend telegram worker-local
+  up -d --no-build backend telegram web worker-local
 ```
 
 Periksa:
@@ -261,11 +324,52 @@ docker compose --env-file .env \
   -f docker-compose.gateway.yml ps
 
 docker compose --env-file .env \
-  -f docker-compose.gateway.yml logs -f backend telegram
+  -f docker-compose.gateway.yml logs -f backend telegram web
 ```
 
 Pada update biasa gunakan `--no-build`. Image baru sudah berasal dari
 `migrate.zip`.
+
+### C5. Reverse proxy domain utama
+
+Web hanya membuka `127.0.0.1:3000`; jangan membuka port 3000 di firewall.
+Tambahkan location berikut pada server HTTPS domain utama. Jangan beri trailing
+slash pada nilai `proxy_pass`, agar prefix `/ui` tetap diteruskan ke Next.js.
+
+```nginx
+location = /ui {
+    return 308 /ui/;
+}
+
+location /ui/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+
+location /api/v1/ {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+Validasi dan reload:
+
+```bash
+nginx -t
+systemctl reload nginx
+curl -I https://DOMAIN-UTAMA/ui/
+curl -fsS https://DOMAIN-UTAMA/api/v1/openapi.json >/dev/null
+```
+
+Gunakan HTTPS. Cookie login produksi memakai atribut `Secure` dan tidak akan
+bekerja benar melalui HTTP biasa.
 
 ## D. Instal atau update VPS worker remote
 
@@ -396,7 +500,7 @@ unzip -o migrate-2026-07-24-1.zip
 docker load -i images/tme3bot-images.tar
 docker compose --env-file .env \
   -f docker-compose.gateway.yml \
-  up -d --no-build backend telegram worker-local
+  up -d --no-build backend telegram web worker-local
 ```
 
 Jangan menghapus volume data ketika rollback. Database, state, export JSON,
@@ -409,6 +513,8 @@ Gateway:
 ```bash
 docker compose --env-file .env -f docker-compose.gateway.yml ps
 docker compose --env-file .env -f docker-compose.gateway.yml logs --tail=100 backend
+docker compose --env-file .env -f docker-compose.gateway.yml logs --tail=100 web
+curl -fsS https://DOMAIN-UTAMA/ui/ >/dev/null
 ```
 
 Worker remote:

@@ -538,9 +538,19 @@ def migrate_images(env: dict[str, str]) -> Path:
                 "BACKEND_ENV_FILE": ".env.backend.example",
                 "TELEGRAM_ENV_FILE": ".env.telegram.example",
                 "LOCAL_WORKER_ENV_FILE": ".env.worker.local.example",
+                "WEB_ENV_FILE": ".env.web.example",
             },
         ),
-        ("docker-compose.worker.yml", {"WORKER_ENV_FILE": ".env.worker.example"}),
+        (
+            "docker-compose.worker.yml",
+            {
+                "WORKER_ENV_FILE": ".env.worker.example",
+                # Compose validates runtime volumes even for a build-only
+                # command. The builder does not mount this path; it only keeps
+                # PROFILE_ROOT mandatory for real worker deployments.
+                "PROFILE_ROOT": "/tmp/tme3bot-worker-build",
+            },
+        ),
     ):
         build_env = dict(env)
         build_env.update(example_overrides)

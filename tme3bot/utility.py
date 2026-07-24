@@ -165,6 +165,7 @@ class UtilityResult:
     utility: str
     succeeded: list[str]
     failed: dict[str, str]
+    details: list[dict[str, object]]
 
 
 class UtilityRunner:
@@ -175,14 +176,43 @@ class UtilityRunner:
     def run(self, utility: str, folders: list[str], password: str | None = None, settings: dict[str, str] | None = None) -> UtilityResult:
         succeeded: list[str] = []
         failed: dict[str, str] = {}
+        details: list[dict[str, object]] = []
         for folder in folders:
             try:
-                self._run_folder(utility, Path(folder), password, settings or DEFAULT_UTILITY_SETTINGS)
+                path = Path(folder)
+                before = self._snapshot(path)
+                self._run_folder(utility, path, password, settings or DEFAULT_UTILITY_SETTINGS)
+                after = self._snapshot(path)
                 succeeded.append(folder)
+                details.append(
+                    {
+                        "folder": folder,
+                        "files_before": before["files"],
+                        "files_after": after["files"],
+                        "bytes_before": before["bytes"],
+                        "bytes_after": after["bytes"],
+                        "groups": after["directories"],
+                        "archives": after["archives"],
+                    }
+                )
             except Exception as exc:
                 failed[folder] = str(exc)
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
-        return UtilityResult(utility, succeeded, failed)
+        return UtilityResult(utility, succeeded, failed, details)
+
+    @staticmethod
+    def _snapshot(folder: Path) -> dict[str, int]:
+        files = [path for path in folder.rglob("*") if path.is_file()]
+        return {
+            "files": len(files),
+            "bytes": sum(path.stat().st_size for path in files),
+            "directories": sum(1 for path in folder.iterdir() if path.is_dir()),
+            "archives": sum(
+                1
+                for path in files
+                if path.suffix.lower() in {".7z", ".zip", ".rar", ".001"}
+            ),
+        }
 
     def _run_folder(self, utility: str, folder: Path, password: str | None, settings: dict[str, str]) -> None:
         if utility == "extract":

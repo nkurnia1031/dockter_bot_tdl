@@ -69,6 +69,23 @@ class JobStoreTests(unittest.TestCase):
                     JobEvent("job-1", 2, JobStatus.RUNNING, "started")
                 )
 
+    def test_filters_archive_restore_and_purge_terminal_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            store.create(self.make_job())
+            store.append_event(JobEvent("job-1", 1, JobStatus.FAILED, "failed"))
+            self.assertEqual(
+                len(store.list(profile="default", status="failed", archived=False)),
+                1,
+            )
+            archived = store.set_archived("job-1", True)
+            self.assertIsNotNone(archived.archived_at)
+            self.assertEqual(len(store.list(profile="default", archived=False)), 0)
+            self.assertEqual(len(store.list(profile="default", archived=True)), 1)
+            store.set_archived("job-1", False)
+            store.set_archived("job-1", True)
+            self.assertTrue(store.purge("job-1"))
+
 
 if __name__ == "__main__":
     unittest.main()

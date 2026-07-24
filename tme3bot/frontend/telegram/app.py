@@ -36,7 +36,6 @@ from tme3bot.frontend.telegram.keyboards import (
 from tme3bot.frontend.telegram.panel import (
     PanelManager,
     edit_menu_message,
-    safe_edit_bot_message,
 )
 from tme3bot.frontend.telegram.text import help_text, source_digest
 from tme3bot.frontend.client import BackendApiClient
@@ -148,6 +147,21 @@ class TelegramFrontendApp:
                     update.effective_message,
                     "Login web berhasil disetujui. Kembali ke browser untuk melanjutkan.",
                     check_profile_markup(),
+                )
+            except Exception as exc:
+                self._show_error(update.effective_message, exc)
+            return
+        if payload.startswith("storage_") and update.effective_user:
+            token = payload[len("storage_") :]
+            try:
+                result = self.client.post(
+                    update.effective_user.id,
+                    f"/api/v1/storage/deep-links/{quote(token, safe='.')}/deliver",
+                )
+                self.panel.update_from_message(
+                    update.effective_message,
+                    f"File dikirim: {result.get('display_name', 'storage')}",
+                    storage_menu_markup(),
                 )
             except Exception as exc:
                 self._show_error(update.effective_message, exc)
@@ -885,13 +899,13 @@ class TelegramFrontendApp:
             )
             return
         job = downloads[0]
-        edit_menu_message(
+        chat_id, message_id = self.panel.update_from_message(
             message,
             self._job_text(job),
             download_status_markup(job["status"] in TERMINAL_JOB_STATUSES),
         )
         if job["status"] not in TERMINAL_JOB_STATUSES:
-            self._poll_job(message.chat_id, message.message_id, user_id, job["id"])
+            self._poll_job(chat_id, message_id, user_id, job["id"])
 
     def _cancel_latest_download(
         self, message, user_id: int, actor: dict[str, Any]
@@ -1008,6 +1022,7 @@ class TelegramFrontendApp:
         panel_token: int | None = None,
         markup=None,
     ) -> None:
+        del message_id
         panel_token = panel_token or self.panel.begin_view(chat_id)
 
         def loop() -> None:
@@ -1019,10 +1034,10 @@ class TelegramFrontendApp:
                     job = self.client.get(user_id, f"/api/v1/jobs/{job_id}")
                     text = self._job_text(job)
                     if text != last:
-                        safe_edit_bot_message(
-                            self.updater.bot,
+                        if not self.panel.is_view_active(chat_id, panel_token):
+                            return
+                        self.panel.update(
                             chat_id,
-                            message_id,
                             text,
                             markup or main_menu_markup(job.get("profile")),
                         )

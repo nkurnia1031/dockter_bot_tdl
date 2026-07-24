@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from tme3bot.backup_service import BackupService, sha256_file
+from tme3bot.export_catalog import inspect_export_json
 from tme3bot.infrastructure.http_client import request_json
 from tme3bot.profile_queue import SerialPerKeyQueue
 from tme3bot.storage_catalog import build_storage_caption
@@ -111,7 +112,21 @@ class WorkerJobExecutor:
             if job_id in self._known:
                 return self._jobs.queue_size(str(command["profile"]))
             self._known.add(job_id)
-        return self._jobs.enqueue(str(command["profile"]), command)
+        position = self._jobs.enqueue(
+            str(command["profile"]),
+            command,
+            priority=0 if command.get("payload", {}).get("priority") == "next" else 100,
+        )
+        try:
+            self.publisher.emit(
+                job_id,
+                "dispatched",
+                "queue",
+                progress={"position": position, "worker": self.config.backup_node_name},
+            )
+        except Exception:
+            LOGGER.exception("Could not publish queue position for %s", job_id)
+        return position
 
     def cancel(self, job_id: str) -> bool:
         with self._lock:
@@ -178,6 +193,8 @@ class WorkerJobExecutor:
             "leave": self._leave,
             "download": self._download,
             "download_clear_failed": self._download_clear_failed,
+            "artifact_inventory": self._artifact_inventory,
+            "artifact_delete": self._artifact_delete,
             "utility": self._utility,
             "storage_upload": self._storage_upload,
             "backup_node": self._backup,
@@ -190,11 +207,40 @@ class WorkerJobExecutor:
     def _export(self, command: dict[str, Any]) -> Any:
         runtime = self.profile_manager.runtime(str(command["profile"]))
         payload = command["payload"]
+        url = payload.get("url")
+        if not url:
+            from urllib.parse import quote
+
+            chat_ref = str(payload["chat_ref"]).strip()
+            if not chat_ref.lstrip("-").isdigit() and not chat_ref.startswith("@"):
+                chat_ref = f"@{chat_ref}"
+            start_id = max(1, int(payload.get("start_id") or 1))
+            label = str(payload.get("label") or "").strip()
+            url = f"https://{runtime.config.tme3_host}/c/{quote(chat_ref, safe='@-')}/{start_id}"
+            if label:
+                url += f"/{quote(label, safe='')}"
         with runtime.export_operation_lock:
-            return runtime.export_service.export_from_url(
-                str(payload["url"]),
+            result = runtime.export_service.export_from_url(
+                str(url),
                 use_url_message_id=bool(payload.get("use_url_message_id", False)),
             )
+        stats = inspect_export_json(result.export_path)
+        artifact = {
+            **stats,
+            "profile": str(command["profile"]),
+            "worker": self.config.backup_node_name,
+            "export_job_id": str(command["job_id"]),
+            "filename": result.export_path.name,
+            "artifact_key": result.export_path.name,
+            "status": "pending",
+        }
+        self.publisher.emit(
+            str(command["job_id"]),
+            "running",
+            "artifact.discovered",
+            result={"artifact": artifact},
+        )
+        return result
 
     def _leave(self, command: dict[str, Any]) -> dict[str, Any]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
@@ -231,8 +277,30 @@ class WorkerJobExecutor:
         try:
             with runtime.download_operation_lock:
                 if command["payload"].get("retry_failed"):
-                    return runtime.download_service.retry_failed_exports()
-                return runtime.download_service.download_pending_exports()
+                    result = runtime.download_service.retry_failed_exports()
+                elif command["payload"].get("artifact_keys"):
+                    result = runtime.download_service.download_selected_exports(
+                        [str(item) for item in command["payload"]["artifact_keys"]]
+                    )
+                else:
+                    result = runtime.download_service.download_pending_exports()
+            for item in result.results:
+                self.publisher.emit(
+                    str(command["job_id"]),
+                    "running",
+                    "artifact.downloaded" if item.status == "success" else "artifact.failed",
+                    result={
+                        "artifact": {
+                            "profile": str(command["profile"]),
+                            "worker": self.config.backup_node_name,
+                            "artifact_key": item.json_path.name,
+                            "status": "downloaded" if item.status == "success" else "failed",
+                            "download_directory": str(item.download_dir),
+                            "error": item.error,
+                        }
+                    },
+                )
+            return result
         finally:
             stop.set()
             monitor.join(timeout=3)
@@ -240,6 +308,59 @@ class WorkerJobExecutor:
     def _download_clear_failed(self, command: dict[str, Any]) -> dict[str, int]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
         return {"deleted": runtime.download_service.clear_failed_exports()}
+
+    def _artifact_inventory(self, command: dict[str, Any]) -> dict[str, int]:
+        runtime = self.profile_manager.runtime(str(command["profile"]))
+        locations = (
+            ("pending", runtime.config.export_pending_dir),
+            ("processing", runtime.config.export_processing_dir),
+            ("downloaded", runtime.config.export_done_dir),
+            ("failed", runtime.config.export_failed_dir),
+        )
+        discovered = 0
+        for status, root in locations:
+            for path in sorted(root.glob("*.json")):
+                try:
+                    stats = inspect_export_json(path)
+                except (OSError, ValueError) as exc:
+                    LOGGER.warning("Artifact inventory skipped %s: %s", path, exc)
+                    continue
+                self.publisher.emit(
+                    str(command["job_id"]),
+                    "running",
+                    "artifact.discovered",
+                    result={
+                        "artifact": {
+                            **stats,
+                            "profile": str(command["profile"]),
+                            "worker": self.config.backup_node_name,
+                            "filename": path.name,
+                            "artifact_key": path.name,
+                            "status": status,
+                        }
+                    },
+                )
+                discovered += 1
+        return {"discovered": discovered}
+
+    def _artifact_delete(self, command: dict[str, Any]) -> dict[str, Any]:
+        runtime = self.profile_manager.runtime(str(command["profile"]))
+        key = str(command["payload"]["artifact_key"])
+        if Path(key).name != key or not key.lower().endswith(".json"):
+            raise ValueError("Artifact key tidak valid.")
+        for root in (
+            runtime.config.export_pending_dir,
+            runtime.config.export_failed_dir,
+        ):
+            candidate = (root.resolve() / key).resolve()
+            try:
+                candidate.relative_to(root.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file():
+                candidate.unlink()
+                return {"deleted": True, "artifact_key": key}
+        raise FileNotFoundError(f"Artifact tidak ditemukan: {key}")
 
     def _utility(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]

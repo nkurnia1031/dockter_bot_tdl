@@ -8,19 +8,12 @@ from telegram import Bot, InlineKeyboardMarkup, Message
 from tme3bot.frontend.telegram.panel_state import PanelViewStore
 
 LOGGER = logging.getLogger(__name__)
-
-
-def safe_edit_message(
-    message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
-) -> bool:
-    try:
-        message.edit_text(text, reply_markup=reply_markup)
-        return True
-    except Exception as exc:
-        if "message is not modified" in str(exc).lower():
-            return True
-        LOGGER.warning("Could not edit Telegram message: %s", exc)
-        return False
+UNEDITABLE_ERRORS = (
+    "message to edit not found",
+    "message can't be edited",
+    "message can not be edited",
+    "message_id_invalid",
+)
 
 
 def safe_edit_bot_message(
@@ -47,38 +40,39 @@ def safe_edit_bot_message(
         return False
 
 
-def edit_or_send_bot_message(
-    bot: Bot,
-    chat_id: int,
-    message_id: int | None,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-    reply_to_message_id: int | None = None,
-) -> int:
-    if message_id is not None and safe_edit_bot_message(
-        bot, chat_id, message_id, text, reply_markup
-    ):
-        return message_id
-    try:
-        message = bot.send_message(
-            chat_id,
-            text,
-            reply_to_message_id=reply_to_message_id,
-            reply_markup=reply_markup,
-        )
-    except Exception:
-        if reply_to_message_id is None:
-            raise
-        LOGGER.info("Bot send with reply failed; retrying without reply", exc_info=True)
-        message = bot.send_message(chat_id, text, reply_markup=reply_markup)
-    return message.message_id
-
-
 def edit_menu_message(
     message: Message, text: str, reply_markup: InlineKeyboardMarkup | None = None
-) -> None:
-    if not safe_edit_message(message, text, reply_markup):
-        LOGGER.info("Menu message edit skipped; keeping existing Telegram message")
+) -> int | None:
+    try:
+        message.edit_text(text, reply_markup=reply_markup)
+        return message.message_id
+    except Exception as exc:
+        detail = str(exc).lower()
+        if "message is not modified" in detail:
+            return message.message_id
+        LOGGER.warning("Could not edit Telegram message: %s", exc)
+        if not any(marker in detail for marker in UNEDITABLE_ERRORS):
+            return None
+
+    try:
+        replacement = message.bot.send_message(
+            chat_id=message.chat_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+        LOGGER.info(
+            "Replaced missing Telegram panel chat=%s old=%s new=%s",
+            message.chat_id,
+            message.message_id,
+            replacement.message_id,
+        )
+        return replacement.message_id
+    except Exception:
+        LOGGER.exception(
+            "Could not create replacement Telegram panel chat=%s",
+            message.chat_id,
+        )
+        return None
 
 
 class PanelManager:
@@ -146,6 +140,9 @@ class PanelManager:
     @staticmethod
     def delete_user_message(message: Message | None) -> None:
         if message is None:
+            return
+        sender = getattr(message, "from_user", None)
+        if sender is not None and bool(getattr(sender, "is_bot", False)):
             return
         try:
             message.delete()

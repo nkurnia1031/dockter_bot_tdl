@@ -2,6 +2,8 @@
 .tdl
 __pycache__/
 tests/__pycache__/
+web/node_modules/
+web/.next/
 exports/
 download/
 downloads/
