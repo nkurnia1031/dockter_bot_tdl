@@ -79,6 +79,25 @@ class RunScriptTests(unittest.TestCase):
         ])
         self.assertEqual(run_compose.call_args_list[0].args[1]["COMPOSE_FILE"], "docker-compose.gateway.yml")
 
+    def test_deploy_worker_imports_profile_root_for_compose_interpolation(self) -> None:
+        env = {"WORKER_ENV_FILE": ".env.worker.test"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            worker_env = project / ".env.worker.test"
+            worker_env.write_text("PROFILE_ROOT=/srv/remote-worker\n", encoding="utf-8")
+            with (
+                patch.object(run, "PROJECT_DIR", project),
+                patch.object(run, "require_env_file"),
+                patch.object(run, "validate_local_base_image"),
+                patch.object(run, "ensure_profile_root"),
+                patch.object(run, "prepare_tdl_build_asset"),
+                patch.object(run, "run_compose") as run_compose,
+            ):
+                run.deploy_application(env, ["worker", "--pull"], start_services=False)
+
+        deploy_env = run_compose.call_args.args[1]
+        self.assertEqual(deploy_env["PROFILE_ROOT"], "/srv/remote-worker")
+
     def test_migrate_builds_both_compose_files_and_saves_images(self) -> None:
         env = {}
 

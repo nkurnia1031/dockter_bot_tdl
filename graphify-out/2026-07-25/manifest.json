@@ -15,8 +15,8 @@
     "semantic_hash": "82d82243ee7478677cac4bb4cec404c6"
   },
   "run.py": {
-    "mtime": 1784912081.4792297,
-    "ast_hash": "0ccc24f4732ca5e5a78acadd7b723be9",
+    "mtime": 1784913687.0418012,
+    "ast_hash": "2d9055cfb184dd7a12052f2cfec4f1eb",
     "semantic_hash": ""
   },
   "tests/test_app_menu.py": {

@@ -553,6 +553,10 @@ def deploy_application(
         deploy_env["COMPOSE_FILE"] = "docker-compose.gateway.yml"
     elif target == "worker":
         deploy_env["COMPOSE_FILE"] = "docker-compose.worker.yml"
+        # Compose interpolation happens before env_file is loaded. Import
+        # PROFILE_ROOT (and other useful defaults) so ${PROFILE_ROOT} in the
+        # worker volume is valid for both build and pull deployments.
+        merge_env_file(deploy_env, deploy_env.get("WORKER_ENV_FILE", ".env.worker"))
 
     ensure_profile_root(deploy_env)
     if pull_only:
@@ -586,6 +590,21 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
     run_compose(["push"], publish_env)
     print("Image berhasil dipublish. Target low-memory dapat memakai: python3 run.py deploy "
           f"{target or 'gateway'} --pull")
+
+
+def merge_env_file(env: dict[str, str], filename: str) -> None:
+    path = Path(filename).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_DIR / path
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        parsed = parse_env_line(raw_line)
+        if parsed is None:
+            continue
+        key, value = parsed
+        if not env.get(key, "").strip():
+            env[key] = value
 
 
 def migrate_images(env: dict[str, str]) -> Path:
