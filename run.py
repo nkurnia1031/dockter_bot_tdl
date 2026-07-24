@@ -34,7 +34,8 @@ Commands:
   backup list                       List recorded backup runs
   backup status                     Show backup status
   update        Rebuild with cache, reuse host tdl, recreate running container
-  deploy [gateway|worker]  Deploy code pulled from Git without rebuilding base image
+  deploy [gateway|worker] [--pull]  Deploy; use --pull on low-memory targets
+  publish [gateway|worker]  Build on builder VPS and push images to registry
   cleanup       Remove dangling local Docker images left by rebuilds
   clean         Alias for cleanup
   restart       Restart the bot container
@@ -100,6 +101,9 @@ def main() -> int:
             return 0
         if action == "deploy":
             deploy_application(env, sys.argv[2:])
+            return 0
+        if action == "publish":
+            publish_application(env, sys.argv[2:])
             return 0
         if action in {"cleanup", "clean"}:
             run_docker(["image", "prune", "--force"], env)
@@ -536,7 +540,9 @@ def deploy_application(env: dict[str, str], arguments: list[str]) -> None:
     application layers that changed since the last deployment.
     """
     require_env_file()
-    target = (arguments[0].strip().lower() if arguments else "").replace("_", "-")
+    pull_only = "--pull" in arguments
+    target_args = [item for item in arguments if item != "--pull"]
+    target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
     if target not in {"", "gateway", "worker"}:
         raise RuntimeError("Target deploy harus gateway atau worker.")
 
@@ -546,16 +552,35 @@ def deploy_application(env: dict[str, str], arguments: list[str]) -> None:
     elif target == "worker":
         deploy_env["COMPOSE_FILE"] = "docker-compose.worker.yml"
 
-    validate_local_base_image()
     ensure_profile_root(deploy_env)
-    prepare_tdl_build_asset(deploy_env)
-    print(
-        "Deploy aplikasi: base image tidak dibangun; hanya layer aplikasi yang diperbarui.",
-        flush=True,
-    )
-    run_compose(["build"], deploy_env)
+    if pull_only:
+        print("Deploy target: pull image registry, tanpa docker build.", flush=True)
+        run_compose(["pull"], deploy_env)
+    else:
+        validate_local_base_image()
+        prepare_tdl_build_asset(deploy_env)
+        print(
+            "Deploy builder: base image tidak dibangun; hanya layer aplikasi yang diperbarui.",
+            flush=True,
+        )
+        run_compose(["build"], deploy_env)
     run_compose(["up", "-d", "--remove-orphans"], deploy_env)
     run_compose(["ps"], deploy_env)
+
+
+def publish_application(env: dict[str, str], arguments: list[str]) -> None:
+    """Build on a capable builder and publish compose images to a registry."""
+    target_args = [item for item in arguments if item != "--pull"]
+    deploy_application(env, target_args)
+    target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
+    publish_env = dict(env)
+    if target == "gateway":
+        publish_env["COMPOSE_FILE"] = "docker-compose.gateway.yml"
+    elif target == "worker":
+        publish_env["COMPOSE_FILE"] = "docker-compose.worker.yml"
+    run_compose(["push"], publish_env)
+    print("Image berhasil dipublish. Target low-memory dapat memakai: python3 run.py deploy "
+          f"{target or 'gateway'} --pull")
 
 
 def migrate_images(env: dict[str, str]) -> Path:

@@ -57,6 +57,54 @@ git switch main
 git pull --ff-only origin main
 ```
 
+## Deployment VPS low-memory melalui registry
+
+VPS Oracle 1 GB tidak boleh menjalankan `next build`. Gunakan VPS besar sebagai
+builder dan registry Docker sebagai distribusi image.
+
+Tambahkan pada env builder dan target dengan nama image registry yang sama:
+
+```env
+WEB_IMAGE_NAME=ghcr.io/ORGANIZATION/tme3bot-web
+GATEWAY_IMAGE_NAME=ghcr.io/ORGANIZATION/tme3bot-gateway
+WORKER_IMAGE_NAME=ghcr.io/ORGANIZATION/tme3bot-worker
+IMAGE_TAG=latest
+```
+
+Login sekali di VPS besar:
+
+```bash
+docker login ghcr.io
+```
+
+Setelah source sudah di-push ke Git, jalankan di VPS besar:
+
+```bash
+cd /opt/tme3bot
+git pull --ff-only origin main
+python3 run.py publish gateway
+```
+
+Untuk worker remote:
+
+```bash
+python3 run.py publish worker
+```
+
+Di Oracle gateway atau target low-memory:
+
+```bash
+cd /opt/tme3bot
+git pull --ff-only origin main
+docker login ghcr.io
+python3 run.py deploy gateway --pull
+```
+
+Target hanya melakukan `docker pull` dan menjalankan container. Tidak ada
+`pnpm install`, `next build`, Go build, atau kompilasi lokal. Pull pertama
+mengunduh layer image; pull berikutnya hanya mengunduh layer yang berubah dan
+layer lama tetap menjadi cache Docker.
+
 ## Catatan update 2.1 — Web Admin subdomain root
 
 Update ini menambahkan container keempat pada gateway:
