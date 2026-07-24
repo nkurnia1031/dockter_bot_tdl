@@ -1,7 +1,7 @@
 # Graph Report - dockter_bot_tdl  (2026-07-25)
 
 ## Corpus Check
-- 127 files · ~50,979 words
+- 127 files · ~51,047 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `80edc68d`
+- Built from commit: `63f83f25`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -223,7 +223,7 @@ Nodes (25): @axe-core/playwright, jsdom, openapi-typescript, tailwindcss, @tailw
 
 ### Community 30 - "dependencies"
 Cohesion: 0.09
-Nodes (23): clsx, @hookform/resolvers, next, @radix-ui/react-dialog, @radix-ui/react-tabs, react, react-dom, react-hook-form (+15 more)
+Nodes (23): clsx, @hookform/resolvers, lucide-react, @radix-ui/react-dialog, @radix-ui/react-tabs, react, react-dom, react-hook-form (+15 more)
 
 ### Community 34 - "bff.ts"
 Cohesion: 0.24

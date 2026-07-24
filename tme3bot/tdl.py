@@ -572,6 +572,12 @@ class TDLClient:
                     mode="w", suffix=".json", prefix="tme3bot-upload-resolve-", delete=False
                 ) as handle:
                     export_path = Path(handle.name)
+                # The resolver can run TDL through ``runuser -u user1``. A
+                # NamedTemporaryFile belongs to root and defaults to 0600, so
+                # user1 could not overwrite it with the exported JSON.
+                # /tmp itself is sticky; making this one random output file
+                # writable is limited to the short lookup window.
+                export_path.chmod(0o666)
                 exported = self.export_messages(
                     chat_ref,
                     start_id,

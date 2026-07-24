@@ -23,6 +23,7 @@ class FakeRunner:
         self.commands: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
         self.caption_contents: list[str] = []
+        self.export_output_modes: list[int] = []
         self.export_calls = 0
 
     def run(
@@ -43,6 +44,8 @@ class FakeRunner:
                 return subprocess.CompletedProcess(command, 1, "", "export failed")
 
             output_path = Path(command[command.index("-o") + 1])
+            if output_path.exists():
+                self.export_output_modes.append(output_path.stat().st_mode & 0o777)
             payload = {"messages": []}
             if self.mode in {"success", "download_failure"}:
                 payload = {
@@ -267,6 +270,7 @@ class TDLClientTests(unittest.TestCase):
 
         self.assertEqual(result.message_id, 4321)
         self.assertGreaterEqual(runner.export_calls, 2)
+        self.assertTrue(all(mode & 0o222 for mode in runner.export_output_modes))
         resolve_command = next(command for command in runner.commands if "export" in command)
         self.assertIn("--with-content", resolve_command)
         self.assertIn("last", resolve_command)
