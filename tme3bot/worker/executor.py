@@ -371,19 +371,8 @@ class WorkerJobExecutor:
         if not folders:
             raise ValueError("Folder utility belum dipilih.")
 
-        def log(line: str) -> None:
-            compact = " ".join(line.replace("\r", " ").split())[-500:]
-            if compact:
-                self.publisher.emit(
-                    str(command["job_id"]),
-                    "running",
-                    "progress",
-                    progress={"message": compact},
-                )
-
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
-            log,
         )
         return json_value(
             runner.run(
@@ -482,8 +471,8 @@ class WorkerJobExecutor:
         for part in archive.parts:
             digest, size = sha256_file(part)
             caption = (
-                f"#backup #node_{payload['node_name']} "
-                f"#run_{str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
+                f"Backup node={payload['node_name']} "
+                f"run={str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
             )
             result = uploader.upload(part, str(payload["channel_ref"]), caption)
             part_payload = {

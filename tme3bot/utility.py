@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -166,6 +167,7 @@ class UtilityResult:
     succeeded: list[str]
     failed: dict[str, str]
     details: list[dict[str, object]]
+    summary: dict[str, object] = field(default_factory=dict)
 
 
 class UtilityRunner:
@@ -183,22 +185,66 @@ class UtilityRunner:
                 before = self._snapshot(path)
                 self._run_folder(utility, path, password, settings or DEFAULT_UTILITY_SETTINGS)
                 after = self._snapshot(path)
+                detail: dict[str, object] = {
+                    "folder": folder,
+                    "files_before": before["files"],
+                    "files_after": after["files"],
+                    "bytes_before": before["bytes"],
+                    "bytes_after": after["bytes"],
+                    "groups": after["directories"],
+                    "archives": after["archives"],
+                }
+                if utility == "export":
+                    detail["organizer"] = self._organizer_log_summary(path)
                 succeeded.append(folder)
-                details.append(
-                    {
-                        "folder": folder,
-                        "files_before": before["files"],
-                        "files_after": after["files"],
-                        "bytes_before": before["bytes"],
-                        "bytes_after": after["bytes"],
-                        "groups": after["directories"],
-                        "archives": after["archives"],
-                    }
-                )
+                details.append(detail)
             except Exception as exc:
                 failed[folder] = str(exc)
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
-        return UtilityResult(utility, succeeded, failed, details)
+        summary: dict[str, object] = {
+            "folders_processed": len(succeeded),
+            "folders_failed": len(failed),
+            "files_before": sum(int(item["files_before"]) for item in details),
+            "files_after": sum(int(item["files_after"]) for item in details),
+            "bytes_before": sum(int(item["bytes_before"]) for item in details),
+            "bytes_after": sum(int(item["bytes_after"]) for item in details),
+        }
+        if utility == "export":
+            organizer = [item.get("organizer", {}) for item in details]
+            summary.update(
+                {
+                    "groups_created": sum(int(item.get("groups_created", 0)) for item in organizer),
+                    "items_moved": sum(int(item.get("items_moved", 0)) for item in organizer),
+                    "unresolved_groups": sum(int(item.get("unresolved_groups", 0)) for item in organizer),
+                }
+            )
+        return UtilityResult(utility, succeeded, failed, details, summary)
+
+    @staticmethod
+    def _organizer_log_summary(folder: Path) -> dict[str, int | str]:
+        log_path = folder / "log.txt"
+        if not log_path.is_file():
+            return {"groups_created": 0, "items_moved": 0, "unresolved_groups": 0, "log_lines": 0}
+        groups = moved = unresolved = lines_count = 0
+        moved_pattern = re.compile(r"\|\s*moved\s+(\d+)\s+items?\s*$", re.IGNORECASE)
+        for raw_line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            lines_count += 1
+            if "| start |" in line:
+                groups += 1
+                if "unresolved-" in line.lower():
+                    unresolved += 1
+            match = moved_pattern.search(line)
+            if match:
+                moved += int(match.group(1))
+        return {
+            "groups_created": groups,
+            "items_moved": moved,
+            "unresolved_groups": unresolved,
+            "log_lines": lines_count,
+        }
 
     @staticmethod
     def _snapshot(folder: Path) -> dict[str, int]:

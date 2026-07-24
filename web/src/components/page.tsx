@@ -21,6 +21,23 @@ export function tone(status: string) {
   return "neutral" as const;
 }
 
+function utilitySummary(job: Job): string | null {
+  if (job.kind !== "utility" || job.status !== "succeeded") return null;
+  const value = (job.result?.value || {}) as {utility?: string; summary?: Record<string, unknown>};
+  const summary = value.summary || {};
+  const folders = Number(summary.folders_processed || 0);
+  const failed = Number(summary.folders_failed || 0);
+  const suffix = failed ? ` · ${failed} gagal` : "";
+  if (value.utility === "export") {
+    return `${folders} folder · ${Number(summary.groups_created || 0)} group dibuat · ${Number(summary.items_moved || 0)} item dipindahkan${suffix}`;
+  }
+  return `${folders} folder diproses · ${Number(summary.files_after || 0)} file${suffix}`;
+}
+
+function jobMessage(job: Job): string {
+  return utilitySummary(job) || String(job.error?.message || job.progress?.message || (job.status === "succeeded" ? "Selesai" : `Worker ${job.worker}`));
+}
+
 export function JobList({kind, title = "Aktivitas terbaru", limit = 8}: {kind?: string; title?: string; limit?: number}) {
   const jobs = useQuery<{items: Job[]}>({
     queryKey: ["jobs", kind, limit],
@@ -33,7 +50,7 @@ export function JobList({kind, title = "Aktivitas terbaru", limit = 8}: {kind?: 
   return <Card><div className="mb-4 flex items-center justify-between"><h2 className="font-bold">{title}</h2><button onClick={() => jobs.refetch()} className="muted" aria-label="Muat ulang"><RefreshCw className="size-4"/></button></div>
     {jobs.isError && <div className="flex gap-2 rounded-xl bg-rose-50 p-3 text-sm text-rose-700"><AlertTriangle className="size-4"/>Gagal mengambil aktivitas.</div>}
     {!jobs.isLoading && !jobs.data?.items.length && <Empty title="Belum ada aktivitas" description="Job baru akan muncul di sini."/>}
-    <div className="divide-y">{jobs.data?.items.map((job) => <div key={job.id} className="grid gap-2 py-3 sm:grid-cols-[1fr_auto] sm:items-center"><div className="min-w-0"><div className="flex items-center gap-2"><b className="truncate text-sm">{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 truncate text-xs">{String(job.progress?.message || job.error?.message || `Worker ${job.worker}`)}</p></div><span className="muted flex items-center gap-1 text-xs"><Clock3 className="size-3"/>{new Date(job.updated_at).toLocaleString("id-ID")}</span></div>)}</div>
+    <div className="divide-y">{jobs.data?.items.map((job) => <div key={job.id} className="grid gap-2 py-3 sm:grid-cols-[1fr_auto] sm:items-center"><div className="min-w-0"><div className="flex items-center gap-2"><b className="truncate text-sm">{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 truncate text-xs">{jobMessage(job)}</p></div><span className="muted flex items-center gap-1 text-xs"><Clock3 className="size-3"/>{new Date(job.updated_at).toLocaleString("id-ID")}</span></div>)}</div>
   </Card>;
 }
 
