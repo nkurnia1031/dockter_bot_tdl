@@ -1,6 +1,6 @@
 import unittest
 
-from tme3bot.panel_state import PanelViewStore
+from tme3bot.frontend.telegram.panel_state import PanelViewStore
 
 
 class PanelViewStoreTests(unittest.TestCase):

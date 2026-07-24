@@ -14,10 +14,71 @@ from tme3bot.persistence import write_json_atomic
 LOGGER = logging.getLogger(__name__)
 UTILITY_NAMES = ("extract", "compress", "export", "pindah")
 DEFAULT_UTILITY_FOLDERS = ("/workspace/biasa", "/workspace/pilihan", "/workspace/downloads")
+DEFAULT_UTILITY_SETTINGS = {
+    "move_size": "4g",
+    "compress_size": "4g",
+    "compress_password": "A1031@bokep@1031A",
+}
 
 
 class UtilityPathError(ValueError):
     pass
+
+
+class UtilitySettingsStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+        self._settings: dict[str, str] | None = None
+
+    def get(self) -> dict[str, str]:
+        with self._lock:
+            self._load()
+            return dict(self._settings or DEFAULT_UTILITY_SETTINGS)
+
+    def set(self, key: str, value: str) -> None:
+        if key not in DEFAULT_UTILITY_SETTINGS:
+            raise ValueError(f"Pengaturan utility tidak dikenal: {key}")
+        value = value.strip()
+        if not value:
+            raise ValueError("Nilai pengaturan tidak boleh kosong.")
+        if key != "compress_password":
+            _validate_size(value)
+        with self._lock:
+            self._load()
+            assert self._settings is not None
+            self._settings[key] = value
+            write_json_atomic(self.path, self._settings)
+            try:
+                self.path.chmod(0o600)
+            except OSError:
+                pass
+
+    def _load(self) -> None:
+        if self._settings is not None:
+            return
+        values: object = None
+        if self.path.exists():
+            try:
+                values = json.loads(self.path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                LOGGER.warning("Utility settings tidak valid: %s", self.path)
+        raw = values if isinstance(values, dict) else {}
+        self._settings = dict(DEFAULT_UTILITY_SETTINGS)
+        for key in DEFAULT_UTILITY_SETTINGS:
+            if str(raw.get(key, "")).strip():
+                self._settings[key] = str(raw[key]).strip()
+        write_json_atomic(self.path, self._settings)
+        try:
+            self.path.chmod(0o600)
+        except OSError:
+            pass
+
+
+def _validate_size(value: str) -> None:
+    import re
+    if not re.fullmatch(r"(?:[0-9]+(?:\.[0-9]+)?)(?:[kmgt]i?b?|b)?", value.lower()):
+        raise ValueError("Ukuran harus seperti 500m, 4g, atau 1.5g.")
 
 
 class UtilityFolderStore:
@@ -111,36 +172,40 @@ class UtilityRunner:
         self.root = utility_root
         self.log_callback = log_callback
 
-    def run(self, utility: str, folders: list[str], password: str | None = None) -> UtilityResult:
+    def run(self, utility: str, folders: list[str], password: str | None = None, settings: dict[str, str] | None = None) -> UtilityResult:
         succeeded: list[str] = []
         failed: dict[str, str] = {}
         for folder in folders:
             try:
-                self._run_folder(utility, Path(folder), password)
+                self._run_folder(utility, Path(folder), password, settings or DEFAULT_UTILITY_SETTINGS)
                 succeeded.append(folder)
             except Exception as exc:
                 failed[folder] = str(exc)
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
         return UtilityResult(utility, succeeded, failed)
 
-    def _run_folder(self, utility: str, folder: Path, password: str | None) -> None:
+    def _run_folder(self, utility: str, folder: Path, password: str | None, settings: dict[str, str]) -> None:
         if utility == "extract":
             command = ["python3", str(self.root / "extract" / "extract.py"), str(folder), "--no-prompt", "--password", password or folder.name]
             self._command(command, folder, "utility-extract")
         elif utility == "compress":
-            self._command(["bash", str(self.root / "compress" / "compress.sh")], folder, "utility-compress")
+            self._command(["bash", str(self.root / "compress" / "compress.sh")], folder, "utility-compress", settings)
         elif utility == "export":
             self._command(["python3", str(self.root / "export" / "telegram_messages_to_json.py")], folder, "utility-export-convert")
             self._command(["python3", str(self.root / "export" / "organize_media_from_json.py"), "--base-dir", str(folder)], folder, "utility-export-organize")
         elif utility == "pindah":
-            self._command(["bash", str(self.root / "pindah" / "pindah.sh"), str(folder)], folder, "utility-pindah")
+            self._command(["bash", str(self.root / "pindah" / "pindah.sh"), str(folder)], folder, "utility-pindah", settings)
         else:
             raise ValueError(f"Utility tidak dikenal: {utility}")
 
-    def _command(self, command: list[str], cwd: Path, prefix: str) -> None:
+    def _command(self, command: list[str], cwd: Path, prefix: str, settings: dict[str, str] | None = None) -> None:
         LOGGER.info("%s start folder=%s", prefix, cwd)
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
+        if settings:
+            env["UTILITY_MOVE_SIZE"] = settings.get("move_size", "4g")
+            env["UTILITY_COMPRESS_SIZE"] = settings.get("compress_size", "4g")
+            env["UTILITY_COMPRESS_PASSWORD"] = settings.get("compress_password", "")
         process = subprocess.Popen(command, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         assert process.stdout is not None
         lines: list[str] = []

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.error
+import urllib.request
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -218,3 +220,65 @@ class StateStore:
             return
 
         write_json_atomic(self.state_file, self._state.to_dict())
+
+
+class HttpStateStore:
+    """StateStore-compatible client used by a worker without a local state file."""
+
+    def __init__(self, base_url: str, token: str, profile_name: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token = token
+        self.profile_name = profile_name
+
+    def get_source(self, chat_ref: str) -> SourceState | None:
+        payload = self._request("GET", f"/internal/v1/profiles/{self.profile_name}/state/source", {"chat_ref": chat_ref})
+        raw = payload.get("source")
+        return SourceState.from_dict(raw) if isinstance(raw, dict) else None
+
+    def load(self) -> StateSnapshot:
+        return StateSnapshot(
+            sources={chat_ref: source for chat_ref, source in self.list_sources()},
+            migration={"remote": True},
+        )
+
+    def list_sources(self) -> list[tuple[str, SourceState]]:
+        payload = self._request("GET", f"/internal/v1/profiles/{self.profile_name}/state/sources")
+        result: list[tuple[str, SourceState]] = []
+        for chat_ref, raw in (payload.get("sources") or {}).items():
+            if isinstance(raw, dict):
+                result.append((str(chat_ref), SourceState.from_dict(raw)))
+        return sorted(result)
+
+    def upsert_source(self, chat_ref: str, label: str | None, last_id: int,
+                      warmup_url: str | None = None, warmup_done: bool | None = None) -> SourceState:
+        payload = self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/source", {
+            "chat_ref": chat_ref, "label": label, "last_id": last_id,
+            "warmup_url": warmup_url, "warmup_done": warmup_done,
+        })
+        return SourceState.from_dict(payload["source"])
+
+    def mark_warmup_done(self, chat_ref: str) -> None:
+        self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/warmup", {"chat_ref": chat_ref})
+
+    def delete_sources(self, chat_refs: Iterable[str]) -> list[str]:
+        payload = self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/delete", {"chat_refs": list(chat_refs)})
+        return [str(item) for item in payload.get("deleted", [])]
+
+    def delete_source(self, chat_ref: str) -> bool:
+        return bool(self.delete_sources([chat_ref]))
+
+    def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.base_url:
+            raise RuntimeError("BACKEND_API_URL wajib diisi untuk APP_ROLE=worker.")
+        data = json.dumps(payload or {}).encode("utf-8") if method != "GET" else None
+        url = self.base_url + path
+        if method == "GET" and payload:
+            from urllib.parse import urlencode
+            url += "?" + urlencode(payload)
+        request = urllib.request.Request(url, data=data, method=method,
+            headers={"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Backend state API gagal: {exc}") from exc

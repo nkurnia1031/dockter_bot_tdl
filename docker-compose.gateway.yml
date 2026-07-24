@@ -1,0 +1,49 @@
+services:
+  backend:
+    image: ${GATEWAY_IMAGE_NAME:-tme3bot-gateway}:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: gateway
+      args:
+        TME3BOT_BASE_IMAGE: ${TME3BOT_BASE_IMAGE:-tme3bot-base:py310-tdl0203}
+    env_file:
+      - ${BACKEND_ENV_FILE:-.env.backend}
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8080}:${BACKEND_PORT:-8080}"
+    volumes:
+      - ${GATEWAY_DATA_ROOT:-/srv/tme3bot/gateway}:/data
+      - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${BACKEND_PORT:-8080}/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  telegram:
+    image: ${GATEWAY_IMAGE_NAME:-tme3bot-gateway}:${IMAGE_TAG:-latest}
+    env_file:
+      - ${TELEGRAM_ENV_FILE:-.env.telegram}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  worker-local:
+    image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+      args:
+        TME3BOT_BASE_IMAGE: ${TME3BOT_BASE_IMAGE:-tme3bot-base:py310-tdl0203}
+    env_file:
+      - ${LOCAL_WORKER_ENV_FILE:-.env.worker.local}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ${LOCAL_WORKER_DATA_ROOT:-/srv/tme3bot/worker-local}:/data
+      - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}

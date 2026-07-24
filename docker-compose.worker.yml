@@ -1,0 +1,18 @@
+services:
+  worker:
+    image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+      args:
+        TME3BOT_BASE_IMAGE: ${TME3BOT_BASE_IMAGE:-tme3bot-base:py310-tdl0203}
+    env_file:
+      - ${WORKER_ENV_FILE:-.env.worker}
+    restart: unless-stopped
+    ports:
+      # Do not expose the worker API publicly; the reverse proxy owns the domain/TLS.
+      - "127.0.0.1:${WORKER_PORT:-8080}:${WORKER_PORT:-8080}"
+    volumes:
+      - ${PROFILE_ROOT}:/data
+      - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}

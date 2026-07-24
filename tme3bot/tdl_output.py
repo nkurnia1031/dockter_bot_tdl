@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-MEDIA_FILE_RE = r"(?:jpg|jpeg|png|webp|gif|mp4|mkv|mov|avi|zip|rar|7z|mp3|flac|m4a|pdf)"
+MEDIA_FILE_RE = r"(?:[A-Za-z0-9][A-Za-z0-9+._-]*)"
 
 
 @dataclass(frozen=True)
@@ -96,6 +96,13 @@ def parse_message_id(line: str) -> int | None:
     # Ignore clipped terminal redraw fragments such as ":2~ ...".
     match = re.search(r":(\d{1,12})\s*->", line)
     return int(match.group(1)) if match else None
+
+
+def parse_upload_message_id(output: str) -> int | None:
+    """Return the last Telegram message id emitted by ``tdl up``."""
+    found = [parse_message_id(line) for line in output.splitlines()]
+    ids = [item for item in found if item is not None]
+    return ids[-1] if ids else None
 
 
 def parse_file_name(line: str) -> str | None:

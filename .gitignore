@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .env
+env
+env.*
 .venv/
 .pytest_cache/
 .ruff_cache/
@@ -11,3 +13,5 @@ graphify-out/cost.json
 graphify-out/cache/
 graphify-out/.graphify_root
 output.zip
+worker_routes.json
+workers.json

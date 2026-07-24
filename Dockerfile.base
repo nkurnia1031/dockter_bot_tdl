@@ -1,0 +1,77 @@
+FROM --platform=$BUILDPLATFORM golang:1.25 AS leave-builder
+WORKDIR /src
+ARG TARGETARCH
+COPY leave-helper/go.mod /src/go.mod
+COPY leave-helper/main.go /src/main.go
+RUN go mod download
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+        amd64) go_arch=amd64 ;; \
+        arm64) go_arch=arm64 ;; \
+        *) echo "Unsupported target architecture: ${TARGETARCH}"; exit 1 ;; \
+    esac; \
+    GOMAXPROCS=1 CGO_ENABLED=0 GOOS=linux GOARCH="${go_arch}" \
+    go build -mod=mod -p=1 -trimpath -ldflags='-s -w' \
+    -o /out/tdl-leave .
+
+FROM ubuntu:22.04 AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+ARG TDL_FALLBACK_VERSION=0.20.3
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/data/root
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        python3 \
+        python3-pip \
+        tar \
+        util-linux \
+        p7zip-full \
+        unar \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --home-dir /home/user1 --shell /usr/sbin/nologin user1
+
+COPY requirements.txt /tmp/tme3bot-requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/tme3bot-requirements.txt \
+    && rm -f /tmp/tme3bot-requirements.txt
+
+COPY --from=leave-builder /out/tdl-leave /usr/local/bin/tdl-leave
+RUN chmod 0755 /usr/local/bin/tdl-leave
+
+COPY .docker/tdl/ /tmp/host-tdl/
+RUN set -eu; \
+    use_host_tdl=0; \
+    if [ -s /tmp/host-tdl/tdl ]; then \
+        echo "Trying tdl copied from the Docker host"; \
+        install -m 0755 /tmp/host-tdl/tdl /usr/local/bin/tdl; \
+        if tdl version; then \
+            use_host_tdl=1; \
+        else \
+            echo "Host tdl is not compatible with this image; using fallback"; \
+            rm -f /usr/local/bin/tdl; \
+        fi; \
+    fi; \
+    if [ "${use_host_tdl}" -eq 0 ]; then \
+        case "${TARGETARCH:-amd64}" in \
+            amd64) tdl_arch=64bit ;; \
+            arm64) tdl_arch=arm64 ;; \
+            *) echo "Unsupported target architecture: ${TARGETARCH}"; exit 1 ;; \
+        esac; \
+        echo "Downloading fallback tdl v${TDL_FALLBACK_VERSION} for ${TARGETARCH:-amd64}"; \
+        curl -fsSL "https://github.com/iyear/tdl/releases/download/v${TDL_FALLBACK_VERSION}/tdl_Linux_${tdl_arch}.tar.gz" -o /tmp/tdl.tar.gz; \
+        tar -xzf /tmp/tdl.tar.gz -C /usr/local/bin tdl; \
+        chmod 0755 /usr/local/bin/tdl; \
+    fi; \
+    rm -rf /tmp/host-tdl /tmp/tdl.tar.gz; \
+    tdl version; \
+    tdl-leave --help >/dev/null 2>&1 || true
+
+RUN mkdir -p /data/root /data/user1 /data/download /data/exports /data/tmp
+

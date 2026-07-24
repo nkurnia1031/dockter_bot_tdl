@@ -5,7 +5,7 @@ import threading
 
 from telegram import Bot, InlineKeyboardMarkup, Message
 
-from tme3bot.panel_state import PanelViewStore
+from tme3bot.frontend.telegram.panel_state import PanelViewStore
 
 LOGGER = logging.getLogger(__name__)
 

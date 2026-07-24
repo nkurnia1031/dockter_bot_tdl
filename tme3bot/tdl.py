@@ -18,6 +18,7 @@ from tme3bot.tdl_output import (
     clean_tdl_output_line,
     is_nonsemantic_tdl_output_line,
     parse_tdl_progress_line,
+    parse_upload_message_id,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -46,6 +47,12 @@ class ExportResult:
     exported_count: int
     max_message_id: int | None
     has_media: bool
+
+
+@dataclass
+class UploadResult:
+    message_id: int
+    output: str
 
 
 ProgressCallback = Callable[[CommandProgress], None]
@@ -445,6 +452,27 @@ class TDLClient:
         )
         self._ensure_success(command, result)
         return result
+
+    def upload(self, file_path: Path, chat_ref: str, caption: str) -> UploadResult:
+        """Upload exactly one file and return its Telegram channel message id."""
+        if not file_path.is_file():
+            raise TDLDataError(f"File upload tidak ditemukan: {file_path}")
+        command = self._wrap_command(
+            self._base_command()
+            + ["up", "-p", str(file_path), "-c", chat_ref, "--caption", caption]
+        )
+        result = self.runner.run(
+            command,
+            env=self._command_env(),
+            log_prefix=f"{self.log_prefix}:upload",
+            stall_timeout_seconds=self.stall_timeout_seconds,
+            progress_callback=self.progress_callback,
+        )
+        self._ensure_success(command, result)
+        message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")
+        if message_id is None:
+            raise TDLDataError("TDL upload selesai tetapi channel message ID tidak ditemukan.")
+        return UploadResult(message_id=message_id, output=f"{result.stdout}\n{result.stderr}")
 
     def cancel_current(self) -> bool:
         return self.runner.cancel_current()

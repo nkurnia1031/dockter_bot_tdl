@@ -17,9 +17,10 @@ from tme3bot.names import normalize_profile_name
 from tme3bot.persistence import write_json_atomic
 from tme3bot.progress import DownloadProgressTracker
 from tme3bot.service import BatchDownloadService, ExportService
-from tme3bot.state import StateStore
+from tme3bot.state import HttpStateStore, StateStore
 from tme3bot.tdl import TDLClient
 from tme3bot.leave import LeaveService
+from tme3bot.worker_registry import WorkerRegistry
 
 LOGGER = logging.getLogger(__name__)
 DOWNLOAD_MODE_SHARED = "shared"
@@ -38,6 +39,8 @@ class ProfileRuntime:
     export_service: ExportService
     download_service: BatchDownloadService
     leave_service: LeaveService
+    export_operation_lock: threading.RLock
+    download_operation_lock: threading.RLock
 
 
 class ProfileSelectionStore:
@@ -86,14 +89,17 @@ class ProfileSelectionStore:
 
 
 class ProfileManager:
-    def __init__(self, base_config: AppConfig) -> None:
+    def __init__(self, base_config: AppConfig, worker_registry: WorkerRegistry | None = None) -> None:
         self.base_config = base_config
+        self.worker_registry = worker_registry
         self.default_profile = (
             normalize_profile_name(base_config.default_profile) or "default"
         )
         self.selection_store = ProfileSelectionStore(
             base_config.state_file.parent / "profile_state.json", self.default_profile
         )
+        self.worker_routes_path = base_config.state_file.parent / "worker_routes.json"
+        self._worker_routes: dict[str, str] | None = None
         self._lock = threading.RLock()
         self._runtimes: dict[str, ProfileRuntime] = {}
 
@@ -138,6 +144,61 @@ class ProfileManager:
                 if child.is_dir():
                     profiles.add(normalize_profile_name(child.name))
         return sorted(profile for profile in profiles if profile)
+
+    def available_worker_routes(self) -> list[str]:
+        if self.worker_registry is not None:
+            return self.worker_registry.names() or ["local"]
+        routes = list((self.base_config.worker_endpoints or {}).keys())
+        if not routes:
+            if self.base_config.worker_local_url:
+                routes.append("local")
+            if self.base_config.worker_remote_url:
+                routes.append("remote")
+        return routes or ["local"]
+
+    def worker_route(self, profile_name: str) -> str:
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        with self._lock:
+            self._load_worker_routes_locked()
+            assert self._worker_routes is not None
+            selected = self._worker_routes.get(normalized)
+            if selected in self.available_worker_routes():
+                return selected
+            configured = (self.base_config.worker_routes or {}).get(normalized)
+            if configured in self.available_worker_routes():
+                return configured
+            return "local" if "local" in self.available_worker_routes() else self.available_worker_routes()[0]
+
+    def set_worker_route(self, profile_name: str, route: str) -> str:
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        selected = normalize_profile_name(route)
+        if selected not in self.available_worker_routes():
+            raise ValueError(f"Worker tidak tersedia: {route}.")
+        with self._lock:
+            self._load_worker_routes_locked()
+            assert self._worker_routes is not None
+            self._worker_routes[normalized] = selected
+            write_json_atomic(self.worker_routes_path, {"profiles": self._worker_routes})
+        return selected
+
+    def _load_worker_routes_locked(self) -> None:
+        if self._worker_routes is not None:
+            return
+        self._worker_routes = {}
+        if not self.worker_routes_path.exists():
+            return
+        try:
+            payload = json.loads(self.worker_routes_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Tidak bisa membaca worker route store: %s", self.worker_routes_path)
+            return
+        raw = payload.get("profiles", {}) if isinstance(payload, dict) else {}
+        if isinstance(raw, dict):
+            self._worker_routes = {
+                normalize_profile_name(str(profile)): normalize_profile_name(str(route))
+                for profile, route in raw.items()
+                if normalize_profile_name(str(profile)) and normalize_profile_name(str(route))
+            }
 
     def download_mode(self, profile_name: str) -> str:
         normalized = normalize_profile_name(profile_name) or self.default_profile
@@ -234,7 +295,12 @@ def describe_download_mode(mode: str) -> str:
 
 
 def build_profile_runtime(profile_name: str, config: AppConfig) -> ProfileRuntime:
-    state_store = StateStore(config.state_file, config.legacy_max_json)
+    state_api_url = config.backend_api_url or config.gateway_api_url
+    state_api_token = config.backend_internal_token or config.gateway_api_token
+    if state_api_url:
+        state_store = HttpStateStore(state_api_url, state_api_token, profile_name)
+    else:
+        state_store = StateStore(config.state_file, config.legacy_max_json)
     state_store.load()
     download_progress = DownloadProgressTracker()
     export_tdl_client = TDLClient(
@@ -271,6 +337,8 @@ def build_profile_runtime(profile_name: str, config: AppConfig) -> ProfileRuntim
         export_service=export_service,
         download_service=download_service,
         leave_service=leave_service,
+        export_operation_lock=threading.RLock(),
+        download_operation_lock=threading.RLock(),
     )
 
 
@@ -308,6 +376,9 @@ def build_profile_config(base_config: AppConfig, profile_name: str) -> AppConfig
 
 
 def ensure_profile_runtime_dirs(config: AppConfig) -> None:
+    if config.app_role == "backend":
+        config.state_file.parent.mkdir(parents=True, exist_ok=True)
+        return
     root_owned_paths = [
         config.download_root,
         config.download_root / "berlabel",

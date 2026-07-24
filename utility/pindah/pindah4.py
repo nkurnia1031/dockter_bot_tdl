@@ -1,9 +1,19 @@
 import os
 import json
 import sys
+import re
 
-# Batas maksimal ukuran folder dalam bytes (4 GB)
-MAX_SIZE = 4 * 1024 * 1024 * 1024
+def parse_size(value):
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmgt]?i?b?)?", value.strip().lower())
+    if not match:
+        raise ValueError(f"Ukuran tidak valid: {value}")
+    number = float(match.group(1))
+    unit = match.group(2) or "b"
+    multipliers = {"b": 1, "k": 1024, "kb": 1024, "ki": 1024, "kib": 1024,
+                   "m": 1024**2, "mb": 1024**2, "mi": 1024**2, "mib": 1024**2,
+                   "g": 1024**3, "gb": 1024**3, "gi": 1024**3, "gib": 1024**3,
+                   "t": 1024**4, "tb": 1024**4, "ti": 1024**4, "tib": 1024**4}
+    return int(number * multipliers[unit])
 excluded = ['pindah2.py','pindah.py','pindah4.py','pindah.sh', 'tes.sh','new_output.json','output.json','extract.py']
 
 def get_size(path):
@@ -24,13 +34,14 @@ def main():
     else:
         current_dir = os.getcwd()
     
+    max_size = parse_size(os.getenv("UTILITY_MOVE_SIZE", "4g"))
     # Menghitung ukuran semua file dan folder sekali saja
     items = []
     for item in os.listdir(current_dir):
         if item not in excluded:
             item_path = os.path.join(current_dir, item)
             item_size = get_size(item_path)
-            if item_size <= MAX_SIZE:
+            if item_size <= max_size:
                 items.append((item_path, item_size))
     
     folder_count = 1
@@ -38,7 +49,7 @@ def main():
     groups = {f'group_{folder_count}': {'items': [], 'total_size': 0}}
 
     for item_path, item_size in items:
-        if current_folder_size + item_size > MAX_SIZE:
+        if current_folder_size + item_size > max_size:
             groups[f'group_{folder_count}']['total_size'] = current_folder_size / (1024 * 1024 * 1024)  # Convert size to GB
             folder_count += 1
             current_folder_size = 0

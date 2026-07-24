@@ -58,6 +58,9 @@ class FakeRunner:
                 return subprocess.CompletedProcess(command, 1, "", "download failed")
             return subprocess.CompletedProcess(command, 0, "ok", "")
 
+        if "up" in command:
+            return subprocess.CompletedProcess(command, 0, "Upload File(1):987 -> /tmp/a.pdf ... done!", "")
+
         raise AssertionError(f"Unexpected command: {command}")
 
 
@@ -208,6 +211,21 @@ class TDLClientTests(unittest.TestCase):
         self.assertEqual(progress.message_id, 339183)
         self.assertEqual(progress.percent, 4.8)
         self.assertEqual(progress.speed, "1.73 MB/s")
+
+    def test_upload_builds_one_file_command_and_returns_message_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "a.pdf"
+            source.write_bytes(b"a")
+            runner = FakeRunner("empty")
+            result = TDLClient(root / "tdl", "default", runner=runner).upload(
+                source, "-100123", "caption"
+            )
+            self.assertEqual(result.message_id, 987)
+            command = runner.commands[0]
+            self.assertEqual(command[command.index("up") : command.index("up") + 8], [
+                "up", "-p", str(source), "-c", "-100123", "--caption", "caption"
+            ])
 
 
 if __name__ == "__main__":

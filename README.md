@@ -1,89 +1,210 @@
-# t.me3 Telegram Bot
+# tme3bot
 
-Untuk konteks teknis lengkap bagi agent/developer baru, baca [AGENTS.md](AGENTS.md).
+Bot Telegram dan control plane JSON untuk export/download TDL, utility,
+storage channel, worker multi-VPS, dan backup terenkripsi.
 
-Service Python dan Docker untuk membuat export JSON melalui `tdl`, lalu mengunduh semua media dari JSON tersebut. Satu bot dapat mengelola beberapa profile Telegram dengan storage dan state terpisah.
+## Arsitektur
 
-Image tetap menggunakan `ubuntu:22.04`. Saat build melalui `run.py`, binary `tdl` dari host Linux akan disalin ke image; bila tidak tersedia atau tidak kompatibel, Docker mengunduh fallback tetap sesuai arsitektur host.
+```text
+Telegram frontend ── JWT/JSON ──► Backend FastAPI ── JSON job ──► Worker
+       │                              │                            │
+       │                              ├─ /data + SQLite            ├─ TDL
+       │                              ├─ source/state              ├─ utility
+       │                              ├─ routing worker            └─ event JSON
+       │                              └─ storage/backup
+       └─ keyboard, prompt, panel
+```
 
-## Alur
+- `APP_ROLE=backend` menjalankan FastAPI, repository, scheduler, dan routing.
+- `APP_ROLE=telegram` hanya menjalankan polling serta presentasi Telegram.
+- `APP_ROLE=worker` menjalankan TDL/utility dan mengirim event job ke backend.
+- Role lama `local` dan `gateway` tidak digunakan lagi.
+- Frontend tidak membawa `chat_id`, `message_id`, atau state panel ke worker.
+- Public API berada di `/api/v1`; kontrak OpenAPI tersedia di
+  `/openapi.json`.
+- Internal API worker/frontend berada di `/internal/v1` dan tidak muncul di
+  OpenAPI publik.
 
-1. URL `t.me3` atau `t.me/c/...` dikirim ke bot.
-2. Worker export menjalankan `tdl` sebagai `user1` dan menyimpan JSON ke folder `exports/pending` profile aktif.
-3. Perintah `/download` memindahkan JSON ke `processing` lalu menjalankan `tdl` sebagai `root`.
-4. JSON berhasil dihapus. JSON gagal dipindahkan ke `exports/failed` agar dapat dicoba ulang.
-
-URL yang dikirim langsung memakai message ID dari URL sebagai override. Export dari menu source tersimpan selalu melanjutkan dari `last_id + 1`.
-
-Download memakai queue terpisah per profile. Profile berbeda dapat berjalan paralel dan memperbarui panel status masing-masing, sedangkan beberapa job pada profile yang sama tetap diproses serial untuk mencegah konflik database `tdl`.
-
-## Struktur Kode
+Struktur source aktif:
 
 ```text
 tme3bot/
-  app.py               Bootstrap dan router utama Telegram
-  profile_handler.py   Command dan callback profile
-  source_handler.py    Source, label, export, dan batch selection
-  download_handler.py  Download, retry, cancel, dan status realtime
-  bot_workers.py       Worker queue export dan download
-  bot_panel.py         Lifecycle satu panel message Telegram
-  bot_keyboards.py     Inline keyboard
-  bot_text.py          Formatter pesan
-  profiles.py          Runtime dan konfigurasi per profile
-  service.py           Orchestration export dan batch download
-  progress.py          State progress download thread-safe
-  profile_queue.py     Scheduler paralel antarprofile, serial per profile
-  tdl.py               Eksekusi proses dan command tdl
-  tdl_output.py        Parser output terminal tdl
-  state.py             Persistensi source dan last ID
+├── api/                  FastAPI public dan internal
+├── application/          use case, ports, dan control plane
+├── domain/               entity serta state machine
+├── frontend/
+│   └── telegram/         polling, panel, keyboard, dan presenter
+├── infrastructure/       SQLite, auth, dan HTTP adapter
+├── worker/               executor TDL/utility tanpa dependency Telegram
+├── composition.py        composition root per APP_ROLE
+└── profiles.py           runtime profile dan kompatibilitas data lama
 ```
 
-## Menjalankan
+## Setup VPS utama
 
-Siapkan `.env` berdasarkan `.env.example`, kemudian:
+```bash
+cp .env.example .env
+cp .env.backend.example .env.backend
+cp .env.telegram.example .env.telegram
+cp .env.worker.local.example .env.worker.local
+```
+
+Buat empat secret yang berbeda:
+
+```bash
+openssl rand -hex 32
+openssl rand -hex 32
+openssl rand -hex 32
+openssl rand -hex 48
+```
+
+Isi:
+
+- `FRONTEND_SERVICE_TOKEN` yang sama pada backend dan Telegram.
+- `BACKEND_INTERNAL_TOKEN` yang sama pada backend dan semua worker.
+- `MANAGEMENT_API_TOKEN` hanya pada backend.
+- `AUTH_JWT_SECRET` hanya pada backend.
+- `WORKER_API_TOKEN` worker-local harus sama dengan token `local` pada
+  `WORKER_API_TOKENS`.
+- `BOT_TOKEN` yang sama pada backend dan Telegram. Backend menggunakannya
+  sebagai adapter storage/backup; Telegram menggunakannya untuk UI polling.
+- `BOT_USERNAME` tanpa `@` pada backend.
+
+Data lama tetap dapat dipakai dengan menunjuk `GATEWAY_DATA_ROOT` dan
+`LOCAL_WORKER_DATA_ROOT` ke direktori lama.
+
+Jalankan:
 
 ```bash
 python3 run.py up
+python3 run.py status
 python3 run.py logs
 ```
 
-Untuk memperbarui kode dan recreate container tanpa menghapus data mount:
+Compose membangun image gateway satu kali. Container `telegram` menggunakan
+image yang sama tanpa build kedua.
+
+## Build image dasar satu kali
+
+Build Go helper, dependency Python, TDL, dan paket sistem dipindahkan ke image
+dasar yang immutable. Di VPS besar jalankan:
 
 ```bash
-python3 run.py update
+python3 run.py build-base
 ```
 
-Untuk membuat paket deployment bersih:
+Perintah ini membuat `base-migrate.zip`. Upload arsip tersebut ke VPS target,
+lalu jalankan:
 
 ```bash
-python3 build.py
+unzip base-migrate.zip
+docker load -i images/tme3bot-base.tar
+cp .env.example .env
+python3 run.py migrate
 ```
 
-Perintah tersebut menghasilkan `output.zip` dan tidak menyertakan `.env`, sesi `.tdl`, state, download, export, test, atau cache Graphify.
+Build aplikasi berikutnya hanya memakai `TME3BOT_BASE_IMAGE` dari `.env` dan
+tidak lagi mengompilasi Go. Jika arsitektur target bukan AMD64, ubah
+`BASE_PLATFORM`, misalnya `linux/arm64`, lalu buat image dasar untuk arsitektur
+tersebut. Image dasar perlu dibuat ulang hanya jika versi TDL, dependency
+Python, atau kode `leave-helper` berubah.
 
-Perintah `update` tidak memakai `--pull`, `--no-cache`, atau cache-buster. Dengan demikian layer Ubuntu, `apt`, Python, dan `tdl` digunakan kembali selama inputnya tidak berubah. Binary `tdl` host dicari dari `PATH`; lokasi khusus dapat diatur dengan `TDL_HOST_BINARY=/path/ke/tdl`.
+Setelah `base-migrate.zip` diekstrak di project, `python3 build.py` otomatis
+memasukkan `images/tme3bot-base.tar` dan manifest base ke `output.zip`. Jika
+fingerprint dependency/base berubah, script akan memberi peringatan dan
+`python3 run.py migrate` akan berhenti agar base baru dibuat di VPS besar dulu.
 
-Instalasi paket Ubuntu host tidak dapat diwariskan langsung ke container karena filesystem dan library keduanya terpisah. Paket dasar tetap dipasang pada build pertama, tetapi tidak dipasang ulang pada update normal.
+## Worker remote
 
-Untuk membersihkan image lama berstatus dangling (`<none>`) setelah beberapa kali rebuild:
+Pada VPS worker:
 
 ```bash
-python3 run.py cleanup
+cp .env.worker.example .env.worker
+docker compose --env-file .env.worker -f docker-compose.worker.yml up -d --build
 ```
 
-Pembersihan ini mempertahankan image bertag dan semua image yang masih dipakai container.
+`BACKEND_API_URL` harus menunjuk domain backend HTTPS dan
+`BACKEND_INTERNAL_TOKEN` harus sama dengan backend. Worker API sendiri
+disarankan hanya tersedia melalui reverse proxy TLS atau jaringan privat.
+`PROFILE_ROOT` pada `.env.worker` adalah lokasi data persistent di host worker.
 
-Profile tambahan dibuat dengan:
+Daftarkan worker dari VPS utama:
 
 ```bash
-python3 run.py add-profile nama-profile
+python3 run.py worker list
+python3 run.py worker add remote-1 https://worker-1.example.com
+python3 run.py worker remove remote-1
 ```
 
-Salin sesi download ke `profiles/<nama>/root/.tdl` dan sesi export ke `profiles/<nama>/user1/.tdl`.
+Perintah tersebut memanggil management JSON API. Penambahan worker tidak
+memerlukan rebuild atau restart backend.
 
-## Verifikasi Lokal
+## Login web melalui bot
+
+Website kelak menggunakan alur berikut:
+
+1. `POST /api/v1/auth/telegram/challenges`.
+2. Buka `verification_uri` yang dikembalikan backend.
+3. User menekan Start pada bot.
+4. Website melakukan polling endpoint token dengan `challenge_id` dan
+   `poll_token`.
+5. Backend mengembalikan access JWT 15 menit dan refresh token 30 hari.
+
+Challenge berlaku lima menit dan hanya dapat digunakan sekali. Login web baru
+mencabut sesi web lama user yang sama. Refresh token disimpan dalam bentuk hash
+dan dirotasi setiap digunakan.
+
+## Job dan progress
+
+Semua operasi panjang menghasilkan resource job:
+
+```text
+queued → dispatched → running → succeeded | failed | cancelled
+```
+
+Frontend membaca:
+
+```text
+GET /api/v1/jobs
+GET /api/v1/jobs/<job_id>
+GET /api/v1/jobs/<job_id>/events?after_sequence=0
+```
+
+Worker menerbitkan event idempotent berdasarkan `job_id + sequence`. Telegram
+frontend melakukan polling dua detik sekali selama panel masih aktif. Histori
+job tetap tersedia setelah restart backend.
+
+## Storage dan backup
+
+Channel menggunakan satu nilai compact:
+
+```env
+STORAGE_CHANNEL=1588718424
+BACKUP_CHANNEL=9876543210
+```
+
+Bot backend mencari nama channel melalui Bot API. Storage search/rename/edit,
+delivery, dan backup dapat dipanggil melalui API maupun menu bot. Rename nama
+tampilan tersedia untuk semua user authorized; folder, keyword, dan delete
+tetap owner-only.
+
+Backup gateway dan worker dibuat sebagai 7z encrypted menggunakan password
+default Utility. Jalankan manual:
 
 ```bash
-python -m unittest discover -s tests
-python -m compileall -q tme3bot bot.py run.py
+python3 run.py backup now
+python3 run.py backup status
+python3 run.py backup list
+```
+
+## Verifikasi
+
+Runbook deployment lengkap dan diperbarui setiap perubahan workflow tersedia di
+[DEPLOYMENT_RUNBOOK.md](DEPLOYMENT_RUNBOOK.md).
+
+```bash
+python -m compileall -q tme3bot utility bot.py run.py
+python -m unittest discover -s tests -v
+git diff --check
+graphify update .
 ```

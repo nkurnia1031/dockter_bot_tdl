@@ -1,0 +1,252 @@
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class ApiResponse(BaseModel):
+    """Base response DTO that remains forward-compatible with added fields."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ErrorBody(ApiResponse):
+    code: str
+    message: str
+    details: dict[str, Any] = Field(default_factory=dict)
+    request_id: str
+
+
+class ErrorResponse(ApiResponse):
+    error: ErrorBody
+
+
+class ChallengeResponse(ApiResponse):
+    challenge_id: str
+    poll_token: str
+    verification_uri: str
+    expires_at: datetime
+    interval: int
+
+
+class ChallengeExchangeResponse(ApiResponse):
+    status: str | None = None
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str | None = None
+    expires_in: int | None = None
+
+
+class TokenPairResponse(ApiResponse):
+    access_token: str
+    refresh_token: str
+    token_type: str
+    expires_in: int
+
+
+class LogoutResponse(ApiResponse):
+    revoked: bool
+
+
+class ActorResponse(ApiResponse):
+    telegram_user_id: int
+    profile: str
+    authorized: bool
+    worker_route: str
+    download_mode: str
+
+
+class JobResponse(ApiResponse):
+    id: str
+    kind: str
+    profile: str
+    actor_user_id: int
+    worker: str
+    status: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    progress: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class JobListResponse(ApiResponse):
+    items: list[JobResponse]
+
+
+class JobEventResponse(ApiResponse):
+    job_id: str
+    sequence: int
+    status: str
+    event_type: str
+    progress: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    created_at: datetime
+
+
+class JobEventListResponse(ApiResponse):
+    items: list[JobEventResponse]
+
+
+class SourceResponse(ApiResponse):
+    chat_ref: str
+    last_id: int
+    label: str | None = None
+    updated_at: datetime
+    warmup_url: str | None = None
+    warmup_done: bool
+    warmup_done_at: datetime | None = None
+
+
+class SourceListResponse(ApiResponse):
+    items: list[SourceResponse]
+
+
+class WorkerResponse(ApiResponse):
+    name: str
+    url: str
+    selected: bool = False
+
+
+class WorkerListResponse(ApiResponse):
+    items: list[WorkerResponse]
+
+
+class StorageItemResponse(ApiResponse):
+    id: int
+    upload_id: str
+    owner_user_id: int
+    owner_profile: str
+    channel_id: int
+    channel_message_id: int
+    original_name: str
+    display_name: str
+    folder: str
+    keywords: str
+    caption: str
+    file_size: int | None = None
+    mime_type: str
+    sha256: str
+    uploaded_at: datetime
+    updated_at: datetime
+    status: str
+
+
+class StorageItemListResponse(ApiResponse):
+    items: list[StorageItemResponse]
+
+
+class StorageSettingsResponse(ApiResponse):
+    channel: str
+    channel_id: int
+    title: str
+
+
+class ItemListResponse(ApiResponse):
+    items: list[Any]
+
+
+class ObjectResponse(ApiResponse):
+    """Typed object envelope for small mutation/settings responses."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class ChallengeTokenRequest(BaseModel):
+    poll_token: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class ApproveChallengeRequest(BaseModel):
+    telegram_user_id: int
+
+
+class ServiceExchangeRequest(BaseModel):
+    telegram_user_id: int
+
+
+class SubmitJobRequest(BaseModel):
+    profile: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExportRequest(BaseModel):
+    url: str
+    use_url_message_id: bool = False
+
+
+class BatchSourcesRequest(BaseModel):
+    chat_refs: list[str]
+
+
+class UtilityJobRequest(BaseModel):
+    utility: str
+    folders: list[str]
+    password: str | None = None
+
+
+class UtilityFolderRequest(BaseModel):
+    path: str
+
+
+class SettingRequest(BaseModel):
+    value: str
+
+
+class LabelRequest(BaseModel):
+    label: str
+
+
+class WorkerRequest(BaseModel):
+    name: str
+    url: str
+    token: str
+
+
+class WorkerUpdateRequest(BaseModel):
+    url: str
+    token: str
+
+
+class WorkerRouteRequest(BaseModel):
+    route: str
+
+
+class StorageUploadRequest(BaseModel):
+    folder_path: str
+    folder: str
+    keywords: str = ""
+
+
+class StorageUpdateRequest(BaseModel):
+    display_name: str | None = None
+    folder: str | None = None
+    keywords: str | None = None
+
+
+class StorageDeliveryRequest(BaseModel):
+    method: str = "telegram"
+
+
+class WorkerJobRequest(BaseModel):
+    job_id: str
+    kind: str
+    profile: str
+    actor_user_id: int
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkerEventRequest(BaseModel):
+    sequence: int
+    status: str
+    event_type: str
+    progress: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from tme3bot.profiles import (
     build_profile_config,
     normalize_profile_name,
     set_profile_download_mode,
+    ProfileManager,
 )
 
 
@@ -90,6 +92,20 @@ class ProfileTests(unittest.TestCase):
     def test_normalize_profile_name(self) -> None:
         self.assertEqual(normalize_profile_name(" Bot 01!! "), "bot-01")
 
+    def test_worker_route_is_persisted_per_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(
+                self.make_config(root),
+                worker_local_url="http://local:8080",
+                worker_remote_url="http://remote:8080",
+            )
+            manager = ProfileManager(config)
+            self.assertEqual(manager.worker_route("default"), "local")
+            self.assertEqual(manager.set_worker_route("default", "remote"), "remote")
+            reloaded = ProfileManager(config)
+            self.assertEqual(reloaded.worker_route("default"), "remote")
+
     def test_app_config_uses_container_profile_root_not_compose_host_path(self) -> None:
         with patch.dict(
             "os.environ",
@@ -103,6 +119,48 @@ class ProfileTests(unittest.TestCase):
                 config = AppConfig.from_env()
 
         self.assertEqual(config.profile_root, "/data")
+
+    def test_app_config_accepts_custom_gateway_and_worker_ports(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"BOT_TOKEN": "token", "GATEWAY_PORT": "9443", "WORKER_PORT": "9123"},
+            clear=False,
+        ):
+            config = AppConfig.from_env()
+
+        self.assertEqual(config.gateway_port, 9443)
+        self.assertEqual(config.worker_port, 9123)
+
+    def test_app_config_parses_multiple_named_worker_endpoints(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "APP_ROLE": "backend",
+                "BOT_TOKEN": "token",
+                "WORKER_ENDPOINTS": "local=http://worker-local:8080,remote-1=https://one.example,remote-2=https://two.example",
+                "WORKER_API_TOKENS": "remote-1=one-token,remote-2=two-token",
+                "WORKER_ROUTES": "irang=remote-2",
+            },
+            clear=False,
+        ):
+            config = AppConfig.from_env()
+
+        self.assertEqual(config.worker_endpoints["remote-2"], "https://two.example")
+        self.assertEqual(config.worker_api_tokens["remote-1"], "one-token")
+        self.assertEqual(config.worker_routes["irang"], "remote-2")
+
+    def test_runtime_role_validation_fails_fast_for_missing_trust_tokens(self):
+        config = replace(
+            self.make_config(Path("/tmp/tme3bot-test")),
+            app_role="worker",
+            backend_api_url="",
+            backend_internal_token="",
+            worker_api_token="",
+        )
+        with self.assertRaises(ValueError) as raised:
+            config.validate_runtime()
+        self.assertIn("BACKEND_API_URL", str(raised.exception))
+        self.assertIn("WORKER_API_TOKEN", str(raised.exception))
 
 
 if __name__ == "__main__":
