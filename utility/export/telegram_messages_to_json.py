@@ -470,6 +470,11 @@ def main():
         default=None,
         help="Path to a Telegram export HTML file. If omitted, all messages*.html files in the script directory are parsed.",
     )
+    parser.add_argument(
+        "--base-dir",
+        default=None,
+        help="Folder containing messages*.html files when using batch mode.",
+    )
     parser.add_argument("--output", default=None, help="Path to output JSON file for single-file mode.")
     args = parser.parse_args()
 
@@ -483,7 +488,7 @@ def main():
         parse_single_file(input_path, output_path, root_catalog)
         return
 
-    parse_batch(script_dir)
+    parse_batch(Path(args.base_dir).resolve() if args.base_dir else Path.cwd())
 
 
 if __name__ == "__main__":

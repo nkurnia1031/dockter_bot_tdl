@@ -221,7 +221,16 @@ class UtilityRunner:
         elif utility == "compress":
             self._command(["bash", str(self.root / "compress" / "compress.sh")], folder, "utility-compress", settings)
         elif utility == "export":
-            self._command(["python3", str(self.root / "export" / "telegram_messages_to_json.py")], folder, "utility-export-convert")
+            self._command(
+                [
+                    "python3",
+                    str(self.root / "export" / "telegram_messages_to_json.py"),
+                    "--base-dir",
+                    str(folder),
+                ],
+                folder,
+                "utility-export-convert",
+            )
             self._command(["python3", str(self.root / "export" / "organize_media_from_json.py"), "--base-dir", str(folder)], folder, "utility-export-organize")
         elif utility == "pindah":
             self._command(["bash", str(self.root / "pindah" / "pindah.sh"), str(folder)], folder, "utility-pindah", settings)

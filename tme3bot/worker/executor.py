@@ -13,7 +13,7 @@ from typing import Any
 
 from tme3bot.backup_service import BackupService, sha256_file
 from tme3bot.export_catalog import inspect_export_json
-from tme3bot.infrastructure.http_client import request_json
+from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import SerialPerKeyQueue
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.utility import UtilityRunner
@@ -76,6 +76,9 @@ class WorkerEventPublisher:
                 )
                 return
             except Exception as exc:
+                if isinstance(exc, JsonHttpError) and exc.status == 409 and event_type == "queue":
+                    LOGGER.info("Ignoring stale queue event for completed job %s", job_id)
+                    return
                 last_error = exc
                 if attempt < 2:
                     time.sleep(0.5 * (attempt + 1))
