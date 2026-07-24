@@ -65,8 +65,8 @@
     "semantic_hash": "9f1a8f961cb1453f0b315d5d45285471"
   },
   "tests/test_tdl.py": {
-    "mtime": 1784834859.5821114,
-    "ast_hash": "dc0647791b253b1312ca98b2b82ee3dc",
+    "mtime": 1784918151.6055217,
+    "ast_hash": "ca3f05000337bed24b80df3b7158df25",
     "semantic_hash": ""
   },
   "tests/test_url_parser.py": {
@@ -140,8 +140,8 @@
     "semantic_hash": ""
   },
   "tme3bot/tdl.py": {
-    "mtime": 1784834377.1386442,
-    "ast_hash": "f0500e9f7d58f0b189e85587353d349a",
+    "mtime": 1784918157.9278593,
+    "ast_hash": "7815d279eaa3ec48fef4015aa011d6ac",
     "semantic_hash": ""
   },
   "tme3bot/tdl_output.py": {

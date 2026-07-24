@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import threading
 import time
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -457,22 +458,43 @@ class TDLClient:
         """Upload exactly one file and return its Telegram channel message id."""
         if not file_path.is_file():
             raise TDLDataError(f"File upload tidak ditemukan: {file_path}")
-        command = self._wrap_command(
-            self._base_command()
-            + ["up", "-p", str(file_path), "-c", chat_ref, "--caption", caption]
-        )
-        result = self.runner.run(
-            command,
-            env=self._command_env(),
-            log_prefix=f"{self.log_prefix}:upload",
-            stall_timeout_seconds=self.stall_timeout_seconds,
-            progress_callback=self.progress_callback,
-        )
-        self._ensure_success(command, result)
-        message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")
-        if message_id is None:
-            raise TDLDataError("TDL upload selesai tetapi channel message ID tidak ditemukan.")
-        return UploadResult(message_id=message_id, output=f"{result.stdout}\n{result.stderr}")
+        # tdl parses --caption as an expression. Passing raw text makes values
+        # such as `#backup` or `node=local` fail during expression parsing.
+        # Store a JSON-quoted constant expression in a temporary caption file,
+        # following the documented `--caption caption.txt` form.
+        caption_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                prefix="tme3bot-caption-",
+                suffix=".txt",
+                delete=False,
+            ) as handle:
+                handle.write(json.dumps(str(caption), ensure_ascii=False))
+                handle.write("\n")
+                caption_path = Path(handle.name)
+            # Upload sessions may run through `runuser -u user1`.
+            caption_path.chmod(0o644)
+            command = self._wrap_command(
+                self._base_command()
+                + ["up", "-p", str(file_path), "-c", chat_ref, "--caption", str(caption_path)]
+            )
+            result = self.runner.run(
+                command,
+                env=self._command_env(),
+                log_prefix=f"{self.log_prefix}:upload",
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                progress_callback=self.progress_callback,
+            )
+            self._ensure_success(command, result)
+            message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")
+            if message_id is None:
+                raise TDLDataError("TDL upload selesai tetapi channel message ID tidak ditemukan.")
+            return UploadResult(message_id=message_id, output=f"{result.stdout}\n{result.stderr}")
+        finally:
+            if caption_path is not None:
+                caption_path.unlink(missing_ok=True)
 
     def cancel_current(self) -> bool:
         return self.runner.cancel_current()

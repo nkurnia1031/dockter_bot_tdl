@@ -22,6 +22,7 @@ class FakeRunner:
         self.mode = mode
         self.commands: list[list[str]] = []
         self.envs: list[dict[str, str] | None] = []
+        self.caption_contents: list[str] = []
 
     def run(
         self,
@@ -33,6 +34,8 @@ class FakeRunner:
     ) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
         self.envs.append(env)
+        if "--caption" in command:
+            self.caption_contents.append(Path(command[command.index("--caption") + 1]).read_text(encoding="utf-8"))
 
         if "chat" in command and "export" in command:
             if self.mode == "export_failure":
@@ -221,11 +224,13 @@ class TDLClientTests(unittest.TestCase):
             result = TDLClient(root / "tdl", "default", runner=runner).upload(
                 source, "-100123", "caption"
             )
-            self.assertEqual(result.message_id, 987)
-            command = runner.commands[0]
-            self.assertEqual(command[command.index("up") : command.index("up") + 8], [
-                "up", "-p", str(source), "-c", "-100123", "--caption", "caption"
-            ])
+        self.assertEqual(result.message_id, 987)
+        command = runner.commands[0]
+        self.assertEqual(command[command.index("up") : command.index("up") + 7], [
+            "up", "-p", str(source), "-c", "-100123", "--caption", command[-1]
+        ])
+        self.assertTrue(command[-1].endswith(".txt"))
+        self.assertEqual(json.loads(runner.caption_contents[0]), "caption")
 
 
 if __name__ == "__main__":
