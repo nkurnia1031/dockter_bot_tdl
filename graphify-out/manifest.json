@@ -465,8 +465,8 @@
     "semantic_hash": ""
   },
   "web/package.json": {
-    "mtime": 1784979726.3825421,
-    "ast_hash": "8f76448c3ba39fa8ff59e291e9828ee0",
+    "mtime": 1784987559.9293456,
+    "ast_hash": "640df92c14bbaa1216889d5bf611536c",
     "semantic_hash": ""
   },
   "web/src/lib/api.test.ts": {
@@ -505,33 +505,33 @@
     "semantic_hash": ""
   },
   "web/src/lib/components/ExportPage.svelte": {
-    "mtime": 1784979911.882587,
-    "ast_hash": "7e944b18b6d5d39aa2ed23715712717b",
+    "mtime": 1784988087.426258,
+    "ast_hash": "eb43926a2a7fa400afb473b2bf76eef2",
     "semantic_hash": ""
   },
   "web/src/lib/components/GenericPage.svelte": {
-    "mtime": 1784980833.9770365,
-    "ast_hash": "3667e7ab588b99bb9c9ca83a58714225",
+    "mtime": 1784988248.6544073,
+    "ast_hash": "b04a637f3ff9c9b528ff31a2e3049151",
     "semantic_hash": ""
   },
   "web/src/lib/components/JobTable.svelte": {
-    "mtime": 1784979726.3845897,
-    "ast_hash": "c2a5f73b7231df2ec733e7a2a4e46f04",
+    "mtime": 1784988812.871183,
+    "ast_hash": "70654fd8e4e03ff5b8ce6a11ff0ebcb2",
     "semantic_hash": ""
   },
   "web/src/lib/components/Login.svelte": {
-    "mtime": 1784979277.8944895,
-    "ast_hash": "5a607abbcdb7be6b9e7dffd8c4836a36",
+    "mtime": 1784988162.1052835,
+    "ast_hash": "6e76b12675fe71f7c563df9b1baffe3f",
     "semantic_hash": ""
   },
   "web/src/lib/components/Overview.svelte": {
-    "mtime": 1784979346.878548,
-    "ast_hash": "64a383c94cf47dec21ab3fa9345af872",
+    "mtime": 1784988053.5142725,
+    "ast_hash": "aa680e0d1ad751157bd6da031abbb58b",
     "semantic_hash": ""
   },
   "web/src/lib/components/Shell.svelte": {
-    "mtime": 1784979277.895843,
-    "ast_hash": "6258c28f357419cbb23d6d2bc5bcc4b6",
+    "mtime": 1784989101.0753276,
+    "ast_hash": "49d5862a6934cc5a9c12db6c9ba9b41f",
     "semantic_hash": ""
   },
   "web/src/lib/session.svelte.ts": {
@@ -540,8 +540,8 @@
     "semantic_hash": ""
   },
   "web/src/routes/+layout.svelte": {
-    "mtime": 1784979226.0819817,
-    "ast_hash": "b6125856bf9eb17f68146cf11cf41765",
+    "mtime": 1784988303.8039482,
+    "ast_hash": "19a9ca86aed7692249de16823cc1aa10",
     "semantic_hash": ""
   },
   "web/src/routes/+layout.ts": {
@@ -555,8 +555,8 @@
     "semantic_hash": ""
   },
   "web/src/routes/activity/+page.svelte": {
-    "mtime": 1784979346.8896606,
-    "ast_hash": "a9384e6ba8009802b8a1972e709a701a",
+    "mtime": 1784989101.0763361,
+    "ast_hash": "db0c09b358b2787611c5b91f65fd02d3",
     "semantic_hash": ""
   },
   "web/src/routes/backups/+page.svelte": {
@@ -595,8 +595,8 @@
     "semantic_hash": ""
   },
   "web/vite.config.ts": {
-    "mtime": 1784980038.6085985,
-    "ast_hash": "e198e6006a433aa63af1dd570dc414ab",
+    "mtime": 1784988697.6414802,
+    "ast_hash": "8019d35c576f4cf4f4a80cdaba64a4e8",
     "semantic_hash": ""
   },
   ".github/workflows/web-static.yml": {
@@ -605,8 +605,18 @@
     "semantic_hash": ""
   },
   "web/src/app.html": {
-    "mtime": 1784979226.077425,
-    "ast_hash": "29c386192c5028fc1b65c4c71cb5031d",
+    "mtime": 1784988168.15386,
+    "ast_hash": "1fd1350cf7fad191731989554bba46e2",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/JobTable.test.ts": {
+    "mtime": 1784988522.3623874,
+    "ast_hash": "1939eb831f930c17d0f2fdda3936cd2c",
+    "semantic_hash": ""
+  },
+  "web/src/test-setup.ts": {
+    "mtime": 1784988697.6424806,
+    "ast_hash": "19a4fcea2a48eb3a2cafe3deda6f26fa",
     "semantic_hash": ""
   }
 }

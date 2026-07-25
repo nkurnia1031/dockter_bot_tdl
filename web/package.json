@@ -13,6 +13,7 @@
   "dependencies": {
     "@lucide/svelte": "^1.26.0",
     "bits-ui": "^1.0.0",
+    "flowbite-svelte": "^1.33.1",
     "svelte": "^5.0.0"
   },
   "devDependencies": {
