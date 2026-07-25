@@ -2,7 +2,7 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Clock3, OctagonX, RefreshCw, Terminal, X } from "lucide-react";
+import { AlertTriangle, ClipboardList, Clock3, OctagonX, RefreshCw, Terminal, X } from "lucide-react";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import { Badge, Button, Card, ConfirmDialog, Empty } from "./ui";
@@ -66,6 +66,20 @@ function JobLogDialog({job}: {job: Job}) {
   </Dialog.Portal></Dialog.Root>;
 }
 
+export function JobReportDialog({job}: {job: Job}) {
+  const [open, setOpen] = useState(false);
+  const terminal = ["succeeded", "failed", "cancelled"].includes(job.status);
+  if (!terminal) return null;
+  const report = job.result ?? job.error ?? job.progress;
+  return <Dialog.Root open={open} onOpenChange={setOpen}><Dialog.Trigger asChild><button className="inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-xs font-semibold text-[var(--brand)] hover:bg-[var(--brand-soft)]" aria-label={`Buka report ${job.kind}`}><ClipboardList className="size-3.5"/>Report</button></Dialog.Trigger><Dialog.Portal>
+    <Dialog.Overlay className="fixed inset-0 z-50 bg-black/55 backdrop-blur-sm"/>
+    <Dialog.Content className="panel fixed left-1/2 top-1/2 z-50 flex max-h-[min(86vh,48rem)] w-[min(96vw,46rem)] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden p-0 shadow-2xl">
+      <header className="flex items-center justify-between border-b px-5 py-4"><div><Dialog.Title className="flex items-center gap-2 font-bold"><ClipboardList className="size-4 text-[var(--brand)]"/>Report akhir: {job.kind.replaceAll("_", " ")}</Dialog.Title><Dialog.Description className="muted mt-1 font-mono text-xs">{job.id}</Dialog.Description></div><Dialog.Close className="rounded-lg p-2 hover:bg-[var(--brand-soft)]" aria-label="Tutup report"><X className="size-4"/></Dialog.Close></header>
+      <div className="grid gap-3 overflow-auto p-5 text-sm"><dl className="grid grid-cols-[7rem_1fr] gap-x-3 gap-y-2"><dt className="muted">Status</dt><dd><Badge tone={tone(job.status)}>{job.status}</Badge></dd><dt className="muted">Worker</dt><dd>{job.worker}</dd><dt className="muted">Selesai/update</dt><dd>{new Date(job.updated_at).toLocaleString("id-ID")}</dd><dt className="muted">Pesan</dt><dd>{jobMessage(job)}</dd></dl><div><p className="muted mb-2 text-xs font-semibold uppercase tracking-wide">Hasil terstruktur</p><pre className="max-h-96 overflow-auto rounded-xl bg-slate-950 p-4 font-mono text-xs leading-6 text-slate-100">{JSON.stringify(report, null, 2)}</pre></div></div>
+    </Dialog.Content>
+  </Dialog.Portal></Dialog.Root>;
+}
+
 function TerminateJobButton({job}: {job: Job}) {
   const client = useQueryClient();
   const terminate = useMutation({
@@ -103,7 +117,7 @@ export function JobList({kind, title = "Aktivitas terbaru", limit = 8}: {kind?: 
   return <Card><div className="mb-4 flex items-center justify-between gap-3"><h2 className="font-bold">{title}</h2><div className="flex items-center gap-2"><TerminateAllJobsButton/><button onClick={() => jobs.refetch()} className="muted" aria-label="Muat ulang"><RefreshCw className="size-4"/></button></div></div>
     {jobs.isError && <div className="flex gap-2 rounded-xl bg-rose-50 p-3 text-sm text-rose-700"><AlertTriangle className="size-4"/>Gagal mengambil aktivitas.</div>}
     {!jobs.isLoading && !jobs.data?.items.length && <Empty title="Belum ada aktivitas" description="Job baru akan muncul di sini."/>}
-    <div className="divide-y">{jobs.data?.items.map((job) => <div key={job.id} className="grid gap-2 py-3 sm:grid-cols-[1fr_auto] sm:items-center"><div className="min-w-0"><div className="flex items-center gap-2"><b className="truncate text-sm">{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 truncate text-xs">{jobMessage(job)}</p></div><div className="flex flex-wrap items-center justify-between gap-2 sm:justify-end"><span className="muted flex items-center gap-1 text-xs"><Clock3 className="size-3"/>{new Date(job.updated_at).toLocaleString("id-ID")}</span><JobLogDialog job={job}/><TerminateJobButton job={job}/></div></div>)}</div>
+    <div className="divide-y">{jobs.data?.items.map((job) => <div key={job.id} className="grid gap-2 py-3 sm:grid-cols-[1fr_auto] sm:items-center"><div className="min-w-0"><div className="flex items-center gap-2"><b className="truncate text-sm">{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 truncate text-xs">{jobMessage(job)}</p></div><div className="flex flex-wrap items-center justify-between gap-2 sm:justify-end"><span className="muted flex items-center gap-1 text-xs"><Clock3 className="size-3"/>{new Date(job.updated_at).toLocaleString("id-ID")}</span><JobReportDialog job={job}/><JobLogDialog job={job}/><TerminateJobButton job={job}/></div></div>)}</div>
   </Card>;
 }
 

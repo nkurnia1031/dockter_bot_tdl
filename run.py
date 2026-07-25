@@ -549,6 +549,10 @@ def deploy_application(
         raise RuntimeError("Target deploy harus gateway atau worker.")
 
     deploy_env = dict(env)
+    # Never rely on a mutable `latest` manifest for production deployment.
+    # Gateway and target use the checked-out Git revision, so they resolve the
+    # exact same immutable image and browsers receive a fresh Next build.
+    deploy_env["IMAGE_TAG"] = release_image_tag(deploy_env)
     if target == "gateway":
         deploy_env["COMPOSE_FILE"] = "docker-compose.gateway.yml"
     elif target == "worker":
@@ -583,6 +587,7 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
     deploy_application(env, target_args, start_services=False)
     target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
     publish_env = dict(env)
+    publish_env["IMAGE_TAG"] = release_image_tag(publish_env)
     if target == "gateway":
         publish_env["COMPOSE_FILE"] = "docker-compose.gateway.yml"
     elif target == "worker":
@@ -590,6 +595,21 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
     run_compose(["push"], publish_env)
     print("Image berhasil dipublish. Target low-memory dapat memakai: python3 run.py deploy "
           f"{target or 'gateway'} --pull")
+
+
+def release_image_tag(env: dict[str, str]) -> str:
+    configured = env.get("IMAGE_TAG", "").strip()
+    if configured and configured != "latest":
+        return configured
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=PROJECT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip() or "latest"
+    except (OSError, subprocess.CalledProcessError):
+        return "latest"
 
 
 def merge_env_file(env: dict[str, str], filename: str) -> None:

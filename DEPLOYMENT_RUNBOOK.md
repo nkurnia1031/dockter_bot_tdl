@@ -68,6 +68,8 @@ Tambahkan pada env builder dan target dengan nama image registry yang sama:
 WEB_IMAGE_NAME=ghcr.io/ORGANIZATION/tme3bot-web
 GATEWAY_IMAGE_NAME=ghcr.io/ORGANIZATION/tme3bot-gateway
 WORKER_IMAGE_NAME=ghcr.io/ORGANIZATION/tme3bot-worker
+# Optional. Jika dikosongkan atau `latest`, run.py otomatis memakai Git commit
+# saat ini sebagai tag image immutable, misalnya a1b2c3d4e5f6.
 IMAGE_TAG=latest
 ```
 
@@ -104,6 +106,12 @@ Target hanya melakukan `docker pull` dan menjalankan container. Tidak ada
 `pnpm install`, `next build`, Go build, atau kompilasi lokal. Pull pertama
 mengunduh layer image; pull berikutnya hanya mengunduh layer yang berubah dan
 layer lama tetap menjadi cache Docker.
+
+Setiap `publish` dan `deploy --pull` sekarang otomatis mengganti `latest`
+dengan short SHA commit Git yang sedang checkout. Karena tag gateway dan target
+sama, target tidak mungkin menjalankan image web lama dari manifest `latest`.
+Setelah deploy, browser meminta ulang HTML dengan `Cache-Control: no-store`;
+asset `/_next/static` tetap cache cepat karena namanya sudah content-hash.
 
 ## Catatan update 2.1 — Web Admin subdomain root
 

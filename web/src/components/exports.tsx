@@ -3,6 +3,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FilePlus2, Trash2 } from "lucide-react";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { z } from "zod";
 import { api } from "@/lib/api";
@@ -16,23 +17,41 @@ type SavedLabel = {label: string; updated_at: string};
 
 export function ExportsPage() {
   const client = useQueryClient();
+  const [startOverridden, setStartOverridden] = useState(false);
   const sources = useQuery<{items: Source[]}>({queryKey: ["sources"], queryFn: () => api("/sources")});
   const savedLabels = useQuery<{items: SavedLabel[]}>({queryKey: ["labels"], queryFn: () => api("/labels")});
   const form = useForm<Form>({resolver: zodResolver(schema), defaultValues: {chat_ref: "", start_id: 1, label: ""}});
-  const submit = useMutation({mutationFn: async (value: Form) => {
-    if (value.label?.trim()) await api("/labels", {method: "POST", body: JSON.stringify({label: value.label.trim()})});
-    return api("/exports", {method: "POST", body: JSON.stringify({...value, label: value.label?.trim() || undefined})});
-  }, onSuccess: () => {form.reset(); client.invalidateQueries({queryKey: ["jobs"]}); client.invalidateQueries({queryKey: ["labels"]});}});
+  const submit = useMutation({
+    mutationFn: async (value: Form) => {
+      if (value.label?.trim()) await api("/labels", {method: "POST", body: JSON.stringify({label: value.label.trim()})});
+      return api("/exports", {method: "POST", body: JSON.stringify({...value, label: value.label?.trim() || undefined, use_url_message_id: startOverridden})});
+    },
+    onSuccess: () => {
+      form.reset();
+      setStartOverridden(false);
+      client.invalidateQueries({queryKey: ["jobs"]});
+      client.invalidateQueries({queryKey: ["labels"]});
+    },
+  });
   const remove = useMutation({mutationFn: (chatRef: string) => api(`/sources/${encodeURIComponent(chatRef)}`, {method: "DELETE"}), onSuccess: () => client.invalidateQueries({queryKey: ["sources"]})});
-  const labels = Array.from(new Set([
-    ...(savedLabels.data?.items || []).map((item) => item.label),
-    ...(sources.data?.items || []).map((item) => item.label).filter((label): label is string => Boolean(label)),
-  ]));
-  return <><PageHeader eyebrow="Export" title="Source & pembuatan export" description="Masukkan username tanpa tautan lengkap, atau gunakan numeric chat ID. Source baru tersimpan setelah export berhasil."/>
-    <div className="grid gap-5 xl:grid-cols-[.75fr_1.25fr]"><Card><div className="mb-5 flex items-center gap-3"><span className="grid size-10 place-items-center rounded-xl bg-[var(--brand-soft)] text-[var(--brand)]"><FilePlus2 className="size-5"/></span><div><h2 className="font-bold">Export baru</h2><p className="muted text-xs">Start ID dapat dioverride per request.</p></div></div>
+  const labels = Array.from(new Set([...(savedLabels.data?.items || []).map((item) => item.label), ...(sources.data?.items || []).map((item) => item.label).filter((label): label is string => Boolean(label))]));
+  const startIdField = form.register("start_id", {valueAsNumber: true});
+  const selectSource = (chatRef: string) => {
+    const source = (sources.data?.items || []).find((item) => item.chat_ref === chatRef);
+    if (!source) return;
+    form.setValue("chat_ref", source.chat_ref, {shouldValidate: true});
+    // This is only the display value. The worker asks the backend for the
+    // latest last_id again just before export when there is no override.
+    form.setValue("start_id", source.last_id + 1, {shouldValidate: true});
+    if (!form.getValues("label") && source.label) form.setValue("label", source.label);
+    setStartOverridden(false);
+  };
+  return <><PageHeader eyebrow="Export" title="Source & pembuatan export" description="Pilih source tersimpan atau masukkan username/numeric chat ID. Source baru tersimpan setelah export berhasil."/>
+    <div className="grid gap-5 xl:grid-cols-[.75fr_1.25fr]"><Card><div className="mb-5 flex items-center gap-3"><span className="grid size-10 place-items-center rounded-xl bg-[var(--brand-soft)] text-[var(--brand)]"><FilePlus2 className="size-5"/></span><div><h2 className="font-bold">Export baru</h2><p className="muted text-xs">Source terpilih otomatis memakai Last ID terbaru.</p></div></div>
       <form className="grid gap-4" onSubmit={form.handleSubmit((value) => submit.mutate(value))}>
+        <Field label="Pilih source tersimpan" hint="Opsional. Memakai channel dan Last ID source."><select className={inputClass} defaultValue="" onChange={(event) => selectSource(event.target.value)}><option value="">Masukkan source baru…</option>{sources.data?.items.map((item) => <option key={item.chat_ref} value={item.chat_ref}>{item.label ? `${item.label} — ` : ""}{item.chat_ref} (berikutnya: {item.last_id + 1})</option>)}</select></Field>
         <Field label="Username atau chat ID"><input className={inputClass} placeholder="nama_channel atau -100…" {...form.register("chat_ref")}/>{form.formState.errors.chat_ref && <span className="text-xs text-rose-600">{form.formState.errors.chat_ref.message}</span>}</Field>
-        <Field label="Start message ID"><input className={inputClass} type="number" min="1" {...form.register("start_id", {valueAsNumber: true})}/></Field>
+        <Field label="Start message ID" hint={startOverridden ? "Override aktif: export dimulai dari ID ini." : "Otomatis memakai Last ID source + 1. Mengubah nilai ini akan menjadi override."}><input className={inputClass} type="number" min="1" {...startIdField} onChange={(event) => {startIdField.onChange(event); setStartOverridden(true);}}/></Field>
         <Field label="Label opsional" hint="Ketik label baru atau pilih label yang pernah digunakan."><input className={inputClass} list="saved-export-labels" placeholder="arsip-2026" {...form.register("label")}/><datalist id="saved-export-labels">{labels.map((label) => <option key={label} value={label}/>)}</datalist>{labels.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{labels.slice(0, 8).map((label) => <button type="button" key={label} className="rounded-full border px-2.5 py-1 text-xs hover:border-[var(--brand)] hover:text-[var(--brand)]" onClick={() => form.setValue("label", label)}>{label}</button>)}</div>}</Field>
         <Button busy={submit.isPending}>Mulai export</Button>{submit.error && <p className="text-sm text-rose-600">{submit.error.message}</p>}
       </form></Card>

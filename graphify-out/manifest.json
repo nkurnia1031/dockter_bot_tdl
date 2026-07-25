@@ -15,8 +15,8 @@
     "semantic_hash": "82d82243ee7478677cac4bb4cec404c6"
   },
   "run.py": {
-    "mtime": 1784914985.6587424,
-    "ast_hash": "4fa9d1eb4c3b9625ff3c2aacfea2d4d4",
+    "mtime": 1784969721.7581804,
+    "ast_hash": "2381164dfc69eac05eb6eadad60f411d",
     "semantic_hash": ""
   },
   "tests/test_app_menu.py": {
@@ -50,8 +50,8 @@
     "semantic_hash": ""
   },
   "tests/test_run.py": {
-    "mtime": 1784914996.4746237,
-    "ast_hash": "ea17d0e5c1b726e6634dc72c59c54433",
+    "mtime": 1784969764.688458,
+    "ast_hash": "6bcb6e139279ec2bf4f9db860301f6d6",
     "semantic_hash": ""
   },
   "tests/test_service.py": {
@@ -405,8 +405,8 @@
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
-    "mtime": 1784912103.1915503,
-    "ast_hash": "a8466b75fb36d3c8936a205dfdb94f28",
+    "mtime": 1784969708.2749548,
+    "ast_hash": "378ac4e5acb4f18e7c3862512503e33e",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/__init__.py": {
@@ -475,8 +475,8 @@
     "semantic_hash": ""
   },
   "web/next.config.ts": {
-    "mtime": 1784908544.40907,
-    "ast_hash": "fc23ef60614cdcf0a0049dab6120f5d6",
+    "mtime": 1784969690.8126967,
+    "ast_hash": "b618410e90f7ef9234cd88ff68d1127c",
     "semantic_hash": ""
   },
   "web/package.json": {
@@ -565,8 +565,8 @@
     "semantic_hash": ""
   },
   "web/src/components/activity.tsx": {
-    "mtime": 1784968399.2609856,
-    "ast_hash": "c2852c4f4d20790b25534c25e3ff8432",
+    "mtime": 1784969690.8111022,
+    "ast_hash": "581fefdbd82366f82119976f84737dbc",
     "semantic_hash": ""
   },
   "web/src/components/admin.tsx": {
@@ -585,8 +585,8 @@
     "semantic_hash": ""
   },
   "web/src/components/exports.tsx": {
-    "mtime": 1784909701.44438,
-    "ast_hash": "6c085e72ffc135383962a237ee1dbb6d",
+    "mtime": 1784969276.557954,
+    "ast_hash": "ad4d276c29d0076f145ed088aca11a8f",
     "semantic_hash": ""
   },
   "web/src/components/login.tsx": {
@@ -600,8 +600,8 @@
     "semantic_hash": ""
   },
   "web/src/components/page.tsx": {
-    "mtime": 1784968382.7195804,
-    "ast_hash": "1ed72ffa301a8dfb22e1183467681743",
+    "mtime": 1784969690.8079596,
+    "ast_hash": "1ffffcc7ab8bd6cc681f82c32bcab9c9",
     "semantic_hash": ""
   },
   "web/src/components/storage.tsx": {

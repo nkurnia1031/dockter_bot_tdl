@@ -7,6 +7,11 @@ import run
 
 
 class RunScriptTests(unittest.TestCase):
+    def test_release_image_tag_uses_immutable_git_revision_when_latest(self) -> None:
+        with patch.object(run.subprocess, "check_output", return_value="abc123def456\n"):
+            self.assertEqual(run.release_image_tag({"IMAGE_TAG": "latest"}), "abc123def456")
+        self.assertEqual(run.release_image_tag({"IMAGE_TAG": "release-7"}), "release-7")
+
     def test_cleanup_prunes_only_dangling_images(self) -> None:
         env = {"DOCKER_CMD": "docker"}
         with (

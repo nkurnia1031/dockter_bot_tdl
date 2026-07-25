@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useSearchParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { Badge, Card, Empty, inputClass } from "./ui";
-import { Job, PageHeader, TerminateAllJobsButton, tone } from "./page";
+import { Job, JobReportDialog, PageHeader, TerminateAllJobsButton, tone } from "./page";
 
 export function ActivityPage() {
   const params = useSearchParams();
@@ -30,7 +30,7 @@ export function ActivityPage() {
           </select>
         </div>
       </div>
-      {!jobs.data?.items.length ? <Empty title="Tidak ada aktivitas" description="Ubah filter atau jalankan job baru."/> : <div className="divide-y">{jobs.data.items.map((job) => <article key={job.id} className="grid gap-2 py-4 md:grid-cols-[1fr_auto]"><div><div className="flex items-center gap-2"><b>{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 text-xs">{job.id} · {job.worker}</p><p className="mt-2 text-sm">{String(job.progress?.message || job.error?.message || "")}</p></div><time className="muted text-xs">{new Date(job.updated_at).toLocaleString("id-ID")}</time></article>)}</div>}
+      {!jobs.data?.items.length ? <Empty title="Tidak ada aktivitas" description="Ubah filter atau jalankan job baru."/> : <div className="divide-y">{jobs.data.items.map((job) => <article key={job.id} className="grid gap-2 py-4 md:grid-cols-[1fr_auto]"><div><div className="flex items-center gap-2"><b>{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 text-xs">{job.id} · {job.worker}</p><p className="mt-2 text-sm">{String(job.progress?.message || job.error?.message || "")}</p></div><div className="flex items-start gap-2"><JobReportDialog job={job}/><time className="muted text-xs">{new Date(job.updated_at).toLocaleString("id-ID")}</time></div></article>)}</div>}
     </Card>
   </>;
 }
