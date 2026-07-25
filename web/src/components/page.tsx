@@ -75,12 +75,23 @@ function TerminateJobButton({job}: {job: Job}) {
       client.invalidateQueries({queryKey: ["job-log", job.id]});
     },
   });
-  if (job.status !== "running") return null;
+  if (!["queued", "dispatched", "running"].includes(job.status)) return null;
   return <ConfirmDialog title="Terminate job aktif?" description="Sistem mengirim interrupt setara Ctrl+C ke proses worker. File yang sedang diproses dapat tersisa sebagian." trigger={<button disabled={terminate.isPending} className="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-500/10 disabled:opacity-50"><OctagonX className="size-3.5"/>Terminate</button>} onConfirm={() => terminate.mutate()}/>;
 }
 
-export function JobList({kind, title = "Aktivitas terbaru", limit = 8}: {kind?: string; title?: string; limit?: number}) {
+export function TerminateAllJobsButton() {
   const client = useQueryClient();
+  const terminateAll = useMutation({
+    mutationFn: () => api("/jobs/terminate-active", {method: "POST"}),
+    onSuccess: () => {
+      client.invalidateQueries({queryKey: ["jobs"]});
+      client.invalidateQueries({queryKey: ["activity"]});
+    },
+  });
+  return <ConfirmDialog title="Terminate semua job aktif?" description="Job yang masih memiliki proses akan menerima Ctrl+C. Job lama dari worker yang sudah restart akan ditandai cancelled agar tidak lagi mengunci worker atau daftar aktivitas." trigger={<button disabled={terminateAll.isPending} className="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-500/10 disabled:opacity-50"><OctagonX className="size-3.5"/>Terminate semua aktif</button>} onConfirm={() => terminateAll.mutate()}/>;
+}
+
+export function JobList({kind, title = "Aktivitas terbaru", limit = 8}: {kind?: string; title?: string; limit?: number}) {
   const jobs = useQuery<{items: Job[]}>({
     queryKey: ["jobs", kind, limit],
     queryFn: () => api(`/jobs?archived=false&limit=${limit}${kind ? `&kind=${kind}` : ""}`),
@@ -89,12 +100,7 @@ export function JobList({kind, title = "Aktivitas terbaru", limit = 8}: {kind?: 
       return items.some((item) => ["queued", "dispatched", "running"].includes(item.status)) ? 1000 : 5000;
     },
   });
-  const terminateAll = useMutation({
-    mutationFn: () => api("/jobs/terminate-active", {method: "POST"}),
-    onSuccess: () => client.invalidateQueries({queryKey: ["jobs"]}),
-  });
-  const hasActive = Boolean(jobs.data?.items.some((item) => ["queued", "dispatched", "running"].includes(item.status)));
-  return <Card><div className="mb-4 flex items-center justify-between gap-3"><h2 className="font-bold">{title}</h2><div className="flex items-center gap-2">{hasActive && <ConfirmDialog title="Terminate semua job aktif?" description="Job yang masih memiliki proses akan menerima Ctrl+C. Job lama dari worker yang sudah restart akan ditandai cancelled agar tidak mengunci daftar aktivitas." trigger={<button disabled={terminateAll.isPending} className="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 px-2 py-1 text-xs font-semibold text-rose-600 hover:bg-rose-500/10 disabled:opacity-50"><OctagonX className="size-3.5"/>Terminate semua</button>} onConfirm={() => terminateAll.mutate()}/>}<button onClick={() => jobs.refetch()} className="muted" aria-label="Muat ulang"><RefreshCw className="size-4"/></button></div></div>
+  return <Card><div className="mb-4 flex items-center justify-between gap-3"><h2 className="font-bold">{title}</h2><div className="flex items-center gap-2"><TerminateAllJobsButton/><button onClick={() => jobs.refetch()} className="muted" aria-label="Muat ulang"><RefreshCw className="size-4"/></button></div></div>
     {jobs.isError && <div className="flex gap-2 rounded-xl bg-rose-50 p-3 text-sm text-rose-700"><AlertTriangle className="size-4"/>Gagal mengambil aktivitas.</div>}
     {!jobs.isLoading && !jobs.data?.items.length && <Empty title="Belum ada aktivitas" description="Job baru akan muncul di sini."/>}
     <div className="divide-y">{jobs.data?.items.map((job) => <div key={job.id} className="grid gap-2 py-3 sm:grid-cols-[1fr_auto] sm:items-center"><div className="min-w-0"><div className="flex items-center gap-2"><b className="truncate text-sm">{job.kind.replaceAll("_", " ")}</b><Badge tone={tone(job.status)}>{job.status}</Badge></div><p className="muted mt-1 truncate text-xs">{jobMessage(job)}</p></div><div className="flex flex-wrap items-center justify-between gap-2 sm:justify-end"><span className="muted flex items-center gap-1 text-xs"><Clock3 className="size-3"/>{new Date(job.updated_at).toLocaleString("id-ID")}</span><JobLogDialog job={job}/><TerminateJobButton job={job}/></div></div>)}</div>

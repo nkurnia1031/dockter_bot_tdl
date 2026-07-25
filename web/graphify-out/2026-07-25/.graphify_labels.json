@@ -22,6 +22,5 @@
   "20": "GET",
   "21": "PATCH",
   "22": "POST",
-  "23": "PUT",
-  "24": "components/page.tsx"
+  "23": "PUT"
 }
