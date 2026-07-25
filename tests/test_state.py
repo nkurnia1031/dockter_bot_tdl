@@ -7,6 +7,18 @@ from tme3bot.state import StateStore
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_username_source_ignores_at_sign_and_case(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = StateStore(root / "state.json", root / "max.json")
+
+            store.upsert_source("@FileTuyenChonBot", "archive", 10)
+
+            self.assertEqual(store.get_source("FileTuyenChonBot").last_id, 10)
+            updated = store.upsert_source("filetuyenchonbot", None, 11)
+            self.assertEqual(updated.last_id, 11)
+            self.assertEqual([key for key, _ in store.list_sources()], ["filetuyenchonbot"])
+
     def test_last_id_never_moves_backwards_when_worker_finishes_late(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -37,8 +49,8 @@ class StateStoreTests(unittest.TestCase):
             store = StateStore(state_path, legacy_path)
             state = store.load()
 
-            self.assertEqual(state.sources["@good_bot"].last_id, 123)
-            self.assertIsNone(state.sources["@good_bot"].label)
+            self.assertEqual(state.sources["good_bot"].last_id, 123)
+            self.assertIsNone(state.sources["good_bot"].label)
             self.assertEqual(len(state.migration["skipped_keys"]), 2)
             self.assertTrue(state_path.exists())
 
@@ -77,8 +89,8 @@ class StateStoreTests(unittest.TestCase):
 
             deleted = store.delete_sources({"@chat0", "@chat2", "@missing"})
 
-            self.assertEqual(deleted, ["@chat0", "@chat2"])
-            self.assertEqual([item[0] for item in store.list_sources()], ["@chat1"])
+            self.assertEqual(deleted, ["chat0", "chat2"])
+            self.assertEqual([item[0] for item in store.list_sources()], ["chat1"])
 
 
 if __name__ == "__main__":

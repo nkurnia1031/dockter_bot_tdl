@@ -12,6 +12,20 @@ from typing import Any
 from tme3bot.persistence import utc_now_iso, write_json_atomic
 
 
+def normalize_chat_ref(chat_ref: str) -> str:
+    """Canonical source key: usernames ignore @ and letter case.
+
+    Numeric Telegram references are preserved unchanged.  This keeps legacy
+    channel IDs distinct while making ``@Channel`` and ``channel`` one source.
+    """
+    value = str(chat_ref or "").strip()
+    if not value:
+        return ""
+    if value.lstrip("-").isdigit():
+        return value
+    return value.lstrip("@").casefold()
+
+
 @dataclass
 class SourceState:
     last_id: int
@@ -84,7 +98,7 @@ class StateStore:
 
     def get_source(self, chat_ref: str) -> SourceState | None:
         with self._lock:
-            source = self.load().sources.get(chat_ref)
+            source = self.load().sources.get(normalize_chat_ref(chat_ref))
             return replace(source) if source is not None else None
 
     def list_sources(self) -> list[tuple[str, SourceState]]:
@@ -103,6 +117,9 @@ class StateStore:
         warmup_done: bool | None = None,
     ) -> SourceState:
         with self._lock:
+            chat_ref = normalize_chat_ref(chat_ref)
+            if not chat_ref:
+                raise ValueError("chat_ref tidak boleh kosong.")
             state = self.load()
             current = state.sources.get(chat_ref)
             next_label = (
@@ -136,7 +153,7 @@ class StateStore:
     def mark_warmup_done(self, chat_ref: str) -> None:
         with self._lock:
             state = self.load()
-            current = state.sources.get(chat_ref)
+            current = state.sources.get(normalize_chat_ref(chat_ref))
             if current is None:
                 return
             current.warmup_done = True
@@ -150,7 +167,9 @@ class StateStore:
     def delete_sources(self, chat_refs: Iterable[str]) -> list[str]:
         with self._lock:
             state = self.load()
-            deleted = sorted(set(chat_refs).intersection(state.sources))
+            requested = {normalize_chat_ref(chat_ref) for chat_ref in chat_refs}
+            requested.discard("")
+            deleted = sorted(requested.intersection(state.sources))
             if not deleted:
                 return []
             for chat_ref in deleted:
@@ -162,11 +181,17 @@ class StateStore:
         payload = json.loads(self.state_file.read_text(encoding="utf-8"))
         sources_payload = payload.get("sources", {})
         migration_payload = payload.get("migration", {"skipped_keys": []})
-        sources = {
-            key: SourceState.from_dict(value)
-            for key, value in sources_payload.items()
-            if isinstance(value, dict) and "last_id" in value
-        }
+        sources: dict[str, SourceState] = {}
+        for raw_key, value in sources_payload.items():
+            if not isinstance(value, dict) or "last_id" not in value:
+                continue
+            key = normalize_chat_ref(str(raw_key))
+            if not key:
+                continue
+            candidate = SourceState.from_dict(value)
+            current = sources.get(key)
+            if current is None or candidate.last_id >= current.last_id:
+                sources[key] = candidate
         return StateSnapshot(sources=sources, migration=migration_payload)
 
     def _migrate_legacy_state(self) -> StateSnapshot:
@@ -179,7 +204,7 @@ class StateStore:
         migrated_at = utc_now_iso()
 
         for raw_key, raw_value in payload.items():
-            key = str(raw_key).strip()
+            key = normalize_chat_ref(str(raw_key))
             value = str(raw_value).strip()
 
             if not key:
@@ -234,7 +259,7 @@ class HttpStateStore:
         self.profile_name = profile_name
 
     def get_source(self, chat_ref: str) -> SourceState | None:
-        payload = self._request("GET", f"/internal/v1/profiles/{self.profile_name}/state/source", {"chat_ref": chat_ref})
+        payload = self._request("GET", f"/internal/v1/profiles/{self.profile_name}/state/source", {"chat_ref": normalize_chat_ref(chat_ref)})
         raw = payload.get("source")
         return SourceState.from_dict(raw) if isinstance(raw, dict) else None
 
@@ -255,16 +280,16 @@ class HttpStateStore:
     def upsert_source(self, chat_ref: str, label: str | None, last_id: int,
                       warmup_url: str | None = None, warmup_done: bool | None = None) -> SourceState:
         payload = self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/source", {
-            "chat_ref": chat_ref, "label": label, "last_id": last_id,
+            "chat_ref": normalize_chat_ref(chat_ref), "label": label, "last_id": last_id,
             "warmup_url": warmup_url, "warmup_done": warmup_done,
         })
         return SourceState.from_dict(payload["source"])
 
     def mark_warmup_done(self, chat_ref: str) -> None:
-        self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/warmup", {"chat_ref": chat_ref})
+        self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/warmup", {"chat_ref": normalize_chat_ref(chat_ref)})
 
     def delete_sources(self, chat_refs: Iterable[str]) -> list[str]:
-        payload = self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/delete", {"chat_refs": list(chat_refs)})
+        payload = self._request("POST", f"/internal/v1/profiles/{self.profile_name}/state/delete", {"chat_refs": [normalize_chat_ref(item) for item in chat_refs]})
         return [str(item) for item in payload.get("deleted", [])]
 
     def delete_source(self, chat_ref: str) -> bool:

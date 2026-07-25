@@ -444,6 +444,17 @@ backend melalui jaringan Docker, sehingga browser tidak menerima token backend.
 
 ```nginx
 # web.example.com
+# Asset Next sudah memiliki content hash pada nama file. Cache lama aman hanya
+# untuk path ini; jangan gunakan rule ekstensi .js/.css global dengan expires.
+location ^~ /_next/static/ {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_hide_header Cache-Control;
+    expires 365d;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+}
+
 location / {
     proxy_pass http://127.0.0.1:3000;
     proxy_http_version 1.1;
@@ -451,6 +462,9 @@ location / {
     proxy_set_header X-Forwarded-Host $host;
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_hide_header Cache-Control;
+    expires -1;
+    add_header Cache-Control "no-store, max-age=0, must-revalidate" always;
 }
 
 # api.example.com
@@ -462,6 +476,11 @@ location /api/v1/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
+
+Jika menggunakan panel yang menambahkan rule `expires 1m` berdasarkan ekstensi
+`.js`, `.css`, atau font di dalam `location /`, hapus rule itu. Rule tersebut
+menyebabkan bundle UI lama tetap dipakai setelah deploy. Gunakan dua location
+di atas dan reload Nginx setelah menyimpan konfigurasi.
 
 Validasi dan reload:
 
