@@ -1,1 +1,1 @@
-<script lang="ts">import GenericPage from '$lib/components/GenericPage.svelte';</script><GenericPage section="storage" />
+<script lang="ts">import StoragePage from '$lib/components/StoragePage.svelte';</script><StoragePage />

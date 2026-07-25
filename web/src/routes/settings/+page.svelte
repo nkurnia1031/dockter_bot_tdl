@@ -1,1 +1,1 @@
-<script lang="ts">import GenericPage from '$lib/components/GenericPage.svelte';</script><GenericPage section="settings" />
+<script lang="ts">import SettingsPage from '$lib/components/SettingsPage.svelte';</script><SettingsPage />

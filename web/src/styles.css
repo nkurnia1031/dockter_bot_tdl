@@ -107,6 +107,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .record-card { border: 1px solid var(--line); border-radius: .9rem; background: color-mix(in srgb, var(--panel-strong) 82%, transparent); padding: 1rem; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
 .record-card:hover { transform: translateY(-2px); border-color: color-mix(in srgb, var(--brand) 42%, var(--line)); box-shadow: var(--shadow); }
 .terminal { border: 1px solid #202a3e; border-radius: .85rem; background: #0b1020; color: #d8e3ff; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+.page-icon { display: grid; width: 3rem; height: 3rem; place-items: center; border-radius: 1rem; background: var(--brand-soft); color: var(--brand); }
+
+dialog[open] { max-width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); }
+dialog[open] > div { max-height: calc(100dvh - 1rem); }
 
 @keyframes page-enter { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 @media (prefers-reduced-motion: reduce) {

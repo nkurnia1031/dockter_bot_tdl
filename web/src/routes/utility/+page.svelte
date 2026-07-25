@@ -1,1 +1,1 @@
-<script lang="ts">import GenericPage from '$lib/components/GenericPage.svelte';</script><GenericPage section="utility" />
+<script lang="ts">import UtilityPage from '$lib/components/UtilityPage.svelte';</script><UtilityPage />

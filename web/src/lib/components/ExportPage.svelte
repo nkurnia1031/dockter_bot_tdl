@@ -1,11 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, post, remove } from '$lib/api';
+  import type { LabelItem } from '$lib/presentation';
   import JobTable from './JobTable.svelte';
   import { FileDown, ListFilter, Plus, Trash2 } from '@lucide/svelte';
 
   let sources = $state<any[]>([]);
-  let labels = $state<string[]>([]);
+  let labels = $state<LabelItem[]>([]);
   let chatRef = $state('');
   let startId = $state('1');
   let label = $state('');
@@ -15,7 +16,7 @@
   async function load() {
     const [sourceResult, labelResult] = await Promise.all([api<any>('/sources'), api<any>('/labels')]);
     sources = sourceResult.items || [];
-    labels = labelResult.items || [];
+    labels = (labelResult.items || []).filter((item: unknown): item is LabelItem => Boolean(item && typeof item === 'object' && typeof (item as LabelItem).label === 'string'));
   }
   function choose(value: string) {
     selected = value;
@@ -34,8 +35,8 @@
 <div class="mt-7 grid gap-5 xl:grid-cols-[.84fr_1.16fr]">
   <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Export baru</h2><p class="muted text-sm">Start ID dapat dioverride saat diperlukan.</p></div></div>
     <label class="mt-6 block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
-    <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" bind:value={chatRef} placeholder="username atau -100..." /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2" type="number" min="1" bind:value={startId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item}></option>{/each}</datalist></label></div>
-    {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item}>{item}</button>{/each}</div>{/if}
+    <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" bind:value={chatRef} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2" type="number" min="1" bind:value={startId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
+    {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
     <button class="button mt-6 w-full" onclick={submit}><FileDown size={16}/>Mulai export</button>{#if message}<p class="mt-3 rounded-xl bg-violet-50 px-3 py-2 text-sm text-violet-700 dark:bg-violet-950 dark:text-violet-200">{message}</p>{/if}
   </section>
 

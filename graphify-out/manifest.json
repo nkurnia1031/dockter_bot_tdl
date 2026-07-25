@@ -505,18 +505,13 @@
     "semantic_hash": ""
   },
   "web/src/lib/components/ExportPage.svelte": {
-    "mtime": 1784988087.426258,
-    "ast_hash": "eb43926a2a7fa400afb473b2bf76eef2",
-    "semantic_hash": ""
-  },
-  "web/src/lib/components/GenericPage.svelte": {
-    "mtime": 1784988248.6544073,
-    "ast_hash": "b04a637f3ff9c9b528ff31a2e3049151",
+    "mtime": 1784992112.0413935,
+    "ast_hash": "f5179d7862964ca286d06d36bf58262d",
     "semantic_hash": ""
   },
   "web/src/lib/components/JobTable.svelte": {
-    "mtime": 1784988812.871183,
-    "ast_hash": "70654fd8e4e03ff5b8ce6a11ff0ebcb2",
+    "mtime": 1784992328.18177,
+    "ast_hash": "db1cd1985a996f4dd113e80a0ac061de",
     "semantic_hash": ""
   },
   "web/src/lib/components/Login.svelte": {
@@ -560,28 +555,28 @@
     "semantic_hash": ""
   },
   "web/src/routes/backups/+page.svelte": {
-    "mtime": 1784979346.8931487,
-    "ast_hash": "9f66b39313b522194bd6359d3ba6f8c3",
+    "mtime": 1784992101.2518826,
+    "ast_hash": "0eed5c5e70910a6c9b26e83bcaceb044",
     "semantic_hash": ""
   },
   "web/src/routes/settings/+page.svelte": {
-    "mtime": 1784979346.8941596,
-    "ast_hash": "a31ab82ae87e2e510a319254eb1b059c",
+    "mtime": 1784992101.2452433,
+    "ast_hash": "0fc8cf64bf7ba83dc3b1bcc830769bd3",
     "semantic_hash": ""
   },
   "web/src/routes/storage/+page.svelte": {
-    "mtime": 1784979346.8874998,
-    "ast_hash": "a7e77883cad28fcdcce0335480040b9f",
+    "mtime": 1784992101.2497742,
+    "ast_hash": "bfb8f5fe77b96e1cb2e41ce99c77dd9f",
     "semantic_hash": ""
   },
   "web/src/routes/utility/+page.svelte": {
-    "mtime": 1784979346.8860402,
-    "ast_hash": "c003f1e35ea3baee9bd9ae01cf734170",
+    "mtime": 1784992101.24228,
+    "ast_hash": "ab378dd09667b998c1300216390c2c95",
     "semantic_hash": ""
   },
   "web/src/routes/workers/+page.svelte": {
-    "mtime": 1784979346.89067,
-    "ast_hash": "0d752bc7aa62e3a6f17faae4b2f21f16",
+    "mtime": 1784992101.2472856,
+    "ast_hash": "c1498cf5de8a9385c9714c40925a0ece",
     "semantic_hash": ""
   },
   "web/static/build-info.json": {
@@ -617,6 +612,61 @@
   "web/src/test-setup.ts": {
     "mtime": 1784988697.6424806,
     "ast_hash": "19a4fcea2a48eb3a2cafe3deda6f26fa",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/BackupsPage.svelte": {
+    "mtime": 1784992063.4750118,
+    "ast_hash": "88e77eab6401d42ff5084a16e0fab480",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/DownloadsPage.svelte": {
+    "mtime": 1784992328.1842935,
+    "ast_hash": "d4e886b70cab75c78eab22ca993c4d9f",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/ExportPage.test.ts": {
+    "mtime": 1784992328.1878355,
+    "ast_hash": "f53ed0fa121bdc08831f5ee6cf1390a1",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/SettingsPage.svelte": {
+    "mtime": 1784992010.4371016,
+    "ast_hash": "75f453a1da7272cd2c1e081104e9dbbd",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/StoragePage.svelte": {
+    "mtime": 1784992101.2412798,
+    "ast_hash": "4fbf01792c05689be320ab56bab6af56",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/UtilityPage.svelte": {
+    "mtime": 1784992010.436094,
+    "ast_hash": "ad13ed986205f742a54d0ed9324c7409",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/WorkersPage.svelte": {
+    "mtime": 1784992237.1769202,
+    "ast_hash": "34400a04c836d70495308b3ae79afbd7",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/WorkspaceExplorer.svelte": {
+    "mtime": 1784991951.1301546,
+    "ast_hash": "88a68c2ffe888424a7a7e062a521fe64",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/WorkspaceExplorer.test.ts": {
+    "mtime": 1784992328.185635,
+    "ast_hash": "c15124b5ed738816af9d439b08b395eb",
+    "semantic_hash": ""
+  },
+  "web/src/lib/presentation.test.ts": {
+    "mtime": 1784992328.1842935,
+    "ast_hash": "ded13d807bc1fcf2e2fa433d86e6c1e2",
+    "semantic_hash": ""
+  },
+  "web/src/lib/presentation.ts": {
+    "mtime": 1784991951.129153,
+    "ast_hash": "caf4bc292e38b89915af6b712e71a1a0",
     "semantic_hash": ""
   }
 }
