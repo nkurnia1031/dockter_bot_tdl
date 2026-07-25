@@ -79,6 +79,7 @@ EXCLUDED_PATTERNS = (
     "state.json",
     "max.json",
     "profile_state.json",
+    "profiles.json",
     "identity.json",
     "labels.json",
     "utility_folders.json",

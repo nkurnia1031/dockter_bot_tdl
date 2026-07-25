@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover - Windows local test environment
 from tme3bot.config import AppConfig
 from tme3bot.names import normalize_profile_name
 from tme3bot.persistence import write_json_atomic
+from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.progress import DownloadProgressTracker
 from tme3bot.service import BatchDownloadService, ExportService
 from tme3bot.state import HttpStateStore, StateStore
@@ -98,6 +99,11 @@ class ProfileManager:
         self.selection_store = ProfileSelectionStore(
             base_config.state_file.parent / "profile_state.json", self.default_profile
         )
+        self.profile_registry = (
+            ProfileRegistry(base_config.state_file.parent / "profiles.json", self.default_profile)
+            if base_config.app_role == "backend"
+            else None
+        )
         self.worker_routes_path = base_config.state_file.parent / "worker_routes.json"
         self._worker_routes: dict[str, str] | None = None
         self._lock = threading.RLock()
@@ -110,6 +116,8 @@ class ProfileManager:
         return profile
 
     def profile_for_user(self, telegram_user_id: int) -> str | None:
+        if self.profile_registry is not None:
+            return self.profile_registry.profile_for_user(telegram_user_id)
         for profile_name in self.list_profiles():
             config = build_profile_config(self.base_config, profile_name)
             identity_path = Path(config.profile_root) / "identity.json"
@@ -138,12 +146,35 @@ class ProfileManager:
         return selected
 
     def list_profiles(self) -> list[str]:
+        if self.profile_registry is not None:
+            return self.profile_registry.names()
+        return self.local_profiles()
+
+    def local_profiles(self) -> list[str]:
         profiles = {self.default_profile}
         if self.base_config.profiles_root.exists():
             for child in self.base_config.profiles_root.iterdir():
                 if child.is_dir():
                     profiles.add(normalize_profile_name(child.name))
         return sorted(profile for profile in profiles if profile)
+
+    def local_profile_identities(self) -> list[dict[str, object]]:
+        """Metadata a worker can safely publish to the backend registry."""
+        result: list[dict[str, object]] = []
+        for profile_name in self.local_profiles():
+            config = build_profile_config(self.base_config, profile_name)
+            identity_path = Path(config.profile_root) / "identity.json"
+            user_id: int | None = None
+            try:
+                payload = json.loads(identity_path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    raw_id = payload.get("telegram_user_id", payload.get("tdl_user_id"))
+                    if raw_id is not None:
+                        user_id = int(raw_id)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+            result.append({"name": profile_name, "telegram_user_id": user_id})
+        return result
 
     def available_worker_routes(self) -> list[str]:
         if self.worker_registry is not None:
@@ -295,11 +326,15 @@ def describe_download_mode(mode: str) -> str:
 
 
 def build_profile_runtime(profile_name: str, config: AppConfig) -> ProfileRuntime:
-    state_api_url = config.backend_api_url or config.gateway_api_url
-    state_api_token = config.backend_internal_token or config.gateway_api_token
-    if state_api_url:
-        state_store = HttpStateStore(state_api_url, state_api_token, profile_name)
+    if config.app_role == "worker":
+        # Workers must use the gateway API.  A local state.json here would
+        # silently diverge as soon as a profile changes worker.
+        state_store = HttpStateStore(
+            config.backend_api_url, config.backend_internal_token, profile_name
+        )
     else:
+        # Backend owns state.json and must not accidentally call itself through
+        # BACKEND_API_URL.
         state_store = StateStore(config.state_file, config.legacy_max_json)
     state_store.load()
     download_progress = DownloadProgressTracker()

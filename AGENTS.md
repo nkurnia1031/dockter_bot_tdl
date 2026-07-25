@@ -29,10 +29,10 @@ Dokumen onboarding singkat untuk agent baru.
   worker lokal di VPS utama; `docker-compose.worker.yml` menjalankan worker VPS
   kedua. Backend menyimpan identity/state dan worker mengaksesnya lewat
   `/internal/v1`.
-- Route worker dipilih per profile dan disimpan di `worker_routes.json`; jangan
-  mengubah worker di tengah job profile karena folder export berada di worker
-  yang dipilih. `state.json` gateway adalah sumber kebenaran lintas VPS untuk
-  source, `last_id`, label, dan warmup.
+- Route worker dipilih per profile dan disimpan di `worker_routes.json`. Job
+  menyimpan worker asalnya saat dibuat, sehingga perubahan route hanya berlaku
+  untuk job baru dan tidak memindahkan job aktif. `state.json` gateway adalah
+  sumber kebenaran lintas VPS untuk source, `last_id`, label, dan warmup.
 
 ## Security
 

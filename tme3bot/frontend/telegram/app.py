@@ -406,7 +406,7 @@ class TelegramFrontendApp:
         routes = [str(item["name"]) for item in workers]
         edit_menu_message(
             message,
-            f"[{actor['profile']}] Worker aktif: {actor['worker_route']}\nJob profile dikunci pada worker ini sampai selesai.",
+            f"[{actor['profile']}] Worker aktif: {actor['worker_route']}\nPergantian worker berlaku untuk job baru; job aktif tetap berada di worker asalnya.",
             worker_menu_markup(actor["profile"], actor["worker_route"], routes),
         )
 

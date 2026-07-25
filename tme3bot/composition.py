@@ -56,6 +56,12 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         bootstrap_tokens,
     )
     profiles = ProfileManager(config, registry)
+    profiles.profile_registry.bootstrap_from_identities(
+        {
+            item["name"]: item.get("telegram_user_id")
+            for item in profiles.local_profile_identities()
+        }
+    )
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)

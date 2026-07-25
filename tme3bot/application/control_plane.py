@@ -127,13 +127,52 @@ class ControlPlane:
         self._event_observers.append(observer)
 
     def set_worker_route(self, actor: Actor, route: str) -> str:
-        if self.jobs.has_active(actor.profile):
-            raise DomainError(
-                "PROFILE_BUSY",
-                "Profile masih memiliki job aktif; worker belum dapat diganti.",
-                status_code=409,
-            )
+        # Each submitted job already stores its worker. Changing this route
+        # therefore only changes the destination of future jobs; in-flight
+        # work remains pinned to its original worker.
         return self.profile_manager.set_worker_route(actor.profile, route)
+
+    def terminate_active_jobs(self, actor: Actor) -> dict[str, int]:
+        active_statuses = (
+            JobStatus.QUEUED.value,
+            JobStatus.DISPATCHED.value,
+            JobStatus.RUNNING.value,
+        )
+        active: list[Job] = []
+        for status in active_statuses:
+            active.extend(
+                self.jobs.list(
+                    profile=actor.profile,
+                    status=status,
+                    archived=False,
+                    offset=0,
+                    limit=200,
+                )
+            )
+        interrupted = forced = 0
+        for job in active:
+            try:
+                signalled = bool(self.dispatcher.cancel(job.worker, job.id))
+            except Exception:
+                signalled = False
+            if signalled:
+                interrupted += 1
+                continue
+            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+            self.jobs.append_event(
+                JobEvent(
+                    job_id=job.id,
+                    sequence=sequence,
+                    status=JobStatus.CANCELLED,
+                    event_type="force_cancelled",
+                    error={
+                        "code": "JOB_TERMINATED_STALE",
+                        "message": "Job dihentikan karena worker tidak lagi memiliki proses aktif.",
+                    },
+                )
+            )
+            forced += 1
+        return {"total": len(active), "interrupted": interrupted, "force_cancelled": forced}
 
     def cancel_job(self, actor: Actor, job_id: str) -> Job:
         job = self.jobs.get(job_id)

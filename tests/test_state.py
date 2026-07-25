@@ -7,6 +7,17 @@ from tme3bot.state import StateStore
 
 
 class StateStoreTests(unittest.TestCase):
+    def test_last_id_never_moves_backwards_when_worker_finishes_late(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = StateStore(root / "state.json", root / "max.json")
+
+            store.upsert_source("123", None, 240)
+            updated = store.upsert_source("123", None, 120)
+
+            self.assertEqual(updated.last_id, 240)
+            self.assertEqual(store.get_source("123").last_id, 240)
+
     def test_migrates_numeric_values_and_skips_tracebacks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

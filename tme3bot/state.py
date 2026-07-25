@@ -119,7 +119,10 @@ class StateStore:
                 next_warmup_done_at = utc_now_iso() if warmup_done else None
 
             updated = SourceState(
-                last_id=last_id,
+                # Several workers may finish exports for one source in a
+                # different order.  The gateway is authoritative, so never
+                # allow an older worker snapshot to move last_id backwards.
+                last_id=max(int(last_id), current.last_id if current else int(last_id)),
                 label=next_label,
                 updated_at=utc_now_iso(),
                 warmup_url=next_warmup_url,

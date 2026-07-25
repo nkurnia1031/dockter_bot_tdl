@@ -9,6 +9,7 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.domain.models import Actor
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
 
@@ -74,6 +75,7 @@ class BackendApiTests(unittest.TestCase):
         (root / "workspace").mkdir()
         db = root / "app.db"
         self.profiles = FakeProfiles()
+        self.profiles.profile_registry = ProfileRegistry(root / "profiles.json", "default")
         self.dispatcher = FakeDispatcher()
         self.jobs = SqliteJobRepository(db)
         self.catalog = StorageCatalog(db)
@@ -143,6 +145,17 @@ class BackendApiTests(unittest.TestCase):
             json={"poll_token": challenge["poll_token"]},
         ).json()["access_token"]
         return {"Authorization": f"Bearer {token}"}
+
+    def test_worker_profile_sync_persists_gateway_registry(self):
+        response = self.client.post(
+            "/internal/v1/profiles/sync",
+            headers={"Authorization": "Bearer internal"},
+            json={"profiles": [{"name": "remote-1", "telegram_user_id": 42}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["profiles"], ["remote-1"])
+        self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
 
     def insert_storage_item(self):
         return self.catalog.insert_item(
@@ -260,6 +273,27 @@ class BackendApiTests(unittest.TestCase):
             json={"value": "4"},
         )
         self.assertEqual(invalid.status_code, 400)
+
+    def test_terminate_all_active_jobs_endpoint_handles_stale_jobs(self):
+        headers = self.login()
+        created = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/123/4", "use_url_message_id": True},
+        )
+        self.assertEqual(created.status_code, 200)
+        self.dispatcher.cancel = lambda worker, job_id: False
+
+        terminated = self.client.post(
+            "/api/v1/jobs/terminate-active", headers=headers
+        )
+
+        self.assertEqual(terminated.status_code, 200)
+        self.assertEqual(terminated.json()["force_cancelled"], 1)
+        self.assertEqual(
+            self.client.get(f"/api/v1/jobs/{created.json()['id']}", headers=headers).json()["status"],
+            "cancelled",
+        )
 
     def test_storage_rename_is_shared_but_owned_metadata_is_atomic(self):
         item = self.insert_storage_item()

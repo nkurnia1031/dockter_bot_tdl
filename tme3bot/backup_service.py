@@ -111,7 +111,7 @@ class BackupService:
         if self.catalog is not None and Path(self.config.storage_db_file).exists():
             self.catalog.backup_database_to(data_target / "storage.db")
         for name in (
-            "state.json", "max.json", "workers.json", "worker_routes.json", "profile_state.json",
+            "state.json", "max.json", "workers.json", "worker_routes.json", "profile_state.json", "profiles.json",
             "labels.json", "utility_folders.json", "utility_settings.json",
         ):
             self._copy_file(data_root / name, data_target / name)

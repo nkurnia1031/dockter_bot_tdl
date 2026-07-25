@@ -370,6 +370,10 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     def cancel_job(job_id: str, actor=Depends(current_actor)):
         return job_dict(context.control_plane.cancel_job(actor, job_id))
 
+    @app.post("/api/v1/jobs/terminate-active", response_model=ObjectResponse)
+    def terminate_active_jobs(actor=Depends(current_actor)):
+        return context.control_plane.terminate_active_jobs(actor)
+
     @app.post("/api/v1/jobs/{job_id}/archive", response_model=JobResponse)
     def archive_job(job_id: str, actor=Depends(current_actor)):
         _owned_job(context, actor, job_id)
@@ -1063,6 +1067,27 @@ def _profile_artifact(context: BackendContext, actor, artifact_id: str):
 
 def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_internal):
     prefix = "/internal/v1/profiles/{profile}/state"
+
+    @app.post(
+        "/internal/v1/profiles/sync",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    async def sync_profiles(request: Request):
+        body = await request.json()
+        profiles = body.get("profiles", []) if isinstance(body, dict) else []
+        registry = getattr(context.profile_manager, "profile_registry", None)
+        if registry is None:
+            raise DomainError("PROFILE_REGISTRY_UNAVAILABLE", "Registry profile backend tidak tersedia.", status_code=503)
+        synced: list[str] = []
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            try:
+                synced.append(registry.register(item.get("name", ""), item.get("telegram_user_id")))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("PROFILE_SYNC_INVALID", str(exc), status_code=422) from exc
+        return {"profiles": sorted(set(synced))}
 
     @app.get(
         prefix + "/sources",

@@ -140,7 +140,24 @@ class WorkerJobExecutor:
         )
 
     def start(self) -> None:
+        self.sync_profiles()
         self._jobs.start()
+
+    def sync_profiles(self) -> None:
+        """Publish only profile metadata; .tdl files remain on this worker."""
+        try:
+            request_json(
+                self.config.backend_api_url,
+                self.config.backend_internal_token,
+                "POST",
+                "/internal/v1/profiles/sync",
+                {"profiles": self.profile_manager.local_profile_identities()},
+                timeout=15,
+            )
+        except Exception as exc:
+            # The worker can still expose its API while the backend restarts;
+            # the next worker restart will retry registration.
+            LOGGER.warning("Could not sync worker profile metadata to backend: %s", exc)
 
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])

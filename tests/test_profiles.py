@@ -11,7 +11,10 @@ from tme3bot.profiles import (
     normalize_profile_name,
     set_profile_download_mode,
     ProfileManager,
+    build_profile_runtime,
 )
+from tme3bot.profile_registry import ProfileRegistry
+from tme3bot.state import HttpStateStore, StateStore
 
 
 class ProfileTests(unittest.TestCase):
@@ -105,6 +108,50 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(manager.set_worker_route("default", "remote"), "remote")
             reloaded = ProfileManager(config)
             self.assertEqual(reloaded.worker_route("default"), "remote")
+
+    def test_backend_profile_registry_is_authoritative_after_worker_profile_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            (root / "profiles" / "remote-only").mkdir(parents=True)
+            (root / "profiles" / "remote-only" / "identity.json").write_text(
+                '{"telegram_user_id": 123}', encoding="utf-8"
+            )
+            manager = ProfileManager(config)
+            manager.profile_registry.bootstrap_from_identities(
+                {item["name"]: item.get("telegram_user_id") for item in manager.local_profile_identities()}
+            )
+
+            self.assertEqual(manager.profile_for_user(123), "remote-only")
+            self.assertIn("remote-only", manager.list_profiles())
+            self.assertTrue((root / "profiles.json").exists())
+
+    def test_worker_runtime_always_uses_backend_state_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(
+                self.make_config(root),
+                app_role="worker",
+                backend_api_url="http://backend:8080",
+                backend_internal_token="internal",
+            )
+            with patch.object(HttpStateStore, "load"):
+                runtime = build_profile_runtime("default", config)
+            self.assertIsInstance(runtime.state_store, HttpStateStore)
+
+    def test_backend_runtime_never_uses_its_own_backend_api_url_for_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(self.make_config(root), backend_api_url="http://backend:8080")
+            runtime = build_profile_runtime("default", config)
+            self.assertIsInstance(runtime.state_store, StateStore)
+
+    def test_profile_registry_rejects_one_telegram_identity_on_two_profiles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ProfileRegistry(Path(temp_dir) / "profiles.json", "default")
+            registry.register("one", 99)
+            with self.assertRaises(ValueError):
+                registry.register("two", 99)
 
     def test_app_config_uses_container_profile_root_not_compose_host_path(self) -> None:
         with patch.dict(
