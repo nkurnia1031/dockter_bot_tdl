@@ -1,0 +1,56 @@
+name: Publish static web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - '.github/workflows/web-static.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install and verify
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm check
+          pnpm test
+      - name: Build static bundle
+        working-directory: web
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          printf '{"revision":"%s","built_at":"%s"}\n' "$BUILD_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > static/build-info.json
+          pnpm build
+      - name: Package release
+        env:
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          tar -C web/build -czf "web-dist-${BUILD_SHA}.tar.gz" .
+          sha256sum "web-dist-${BUILD_SHA}.tar.gz" > "web-dist-${BUILD_SHA}.tar.gz.sha256"
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: web-latest
+          name: Static UI latest
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          files: |
+            web-dist-*.tar.gz
+            web-dist-*.tar.gz.sha256

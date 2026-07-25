@@ -63,6 +63,28 @@ class RunScriptTests(unittest.TestCase):
             "docker", "compose", "-f", "docker-compose.gateway.yml", "ps"
         ])
 
+    def test_static_web_install_preserves_aapanel_files_and_replaces_managed_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "release"
+            target = root / "ui.utama.naufix.space"
+            (source / "_app").mkdir(parents=True)
+            (source / "_app" / "fresh.js").write_text("fresh", encoding="utf-8")
+            (source / "index.html").write_text("new", encoding="utf-8")
+            target.mkdir()
+            (target / "custom-aapanel-file.txt").write_text("keep", encoding="utf-8")
+            (target / "old.html").write_text("remove", encoding="utf-8")
+            (target / ".tme3bot-static-manifest.json").write_text(
+                '["old.html"]\n', encoding="utf-8"
+            )
+
+            run._install_static_release(source, target)
+
+            self.assertEqual((target / "index.html").read_text(encoding="utf-8"), "new")
+            self.assertTrue((target / "_app" / "fresh.js").is_file())
+            self.assertFalse((target / "old.html").exists())
+            self.assertEqual((target / "custom-aapanel-file.txt").read_text(encoding="utf-8"), "keep")
+
     def test_deploy_gateway_reuses_base_and_recreates_services(self) -> None:
         env = {"COMPOSE_FILE": "docker-compose.worker.yml"}
         with (

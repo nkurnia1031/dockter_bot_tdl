@@ -110,6 +110,9 @@ class BackendApiTests(unittest.TestCase):
                 "backup_channel": "456",
                 "backup_channel_ref": "-100456",
                 "backup_channel_id": -100456,
+                "web_cookie_secret": "w" * 48,
+                "web_cookie_secure": False,
+                "web_public_origin": "",
             },
         )()
         context = BackendContext(
@@ -201,6 +204,47 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.get("/api/v1/me", headers=missing).status_code, 404
         )
+
+    def test_browser_cookie_login_refresh_profile_and_logout_keep_tokens_out_of_json(self):
+        challenge = self.client.post("/api/v1/auth/browser/challenge")
+        self.assertEqual(challenge.status_code, 200)
+        body = challenge.json()
+        self.assertNotIn("poll_token", body)
+        self.assertIn("tme3_poll", self.client.cookies)
+        code = body["verification_uri"].split("login_", 1)[1]
+        approved = self.client.post(
+            f"/internal/v1/auth/telegram/challenges/{code}/approve",
+            headers={"Authorization": "Bearer frontend"},
+            json={"telegram_user_id": 42},
+        )
+        self.assertEqual(approved.status_code, 200)
+        session = self.client.get("/api/v1/auth/browser/challenge")
+        self.assertEqual(session.status_code, 200)
+        self.assertTrue(session.json()["authenticated"])
+        self.assertNotIn("access_token", session.text)
+        self.assertIn("tme3_access", self.client.cookies)
+        self.assertEqual(self.client.get("/api/v1/me").status_code, 200)
+
+        csrf = self.client.cookies.get("tme3_csrf")
+        profile = self.client.put(
+            "/api/v1/auth/browser/profile",
+            headers={"X-CSRF-Token": csrf},
+            json={"profile": "archive"},
+        )
+        self.assertEqual(profile.status_code, 200)
+        self.assertEqual(profile.json()["actor"]["profile"], "archive")
+        self.assertEqual(
+            self.client.post("/api/v1/auth/browser/refresh").status_code, 403
+        )
+        refreshed = self.client.post(
+            "/api/v1/auth/browser/refresh", headers={"X-CSRF-Token": csrf}
+        )
+        self.assertEqual(refreshed.status_code, 200)
+        logged_out = self.client.post(
+            "/api/v1/auth/browser/logout", headers={"X-CSRF-Token": self.client.cookies.get("tme3_csrf")}
+        )
+        self.assertEqual(logged_out.status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/me").status_code, 401)
 
     def test_submit_job_and_worker_events_are_json_only(self):
         headers = self.login()

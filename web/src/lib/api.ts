@@ -1,28 +1,26 @@
-export type ApiError = {error?: {code?: string; message?: string}};
+export type ApiError = Error & { code?: string; status?: number };
 
-function csrf() {
-  return document.cookie.split("; ").find((item) => item.startsWith("tme3_csrf="))?.split("=")[1] || "";
-}
+const csrf = () => document.cookie.split('; ').find((part) => part.startsWith('tme3_csrf='))?.split('=').slice(1).join('') || '';
 
-export async function api<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
+export async function api<T>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
+  const method = (init.method || 'GET').toUpperCase();
   const headers = new Headers(init.headers);
-  if (init.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
-  if (init.method && !["GET", "HEAD"].includes(init.method)) headers.set("X-CSRF-Token", decodeURIComponent(csrf()));
-  const response = await fetch(`/api/backend${path}`, {...init, headers, cache: "no-store"});
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error((payload as ApiError).error?.message || `HTTP ${response.status}`);
-  return payload as T;
+  if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json');
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) headers.set('x-csrf-token', csrf());
+  let response = await fetch(`/api/v1${path}`, { ...init, method, headers, credentials: 'same-origin', cache: 'no-store' });
+  if (response.status === 401 && !retried && !path.startsWith('/auth/browser/')) {
+    const refresh = await fetch('/api/v1/auth/browser/refresh', { method: 'POST', credentials: 'same-origin', headers: { 'x-csrf-token': csrf() } });
+    if (refresh.ok) return api<T>(path, init, true);
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    const error = new Error(body?.error?.message || `HTTP ${response.status}`) as ApiError;
+    error.code = body?.error?.code; error.status = response.status; throw error;
+  }
+  return response.json() as Promise<T>;
 }
 
-export const formatBytes = (value?: number | null) => {
-  if (value === null || value === undefined) return "Tidak diketahui";
-  if (value < 1024) return `${value} B`;
-  const units = ["KB", "MB", "GB", "TB"];
-  let result = value / 1024;
-  let unit = units[0];
-  for (let i = 1; result >= 1024 && i < units.length; i++) {
-    result /= 1024;
-    unit = units[i];
-  }
-  return `${result.toFixed(result >= 10 ? 1 : 2)} ${unit}`;
-};
+export const post = <T>(path: string, value?: unknown) => api<T>(path, { method: 'POST', body: value === undefined ? undefined : JSON.stringify(value) });
+export const put = <T>(path: string, value: unknown) => api<T>(path, { method: 'PUT', body: JSON.stringify(value) });
+export const patch = <T>(path: string, value: unknown) => api<T>(path, { method: 'PATCH', body: JSON.stringify(value) });
+export const remove = <T>(path: string) => api<T>(path, { method: 'DELETE' });

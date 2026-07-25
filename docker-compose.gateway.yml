@@ -1,25 +1,4 @@
 services:
-  web:
-    image: ${WEB_IMAGE_NAME:-tme3bot-web}:${IMAGE_TAG:-latest}
-    build:
-      context: .
-      dockerfile: Dockerfile.web
-      args:
-        TME3BOT_BUILD_ID: ${IMAGE_TAG:-dev}
-    env_file:
-      - ${WEB_ENV_FILE:-.env.web}
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:${WEB_PORT:-3000}:3000"
-    depends_on:
-      backend:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>{if(r.status>=500)process.exit(1)}).catch(()=>process.exit(1))"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-
   backend:
     image: ${GATEWAY_IMAGE_NAME:-tme3bot-gateway}:${IMAGE_TAG:-latest}
     build:

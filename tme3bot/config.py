@@ -85,6 +85,9 @@ class AppConfig:
     auth_refresh_days: int = 30
     auth_challenge_minutes: int = 5
     bot_username: str = ""
+    web_public_origin: str = ""
+    web_cookie_secret: str = ""
+    web_cookie_secure: bool = True
 
     def validate_runtime(self) -> None:
         """Fail fast when a production role is missing its trust boundary."""
@@ -293,6 +296,10 @@ class AppConfig:
             auth_refresh_days=max(1, int(os.getenv("AUTH_REFRESH_DAYS", "30"))),
             auth_challenge_minutes=max(1, int(os.getenv("AUTH_CHALLENGE_MINUTES", "5"))),
             bot_username=os.getenv("BOT_USERNAME", "").strip().lstrip("@"),
+            web_public_origin=os.getenv("WEB_PUBLIC_ORIGIN", "").strip().rstrip("/"),
+            web_cookie_secret=os.getenv("WEB_COOKIE_SECRET", "").strip(),
+            web_cookie_secure=os.getenv("WEB_COOKIE_SECURE", "true").strip().lower()
+            not in {"0", "false", "no", "off"},
         )
 
 

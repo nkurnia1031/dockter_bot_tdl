@@ -1,0 +1,1 @@
+<script lang="ts">import JobTable from '$lib/components/JobTable.svelte';</script><header><p class="text-sm font-bold tracking-[.2em] text-indigo-300">AKTIVITAS</p><h1 class="mt-2 text-3xl font-black">Seluruh job</h1><p class="muted mt-2">Buka report/log snapshot atau terminate job yang masih aktif.</p></header><JobTable title="Daftar aktivitas" />

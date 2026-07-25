@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import logging
+import secrets
 import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -14,6 +18,9 @@ from tme3bot.api.schemas import (
     ActorResponse,
     ApproveChallengeRequest,
     BatchSourcesRequest,
+    BrowserChallengeResponse,
+    BrowserProfileRequest,
+    BrowserSessionResponse,
     ChallengeExchangeResponse,
     ChallengeResponse,
     ChallengeTokenRequest,
@@ -215,26 +222,111 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             status_code=500,
         )
 
+    cookie_secret = (
+        getattr(context.config, "web_cookie_secret", "")
+        or getattr(context.config, "auth_jwt_secret", "")
+    )
+    cookie_secure = bool(getattr(context.config, "web_cookie_secure", True))
+    configured_origin = str(
+        getattr(context.config, "web_public_origin", "") or ""
+    ).rstrip("/")
+
+    def _cookie_options(*, max_age: int | None = None, http_only: bool = True) -> dict[str, Any]:
+        return {
+            "max_age": max_age,
+            "httponly": http_only,
+            "secure": cookie_secure,
+            "samesite": "lax",
+            "path": "/",
+        }
+
+    def _set_cookie(response: Response, name: str, value: str, *, max_age: int | None = None, http_only: bool = True) -> None:
+        response.set_cookie(name, value, **_cookie_options(max_age=max_age, http_only=http_only))
+
+    def _clear_cookie(response: Response, name: str, *, http_only: bool = True) -> None:
+        _set_cookie(response, name, "", max_age=0, http_only=http_only)
+
+    def _profile_cookie(profile: str) -> str:
+        if not cookie_secret:
+            raise DomainError("WEB_COOKIE_SECRET_REQUIRED", "WEB_COOKIE_SECRET belum dikonfigurasi.", status_code=500)
+        value = base64.urlsafe_b64encode(profile.encode("utf-8")).decode("ascii").rstrip("=")
+        signature = hmac.new(cookie_secret.encode("utf-8"), f"profile:{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+        return f"{value}.{signature}"
+
+    def _read_profile_cookie(value: str | None) -> str | None:
+        if not value or not cookie_secret or "." not in value:
+            return None
+        encoded, signature = value.rsplit(".", 1)
+        expected = hmac.new(cookie_secret.encode("utf-8"), f"profile:{encoded}".encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        try:
+            return base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            return None
+
+    def _valid_browser_mutation(request: Request) -> bool:
+        origin = request.headers.get("origin", "").rstrip("/")
+        if configured_origin:
+            if origin != configured_origin:
+                return False
+        elif origin and origin != f"{request.url.scheme}://{request.headers.get('host', '')}":
+            return False
+        csrf_cookie = request.cookies.get("tme3_csrf", "")
+        csrf_header = request.headers.get("x-csrf-token", "")
+        return bool(csrf_cookie and csrf_header and hmac.compare_digest(csrf_cookie, csrf_header))
+
+    def _set_session(response: Response, pair: Any) -> None:
+        _set_cookie(response, "tme3_access", str(pair.access_token), max_age=int(pair.expires_in))
+        _set_cookie(response, "tme3_refresh", str(pair.refresh_token), max_age=int(getattr(context.auth, "refresh_days", 30)) * 86400)
+        _set_cookie(response, "tme3_csrf", secrets.token_urlsafe(24), max_age=int(getattr(context.auth, "refresh_days", 30)) * 86400, http_only=False)
+
+    def _clear_session(response: Response) -> None:
+        for name in ("tme3_access", "tme3_refresh", "tme3_profile", "tme3_challenge", "tme3_poll"):
+            _clear_cookie(response, name)
+        _clear_cookie(response, "tme3_csrf", http_only=False)
+
     def raw_token(
+        request: Request,
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> str:
-        if credentials is None or credentials.scheme.lower() != "bearer":
-            raise DomainError("TOKEN_REQUIRED", "Bearer token wajib diisi.", status_code=401)
-        return credentials.credentials
+        if credentials is not None and credentials.scheme.lower() == "bearer":
+            request.state.cookie_auth = False
+            return credentials.credentials
+        token = request.cookies.get("tme3_access", "")
+        if not token:
+            raise DomainError("TOKEN_REQUIRED", "Bearer token atau sesi browser wajib diisi.", status_code=401)
+        request.state.cookie_auth = True
+        if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and not _valid_browser_mutation(request):
+            raise DomainError("CSRF_INVALID", "Request browser ditolak karena CSRF atau Origin tidak valid.", status_code=403)
+        return token
 
     def current_actor(
+        request: Request,
         token: str = Depends(raw_token),
         x_profile: str | None = Header(default=None, alias="X-Profile"),
     ):
         payload = context.auth.decode_access(token)
         actor = context.control_plane.actor(int(payload["telegram_user_id"]))
-        if x_profile:
-            if x_profile not in context.profile_manager.list_profiles():
+        selected_profile = x_profile
+        if getattr(request.state, "cookie_auth", False):
+            selected_profile = _read_profile_cookie(request.cookies.get("tme3_profile")) or selected_profile
+        if selected_profile:
+            if selected_profile not in context.profile_manager.list_profiles():
                 raise DomainError(
                     "PROFILE_NOT_FOUND", "Profile tidak ditemukan.", status_code=404
                 )
-            return Actor(actor.telegram_user_id, x_profile)
+            return Actor(actor.telegram_user_id, selected_profile)
         return actor
+
+    def browser_actor_dict(actor: Actor) -> dict[str, Any]:
+        return {
+            "telegram_user_id": actor.telegram_user_id,
+            "profile": actor.profile,
+            "authorized": actor.authorized,
+            "worker_route": context.profile_manager.worker_route(actor.profile),
+            "download_mode": context.profile_manager.download_mode(actor.profile),
+        }
 
     def require_service(token: str = Depends(raw_token)) -> None:
         if not context.config.frontend_service_token or token != context.config.frontend_service_token:
@@ -276,6 +368,97 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.post("/api/v1/auth/logout", response_model=LogoutResponse)
     def logout(body: RefreshRequest):
         return {"revoked": context.auth.logout(body.refresh_token)}
+
+    @app.post(
+        "/api/v1/auth/browser/challenge",
+        response_model=BrowserChallengeResponse,
+    )
+    def browser_challenge(response: Response):
+        """Start a Telegram login without exposing the poll credential to JS."""
+        challenge = context.auth.create_challenge()
+        _set_cookie(response, "tme3_challenge", str(challenge["challenge_id"]), max_age=300)
+        _set_cookie(response, "tme3_poll", str(challenge["poll_token"]), max_age=300)
+        if not response.headers.get("set-cookie") or "tme3_csrf" not in response.headers.get("set-cookie", ""):
+            _set_cookie(response, "tme3_csrf", secrets.token_urlsafe(24), max_age=300, http_only=False)
+        return {
+            "challenge_id": challenge["challenge_id"],
+            "verification_uri": challenge["verification_uri"],
+            "expires_at": challenge["expires_at"],
+            "interval": challenge["interval"],
+        }
+
+    @app.get(
+        "/api/v1/auth/browser/challenge",
+        response_model=BrowserSessionResponse,
+    )
+    def browser_challenge_status(request: Request, response: Response):
+        challenge_id = request.cookies.get("tme3_challenge", "")
+        poll_token = request.cookies.get("tme3_poll", "")
+        if not challenge_id or not poll_token:
+            raise DomainError("CHALLENGE_COOKIE_REQUIRED", "Mulai login lagi dari browser ini.", status_code=401)
+        pair = context.auth.exchange_challenge(challenge_id, poll_token)
+        if pair is None:
+            return {"authenticated": False, "profiles": []}
+        _set_session(response, pair)
+        _clear_cookie(response, "tme3_challenge")
+        _clear_cookie(response, "tme3_poll")
+        payload = context.auth.decode_access(pair.access_token)
+        actor = context.control_plane.actor(int(payload["telegram_user_id"]))
+        return {
+            "authenticated": True,
+            "actor": browser_actor_dict(actor),
+            "profiles": context.profile_manager.list_profiles(),
+        }
+
+    @app.get("/api/v1/auth/browser/session", response_model=BrowserSessionResponse)
+    def browser_session(request: Request, actor: Actor = Depends(current_actor)):
+        if not getattr(request.state, "cookie_auth", False):
+            raise DomainError("BROWSER_SESSION_REQUIRED", "Sesi browser wajib digunakan.", status_code=401)
+        return {
+            "authenticated": True,
+            "actor": browser_actor_dict(actor),
+            "profiles": context.profile_manager.list_profiles(),
+        }
+
+    @app.post("/api/v1/auth/browser/refresh", response_model=BrowserSessionResponse)
+    def browser_refresh(request: Request, response: Response):
+        if not _valid_browser_mutation(request):
+            raise DomainError("CSRF_INVALID", "Request browser tidak valid.", status_code=403)
+        refresh_token = request.cookies.get("tme3_refresh", "")
+        if not refresh_token:
+            raise DomainError("REFRESH_REQUIRED", "Sesi browser sudah berakhir.", status_code=401)
+        pair = context.auth.refresh(refresh_token)
+        _set_session(response, pair)
+        payload = context.auth.decode_access(pair.access_token)
+        actor = context.control_plane.actor(int(payload["telegram_user_id"]))
+        selected = _read_profile_cookie(request.cookies.get("tme3_profile"))
+        if selected in context.profile_manager.list_profiles():
+            actor = Actor(actor.telegram_user_id, selected)
+        return {"authenticated": True, "actor": browser_actor_dict(actor), "profiles": context.profile_manager.list_profiles()}
+
+    @app.post("/api/v1/auth/browser/logout", response_model=LogoutResponse)
+    def browser_logout(request: Request, response: Response):
+        if not _valid_browser_mutation(request):
+            raise DomainError("CSRF_INVALID", "Request browser tidak valid.", status_code=403)
+        refresh_token = request.cookies.get("tme3_refresh", "")
+        revoked = context.auth.logout(refresh_token) if refresh_token else False
+        _clear_session(response)
+        return {"revoked": revoked}
+
+    @app.put("/api/v1/auth/browser/profile", response_model=BrowserSessionResponse)
+    def browser_profile(
+        request: Request,
+        response: Response,
+        body: BrowserProfileRequest,
+        actor: Actor = Depends(current_actor),
+    ):
+        if not getattr(request.state, "cookie_auth", False):
+            raise DomainError("BROWSER_SESSION_REQUIRED", "Sesi browser wajib digunakan.", status_code=401)
+        profiles = context.profile_manager.list_profiles()
+        if body.profile not in profiles:
+            raise DomainError("PROFILE_NOT_FOUND", "Profile tidak ditemukan.", status_code=404)
+        _set_cookie(response, "tme3_profile", _profile_cookie(body.profile), max_age=int(getattr(context.auth, "refresh_days", 30)) * 86400)
+        return {"authenticated": True, "actor": browser_actor_dict(Actor(actor.telegram_user_id, body.profile)), "profiles": profiles}
 
     @app.post(
         "/internal/v1/auth/telegram/challenges/{code}/approve",

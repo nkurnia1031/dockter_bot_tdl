@@ -31,6 +31,25 @@ class ChallengeResponse(ApiResponse):
     interval: int
 
 
+class BrowserChallengeResponse(ApiResponse):
+    """Safe browser login response; the poll token stays in an HttpOnly cookie."""
+
+    challenge_id: str
+    verification_uri: str
+    expires_at: datetime
+    interval: int
+
+
+class BrowserSessionResponse(ApiResponse):
+    authenticated: bool
+    actor: ActorResponse | None = None
+    profiles: list[str] = Field(default_factory=list)
+
+
+class BrowserProfileRequest(BaseModel):
+    profile: str
+
+
 class ChallengeExchangeResponse(ApiResponse):
     status: str | None = None
     access_token: str | None = None
