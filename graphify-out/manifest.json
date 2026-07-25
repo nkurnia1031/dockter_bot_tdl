@@ -25,8 +25,8 @@
     "semantic_hash": ""
   },
   "tests/test_container.py": {
-    "mtime": 1784900240.2791953,
-    "ast_hash": "18e77deb9da2431e8c59f667e35e0ea8",
+    "mtime": 1784972159.0425546,
+    "ast_hash": "30cbc1a701c1d7b3c8b23996b893d1f7",
     "semantic_hash": ""
   },
   "tests/test_labels.py": {
@@ -225,8 +225,8 @@
     "semantic_hash": ""
   },
   "docker-compose.gateway.yml": {
-    "mtime": 1784908544.4190183,
-    "ast_hash": "c5068f13c80a23cffa9d8439c3e8bfdb",
+    "mtime": 1784972136.652738,
+    "ast_hash": "dc87c973cbb2c05fc685867892ef02ca",
     "semantic_hash": ""
   },
   "docker-compose.worker.yml": {
@@ -405,8 +405,8 @@
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
-    "mtime": 1784970830.9546995,
-    "ast_hash": "e9cc1e1661e7ce38fcb1e65baa47463c",
+    "mtime": 1784972136.6597333,
+    "ast_hash": "d95a7ae70c617c0172ad9674363f79c6",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/__init__.py": {
@@ -530,8 +530,8 @@
     "semantic_hash": ""
   },
   "web/src/app/layout.tsx": {
-    "mtime": 1784899086.5680819,
-    "ast_hash": "2a8df12959e965c1e80280219e37260b",
+    "mtime": 1784972136.6547365,
+    "ast_hash": "38b412a70228dd9b0c7b7f030b2729ce",
     "semantic_hash": ""
   },
   "web/src/app/page.tsx": {
@@ -575,8 +575,8 @@
     "semantic_hash": ""
   },
   "web/src/components/app-shell.tsx": {
-    "mtime": 1784908544.418006,
-    "ast_hash": "b1b38800419e602dc318661b5d83272b",
+    "mtime": 1784972136.6567347,
+    "ast_hash": "c993cb52c76dd8b17517ba940ab46db2",
     "semantic_hash": ""
   },
   "web/src/components/downloads.tsx": {

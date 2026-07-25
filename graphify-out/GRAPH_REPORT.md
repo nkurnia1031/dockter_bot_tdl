@@ -1,7 +1,7 @@
 # Graph Report - dockter_bot_tdl  (2026-07-25)
 
 ## Corpus Check
-- 129 files · ~54,093 words
+- 129 files · ~54,160 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `b4b588f8`
+- Built from commit: `fc04114c`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -191,7 +191,7 @@ Cohesion: 0.07
 Nodes (25): BackupServiceTests, make_config(), Path, item_values(), StorageCatalogTests, BackupArchive, BackupService, Path (+17 more)
 
 ### Community 17 - "composition.py"
-Cohesion: 0.12
+Cohesion: 0.11
 Nodes (11): BackupCoordinator, BackupNodeJob, BackupScheduler, datetime, Gateway orchestration, channel upload, scheduling, and retention., Worker-neutral command payload for one node backup., build_backend_context(), ControlPlaneBackupRouter (+3 more)
 
 ### Community 18 - "config.py"
@@ -211,8 +211,8 @@ Cohesion: 0.12
 Nodes (15): aliases, components, hooks, lib, ui, utils, iconLibrary, rsc (+7 more)
 
 ### Community 22 - "ProfileTests"
-Cohesion: 0.15
-Nodes (8): json_value(), Any, Exception, Path, Executes domain jobs and publishes JSON events; no UI dependency., Publish only profile metadata; .tdl files remain on this worker., Return a safe, shallow directory listing for the active workspace., WorkerJobExecutor
+Cohesion: 0.13
+Nodes (10): JobLogSnapshot, json_value(), Any, Exception, Path, Executes domain jobs and publishes JSON events; no UI dependency., Publish only profile metadata; .tdl files remain on this worker., Bounded raw command output retained with the persistent job history. (+2 more)
 
 ### Community 24 - "ExportService"
 Cohesion: 0.60
@@ -240,7 +240,7 @@ Nodes (25): @axe-core/playwright, jsdom, openapi-typescript, tailwindcss, @tailw
 
 ### Community 30 - "dependencies"
 Cohesion: 0.09
-Nodes (23): clsx, @hookform/resolvers, next, @radix-ui/react-dialog, @radix-ui/react-tabs, react, react-dom, react-hook-form (+15 more)
+Nodes (23): clsx, @hookform/resolvers, lucide-react, @radix-ui/react-dialog, @radix-ui/react-tabs, react, react-dom, react-hook-form (+15 more)
 
 ### Community 34 - "bff.ts"
 Cohesion: 0.24
@@ -311,16 +311,16 @@ Cohesion: 0.05
 Nodes (41): A1. Kirim source terbaru ke VPS besar, A2. Siapkan source di VPS besar, A3. Build base image satu kali, A. Kondisi pertama: membuat base image di VPS besar, Aturan dasar, B1. Di project lokal, B2. Ekstrak base image dengan aman di project lokal, B3. Kirim source ke VPS besar (+33 more)
 
 ### Community 73 - "request_json"
-Cohesion: 0.24
-Nodes (6): BackendApiClient, Any, Frontend adapters. They communicate with the backend only through JSON., Any, RuntimeError, request_json()
+Cohesion: 0.32
+Nodes (4): BackendApiClient, Any, Frontend adapters. They communicate with the backend only through JSON., request_json()
 
 ### Community 74 - "edit_menu_message"
 Cohesion: 0.31
 Nodes (3): Any, main_menu_markup(), edit_menu_message()
 
 ### Community 76 - "ControlPlaneBackupRouter"
-Cohesion: 0.16
-Nodes (5): JsonHttpError, JobLogSnapshot, Bounded raw command output retained with the persistent job history., WorkerEventPublisher, Framework-independent worker execution adapter.
+Cohesion: 0.18
+Nodes (5): JsonHttpError, Any, RuntimeError, WorkerEventPublisher, Framework-independent worker execution adapter.
 
 ### Community 77 - "BatchDownloadService"
 Cohesion: 0.36

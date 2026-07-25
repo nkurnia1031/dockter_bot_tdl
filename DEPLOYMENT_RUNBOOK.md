@@ -112,6 +112,10 @@ dengan short SHA commit Git yang sedang checkout. Karena tag gateway dan target
 sama, target tidak mungkin menjalankan image web lama dari manifest `latest`.
 Setelah deploy, browser meminta ulang HTML dengan `Cache-Control: no-store`;
 asset `/_next/static` tetap cache cepat karena namanya sudah content-hash.
+UI menampilkan `build <git-sha>` kecil di kartu Worker aktif. Jika angka build
+berubah saat refresh, ada lebih dari satu upstream/proxy yang melayani domain;
+jika angkanya tidak sama dengan `git rev-parse --short=12 HEAD` di VPS gateway,
+image yang berjalan belum berasal dari commit tersebut.
 
 ## Catatan update 2.1 — Web Admin subdomain root
 

@@ -4,6 +4,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.web
+      args:
+        TME3BOT_BUILD_ID: ${IMAGE_TAG:-dev}
     env_file:
       - ${WEB_ENV_FILE:-.env.web}
     restart: unless-stopped

@@ -58,6 +58,7 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("FROM runtime-base AS gateway", dockerfile)
         self.assertIn("FROM runtime-base AS worker", dockerfile)
         self.assertTrue((PROJECT_ROOT / "Dockerfile.web").is_file())
+        self.assertIn("TME3BOT_BUILD_ID", (PROJECT_ROOT / "Dockerfile.web").read_text(encoding="utf-8"))
 
     def test_deployment_archive_includes_split_configs(self) -> None:
         names = {path.name for path in build.iter_files()}

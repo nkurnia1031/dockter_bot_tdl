@@ -61,7 +61,7 @@ export function AppShell({children}: {children: React.ReactNode}) {
         return <Link key={href} href={href} onClick={() => setOpen(false)} className={cn("flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition", active ? "bg-[var(--brand-soft)] text-[var(--brand)]" : "muted hover:bg-[var(--surface)] hover:text-[var(--ink)]")}><Icon className="size-[18px]"/>{label}</Link>;
       })}
     </nav>
-    <div className="mt-auto rounded-2xl bg-[var(--brand-soft)] p-3 text-sm"><p className="font-semibold text-[var(--brand)]">Worker aktif</p><p className="mt-1 truncate">{actor.worker_route}</p></div>
+    <div className="mt-auto rounded-2xl bg-[var(--brand-soft)] p-3 text-sm"><p className="font-semibold text-[var(--brand)]">Worker aktif</p><p className="mt-1 truncate">{actor.worker_route}</p><p className="mt-2 font-mono text-[10px] text-[var(--brand)]/75">build {process.env.NEXT_PUBLIC_TME3BOT_BUILD_ID || "dev"}</p></div>
   </aside>;
 
   return <div className="min-h-screen lg:grid lg:grid-cols-[16rem_1fr]">
