@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import threading
 from dataclasses import dataclass, field
@@ -213,6 +214,22 @@ class UtilityRunner:
     def __init__(self, utility_root: Path, log_callback: Callable[[str], None] | None = None) -> None:
         self.root = utility_root
         self.log_callback = log_callback
+        self._process_lock = threading.RLock()
+        self._current_process: subprocess.Popen[str] | None = None
+
+    def cancel_current(self) -> bool:
+        with self._process_lock:
+            process = self._current_process
+        if process is None or process.poll() is not None:
+            return False
+        if os.name != "nt":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            except ProcessLookupError:
+                return False
+        else:  # pragma: no cover - production workers run on Linux
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        return True
 
     def run(self, utility: str, folders: list[str], password: str | None = None, settings: dict[str, str] | None = None) -> UtilityResult:
         succeeded: list[str] = []
@@ -335,15 +352,30 @@ class UtilityRunner:
             env["UTILITY_MOVE_SIZE"] = settings.get("move_size", "4g")
             env["UTILITY_COMPRESS_SIZE"] = settings.get("compress_size", "4g")
             env["UTILITY_COMPRESS_PASSWORD"] = settings.get("compress_password", "")
-        process = subprocess.Popen(command, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        process = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            start_new_session=os.name != "nt",
+        )
+        with self._process_lock:
+            self._current_process = process
         assert process.stdout is not None
         lines: list[str] = []
-        for line in process.stdout:
-            clean = line.rstrip()
-            lines.append(clean)
-            LOGGER.info("%s | %s", prefix, clean)
-            if self.log_callback:
-                self.log_callback(clean)
-        code = process.wait()
+        try:
+            for line in process.stdout:
+                clean = line.rstrip()
+                lines.append(clean)
+                LOGGER.info("%s | %s", prefix, clean)
+                if self.log_callback:
+                    self.log_callback(clean)
+            code = process.wait()
+        finally:
+            with self._process_lock:
+                if self._current_process is process:
+                    self._current_process = None
         if code != 0:
             raise RuntimeError(f"{prefix} exit code {code}: {' | '.join(lines[-5:])}")

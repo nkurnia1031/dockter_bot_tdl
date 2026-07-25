@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import shlex
+import signal
 import subprocess
 import threading
 import time
@@ -57,6 +58,7 @@ class UploadResult:
 
 
 ProgressCallback = Callable[[CommandProgress], None]
+OutputCallback = Callable[[str], None]
 
 
 class SubprocessRunner:
@@ -73,12 +75,15 @@ class SubprocessRunner:
         log_prefix: str = "tdl",
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
+        output_callback: OutputCallback | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process_command = prepare_subprocess_command(command, env)
         if process_command == command:
             LOGGER.info("%s start: %s", log_prefix, " ".join(command))
         else:
             LOGGER.info("%s start via pseudo-tty: %s", log_prefix, " ".join(command))
+        if output_callback is not None:
+            output_callback(f"$ {' '.join(command)}")
         started_at = time.time()
         output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         stdout_lines: list[str] = []
@@ -92,6 +97,7 @@ class SubprocessRunner:
                 text=False,
                 bufsize=0,
                 env=env,
+                start_new_session=os.name != "nt",
             )
         except FileNotFoundError as exc:
             raise TDLCommandError(command, -1, "", str(exc)) from exc
@@ -122,6 +128,7 @@ class SubprocessRunner:
                     stderr_lines,
                     log_prefix,
                     progress_callback,
+                    output_callback,
                 )
                 if stall_timeout_seconds > 0 and self._is_stalled(
                     stall_timeout_seconds
@@ -138,7 +145,7 @@ class SubprocessRunner:
             stdout_thread.join(timeout=2)
             stderr_thread.join(timeout=2)
             self._drain_output(
-                output_queue, stdout_lines, stderr_lines, log_prefix, progress_callback
+                output_queue, stdout_lines, stderr_lines, log_prefix, progress_callback, output_callback
             )
             returncode = process.poll()
             if returncode is None:
@@ -155,18 +162,40 @@ class SubprocessRunner:
         if returncode != 0:
             self._log_failure_output(log_prefix, returncode, stdout, stderr)
         LOGGER.info("%s finished with exit code %s", log_prefix, returncode)
+        if output_callback is not None:
+            output_callback(f"[process exited with code {returncode}]")
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     def cancel_current(self) -> bool:
+        return self.interrupt_current()
+
+    def interrupt_current(self) -> bool:
         with self._lock:
             process = self._current_process
             command = self._current_command
         if process is None or process.poll() is not None:
             return False
 
-        LOGGER.warning("Cancelling running TDL command: %s", " ".join(command or []))
-        self._terminate_process(process)
+        LOGGER.warning("Interrupting running TDL command: %s", " ".join(command or []))
+        self._interrupt_process(process)
         return True
+
+    @staticmethod
+    def _interrupt_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGINT)
+            except ProcessLookupError:
+                return
+        else:  # pragma: no cover - production workers run on Linux
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            process.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            SubprocessRunner._terminate_process(process)
 
     @staticmethod
     def _read_stream(
@@ -198,6 +227,7 @@ class SubprocessRunner:
         stderr_lines: list[str],
         log_prefix: str,
         progress_callback: ProgressCallback | None,
+        output_callback: OutputCallback | None,
     ) -> None:
         while True:
             try:
@@ -208,6 +238,9 @@ class SubprocessRunner:
             clean_line = clean_tdl_output_line(line)
             if not clean_line:
                 continue
+
+            if output_callback is not None:
+                output_callback(clean_line)
 
             target_lines = stderr_lines if stream_name == "stderr" else stdout_lines
             target_lines.append(clean_line + "\n")
@@ -350,6 +383,7 @@ class TDLClient:
         log_prefix: str = "tdl",
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
+        output_callback: OutputCallback | None = None,
         upload_resolve_timeout_seconds: float | None = None,
         upload_resolve_interval_seconds: float | None = None,
     ) -> None:
@@ -362,6 +396,7 @@ class TDLClient:
         self.log_prefix = log_prefix
         self.stall_timeout_seconds = stall_timeout_seconds
         self.progress_callback = progress_callback
+        self.output_callback = output_callback
         self.upload_resolve_timeout_seconds = (
             float(upload_resolve_timeout_seconds)
             if upload_resolve_timeout_seconds is not None
@@ -399,6 +434,7 @@ class TDLClient:
             log_prefix=f"{self.log_prefix}:export",
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
+            output_callback=self.output_callback,
         )
         self._ensure_success(command, result)
 
@@ -455,6 +491,7 @@ class TDLClient:
             log_prefix=f"{self.log_prefix}:download",
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
+            output_callback=self.output_callback,
         )
         self._ensure_success(command, result)
         return result
@@ -483,6 +520,7 @@ class TDLClient:
             log_prefix=f"{self.log_prefix}:download-url",
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
+            output_callback=self.output_callback,
         )
         self._ensure_success(command, result)
         return result
@@ -525,6 +563,7 @@ class TDLClient:
                 log_prefix=f"{self.log_prefix}:upload",
                 stall_timeout_seconds=self.stall_timeout_seconds,
                 progress_callback=self.progress_callback,
+                output_callback=self.output_callback,
             )
             self._ensure_success(command, result)
             message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")

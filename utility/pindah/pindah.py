@@ -3,10 +3,29 @@ import os
 from itertools import combinations
 import multiprocessing
 import queue
+import re
 import time
 
-# Batas maksimal ukuran folder dalam bytes (3.99 GB)
-MAX_SIZE = 3.99 * 1024 * 1024 * 1024
+
+def parse_size(value):
+    """Convert the shared Utility setting (for example ``750m``) to bytes."""
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([kmgt]?i?b?)?", value.strip().lower())
+    if not match:
+        raise ValueError(f"Ukuran tidak valid: {value}")
+    number = float(match.group(1))
+    unit = match.group(2) or "b"
+    multipliers = {
+        "b": 1,
+        "k": 1024, "kb": 1024, "ki": 1024, "kib": 1024,
+        "m": 1024**2, "mb": 1024**2, "mi": 1024**2, "mib": 1024**2,
+        "g": 1024**3, "gb": 1024**3, "gi": 1024**3, "gib": 1024**3,
+        "t": 1024**4, "tb": 1024**4, "ti": 1024**4, "tib": 1024**4,
+    }
+    return int(number * multipliers[unit])
+
+
+def move_size_limit() -> int:
+    return parse_size(os.getenv("UTILITY_MOVE_SIZE", "4g"))
 
 def load_json(filename):
     """Membaca dan mengembalikan konten file JSON."""
@@ -15,7 +34,7 @@ def load_json(filename):
 
 def find_best_combination_worker(args):
     """Worker function to find the best combination within a given range of combination lengths."""
-    items, space_left, r_start, r_end, progress_queue, stop_event = args
+    items, space_left, r_start, r_end, progress_queue, stop_event, close_enough = args
     best_combination = []
     smallest_difference = space_left
     valid_combinations_count = 0
@@ -38,13 +57,13 @@ def find_best_combination_worker(args):
                 if difference < smallest_difference:
                     best_combination = [item[0] for item in combination]
                     smallest_difference = difference
-                    if smallest_difference < 0.05 * 1024 * 1024 * 1024:  # less than 0.01 GB
+                    if smallest_difference < close_enough:
                         stop_event.set()
                         return best_combination, smallest_difference, valid_combinations_count
 
     return best_combination, smallest_difference, valid_combinations_count
 
-def find_best_combination(items, space_left, num_workers=4):
+def find_best_combination(items, space_left, num_workers=4, close_enough=1 * 1024 * 1024):
     """Find the best combination of items to fill the space left using multiprocessing."""
     item_sizes = [(item['file'], item['size']) for item in items]
     total_items = len(item_sizes)
@@ -59,7 +78,7 @@ def find_best_combination(items, space_left, num_workers=4):
     manager = multiprocessing.Manager()
     progress_queue = manager.Queue()
     stop_event = manager.Event()
-    ranges = [(item_sizes, space_left, i * chunk_size + 1, min((i + 1) * chunk_size + 1, total_items + 1), progress_queue, stop_event)
+    ranges = [(item_sizes, space_left, i * chunk_size + 1, min((i + 1) * chunk_size + 1, total_items + 1), progress_queue, stop_event, close_enough)
               for i in range(num_workers)]
 
     with multiprocessing.Pool(num_workers) as pool:
@@ -93,6 +112,12 @@ def find_best_combination(items, space_left, num_workers=4):
     return best_combination
 
 def main():
+    max_size = move_size_limit()
+    # Preserve a small safety buffer without making low-size groups lose the
+    # fixed 100 MB that used to be tailored only to the 4 GB default.
+    safety_buffer = min(100 * 1024 * 1024, max(1 * 1024 * 1024, int(max_size * 0.025)))
+    close_enough = max(1 * 1024 * 1024, int(max_size * 0.0125))
+    print(f"Move group limit: {max_size / (1024 * 1024 * 1024):.2f} GB")
     data = load_json('output.json')
     
     for group in data.values():
@@ -113,16 +138,18 @@ def main():
         
         print(f'Processing {current_group_key} with current size {current_size / (1024 * 1024 * 1024):.2f} GB')
 
-        if current_size < (MAX_SIZE-(0.1 * 1024 * 1024 * 1024)):
+        if current_size < (max_size - safety_buffer):
             
-            space_left = MAX_SIZE - current_size
+            space_left = max_size - current_size
           
             
             print(f'{current_group_key} has {space_left / (1024 * 1024 * 1024):.2f} GB space left')
             
             all_other_items = [item for group in unprocessed_groups.values() for item in group['items']]
             
-            best_combination_files = find_best_combination(all_other_items, space_left)
+            best_combination_files = find_best_combination(
+                all_other_items, space_left, close_enough=close_enough
+            )
             best_combination_items = [item for item in all_other_items if item['file'] in best_combination_files]
 
             if not best_combination_items:

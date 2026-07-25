@@ -6,7 +6,7 @@ import mimetypes
 import threading
 import time
 import uuid
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +19,36 @@ from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.utility import UtilityRunner
 
 LOGGER = logging.getLogger(__name__)
+
+
+class JobLogSnapshot:
+    """Bounded raw command output retained with the persistent job history."""
+
+    max_lines = 5_000
+    max_characters = 1_000_000
+
+    def __init__(self) -> None:
+        self._lines: list[str] = []
+        self._characters = 0
+        self.truncated = False
+
+    def add(self, value: str) -> None:
+        for raw_line in str(value).splitlines() or [str(value)]:
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            if len(self._lines) >= self.max_lines or self._characters + len(line) + 1 > self.max_characters:
+                self.truncated = True
+                return
+            self._lines.append(line)
+            self._characters += len(line) + 1
+
+    def value(self) -> dict[str, Any]:
+        return {
+            "lines": self._lines,
+            "line_count": len(self._lines),
+            "truncated": self.truncated,
+        }
 
 
 def json_value(value: Any) -> Any:
@@ -98,8 +128,11 @@ class WorkerJobExecutor:
         self.profile_manager = profile_manager
         self.publisher = publisher
         self._active: dict[str, tuple[str, str]] = {}
+        self._utility_runners: dict[str, UtilityRunner] = {}
+        self._cancel_requested: set[str] = set()
         self._known: set[str] = set()
         self._lock = threading.RLock()
+        self._job_log = threading.local()
         self._jobs = SerialPerKeyQueue[str, dict[str, Any]](
             self._run,
             error_handler=self._unhandled,
@@ -134,13 +167,25 @@ class WorkerJobExecutor:
     def cancel(self, job_id: str) -> bool:
         with self._lock:
             active = self._active.get(job_id)
+            utility_runner = self._utility_runners.get(job_id)
         if active is None:
             return False
         profile, kind = active
-        if kind != "download":
-            return False
         runtime = self.profile_manager.runtime(profile)
-        return bool(runtime.download_tdl_client.cancel_current())
+        if kind == "download":
+            cancelled = runtime.download_tdl_client.interrupt_current()
+        elif kind in {"export", "storage_upload", "backup_node"}:
+            cancelled = runtime.export_tdl_client.interrupt_current()
+        elif kind == "leave":
+            cancelled = runtime.leave_service.runner.interrupt_current()
+        elif kind == "utility" and utility_runner is not None:
+            cancelled = utility_runner.cancel_current()
+        else:
+            cancelled = False
+        if cancelled:
+            with self._lock:
+                self._cancel_requested.add(job_id)
+        return cancelled
 
     def queue_size(self, profile: str) -> int:
         return self._jobs.queue_size(profile)
@@ -154,6 +199,9 @@ class WorkerJobExecutor:
         job_id = str(command["job_id"])
         profile = str(command["profile"])
         kind = str(command["kind"])
+        snapshot = JobLogSnapshot()
+        snapshot.add(f"[job {job_id} started: {kind}]")
+        self._job_log.snapshot = snapshot
         with self._lock:
             self._active[job_id] = (profile, kind)
         try:
@@ -164,15 +212,42 @@ class WorkerJobExecutor:
                 progress={"message": f"{kind} mulai diproses"},
             )
             result = self._execute(command)
-            self.publisher.emit(
-                job_id, "succeeded", "completed", result={"value": json_value(result)}
-            )
+            with self._lock:
+                cancelled = job_id in self._cancel_requested
+            snapshot.add("[job terminated]" if cancelled else "[job completed]")
+            self._publish_log_snapshot(job_id, snapshot)
+            if cancelled:
+                self.publisher.emit(
+                    job_id,
+                    "cancelled",
+                    "cancelled",
+                    error={"code": "JOB_TERMINATED", "message": "Job dihentikan oleh user (Ctrl+C)."},
+                )
+            else:
+                self.publisher.emit(
+                    job_id, "succeeded", "completed", result={"value": json_value(result)}
+                )
         except Exception as exc:
             LOGGER.exception("Job %s (%s) failed", job_id, kind)
-            self._failed(command, exc)
+            snapshot.add(f"[job failed: {exc}]")
+            self._publish_log_snapshot(job_id, snapshot)
+            with self._lock:
+                cancelled = job_id in self._cancel_requested
+            if cancelled:
+                self.publisher.emit(
+                    job_id,
+                    "cancelled",
+                    "cancelled",
+                    error={"code": "JOB_TERMINATED", "message": "Job dihentikan oleh user (Ctrl+C)."},
+                )
+            else:
+                self._failed(command, exc)
         finally:
+            del self._job_log.snapshot
             with self._lock:
                 self._active.pop(job_id, None)
+                self._utility_runners.pop(job_id, None)
+                self._cancel_requested.discard(job_id)
             self.publisher.forget(job_id)
 
     def _failed(self, command: dict[str, Any], exc: Exception) -> None:
@@ -188,6 +263,34 @@ class WorkerJobExecutor:
             )
         except Exception:
             LOGGER.exception("Could not publish failure for job %s", command.get("job_id"))
+
+    def _append_job_log(self, line: str) -> None:
+        snapshot = getattr(self._job_log, "snapshot", None)
+        if snapshot is not None:
+            snapshot.add(line)
+
+    def _publish_log_snapshot(self, job_id: str, snapshot: JobLogSnapshot) -> None:
+        self.publisher.emit(
+            job_id,
+            "running",
+            "log.snapshot",
+            result={"log": snapshot.value()},
+        )
+
+    @contextmanager
+    def _capture_tdl_output(self, client):
+        previous = client.output_callback
+
+        def capture(line: str) -> None:
+            self._append_job_log(line)
+            if previous is not None:
+                previous(line)
+
+        client.output_callback = capture
+        try:
+            yield
+        finally:
+            client.output_callback = previous
 
     def _execute(self, command: dict[str, Any]) -> Any:
         kind = str(command["kind"])
@@ -223,10 +326,11 @@ class WorkerJobExecutor:
             if label:
                 url += f"/{quote(label, safe='')}"
         with runtime.export_operation_lock:
-            result = runtime.export_service.export_from_url(
-                str(url),
-                use_url_message_id=bool(payload.get("use_url_message_id", False)),
-            )
+            with self._capture_tdl_output(runtime.export_tdl_client):
+                result = runtime.export_service.export_from_url(
+                    str(url),
+                    use_url_message_id=bool(payload.get("use_url_message_id", False)),
+                )
         stats = inspect_export_json(result.export_path)
         artifact = {
             **stats,
@@ -249,7 +353,8 @@ class WorkerJobExecutor:
         runtime = self.profile_manager.runtime(str(command["profile"]))
         with runtime.export_operation_lock:
             result = runtime.leave_service.leave(
-                [str(item) for item in command["payload"].get("chat_refs", [])]
+                [str(item) for item in command["payload"].get("chat_refs", [])],
+                output_callback=self._append_job_log,
             )
             deleted = runtime.state_store.delete_sources(result.succeeded)
         return {"succeeded": deleted, "failed": result.failed}
@@ -279,14 +384,15 @@ class WorkerJobExecutor:
         monitor.start()
         try:
             with runtime.download_operation_lock:
-                if command["payload"].get("retry_failed"):
-                    result = runtime.download_service.retry_failed_exports()
-                elif command["payload"].get("artifact_keys"):
-                    result = runtime.download_service.download_selected_exports(
-                        [str(item) for item in command["payload"]["artifact_keys"]]
-                    )
-                else:
-                    result = runtime.download_service.download_pending_exports()
+                with self._capture_tdl_output(runtime.download_tdl_client):
+                    if command["payload"].get("retry_failed"):
+                        result = runtime.download_service.retry_failed_exports()
+                    elif command["payload"].get("artifact_keys"):
+                        result = runtime.download_service.download_selected_exports(
+                            [str(item) for item in command["payload"]["artifact_keys"]]
+                        )
+                    else:
+                        result = runtime.download_service.download_pending_exports()
             for item in result.results:
                 self.publisher.emit(
                     str(command["job_id"]),
@@ -379,15 +485,23 @@ class WorkerJobExecutor:
 
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
+            log_callback=self._append_job_log,
         )
-        return json_value(
-            runner.run(
-                str(payload["utility"]),
-                [str(item) for item in folders],
-                payload.get("password"),
-                payload.get("settings") or {},
+        job_id = str(command["job_id"])
+        with self._lock:
+            self._utility_runners[job_id] = runner
+        try:
+            return json_value(
+                runner.run(
+                    str(payload["utility"]),
+                    [str(item) for item in folders],
+                    payload.get("password"),
+                    payload.get("settings") or {},
+                )
             )
-        )
+        finally:
+            with self._lock:
+                self._utility_runners.pop(job_id, None)
 
     def _storage_upload(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
@@ -400,60 +514,61 @@ class WorkerJobExecutor:
             raise ValueError("Folder storage tidak berisi file.")
         failed, succeeded = [], 0
         with runtime.export_operation_lock:
-            for index, path in enumerate(files, start=1):
-                try:
-                    upload_id = str(
-                        uuid.uuid5(
-                            uuid.NAMESPACE_URL,
-                            f"tme3bot:{payload['batch_id']}:{path.relative_to(root)}",
+            with self._capture_tdl_output(runtime.export_tdl_client):
+                for index, path in enumerate(files, start=1):
+                    try:
+                        upload_id = str(
+                            uuid.uuid5(
+                                uuid.NAMESPACE_URL,
+                                f"tme3bot:{payload['batch_id']}:{path.relative_to(root)}",
+                            )
                         )
-                    )
-                    caption = build_storage_caption(
-                        str(payload["folder"]), path.name, str(payload.get("keywords", ""))
-                    )
-                    result = runtime.export_tdl_client.upload(
-                        path, runtime.config.storage_channel_ref, caption
-                    )
-                    digest, size = self._digest(path)
-                    item = {
-                        "upload_id": upload_id,
-                        "owner_user_id": int(payload["owner_user_id"]),
-                        "owner_profile": str(payload["owner_profile"]),
-                        "channel_id": runtime.config.storage_channel_id,
-                        "channel_message_id": result.message_id,
-                        "original_name": path.name,
-                        "display_name": path.name,
-                        "folder": str(payload["folder"]),
-                        "keywords": str(payload.get("keywords", "")),
-                        "caption": caption,
-                        "file_size": size,
-                        "mime_type": mimetypes.guess_type(path.name)[0] or "",
-                        "sha256": digest,
-                        "status": "active",
-                        "uploaded_at": None,
-                    }
-                    self.publisher.emit(
-                        str(command["job_id"]),
-                        "running",
-                        "storage.item_uploaded",
-                        progress={"current": index, "total": len(files), "message": path.name},
-                        result={"item": item},
-                    )
-                    succeeded += 1
-                except Exception as exc:
-                    LOGGER.exception("Storage upload failed for %s", path)
-                    failed.append({"name": path.name, "error": str(exc)})
-                    self.publisher.emit(
-                        str(command["job_id"]),
-                        "running",
-                        "progress",
-                        progress={
-                            "current": index,
-                            "total": len(files),
-                            "message": path.name,
-                            "failed": len(failed),
-                        },
-                    )
+                        caption = build_storage_caption(
+                            str(payload["folder"]), path.name, str(payload.get("keywords", ""))
+                        )
+                        result = runtime.export_tdl_client.upload(
+                            path, runtime.config.storage_channel_ref, caption
+                        )
+                        digest, size = self._digest(path)
+                        item = {
+                            "upload_id": upload_id,
+                            "owner_user_id": int(payload["owner_user_id"]),
+                            "owner_profile": str(payload["owner_profile"]),
+                            "channel_id": runtime.config.storage_channel_id,
+                            "channel_message_id": result.message_id,
+                            "original_name": path.name,
+                            "display_name": path.name,
+                            "folder": str(payload["folder"]),
+                            "keywords": str(payload.get("keywords", "")),
+                            "caption": caption,
+                            "file_size": size,
+                            "mime_type": mimetypes.guess_type(path.name)[0] or "",
+                            "sha256": digest,
+                            "status": "active",
+                            "uploaded_at": None,
+                        }
+                        self.publisher.emit(
+                            str(command["job_id"]),
+                            "running",
+                            "storage.item_uploaded",
+                            progress={"current": index, "total": len(files), "message": path.name},
+                            result={"item": item},
+                        )
+                        succeeded += 1
+                    except Exception as exc:
+                        LOGGER.exception("Storage upload failed for %s", path)
+                        failed.append({"name": path.name, "error": str(exc)})
+                        self.publisher.emit(
+                            str(command["job_id"]),
+                            "running",
+                            "progress",
+                            progress={
+                                "current": index,
+                                "total": len(files),
+                                "message": path.name,
+                                "failed": len(failed),
+                            },
+                        )
         return {"total": len(files), "succeeded": succeeded, "failed": failed}
 
     def _backup(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -474,32 +589,33 @@ class WorkerJobExecutor:
             raise RuntimeError("Tidak ada profile runtime untuk upload backup.")
         uploader = runtimes[0].export_tdl_client
         sent = 0
-        for part in archive.parts:
-            digest, size = sha256_file(part)
-            caption = (
-                f"Backup node={payload['node_name']} "
-                f"run={str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
-            )
-            result = uploader.upload(part, str(payload["channel_ref"]), caption)
-            part_payload = {
-                "run_id": str(payload["backup_run_id"]),
-                "node_name": str(payload["node_name"]),
-                "part_name": part.name,
-                "channel_id": int(payload["channel_id"]),
-                "channel_message_id": result.message_id,
-                "file_size": size,
-                "sha256": digest,
-                "uploaded_at": archive.created_at,
-                "status": "active",
-            }
-            self.publisher.emit(
-                str(command["job_id"]),
-                "running",
-                "backup.part_uploaded",
-                progress={"current": sent + 1, "total": len(archive.parts), "message": part.name},
-                result={"part": part_payload},
-            )
-            sent += 1
+        with self._capture_tdl_output(uploader):
+            for part in archive.parts:
+                digest, size = sha256_file(part)
+                caption = (
+                    f"Backup node={payload['node_name']} "
+                    f"run={str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
+                )
+                result = uploader.upload(part, str(payload["channel_ref"]), caption)
+                part_payload = {
+                    "run_id": str(payload["backup_run_id"]),
+                    "node_name": str(payload["node_name"]),
+                    "part_name": part.name,
+                    "channel_id": int(payload["channel_id"]),
+                    "channel_message_id": result.message_id,
+                    "file_size": size,
+                    "sha256": digest,
+                    "uploaded_at": archive.created_at,
+                    "status": "active",
+                }
+                self.publisher.emit(
+                    str(command["job_id"]),
+                    "running",
+                    "backup.part_uploaded",
+                    progress={"current": sent + 1, "total": len(archive.parts), "message": part.name},
+                    result={"part": part_payload},
+                )
+                sent += 1
         for part in archive.parts:
             try:
                 part.unlink(missing_ok=True)

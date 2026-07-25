@@ -33,6 +33,7 @@ class FakeRunner:
         log_prefix: str = "tdl",
         stall_timeout_seconds: int = 0,
         progress_callback=None,
+        output_callback=None,
     ) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
         self.envs.append(env)
@@ -115,6 +116,21 @@ class TDLClientTests(unittest.TestCase):
         self.assertIn("complete captured output follows", logs)
         self.assertIn("before \\xa8 after", logs)
         self.assertIn("fatal \\xff detail", logs)
+
+    def test_runner_forwards_raw_output_to_snapshot_callback(self) -> None:
+        env = dict(os.environ)
+        env["TDL_FORCE_PTY"] = "0"
+        captured: list[str] = []
+        result = SubprocessRunner().run(
+            [sys.executable, "-c", "print('raw worker output')"],
+            env=env,
+            log_prefix="tdl-test",
+            output_callback=captured.append,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(any("raw worker output" in line for line in captured))
+        self.assertTrue(any("process exited with code 0" in line for line in captured))
 
     def test_export_handles_empty_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

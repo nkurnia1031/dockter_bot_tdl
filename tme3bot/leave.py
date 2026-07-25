@@ -5,6 +5,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from tme3bot.tdl import SubprocessRunner, TDLCommandError
 
@@ -22,7 +23,12 @@ class LeaveService:
         self.config = config
         self.runner = runner or SubprocessRunner()
 
-    def leave(self, chat_refs: list[str]) -> LeaveResult:
+    def leave(
+        self,
+        chat_refs: list[str],
+        *,
+        output_callback: Callable[[str], None] | None = None,
+    ) -> LeaveResult:
         command = [
             self.config.leave_helper_binary,
             "--storage", str(self.config.tdl_export_storage / "data"),
@@ -35,7 +41,12 @@ class LeaveService:
         env = dict(os.environ)
         env["HOME"] = str(self.config.tdl_export_home)
         env["TDL_FORCE_PTY"] = "0"
-        result = self.runner.run(command, env=env, log_prefix="tdl-leave")
+        result = self.runner.run(
+            command,
+            env=env,
+            log_prefix="tdl-leave",
+            output_callback=output_callback,
+        )
         if result.returncode != 0:
             raise TDLCommandError(command, result.returncode, result.stdout, result.stderr)
         succeeded: list[str] = []

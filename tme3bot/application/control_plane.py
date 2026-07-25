@@ -145,18 +145,14 @@ class ControlPlane:
         if not self.dispatcher.cancel(job.worker, job.id):
             raise DomainError(
                 "JOB_NOT_CANCELLABLE",
-                "Worker tidak dapat membatalkan job tersebut.",
+                "Worker tidak memiliki proses aktif yang dapat dihentikan.",
                 status_code=409,
             )
-        sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-        return self.jobs.append_event(
-            JobEvent(
-                job_id=job.id,
-                sequence=sequence,
-                status=JobStatus.CANCELLED,
-                event_type="cancelled",
-            )
-        )[0]
+        # The worker emits the terminal ``cancelled`` event only after the
+        # interrupted process has actually stopped. Marking it terminal here
+        # would reject late log/final events and make the UI lie about a still
+        # running process.
+        return self.jobs.get(job.id) or job
 
     @staticmethod
     def _redacted_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:

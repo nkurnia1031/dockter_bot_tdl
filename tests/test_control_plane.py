@@ -77,6 +77,17 @@ class ControlPlaneTests(unittest.TestCase):
             "extract-secret",
         )
 
+    def test_terminate_waits_for_worker_terminal_event(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+
+        returned = self.control.cancel_job(self.actor, job.id)
+
+        self.assertEqual(returned.status.value, "dispatched")
+        self.assertTrue(self.jobs.has_active("default"))
+        self.assertFalse(any(event.status.value == "cancelled" for event in self.jobs.events(job.id)))
+
 
 if __name__ == "__main__":
     unittest.main()
