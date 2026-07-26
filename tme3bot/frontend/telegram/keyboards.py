@@ -106,27 +106,6 @@ def export_workspace_markup(
     return InlineKeyboardMarkup(rows)
 
 
-def export_job_markup(terminal: bool = False) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Export fokus", callback_data="workspace:export"),
-                InlineKeyboardButton("Refresh report", callback_data="ew:refresh_job"),
-            ],
-            [InlineKeyboardButton("Detail job", callback_data="ew:detail")],
-            [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
-        ]
-        if not terminal
-        else [
-            [
-                InlineKeyboardButton("Export lagi", callback_data="workspace:export"),
-                InlineKeyboardButton("Detail job", callback_data="ew:detail"),
-            ],
-            [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
-        ]
-    )
-
-
 def export_input_cancel_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Batal, kembali ke form", callback_data="workspace:export")]]

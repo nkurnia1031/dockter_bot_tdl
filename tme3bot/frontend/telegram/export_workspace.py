@@ -50,6 +50,50 @@ def export_report(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def format_export_job(job: dict[str, Any]) -> str:
+    """Render job details without exposing raw dictionaries or empty counters."""
+    progress = job.get("progress") or {}
+    lines = [f"Status: {job.get('status', '-')}" ]
+    if job.get("id"):
+        lines.append(f"Job: {str(job['id'])[:12]}")
+    profile = job.get("profile")
+    worker = job.get("worker")
+    if profile or worker:
+        lines.append(
+            "  •  ".join(
+                value for value in (f"Profile: {profile}" if profile else "", f"Worker: {worker}" if worker else "") if value
+            )
+        )
+    if job.get("queue_position") is not None:
+        lines.append(f"Posisi antrean: {job['queue_position']}")
+    if progress.get("message"):
+        lines.append(f"Saat ini: {short_text(progress['message'], 160)}")
+    overall = progress.get("overall")
+    if isinstance(overall, dict):
+        current = overall.get("current", "?")
+        total = overall.get("total", "?")
+        percent = overall.get("percent")
+        suffix = f" ({percent:.1f}%)" if isinstance(percent, (int, float)) else ""
+        lines.append(f"Progress: {current}/{total}{suffix}")
+
+    if job.get("status") in {"succeeded", "failed", "cancelled"}:
+        report = export_report(job)
+        for label, key in (
+            ("Message", "message_count"),
+            ("Media", "media_count"),
+            ("Foto", "photo_count"),
+            ("Video", "video_count"),
+            ("Latest ID", "latest_id"),
+        ):
+            if report[key] is not None:
+                lines.append(f"{label}: {report[key]}")
+        if report["filename"] or report["artifact"]:
+            lines.append(f"Artifact: {report['filename'] or report['artifact']}")
+        if report["error"]:
+            lines.append(f"Error: {short_text(report['error'], 240)}")
+    return "\n".join(lines)
+
+
 @dataclass
 class ExportWorkspaceState:
     source: dict[str, Any] | None = None
@@ -57,7 +101,7 @@ class ExportWorkspaceState:
     label: str | None = None
     start_id: int | None = None
     active_job_id: str | None = None
-    terminal_notified_job_id: str | None = None
+    job_snapshot: dict[str, Any] | None = None
     source_page: int = 0
     label_page: int = 0
     touched_at: float = field(default_factory=time.monotonic)
@@ -74,6 +118,7 @@ class ExportWorkspaceState:
         self.chat_ref = ref
         self.start_id = None
         self.source_page = 0
+        self.clear_job_view()
         self.touch()
 
     def select_chat_ref(self, chat_ref: str, source: dict[str, Any] | None = None) -> None:
@@ -86,7 +131,17 @@ class ExportWorkspaceState:
             self.source["chat_ref"] = ref
         self.start_id = None
         self.source_page = 0
+        self.clear_job_view()
         self.touch()
+
+    def set_job(self, job: dict[str, Any]) -> None:
+        self.active_job_id = str(job.get("id", "")) or None
+        self.job_snapshot = dict(job)
+        self.touch()
+
+    def clear_job_view(self) -> None:
+        self.active_job_id = None
+        self.job_snapshot = None
 
     def set_label(self, label: str | None) -> None:
         value = str(label or "").strip()

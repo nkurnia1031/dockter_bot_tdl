@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.4 - Storage file manager, notifikasi export, dan Telegram export workspace
+Versi: 3.5 - Storage file manager dan single-panel Telegram export
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -29,7 +29,7 @@ manual. Data `/data`, katalog, state, dan sesi TDL tidak dihapus.
 
 Worker release ini juga menambahkan statistik `message_count`, `media_count`,
 `photo_count`, dan `video_count` pada report akhir export. Web memakai data itu
-untuk notifikasi fixed saat export masuk antrean dan selesai.
+untuk ringkasan report pada panel export Telegram dan dashboard.
 
 ## Workspace export Telegram
 
@@ -48,9 +48,11 @@ worker, settings, dan source management lama. Pergantian workspace hanya
 mengubah tampilan bot; profile, worker route, state source, dan job aktif tidak
 berubah. Setelah restart frontend Telegram, mode awal kembali ke `Export fokus`.
 
-Saat export diterima, Telegram menampilkan alert antrean. Saat job terminal,
-bot mengirim satu notifikasi baru berisi status, jumlah message/media/foto/video,
-latest ID, dan artifact. Panel job tetap dapat dibuka melalui tombol report.
+Saat export dikirim, callback hanya di-acknowledge tanpa popup. Status antrean,
+progress, dan report terminal ditulis ke panel export utama yang sama. Tidak ada
+pesan terminal tambahan dan tidak ada keyboard job terpisah. Jika user memilih
+source lagi, detail job pada panel dihapus dan form kembali ke kondisi awal;
+job backend yang sudah berjalan tetap dilanjutkan.
 
 ## Sekali saja: konfigurasi gateway dan UI
 

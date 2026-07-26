@@ -4,6 +4,7 @@ from tme3bot.frontend.telegram.export_workspace import (
     ExportWorkspaceState,
     ExportWorkspaceStore,
     export_report,
+    format_export_job,
 )
 from tme3bot.frontend.telegram.keyboards import export_workspace_markup
 
@@ -55,6 +56,18 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertEqual(first.chat_ref, "one")
         self.assertIsNone(second.chat_ref)
 
+    def test_selecting_source_resets_only_the_panel_job_view(self):
+        state = ExportWorkspaceState()
+        state.select_source({"chat_ref": "old", "last_id": 10})
+        state.set_job({"id": "job-old", "status": "succeeded"})
+
+        state.select_source({"chat_ref": "new", "last_id": 20})
+
+        self.assertEqual(state.chat_ref, "new")
+        self.assertIsNone(state.active_job_id)
+        self.assertIsNone(state.job_snapshot)
+        self.assertEqual(state.default_start_id, 21)
+
     def test_report_unwraps_structured_worker_result(self):
         report = export_report(
             {
@@ -91,6 +104,25 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertTrue(any("arsip" in value for value in labels))
         self.assertTrue(any("2026" in value for value in labels))
         self.assertFalse(any("object at" in value for value in labels))
+        self.assertFalse(any(value in labels for value in ("Export lagi", "Detail job")))
+
+    def test_job_formatter_is_structured_and_omits_missing_fields(self):
+        text = format_export_job(
+            {
+                "status": "succeeded",
+                "id": "job-1234567890",
+                "profile": "default",
+                "worker": "local",
+                "result": {"value": {"message_count": 3, "media_count": 1}},
+            }
+        )
+
+        self.assertIn("Status: succeeded", text)
+        self.assertIn("Message: 3", text)
+        self.assertIn("Media: 1", text)
+        self.assertNotIn("Foto:", text)
+        self.assertNotIn("Video:", text)
+        self.assertNotIn("{'", text)
 
 
 if __name__ == "__main__":

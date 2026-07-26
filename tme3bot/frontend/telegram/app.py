@@ -22,7 +22,6 @@ from tme3bot.frontend.telegram.keyboards import (
     check_profile_markup,
     clear_confirm_markup,
     download_status_markup,
-    export_job_markup,
     export_input_cancel_markup,
     export_workspace_markup,
     main_menu_markup,
@@ -43,7 +42,7 @@ from tme3bot.frontend.telegram.panel import (
 from tme3bot.frontend.telegram.text import help_text, source_digest
 from tme3bot.frontend.telegram.export_workspace import (
     ExportWorkspaceStore,
-    export_report,
+    format_export_job,
     short_text,
 )
 from tme3bot.frontend.client import BackendApiClient
@@ -420,8 +419,7 @@ class TelegramFrontendApp:
 
     def _workspace_callback(self, query, user_id: int, actor: dict[str, Any], data: str) -> None:
         message = query.message
-        if data != "ew:submit":
-            query.answer()
+        query.answer()
         if data == "workspace:full":
             edit_menu_message(
                 message,
@@ -510,7 +508,7 @@ class TelegramFrontendApp:
             )
             return
         if data == "ew:submit":
-            self._submit_export_workspace(message, user_id, actor, query)
+            self._submit_export_workspace(message, user_id, actor)
             return
         if data in {"ew:refresh_job", "ew:detail"}:
             state = self.export_workspaces.get(message.chat_id, user_id)
@@ -519,13 +517,12 @@ class TelegramFrontendApp:
                 return
             try:
                 job = self.client.get(user_id, f"/api/v1/jobs/{state.active_job_id}")
-                edit_menu_message(
-                    message,
-                    self._export_job_text(job),
-                    export_job_markup(job.get("status") in TERMINAL_JOB_STATUSES),
-                )
+                state.set_job(job)
+                self._show_export_workspace(message, user_id, actor)
             except Exception as exc:
-                self._show_error(message, exc)
+                self._show_export_workspace(
+                    message, user_id, actor, f"Report belum dapat dimuat: {short_text(exc, 240)}"
+                )
             return
         self._show_export_workspace(message, user_id, actor)
 
@@ -537,6 +534,16 @@ class TelegramFrontendApp:
         notice: str | None = None,
     ) -> None:
         state = self.export_workspaces.get(message.chat_id, user_id)
+        text, markup = self._export_panel_content(user_id, actor, state, notice)
+        self.panel.update_from_message(message, text, markup)
+
+    def _export_panel_content(
+        self,
+        user_id: int,
+        actor: dict[str, Any],
+        state,
+        notice: str | None = None,
+    ) -> tuple[str, Any]:
         sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
         labels = self.client.get(user_id, "/api/v1/labels").get("items", [])
         source_map = {
@@ -562,42 +569,48 @@ class TelegramFrontendApp:
             lines.append("Source baru: belum memiliki Last ID backend")
         if notice:
             lines.extend(["", f"ℹ️ {notice}"])
-        self.panel.update_from_message(
-            message,
-            "\n".join(lines),
-            export_workspace_markup(state, sources, labels),
-        )
+        if state.job_snapshot:
+            status = state.job_snapshot.get("status")
+            heading = "✅ Report export" if status == "succeeded" else (
+                "❌ Report export" if status in {"failed", "cancelled"} else "⏳ Job export"
+            )
+            lines.extend(["", heading, format_export_job(state.job_snapshot)])
+        return "\n".join(lines), export_workspace_markup(state, sources, labels)
 
     def _submit_export_workspace(
-        self, message, user_id: int, actor: dict[str, Any], query=None
+        self, message, user_id: int, actor: dict[str, Any]
     ) -> None:
         state = self.export_workspaces.get(message.chat_id, user_id)
         try:
             payload = state.payload()
         except (TypeError, ValueError) as exc:
-            if query is not None:
-                query.answer(str(exc), show_alert=True)
-            edit_menu_message(
-                message,
-                f"⚠️ {exc}",
-                export_workspace_markup(state),
-            )
+            state.set_job({
+                "status": "failed",
+                "profile": actor.get("profile"),
+                "worker": actor.get("worker_route"),
+                "error": {"message": str(exc)},
+            })
+            self._show_export_workspace(message, user_id, actor)
             return
-        if state.label:
-            self.client.post(user_id, "/api/v1/labels", {"label": state.label})
-        job = self.client.post(user_id, "/api/v1/exports", payload)
-        state.active_job_id = str(job["id"])
-        state.terminal_notified_job_id = None
-        if query is not None:
-            query.answer("Export masuk antrian", show_alert=True)
-        chat_id, _ = self.panel.update_from_message(
-            message,
-            self._export_job_text(job),
-            export_job_markup(False),
-        )
+        try:
+            if state.label:
+                self.client.post(user_id, "/api/v1/labels", {"label": state.label})
+            job = self.client.post(user_id, "/api/v1/exports", payload)
+        except Exception as exc:
+            state.set_job({
+                "status": "failed",
+                "profile": actor.get("profile"),
+                "worker": actor.get("worker_route"),
+                "error": {"message": str(exc)},
+            })
+            self._show_export_workspace(message, user_id, actor)
+            return
+        state.set_job(job)
+        text, markup = self._export_panel_content(user_id, actor, state)
+        chat_id, _ = self.panel.update_from_message(message, text, markup)
         token = self.panel.begin_view(chat_id)
         if job.get("status") not in TERMINAL_JOB_STATUSES:
-            self._poll_export_job(chat_id, user_id, str(job["id"]), token)
+            self._poll_export_job(chat_id, user_id, str(job["id"]), token, actor)
 
     def _handle_export_input(self, message, user_id: int, pending: PendingInput, value: str) -> None:
         state = self.export_workspaces.get(message.chat_id, user_id)
@@ -630,7 +643,12 @@ class TelegramFrontendApp:
             self._show_export_workspace(message, user_id, self.client.me(user_id))
 
     def _poll_export_job(
-        self, chat_id: int, user_id: int, job_id: str, panel_token: int
+        self,
+        chat_id: int,
+        user_id: int,
+        job_id: str,
+        panel_token: int,
+        actor: dict[str, Any],
     ) -> None:
         def loop() -> None:
             last = ""
@@ -639,17 +657,14 @@ class TelegramFrontendApp:
                     return
                 try:
                     job = self.client.get(user_id, f"/api/v1/jobs/{job_id}")
-                    text = self._export_job_text(job)
+                    state = self.export_workspaces.get(chat_id, user_id)
+                    state.set_job(job)
+                    text, markup = self._export_panel_content(user_id, actor, state)
                     terminal = job.get("status") in TERMINAL_JOB_STATUSES
                     if text != last:
-                        self.panel.update(
-                            chat_id,
-                            text,
-                            export_job_markup(terminal),
-                        )
+                        self.panel.update(chat_id, text, markup)
                         last = text
                     if terminal:
-                        self._notify_export_complete(chat_id, user_id, job)
                         return
                 except Exception:
                     LOGGER.exception("Export workspace polling failed for %s", job_id)
@@ -661,67 +676,6 @@ class TelegramFrontendApp:
             daemon=True,
             name=f"telegram-export-workspace-{job_id[:8]}",
         ).start()
-
-    def _notify_export_complete(self, chat_id: int, user_id: int, job: dict[str, Any]) -> None:
-        state = self.export_workspaces.get(chat_id, user_id)
-        job_id = str(job.get("id", ""))
-        if state.terminal_notified_job_id == job_id:
-            return
-        state.terminal_notified_job_id = job_id
-        try:
-            self.panel.bot.send_message(
-                chat_id,
-                self._export_completion_text(job),
-                reply_markup=export_job_markup(True),
-            )
-        except Exception:
-            LOGGER.exception("Could not send export completion notification")
-
-    @staticmethod
-    def _export_job_text(job: dict[str, Any]) -> str:
-        progress = job.get("progress") or {}
-        lines = [
-            "🚀 Export fokus",
-            f"Status: {job.get('status', '-')}",
-            f"Job: {str(job.get('id', ''))[:12]}",
-            f"Profile: {job.get('profile', '-')}  •  Worker: {job.get('worker', '-')}",
-        ]
-        if job.get("queue_position") is not None:
-            lines.append(f"Posisi antrean: {job['queue_position']}")
-        if progress.get("message"):
-            lines.append(f"Saat ini: {short_text(progress['message'], 160)}")
-        if progress.get("overall"):
-            overall = progress["overall"]
-            current = overall.get("current", "?")
-            total = overall.get("total", "?")
-            percent = overall.get("percent")
-            suffix = f" ({percent:.1f}%)" if isinstance(percent, (int, float)) else ""
-            lines.append(f"Progress: {current}/{total}{suffix}")
-        if job.get("status") in TERMINAL_JOB_STATUSES:
-            lines.extend(["", TelegramFrontendApp._export_completion_text(job)])
-        return "\n".join(lines)
-
-    @staticmethod
-    def _export_completion_text(job: dict[str, Any]) -> str:
-        report = export_report(job)
-        lines = [
-            f"{'✅' if report['status'] == 'succeeded' else '❌'} Export {report['status']}",
-        ]
-        labels = (
-            ("Message", report["message_count"]),
-            ("Media", report["media_count"]),
-            ("Foto", report["photo_count"]),
-            ("Video", report["video_count"]),
-            ("Latest ID", report["latest_id"]),
-        )
-        for label, value in labels:
-            if value is not None:
-                lines.append(f"{label}: {value}")
-        if report["filename"] or report["artifact"]:
-            lines.append(f"Artifact: {report['filename'] or report['artifact']}")
-        if report["error"]:
-            lines.append(f"Error: {short_text(report['error'], 240)}")
-        return "\n".join(lines)
 
     def _show_workers(
         self, message, user_id: int, actor: dict[str, Any]
