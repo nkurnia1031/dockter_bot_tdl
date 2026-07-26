@@ -2861,8 +2861,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tests_test_state",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": "test_state.py"
     },
     {
@@ -2872,8 +2872,8 @@
       "source_location": "L9",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": "statestoretests"
     },
     {
@@ -2883,8 +2883,8 @@
       "source_location": "L10",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests_test_username_source_ignores_at_sign_and_case",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".test_username_source_ignores_at_sign_and_case()"
     },
     {
@@ -2894,8 +2894,8 @@
       "source_location": "L22",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests_test_last_id_never_moves_backwards_when_worker_finishes_late",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".test_last_id_never_moves_backwards_when_worker_finishes_late()"
     },
     {
@@ -2905,8 +2905,8 @@
       "source_location": "L33",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests_test_migrates_numeric_values_and_skips_tracebacks",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".test_migrates_numeric_values_and_skips_tracebacks()"
     },
     {
@@ -2916,8 +2916,8 @@
       "source_location": "L57",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests_test_upsert_updates_latest_label_without_splitting_last_id",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".test_upsert_updates_latest_label_without_splitting_last_id()"
     },
     {
@@ -2927,8 +2927,8 @@
       "source_location": "L71",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests_test_delete_source_removes_only_requested_chat",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".test_delete_source_removes_only_requested_chat()"
     },
     {
@@ -2938,8 +2938,8 @@
       "source_location": "L83",
       "_origin": "ast",
       "id": "tests_test_state_statestoretests_test_delete_sources_removes_batch_in_one_update",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".test_delete_sources_removes_batch_in_one_update()"
     },
     {
@@ -8581,8 +8581,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_names",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "names.py"
     },
     {
@@ -8603,8 +8603,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_persistence",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "persistence.py"
     },
     {
@@ -8614,8 +8614,8 @@
       "source_location": "L9",
       "_origin": "ast",
       "id": "tme3bot_persistence_utc_now_iso",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "utc_now_iso()"
     },
     {
@@ -8625,8 +8625,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "tme3bot_persistence_write_json_atomic",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "write_json_atomic()"
     },
     {
@@ -8636,8 +8636,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_persistence_py_path",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "path"
     },
     {
@@ -8647,8 +8647,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_persistence_py_any",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "any"
     },
     {
@@ -8823,8 +8823,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_profile_registry",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "profile_registry.py"
     },
     {
@@ -9681,8 +9681,8 @@
       "source_location": "L41",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadresult",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "batchdownloadresult"
     },
     {
@@ -9703,8 +9703,8 @@
       "source_location": "L49",
       "_origin": "ast",
       "id": "tme3bot_service_exportservice_init",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".__init__()"
     },
     {
@@ -9758,8 +9758,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_service_py_path",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "path"
     },
     {
@@ -9824,8 +9824,8 @@
       "source_location": "L185",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "batchdownloadservice"
     },
     {
@@ -9846,8 +9846,8 @@
       "source_location": "L198",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_download_pending_exports",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": ".download_pending_exports()"
     },
     {
@@ -9857,8 +9857,8 @@
       "source_location": "L203",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_download_selected_exports",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": ".download_selected_exports()"
     },
     {
@@ -9868,8 +9868,8 @@
       "source_location": "L223",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_retry_failed_exports",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": ".retry_failed_exports()"
     },
     {
@@ -9879,8 +9879,8 @@
       "source_location": "L228",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_clear_failed_exports",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": ".clear_failed_exports()"
     },
     {
@@ -9890,8 +9890,8 @@
       "source_location": "L234",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_download_files",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "._download_files()"
     },
     {
@@ -9901,8 +9901,8 @@
       "source_location": "L295",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_download_dir_for_export",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "._download_dir_for_export()"
     },
     {
@@ -9912,8 +9912,8 @@
       "source_location": "L305",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_warmup_if_needed",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "._warmup_if_needed()"
     },
     {
@@ -9923,8 +9923,8 @@
       "source_location": "L324",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_read_export_metadata",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "._read_export_metadata()"
     },
     {
@@ -9934,8 +9934,8 @@
       "source_location": "L334",
       "_origin": "ast",
       "id": "tme3bot_service_batchdownloadservice_move_to_processing",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "._move_to_processing()"
     },
     {
@@ -9945,8 +9945,8 @@
       "source_location": "L341",
       "_origin": "ast",
       "id": "tme3bot_service_unique_path",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "unique_path()"
     },
     {
@@ -9978,8 +9978,8 @@
       "source_location": "L206",
       "_origin": "ast",
       "id": "tme3bot_service_rationale_206",
-      "community": 55,
-      "community_name": "BatchDownloadService",
+      "community": 49,
+      "community_name": "build_profile_runtime",
       "norm_label": "download selected opaque filenames after strict directory validation."
     },
     {
@@ -9989,8 +9989,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_state",
-      "community": 83,
-      "community_name": "next",
+      "community": 43,
+      "community_name": "HttpStateStore",
       "norm_label": "state.py"
     },
     {
@@ -10077,8 +10077,8 @@
       "source_location": "L77",
       "_origin": "ast",
       "id": "tme3bot_state_statestore",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": "statestore"
     },
     {
@@ -10088,8 +10088,8 @@
       "source_location": "L78",
       "_origin": "ast",
       "id": "tme3bot_state_statestore_init",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": ".__init__()"
     },
     {
@@ -10099,8 +10099,8 @@
       "source_location": "",
       "_origin": "ast",
       "id": "tme3bot_state_py_path",
-      "community": 43,
-      "community_name": "HttpStateStore",
+      "community": 55,
+      "community_name": "BatchDownloadService",
       "norm_label": "path"
     },
     {
@@ -12395,7 +12395,7 @@
       "label": "._backup()",
       "file_type": "code",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1024",
+      "source_location": "L1029",
       "_origin": "ast",
       "id": "tme3bot_worker_executor_workerjobexecutor_backup",
       "community": 22,
@@ -12406,7 +12406,7 @@
       "label": "._workspace_path()",
       "file_type": "code",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1223",
+      "source_location": "L1233",
       "_origin": "ast",
       "id": "tme3bot_worker_executor_workerjobexecutor_workspace_path",
       "community": 22,
@@ -12428,7 +12428,7 @@
       "label": ".workspace_tree()",
       "file_type": "code",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1237",
+      "source_location": "L1247",
       "_origin": "ast",
       "id": "tme3bot_worker_executor_workerjobexecutor_workspace_tree",
       "community": 22,
@@ -12439,7 +12439,7 @@
       "label": "._digest()",
       "file_type": "code",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1274",
+      "source_location": "L1284",
       "_origin": "ast",
       "id": "tme3bot_worker_executor_workerjobexecutor_digest",
       "community": 22,
@@ -12483,9 +12483,9 @@
       "label": "Return a safe, shallow directory listing for the active workspace.",
       "file_type": "rationale",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1238",
+      "source_location": "L1248",
       "_origin": "ast",
-      "id": "tme3bot_worker_executor_rationale_1238",
+      "id": "tme3bot_worker_executor_rationale_1248",
       "community": 22,
       "community_name": "ProfileTests",
       "norm_label": "return a safe, shallow directory listing for the active workspace."
@@ -14263,8 +14263,8 @@
       "source_location": "L23",
       "_origin": "ast",
       "id": "web_src_lib_api_post",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "post()"
     },
     {
@@ -14308,8 +14308,8 @@
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "id": "web_src_lib_components_backupspage",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "$lib/components/backupspage.svelte"
     },
     {
@@ -14343,8 +14343,8 @@
       "_origin": "ast",
       "source_location": "L1",
       "id": "web_src_lib_components_jobtable",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "$lib/components/jobtable.svelte"
     },
     {
@@ -14354,8 +14354,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_lib_components_downloadspage",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "downloadspage.svelte"
     },
     {
@@ -14376,8 +14376,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_lib_components_exportpage",
-      "community": 69,
-      "community_name": "ExportPage.svelte",
+      "community": 8,
+      "community_name": "UtilityHandler",
       "norm_label": "exportpage.svelte"
     },
     {
@@ -14387,8 +14387,8 @@
       "source_location": "L44",
       "_origin": "ast",
       "id": "web_src_lib_components_exportpage_async",
-      "community": 69,
-      "community_name": "ExportPage.svelte",
+      "community": 8,
+      "community_name": "UtilityHandler",
       "norm_label": "async()"
     },
     {
@@ -14398,8 +14398,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_lib_components_exportpage_test",
-      "community": 69,
-      "community_name": "ExportPage.svelte",
+      "community": 8,
+      "community_name": "UtilityHandler",
       "norm_label": "exportpage.test.ts"
     },
     {
@@ -14410,8 +14410,8 @@
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "id": "web_src_lib_components_jobprogresscard",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "./jobprogresscard.svelte"
     },
     {
@@ -14444,8 +14444,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_lib_components_jobprogresscard_test",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "jobprogresscard.test.ts"
     },
     {
@@ -14455,8 +14455,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_lib_components_jobtable_test",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "jobtable.test.ts"
     },
     {
@@ -14479,8 +14479,8 @@
       "_origin": "ast",
       "source_location": "L1",
       "id": "web_src_lib_session_svelte",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "session.svelte.ts"
     },
     {
@@ -14639,8 +14639,8 @@
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "id": "web_src_lib_components_utilitypage",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 8,
+      "community_name": "UtilityHandler",
       "norm_label": "$lib/components/utilitypage.svelte"
     },
     {
@@ -14650,8 +14650,8 @@
       "source_location": "L46",
       "_origin": "ast",
       "id": "web_src_lib_components_utilitypage_async",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 8,
+      "community_name": "UtilityHandler",
       "norm_label": "async()"
     },
     {
@@ -14662,8 +14662,8 @@
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "id": "web_src_lib_components_workerspage",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "$lib/components/workerspage.svelte"
     },
     {
@@ -14915,8 +14915,8 @@
       "source_location": "L3",
       "_origin": "ast",
       "id": "web_src_lib_session_svelte_session",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "session"
     },
     {
@@ -14926,8 +14926,8 @@
       "source_location": "L4",
       "_origin": "ast",
       "id": "web_src_lib_session_svelte_current",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "current"
     },
     {
@@ -14937,8 +14937,8 @@
       "source_location": "L5",
       "_origin": "ast",
       "id": "web_src_lib_session_svelte_loading",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "loading"
     },
     {
@@ -14948,8 +14948,8 @@
       "source_location": "L6",
       "_origin": "ast",
       "id": "web_src_lib_session_svelte_challenge",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "challenge"
     },
     {
@@ -15003,8 +15003,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_routes_activity_page",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "activity/+page.svelte"
     },
     {
@@ -15014,8 +15014,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_routes_backups_page",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 62,
+      "community_name": "presentation.ts",
       "norm_label": "backups/+page.svelte"
     },
     {
@@ -15047,8 +15047,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_routes_utility_page",
-      "community": 59,
-      "community_name": "$lib/components/JobTable.svelte",
+      "community": 8,
+      "community_name": "UtilityHandler",
       "norm_label": "utility/+page.svelte"
     },
     {
@@ -15058,8 +15058,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "web_src_routes_workers_page",
-      "community": 8,
-      "community_name": "UtilityHandler",
+      "community": 63,
+      "community_name": "$lib/components/Shell.svelte",
       "norm_label": "workers/+page.svelte"
     },
     {
@@ -32042,7 +32042,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1091",
+      "source_location": "L1097",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_backup",
@@ -32384,7 +32384,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1054",
+      "source_location": "L1059",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_backup",
@@ -45740,7 +45740,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1026",
+      "source_location": "L1031",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_backup",
@@ -48547,7 +48547,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L864",
+      "source_location": "L869",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_storage_upload",
@@ -52663,7 +52663,7 @@
       "context": "generic_arg",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1024",
+      "source_location": "L1029",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_backup",
@@ -52807,7 +52807,7 @@
       "context": "generic_arg",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1237",
+      "source_location": "L1247",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_workspace_tree",
@@ -53039,7 +53039,7 @@
       "relation": "method",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1024",
+      "source_location": "L1029",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor",
@@ -53083,7 +53083,7 @@
       "relation": "method",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1274",
+      "source_location": "L1284",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor",
@@ -53270,7 +53270,7 @@
       "relation": "method",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1223",
+      "source_location": "L1233",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor",
@@ -53281,7 +53281,7 @@
       "relation": "method",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1237",
+      "source_location": "L1247",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor",
@@ -53412,7 +53412,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1069",
+      "source_location": "L1074",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_backup",
@@ -53460,7 +53460,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1152",
+      "source_location": "L1162",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_backup",
@@ -53484,7 +53484,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L888",
+      "source_location": "L893",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_storage_upload",
@@ -53532,7 +53532,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L919",
+      "source_location": "L924",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_storage_upload",
@@ -53556,7 +53556,7 @@
       "context": "return_type",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1223",
+      "source_location": "L1233",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_workspace_path",
@@ -53568,7 +53568,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1240",
+      "source_location": "L1250",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_workspace_tree",
@@ -53580,7 +53580,7 @@
       "context": "parameter_type",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1274",
+      "source_location": "L1284",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_digest",
@@ -53592,7 +53592,7 @@
       "context": "call",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1239",
+      "source_location": "L1249",
       "weight": 1.0,
       "_origin": "ast",
       "source": "tme3bot_worker_executor_workerjobexecutor_workspace_tree",
@@ -53603,10 +53603,10 @@
       "relation": "rationale_for",
       "confidence": "EXTRACTED",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1238",
+      "source_location": "L1248",
       "weight": 1.0,
       "_origin": "ast",
-      "source": "tme3bot_worker_executor_rationale_1238",
+      "source": "tme3bot_worker_executor_rationale_1248",
       "target": "tme3bot_worker_executor_workerjobexecutor_workspace_tree",
       "confidence_score": 1.0
     },

@@ -63,13 +63,10 @@
   "62": "presentation.ts",
   "63": "$lib/components/Shell.svelte",
   "64": "TDLClient",
-  "65": "models.py",
-  "66": "FakeWorkers",
   "67": "pindah.py",
   "68": "$lib/components/Overview.svelte",
   "72": "tme3bot",
   "75": "ArchitectureBoundaryTests",
   "78": "infrastructure/__init__.py",
-  "81": "_message_contains_caption",
-  "83": "next"
+  "81": "_message_contains_caption"
 }
