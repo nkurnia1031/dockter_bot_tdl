@@ -20,17 +20,30 @@
   let message = $state('');
   let confirm = $state<{action:'delete'|'purge'; item:Artifact}|null>(null);
   const tabs: Array<{key:Tab;label:string}> = [{key:'pending',label:'Pending'}, {key:'processing',label:'Sedang diproses'}, {key:'history',label:'History'}, {key:'archived',label:'Archived'}];
+  const ARTIFACT_PAGE_SIZE = 200;
   const visible = $derived(artifacts.filter((item) => activeTab === 'pending' ? ['pending','failed'].includes(item.status) : activeTab === 'processing' ? item.status === 'processing' : activeTab === 'history' ? ['downloaded','failed','deleted'].includes(item.status) && !item.archived_at : Boolean(item.archived_at) || item.status === 'archived'));
   const selectedItems = $derived(artifacts.filter((item) => selected.includes(item.id)));
   const selectedWorker = $derived(selectedItems[0]?.worker || '');
 
+  async function loadArtifacts(archived: boolean): Promise<Artifact[]> {
+    const result: Artifact[] = [];
+    let offset = 0;
+    while (true) {
+      const page = await api<{items: Artifact[]; total?: number}>(
+        `/downloads/artifacts?limit=${ARTIFACT_PAGE_SIZE}&offset=${offset}&archived=${archived}`
+      );
+      const items = page.items || [];
+      result.push(...items);
+      offset += items.length;
+      if (!items.length || items.length < ARTIFACT_PAGE_SIZE || (page.total !== undefined && offset >= page.total)) break;
+    }
+    return result;
+  }
+
   async function load() {
     try {
-      const [current, archived] = await Promise.all([
-        api<{items:Artifact[]}>('/downloads/artifacts?limit=500&archived=false'),
-        api<{items:Artifact[]}>('/downloads/artifacts?limit=500&archived=true')
-      ]);
-      artifacts = [...(current.items || []), ...(archived.items || []).filter((item) => !(current.items || []).some((other) => other.id === item.id))];
+      const [current, archived] = await Promise.all([loadArtifacts(false), loadArtifacts(true)]);
+      artifacts = [...current, ...archived.filter((item) => !current.some((other) => other.id === item.id))];
       selected = selected.filter((id) => artifacts.some((item) => item.id === id));
       message = '';
     } catch (cause) { message = cause instanceof Error ? cause.message : 'Artifact gagal dimuat.'; }

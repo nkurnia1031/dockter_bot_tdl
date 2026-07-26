@@ -49,6 +49,7 @@
   "47": "@lucide/svelte",
   "48": "test-setup.ts",
   "49": "build_profile_runtime",
+  "50": "WorkerEventPublisher",
   "51": "models.py",
   "52": "ControlPlaneTests",
   "53": "BatchDownloadService",

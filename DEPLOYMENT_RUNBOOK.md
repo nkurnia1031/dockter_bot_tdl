@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.5 - Storage file manager dan single-panel Telegram export
+Versi: 3.6 - Storage file manager, single-panel Telegram export, dan pagination download
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -30,6 +30,11 @@ manual. Data `/data`, katalog, state, dan sesi TDL tidak dihapus.
 Worker release ini juga menambahkan statistik `message_count`, `media_count`,
 `photo_count`, dan `video_count` pada report akhir export. Web memakai data itu
 untuk ringkasan report pada panel export Telegram dan dashboard.
+
+Download manager mengambil katalog artifact secara bertahap dengan maksimal 200
+item per request, mengikuti batas endpoint backend. Karena itu riwayat yang
+besar tetap dapat dimuat tanpa mengubah konfigurasi backend; perubahan ini
+hanya memerlukan deploy ulang web static.
 
 ## Workspace export Telegram
 

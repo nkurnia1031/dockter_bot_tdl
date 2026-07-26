@@ -405,8 +405,8 @@
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
-    "mtime": 1785088148.7312067,
-    "ast_hash": "f38fe83c007c51723a3e6c2fbf41225d",
+    "mtime": 1785090948.3185506,
+    "ast_hash": "b88031d867179f39b2b6cd6c37e9f729",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/__init__.py": {
@@ -620,8 +620,8 @@
     "semantic_hash": ""
   },
   "web/src/lib/components/DownloadsPage.svelte": {
-    "mtime": 1784992328.1842935,
-    "ast_hash": "d4e886b70cab75c78eab22ca993c4d9f",
+    "mtime": 1785090439.2512186,
+    "ast_hash": "009159c04ae6addc73075e2cc9efffd0",
     "semantic_hash": ""
   },
   "web/src/lib/components/ExportPage.test.ts": {

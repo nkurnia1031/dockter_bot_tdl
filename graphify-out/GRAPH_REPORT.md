@@ -1,16 +1,16 @@
 # Graph Report - dockter_bot_tdl  (2026-07-27)
 
 ## Corpus Check
-- 139 files · ~67,918 words
+- 139 files · ~68,010 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1572 nodes · 4156 edges · 71 communities (56 shown, 15 thin omitted)
+- 1572 nodes · 4156 edges · 72 communities (56 shown, 16 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 416 edges (avg confidence: 0.54)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `3447e163`
+- Built from commit: `e92a57b2`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -58,6 +58,7 @@
 - DownloadProgressTracker
 - tme3bot/app.py
 - build_profile_runtime
+- WorkerEventPublisher
 - models.py
 - ControlPlaneTests
 - BatchDownloadService
@@ -107,7 +108,7 @@
 ## Import Cycles
 - None detected.
 
-## Communities (71 total, 15 thin omitted)
+## Communities (72 total, 16 thin omitted)
 
 ### Community 0 - "ProfileManager"
 Cohesion: 0.16
@@ -142,8 +143,8 @@ Cohesion: 0.12
 Nodes (13): OutputCallback, Popen, ProgressCallback, Queue, decode_process_output(), _message_contains_caption(), _normalize_upload_caption(), parse_terminal_size() (+5 more)
 
 ### Community 8 - "UtilityHandler"
-Cohesion: 0.19
-Nodes (12): $lib/api, api(), ApiError, csrf(), patch(), put(), remove(), $lib/components/SettingsPage.svelte (+4 more)
+Cohesion: 0.15
+Nodes (15): $lib/api, api(), ApiError, csrf(), patch(), put(), remove(), $lib/components/SettingsPage.svelte (+7 more)
 
 ### Community 9 - "ProfileManager"
 Cohesion: 0.07
@@ -258,8 +259,8 @@ Cohesion: 0.32
 Nodes (3): DownloadProgressSnapshot, DownloadProgressTracker, CommandProgress
 
 ### Community 57 - "executor.py"
-Cohesion: 0.11
-Nodes (10): StorageWorkerPathTests, sha256_file(), JsonHttpError, JobLogSnapshot, Return nested directories, including empty ones, as portable paths., Bounded raw command output retained with the persistent job history., storage_logical_folder(), storage_relative_folders() (+2 more)
+Cohesion: 0.14
+Nodes (9): StorageWorkerPathTests, sha256_file(), JsonHttpError, JobLogSnapshot, Return nested directories, including empty ones, as portable paths., Bounded raw command output retained with the persistent job history., storage_logical_folder(), storage_relative_folders() (+1 more)
 
 ### Community 58 - "SqliteAuthRepository"
 Cohesion: 0.15
@@ -270,8 +271,8 @@ Cohesion: 0.18
 Nodes (3): FakeDispatcher, FakeWorkers, UtilityFolderStore
 
 ### Community 60 - "WorkspaceExplorer.svelte"
-Cohesion: 0.38
-Nodes (4): crumbs, goUp(), load(), openCrumb()
+Cohesion: 0.24
+Nodes (6): $lib/components/UtilityPage.svelte, async(), crumbs, goUp(), load(), openCrumb()
 
 ### Community 61 - "job-progress.ts"
 Cohesion: 0.39
@@ -282,8 +283,8 @@ Cohesion: 0.15
 Nodes (10): $lib/components/BackupsPage.svelte, ./JobProgressCard.svelte, $lib/components/JobTable.svelte, formatBytes(), formatDate(), groupIdsByWorker(), jobMessage(), LabelItem (+2 more)
 
 ### Community 63 - "$lib/components/Shell.svelte"
-Cohesion: 0.15
-Nodes (8): ../styles.css, ./Login.svelte, $lib/components/Shell.svelte, $lib/components/WorkersPage.svelte, challenge, current, loading, Session
+Cohesion: 0.29
+Nodes (3): ../styles.css, ./Login.svelte, $lib/components/Shell.svelte
 
 ### Community 67 - "pindah.py"
 Cohesion: 0.27
@@ -308,7 +309,7 @@ Nodes (26): A. Langkah di komputer lokal, B. Langkah di VPS builder besar, Backe
 ## Knowledge Gaps
 - **93 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `name`, `version` (+88 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **15 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **16 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
