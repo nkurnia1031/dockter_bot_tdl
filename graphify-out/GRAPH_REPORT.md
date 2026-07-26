@@ -1,7 +1,7 @@
 # Graph Report - dockter_bot_tdl  (2026-07-26)
 
 ## Corpus Check
-- 133 files · ~59,828 words
+- 133 files · ~59,936 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `6ff506fb`
+- Built from commit: `843030b7`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -137,7 +137,7 @@ Cohesion: 0.25
 Nodes (5): LabelStoreTests, label_digest(), LabelStore, Path, SavedLabel
 
 ### Community 7 - "bot_text.py"
-Cohesion: 0.16
+Cohesion: 0.17
 Nodes (7): OutputCallback, Popen, ProgressCallback, Queue, LeaveResult, LeaveService, SubprocessRunner
 
 ### Community 8 - "UtilityHandler"
@@ -229,8 +229,8 @@ Cohesion: 0.11
 Nodes (5): FakeDispatcher, FakeProfiles, FakeWorkers, UtilitySettingsTests, UtilitySettingsStore
 
 ### Community 37 - "ExportService"
-Cohesion: 0.15
-Nodes (22): _byte_multiplier(), clean_tdl_output_line(), CommandProgress, _duration_seconds(), is_nonsemantic_tdl_output_line(), is_standalone_tdl_progress_bar(), is_tdl_telemetry_line(), parse_elapsed_seconds() (+14 more)
+Cohesion: 0.18
+Nodes (18): _byte_multiplier(), clean_tdl_output_line(), _duration_seconds(), is_nonsemantic_tdl_output_line(), is_standalone_tdl_progress_bar(), is_tdl_telemetry_line(), parse_elapsed_seconds(), parse_eta_seconds() (+10 more)
 
 ### Community 41 - "ProfileManager"
 Cohesion: 0.25
@@ -313,8 +313,8 @@ Cohesion: 0.07
 Nodes (25): A. Langkah di komputer lokal, B. Langkah di VPS builder besar, Backend atau worker, Batas keamanan, C. Langkah di VPS gateway, D. Langkah di setiap VPS worker remote, E. Deploy web static di VPS gateway, F. Smoke test telemetry progress (+17 more)
 
 ### Community 81 - "_message_contains_caption"
-Cohesion: 0.50
-Nodes (3): _message_contains_caption(), Any, Match captions across the different JSON shapes emitted by TDL.
+Cohesion: 0.32
+Nodes (7): _message_contains_caption(), CommandProgress, parse_terminal_size(), prepare_subprocess_command(), Any, Match captions across the different JSON shapes emitted by TDL., UploadResult
 
 ## Knowledge Gaps
 - **79 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `name`, `version` (+74 more)

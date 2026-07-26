@@ -103,22 +103,25 @@
     </aside>
 
     <main class="min-w-0">
-      <header class="sticky top-0 z-20 border-b border-[var(--line)] bg-[color:var(--panel)]/92 px-4 py-3 backdrop-blur-xl sm:px-6">
-        <div class="flex items-center justify-between gap-3">
-          <div class="flex min-w-0 items-center gap-2">
-            <button class="button secondary size-10 !rounded-xl !p-0 lg:hidden" onclick={() => mobileOpen = true} aria-label="Buka navigasi"><Menu size={19}/></button>
-            <div class="hidden min-w-0 sm:block"><p class="muted truncate text-xs">Profile aktif</p><p class="truncate text-sm font-bold">{session.current.actor?.profile}</p></div>
-            <select class="field h-10 w-auto max-w-40 !py-1.5 text-sm font-semibold" aria-label="Pilih profile" value={session.current.actor?.profile} onchange={(event) => session.chooseProfile((event.currentTarget as HTMLSelectElement).value)}>
-              {#each session.current.profiles as profile}<option value={profile}>{profile}</option>{/each}
-            </select>
+      <header class="topbar sticky top-0 z-20 border-b border-[var(--line)] bg-[color:var(--panel)]/92 px-3 py-2.5 backdrop-blur-xl sm:px-6 sm:py-3">
+        <div class="flex min-w-0 items-center justify-between gap-2 sm:gap-3">
+          <div class="topbar-left flex min-w-0 flex-1 items-center gap-2">
+            <button class="button secondary menu-trigger size-10 shrink-0 !rounded-xl !p-0 lg:hidden" onclick={() => mobileOpen = true} aria-label="Buka navigasi"><Menu size={19}/></button>
+            <div class="profile-picker flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-2 py-1 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
+              <div class="profile-icon hidden shrink-0 place-items-center rounded-lg bg-violet-100 text-violet-700 sm:grid dark:bg-violet-950 dark:text-violet-200"><Users size={15}/></div>
+              <div class="hidden min-w-0 sm:block"><p class="muted truncate text-[.68rem] font-bold uppercase tracking-[.12em]">Profile aktif</p></div>
+              <select class="profile-select field h-9 min-w-0 w-[8.75rem] !border-0 !bg-transparent !px-1.5 !py-1 text-sm font-bold shadow-none focus:!ring-0 sm:h-10 sm:w-[9.5rem] sm:!border-[var(--line)] sm:!bg-[var(--panel-strong)] sm:!px-3 sm:shadow-sm" aria-label="Pilih profile" value={session.current.actor?.profile} onchange={(event) => session.chooseProfile((event.currentTarget as HTMLSelectElement).value)}>
+                {#each session.current.profiles as profile}<option value={profile}>{profile}</option>{/each}
+              </select>
+            </div>
             <span class="hidden items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-700 md:inline-flex dark:bg-emerald-950 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Backend online</span>
           </div>
-          <div class="flex items-center gap-2">
-            <button id="theme-trigger" class="button secondary size-10 !rounded-xl !p-0" aria-label="Pilih tema"><span class="sr-only">Tema {labelForTheme(theme)}</span>{#if theme === 'dark'}<Moon size={17}/>{:else}<Sun size={17}/>{/if}</button>
+          <div class="topbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
+            <button id="theme-trigger" class="button secondary theme-trigger hidden size-10 !rounded-xl !p-0 sm:inline-flex" aria-label="Pilih tema"><span class="sr-only">Tema {labelForTheme(theme)}</span>{#if theme === 'dark'}<Moon size={17}/>{:else}<Sun size={17}/>{/if}</button>
             <Dropdown bind:isOpen={themeMenuOpen} triggeredBy="#theme-trigger" placement="bottom-end" class="!z-50 !w-40 !rounded-xl !border-[var(--line)] !bg-[var(--panel-strong)] !p-1 !shadow-xl" simple>
               {#each ['light', 'dark', 'system'] as option}<DropdownItem onclick={() => setTheme(option as Theme)} class="!rounded-lg !px-3 !py-2 !text-sm !text-[var(--ink)] hover:!bg-[var(--brand-soft)]">{labelForTheme(option as Theme)}{#if theme === option}<span class="float-right text-violet-600">&#10003;</span>{/if}</DropdownItem>{/each}
             </Dropdown>
-            <button id="actor-trigger" class="button secondary flex h-10 max-w-40 items-center gap-2 !rounded-xl !px-3" aria-label="Menu akun"><span class="grid size-6 place-items-center rounded-full bg-violet-100 text-xs font-bold text-violet-700 dark:bg-violet-900 dark:text-violet-200">{String(session.current.actor?.telegram_user_id || '?').slice(-2)}</span><span class="hidden truncate text-xs font-bold sm:block">{session.current.actor?.telegram_user_id}</span></button>
+            <button id="actor-trigger" class="button secondary flex size-10 max-w-40 items-center justify-center gap-2 !rounded-xl !p-0 sm:h-10 sm:justify-start sm:!px-3" aria-label="Menu akun"><span class="grid size-6 place-items-center rounded-full bg-violet-100 text-xs font-bold text-violet-700 dark:bg-violet-900 dark:text-violet-200">{String(session.current.actor?.telegram_user_id || '?').slice(-2)}</span><span class="hidden truncate text-xs font-bold sm:block">{session.current.actor?.telegram_user_id}</span></button>
             <Dropdown bind:isOpen={actorMenuOpen} triggeredBy="#actor-trigger" placement="bottom-end" class="!z-50 !w-52 !rounded-xl !border-[var(--line)] !bg-[var(--panel-strong)] !p-1 !shadow-xl" simple>
               <div class="border-b border-[var(--line)] px-3 py-2 text-xs"><p class="muted">Telegram user</p><b class="text-[var(--ink)]">{session.current.actor?.telegram_user_id}</b></div>
               <DropdownItem onclick={() => session.logout()} class="!mt-1 !rounded-lg !px-3 !py-2 !text-rose-600 hover:!bg-rose-50 dark:hover:!bg-rose-950"><LogOut size={15} class="mr-2 inline"/>Keluar</DropdownItem>
@@ -141,6 +144,10 @@
 
 <style>
   .app-shell { transition: grid-template-columns .24s cubic-bezier(.16, 1, .3, 1); }
+  .topbar { box-shadow: 0 1px 0 color-mix(in srgb, var(--line) 75%, transparent); }
+  .profile-picker { transition: border-color .18s ease, background .18s ease, box-shadow .18s ease; }
+  .profile-picker:focus-within { border-color: color-mix(in srgb, var(--brand) 58%, var(--line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 14%, transparent); }
+  .profile-select { text-overflow: ellipsis; }
   .app-sidebar { background: color-mix(in srgb, var(--panel-strong) 92%, transparent); }
   .sidebar-collapsed { grid-template-columns: 5.5rem 1fr; }
   .sidebar-collapsed .brand-copy, .sidebar-collapsed .nav-label, .sidebar-collapsed .worker-card { display: none; }

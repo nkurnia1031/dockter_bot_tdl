@@ -3158,8 +3158,8 @@
       "source_location": "L95",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_runner_preserves_and_logs_full_non_utf8_failure_output",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 56,
+      "community_name": "request_json",
       "norm_label": ".test_runner_preserves_and_logs_full_non_utf8_failure_output()"
     },
     {
@@ -3169,8 +3169,8 @@
       "source_location": "L120",
       "_origin": "ast",
       "id": "tests_test_tdl_tdlclienttests_test_runner_forwards_raw_output_to_snapshot_callback",
-      "community": 7,
-      "community_name": "bot_text.py",
+      "community": 56,
+      "community_name": "request_json",
       "norm_label": ".test_runner_forwards_raw_output_to_snapshot_callback()"
     },
     {
@@ -10825,8 +10825,8 @@
       "source_location": "L1",
       "_origin": "ast",
       "id": "tme3bot_tdl",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 81,
+      "community_name": "_message_contains_caption",
       "norm_label": "tdl.py"
     },
     {
@@ -10891,8 +10891,8 @@
       "source_location": "L55",
       "_origin": "ast",
       "id": "tme3bot_tdl_uploadresult",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 81,
+      "community_name": "_message_contains_caption",
       "norm_label": "uploadresult"
     },
     {
@@ -11012,8 +11012,8 @@
       "source_location": "L201",
       "_origin": "ast",
       "id": "tme3bot_tdl_subprocessrunner_read_stream",
-      "community": 81,
-      "community_name": "_message_contains_caption",
+      "community": 7,
+      "community_name": "bot_text.py",
       "norm_label": "._read_stream()"
     },
     {
@@ -11089,8 +11089,8 @@
       "source_location": "L318",
       "_origin": "ast",
       "id": "tme3bot_tdl_prepare_subprocess_command",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 81,
+      "community_name": "_message_contains_caption",
       "norm_label": "prepare_subprocess_command()"
     },
     {
@@ -11111,8 +11111,8 @@
       "source_location": "L345",
       "_origin": "ast",
       "id": "tme3bot_tdl_parse_terminal_size",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 81,
+      "community_name": "_message_contains_caption",
       "norm_label": "parse_terminal_size()"
     },
     {
@@ -11342,8 +11342,8 @@
       "source_location": "L13",
       "_origin": "ast",
       "id": "tme3bot_tdl_output_commandprogress",
-      "community": 37,
-      "community_name": "ExportService",
+      "community": 81,
+      "community_name": "_message_contains_caption",
       "norm_label": "commandprogress"
     },
     {
@@ -14567,7 +14567,7 @@
       "label": "labelForTheme()",
       "file_type": "code",
       "source_file": "web/src/lib/components/Shell.svelte",
-      "source_location": "L119",
+      "source_location": "L122",
       "_origin": "ast",
       "id": "web_src_lib_components_shell_labelfortheme",
       "community": 63,
@@ -14578,7 +14578,7 @@
       "label": "var()",
       "file_type": "code",
       "source_file": "web/src/lib/components/Shell.svelte",
-      "source_location": "L144",
+      "source_location": "L151",
       "_origin": "ast",
       "id": "web_src_lib_components_shell_var",
       "community": 63,
@@ -57858,7 +57858,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "web/src/lib/components/Shell.svelte",
-      "source_location": "L119",
+      "source_location": "L122",
       "weight": 1.0,
       "_origin": "ast",
       "source": "web_src_lib_components_shell",
@@ -57869,7 +57869,7 @@
       "relation": "contains",
       "confidence": "EXTRACTED",
       "source_file": "web/src/lib/components/Shell.svelte",
-      "source_location": "L144",
+      "source_location": "L151",
       "weight": 1.0,
       "_origin": "ast",
       "source": "web_src_lib_components_shell",
@@ -58705,5 +58705,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "6ff506fbc950f8ff06fb31af498298ece24b4048"
+  "built_at_commit": "843030b7922df1084c30a3569bbafdd92f841f39"
 }

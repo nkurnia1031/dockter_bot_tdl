@@ -525,8 +525,8 @@
     "semantic_hash": ""
   },
   "web/src/lib/components/Shell.svelte": {
-    "mtime": 1784989101.0753276,
-    "ast_hash": "49d5862a6934cc5a9c12db6c9ba9b41f",
+    "mtime": 1785059572.1354592,
+    "ast_hash": "220d6450964e6d02fcb81489562da390",
     "semantic_hash": ""
   },
   "web/src/lib/session.svelte.ts": {
