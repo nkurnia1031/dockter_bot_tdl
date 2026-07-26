@@ -1,0 +1,97 @@
+import unittest
+
+from tme3bot.frontend.telegram.export_workspace import (
+    ExportWorkspaceState,
+    ExportWorkspaceStore,
+    export_report,
+)
+from tme3bot.frontend.telegram.keyboards import export_workspace_markup
+
+
+class ExportWorkspaceTests(unittest.TestCase):
+    def test_source_selection_uses_backend_last_id_by_default(self):
+        state = ExportWorkspaceState()
+        state.select_source({"chat_ref": "@FileTuyenChonBot", "last_id": 7932})
+
+        self.assertEqual(state.chat_ref, "filetuyenchonbot")
+        self.assertEqual(state.default_start_id, 7933)
+        self.assertEqual(
+            state.payload(),
+            {
+                "chat_ref": "filetuyenchonbot",
+                "use_url_message_id": False,
+            },
+        )
+
+    def test_explicit_start_id_is_sent_as_override(self):
+        state = ExportWorkspaceState()
+        state.select_source({"chat_ref": "channel", "last_id": 99})
+        state.set_label("arsip 2026")
+        state.set_start_id("123")
+
+        self.assertEqual(
+            state.payload(),
+            {
+                "chat_ref": "channel",
+                "label": "arsip 2026",
+                "start_id": 123,
+                "use_url_message_id": True,
+            },
+        )
+
+    def test_new_source_defaults_to_message_one_and_at_is_ignored(self):
+        state = ExportWorkspaceState()
+        state.select_chat_ref("@NewChannel")
+
+        self.assertEqual(state.effective_start_id, 1)
+        self.assertEqual(state.payload()["chat_ref"], "newchannel")
+
+    def test_store_isolated_by_chat_and_user(self):
+        store = ExportWorkspaceStore()
+        first = store.get(10, 42)
+        second = store.get(10, 43)
+        first.select_chat_ref("one")
+
+        self.assertEqual(first.chat_ref, "one")
+        self.assertIsNone(second.chat_ref)
+
+    def test_report_unwraps_structured_worker_result(self):
+        report = export_report(
+            {
+                "status": "succeeded",
+                "result": {
+                    "value": {
+                        "exported_count": 26,
+                        "message_count": 26,
+                        "media_count": 10,
+                        "photo_count": 6,
+                        "video_count": 4,
+                        "latest_id": 7958,
+                        "filename": "export.json",
+                    }
+                },
+            }
+        )
+
+        self.assertEqual(report["message_count"], 26)
+        self.assertEqual(report["media_count"], 10)
+        self.assertEqual(report["latest_id"], 7958)
+        self.assertEqual(report["filename"], "export.json")
+
+    def test_keyboard_renders_values_as_text(self):
+        state = ExportWorkspaceState()
+        state.select_source({"chat_ref": "channel", "last_id": 4})
+        markup = export_workspace_markup(
+            state,
+            [{"chat_ref": "channel", "label": "arsip", "last_id": 4}],
+            [{"label": "2026", "updated_at": "now"}],
+        )
+        labels = [button.text for row in markup.inline_keyboard for button in row]
+
+        self.assertTrue(any("arsip" in value for value in labels))
+        self.assertTrue(any("2026" in value for value in labels))
+        self.assertFalse(any("object at" in value for value in labels))
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -53,6 +53,7 @@ class AppConfig:
     storage_channel_username: str = ""
     storage_channel: str = ""
     storage_db_file: Path = Path("/data/storage.db")
+    storage_trash_retention_days: int = 30
     backup_enabled: bool = True
     backup_channel_ref: str = ""
     backup_channel_id: int = 0
@@ -194,6 +195,9 @@ class AppConfig:
         except ValueError as exc:
             raise ValueError("STORAGE_CHANNEL_ID harus berupa angka Telegram chat ID.") from exc
         storage_db_file = Path(os.getenv("STORAGE_DB_FILE", "/data/storage.db"))
+        storage_trash_retention_days = max(
+            1, int(os.getenv("STORAGE_TRASH_RETENTION_DAYS", "30"))
+        )
         backup_enabled = os.getenv("BACKUP_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         backup_channel = compact_channel_ref(os.getenv("BACKUP_CHANNEL", "").strip() or os.getenv("BACKUP_CHANNEL_REF", "").strip())
         backup_channel_ref = channel_tdl_ref(backup_channel)
@@ -264,6 +268,7 @@ class AppConfig:
             storage_channel_username=storage_channel_username,
             storage_channel=storage_channel,
             storage_db_file=storage_db_file,
+            storage_trash_retention_days=storage_trash_retention_days,
             backup_enabled=backup_enabled,
             backup_channel_ref=backup_channel_ref,
             backup_channel_id=backup_channel_id,

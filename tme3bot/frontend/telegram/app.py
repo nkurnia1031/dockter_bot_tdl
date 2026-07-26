@@ -22,6 +22,9 @@ from tme3bot.frontend.telegram.keyboards import (
     check_profile_markup,
     clear_confirm_markup,
     download_status_markup,
+    export_job_markup,
+    export_input_cancel_markup,
+    export_workspace_markup,
     main_menu_markup,
     storage_delete_markup,
     storage_folders_markup,
@@ -38,6 +41,11 @@ from tme3bot.frontend.telegram.panel import (
     edit_menu_message,
 )
 from tme3bot.frontend.telegram.text import help_text, source_digest
+from tme3bot.frontend.telegram.export_workspace import (
+    ExportWorkspaceStore,
+    export_report,
+    short_text,
+)
 from tme3bot.frontend.client import BackendApiClient
 from tme3bot.infrastructure.http_client import JsonHttpError
 
@@ -66,6 +74,7 @@ class TelegramFrontendApp:
         self.pending: dict[tuple[int, int], PendingInput] = {}
         self.utility_selected: dict[int, set[str]] = {}
         self.source_selected: dict[int, set[str]] = {}
+        self.export_workspaces = ExportWorkspaceStore()
         self._register()
 
     def start(self) -> None:
@@ -173,10 +182,8 @@ class TelegramFrontendApp:
         actor = self._actor(update)
         if actor is None:
             return
-        self.panel.update_from_message(
-            update.effective_message,
-            "Menu bot:",
-            main_menu_markup(actor["profile"]),
+        self._show_export_workspace(
+            update.effective_message, update.effective_user.id, actor
         )
 
     def help_command(self, update: Update, context: CallbackContext) -> None:
@@ -294,16 +301,20 @@ class TelegramFrontendApp:
         query = update.callback_query
         if query is None or query.message is None or query.data is None:
             return
-        query.answer()
         user_id = update.effective_user.id if update.effective_user else 0
+        message, data = query.message, query.data
+        workspace_callback = data.startswith(("workspace:", "ew:"))
+        if not workspace_callback:
+            query.answer()
         actor = self._actor(update)
         if actor is None:
             return
-        message, data = query.message, query.data
         self.panel.remember(message)
         self.panel.invalidate_view(message.chat_id)
         try:
-            if data in {"menu:main", "access:check"}:
+            if workspace_callback:
+                self._workspace_callback(query, user_id, actor, data)
+            elif data in {"menu:main", "access:check"}:
                 edit_menu_message(
                     message, "Menu bot:", main_menu_markup(actor["profile"])
                 )
@@ -373,7 +384,15 @@ class TelegramFrontendApp:
             )
             self._show_job(message, user.id, job)
         except Exception as exc:
-            self._show_error(message, exc)
+            if pending is not None and pending.action.startswith("export_"):
+                self._show_export_workspace(
+                    message,
+                    user.id,
+                    actor,
+                    f"Input tidak valid: {short_text(exc, 240)}",
+                )
+            else:
+                self._show_error(message, exc)
 
     def _actor(self, update: Update) -> dict[str, Any] | None:
         message = update.effective_message
@@ -398,6 +417,311 @@ class TelegramFrontendApp:
             self.client.put(user_id, "/api/v1/me/worker-route", {"route": route})
             actor = self.client.me(user_id)
         self._show_workers(message, user_id, actor)
+
+    def _workspace_callback(self, query, user_id: int, actor: dict[str, Any], data: str) -> None:
+        message = query.message
+        if data != "ew:submit":
+            query.answer()
+        if data == "workspace:full":
+            edit_menu_message(
+                message,
+                "Menu lengkap bot:",
+                main_menu_markup(actor["profile"]),
+            )
+            return
+        if data in {"workspace:export", "ew:refresh"}:
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data == "ew:new":
+            self.pending[(message.chat_id, user_id)] = PendingInput(
+                "export_source_new"
+            )
+            edit_menu_message(
+                message,
+                "Ketik username tanpa link atau numeric chat ID untuk source baru.",
+                export_input_cancel_markup(),
+            )
+            return
+        if data.startswith("ew:s:"):
+            try:
+                index = int(data.split(":", 2)[2])
+                sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
+                source = sources[index]
+            except (ValueError, IndexError, KeyError):
+                self._show_export_workspace(message, user_id, actor, "Source sudah berubah; pilih ulang.")
+                return
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.select_source(source)
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data.startswith("ew:p:"):
+            try:
+                page = max(0, int(data.split(":", 2)[2]))
+            except ValueError:
+                page = 0
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.source_page = page
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data == "ew:label:none":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.set_label(None)
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data.startswith("ew:l:"):
+            try:
+                index = int(data.split(":", 2)[2])
+                labels = self.client.get(user_id, "/api/v1/labels").get("items", [])
+                label = str(labels[index].get("label", "")).strip()
+            except (ValueError, IndexError, KeyError):
+                self._show_export_workspace(message, user_id, actor, "Label sudah berubah; refresh ulang.")
+                return
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.set_label(label)
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data.startswith("ew:lp:"):
+            try:
+                page = max(0, int(data.split(":", 2)[2]))
+            except ValueError:
+                page = 0
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.label_page = page
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data == "ew:label:custom":
+            self.pending[(message.chat_id, user_id)] = PendingInput(
+                "export_label_custom"
+            )
+            edit_menu_message(
+                message,
+                "Ketik label export. Ketik '-' untuk tanpa label.",
+                export_input_cancel_markup(),
+            )
+            return
+        if data == "ew:last":
+            self.pending[(message.chat_id, user_id)] = PendingInput(
+                "export_start_id"
+            )
+            edit_menu_message(
+                message,
+                "Ketik Start ID angka minimal 1, atau 'auto' untuk memakai Last ID + 1.",
+                export_input_cancel_markup(),
+            )
+            return
+        if data == "ew:submit":
+            self._submit_export_workspace(message, user_id, actor, query)
+            return
+        if data in {"ew:refresh_job", "ew:detail"}:
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            if not state.active_job_id:
+                self._show_export_workspace(message, user_id, actor)
+                return
+            try:
+                job = self.client.get(user_id, f"/api/v1/jobs/{state.active_job_id}")
+                edit_menu_message(
+                    message,
+                    self._export_job_text(job),
+                    export_job_markup(job.get("status") in TERMINAL_JOB_STATUSES),
+                )
+            except Exception as exc:
+                self._show_error(message, exc)
+            return
+        self._show_export_workspace(message, user_id, actor)
+
+    def _show_export_workspace(
+        self,
+        message,
+        user_id: int,
+        actor: dict[str, Any],
+        notice: str | None = None,
+    ) -> None:
+        state = self.export_workspaces.get(message.chat_id, user_id)
+        sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
+        labels = self.client.get(user_id, "/api/v1/labels").get("items", [])
+        source_map = {
+            str(item.get("chat_ref", "")).lstrip("@").casefold(): item
+            for item in sources
+        }
+        if state.chat_ref and state.source is None:
+            state.source = source_map.get(state.chat_ref.lstrip("@").casefold())
+        selected = state.chat_ref or "Belum dipilih"
+        if state.source and state.source.get("label"):
+            selected = f"{state.source['label']} — {selected}"
+        lines = [
+            "🚀 Export fokus",
+            f"Profile: {actor['profile']}  •  Worker: {actor['worker_route']}",
+            "",
+            f"Source: {selected}",
+            f"Label: {state.label or 'tanpa label'}",
+            f"Start ID: {state.effective_start_id if state.chat_ref else 'pilih source dulu'}",
+        ]
+        if state.source:
+            lines.append(f"Last ID backend: {state.source.get('last_id', 0)}")
+        elif state.chat_ref:
+            lines.append("Source baru: belum memiliki Last ID backend")
+        if notice:
+            lines.extend(["", f"ℹ️ {notice}"])
+        self.panel.update_from_message(
+            message,
+            "\n".join(lines),
+            export_workspace_markup(state, sources, labels),
+        )
+
+    def _submit_export_workspace(
+        self, message, user_id: int, actor: dict[str, Any], query=None
+    ) -> None:
+        state = self.export_workspaces.get(message.chat_id, user_id)
+        try:
+            payload = state.payload()
+        except (TypeError, ValueError) as exc:
+            if query is not None:
+                query.answer(str(exc), show_alert=True)
+            edit_menu_message(
+                message,
+                f"⚠️ {exc}",
+                export_workspace_markup(state),
+            )
+            return
+        if state.label:
+            self.client.post(user_id, "/api/v1/labels", {"label": state.label})
+        job = self.client.post(user_id, "/api/v1/exports", payload)
+        state.active_job_id = str(job["id"])
+        state.terminal_notified_job_id = None
+        if query is not None:
+            query.answer("Export masuk antrian", show_alert=True)
+        chat_id, _ = self.panel.update_from_message(
+            message,
+            self._export_job_text(job),
+            export_job_markup(False),
+        )
+        token = self.panel.begin_view(chat_id)
+        if job.get("status") not in TERMINAL_JOB_STATUSES:
+            self._poll_export_job(chat_id, user_id, str(job["id"]), token)
+
+    def _handle_export_input(self, message, user_id: int, pending: PendingInput, value: str) -> None:
+        state = self.export_workspaces.get(message.chat_id, user_id)
+        if pending.action == "export_source_new":
+            ref = value.strip()
+            sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
+            source = next(
+                (
+                    item
+                    for item in sources
+                    if str(item.get("chat_ref", "")).lstrip("@").casefold()
+                    == ref.lstrip("@").casefold()
+                ),
+                None,
+            )
+            state.select_chat_ref(ref, source)
+            self._show_export_workspace(message, user_id, self.client.me(user_id))
+            return
+        if pending.action == "export_label_custom":
+            state.set_label(None if value.strip() == "-" else value)
+            if state.label:
+                self.client.post(user_id, "/api/v1/labels", {"label": state.label})
+            self._show_export_workspace(message, user_id, self.client.me(user_id))
+            return
+        if pending.action == "export_start_id":
+            if value.casefold() == "auto":
+                state.set_start_id(None)
+            else:
+                state.set_start_id(value)
+            self._show_export_workspace(message, user_id, self.client.me(user_id))
+
+    def _poll_export_job(
+        self, chat_id: int, user_id: int, job_id: str, panel_token: int
+    ) -> None:
+        def loop() -> None:
+            last = ""
+            for _ in range(10800):
+                if not self.panel.is_view_active(chat_id, panel_token):
+                    return
+                try:
+                    job = self.client.get(user_id, f"/api/v1/jobs/{job_id}")
+                    text = self._export_job_text(job)
+                    terminal = job.get("status") in TERMINAL_JOB_STATUSES
+                    if text != last:
+                        self.panel.update(
+                            chat_id,
+                            text,
+                            export_job_markup(terminal),
+                        )
+                        last = text
+                    if terminal:
+                        self._notify_export_complete(chat_id, user_id, job)
+                        return
+                except Exception:
+                    LOGGER.exception("Export workspace polling failed for %s", job_id)
+                    job = {"status": "queued"}
+                time.sleep(1 if job.get("status") == "running" else 3)
+
+        threading.Thread(
+            target=loop,
+            daemon=True,
+            name=f"telegram-export-workspace-{job_id[:8]}",
+        ).start()
+
+    def _notify_export_complete(self, chat_id: int, user_id: int, job: dict[str, Any]) -> None:
+        state = self.export_workspaces.get(chat_id, user_id)
+        job_id = str(job.get("id", ""))
+        if state.terminal_notified_job_id == job_id:
+            return
+        state.terminal_notified_job_id = job_id
+        try:
+            self.panel.bot.send_message(
+                chat_id,
+                self._export_completion_text(job),
+                reply_markup=export_job_markup(True),
+            )
+        except Exception:
+            LOGGER.exception("Could not send export completion notification")
+
+    @staticmethod
+    def _export_job_text(job: dict[str, Any]) -> str:
+        progress = job.get("progress") or {}
+        lines = [
+            "🚀 Export fokus",
+            f"Status: {job.get('status', '-')}",
+            f"Job: {str(job.get('id', ''))[:12]}",
+            f"Profile: {job.get('profile', '-')}  •  Worker: {job.get('worker', '-')}",
+        ]
+        if job.get("queue_position") is not None:
+            lines.append(f"Posisi antrean: {job['queue_position']}")
+        if progress.get("message"):
+            lines.append(f"Saat ini: {short_text(progress['message'], 160)}")
+        if progress.get("overall"):
+            overall = progress["overall"]
+            current = overall.get("current", "?")
+            total = overall.get("total", "?")
+            percent = overall.get("percent")
+            suffix = f" ({percent:.1f}%)" if isinstance(percent, (int, float)) else ""
+            lines.append(f"Progress: {current}/{total}{suffix}")
+        if job.get("status") in TERMINAL_JOB_STATUSES:
+            lines.extend(["", TelegramFrontendApp._export_completion_text(job)])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _export_completion_text(job: dict[str, Any]) -> str:
+        report = export_report(job)
+        lines = [
+            f"{'✅' if report['status'] == 'succeeded' else '❌'} Export {report['status']}",
+        ]
+        labels = (
+            ("Message", report["message_count"]),
+            ("Media", report["media_count"]),
+            ("Foto", report["photo_count"]),
+            ("Video", report["video_count"]),
+            ("Latest ID", report["latest_id"]),
+        )
+        for label, value in labels:
+            if value is not None:
+                lines.append(f"{label}: {value}")
+        if report["filename"] or report["artifact"]:
+            lines.append(f"Artifact: {report['filename'] or report['artifact']}")
+        if report["error"]:
+            lines.append(f"Error: {short_text(report['error'], 240)}")
+        return "\n".join(lines)
 
     def _show_workers(
         self, message, user_id: int, actor: dict[str, Any]
@@ -506,13 +830,13 @@ class TelegramFrontendApp:
             item_id = int(data.rsplit(":", 1)[1])
             edit_menu_message(
                 message,
-                "Hapus file dari channel dan katalog?",
+                "Pindahkan file ke Trash? Message channel belum dihapus.",
                 storage_delete_markup(item_id),
             )
         elif data.startswith("storage:delete_yes:"):
             item_id = int(data.rsplit(":", 1)[1])
             self.client.delete(user_id, f"/api/v1/storage/items/{item_id}")
-            edit_menu_message(message, "File storage dihapus.", storage_menu_markup())
+            edit_menu_message(message, "File dipindahkan ke Trash.", storage_menu_markup())
 
     def _show_storage_results(
         self, message, user_id: int, query: str, *, mine: bool = False
@@ -942,7 +1266,12 @@ class TelegramFrontendApp:
     ) -> None:
         action = pending.action
         if value.lower() in {"batal", "cancel"}:
-            edit_menu_message(message, "Input dibatalkan.", main_menu_markup(actor["profile"]))
+            if action.startswith("export_"):
+                self._show_export_workspace(message, user_id, actor, "Input dibatalkan.")
+            else:
+                edit_menu_message(message, "Input dibatalkan.", main_menu_markup(actor["profile"]))
+        elif action.startswith("export_"):
+            self._handle_export_input(message, user_id, pending, value)
         elif action == "storage_folder_name":
             self.pending[(message.chat_id, user_id)] = PendingInput(
                 "storage_keywords",

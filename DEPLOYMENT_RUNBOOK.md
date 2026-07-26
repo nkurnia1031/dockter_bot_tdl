@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.1 - UI static SvelteKit dan telemetry progress job
+Versi: 3.4 - Storage file manager, notifikasi export, dan Telegram export workspace
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -15,16 +15,42 @@ tidak membutuhkan Node.js atau container web di VPS target.
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
 | aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
 
-Untuk update telemetry progress, urutan wajib adalah:
+Untuk update Storage file manager ini, urutan wajib adalah:
 
 1. Backend dan worker-local di VPS gateway.
 2. Seluruh worker remote.
 3. Web static.
 
-Backend harus diperbarui lebih dahulu karena backend baru memahami event
-`transient` dan menyimpan `progress_sequence`. Migrasi tabel SQLite dilakukan
+Backend harus diperbarui lebih dahulu karena backend membuat tabel folder,
+kolom Trash, dan antrean sinkronisasi caption. Worker baru lalu mengirim relative
+path agar nested/empty folder dapat dipertahankan. Migrasi SQLite berjalan
 otomatis dan idempotent saat backend mulai. Tidak ada perintah migrasi database
 manual. Data `/data`, katalog, state, dan sesi TDL tidak dihapus.
+
+Worker release ini juga menambahkan statistik `message_count`, `media_count`,
+`photo_count`, dan `video_count` pada report akhir export. Web memakai data itu
+untuk notifikasi fixed saat export masuk antrean dan selesai.
+
+## Workspace export Telegram
+
+`/start`, `/menu`, dan `/panel` sekarang membuka `Export fokus` sebagai panel
+awal. Panel ini menggabungkan pemilihan source, label opsional, Start ID, dan
+pengiriman export dalam satu pesan Telegram. Source tersimpan dipilih melalui
+tombol inline; source baru dapat dimasukkan sebagai username tanpa `@` atau
+numeric chat ID. Username dengan dan tanpa `@` dianggap source yang sama.
+
+`Start ID` kosong memakai `Last ID backend + 1`. Jika diisi manual, bot mengirim
+`use_url_message_id=true` agar override benar-benar dipakai dan tidak ditimpa
+oleh state source. Label custom otomatis masuk daftar label berikutnya.
+
+Tombol `Workspace full fitur` membuka menu utility, storage, download, backup,
+worker, settings, dan source management lama. Pergantian workspace hanya
+mengubah tampilan bot; profile, worker route, state source, dan job aktif tidak
+berubah. Setelah restart frontend Telegram, mode awal kembali ke `Export fokus`.
+
+Saat export diterima, Telegram menampilkan alert antrean. Saat job terminal,
+bot mengirim satu notifikasi baru berisi status, jumlah message/media/foto/video,
+latest ID, dan artifact. Panel job tetap dapat dibuka melalui tombol report.
 
 ## Sekali saja: konfigurasi gateway dan UI
 
@@ -34,7 +60,12 @@ Pada `.env.backend`, isi konfigurasi browser:
 WEB_PUBLIC_ORIGIN=https://ui.utama.naufix.space
 WEB_COOKIE_SECRET=<hasil openssl rand -hex 32>
 WEB_COOKIE_SECURE=true
+STORAGE_TRASH_RETENTION_DAYS=30
 ```
+
+`STORAGE_TRASH_RETENTION_DAYS` menentukan kapan item Trash dihapus permanen
+dari channel. Sebelum tenggat, delete dari web/bot hanya memindahkan item ke
+Recycle Bin.
 
 Pada `.env` utama di VPS gateway, simpan konfigurasi release UI. PAT GitHub
 tidak boleh dimasukkan ke `.env.backend` karena backend tidak membutuhkannya.

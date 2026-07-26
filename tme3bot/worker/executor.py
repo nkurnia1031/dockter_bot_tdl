@@ -22,6 +22,25 @@ from tme3bot.utility import UtilityRunner
 LOGGER = logging.getLogger(__name__)
 
 
+def storage_relative_folders(root: Path) -> list[str]:
+    """Return nested directories, including empty ones, as portable paths."""
+    return [
+        path.relative_to(root).as_posix()
+        for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_dir())
+    ]
+
+
+def storage_logical_folder(
+    root: Path, path: Path, destination_path: str, preserve_structure: bool
+) -> tuple[str, str]:
+    relative = path.relative_to(root).parent.as_posix() if preserve_structure else "."
+    relative = "" if relative == "." else relative
+    logical = "/".join(
+        part for part in (str(destination_path).strip("/"), relative) if part
+    )
+    return logical, relative
+
+
 def _utility_progress_message(utility: str, phase: str, item: str) -> str:
     labels = {
         "compressing": "Mengompres",
@@ -458,7 +477,7 @@ class WorkerJobExecutor:
             "artifact.discovered",
             result={"artifact": artifact},
         )
-        return result
+        return {**asdict(result), **stats}
 
     def _leave(self, command: dict[str, Any]) -> dict[str, Any]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
@@ -764,8 +783,34 @@ class WorkerJobExecutor:
         if not root.is_dir():
             raise ValueError(f"Folder storage tidak ditemukan: {root}")
         files = sorted(path for path in root.rglob("*") if path.is_file())
+        preserve_structure = bool(payload.get("preserve_structure", True))
+        if preserve_structure:
+            for relative in storage_relative_folders(root):
+                self.publisher.emit(
+                    str(command["job_id"]),
+                    "running",
+                    "storage.folder_discovered",
+                    result={
+                        "destination_folder_id": payload.get("destination_folder_id"),
+                        "relative_path": relative,
+                        "owner_user_id": int(payload["owner_user_id"]),
+                    },
+                )
         if not files:
-            raise ValueError("Folder storage tidak berisi file.")
+            reporter.report(
+                phase="registering",
+                message="Struktur folder kosong selesai dibuat",
+                overall={"current": 0, "total": 0, "unit": "files", "percent": 100},
+                counters={"succeeded": 0, "failed": 0},
+                force=True,
+            )
+            return {
+                "status": "uploaded",
+                "batch_id": payload["batch_id"],
+                "succeeded": 0,
+                "failed": [],
+                "total": 0,
+            }
         file_sizes = {path: path.stat().st_size for path in files}
         total_bytes = sum(file_sizes.values())
         failed, succeeded = [], 0
@@ -860,6 +905,14 @@ class WorkerJobExecutor:
                             )
 
                     try:
+                        base_folder = str(
+                            payload.get("destination_folder_path")
+                            or payload.get("folder")
+                            or ""
+                        )
+                        logical_folder, relative_parent = storage_logical_folder(
+                            root, path, base_folder, preserve_structure
+                        )
                         upload_id = str(
                             uuid.uuid5(
                                 uuid.NAMESPACE_URL,
@@ -867,7 +920,7 @@ class WorkerJobExecutor:
                             )
                         )
                         caption = build_storage_caption(
-                            str(payload["folder"]), path.name, str(payload.get("keywords", ""))
+                            logical_folder, path.name, str(payload.get("keywords", ""))
                         )
                         reporter.report(
                             phase="uploading",
@@ -930,7 +983,9 @@ class WorkerJobExecutor:
                             "channel_message_id": result.message_id,
                             "original_name": path.name,
                             "display_name": path.name,
-                            "folder": str(payload["folder"]),
+                            "folder": logical_folder,
+                            "folder_id": payload.get("destination_folder_id"),
+                            "relative_folder": relative_parent,
                             "keywords": str(payload.get("keywords", "")),
                             "caption": caption,
                             "file_size": size,

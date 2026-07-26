@@ -5,11 +5,140 @@ from __future__ import annotations
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+def export_workspace_markup(
+    state,
+    sources: list[dict] | None = None,
+    labels: list[dict] | None = None,
+) -> InlineKeyboardMarkup:
+    """Single-message export form with inline field pickers."""
+    sources = sources or []
+    labels = labels or []
+    source_page = max(0, int(getattr(state, "source_page", 0)))
+    label_page = max(0, int(getattr(state, "label_page", 0)))
+    source_start = source_page * 8
+    label_start = label_page * 6
+    selected_ref = str(getattr(state, "chat_ref", "") or "")
+    source = getattr(state, "source", None) or {}
+    source_text = selected_ref or "Belum dipilih"
+    if source.get("label"):
+        source_text = f"{source.get('label')} — {source_text}"
+    if getattr(state, "source", None) is None and selected_ref:
+        source_text += " (source baru)"
+
+    label_text = getattr(state, "label", None) or "Kosong"
+    if getattr(state, "start_id", None) is None:
+        start_text = f"Otomatis: {getattr(state, 'default_start_id', 1)}"
+    else:
+        start_text = f"Override: {getattr(state, 'start_id')}"
+
+    rows = [
+        [InlineKeyboardButton(f"Source: {source_text}"[:60], callback_data="ew:source")],
+    ]
+    for index, item in enumerate(sources[source_start : source_start + 8]):
+        ref = str(item.get("chat_ref", ""))
+        label = f"✓ {item.get('label') + ' — ' if item.get('label') else ''}{ref}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label[:60], callback_data=f"ew:s:{source_start + index}"
+                )
+            ]
+        )
+    if len(sources) > 8:
+        navigation = []
+        if source_page > 0:
+            navigation.append(
+                InlineKeyboardButton("‹ Source", callback_data=f"ew:p:{source_page - 1}")
+            )
+        if source_start + 8 < len(sources):
+            navigation.append(
+                InlineKeyboardButton("Source ›", callback_data=f"ew:p:{source_page + 1}")
+            )
+        if navigation:
+            rows.append(navigation)
+    rows.append([InlineKeyboardButton("＋ Source baru", callback_data="ew:new")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"Label: {label_text}"[:30], callback_data="ew:label"
+            ),
+            InlineKeyboardButton(
+                f"Start ID: {start_text}"[:30], callback_data="ew:last"
+            ),
+        ]
+    )
+    label_row = []
+    for index, item in enumerate(labels[label_start : label_start + 6]):
+        value = str(item.get("label", "")).strip()
+        if value:
+            label_row.append(
+                InlineKeyboardButton(value[:18], callback_data=f"ew:l:{label_start + index}")
+            )
+    if label_row:
+        rows.append(label_row[:3])
+        if len(label_row) > 3:
+            rows.append(label_row[3:6])
+    if len(labels) > 6:
+        navigation = []
+        if label_page > 0:
+            navigation.append(
+                InlineKeyboardButton("‹ Label", callback_data=f"ew:lp:{label_page - 1}")
+            )
+        if label_start + 6 < len(labels):
+            navigation.append(
+                InlineKeyboardButton("Label ›", callback_data=f"ew:lp:{label_page + 1}")
+            )
+        if navigation:
+            rows.append(navigation)
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton("Label custom", callback_data="ew:label:custom"),
+                InlineKeyboardButton("Tanpa label", callback_data="ew:label:none"),
+            ],
+            [
+                InlineKeyboardButton("🚀 Kirim export", callback_data="ew:submit"),
+                InlineKeyboardButton("↻ Refresh", callback_data="ew:refresh"),
+            ],
+            [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def export_job_markup(terminal: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Export fokus", callback_data="workspace:export"),
+                InlineKeyboardButton("Refresh report", callback_data="ew:refresh_job"),
+            ],
+            [InlineKeyboardButton("Detail job", callback_data="ew:detail")],
+            [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
+        ]
+        if not terminal
+        else [
+            [
+                InlineKeyboardButton("Export lagi", callback_data="workspace:export"),
+                InlineKeyboardButton("Detail job", callback_data="ew:detail"),
+            ],
+            [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
+        ]
+    )
+
+
+def export_input_cancel_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Batal, kembali ke form", callback_data="workspace:export")]]
+    )
+
+
 def main_menu_markup(profile_name: str | None = None) -> InlineKeyboardMarkup:
     profile_label = f"Profile: {profile_name}" if profile_name else "Profiles"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(profile_label[:60], callback_data="profile:info")],
+            [InlineKeyboardButton("Export fokus", callback_data="workspace:export")],
             [InlineKeyboardButton("Pilih worker", callback_data="worker:info")],
             [InlineKeyboardButton("Utility", callback_data="utility:menu")],
             [InlineKeyboardButton("Storage channel", callback_data="storage:menu")],
@@ -118,7 +247,7 @@ def storage_delete_markup(item_id: int) -> InlineKeyboardMarkup:
         [
             [
                 InlineKeyboardButton(
-                    "Ya, hapus message",
+                    "Ya, pindahkan ke Trash",
                     callback_data=f"storage:delete_yes:{item_id}",
                 )
             ],

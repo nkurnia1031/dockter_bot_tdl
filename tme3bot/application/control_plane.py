@@ -206,10 +206,32 @@ class ControlPlane:
 
     def _apply_event_side_effects(self, job: Job, event: JobEvent) -> None:
         result = event.result or {}
+        if event.event_type == "storage.folder_discovered" and self.storage_catalog is not None:
+            relative_path = str(result.get("relative_path", "")).strip()
+            if relative_path:
+                self.storage_catalog.ensure_path(
+                    relative_path,
+                    int(result.get("owner_user_id", job.actor_user_id)),
+                    parent_id=(
+                        int(result["destination_folder_id"])
+                        if result.get("destination_folder_id") is not None
+                        else None
+                    ),
+                )
         if event.event_type == "storage.item_uploaded" and self.storage_catalog is not None:
             item = result.get("item")
             if isinstance(item, dict):
-                self.storage_catalog.insert_item(**item)
+                values = dict(item)
+                relative = str(values.pop("relative_folder", "") or "")
+                parent = values.get("folder_id")
+                if relative:
+                    folder = self.storage_catalog.ensure_path(
+                        relative,
+                        int(values["owner_user_id"]),
+                        parent_id=int(parent) if parent is not None else None,
+                    )
+                    values["folder_id"] = folder.id if folder else parent
+                self.storage_catalog.insert_item(**values)
         if event.event_type == "artifact.discovered" and self.export_catalog is not None:
             artifact = result.get("artifact")
             if isinstance(artifact, dict):

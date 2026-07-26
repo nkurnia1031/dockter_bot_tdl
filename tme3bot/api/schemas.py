@@ -157,6 +157,13 @@ class StorageItemResponse(ApiResponse):
     uploaded_at: datetime
     updated_at: datetime
     status: str
+    folder_id: int | None = None
+    trashed_at: datetime | None = None
+    trashed_by: int | None = None
+    caption_sync_status: str = "synced"
+    purge_error: str | None = None
+    folder_path: str = ""
+    purge_at: datetime | None = None
 
 
 class StorageItemListResponse(ApiResponse):
@@ -257,7 +264,9 @@ class WorkerRouteRequest(BaseModel):
 
 class StorageUploadRequest(BaseModel):
     folder_path: str
-    folder: str
+    folder: str = ""
+    destination_folder_id: int | None = None
+    preserve_structure: bool = True
     keywords: str = ""
 
 
@@ -265,6 +274,22 @@ class StorageUpdateRequest(BaseModel):
     display_name: str | None = None
     folder: str | None = None
     keywords: str | None = None
+
+
+class StorageFolderRequest(BaseModel):
+    name: str
+    parent_id: int | None = None
+
+
+class StorageFolderUpdateRequest(BaseModel):
+    name: str | None = None
+    parent_id: int | None = None
+
+
+class StorageBulkActionRequest(BaseModel):
+    item_ids: list[int] = Field(default_factory=list)
+    folder_ids: list[int] = Field(default_factory=list)
+    destination_folder_id: int | None = None
 
 
 class StorageDeliveryRequest(BaseModel):

@@ -39,14 +39,14 @@ class StorageCatalogTests(unittest.TestCase):
             self.assertEqual(len(catalog.search("javascript")), 1)
             self.assertEqual(len(catalog.search("2021jsa")), 1)
 
-    def test_owner_can_edit_but_other_user_cannot(self):
+    def test_all_authorized_users_can_edit_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = StorageCatalog(Path(temp_dir) / "storage.db")
             item = catalog.insert_item(**item_values())
             renamed = catalog.rename(item.id, 10, "Laporan JS 2021")
             self.assertEqual(renamed.display_name, "Laporan JS 2021")
-            with self.assertRaises(PermissionError):
-                catalog.update_metadata(item.id, 99, folder="other")
+            changed = catalog.update_metadata(item.id, 99, folder="other")
+            self.assertEqual(changed.folder, "other")
 
     def test_any_authorized_user_can_rename_without_changing_original_name(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -81,6 +81,45 @@ class StorageCatalogTests(unittest.TestCase):
                 catalog.finish_backup_run(run_id, "remote-1")
             self.assertEqual(len(catalog.backup_parts("run-1", "remote-1")), 1)
             self.assertEqual(len(catalog.backup_retention_candidates("remote-1", 7)), 1)
+
+    def test_nested_folder_browser_move_and_cycle_prevention(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            parent = catalog.create_folder("Projects", 10)
+            child = catalog.create_folder("2026", 10, parent.id)
+            item = catalog.insert_item(
+                **{**item_values(), "folder": "", "folder_id": child.id}
+            )
+            browser = catalog.browser(parent.id)
+            self.assertEqual(browser["folders"][0]["name"], "2026")
+            self.assertEqual(catalog.folder_path(child.id), "Projects/2026")
+            moved = catalog.move_items([item.id], None)[0]
+            self.assertEqual(moved.folder, "")
+            with self.assertRaises(ValueError):
+                catalog.move_folder(parent.id, child.id)
+
+    def test_duplicate_names_suffix_and_trash_restore(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            first = catalog.insert_item(**item_values("one"))
+            second_values = item_values("two")
+            second_values["channel_message_id"] = 9002
+            second = catalog.insert_item(**second_values)
+            self.assertEqual(second.display_name, "laporan-final (2).pdf")
+            catalog.trash_items([first.id], 99)
+            self.assertEqual(catalog.get(first.id, include_deleted=True).status, "trashed")
+            restored = catalog.restore_items([first.id])[0]
+            self.assertEqual(restored.status, "active")
+            self.assertEqual(restored.display_name, "laporan-final.pdf")
+
+    def test_legacy_folder_path_migrates_to_nested_tree(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "storage.db"
+            catalog = StorageCatalog(path)
+            item = catalog.insert_item(**{**item_values(), "folder": "A/B/C"})
+            self.assertIsNotNone(item.folder_id)
+            self.assertEqual(catalog.folder_path(item.folder_id), "A/B/C")
+            self.assertEqual([part["name"] for part in catalog.breadcrumbs(item.folder_id)], ["A", "B", "C"])
 
 
 if __name__ == "__main__":

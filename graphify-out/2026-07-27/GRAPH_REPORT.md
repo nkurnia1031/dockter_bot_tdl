@@ -1,7 +1,7 @@
 # Graph Report - dockter_bot_tdl  (2026-07-27)
 
 ## Corpus Check
-- 139 files · ~67,796 words
+- 139 files · ~67,632 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -226,8 +226,8 @@ Cohesion: 0.18
 Nodes (9): ExportArtifactCatalogTests, ExportArtifactCatalog, inspect_export_json(), Any, Connection, Path, Gateway-owned catalog for export JSON artifacts.  The worker owns the physical J, Return safe media statistics without assuming a single TDL JSON shape. (+1 more)
 
 ### Community 36 - "BackupCoordinator"
-Cohesion: 0.27
-Nodes (4): ProfileRegistry, Path, Gateway-owned registry for profile metadata, separate from TDL sessions.      A, One-way migration for installations created before the registry.
+Cohesion: 0.12
+Nodes (6): FakeDispatcher, FakeWorkers, ProfileRegistry, Path, Gateway-owned registry for profile metadata, separate from TDL sessions.      A, One-way migration for installations created before the registry.
 
 ### Community 37 - "ExportService"
 Cohesion: 0.16
@@ -254,7 +254,7 @@ Cohesion: 0.23
 Nodes (14): post(), chooseScope(), clearSelection(), createFolder(), deliver(), dropOnFolder(), load(), moveSelection() (+6 more)
 
 ### Community 52 - "ControlPlaneTests"
-Cohesion: 0.12
+Cohesion: 0.11
 Nodes (14): Enum, Protocol, Update the latest telemetry without growing persistent event history., ActorResolver, JobRepository, Any, StorageDelivery, WorkerDispatcher (+6 more)
 
 ### Community 53 - "BatchDownloadService"
@@ -278,8 +278,8 @@ Cohesion: 0.12
 Nodes (16): str, AuthServiceTests, Path, AuthChallengeStatus, DomainError, Any, RuntimeError, BotAuthService (+8 more)
 
 ### Community 59 - "ControlPlaneTests"
-Cohesion: 0.08
-Nodes (12): FakeDispatcher, FakeWorkers, ControlPlaneTests, FakeDispatcher, FakeProfiles, ControlPlane, Any, Application facade used by every frontend adapter. (+4 more)
+Cohesion: 0.11
+Nodes (10): ControlPlaneTests, FakeDispatcher, FakeProfiles, ControlPlane, Any, Application facade used by every frontend adapter., _redact_secrets(), serializable() (+2 more)
 
 ### Community 60 - "WorkspaceExplorer.svelte"
 Cohesion: 0.38
@@ -335,7 +335,7 @@ _Questions this graph is uniquely positioned to answer:_
 
 - **Why does `AppConfig` connect `SerialPerKeyQueue` to `ProfileManager`, `tme3bot/app.py`, `BatchDownloadService`, `ProfileTests`, `ExportResult`, `HttpStateStore`, `DownloadProgressTracker`, `next`, `write_json_atomic`, `composition.py`, `UtilityFolderStore`?**
   _High betweenness centrality (0.058) - this node is a cross-community bridge._
-- **Why does `StorageCatalog` connect `StorageCatalog` to `DownloadProgressTracker`, `tme3bot/app.py`, `composition.py`, `DownloadProgressTracker`, `ControlPlaneTests`?**
+- **Why does `StorageCatalog` connect `StorageCatalog` to `BackupCoordinator`, `DownloadProgressTracker`, `tme3bot/app.py`, `composition.py`, `DownloadProgressTracker`, `ControlPlaneTests`?**
   _High betweenness centrality (0.051) - this node is a cross-community bridge._
 - **Why does `TelegramFrontendApp` connect `BatchDownloadService` to `tme3bot/app.py`, `TDLClient`, `@radix-ui/react-dropdown-menu`, `ProfileTests`?**
   _High betweenness centrality (0.041) - this node is a cross-community bridge._

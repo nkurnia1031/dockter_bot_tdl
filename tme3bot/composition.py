@@ -18,6 +18,7 @@ from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
 from tme3bot.storage_catalog import StorageCatalog
+from tme3bot.storage_maintenance import StorageMaintenanceService
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
 from tme3bot.worker.executor import WorkerEventPublisher, WorkerJobExecutor
 from tme3bot.worker_registry import WorkerRegistry
@@ -93,6 +94,9 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         challenge_minutes=config.auth_challenge_minutes,
     )
     bot = Bot(token=config.bot_token)
+    storage_maintenance = StorageMaintenanceService(
+        catalog, bot, config.storage_trash_retention_days
+    )
     coordinator = None
     scheduler = BackupScheduler(config, _NullCoordinator())
     try:
@@ -131,6 +135,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         backup_coordinator=coordinator,
         bot=bot,
         worker_dispatcher=dispatcher,
+        storage_maintenance=storage_maintenance,
     )
     return context, scheduler
 
@@ -138,6 +143,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
 def run_backend(config: AppConfig) -> None:
     context, scheduler = build_backend_context(config)
     scheduler.start()
+    context.storage_maintenance.start()
     uvicorn.run(
         create_backend_app(context),
         host=config.backend_bind_host,

@@ -361,7 +361,7 @@ class BackendApiTests(unittest.TestCase):
             "cancelled",
         )
 
-    def test_storage_rename_is_shared_but_owned_metadata_is_atomic(self):
+    def test_storage_metadata_is_shared_for_all_authorized_users(self):
         item = self.insert_storage_item()
         headers = self.login(43)
 
@@ -373,15 +373,41 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(renamed.status_code, 200)
         self.assertEqual(renamed.json()["display_name"], "Shared rename")
 
-        denied = self.client.patch(
+        updated = self.client.patch(
             f"/api/v1/storage/items/{item.id}",
             headers=headers,
-            json={"display_name": "Must not persist", "folder": "forbidden"},
+            json={"display_name": "Shared metadata", "folder": "shared-folder"},
         )
-        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(updated.status_code, 200)
         current = self.catalog.get(item.id)
-        self.assertEqual(current.display_name, "Shared rename")
-        self.assertEqual(current.folder, "old")
+        self.assertEqual(current.display_name, "Shared metadata")
+        self.assertEqual(current.folder, "shared-folder")
+
+    def test_storage_browser_folder_and_trash_flow(self):
+        item = self.insert_storage_item()
+        headers = self.login()
+        created = self.client.post(
+            "/api/v1/storage/folders",
+            headers=headers,
+            json={"name": "Shared", "parent_id": None},
+        )
+        self.assertEqual(created.status_code, 200)
+        folder_id = created.json()["id"]
+        moved = self.client.post(
+            "/api/v1/storage/actions/move",
+            headers=headers,
+            json={"item_ids": [item.id], "folder_ids": [], "destination_folder_id": folder_id},
+        )
+        self.assertEqual(moved.status_code, 200)
+        browser = self.client.get(
+            f"/api/v1/storage/browser?folder_id={folder_id}", headers=headers
+        )
+        self.assertEqual(browser.status_code, 200)
+        self.assertEqual(browser.json()["items"][0]["folder"], "Shared")
+        trashed = self.client.delete(
+            f"/api/v1/storage/items/{item.id}", headers=headers
+        )
+        self.assertEqual(trashed.json()["status"], "trashed")
 
 
 if __name__ == "__main__":
