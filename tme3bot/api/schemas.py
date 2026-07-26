@@ -283,6 +283,7 @@ class WorkerEventRequest(BaseModel):
     sequence: int
     status: str
     event_type: str
+    transient: bool = False
     progress: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] | None = None
     error: dict[str, Any] | None = None

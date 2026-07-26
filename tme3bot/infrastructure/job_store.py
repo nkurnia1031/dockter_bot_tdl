@@ -63,6 +63,7 @@ class SqliteJobRepository:
                     progress TEXT NOT NULL DEFAULT '{}',
                     result TEXT,
                     error TEXT,
+                    progress_sequence INTEGER NOT NULL DEFAULT 0,
                     archived_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -91,6 +92,10 @@ class SqliteJobRepository:
             }
             if "archived_at" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN archived_at TEXT")
+            if "progress_sequence" not in columns:
+                db.execute(
+                    "ALTER TABLE jobs ADD COLUMN progress_sequence INTEGER NOT NULL DEFAULT 0"
+                )
 
     def create(self, job: Job) -> Job:
         with self._db() as db:
@@ -256,7 +261,8 @@ class SqliteJobRepository:
             db.execute(
                 """
                 UPDATE jobs
-                SET status = ?, progress = ?, result = ?, error = ?, updated_at = ?
+                SET status = ?, progress = ?, result = ?, error = ?,
+                    progress_sequence = MAX(progress_sequence, ?), updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -264,6 +270,7 @@ class SqliteJobRepository:
                     _dump(progress),
                     _dump(result) if result is not None else None,
                     _dump(error) if error is not None else None,
+                    event.sequence,
                     event.created_at.isoformat(),
                     event.job_id,
                 ),
@@ -275,6 +282,43 @@ class SqliteJobRepository:
                     progress=progress,
                     result=result,
                     error=error,
+                    updated_at=event.created_at,
+                ),
+                True,
+            )
+
+    def update_progress_snapshot(self, event: JobEvent) -> tuple[Job, bool]:
+        """Keep only the newest high-frequency telemetry snapshot."""
+        with self._db() as db:
+            row = db.execute("SELECT * FROM jobs WHERE id = ?", (event.job_id,)).fetchone()
+            job = self._job(row)
+            if job is None:
+                raise KeyError(f"Unknown job: {event.job_id}")
+            if job.status.terminal:
+                return job, False
+            current_sequence = int(row["progress_sequence"] or 0)
+            if event.sequence <= current_sequence:
+                return job, False
+            job.ensure_transition(event.status)
+            db.execute(
+                """
+                UPDATE jobs
+                SET status = ?, progress = ?, progress_sequence = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    event.status.value,
+                    _dump(event.progress),
+                    event.sequence,
+                    event.created_at.isoformat(),
+                    event.job_id,
+                ),
+            )
+            return (
+                replace(
+                    job,
+                    status=event.status,
+                    progress=event.progress,
                     updated_at=event.created_at,
                 ),
                 True,

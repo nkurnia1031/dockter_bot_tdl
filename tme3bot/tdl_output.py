@@ -16,6 +16,10 @@ class CommandProgress:
     updated_at: float
     percent: float | None = None
     speed: str | None = None
+    speed_bps: float | None = None
+    eta_seconds: int | None = None
+    elapsed_seconds: float | None = None
+    transferred_bytes: int | None = None
     fraction_current: int | None = None
     fraction_total: int | None = None
     file_name: str | None = None
@@ -58,6 +62,10 @@ def parse_tdl_progress_line(line: str, stream_name: str) -> CommandProgress:
         updated_at=time.time(),
         percent=parse_percent(clean_line),
         speed=parse_speed(clean_line),
+        speed_bps=parse_speed_bps(clean_line),
+        eta_seconds=parse_eta_seconds(clean_line),
+        elapsed_seconds=parse_elapsed_seconds(clean_line),
+        transferred_bytes=parse_transferred_bytes(clean_line),
         fraction_current=fraction_current,
         fraction_total=fraction_total,
         file_name=parse_file_name(clean_line),
@@ -80,6 +88,61 @@ def parse_speed(line: str) -> str | None:
         r"(\d+(?:\.\d+)?\s*(?:KB|MB|GB|TB|B)\s*/\s*s)", line, flags=re.IGNORECASE
     )
     return re.sub(r"\s+", "", match.group(1)) if match else None
+
+
+def parse_speed_bps(line: str) -> float | None:
+    speed = parse_speed(line)
+    if not speed:
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)\s*([KMGT]?i?B|B)", speed, re.IGNORECASE)
+    if not match:
+        return None
+    return float(match.group(1)) * _byte_multiplier(match.group(2))
+
+
+def parse_eta_seconds(line: str) -> int | None:
+    match = re.search(r"(?:~?\s*ETA\s*:?\s*)(\d+(?:h\d+m?\d*s?|m\d+s?|[hms]))", line, re.IGNORECASE)
+    if not match:
+        return None
+    return _duration_seconds(match.group(1))
+
+
+def parse_elapsed_seconds(line: str) -> float | None:
+    match = re.search(r"\bin\s+(\d+(?:\.\d+)?)s\b", line, re.IGNORECASE)
+    return float(match.group(1)) if match else None
+
+
+def parse_transferred_bytes(line: str) -> int | None:
+    match = re.search(
+        r"\[(\d+(?:\.\d+)?)\s*([KMGT]?i?B|B)\s+in\b",
+        line,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return int(float(match.group(1)) * _byte_multiplier(match.group(2)))
+
+
+def _byte_multiplier(unit: str) -> int:
+    normalized = unit.lower().replace("ib", "b")
+    return {
+        "b": 1,
+        "kb": 1024,
+        "mb": 1024**2,
+        "gb": 1024**3,
+        "tb": 1024**4,
+    }.get(normalized, 1)
+
+
+def _duration_seconds(value: str) -> int:
+    matched = re.fullmatch(
+        r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?",
+        value.strip().lower(),
+    )
+    if not matched:
+        return 0
+    hours, minutes, seconds = (int(item or 0) for item in matched.groups())
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def parse_fraction(line: str) -> tuple[int | None, int | None]:

@@ -123,6 +123,11 @@ class ControlPlane:
                 observer(event)
         return job
 
+    def update_worker_progress(self, event: JobEvent) -> Job:
+        """Update the latest telemetry without growing persistent event history."""
+        job, _ = self.jobs.update_progress_snapshot(event)
+        return job
+
     def add_event_observer(self, observer: Callable[[JobEvent], None]) -> None:
         self._event_observers.append(observer)
 

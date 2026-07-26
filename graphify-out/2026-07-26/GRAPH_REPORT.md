@@ -1,11 +1,11 @@
 # Graph Report - dockter_bot_tdl  (2026-07-26)
 
 ## Corpus Check
-- 133 files · ~59,016 words
+- 133 files · ~58,990 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1408 nodes · 3720 edges · 73 communities (59 shown, 14 thin omitted)
+- 1408 nodes · 3720 edges · 75 communities (60 shown, 15 thin omitted)
 - Extraction: 89% EXTRACTED · 11% INFERRED · 0% AMBIGUOUS · INFERRED: 398 edges (avg confidence: 0.54)
 - Token cost: 0 input · 0 output
 
@@ -67,6 +67,7 @@
 - request_json
 - executor.py
 - SqliteAuthRepository
+- $lib/components/JobTable.svelte
 - WorkspaceExplorer.svelte
 - job-progress.ts
 - presentation.ts
@@ -76,6 +77,7 @@
 - FakeWorkers
 - pindah.py
 - $lib/components/Overview.svelte
+- ExportPage.svelte
 - tme3bot
 - ArchitectureBoundaryTests
 - infrastructure/__init__.py
@@ -109,7 +111,7 @@
 ## Import Cycles
 - None detected.
 
-## Communities (73 total, 14 thin omitted)
+## Communities (75 total, 15 thin omitted)
 
 ### Community 0 - "ProfileManager"
 Cohesion: 0.19
@@ -144,8 +146,8 @@ Cohesion: 0.18
 Nodes (6): OutputCallback, Popen, ProgressCallback, Queue, decode_process_output(), SubprocessRunner
 
 ### Community 8 - "UtilityHandler"
-Cohesion: 0.18
-Nodes (11): $lib/api, api(), ApiError, csrf(), patch(), put(), remove(), async() (+3 more)
+Cohesion: 0.17
+Nodes (14): $lib/api, api(), ApiError, csrf(), patch(), post(), put(), remove() (+6 more)
 
 ### Community 9 - "ProfileManager"
 Cohesion: 0.07
@@ -232,8 +234,8 @@ Cohesion: 0.23
 Nodes (9): _normalize_upload_caption(), CompletedProcess, Path, RuntimeError, Raised when TDL returns unusable or malformed export data., Upload exactly one file and return its Telegram channel message id., Resolve delayed TDL upload results by polling channel history.          Some TDL, TDLDataError (+1 more)
 
 ### Community 43 - "HttpStateStore"
-Cohesion: 0.12
-Nodes (11): Any, Path, utc_now_iso(), write_json_atomic(), HttpStateStore, normalize_chat_ref(), Any, Canonical source key: usernames ignore @ and letter case.      Numeric Telegram (+3 more)
+Cohesion: 0.11
+Nodes (10): StateStoreTests, HttpStateStore, normalize_chat_ref(), Any, Path, Canonical source key: usernames ignore @ and letter case.      Numeric Telegram, StateStore-compatible client used by a worker without a local state file., SourceState (+2 more)
 
 ### Community 44 - "@radix-ui/react-dropdown-menu"
 Cohesion: 0.24
@@ -248,8 +250,8 @@ Cohesion: 0.16
 Nodes (11): configure_logging(), main(), BackupScheduler, build_backend_context(), ControlPlaneBackupRouter, _first_actor(), _NullCoordinator, run_backend() (+3 more)
 
 ### Community 49 - "build_profile_runtime"
-Cohesion: 0.16
-Nodes (16): LeaveResult, LeaveService, has_downloadable_media(), is_image_message(), Any, BatchDownloadResult, BatchDownloadService, DownloadedJsonResult (+8 more)
+Cohesion: 0.23
+Nodes (11): LeaveResult, LeaveService, has_downloadable_media(), is_image_message(), Any, DownloadedJsonResult, media_ids_in_export(), Any (+3 more)
 
 ### Community 52 - "ControlPlaneTests"
 Cohesion: 0.14
@@ -264,8 +266,8 @@ Cohesion: 0.29
 Nodes (3): DownloadProgressSnapshot, DownloadProgressTracker, CommandProgress
 
 ### Community 55 - "BatchDownloadService"
-Cohesion: 0.27
-Nodes (3): StateStoreTests, Path, StateStore
+Cohesion: 0.36
+Nodes (5): BatchDownloadResult, BatchDownloadService, Path, Download selected opaque filenames after strict directory validation., unique_path()
 
 ### Community 57 - "executor.py"
 Cohesion: 0.18
@@ -274,6 +276,10 @@ Nodes (4): JsonHttpError, JobLogSnapshot, Bounded raw command output retained wi
 ### Community 58 - "SqliteAuthRepository"
 Cohesion: 0.15
 Nodes (9): BotAuthService, _hash_secret(), _now(), Any, Connection, datetime, Path, SqliteAuthRepository (+1 more)
+
+### Community 59 - "$lib/components/JobTable.svelte"
+Cohesion: 0.18
+Nodes (5): $lib/components/BackupsPage.svelte, ./JobProgressCard.svelte, $lib/components/JobTable.svelte, $lib/components/UtilityPage.svelte, async()
 
 ### Community 60 - "WorkspaceExplorer.svelte"
 Cohesion: 0.24
@@ -284,12 +290,12 @@ Cohesion: 0.39
 Nodes (6): clampPercent(), formatDuration(), JobLike, NormalizedProgress, normalizeJobProgress(), number()
 
 ### Community 62 - "presentation.ts"
-Cohesion: 0.18
-Nodes (10): $lib/components/BackupsPage.svelte, ./JobProgressCard.svelte, $lib/components/JobTable.svelte, formatBytes(), formatDate(), groupIdsByWorker(), jobMessage(), LabelItem (+2 more)
+Cohesion: 0.39
+Nodes (7): formatBytes(), formatDate(), groupIdsByWorker(), jobMessage(), LabelItem, resultEntries(), textValue()
 
 ### Community 63 - "$lib/components/Shell.svelte"
-Cohesion: 0.14
-Nodes (9): ../styles.css, post(), ./Login.svelte, $lib/components/Shell.svelte, $lib/components/WorkersPage.svelte, challenge, current, loading (+1 more)
+Cohesion: 0.29
+Nodes (3): ../styles.css, ./Login.svelte, $lib/components/Shell.svelte
 
 ### Community 64 - "TDLClient"
 Cohesion: 0.36
@@ -316,18 +322,18 @@ Cohesion: 0.67
 Nodes (3): _message_contains_caption(), Any, Match captions across the different JSON shapes emitted by TDL.
 
 ### Community 83 - "next"
-Cohesion: 0.27
-Nodes (4): ProfileRegistry, Path, Gateway-owned registry for profile metadata, separate from TDL sessions.      A, One-way migration for installations created before the registry.
+Cohesion: 0.18
+Nodes (8): Any, Path, utc_now_iso(), write_json_atomic(), ProfileRegistry, Path, Gateway-owned registry for profile metadata, separate from TDL sessions.      A, One-way migration for installations created before the registry.
 
 ## Knowledge Gaps
 - **71 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `name`, `version` (+66 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **14 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **15 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `AppConfig` connect `SerialPerKeyQueue` to `ProfileManager`, `ExportResult`, `tme3bot/app.py`, `composition.py`, `ProfileSelectionStore`, `build_profile_runtime`, `UtilityFolderStore`, `BatchDownloadService`, `dependencies`?**
+- **Why does `AppConfig` connect `SerialPerKeyQueue` to `ProfileManager`, `ExportResult`, `HttpStateStore`, `tme3bot/app.py`, `composition.py`, `ProfileSelectionStore`, `build_profile_runtime`, `UtilityFolderStore`, `BatchDownloadService`, `dependencies`?**
   _High betweenness centrality (0.060) - this node is a cross-community bridge._
 - **Why does `ProfileManager` connect `SerialPerKeyQueue` to `ProfileManager`, `TDLClient`, `HttpStateStore`, `tme3bot/app.py`, `build_profile_runtime`, `next`, `SerialPerKeyQueue`, `UtilityFolderStore`, `BatchDownloadService`, `dependencies`?**
   _High betweenness centrality (0.057) - this node is a cross-community bridge._

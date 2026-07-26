@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from tme3bot.persistence import write_json_atomic
+from tme3bot.tdl_output import parse_tdl_progress_line
 
 LOGGER = logging.getLogger(__name__)
 UTILITY_NAMES = ("extract", "compress", "export", "pindah")
@@ -211,9 +212,15 @@ class UtilityResult:
 
 
 class UtilityRunner:
-    def __init__(self, utility_root: Path, log_callback: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        utility_root: Path,
+        log_callback: Callable[[str], None] | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> None:
         self.root = utility_root
         self.log_callback = log_callback
+        self.progress_callback = progress_callback
         self._process_lock = threading.RLock()
         self._current_process: subprocess.Popen[str] | None = None
 
@@ -235,7 +242,7 @@ class UtilityRunner:
         succeeded: list[str] = []
         failed: dict[str, str] = {}
         details: list[dict[str, object]] = []
-        for folder in folders:
+        for folder_index, folder in enumerate(folders, start=1):
             try:
                 path = Path(folder)
                 if not path.is_absolute():
@@ -243,6 +250,15 @@ class UtilityRunner:
                 path = path.resolve()
                 if not path.is_dir():
                     raise UtilityPathError(f"Folder utility tidak ditemukan: {path}")
+                self._progress(
+                    {
+                        "phase": f"{utility}_starting",
+                        "folder": str(path),
+                        "folder_index": folder_index,
+                        "folder_total": len(folders),
+                        "indeterminate": True,
+                    }
+                )
                 before = self._snapshot(path)
                 self._run_folder(utility, path, password, settings or DEFAULT_UTILITY_SETTINGS)
                 after = self._snapshot(path)
@@ -259,8 +275,28 @@ class UtilityRunner:
                     detail["organizer"] = self._organizer_log_summary(path)
                 succeeded.append(str(path))
                 details.append(detail)
+                self._progress(
+                    {
+                        "phase": f"{utility}_folder_completed",
+                        "folder": str(path),
+                        "folder_index": folder_index,
+                        "folder_total": len(folders),
+                        "percent": 100,
+                        "indeterminate": False,
+                    }
+                )
             except Exception as exc:
                 failed[folder] = str(exc)
+                self._progress(
+                    {
+                        "phase": f"{utility}_folder_failed",
+                        "folder": folder,
+                        "folder_index": folder_index,
+                        "folder_total": len(folders),
+                        "error": str(exc)[:500],
+                        "indeterminate": False,
+                    }
+                )
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
         summary: dict[str, object] = {
             "folders_processed": len(succeeded),
@@ -280,6 +316,10 @@ class UtilityRunner:
                 }
             )
         return UtilityResult(utility, succeeded, failed, details, summary)
+
+    def _progress(self, value: dict[str, object]) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(value)
 
     @staticmethod
     def _organizer_log_summary(folder: Path) -> dict[str, int | str]:
@@ -365,15 +405,62 @@ class UtilityRunner:
             self._current_process = process
         assert process.stdout is not None
         lines: list[str] = []
+        marker: dict[str, object] = {}
+
+        def consume_line(raw_line: str) -> None:
+            nonlocal marker
+            clean = raw_line.strip()
+            if not clean:
+                return
+            lines.append(clean)
+            LOGGER.info("%s | %s", prefix, clean)
+            if self.log_callback:
+                self.log_callback(clean)
+            if clean.startswith("TME3_PROGRESS "):
+                try:
+                    decoded = json.loads(clean.removeprefix("TME3_PROGRESS "))
+                    if isinstance(decoded, dict):
+                        marker = decoded
+                        self._progress({"command": prefix, **decoded})
+                except json.JSONDecodeError:
+                    LOGGER.warning("Invalid utility progress marker: %s", clean)
+                return
+            parsed = parse_tdl_progress_line(clean, "stdout")
+            if (
+                parsed.percent is not None
+                or parsed.speed_bps is not None
+                or parsed.eta_seconds is not None
+            ):
+                self._progress(
+                    {
+                        "command": prefix,
+                        **marker,
+                        "percent": parsed.percent,
+                        "speed_bps": parsed.speed_bps,
+                        "eta_seconds": parsed.eta_seconds,
+                        "elapsed_seconds": parsed.elapsed_seconds,
+                        "bytes_current": parsed.transferred_bytes,
+                        "indeterminate": parsed.percent is None,
+                    }
+                )
+
         try:
-            for line in process.stdout:
-                clean = line.rstrip()
-                lines.append(clean)
-                LOGGER.info("%s | %s", prefix, clean)
-                if self.log_callback:
-                    self.log_callback(clean)
+            buffer: list[str] = []
+            while True:
+                char = process.stdout.read(1)
+                if not char:
+                    break
+                if char in {"\r", "\n"}:
+                    if buffer:
+                        consume_line("".join(buffer))
+                        buffer = []
+                else:
+                    buffer.append(char)
+            if buffer:
+                consume_line("".join(buffer))
             code = process.wait()
         finally:
+            process.stdout.close()
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None

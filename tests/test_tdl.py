@@ -247,6 +247,10 @@ class TDLClientTests(unittest.TestCase):
         self.assertEqual(progress.message_id, 339183)
         self.assertEqual(progress.percent, 4.8)
         self.assertEqual(progress.speed, "1.73 MB/s")
+        self.assertEqual(progress.speed_bps, 1814036.48)
+        self.assertEqual(progress.eta_seconds, 403)
+        self.assertEqual(progress.elapsed_seconds, 16.801)
+        self.assertEqual(progress.transferred_bytes, 29 * 1024 * 1024)
 
     def test_upload_builds_one_file_command_and_returns_message_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

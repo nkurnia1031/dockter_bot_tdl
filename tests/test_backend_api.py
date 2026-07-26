@@ -275,11 +275,29 @@ class BackendApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(running.status_code, 200)
-        completed = self.client.post(
+        transient = self.client.post(
             f"/internal/v1/jobs/{job['id']}/events",
             headers={"Authorization": "Bearer internal"},
             json={
                 "sequence": 3,
+                "status": "running",
+                "event_type": "progress.snapshot",
+                "transient": True,
+                "progress": {
+                    "phase": "exporting",
+                    "item": {"percent": 50},
+                },
+            },
+        )
+        self.assertEqual(transient.status_code, 200)
+        self.assertEqual(
+            transient.json()["job"]["progress"]["item"]["percent"], 50
+        )
+        completed = self.client.post(
+            f"/internal/v1/jobs/{job['id']}/events",
+            headers={"Authorization": "Bearer internal"},
+            json={
+                "sequence": 4,
                 "status": "succeeded",
                 "event_type": "completed",
                 "result": {"ok": True},
@@ -291,6 +309,10 @@ class BackendApiTests(unittest.TestCase):
         ).json()
         self.assertEqual(fetched["status"], "succeeded")
         self.assertEqual(fetched["result"], {"ok": True})
+        events = self.client.get(
+            f"/api/v1/jobs/{job['id']}/events", headers=headers
+        ).json()["items"]
+        self.assertNotIn("progress.snapshot", [event["event_type"] for event in events])
 
     def test_error_envelope_is_stable(self):
         response = self.client.get("/api/v1/me")

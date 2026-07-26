@@ -24,6 +24,10 @@ class DownloadProgressSnapshot:
     tdl_line: str | None = None
     tdl_percent: float | None = None
     tdl_speed: str | None = None
+    tdl_speed_bps: float | None = None
+    tdl_eta_seconds: int | None = None
+    tdl_elapsed_seconds: float | None = None
+    tdl_bytes_current: int | None = None
     tdl_fraction_current: int | None = None
     tdl_fraction_total: int | None = None
     tdl_file_name: str | None = None
@@ -34,6 +38,7 @@ class DownloadProgressTracker:
         self._lock = threading.RLock()
         self._snapshot = DownloadProgressSnapshot()
         self._current_media_positions: dict[int, int] = {}
+        self._speed_ewma: float | None = None
 
     def start_batch(self, mode: str, total_json: int) -> None:
         now = time.time()
@@ -47,6 +52,7 @@ class DownloadProgressTracker:
                 total_json=total_json,
             )
             self._current_media_positions = {}
+            self._speed_ewma = None
 
     def start_json(
         self, index: int, total_json: int, json_name: str, media_ids: list[int]
@@ -57,6 +63,7 @@ class DownloadProgressTracker:
                 message_id: position
                 for position, message_id in enumerate(ordered_media_ids, start=1)
             }
+            self._speed_ewma = None
         self._replace(
             phase="processing_json",
             total_json=total_json,
@@ -66,6 +73,10 @@ class DownloadProgressTracker:
             tdl_line=None,
             tdl_percent=None,
             tdl_speed=None,
+            tdl_speed_bps=None,
+            tdl_eta_seconds=None,
+            tdl_elapsed_seconds=None,
+            tdl_bytes_current=None,
             tdl_fraction_current=None,
             tdl_fraction_total=None,
             tdl_file_name=None,
@@ -88,14 +99,28 @@ class DownloadProgressTracker:
         elif media_current is not None and snapshot.current_media_total:
             media_total = snapshot.current_media_total
 
-        self._replace(
-            tdl_line=progress.line,
-            tdl_percent=progress.percent,
-            tdl_speed=progress.speed,
-            tdl_fraction_current=media_current,
-            tdl_fraction_total=media_total,
-            tdl_file_name=progress.file_name,
-        )
+        if progress.speed_bps is not None and progress.speed_bps > 0:
+            self._speed_ewma = (
+                progress.speed_bps
+                if self._speed_ewma is None
+                else 0.3 * progress.speed_bps + 0.7 * self._speed_ewma
+            )
+        changes = {"tdl_line": progress.line}
+        for key, value in (
+            ("tdl_percent", progress.percent),
+            ("tdl_speed", progress.speed),
+            ("tdl_eta_seconds", progress.eta_seconds),
+            ("tdl_elapsed_seconds", progress.elapsed_seconds),
+            ("tdl_bytes_current", progress.transferred_bytes),
+            ("tdl_fraction_current", media_current),
+            ("tdl_fraction_total", media_total),
+            ("tdl_file_name", progress.file_name),
+        ):
+            if value is not None:
+                changes[key] = value
+        if self._speed_ewma is not None:
+            changes["tdl_speed_bps"] = self._speed_ewma
+        self._replace(**changes)
 
     def finish_json(self, success: bool, error: str | None = None) -> None:
         snapshot = self.snapshot()

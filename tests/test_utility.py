@@ -48,6 +48,28 @@ class UtilitySummaryTests(unittest.TestCase):
         self.assertIn("relative-folder", result.failed)
         self.assertIn("absolut", result.failed["relative-folder"])
 
+    def test_structured_marker_and_7z_line_become_progress(self):
+        values = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = UtilityRunner(
+                Path("utility"), progress_callback=lambda value: values.append(value)
+            )
+            script = (
+                "print('TME3_PROGRESS {\"phase\":\"compressing\","
+                "\"index\":1,\"total\":2,\"name\":\"group-1\"}');"
+                "print('group-1 ... 25% [25 MB in 5s; ~ETA: 15s; 5 MB/s]')"
+            )
+            runner._command(
+                ["python", "-c", script],
+                Path(temp_dir),
+                "utility-compress",
+            )
+
+        self.assertEqual(values[0]["phase"], "compressing")
+        self.assertEqual(values[-1]["percent"], 25.0)
+        self.assertEqual(values[-1]["eta_seconds"], 15)
+        self.assertEqual(values[-1]["name"], "group-1")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,11 @@ export async function api<T>(path: string, init: RequestInit = {}, retried = fal
   return response.json() as Promise<T>;
 }
 
-export const post = <T>(path: string, value?: unknown) => api<T>(path, { method: 'POST', body: value === undefined ? undefined : JSON.stringify(value) });
+export async function post<T>(path: string, value?: unknown): Promise<T> {
+  const result = await api<T>(path, { method: 'POST', body: value === undefined ? undefined : JSON.stringify(value) });
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('tme3:data-mutated', { detail: { path } }));
+  return result;
+}
 export const put = <T>(path: string, value: unknown) => api<T>(path, { method: 'PUT', body: JSON.stringify(value) });
 export const patch = <T>(path: string, value: unknown) => api<T>(path, { method: 'PATCH', body: JSON.stringify(value) });
 export const remove = <T>(path: string) => api<T>(path, { method: 'DELETE' });

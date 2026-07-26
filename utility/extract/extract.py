@@ -2,6 +2,11 @@ import os
 import re
 import argparse
 import subprocess
+import json
+
+
+def emit_progress(**values):
+    print('TME3_PROGRESS ' + json.dumps(values, ensure_ascii=True), flush=True)
 
 
 def get_folder_password(folder):
@@ -174,7 +179,7 @@ def try_extract_with_prompt(filepath, cmd_builder, default_password, allow_promp
 # =============================
 # EXTRACTION
 # =============================
-def extract_archive(filepath, password=None, allow_prompt=True):
+def extract_archive(filepath, password=None, allow_prompt=True, index=1, total=1):
     filepath = os.path.abspath(filepath)
     folder = os.path.dirname(filepath)
     filename = os.path.basename(filepath)
@@ -191,6 +196,13 @@ def extract_archive(filepath, password=None, allow_prompt=True):
     base_name = get_extract_folder_name(filename)
     extract_dir = os.path.join(folder, base_name)
     extract_dir_preexisting = os.path.isdir(extract_dir)
+    emit_progress(
+        phase='extracting',
+        index=index,
+        total=total,
+        name=filename,
+        indeterminate=lower.endswith('.rar'),
+    )
 
     if lower.endswith(('.7z', '.7z.001', '.zip')):
         def builder(p):
@@ -200,6 +212,7 @@ def extract_archive(filepath, password=None, allow_prompt=True):
                 '-y',
                 filepath,
                 f'-o{extract_dir}'
+                , '-bsp1'
             ]
 
     elif lower.endswith('.rar'):
@@ -231,6 +244,14 @@ def extract_archive(filepath, password=None, allow_prompt=True):
                 print(f'[!] Gagal hapus {part}: {e}')
     elif not extract_dir_preexisting:
         cleanup_empty_directory(extract_dir)
+    emit_progress(
+        phase='item_completed' if success else 'item_failed',
+        index=index,
+        total=total,
+        name=filename,
+        percent=100 if success else None,
+        indeterminate=False,
+    )
     return success
 
 
@@ -240,15 +261,20 @@ def extract_archive(filepath, password=None, allow_prompt=True):
 def scan_directory(base_dir, password, allow_prompt=True):
     base_dir = os.path.abspath(base_dir)
     success = True
-
+    archives = []
     for root, _, files in os.walk(base_dir):
         for file in files:
             if is_main_part(file):
                 filepath = os.path.join(root, file)
-                # Daftar `files` adalah snapshot. Arsip mungkin sudah terhapus
-                # sebagai bagian dari grup multipart yang baru selesai diproses.
-                if os.path.isfile(filepath):
-                    success = extract_archive(filepath, password, allow_prompt) and success
+                archives.append(filepath)
+    total = len(archives)
+    for index, filepath in enumerate(archives, start=1):
+        # Daftar arsip adalah snapshot. Arsip mungkin sudah terhapus sebagai
+        # bagian dari grup multipart yang baru selesai diproses.
+        if os.path.isfile(filepath):
+            success = extract_archive(
+                filepath, password, allow_prompt, index=index, total=total
+            ) and success
     return success
 
 

@@ -11,12 +11,14 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.utility import UtilitySettingsStore
+from tme3bot.tdl_output import clean_tdl_output_line, parse_percent
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,9 +70,19 @@ def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> tuple[str, int]:
 
 
 class BackupService:
-    def __init__(self, config, catalog: StorageCatalog | None = None) -> None:
+    def __init__(
+        self,
+        config,
+        catalog: StorageCatalog | None = None,
+        progress_callback=None,
+    ) -> None:
         self.config = config
         self.catalog = catalog
+        self.progress_callback = progress_callback
+
+    def _progress(self, phase: str, **values) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback({"phase": phase, **values})
 
     def password(self) -> str:
         values = UtilitySettingsStore(self.config.utility_settings_file).get()
@@ -90,12 +102,23 @@ class BackupService:
         archive_path = output_dir / f"backup-{safe_node}-{created_at.replace(':', '').replace('+00:00', 'Z')}.7z"
         with tempfile.TemporaryDirectory(prefix=f"backup-{safe_node}-", dir=str(output_dir)) as raw_staging:
             staging = Path(raw_staging)
+            self._progress("staging", message="Mengumpulkan data runtime", indeterminate=True)
             if self.catalog is not None:
                 self._build_gateway_staging(staging)
             else:
                 self._build_worker_staging(staging)
             self._write_runtime_env(staging)
             self._write_manifest(staging, run_id, node_name, created_at)
+            staging_files = [path for path in staging.rglob("*") if path.is_file()]
+            staging_bytes = sum(path.stat().st_size for path in staging_files)
+            self._progress(
+                "compressing",
+                message=f"Mengompres {len(staging_files)} file runtime",
+                files_total=len(staging_files),
+                bytes_total=staging_bytes,
+                percent=0,
+                indeterminate=False,
+            )
             self._make_7z(staging, archive_path, password, volume_size or self.config.backup_volume_size)
         parts = tuple(sorted(archive_path.parent.glob(archive_path.name + ".*")))
         if archive_path.exists():
@@ -206,14 +229,63 @@ class BackupService:
         path.write_text(json.dumps(manifest, indent=2, ensure_ascii=True), encoding="utf-8")
         return path
 
-    @staticmethod
-    def _make_7z(staging: Path, output: Path, password: str, volume_size: str) -> None:
+    def _make_7z(self, staging: Path, output: Path, password: str, volume_size: str) -> None:
         binary = os.getenv("SEVEN_ZIP_BINARY", "7z").strip() or "7z"
-        command = [binary, "a", str(output), ".", "-r", "-v" + volume_size, "-mx=0", "-mhe=on", "-p" + password, "-y"]
+        command = [binary, "a", str(output), ".", "-r", "-v" + volume_size, "-mx=0", "-mhe=on", "-p" + password, "-y", "-bsp1"]
+        started = time.monotonic()
+        output_lines: list[str] = []
         try:
-            completed = subprocess.run(command, cwd=str(staging), check=False, capture_output=True, text=True)
+            process = subprocess.Popen(
+                command,
+                cwd=str(staging),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
         except FileNotFoundError as exc:
             raise RuntimeError("7z tidak tersedia di node backup.") from exc
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "7z gagal")[-1000:]
+        assert process.stdout is not None
+        buffer: list[str] = []
+        while True:
+            char = process.stdout.read(1)
+            if not char:
+                break
+            if char in {"\r", "\n"}:
+                line = clean_tdl_output_line("".join(buffer))
+                buffer = []
+                if not line:
+                    continue
+                output_lines.append(line)
+                percent = parse_percent(line)
+                if percent is not None:
+                    elapsed = max(0.0, time.monotonic() - started)
+                    eta = (
+                        int(elapsed * (100.0 - percent) / percent)
+                        if percent > 0
+                        else None
+                    )
+                    self._progress(
+                        "compressing",
+                        message="Membuat arsip backup terenkripsi",
+                        percent=percent,
+                        eta_seconds=eta,
+                        elapsed_seconds=int(elapsed),
+                        indeterminate=False,
+                    )
+            else:
+                buffer.append(char)
+        if buffer:
+            output_lines.append(clean_tdl_output_line("".join(buffer)))
+        process.stdout.close()
+        code = process.wait()
+        if code != 0:
+            detail = "\n".join(output_lines)[-1000:] or "7z gagal"
             raise RuntimeError(f"7z backup gagal: {detail}")
+        self._progress(
+            "compressing",
+            message="Arsip backup selesai dibuat",
+            percent=100,
+            elapsed_seconds=int(time.monotonic() - started),
+            indeterminate=False,
+        )

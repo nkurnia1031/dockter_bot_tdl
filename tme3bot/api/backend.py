@@ -1198,16 +1198,19 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError(
                 "INVALID_JOB_STATUS", "Status job tidak valid.", status_code=422
             ) from exc
-        job = context.control_plane.append_worker_event(
-            JobEvent(
-                job_id=job_id,
-                sequence=body.sequence,
-                status=status,
-                event_type=body.event_type,
-                progress=body.progress,
-                result=body.result,
-                error=body.error,
-            )
+        event = JobEvent(
+            job_id=job_id,
+            sequence=body.sequence,
+            status=status,
+            event_type=body.event_type,
+            progress=body.progress,
+            result=body.result,
+            error=body.error,
+        )
+        job = (
+            context.control_plane.update_worker_progress(event)
+            if body.transient
+            else context.control_plane.append_worker_event(event)
         )
         return {"ok": True, "job": job_dict(job)}
 

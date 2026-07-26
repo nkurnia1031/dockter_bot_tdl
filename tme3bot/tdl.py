@@ -531,6 +531,7 @@ class TDLClient:
         chat_ref: str,
         caption: str,
         resolve_after_id: int | None = None,
+        status_callback: Callable[[str], None] | None = None,
     ) -> UploadResult:
         """Upload exactly one file and return its Telegram channel message id."""
         if not file_path.is_file():
@@ -557,6 +558,8 @@ class TDLClient:
                 self._base_command()
                 + ["up", "-p", str(file_path), "-c", chat_ref, "--caption", str(caption_path)]
             )
+            if status_callback is not None:
+                status_callback("uploading")
             result = self.runner.run(
                 command,
                 env=self._command_env(),
@@ -568,6 +571,8 @@ class TDLClient:
             self._ensure_success(command, result)
             message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")
             if message_id is None:
+                if status_callback is not None:
+                    status_callback("resolving_message")
                 message_id = self._wait_for_upload_message_id(
                     chat_ref,
                     caption,
@@ -578,6 +583,8 @@ class TDLClient:
                     "TDL upload selesai tetapi channel message ID tidak ditemukan "
                     f"dalam {self.upload_resolve_timeout_seconds:g} detik."
                 )
+            if status_callback is not None:
+                status_callback("uploaded")
             return UploadResult(message_id=message_id, output=f"{result.stdout}\n{result.stderr}")
         finally:
             if caption_path is not None:

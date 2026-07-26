@@ -15,10 +15,36 @@ from tme3bot.backup_service import BackupService, sha256_file
 from tme3bot.export_catalog import inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import SerialPerKeyQueue
+from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.utility import UtilityRunner
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _utility_progress_message(utility: str, phase: str, item: str) -> str:
+    labels = {
+        "compressing": "Mengompres",
+        "extracting": "Mengekstrak",
+        "item_completed": "Selesai memproses",
+        "item_failed": "Gagal memproses",
+        "pindah_starting": "Menyiapkan pemindahan",
+        "export_starting": "Menyiapkan organizer export",
+    }
+    action = labels.get(phase, f"Menjalankan {utility}")
+    return f"{action} {item}".strip()
+
+
+def _has_transfer_telemetry(progress) -> bool:
+    return any(
+        value is not None
+        for value in (
+            progress.percent,
+            progress.speed_bps,
+            progress.eta_seconds,
+            progress.transferred_bytes,
+        )
+    )
 
 
 class JobLogSnapshot:
@@ -78,6 +104,7 @@ class WorkerEventPublisher:
         status: str,
         event_type: str,
         *,
+        transient: bool = False,
         progress: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
@@ -89,6 +116,7 @@ class WorkerEventPublisher:
             "sequence": sequence,
             "status": status,
             "event_type": event_type,
+            "transient": transient,
             "progress": json_value(progress or {}),
             "result": json_value(result) if result is not None else None,
             "error": json_value(error) if error is not None else None,
@@ -226,7 +254,15 @@ class WorkerJobExecutor:
                 job_id,
                 "running",
                 "started",
-                progress={"message": f"{kind} mulai diproses"},
+                progress={
+                    "phase": "starting",
+                    "message": f"{kind} mulai diproses",
+                    "overall": {},
+                    "item": {},
+                    "transfer": {},
+                    "counters": {"succeeded": 0, "failed": 0, "skipped": 0},
+                    "indeterminate": True,
+                },
             )
             result = self._execute(command)
             with self._lock:
@@ -309,6 +345,21 @@ class WorkerJobExecutor:
         finally:
             client.output_callback = previous
 
+    @contextmanager
+    def _capture_tdl_progress(self, client, callback):
+        previous = client.progress_callback
+
+        def capture(progress) -> None:
+            callback(progress)
+            if previous is not None:
+                previous(progress)
+
+        client.progress_callback = capture
+        try:
+            yield
+        finally:
+            client.progress_callback = previous
+
     def _execute(self, command: dict[str, Any]) -> Any:
         kind = str(command["kind"])
         handlers = {
@@ -330,6 +381,7 @@ class WorkerJobExecutor:
     def _export(self, command: dict[str, Any]) -> Any:
         runtime = self.profile_manager.runtime(str(command["profile"]))
         payload = command["payload"]
+        reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         url = payload.get("url")
         if not url:
             from urllib.parse import quote
@@ -342,12 +394,39 @@ class WorkerJobExecutor:
             url = f"https://{runtime.config.tme3_host}/c/{quote(chat_ref, safe='@-')}/{start_id}"
             if label:
                 url += f"/{quote(label, safe='')}"
+        reporter.report(
+            phase="connecting",
+            message="Menghubungkan sesi Telegram untuk export",
+            item={"name": str(payload.get("chat_ref") or url)},
+            indeterminate=True,
+            force=True,
+        )
+
+        def export_progress(progress) -> None:
+            if not _has_transfer_telemetry(progress):
+                return
+            reporter.report(
+                phase="exporting",
+                message=f"Export {progress.file_name or payload.get('chat_ref') or 'chat'}",
+                item={
+                    "name": progress.file_name or str(payload.get("chat_ref") or url),
+                    "index": progress.fraction_current,
+                    "total": progress.fraction_total,
+                    "percent": progress.percent,
+                },
+                transfer=reporter.tdl_transfer(progress),
+                indeterminate=progress.percent is None,
+            )
+
         with runtime.export_operation_lock:
             with self._capture_tdl_output(runtime.export_tdl_client):
-                result = runtime.export_service.export_from_url(
-                    str(url),
-                    use_url_message_id=bool(payload.get("use_url_message_id", False)),
-                )
+                with self._capture_tdl_progress(
+                    runtime.export_tdl_client, export_progress
+                ):
+                    result = runtime.export_service.export_from_url(
+                        str(url),
+                        use_url_message_id=bool(payload.get("use_url_message_id", False)),
+                    )
         stats = inspect_export_json(result.export_path)
         artifact = {
             **stats,
@@ -358,6 +437,21 @@ class WorkerJobExecutor:
             "artifact_key": result.export_path.name,
             "status": "pending",
         }
+        reporter.report(
+            phase="completed",
+            message=(
+                f"Export selesai: {result.exported_count} message"
+                + (" dengan media" if result.has_media else "")
+            ),
+            overall={
+                "current": result.exported_count,
+                "total": result.exported_count,
+                "percent": 100,
+                "unit": "messages",
+            },
+            counters={"succeeded": result.exported_count},
+            force=True,
+        )
         self.publisher.emit(
             str(command["job_id"]),
             "running",
@@ -379,16 +473,50 @@ class WorkerJobExecutor:
     def _download(self, command: dict[str, Any]) -> Any:
         runtime = self.profile_manager.runtime(str(command["profile"]))
         stop = threading.Event()
+        reporter = ProgressReporter(self.publisher, str(command["job_id"]))
 
         def publish_progress() -> None:
-            while not stop.wait(2):
+            while not stop.wait(1):
                 snapshot = runtime.download_progress.snapshot()
                 try:
-                    self.publisher.emit(
-                        str(command["job_id"]),
-                        "running",
-                        "progress",
-                        progress=json_value(snapshot),
+                    total_json = max(0, snapshot.total_json)
+                    json_done = max(
+                        snapshot.success_count + snapshot.failed_count,
+                        snapshot.current_json_index - 1,
+                    )
+                    item_percent = snapshot.tdl_percent
+                    reporter.report(
+                        phase=snapshot.phase,
+                        message=(
+                            f"Download {snapshot.tdl_file_name}"
+                            if snapshot.tdl_file_name
+                            else f"Memproses {snapshot.current_json_name or 'antrean download'}"
+                        ),
+                        overall={
+                            "current": json_done,
+                            "total": total_json,
+                            "percent": (
+                                json_done * 100 / total_json if total_json else None
+                            ),
+                            "unit": "json",
+                        },
+                        item={
+                            "name": snapshot.tdl_file_name or snapshot.current_json_name,
+                            "index": snapshot.tdl_fraction_current,
+                            "total": snapshot.tdl_fraction_total or snapshot.current_media_total,
+                            "percent": item_percent,
+                        },
+                        transfer={
+                            "bytes_current": snapshot.tdl_bytes_current,
+                            "speed_bps": snapshot.tdl_speed_bps,
+                            "eta_seconds": snapshot.tdl_eta_seconds,
+                            "elapsed_seconds": snapshot.tdl_elapsed_seconds,
+                        },
+                        counters={
+                            "succeeded": snapshot.success_count,
+                            "failed": snapshot.failed_count,
+                        },
+                        indeterminate=item_percent is None,
                     )
                 except Exception:
                     LOGGER.exception("Could not publish download progress")
@@ -426,6 +554,24 @@ class WorkerJobExecutor:
                         }
                     },
                 )
+            reporter.report(
+                phase="completed",
+                message=(
+                    f"Download selesai: {result.success_count} JSON berhasil, "
+                    f"{result.failed_count} gagal"
+                ),
+                overall={
+                    "current": result.moved_count,
+                    "total": result.moved_count,
+                    "percent": 100,
+                    "unit": "json",
+                },
+                counters={
+                    "succeeded": result.success_count,
+                    "failed": result.failed_count,
+                },
+                force=True,
+            )
             return result
         finally:
             stop.set()
@@ -490,6 +636,7 @@ class WorkerJobExecutor:
 
     def _utility(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
+        reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         folders = [
             self._workspace_path(item, require_absolute=True)
             for item in payload.get("folders", [])
@@ -499,23 +646,106 @@ class WorkerJobExecutor:
         missing = [str(folder) for folder in folders if not folder.is_dir()]
         if missing:
             raise ValueError(f"Folder utility tidak ditemukan: {', '.join(missing)}")
+        utility_name = str(payload["utility"])
+        counters = {"succeeded": 0, "failed": 0, "skipped": 0}
+
+        def utility_progress(value: dict[str, object]) -> None:
+            phase = str(value.get("phase") or utility_name)
+            if phase in {"item_completed", f"{utility_name}_folder_completed"}:
+                counters["succeeded"] += 1
+            elif phase in {"item_failed", f"{utility_name}_folder_failed"}:
+                counters["failed"] += 1
+            index = int(value.get("index") or value.get("folder_index") or 0)
+            total = int(value.get("total") or value.get("folder_total") or len(folders))
+            percent = value.get("percent")
+            item_name = str(
+                value.get("name")
+                or value.get("folder")
+                or (folders[min(max(index - 1, 0), len(folders) - 1)] if folders else "")
+            )
+            progress_payload = reporter.report(
+                phase=phase,
+                message=_utility_progress_message(utility_name, phase, item_name),
+                overall={
+                    "current": max(0, index - (0 if "completed" in phase else 1)),
+                    "total": total,
+                    "percent": (
+                        float(percent)
+                        if total <= 1 and isinstance(percent, (int, float))
+                        else (
+                            ((max(index - 1, 0) + float(percent) / 100) * 100 / total)
+                            if total and isinstance(percent, (int, float))
+                            else None
+                        )
+                    ),
+                    "unit": "folders",
+                },
+                item={
+                    "name": item_name,
+                    "index": index or None,
+                    "total": total or None,
+                    "size_bytes": value.get("size_bytes"),
+                    "percent": percent,
+                },
+                transfer=reporter.transfer_metrics(
+                    speed_bps=value.get("speed_bps"),
+                    current_bytes=value.get("bytes_current"),
+                    total_bytes=value.get("size_bytes"),
+                    eta_seconds=value.get("eta_seconds"),
+                    elapsed_seconds=value.get("elapsed_seconds"),
+                    percent=float(percent) if isinstance(percent, (int, float)) else None,
+                ),
+                counters=counters,
+                indeterminate=bool(value.get("indeterminate", percent is None)),
+                force=phase.endswith("_starting") or phase in {"item_completed", "item_failed"},
+            )
+            if phase in {"item_completed", "item_failed"}:
+                reporter.milestone(
+                    phase,
+                    progress=progress_payload,
+                    error=(
+                        {"message": str(value.get("error")), "item": item_name}
+                        if phase == "item_failed"
+                        else None
+                    ),
+                )
 
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
             log_callback=self._append_job_log,
+            progress_callback=utility_progress,
         )
         job_id = str(command["job_id"])
         with self._lock:
             self._utility_runners[job_id] = runner
         try:
-            return json_value(
+            result = json_value(
                 runner.run(
-                    str(payload["utility"]),
+                    utility_name,
                     [str(item) for item in folders],
                     payload.get("password"),
                     payload.get("settings") or {},
                 )
             )
+            reporter.report(
+                phase="completed",
+                message=(
+                    f"Utility selesai: {len(result.get('succeeded', []))} folder berhasil, "
+                    f"{len(result.get('failed', {}))} gagal"
+                ),
+                overall={
+                    "current": len(folders),
+                    "total": len(folders),
+                    "percent": 100,
+                    "unit": "folders",
+                },
+                counters={
+                    "succeeded": len(result.get("succeeded", [])),
+                    "failed": len(result.get("failed", {})),
+                },
+                force=True,
+            )
+            return result
         finally:
             with self._lock:
                 self._utility_runners.pop(job_id, None)
@@ -523,16 +753,112 @@ class WorkerJobExecutor:
     def _storage_upload(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
         runtime = self.profile_manager.runtime(str(command["profile"]))
+        reporter = ProgressReporter(self.publisher, str(command["job_id"]))
+        reporter.report(
+            phase="scanning",
+            message="Memindai file dalam folder storage",
+            indeterminate=True,
+            force=True,
+        )
         root = self._workspace_path(str(payload["folder_path"]))
         if not root.is_dir():
             raise ValueError(f"Folder storage tidak ditemukan: {root}")
         files = sorted(path for path in root.rglob("*") if path.is_file())
         if not files:
             raise ValueError("Folder storage tidak berisi file.")
+        file_sizes = {path: path.stat().st_size for path in files}
+        total_bytes = sum(file_sizes.values())
         failed, succeeded = [], 0
+        completed_bytes = 0
+        reporter.milestone(
+            "phase_changed",
+            progress=reporter.report(
+                phase="uploading",
+                message=f"Siap mengupload {len(files)} file",
+                overall={
+                    "current": 0,
+                    "total": len(files),
+                    "percent": 0,
+                    "unit": "files",
+                    "bytes_current": 0,
+                    "bytes_total": total_bytes,
+                },
+                counters={"succeeded": 0, "failed": 0},
+                force=True,
+            ),
+        )
         with runtime.export_operation_lock:
             with self._capture_tdl_output(runtime.export_tdl_client):
                 for index, path in enumerate(files, start=1):
+                    size = file_sizes[path]
+                    upload_state = {"phase": "uploading"}
+                    reporter.reset_transfer()
+
+                    def upload_progress(progress) -> None:
+                        if (
+                            upload_state["phase"] != "uploading"
+                            or not _has_transfer_telemetry(progress)
+                        ):
+                            return
+                        transfer = reporter.tdl_transfer(progress, total_bytes=size)
+                        current_bytes = int(transfer.get("bytes_current") or 0)
+                        overall_bytes = min(total_bytes, completed_bytes + current_bytes)
+                        reporter.report(
+                            phase="uploading",
+                            message=f"Mengupload {path.name}",
+                            overall={
+                                "current": index - 1,
+                                "total": len(files),
+                                "percent": (
+                                    overall_bytes * 100 / total_bytes
+                                    if total_bytes
+                                    else None
+                                ),
+                                "unit": "files",
+                                "bytes_current": overall_bytes,
+                                "bytes_total": total_bytes,
+                            },
+                            item={
+                                "name": path.name,
+                                "index": index,
+                                "total": len(files),
+                                "size_bytes": size,
+                                "percent": progress.percent,
+                            },
+                            transfer=transfer,
+                            counters={
+                                "succeeded": succeeded,
+                                "failed": len(failed),
+                            },
+                            indeterminate=progress.percent is None,
+                        )
+
+                    def upload_phase(phase: str) -> None:
+                        upload_state["phase"] = phase
+                        if phase == "resolving_message":
+                            reporter.report(
+                                phase=phase,
+                                message=f"Menunggu konfirmasi Telegram untuk {path.name}",
+                                overall={
+                                    "current": index - 1,
+                                    "total": len(files),
+                                    "unit": "files",
+                                },
+                                item={
+                                    "name": path.name,
+                                    "index": index,
+                                    "total": len(files),
+                                    "size_bytes": size,
+                                    "percent": 100,
+                                },
+                                counters={
+                                    "succeeded": succeeded,
+                                    "failed": len(failed),
+                                },
+                                indeterminate=True,
+                                force=True,
+                            )
+
                     try:
                         upload_id = str(
                             uuid.uuid5(
@@ -543,8 +869,57 @@ class WorkerJobExecutor:
                         caption = build_storage_caption(
                             str(payload["folder"]), path.name, str(payload.get("keywords", ""))
                         )
-                        result = runtime.export_tdl_client.upload(
-                            path, runtime.config.storage_channel_ref, caption
+                        reporter.report(
+                            phase="uploading",
+                            message=f"Mengupload {path.name}",
+                            overall={
+                                "current": index - 1,
+                                "total": len(files),
+                                "unit": "files",
+                            },
+                            item={
+                                "name": path.name,
+                                "index": index,
+                                "total": len(files),
+                                "size_bytes": size,
+                                "percent": 0,
+                            },
+                            counters={
+                                "succeeded": succeeded,
+                                "failed": len(failed),
+                            },
+                            force=True,
+                        )
+                        with self._capture_tdl_progress(
+                            runtime.export_tdl_client, upload_progress
+                        ):
+                            result = runtime.export_tdl_client.upload(
+                                path,
+                                runtime.config.storage_channel_ref,
+                                caption,
+                                status_callback=upload_phase,
+                            )
+                        reporter.report(
+                            phase="hashing",
+                            message=f"Memverifikasi {path.name}",
+                            overall={
+                                "current": index - 1,
+                                "total": len(files),
+                                "unit": "files",
+                            },
+                            item={
+                                "name": path.name,
+                                "index": index,
+                                "total": len(files),
+                                "size_bytes": size,
+                                "percent": 100,
+                            },
+                            counters={
+                                "succeeded": succeeded,
+                                "failed": len(failed),
+                            },
+                            indeterminate=True,
+                            force=True,
                         )
                         digest, size = self._digest(path)
                         item = {
@@ -564,39 +939,126 @@ class WorkerJobExecutor:
                             "status": "active",
                             "uploaded_at": None,
                         }
-                        self.publisher.emit(
-                            str(command["job_id"]),
-                            "running",
+                        succeeded += 1
+                        completed_bytes += file_sizes[path]
+                        progress_payload = reporter.report(
+                            phase="registering",
+                            message=f"{path.name} selesai diupload",
+                            overall={
+                                "current": index,
+                                "total": len(files),
+                                "percent": (
+                                    completed_bytes * 100 / total_bytes
+                                    if total_bytes
+                                    else 100
+                                ),
+                                "unit": "files",
+                                "bytes_current": completed_bytes,
+                                "bytes_total": total_bytes,
+                            },
+                            item={
+                                "name": path.name,
+                                "index": index,
+                                "total": len(files),
+                                "size_bytes": size,
+                                "percent": 100,
+                            },
+                            counters={
+                                "succeeded": succeeded,
+                                "failed": len(failed),
+                            },
+                            force=True,
+                        )
+                        reporter.milestone(
                             "storage.item_uploaded",
-                            progress={"current": index, "total": len(files), "message": path.name},
+                            progress=progress_payload,
                             result={"item": item},
                         )
-                        succeeded += 1
                     except Exception as exc:
                         LOGGER.exception("Storage upload failed for %s", path)
                         failed.append({"name": path.name, "error": str(exc)})
-                        self.publisher.emit(
-                            str(command["job_id"]),
-                            "running",
-                            "progress",
-                            progress={
+                        completed_bytes += file_sizes[path]
+                        progress_payload = reporter.report(
+                            phase="uploading",
+                            message=f"Upload gagal: {path.name}",
+                            overall={
                                 "current": index,
                                 "total": len(files),
-                                "message": path.name,
+                                "percent": (
+                                    completed_bytes * 100 / total_bytes
+                                    if total_bytes
+                                    else 100
+                                ),
+                                "unit": "files",
+                                "bytes_current": completed_bytes,
+                                "bytes_total": total_bytes,
+                            },
+                            item={
+                                "name": path.name,
+                                "index": index,
+                                "total": len(files),
+                                "size_bytes": file_sizes[path],
+                            },
+                            counters={
+                                "succeeded": succeeded,
                                 "failed": len(failed),
                             },
+                            force=True,
                         )
+                        reporter.milestone(
+                            "item_failed",
+                            progress=progress_payload,
+                            error={"message": str(exc)[:500], "item": path.name},
+                        )
+        reporter.report(
+            phase="completed",
+            message=f"Upload selesai: {succeeded} berhasil, {len(failed)} gagal",
+            overall={
+                "current": len(files),
+                "total": len(files),
+                "percent": 100,
+                "unit": "files",
+                "bytes_current": total_bytes,
+                "bytes_total": total_bytes,
+            },
+            counters={"succeeded": succeeded, "failed": len(failed)},
+            force=True,
+        )
         return {"total": len(files), "succeeded": succeeded, "failed": failed}
 
     def _backup(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
+        reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         profiles = sorted(self.profile_manager.list_profiles())
         runtimes = [self.profile_manager.runtime(profile) for profile in profiles]
+
+        def backup_progress(value: dict[str, Any]) -> None:
+            percent = value.get("percent")
+            reporter.report(
+                phase=str(value.get("phase") or "staging"),
+                message=str(value.get("message") or "Menyiapkan backup"),
+                overall={
+                    "current": value.get("files_current"),
+                    "total": value.get("files_total"),
+                    "percent": percent,
+                    "unit": "files",
+                    "bytes_total": value.get("bytes_total"),
+                },
+                transfer={
+                    "eta_seconds": value.get("eta_seconds"),
+                    "elapsed_seconds": value.get("elapsed_seconds"),
+                },
+                indeterminate=bool(value.get("indeterminate", percent is None)),
+                force=str(value.get("phase")) == "staging" or percent == 100,
+            )
+
         with ExitStack() as locks:
             for runtime in runtimes:
                 locks.enter_context(runtime.export_operation_lock)
                 locks.enter_context(runtime.download_operation_lock)
-            archive = BackupService(self.config).create_archive(
+            archive = BackupService(
+                self.config, progress_callback=backup_progress
+            ).create_archive(
                 str(payload["backup_run_id"]),
                 str(payload["node_name"]),
                 password=str(payload["password"]),
@@ -605,15 +1067,105 @@ class WorkerJobExecutor:
         if not runtimes:
             raise RuntimeError("Tidak ada profile runtime untuk upload backup.")
         uploader = runtimes[0].export_tdl_client
+        part_sizes = {part: part.stat().st_size for part in archive.parts}
+        total_bytes = sum(part_sizes.values())
+        completed_bytes = 0
         sent = 0
         with self._capture_tdl_output(uploader):
-            for part in archive.parts:
+            for index, part in enumerate(archive.parts, start=1):
+                size = part_sizes[part]
+                upload_state = {"phase": "uploading"}
+                reporter.reset_transfer()
+                reporter.report(
+                    phase="verifying",
+                    message=f"Memverifikasi {part.name}",
+                    overall={
+                        "current": sent,
+                        "total": len(archive.parts),
+                        "unit": "parts",
+                    },
+                    item={
+                        "name": part.name,
+                        "index": index,
+                        "total": len(archive.parts),
+                        "size_bytes": size,
+                    },
+                    counters={"succeeded": sent},
+                    indeterminate=True,
+                    force=True,
+                )
                 digest, size = sha256_file(part)
+
+                def part_progress(progress) -> None:
+                    if (
+                        upload_state["phase"] != "uploading"
+                        or not _has_transfer_telemetry(progress)
+                    ):
+                        return
+                    transfer = reporter.tdl_transfer(progress, total_bytes=size)
+                    current_bytes = int(transfer.get("bytes_current") or 0)
+                    overall_bytes = min(total_bytes, completed_bytes + current_bytes)
+                    reporter.report(
+                        phase="uploading_parts",
+                        message=f"Mengupload {part.name}",
+                        overall={
+                            "current": sent,
+                            "total": len(archive.parts),
+                            "percent": (
+                                overall_bytes * 100 / total_bytes
+                                if total_bytes
+                                else None
+                            ),
+                            "unit": "parts",
+                            "bytes_current": overall_bytes,
+                            "bytes_total": total_bytes,
+                        },
+                        item={
+                            "name": part.name,
+                            "index": index,
+                            "total": len(archive.parts),
+                            "size_bytes": size,
+                            "percent": progress.percent,
+                        },
+                        transfer=transfer,
+                        counters={"succeeded": sent},
+                        indeterminate=progress.percent is None,
+                    )
+
+                def part_phase(phase: str) -> None:
+                    upload_state["phase"] = phase
+                    if phase == "resolving_message":
+                        reporter.report(
+                            phase=phase,
+                            message=f"Menunggu konfirmasi Telegram untuk {part.name}",
+                            overall={
+                                "current": sent,
+                                "total": len(archive.parts),
+                                "unit": "parts",
+                            },
+                            item={
+                                "name": part.name,
+                                "index": index,
+                                "total": len(archive.parts),
+                                "size_bytes": size,
+                                "percent": 100,
+                            },
+                            counters={"succeeded": sent},
+                            indeterminate=True,
+                            force=True,
+                        )
+
                 caption = (
                     f"Backup node={payload['node_name']} "
                     f"run={str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
                 )
-                result = uploader.upload(part, str(payload["channel_ref"]), caption)
+                with self._capture_tdl_progress(uploader, part_progress):
+                    result = uploader.upload(
+                        part,
+                        str(payload["channel_ref"]),
+                        caption,
+                        status_callback=part_phase,
+                    )
                 part_payload = {
                     "run_id": str(payload["backup_run_id"]),
                     "node_name": str(payload["node_name"]),
@@ -625,14 +1177,52 @@ class WorkerJobExecutor:
                     "uploaded_at": archive.created_at,
                     "status": "active",
                 }
-                self.publisher.emit(
-                    str(command["job_id"]),
-                    "running",
+                sent += 1
+                completed_bytes += part_sizes[part]
+                progress_payload = reporter.report(
+                    phase="uploading_parts",
+                    message=f"{part.name} selesai diupload",
+                    overall={
+                        "current": sent,
+                        "total": len(archive.parts),
+                        "percent": (
+                            completed_bytes * 100 / total_bytes
+                            if total_bytes
+                            else 100
+                        ),
+                        "unit": "parts",
+                        "bytes_current": completed_bytes,
+                        "bytes_total": total_bytes,
+                    },
+                    item={
+                        "name": part.name,
+                        "index": index,
+                        "total": len(archive.parts),
+                        "size_bytes": size,
+                        "percent": 100,
+                    },
+                    counters={"succeeded": sent},
+                    force=True,
+                )
+                reporter.milestone(
                     "backup.part_uploaded",
-                    progress={"current": sent + 1, "total": len(archive.parts), "message": part.name},
+                    progress=progress_payload,
                     result={"part": part_payload},
                 )
-                sent += 1
+        reporter.report(
+            phase="completed",
+            message=f"Backup selesai: {sent} part tersimpan",
+            overall={
+                "current": sent,
+                "total": len(archive.parts),
+                "percent": 100,
+                "unit": "parts",
+                "bytes_current": total_bytes,
+                "bytes_total": total_bytes,
+            },
+            counters={"succeeded": sent},
+            force=True,
+        )
         for part in archive.parts:
             try:
                 part.unlink(missing_ok=True)

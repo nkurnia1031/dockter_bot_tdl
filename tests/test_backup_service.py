@@ -1,4 +1,5 @@
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,13 +56,18 @@ class BackupServiceTests(unittest.TestCase):
             staging.mkdir()
             staging.joinpath("data.txt").write_text("x", encoding="utf-8")
             output = root / "backup.7z"
-            completed = type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
-            with patch("tme3bot.backup_service.subprocess.run", return_value=completed) as run:
-                BackupService._make_7z(staging, output, "secret", "45m")
-            command = run.call_args.args[0]
+            process = type(
+                "Process",
+                (),
+                {"stdout": io.StringIO(" 50%\r 100%\r"), "wait": lambda self: 0},
+            )()
+            service = BackupService(make_config(root))
+            with patch("tme3bot.backup_service.subprocess.Popen", return_value=process) as popen:
+                service._make_7z(staging, output, "secret", "45m")
+            command = popen.call_args.args[0]
             self.assertIn("-mhe=on", command)
             self.assertIn("-psecret", command)
-            self.assertEqual(run.call_args.kwargs["capture_output"], True)
+            self.assertEqual(popen.call_args.kwargs["stderr"], __import__("subprocess").STDOUT)
 
 
 if __name__ == "__main__":
