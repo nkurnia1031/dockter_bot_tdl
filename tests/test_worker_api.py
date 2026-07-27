@@ -19,6 +19,15 @@ class FakeExecutor:
     def workspace_tree(self, path):
         return {"path": path, "items": [{"name": "biasa", "path": "/workspace/biasa", "kind": "directory"}]}
 
+    def job_log_snapshot(self, job_id):
+        if job_id != "active":
+            return None
+        return {
+            "lines": ["tdl download started", "50% 1 MB/s"],
+            "line_count": 2,
+            "truncated": False,
+        }
+
 
 class WorkerApiTests(unittest.TestCase):
     def setUp(self):
@@ -62,6 +71,22 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["path"], "/workspace/biasa")
+
+    def test_active_job_log_snapshot_requires_token_and_handles_missing(self):
+        denied = self.client.get("/internal/v1/jobs/active/log-snapshot")
+        self.assertEqual(denied.status_code, 401)
+        active = self.client.get(
+            "/internal/v1/jobs/active/log-snapshot",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(active.status_code, 200)
+        self.assertEqual(active.json()["log"]["line_count"], 2)
+        missing = self.client.get(
+            "/internal/v1/jobs/missing/log-snapshot",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["code"], "JOB_LOG_NOT_ACTIVE")
 
 
 if __name__ == "__main__":

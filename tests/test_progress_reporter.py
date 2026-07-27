@@ -56,6 +56,21 @@ class ProgressReporterTests(unittest.TestCase):
         self.assertEqual(transfer["speed_bps"], 5 * 1024 * 1024)
         self.assertEqual(transfer["eta_seconds"], 10)
 
+    def test_batch_context_is_preserved_in_transient_snapshot(self):
+        publisher = FakePublisher()
+        reporter = ProgressReporter(publisher, "job-1")
+        reporter.report(
+            phase="downloading",
+            message="batch.json",
+            batch={"name": "batch.json", "index": 1, "total": 2, "unit": "json"},
+            item={"name": "video.mp4", "index": 4, "total": 10},
+            force=True,
+        )
+        progress = publisher.events[-1]["progress"]
+        self.assertEqual(progress["batch"]["name"], "batch.json")
+        self.assertEqual(progress["batch"]["index"], 1)
+        self.assertEqual(progress["item"]["name"], "video.mp4")
+
 
 if __name__ == "__main__":
     unittest.main()

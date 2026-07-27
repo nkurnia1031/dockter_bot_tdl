@@ -75,6 +75,20 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     def cancel_job(job_id: str):
         return {"cancelled": context.executor.cancel(job_id)}
 
+    @app.get(
+        "/internal/v1/jobs/{job_id}/log-snapshot",
+        dependencies=[Depends(authorize)],
+    )
+    def job_log_snapshot(job_id: str):
+        snapshot = context.executor.job_log_snapshot(job_id)
+        if snapshot is None:
+            raise DomainError(
+                "JOB_LOG_NOT_ACTIVE",
+                "Snapshot log aktif tidak ditemukan.",
+                status_code=404,
+            )
+        return {"log": snapshot}
+
     return app
 
 

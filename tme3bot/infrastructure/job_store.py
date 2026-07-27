@@ -177,6 +177,7 @@ class SqliteJobRepository:
         profile: str | None = None,
         kind: str | None = None,
         status: str | None = None,
+        worker: str | None = None,
         archived: bool | None = None,
     ) -> int:
         clauses, values = [], []
@@ -184,6 +185,7 @@ class SqliteJobRepository:
             ("profile", profile),
             ("kind", kind),
             ("status", status),
+            ("worker", worker),
         ):
             if value:
                 clauses.append(f"{column} = ?")

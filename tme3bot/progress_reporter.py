@@ -86,6 +86,7 @@ class ProgressReporter:
         *,
         phase: str,
         message: str,
+        batch: dict[str, Any] | None = None,
         overall: dict[str, Any] | None = None,
         item: dict[str, Any] | None = None,
         transfer: dict[str, Any] | None = None,
@@ -96,6 +97,7 @@ class ProgressReporter:
         payload = {
             "phase": phase,
             "message": message,
+            "batch": _without_none(batch or {}),
             "overall": _without_none(overall or {}),
             "item": _without_none(item or {}),
             "transfer": _without_none(transfer or {}),

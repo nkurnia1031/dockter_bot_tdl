@@ -236,6 +236,25 @@ class ControlPlane:
             artifact = result.get("artifact")
             if isinstance(artifact, dict):
                 self.export_catalog.upsert(**artifact)
+        if (
+            event.event_type == "artifact.inventory_completed"
+            and self.export_catalog is not None
+        ):
+            inventory = result.get("inventory")
+            if isinstance(inventory, dict):
+                self.export_catalog.complete_inventory(
+                    str(inventory["profile"]),
+                    str(inventory["worker"]),
+                    str(inventory["inventory_id"]),
+                )
+        if event.event_type == "artifact.missing" and self.export_catalog is not None:
+            artifact = result.get("artifact")
+            if isinstance(artifact, dict):
+                self.export_catalog.mark_missing(
+                    str(artifact["profile"]),
+                    str(artifact["worker"]),
+                    str(artifact["artifact_key"]),
+                )
         if event.event_type in {"artifact.downloaded", "artifact.failed"} and self.export_catalog is not None:
             artifact = result.get("artifact")
             if isinstance(artifact, dict):
@@ -251,6 +270,8 @@ class ControlPlane:
                         download_directory=artifact.get("download_directory"),
                         error=artifact.get("error"),
                         completed_at=event.created_at.isoformat(),
+                        available=True,
+                        missing_at=None,
                     )
         if event.event_type == "backup.part_uploaded" and self.storage_catalog is not None:
             part = result.get("part")

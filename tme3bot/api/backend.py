@@ -524,7 +524,11 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             limit=limit,
         )
         total = context.control_plane.jobs.count(
-            profile=actor.profile, kind=kind, status=status, archived=archived
+            profile=actor.profile,
+            kind=kind,
+            status=status,
+            worker=worker,
+            archived=archived,
         )
         return {
             "items": [job_dict(item) for item in items],
@@ -551,6 +555,34 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     job_id, after_sequence=after_sequence
                 )
             ]
+        }
+
+    @app.get("/api/v1/jobs/{job_id}/log-snapshot", response_model=ObjectResponse)
+    def get_job_log_snapshot(job_id: str, actor=Depends(current_actor)):
+        job = _owned_job(context, actor, job_id)
+        if context.worker_dispatcher is not None:
+            try:
+                return {
+                    **context.worker_dispatcher.job_log(job.worker, job.id),
+                    "source": "worker",
+                }
+            except Exception:
+                if job.status.value in {"queued", "dispatched", "running"}:
+                    raise DomainError(
+                        "JOB_LOG_UNAVAILABLE",
+                        "Snapshot log worker belum tersedia.",
+                        status_code=503,
+                    )
+        for event in reversed(context.control_plane.jobs.events(job.id)):
+            if (
+                event.event_type == "log.snapshot"
+                and isinstance(event.result, dict)
+                and isinstance(event.result.get("log"), dict)
+            ):
+                return {"log": event.result["log"], "source": "history"}
+        return {
+            "log": {"lines": [], "line_count": 0, "truncated": False},
+            "source": "empty",
         }
 
     @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobResponse)
@@ -676,8 +708,10 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     ):
         values = _model_dict(body) if body is not None else {}
         artifact_ids = values.get("artifact_ids") or []
+        active_worker = context.profile_manager.worker_route(actor.profile)
         worker = None
         artifact_keys: list[str] = []
+        artifact_refs: list[dict[str, str]] = []
         for artifact_id in artifact_ids:
             artifact = context.export_catalog.get(str(artifact_id))
             if artifact is None or artifact["profile"] != actor.profile:
@@ -690,6 +724,18 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     "Artifact tidak berada pada antrean yang dapat dijalankan.",
                     status_code=409,
                 )
+            if not bool(artifact.get("available", 1)):
+                raise DomainError(
+                    "ARTIFACT_UNAVAILABLE",
+                    "File artifact sudah tidak tersedia pada worker.",
+                    status_code=409,
+                )
+            if str(artifact["worker"]) != active_worker:
+                raise DomainError(
+                    "ARTIFACT_WORKER_INACTIVE",
+                    f"Pilih worker {artifact['worker']} sebelum menjalankan artifact ini.",
+                    status_code=409,
+                )
             if worker is not None and worker != artifact["worker"]:
                 raise DomainError(
                     "ARTIFACT_WORKER_MISMATCH",
@@ -698,6 +744,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 )
             worker = str(artifact["worker"])
             artifact_keys.append(str(artifact["artifact_key"]))
+            artifact_refs.append(
+                {
+                    "key": str(artifact["artifact_key"]),
+                    "status": str(artifact["status"]),
+                }
+            )
         return job_dict(
             context.control_plane.submit_job(
                 actor,
@@ -705,6 +757,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 {
                     "retry_failed": retry_failed,
                     "artifact_keys": artifact_keys,
+                    "artifacts": artifact_refs,
                     "priority": values.get("priority", "normal"),
                 },
                 profile=actor.profile,
@@ -717,6 +770,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         status: str | None = None,
         archived: bool | None = False,
         worker: str | None = None,
+        available: bool | None = None,
         limit: int = Query(50, ge=1, le=200),
         offset: int = Query(0, ge=0),
         actor=Depends(current_actor),
@@ -726,6 +780,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             status=status,
             archived=archived,
             worker=worker,
+            available=available,
             limit=limit,
             offset=offset,
         )
@@ -733,9 +788,15 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     @app.post("/api/v1/downloads/artifacts/reconcile", response_model=JobResponse)
     def reconcile_artifacts(actor=Depends(current_actor)):
+        inventory_id = str(uuid.uuid4())
+        worker = context.profile_manager.worker_route(actor.profile)
         return job_dict(
             context.control_plane.submit_job(
-                actor, "artifact_inventory", {}, profile=actor.profile
+                actor,
+                "artifact_inventory",
+                {"inventory_id": inventory_id},
+                profile=actor.profile,
+                worker=worker,
             )
         )
 

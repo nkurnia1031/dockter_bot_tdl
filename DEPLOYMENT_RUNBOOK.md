@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.6 - Storage file manager, single-panel Telegram export, dan pagination download
+Versi: 3.7 - Download manager worker-scoped, inventory availability, dan live telemetry
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -15,26 +15,32 @@ tidak membutuhkan Node.js atau container web di VPS target.
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
 | aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
 
-Untuk update Storage file manager ini, urutan wajib adalah:
+Untuk update Download manager ini, urutan wajib adalah:
 
 1. Backend dan worker-local di VPS gateway.
 2. Seluruh worker remote.
 3. Web static.
 
-Backend harus diperbarui lebih dahulu karena backend membuat tabel folder,
-kolom Trash, dan antrean sinkronisasi caption. Worker baru lalu mengirim relative
-path agar nested/empty folder dapat dipertahankan. Migrasi SQLite berjalan
+Backend harus diperbarui lebih dahulu karena backend menambahkan kolom inventory
+artifact (`available`, inventory ID, waktu terakhir terlihat, dan waktu hilang),
+filter worker pada job, serta proxy snapshot log aktif. Migrasi SQLite berjalan
 otomatis dan idempotent saat backend mulai. Tidak ada perintah migrasi database
 manual. Data `/data`, katalog, state, dan sesi TDL tidak dihapus.
 
-Worker release ini juga menambahkan statistik `message_count`, `media_count`,
-`photo_count`, dan `video_count` pada report akhir export. Web memakai data itu
-untuk ringkasan report pada panel export Telegram dan dashboard.
+Worker release ini mengirim inventory generation, milestone JSON download,
+telemetry JSON N/N dan file N/N, speed/ETA, serta snapshot output TDL aktif.
+Seluruh worker harus diperbarui sebelum web static agar kontrak telemetry sama.
 
-Download manager mengambil katalog artifact secara bertahap dengan maksimal 200
-item per request, mengikuti batas endpoint backend. Karena itu riwayat yang
-besar tetap dapat dimuat tanpa mengubah konfigurasi backend; perubahan ini
-hanya memerlukan deploy ulang web static.
+Download manager hanya menampilkan artifact dan job milik profile serta worker
+yang sedang dipilih di navbar. Saat context berubah, UI mengosongkan data lama,
+menjalankan reconcile pada worker baru, menunggu inventory selesai, lalu memuat
+ulang katalog. Artifact yang tidak lagi ada di worker dipertahankan untuk audit
+di History dengan status `File tidak tersedia`, tetapi tidak dapat dijalankan.
+`Mulai semua` hanya mengirim file pending yang tersedia pada worker aktif.
+
+Activity tetap menampilkan job lintas-worker untuk profile aktif. Mengganti
+worker hanya mengubah route job berikutnya; job lama tetap berjalan pada worker
+asal dan tidak dipindahkan.
 
 ## Workspace export Telegram
 
@@ -281,18 +287,27 @@ curl -I https://ui.utama.naufix.space/
 `build-info.json` harus `no-cache`; hanya `/_app/immutable/*` yang boleh memakai
 cache immutable.
 
-## F. Smoke test telemetry progress
+## F. Smoke test worker dan Download manager
 
-1. Login ke dashboard lalu buka Activity.
-2. Jalankan upload Storage dari folder kecil dengan beberapa file.
-3. Pastikan kartu menampilkan jumlah file, file aktif, progress bar, speed, ETA,
-   berhasil, dan gagal.
-4. Saat TDL selesai tetapi message ID belum tersedia, fase harus menjadi
-   `Menunggu Telegram`, bukan gagal atau kembali menjadi upload.
-5. Jalankan Utility Compress atau Extract dan pastikan progress 7z bergerak.
-6. Buka Detail untuk milestone dan Log untuk snapshot terminal.
-7. Pastikan job terminal berpindah ke history dan report akhirnya tetap dapat
-   dibuka.
+1. Login ke dashboard dan pastikan selector Profile serta Worker tampil
+   berdampingan di navbar.
+2. Buka Download. Tunggu status reconcile selesai sebelum menekan aksi.
+3. Pastikan daftar hanya berisi artifact milik worker aktif. Ganti worker dari
+   navbar dan pastikan daftar serta Job Monitor berubah tanpa reload browser.
+4. Pastikan Pending/Processing tidak menampilkan artifact yang file JSON-nya
+   sudah hilang. Metadata lama boleh tetap terlihat di History dengan badge
+   `File tidak tersedia` dan tanpa tombol Start/Retry.
+5. Jalankan dua JSON pada worker aktif. Kartu harus memakai nama JSON sebagai
+   judul, badge `JSON N/N`, nama media aktif, `File N/N`, speed, ETA, berhasil,
+   gagal, dan dilewati.
+6. Buka Log saat job masih berjalan. Ringkasan JSON/file harus tampil di atas,
+   sedangkan output TDL aktif tampil pada terminal di bawahnya.
+7. Ganti worker ketika job lama masih berjalan. Route baru hanya berlaku pada
+   job berikutnya; job lama tetap terlihat di Activity pada worker asal.
+8. Uji `Mulai semua` dan pastikan hanya artifact pending dari worker aktif yang
+   masuk ke satu job worker tersebut.
+9. Pastikan job terminal berpindah ke History dan snapshot log terakhir tetap
+   dapat dibuka.
 
 Pantau server saat smoke test:
 

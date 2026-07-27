@@ -269,6 +269,39 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(tracker.snapshot().tdl_fraction_current, 2)
         self.assertEqual(tracker.snapshot().tdl_fraction_total, 2)
 
+    def test_progress_tracker_emits_json_and_batch_milestones(self) -> None:
+        tracker = DownloadProgressTracker()
+        events: list[tuple[str, object]] = []
+        tracker.set_event_callback(
+            lambda event, snapshot: events.append((event, snapshot))
+        )
+
+        tracker.start_batch("selected", 1)
+        tracker.start_json(1, 1, "batch.json", [10])
+        tracker.update_tdl_progress(
+            parse_tdl_progress_line(
+                "Channel:10 -> video.mp4 ... 50% [5 MB in 2s; ~ETA: 2s; 2.5 MB/s]",
+                "stdout",
+            )
+        )
+        tracker.finish_json(True)
+        tracker.finish_batch()
+
+        self.assertEqual(
+            [event for event, _ in events],
+            [
+                "batch_started",
+                "json_started",
+                "progress",
+                "json_completed",
+                "batch_completed",
+            ],
+        )
+        progress_snapshot = events[2][1]
+        self.assertEqual(progress_snapshot.current_json_name, "batch.json")
+        self.assertEqual(progress_snapshot.tdl_file_name, "video.mp4")
+        self.assertEqual(progress_snapshot.tdl_percent, 50)
+
     def test_download_moves_pending_to_done_and_downloads_each_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

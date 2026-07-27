@@ -204,14 +204,29 @@ class BatchDownloadService:
         self, artifact_keys: list[str]
     ) -> BatchDownloadResult:
         """Download selected opaque filenames after strict directory validation."""
+        return self.download_selected_artifacts(
+            [{"key": key, "status": "pending"} for key in artifact_keys]
+        )
+
+    def download_selected_artifacts(
+        self, artifacts: list[dict[str, str]]
+    ) -> BatchDownloadResult:
+        """Download selected pending/failed JSON files from validated roots."""
         selected: list[Path] = []
-        pending_root = self.config.export_pending_dir.resolve()
-        for key in artifact_keys:
+        roots = {
+            "pending": self.config.export_pending_dir.resolve(),
+            "failed": self.config.export_failed_dir.resolve(),
+        }
+        for artifact in artifacts:
+            key = str(artifact.get("key") or "")
             if Path(key).name != key or not key.lower().endswith(".json"):
                 raise ValueError("Artifact key tidak valid.")
-            path = (pending_root / key).resolve()
+            source_root = roots.get(str(artifact.get("status") or "pending"))
+            if source_root is None:
+                raise ValueError("Status artifact tidak dapat dijalankan.")
+            path = (source_root / key).resolve()
             try:
-                path.relative_to(pending_root)
+                path.relative_to(source_root)
             except ValueError as exc:
                 raise ValueError("Artifact key keluar dari direktori export.") from exc
             if not path.is_file():

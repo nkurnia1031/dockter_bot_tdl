@@ -1,12 +1,12 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { page } from '$app/state';
-  import { Drawer, Dropdown, DropdownItem, Sidebar, Tooltip } from 'flowbite-svelte';
+  import { Drawer, Dropdown, DropdownItem, Sidebar, Toast, Tooltip } from 'flowbite-svelte';
   import { session } from '$lib/session.svelte';
   import Login from './Login.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
-    LayoutDashboard, LogOut, Menu, Moon, Settings, Sun, Users, Wrench
+    LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, Users, Wrench
   } from '@lucide/svelte';
 
   let { children } = $props();
@@ -29,6 +29,8 @@
   let theme = $state<Theme>('light');
   let themeMenuOpen = $state(false);
   let actorMenuOpen = $state(false);
+  let contextToast = $state(false);
+  let contextError = $state('');
 
   const active = (href: string) => page.url.pathname === href || (href !== '/' && page.url.pathname.startsWith(href));
   const labelForTheme = (value: Theme) => value === 'light' ? 'Terang' : value === 'dark' ? 'Gelap' : 'Sistem';
@@ -44,6 +46,24 @@
   function toggleCollapsed() {
     collapsed = !collapsed;
     localStorage.setItem('tme3-sidebar-collapsed', String(collapsed));
+  }
+
+  async function chooseProfile(value: string) {
+    try {
+      await session.chooseProfile(value);
+    } catch (cause) {
+      contextError = cause instanceof Error ? cause.message : 'Profile gagal diganti.';
+      contextToast = true;
+    }
+  }
+
+  async function chooseWorker(value: string) {
+    try {
+      await session.chooseWorker(value);
+    } catch (cause) {
+      contextError = cause instanceof Error ? cause.message : 'Worker gagal diganti.';
+      contextToast = true;
+    }
   }
 
   onMount(() => {
@@ -110,8 +130,15 @@
             <div class="profile-picker flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-2 py-1 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
               <div class="profile-icon hidden shrink-0 place-items-center rounded-lg bg-violet-100 text-violet-700 sm:grid dark:bg-violet-950 dark:text-violet-200"><Users size={15}/></div>
               <div class="hidden min-w-0 sm:block"><p class="muted truncate text-[.68rem] font-bold uppercase tracking-[.12em]">Profile aktif</p></div>
-              <select class="profile-select field h-9 min-w-0 w-[8.75rem] !border-0 !bg-transparent !px-1.5 !py-1 text-sm font-bold shadow-none focus:!ring-0 sm:h-10 sm:w-[9.5rem] sm:!border-[var(--line)] sm:!bg-[var(--panel-strong)] sm:!px-3 sm:shadow-sm" aria-label="Pilih profile" value={session.current.actor?.profile} onchange={(event) => session.chooseProfile((event.currentTarget as HTMLSelectElement).value)}>
+              <select class="profile-select field h-9 min-w-0 w-[7.5rem] !border-0 !bg-transparent !px-1.5 !py-1 text-sm font-bold shadow-none focus:!ring-0 sm:h-10 sm:w-[9.5rem] sm:!border-[var(--line)] sm:!bg-[var(--panel-strong)] sm:!px-3 sm:shadow-sm" aria-label="Pilih profile" value={session.current.actor?.profile} disabled={session.switching} onchange={(event) => chooseProfile((event.currentTarget as HTMLSelectElement).value)}>
                 {#each session.current.profiles as profile}<option value={profile}>{profile}</option>{/each}
+              </select>
+            </div>
+            <div class="profile-picker flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-2 py-1 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
+              <div class="profile-icon hidden shrink-0 place-items-center rounded-lg bg-sky-100 text-sky-700 md:grid dark:bg-sky-950 dark:text-sky-200"><Server size={15}/></div>
+              <div class="hidden min-w-0 xl:block"><p class="muted truncate text-[.68rem] font-bold uppercase tracking-[.12em]">Worker aktif</p></div>
+              <select class="profile-select field h-9 min-w-0 w-[7.5rem] !border-0 !bg-transparent !px-1.5 !py-1 text-sm font-bold shadow-none focus:!ring-0 sm:h-10 sm:w-[9.5rem] sm:!border-[var(--line)] sm:!bg-[var(--panel-strong)] sm:!px-3 sm:shadow-sm" aria-label="Pilih worker" value={session.current.actor?.worker_route} disabled={session.switching} onchange={(event) => chooseWorker((event.currentTarget as HTMLSelectElement).value)}>
+                {#each session.workers as worker}<option value={worker.name}>{worker.name}</option>{/each}
               </select>
             </div>
             <span class="hidden items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-700 md:inline-flex dark:bg-emerald-950 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Backend online</span>
@@ -140,6 +167,7 @@
       <div class="mt-auto worker-card rounded-2xl p-3.5"><p class="worker-label text-xs font-bold uppercase tracking-[.13em]">Worker aktif</p><b class="mt-1 block truncate text-sm">{session.current.actor?.worker_route || '-'}</b></div>
     </div>
   </Drawer>
+  <Toast bind:toastStatus={contextToast} position="bottom-right" color="red">{contextError}</Toast>
 {/if}
 
 <style>

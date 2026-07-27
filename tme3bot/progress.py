@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import threading
 import time
+import logging
 from dataclasses import dataclass, replace
+from typing import Callable
 
 from tme3bot.tdl_output import CommandProgress
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -39,6 +43,9 @@ class DownloadProgressTracker:
         self._snapshot = DownloadProgressSnapshot()
         self._current_media_positions: dict[int, int] = {}
         self._speed_ewma: float | None = None
+        self._event_callback: (
+            Callable[[str, DownloadProgressSnapshot], None] | None
+        ) = None
 
     def start_batch(self, mode: str, total_json: int) -> None:
         now = time.time()
@@ -53,6 +60,8 @@ class DownloadProgressTracker:
             )
             self._current_media_positions = {}
             self._speed_ewma = None
+            snapshot = self._snapshot
+        self._notify("batch_started", snapshot)
 
     def start_json(
         self, index: int, total_json: int, json_name: str, media_ids: list[int]
@@ -64,7 +73,7 @@ class DownloadProgressTracker:
                 for position, message_id in enumerate(ordered_media_ids, start=1)
             }
             self._speed_ewma = None
-        self._replace(
+        snapshot = self._replace(
             phase="processing_json",
             total_json=total_json,
             current_json_index=index,
@@ -82,9 +91,10 @@ class DownloadProgressTracker:
             tdl_file_name=None,
             last_error=None,
         )
+        self._notify("json_started", snapshot)
 
     def set_phase(self, phase: str) -> None:
-        self._replace(phase=phase)
+        self._notify("phase_changed", self._replace(phase=phase))
 
     def update_tdl_progress(self, progress: CommandProgress) -> None:
         snapshot = self.snapshot()
@@ -120,24 +130,45 @@ class DownloadProgressTracker:
                 changes[key] = value
         if self._speed_ewma is not None:
             changes["tdl_speed_bps"] = self._speed_ewma
-        self._replace(**changes)
+        self._notify("progress", self._replace(**changes))
 
     def finish_json(self, success: bool, error: str | None = None) -> None:
         snapshot = self.snapshot()
-        self._replace(
+        updated = self._replace(
             phase="json_done" if success else "json_failed",
             success_count=snapshot.success_count + int(success),
             failed_count=snapshot.failed_count + int(not success),
             last_error=error,
         )
+        self._notify("json_completed" if success else "json_failed", updated)
 
     def finish_batch(self) -> None:
-        self._replace(active=False, phase="done")
+        self._notify("batch_completed", self._replace(active=False, phase="done"))
+
+    def set_event_callback(
+        self,
+        callback: Callable[[str, DownloadProgressSnapshot], None] | None,
+    ) -> Callable[[str, DownloadProgressSnapshot], None] | None:
+        with self._lock:
+            previous = self._event_callback
+            self._event_callback = callback
+        return previous
 
     def snapshot(self) -> DownloadProgressSnapshot:
         with self._lock:
             return self._snapshot
 
-    def _replace(self, **changes: object) -> None:
+    def _replace(self, **changes: object) -> DownloadProgressSnapshot:
         with self._lock:
             self._snapshot = replace(self._snapshot, updated_at=time.time(), **changes)
+            return self._snapshot
+
+    def _notify(self, event: str, snapshot: DownloadProgressSnapshot) -> None:
+        with self._lock:
+            callback = self._event_callback
+        if callback is None:
+            return
+        try:
+            callback(event, snapshot)
+        except Exception:
+            LOGGER.exception("Download progress callback failed for %s", event)

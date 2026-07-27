@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.domain.models import Actor
+from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.profile_registry import ProfileRegistry
@@ -46,6 +47,15 @@ class FakeDispatcher:
     def cancel(self, worker, job_id):
         return True
 
+    def job_log(self, worker, job_id):
+        return {
+            "log": {
+                "lines": [f"{worker}:{job_id}:active"],
+                "line_count": 1,
+                "truncated": False,
+            }
+        }
+
 
 class FakeWorkers:
     def __init__(self):
@@ -79,12 +89,14 @@ class BackendApiTests(unittest.TestCase):
         self.dispatcher = FakeDispatcher()
         self.jobs = SqliteJobRepository(db)
         self.catalog = StorageCatalog(db)
+        self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
         self.control = ControlPlane(
             self.jobs,
             self.dispatcher,
             self.profiles,
             storage_catalog=self.catalog,
+            export_catalog=self.export_catalog,
             worker_registry=self.workers,
         )
         self.auth = BotAuthService(
@@ -121,11 +133,13 @@ class BackendApiTests(unittest.TestCase):
             auth=self.auth,
             profile_manager=self.profiles,
             storage_catalog=self.catalog,
+            export_catalog=self.export_catalog,
             worker_registry=self.workers,
             utility_folders=UtilityFolderStore(
                 root / "folders.json", root / "workspace"
             ),
             utility_settings=UtilitySettingsStore(root / "settings.json"),
+            worker_dispatcher=self.dispatcher,
         )
         self.client = TestClient(create_backend_app(context))
 
@@ -203,6 +217,75 @@ class BackendApiTests(unittest.TestCase):
         missing["X-Profile"] = "missing"
         self.assertEqual(
             self.client.get("/api/v1/me", headers=missing).status_code, 404
+        )
+
+    def test_download_rejects_unavailable_or_non_active_worker_artifact(self):
+        headers = self.login()
+        unavailable = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="missing.json",
+            artifact_key="missing.json",
+            status="pending",
+            available=False,
+        )
+        response = self.client.post(
+            "/api/v1/downloads",
+            headers=headers,
+            json={"artifact_ids": [unavailable["id"]]},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "ARTIFACT_UNAVAILABLE")
+
+        remote = self.export_catalog.upsert(
+            profile="default",
+            worker="remote-1",
+            filename="remote.json",
+            artifact_key="remote.json",
+            status="pending",
+        )
+        response = self.client.post(
+            "/api/v1/downloads",
+            headers=headers,
+            json={"artifact_ids": [remote["id"]]},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            response.json()["error"]["code"], "ARTIFACT_WORKER_INACTIVE"
+        )
+
+    def test_download_artifact_list_can_filter_worker_and_availability(self):
+        headers = self.login()
+        self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="available.json",
+            artifact_key="available.json",
+            status="pending",
+        )
+        self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="missing.json",
+            artifact_key="missing.json",
+            status="pending",
+            available=False,
+        )
+        self.export_catalog.upsert(
+            profile="default",
+            worker="remote-1",
+            filename="remote.json",
+            artifact_key="remote.json",
+            status="pending",
+        )
+        response = self.client.get(
+            "/api/v1/downloads/artifacts?worker=local&available=true",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 1)
+        self.assertEqual(
+            response.json()["items"][0]["artifact_key"], "available.json"
         )
 
     def test_browser_cookie_login_refresh_profile_and_logout_keep_tokens_out_of_json(self):
@@ -293,6 +376,13 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             transient.json()["job"]["progress"]["item"]["percent"], 50
         )
+        log_snapshot = self.client.get(
+            f"/api/v1/jobs/{job['id']}/log-snapshot",
+            headers=headers,
+        )
+        self.assertEqual(log_snapshot.status_code, 200)
+        self.assertEqual(log_snapshot.json()["source"], "worker")
+        self.assertEqual(log_snapshot.json()["log"]["line_count"], 1)
         completed = self.client.post(
             f"/internal/v1/jobs/{job['id']}/events",
             headers={"Authorization": "Bearer internal"},

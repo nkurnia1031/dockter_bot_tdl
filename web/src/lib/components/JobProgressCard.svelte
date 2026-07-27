@@ -12,11 +12,12 @@
   const overallPercent = $derived(progress.overall.percent);
   const itemPercent = $derived(progress.item.percent);
   const speed = $derived(progress.transfer.speed_bps ? `${formatBytes(progress.transfer.speed_bps)}/dtk` : progress.transfer.speed_text || 'Menghitung...');
+  const headline = $derived(progress.batch.name || progress.message);
 </script>
 
 <article class="progress-card">
   <header class="flex flex-wrap items-start justify-between gap-3">
-    <div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><span class="badge running">{phaseLabel(progress.phase)}</span><b class="capitalize">{job.kind.replaceAll('_',' ')}</b><span class="muted text-xs">{job.profile} / {job.worker}</span></div><h3 class="mt-2 truncate text-base font-extrabold">{progress.message}</h3></div>
+    <div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><span class="badge running">{phaseLabel(progress.phase)}</span><b class="capitalize">{job.kind.replaceAll('_',' ')}</b><span class="muted text-xs">{job.profile} / {job.worker}</span></div><h3 class="mt-2 truncate text-base font-extrabold">{headline}</h3>{#if progress.batch.index}<p class="muted mt-1 text-xs font-bold uppercase tracking-wide">JSON {progress.batch.index}/{progress.batch.total || '?'}</p>{/if}</div>
     <div class="flex items-center gap-1 text-xs text-[var(--muted)]"><Clock3 size={14}/>{formatDuration(progress.elapsedSeconds ?? ((Date.now() - new Date(job.created_at).getTime()) / 1000))}</div>
   </header>
 
@@ -27,17 +28,18 @@
 
   {#if progress.item.name}
     <div class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3">
-      <div class="flex justify-between gap-3 text-sm"><b class="min-w-0 truncate">{progress.item.name}</b><span class="muted shrink-0">{progress.item.index ? `${progress.item.index}/${progress.item.total || '?'}` : ''}</span></div>
+      <div class="flex justify-between gap-3 text-sm"><b class="min-w-0 truncate">{progress.item.name}</b><span class="muted shrink-0">{progress.item.index ? `File ${progress.item.index}/${progress.item.total || '?'}` : ''}</span></div>
       <div class={`progress-track mt-3 !h-2 ${progress.indeterminate && itemPercent === undefined ? 'indeterminate' : ''}`}><div class="progress-fill" style={`width:${itemPercent ?? 0}%`}></div></div>
       <div class="muted mt-2 flex flex-wrap justify-between gap-2 text-xs"><span>{progress.item.size_bytes ? formatBytes(progress.item.size_bytes) : 'Ukuran tidak diketahui'}</span><span>{itemPercent !== undefined ? `${itemPercent.toFixed(1)}%` : 'Sedang diproses'}</span></div>
     </div>
   {/if}
 
-  <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+  <div class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-5">
     <div class="metric"><Gauge size={15}/><span><small>Speed</small><b>{speed}</b></span></div>
     <div class="metric"><Timer size={15}/><span><small>ETA</small><b>{progress.transfer.eta_seconds !== undefined ? formatDuration(progress.transfer.eta_seconds) : 'Menghitung...'}</b></span></div>
     <div class="metric success"><span><small>Berhasil</small><b>{progress.counters.succeeded}</b></span></div>
     <div class="metric failed"><span><small>Gagal</small><b>{progress.counters.failed}</b></span></div>
+    <div class="metric"><span><small>Dilewati</small><b>{progress.counters.skipped}</b></span></div>
   </div>
 
   <footer class="mt-5 flex flex-wrap justify-end gap-2 border-t border-[var(--line)] pt-4">

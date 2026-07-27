@@ -133,6 +133,28 @@ class ExportArtifactCatalog:
                     ON export_artifacts(worker, profile, status);
                 """
             )
+            self._ensure_column(
+                db,
+                "export_artifacts",
+                "available",
+                "INTEGER NOT NULL DEFAULT 1",
+            )
+            self._ensure_column(
+                db, "export_artifacts", "last_seen_inventory_id", "TEXT"
+            )
+            self._ensure_column(db, "export_artifacts", "last_seen_at", "TEXT")
+            self._ensure_column(db, "export_artifacts", "missing_at", "TEXT")
+
+    @staticmethod
+    def _ensure_column(
+        db: sqlite3.Connection, table: str, column: str, declaration: str
+    ) -> None:
+        columns = {
+            str(row["name"])
+            for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
     def upsert(self, **values: Any) -> dict[str, Any]:
         status = str(values.get("status") or "pending")
@@ -163,13 +185,29 @@ class ExportArtifactCatalog:
             "started_at": values.get("started_at"),
             "completed_at": values.get("completed_at"),
             "archived_at": values.get("archived_at"),
+            "available": int(bool(values.get("available", True))),
+            "last_seen_inventory_id": values.get("last_seen_inventory_id"),
+            "last_seen_at": values.get("last_seen_at"),
+            "missing_at": values.get("missing_at"),
         }
+        if record["last_seen_inventory_id"] and not record["last_seen_at"]:
+            record["last_seen_at"] = now
+        if record["available"]:
+            record["missing_at"] = None
         columns = ", ".join(record)
         placeholders = ", ".join(f":{name}" for name in record)
         updates = ", ".join(
             f"{name}=excluded.{name}"
             for name in record
-            if name not in {"id", "profile", "worker", "artifact_key", "created_at"}
+            if name
+            not in {
+                "id",
+                "profile",
+                "worker",
+                "artifact_key",
+                "created_at",
+                "archived_at",
+            }
         )
         with self._db() as db:
             db.execute(
@@ -209,6 +247,7 @@ class ExportArtifactCatalog:
         status: str | None = None,
         archived: bool | None = False,
         worker: str | None = None,
+        available: bool | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
@@ -219,6 +258,9 @@ class ExportArtifactCatalog:
         if worker:
             clauses.append("worker=?")
             params.append(worker)
+        if available is not None:
+            clauses.append("available=?")
+            params.append(int(available))
         if archived is True:
             clauses.append("archived_at IS NOT NULL")
         elif archived is False:
@@ -242,7 +284,8 @@ class ExportArtifactCatalog:
             raise ValueError("Status artifact tidak valid.")
         allowed = {
             "actual_downloaded_bytes", "download_directory", "error",
-            "started_at", "completed_at", "archived_at",
+            "started_at", "completed_at", "archived_at", "available",
+            "last_seen_inventory_id", "last_seen_at", "missing_at",
         }
         values = {key: value for key, value in changes.items() if key in allowed}
         if status == "processing" and "started_at" not in values:
@@ -260,6 +303,35 @@ class ExportArtifactCatalog:
         if result is None:
             raise KeyError("Artifact tidak ditemukan.")
         return result
+
+    def complete_inventory(
+        self, profile: str, worker: str, inventory_id: str
+    ) -> int:
+        """Mark catalog rows absent when a worker inventory completes."""
+        now = utc_now()
+        with self._db() as db:
+            cursor = db.execute(
+                """UPDATE export_artifacts
+                   SET available=0, missing_at=COALESCE(missing_at, ?)
+                   WHERE profile=? AND worker=?
+                     AND (last_seen_inventory_id IS NULL
+                          OR last_seen_inventory_id<>?)""",
+                (now, profile, worker, inventory_id),
+            )
+        return int(cursor.rowcount)
+
+    def mark_missing(
+        self, profile: str, worker: str, artifact_key: str
+    ) -> dict[str, Any] | None:
+        now = utc_now()
+        with self._db() as db:
+            db.execute(
+                """UPDATE export_artifacts
+                   SET available=0, missing_at=COALESCE(missing_at, ?)
+                   WHERE profile=? AND worker=? AND artifact_key=?""",
+                (now, profile, worker, artifact_key),
+            )
+        return self.get_by_key(profile, worker, artifact_key)
 
     def archive(self, artifact_id: str) -> dict[str, Any]:
         item = self.get(artifact_id)

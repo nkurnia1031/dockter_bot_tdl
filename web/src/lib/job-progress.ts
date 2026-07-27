@@ -3,6 +3,7 @@ export type JobLike = Record<string, any>;
 export type NormalizedProgress = {
   phase: string;
   message: string;
+  batch: Record<string, any>;
   overall: Record<string, any>;
   item: Record<string, any>;
   transfer: Record<string, any>;
@@ -27,6 +28,7 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
     return {
       phase: String(raw.phase),
       message: String(raw.message || `${job.kind} sedang diproses`),
+      batch: { ...(raw.batch || {}) },
       overall: { ...(raw.overall || {}), percent: clampPercent(raw.overall?.percent) },
       item: { ...(raw.item || {}), percent: clampPercent(raw.item?.percent) },
       transfer: raw.transfer || {},
@@ -46,6 +48,12 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
   return {
     phase: String(raw.phase || (job.status === 'running' ? 'processing' : job.status || 'queued')),
     message: String(raw.message || raw.tdl_line || raw.current_json_name || 'Menunggu proses'),
+    batch: {
+      name: raw.current_json_name,
+      index: number(raw.current_json_index),
+      total: number(raw.total_json),
+      unit: raw.total_json ? 'json' : undefined
+    },
     overall: { current, total, percent, unit: raw.total_json ? 'json' : 'files' },
     item: {
       name: raw.tdl_file_name || raw.current_json_name || raw.message,

@@ -11,10 +11,15 @@
   let editing = $state<Worker|null>(null); let deleting = $state<Worker|null>(null); let editOpen = $state(false); let deleteOpen = $state(false); let editUrl = $state(''); let editToken = $state('');
   async function load() { try { workers = (await api<{items:Worker[]}>('/workers')).items || []; } catch (cause) { message = cause instanceof Error ? cause.message : 'Worker gagal dimuat.'; } }
   async function add() { await post('/workers', { name, url, token }); name = url = token = ''; message = 'Worker ditambahkan.'; await load(); }
-  async function select(worker: Worker) { await put('/me/worker-route', { route: worker.name }); await session.restore(); message = `Job baru akan memakai ${worker.name}.`; await load(); }
+  async function select(worker: Worker) { await session.chooseWorker(worker.name); message = `Job baru akan memakai ${worker.name}.`; await load(); }
   async function update() { if (!editing) return; await put(`/workers/${encodeURIComponent(editing.name)}`, { url: editUrl, token: editToken }); editing = null; editOpen = false; await load(); }
   async function destroy() { if (!deleting) return; await remove(`/workers/${encodeURIComponent(deleting.name)}`); deleting = null; deleteOpen = false; await load(); }
-  onMount(load);
+  onMount(() => {
+    const refresh = () => load();
+    window.addEventListener('tme3:context-changed', refresh);
+    load();
+    return () => window.removeEventListener('tme3:context-changed', refresh);
+  });
 </script>
 
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">WORKERS</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Worker & routing</h1><p class="muted mt-2">Route baru hanya berlaku untuk job berikutnya; job lama tetap pada worker asal.</p></div><div class="page-icon"><Server size={23}/></div></header>

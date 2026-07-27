@@ -91,3 +91,14 @@ class WorkerHttpDispatcher:
             "GET",
             "/internal/v1/workspace/tree?path=" + quote(path, safe=""),
         )
+
+    def job_log(self, worker: str, job_id: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            f"/internal/v1/jobs/{quote(job_id, safe='')}/log-snapshot",
+        )
