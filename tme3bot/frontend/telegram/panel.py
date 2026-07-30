@@ -149,6 +149,36 @@ class PanelManager:
         except Exception:
             LOGGER.debug("Could not delete processed user message", exc_info=True)
 
+    def send_transient(self, chat_id: int, text: str) -> Message | None:
+        """Send a status-only message without any menu or keyboard."""
+        try:
+            return self.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            LOGGER.warning(
+                "Could not send transient Telegram status chat=%s",
+                chat_id,
+                exc_info=True,
+            )
+            return None
+
+    def update_transient(self, message: Message | None, text: str) -> bool:
+        """Edit a status-only message; a deleted message is non-fatal."""
+        if message is None:
+            return False
+        return safe_edit_bot_message(
+            self.bot, message.chat_id, message.message_id, text, None
+        )
+
+    @staticmethod
+    def delete_transient(message: Message | None) -> None:
+        """Best-effort deletion for a completed transient status message."""
+        if message is None:
+            return
+        try:
+            message.delete()
+        except Exception:
+            LOGGER.debug("Could not delete transient Telegram status", exc_info=True)
+
     def _send(
         self,
         chat_id: int,

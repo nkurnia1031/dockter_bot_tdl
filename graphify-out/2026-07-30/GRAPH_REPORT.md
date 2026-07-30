@@ -1,11 +1,11 @@
 # Graph Report - dockter_bot_tdl  (2026-07-30)
 
 ## Corpus Check
-- 141 files · ~71,561 words
+- 141 files · ~71,531 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 1627 nodes · 4293 edges · 75 communities (62 shown, 13 thin omitted)
+- 1627 nodes · 4293 edges · 74 communities (62 shown, 12 thin omitted)
 - Extraction: 90% EXTRACTED · 10% INFERRED · 0% AMBIGUOUS · INFERRED: 428 edges (avg confidence: 0.54)
 - Token cost: 0 input · 0 output
 
@@ -78,7 +78,6 @@
 - .sync_profiles
 - $lib/components/Overview.svelte
 - .sync_profiles
-- ._submit_export_workspace
 - BatchDownloadService
 - tme3bot
 - ArchitectureBoundaryTests
@@ -111,7 +110,7 @@
 ## Import Cycles
 - None detected.
 
-## Communities (75 total, 13 thin omitted)
+## Communities (74 total, 12 thin omitted)
 
 ### Community 0 - "ProfileManager"
 Cohesion: 0.33
@@ -158,8 +157,8 @@ Cohesion: 0.17
 Nodes (12): ChannelRefTests, configure_logging(), main(), channel_chat_id(), channel_tdl_ref(), compact_channel_ref(), Normalize Telegram private channel links and compact numeric references., Return the peer reference format expected by tdl.      Bot API uses `-100<peer i (+4 more)
 
 ### Community 12 - "SerialPerKeyQueue"
-Cohesion: 0.21
-Nodes (4): PendingInput, Any, main_menu_markup(), edit_menu_message()
+Cohesion: 0.19
+Nodes (6): Thread, Any, Telegram presentation adapter; all business actions use BackendApiClient., TelegramFrontendApp, main_menu_markup(), edit_menu_message()
 
 ### Community 13 - "boltStorage"
 Cohesion: 0.18
@@ -190,8 +189,8 @@ Cohesion: 0.20
 Nodes (9): ./.svelte-kit/tsconfig.json, compilerOptions, allowJs, checkJs, esModuleInterop, forceConsistentCasingInFileNames, skipLibCheck, strict (+1 more)
 
 ### Community 20 - "DownloadProgressTracker"
-Cohesion: 0.24
-Nodes (17): Telegram presentation adapter and UI-only helpers., backup_menu_markup(), check_profile_markup(), clear_confirm_markup(), download_status_markup(), export_input_cancel_markup(), InlineKeyboardMarkup, Inline keyboards used by the API-backed Telegram frontend. (+9 more)
+Cohesion: 0.18
+Nodes (18): PendingInput, Telegram presentation adapter and UI-only helpers., backup_menu_markup(), check_profile_markup(), clear_confirm_markup(), download_status_markup(), export_input_cancel_markup(), InlineKeyboardMarkup (+10 more)
 
 ### Community 21 - "SerialPerKeyQueue"
 Cohesion: 0.13
@@ -203,7 +202,7 @@ Nodes (7): json_value(), Any, Exception, Path, Return a safe, shallow directory 
 
 ### Community 24 - "Update"
 Cohesion: 0.23
-Nodes (5): CallbackContext, Exception, Telegram presentation adapter; all business actions use BackendApiClient., TelegramFrontendApp, Update
+Nodes (3): CallbackContext, Exception, Update
 
 ### Community 25 - "tme3bot Agent Context"
 Cohesion: 0.18
@@ -310,7 +309,7 @@ Cohesion: 0.10
 Nodes (14): ../styles.css, ./Login.svelte, $lib/components/Shell.svelte, $lib/components/WorkersPage.svelte, challenge, contextRevision, current, loading (+6 more)
 
 ### Community 64 - "source_digest"
-Cohesion: 0.32
+Cohesion: 0.38
 Nodes (4): AppMenuTests, help_text(), Text helpers owned by the Telegram presentation adapter., source_digest()
 
 ### Community 65 - "_message_contains_caption"
@@ -336,12 +335,12 @@ Nodes (26): A. Langkah di komputer lokal, B. Langkah di VPS builder besar, Backe
 ## Knowledge Gaps
 - **96 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `name`, `version` (+91 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **13 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **12 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `TelegramFrontendApp` connect `Update` to `source_digest`, `TDLClient`, `._submit_export_workspace`, `ExportResult`, `SerialPerKeyQueue`, `DownloadProgressTracker`, `BatchDownloadService`, `FakeStatusPanel`, `request_json`?**
+- **Why does `TelegramFrontendApp` connect `SerialPerKeyQueue` to `TDLClient`, `ExportResult`, `DownloadProgressTracker`, `BatchDownloadService`, `FakeStatusPanel`, `request_json`, `Update`?**
   _High betweenness centrality (0.077) - this node is a cross-community bridge._
 - **Why does `StorageCatalog` connect `StorageCatalog` to `composition.py`, `ControlPlaneTests`, `next`, `WorkerRegistry`?**
   _High betweenness centrality (0.068) - this node is a cross-community bridge._

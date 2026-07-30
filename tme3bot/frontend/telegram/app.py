@@ -43,6 +43,7 @@ from tme3bot.frontend.telegram.text import help_text, source_digest
 from tme3bot.frontend.telegram.export_workspace import (
     ExportWorkspaceStore,
     format_export_job,
+    format_export_status,
     short_text,
 )
 from tme3bot.frontend.client import BackendApiClient
@@ -570,11 +571,7 @@ class TelegramFrontendApp:
         if notice:
             lines.extend(["", f"ℹ️ {notice}"])
         if state.job_snapshot:
-            status = state.job_snapshot.get("status")
-            heading = "✅ Report export" if status == "succeeded" else (
-                "❌ Report export" if status in {"failed", "cancelled"} else "⏳ Job export"
-            )
-            lines.extend(["", heading, format_export_job(state.job_snapshot)])
+            lines.extend(["", format_export_status(state.job_snapshot)])
         return "\n".join(lines), export_workspace_markup(state, sources, labels)
 
     def _submit_export_workspace(
@@ -609,8 +606,20 @@ class TelegramFrontendApp:
         text, markup = self._export_panel_content(user_id, actor, state)
         chat_id, _ = self.panel.update_from_message(message, text, markup)
         token = self.panel.begin_view(chat_id)
-        if job.get("status") not in TERMINAL_JOB_STATUSES:
-            self._poll_export_job(chat_id, user_id, str(job["id"]), token, actor)
+        status_message = self.panel.send_transient(
+            chat_id, format_export_status(job)
+        )
+        if job.get("status") in TERMINAL_JOB_STATUSES:
+            self._expire_export_status(status_message, job)
+        else:
+            self._poll_export_job(
+                chat_id,
+                user_id,
+                str(job["id"]),
+                token,
+                actor,
+                status_message,
+            )
 
     def _handle_export_input(self, message, user_id: int, pending: PendingInput, value: str) -> None:
         state = self.export_workspaces.get(message.chat_id, user_id)
@@ -649,32 +658,80 @@ class TelegramFrontendApp:
         job_id: str,
         panel_token: int,
         actor: dict[str, Any],
-    ) -> None:
+        status_message=None,
+    ) -> threading.Thread:
         def loop() -> None:
-            last = ""
+            last_panel_text = ""
+            last_status_text = ""
+            transient = status_message
             for _ in range(10800):
-                if not self.panel.is_view_active(chat_id, panel_token):
-                    return
                 try:
                     job = self.client.get(user_id, f"/api/v1/jobs/{job_id}")
-                    state = self.export_workspaces.get(chat_id, user_id)
-                    state.set_job(job)
-                    text, markup = self._export_panel_content(user_id, actor, state)
+                    status_text = format_export_status(job)
+                    if status_text != last_status_text:
+                        if transient is not None and not self.panel.update_transient(
+                            transient, status_text
+                        ):
+                            transient = None
+                        last_status_text = status_text
+
+                    panel_active = self.panel.is_view_active(chat_id, panel_token)
+                    if panel_active:
+                        state = self.export_workspaces.get(chat_id, user_id)
+                        state.set_job(job)
+                        text, markup = self._export_panel_content(
+                            user_id, actor, state
+                        )
+                    else:
+                        text = ""
+                        markup = None
                     terminal = job.get("status") in TERMINAL_JOB_STATUSES
-                    if text != last:
+                    if panel_active and text != last_panel_text:
                         self.panel.update(chat_id, text, markup)
-                        last = text
+                        last_panel_text = text
                     if terminal:
+                        time.sleep(3)
+                        self.panel.delete_transient(transient)
                         return
-                except Exception:
+                except Exception as exc:
                     LOGGER.exception("Export workspace polling failed for %s", job_id)
-                    job = {"status": "queued"}
+                    error_text = (
+                        "⚠️ Update export sementara gagal\n"
+                        f"Job: {job_id[:12]}\n"
+                        f"Error: {short_text(exc, 180)}"
+                    )
+                    if error_text != last_status_text:
+                        if transient is not None and not self.panel.update_transient(
+                            transient, error_text
+                        ):
+                            transient = None
+                        last_status_text = error_text
+                    time.sleep(3)
+                    continue
                 time.sleep(1 if job.get("status") == "running" else 3)
 
-        threading.Thread(
+        thread = threading.Thread(
             target=loop,
             daemon=True,
             name=f"telegram-export-workspace-{job_id[:8]}",
+        )
+        thread.start()
+        return thread
+
+    def _expire_export_status(self, status_message, job: dict[str, Any]) -> None:
+        if status_message is None:
+            return
+
+        def expire() -> None:
+            time.sleep(3)
+            self.panel.delete_transient(status_message)
+
+        if not self.panel.update_transient(status_message, format_export_status(job)):
+            return
+        threading.Thread(
+            target=expire,
+            daemon=True,
+            name=f"telegram-export-status-expire-{str(job.get('id', 'job'))[:8]}",
         ).start()
 
     def _show_workers(

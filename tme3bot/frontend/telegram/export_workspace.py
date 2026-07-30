@@ -23,6 +23,22 @@ def short_text(value: Any, limit: int = 80) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def format_rate(value: Any) -> str:
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if rate < 1024:
+        return f"{rate:.0f} B/dtk"
+    units = ("KB/dtk", "MB/dtk", "GB/dtk")
+    number = rate
+    for unit in units:
+        number /= 1024
+        if number < 1024 or unit == units[-1]:
+            return f"{number:.1f} {unit}"
+    return ""
+
+
 def result_value(job: dict[str, Any]) -> dict[str, Any]:
     result = job.get("result") or {}
     if not isinstance(result, dict):
@@ -68,6 +84,27 @@ def format_export_job(job: dict[str, Any]) -> str:
         lines.append(f"Posisi antrean: {job['queue_position']}")
     if progress.get("message"):
         lines.append(f"Saat ini: {short_text(progress['message'], 160)}")
+    batch = progress.get("batch")
+    if isinstance(batch, dict) and batch.get("name"):
+        position = ""
+        if batch.get("index") is not None:
+            position = f" ({batch.get('index')}/{batch.get('total', '?')})"
+        lines.append(f"JSON: {short_text(batch['name'], 120)}{position}")
+    item = progress.get("item")
+    if isinstance(item, dict) and item.get("name"):
+        position = ""
+        if item.get("index") is not None:
+            position = f" ({item.get('index')}/{item.get('total', '?')})"
+        lines.append(f"File: {short_text(item['name'], 120)}{position}")
+    transfer = progress.get("transfer")
+    if isinstance(transfer, dict):
+        speed = format_rate(transfer.get("speed_bps")) or short_text(
+            transfer.get("speed_text"), 60
+        )
+        if speed:
+            lines.append(f"Speed: {speed}")
+        if transfer.get("eta_seconds") is not None:
+            lines.append(f"ETA: {transfer['eta_seconds']} dtk")
     overall = progress.get("overall")
     if isinstance(overall, dict):
         current = overall.get("current", "?")
@@ -92,6 +129,22 @@ def format_export_job(job: dict[str, Any]) -> str:
         if report["error"]:
             lines.append(f"Error: {short_text(report['error'], 240)}")
     return "\n".join(lines)
+
+
+def format_export_status(job: dict[str, Any]) -> str:
+    """Format the standalone status message without a Telegram keyboard."""
+    status = str(job.get("status") or "queued")
+    if status == "succeeded":
+        heading = "✅ Export selesai"
+    elif status == "failed":
+        heading = "❌ Export gagal"
+    elif status == "cancelled":
+        heading = "⚠️ Export dibatalkan"
+    elif status in {"queued", "dispatched"}:
+        heading = "⏳ Export masuk antrean"
+    else:
+        heading = "⏳ Export sedang berjalan"
+    return f"{heading}\n{format_export_job(job)}"
 
 
 @dataclass

@@ -104,6 +104,27 @@ class TelegramPanelRecoveryTests(unittest.TestCase):
 
         self.assertTrue(user_message.deleted)
 
+    def test_transient_status_has_no_keyboard_and_can_be_deleted(self) -> None:
+        bot = FakeBot()
+        manager = PanelManager(bot)
+
+        status = manager.send_transient(10, "⏳ Export masuk antrean")
+        self.assertIsNotNone(status)
+        self.assertNotIn("reply_markup", bot.send_calls[-1])
+        self.assertTrue(manager.update_transient(status, "⏳ Export berjalan"))
+
+        manager.delete_transient(status)
+        self.assertTrue(status.deleted)
+
+    def test_deleted_transient_status_is_non_fatal(self) -> None:
+        bot = FakeBot()
+        manager = PanelManager(bot)
+        status = manager.send_transient(10, "⏳ Export masuk antrean")
+        bot.fail_edit_ids.add(status.message_id)
+
+        self.assertFalse(manager.update_transient(status, "⏳ Export berjalan"))
+        manager.delete_transient(status)
+
 
 if __name__ == "__main__":
     unittest.main()

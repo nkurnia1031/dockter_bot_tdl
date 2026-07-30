@@ -61,9 +61,19 @@ berubah. Setelah restart frontend Telegram, mode awal kembali ke `Export fokus`.
 
 Saat export dikirim, callback hanya di-acknowledge tanpa popup. Status antrean,
 progress, dan report terminal ditulis ke panel export utama yang sama. Tidak ada
-pesan terminal tambahan dan tidak ada keyboard job terpisah. Jika user memilih
+popup atau keyboard job khusus. Jika user memilih
 source lagi, detail job pada panel dihapus dan form kembali ke kondisi awal;
 job backend yang sudah berjalan tetap dilanjutkan.
+
+Selain panel utama, setiap export mengirim satu pesan status tanpa keyboard.
+Pesan yang sama diedit untuk antrean dan progress, menampilkan report sukses,
+gagal, atau dibatalkan selama 3 detik, lalu otomatis dihapus. Polling status
+tetap berjalan walaupun panel utama berpindah source; hanya pembaruan panel yang
+dihentikan ketika view token sudah tidak aktif. Pesan status tidak dibuat ulang
+pada setiap polling atau saat job selesai.
+
+Perubahan status Telegram ini hanya mengubah image gateway/frontend Telegram.
+Tidak memerlukan rebuild base Go/TDL atau update worker remote.
 
 ## Sekali saja: konfigurasi gateway dan UI
 

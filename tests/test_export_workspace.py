@@ -5,6 +5,7 @@ from tme3bot.frontend.telegram.export_workspace import (
     ExportWorkspaceStore,
     export_report,
     format_export_job,
+    format_export_status,
 )
 from tme3bot.frontend.telegram.keyboards import export_workspace_markup
 
@@ -123,6 +124,52 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertNotIn("Foto:", text)
         self.assertNotIn("Video:", text)
         self.assertNotIn("{'", text)
+
+    def test_status_formatter_includes_terminal_report_without_raw_objects(self):
+        text = format_export_status(
+            {
+                "status": "succeeded",
+                "id": "job-1234567890",
+                "profile": "default",
+                "worker": "local",
+                "result": {
+                    "value": {
+                        "message_count": 26,
+                        "media_count": 10,
+                        "photo_count": 6,
+                        "video_count": 4,
+                        "latest_id": 7958,
+                        "filename": "export.json",
+                    }
+                },
+            }
+        )
+
+        self.assertIn("✅ Export selesai", text)
+        self.assertIn("Message: 26", text)
+        self.assertIn("Media: 10", text)
+        self.assertIn("Artifact: export.json", text)
+        self.assertNotIn("{'", text)
+
+    def test_status_formatter_includes_active_json_file_speed_and_eta(self):
+        text = format_export_status(
+            {
+                "status": "running",
+                "id": "job-running",
+                "progress": {
+                    "message": "Mendownload media",
+                    "batch": {"name": "archive.json", "index": 2, "total": 3},
+                    "item": {"name": "video.mp4", "index": 7, "total": 20},
+                    "transfer": {"speed_bps": 1048576, "eta_seconds": 12},
+                    "overall": {"current": 1, "total": 3, "percent": 50},
+                },
+            }
+        )
+
+        self.assertIn("JSON: archive.json (2/3)", text)
+        self.assertIn("File: video.mp4 (7/20)", text)
+        self.assertIn("Speed: 1.0 MB/dtk", text)
+        self.assertIn("ETA: 12 dtk", text)
 
 
 if __name__ == "__main__":
