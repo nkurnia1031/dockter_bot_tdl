@@ -90,6 +90,7 @@ class RunScriptTests(unittest.TestCase):
         with (
             patch.object(run, "require_env_file"),
             patch.object(run, "validate_local_base_image") as validate_base,
+            patch.object(run, "ensure_base_image_available"),
             patch.object(run, "ensure_profile_root") as ensure_root,
             patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
             patch.object(run, "run_compose") as run_compose,
@@ -138,6 +139,7 @@ class RunScriptTests(unittest.TestCase):
 
         with (
             patch.object(run, "require_env_file"),
+            patch.object(run, "ensure_base_image_available"),
             patch.object(run, "prepare_tdl_build_asset"),
             patch.object(run, "run_compose") as run_compose,
             patch.object(run, "capture_compose", side_effect=["gateway-image\nworker-image\n", "worker-image\n"]),
@@ -154,6 +156,31 @@ class RunScriptTests(unittest.TestCase):
         )
         run_docker.assert_called_once()
         self.assertEqual(run_docker.call_args.args[0][:2], ["save", "-o"])
+
+    def test_missing_base_image_fails_before_compose_with_recovery_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            with (
+                patch.object(run, "PROJECT_DIR", project),
+                patch.object(run, "docker_image_exists", return_value=False),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "build-base.*base-migrate.zip"):
+                    run.ensure_base_image_available({})
+
+    def test_base_tar_is_loaded_when_local_image_was_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            base_tar = project / "images" / "tme3bot-base.tar"
+            base_tar.parent.mkdir()
+            base_tar.write_bytes(b"base")
+            with (
+                patch.object(run, "PROJECT_DIR", project),
+                patch.object(run, "docker_image_exists", side_effect=[False, True]),
+                patch.object(run, "run_docker") as run_docker,
+            ):
+                run.ensure_base_image_available({})
+
+            run_docker.assert_called_once_with(["load", "-i", str(base_tar)], {})
 
     def test_build_base_builds_and_exports_only_the_base_image(self) -> None:
         env = {"BASE_PLATFORM": "linux/amd64", "TME3BOT_BASE_IMAGE": "base:test"}
@@ -186,6 +213,7 @@ class RunScriptTests(unittest.TestCase):
             patch.object(run.sys, "argv", ["run.py", "update"]),
             patch.object(run, "load_env_file", return_value=env),
             patch.object(run, "ensure_profile_root"),
+            patch.object(run, "ensure_base_image_available"),
             patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
             patch.object(run, "run_compose") as run_compose,
         ):

@@ -119,6 +119,37 @@ TME3BOT_BASE_IMAGE=tme3bot-base:py310-tdl0203
 `run.py` mengganti `latest` dengan 12 karakter Git SHA saat publish/deploy,
 sehingga target mengambil image immutable dari commit yang sama.
 
+### Jika base image terhapus setelah cleanup Docker
+
+Build aplikasi tidak membuat ulang Go/TDL base image. Jika muncul error seperti
+`failed to resolve source metadata for tme3bot-base:py310-tdl0203`, berarti base
+image lokal sudah terhapus atau belum pernah di-load pada mesin tersebut.
+
+Jalankan di VPS builder besar:
+
+```bash
+python3 run.py build-base
+```
+
+Download `base-migrate.zip` ke project target, extract dari root project, lalu
+load image sebelum build:
+
+```bash
+unzip -o base-migrate.zip
+docker load -i images/tme3bot-base.tar
+docker image inspect tme3bot-base:py310-tdl0203 >/dev/null
+```
+
+Jika project juga memerlukan source terbaru, jalankan `git pull --ff-only`
+setelah extract dan pastikan `TME3BOT_BASE_IMAGE` di `.env` sama dengan nama
+image yang di-load. Setelah itu ulangi `python3 run.py migrate` atau
+`python3 run.py deploy gateway`.
+
+Versi `run.py` terbaru memeriksa image ini sebelum Compose berjalan. Jika image
+belum tersedia tetapi `images/tme3bot-base.tar` ada, script akan mencoba
+`docker load` otomatis. Jika keduanya tidak ada, script berhenti dengan pesan
+recovery dan tidak mencoba pull dari Docker Hub.
+
 ## A. Langkah di komputer lokal
 
 Jalankan dari root project sebelum push:

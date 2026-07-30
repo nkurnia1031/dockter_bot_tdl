@@ -75,12 +75,14 @@ def main() -> int:
             return 0
         if action in {"up", "start"}:
             ensure_profile_root(env)
+            ensure_base_image_available(env)
             prepare_tdl_build_asset(env)
             run_compose(["up", "-d", "--build"], env)
             run_compose(["ps"], env)
             return 0
         if action == "build":
             require_env_file()
+            ensure_base_image_available(env)
             prepare_tdl_build_asset(env)
             run_compose(["build"], env)
             return 0
@@ -98,6 +100,7 @@ def main() -> int:
             return 0
         if action == "update":
             ensure_profile_root(env)
+            ensure_base_image_available(env)
             prepare_tdl_build_asset(env)
             run_compose(["build"], env)
             run_compose(["up", "-d", "--remove-orphans"], env)
@@ -576,6 +579,7 @@ def deploy_application(
         run_compose(["pull"], deploy_env)
     else:
         validate_local_base_image()
+        ensure_base_image_available(deploy_env)
         prepare_tdl_build_asset(deploy_env)
         print(
             "Deploy builder: base image tidak dibangun; hanya layer aplikasi yang diperbarui.",
@@ -795,6 +799,7 @@ def migrate_images(env: dict[str, str]) -> Path:
     """Build both split deployment images and package them for an offline load."""
     require_env_file()
     validate_local_base_image()
+    ensure_base_image_available(env)
     prepare_tdl_build_asset(env)
 
     image_names: list[str] = []
@@ -883,15 +888,72 @@ def validate_local_base_image() -> None:
         )
 
 
+def configured_base_image(env: dict[str, str]) -> str:
+    image_name = (env.get("TME3BOT_BASE_IMAGE") or "tme3bot-base:py310-tdl0203").strip()
+    if not image_name:
+        raise RuntimeError("TME3BOT_BASE_IMAGE tidak boleh kosong.")
+    return image_name
+
+
+def docker_image_exists(image_name: str, env: dict[str, str]) -> bool:
+    """Check the local Docker daemon without allowing an implicit registry pull."""
+    docker_cmd = env.get("DOCKER_CMD") or os.getenv("DOCKER_CMD", "docker")
+    command = shlex.split(docker_cmd) + ["image", "inspect", image_name]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            env=compose_env(env),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def ensure_base_image_available(env: dict[str, str]) -> None:
+    """Ensure Docker can resolve the immutable base image before Compose builds.
+
+    Docker's default behavior is to treat an unknown FROM image as a public
+    registry image. That is dangerous here because the base image is intended
+    to be built once on the large builder VPS and loaded locally on every
+    build host. Try the extracted tar automatically, then fail with a recovery
+    command instead of letting Compose emit an opaque Docker Hub error.
+    """
+    image_name = configured_base_image(env)
+    if docker_image_exists(image_name, env):
+        return
+
+    base_tar = PROJECT_DIR / "images" / "tme3bot-base.tar"
+    if base_tar.is_file() and base_tar.stat().st_size > 0:
+        print(f"Base image tidak ada di Docker; memuat {base_tar}", flush=True)
+        run_docker(["load", "-i", str(base_tar)], env)
+        if docker_image_exists(image_name, env):
+            print(f"Base image tersedia: {image_name}", flush=True)
+            return
+        raise RuntimeError(
+            f"{base_tar} berhasil diproses tetapi image {image_name!r} tidak "
+            "ditemukan. Pastikan nama TME3BOT_BASE_IMAGE sama dengan image "
+            "yang dibuat di VPS builder besar."
+        )
+
+    raise RuntimeError(
+        f"Base image {image_name!r} tidak tersedia di Docker lokal dan "
+        f"{base_tar} juga tidak ditemukan. Jalankan `python3 run.py build-base` "
+        "di VPS besar, download/extract base-migrate.zip ke project ini, "
+        "lalu jalankan `docker load -i images/tme3bot-base.tar`. Setelah itu "
+        "ulang command build/migrate/deploy. Jangan menjalankan build di VPS "
+        "1 GB sebelum base image dimuat."
+    )
+
+
 def build_base_image(env: dict[str, str]) -> Path:
     """Build and export the expensive immutable runtime/Go base image once."""
     prepare_tdl_build_asset(env)
-    image_name = (
-        env.get("TME3BOT_BASE_IMAGE") or "tme3bot-base:py310-tdl0203"
-    ).strip()
+    image_name = configured_base_image(env)
     platform = (env.get("BASE_PLATFORM") or "linux/amd64").strip()
-    if not image_name:
-        raise RuntimeError("TME3BOT_BASE_IMAGE tidak boleh kosong.")
     if not platform:
         raise RuntimeError("BASE_PLATFORM tidak boleh kosong.")
 
