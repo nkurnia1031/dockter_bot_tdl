@@ -86,8 +86,8 @@ class TelegramFrontendApp:
     def _register(self) -> None:
         dispatcher = self.updater.dispatcher
         dispatcher.add_handler(CommandHandler("start", self.start_command))
-        for command in ("menu", "panel"):
-            dispatcher.add_handler(CommandHandler(command, self.menu_command))
+        dispatcher.add_handler(CommandHandler("menu", self.menu_command))
+        dispatcher.add_handler(CommandHandler("panel", self.panel_command))
         dispatcher.add_handler(CommandHandler("help", self.help_command))
         dispatcher.add_handler(CommandHandler("check_profil", self.check_command))
         dispatcher.add_handler(CommandHandler("download", self.download_command))
@@ -163,14 +163,13 @@ class TelegramFrontendApp:
         if payload.startswith("storage_") and update.effective_user:
             token = payload[len("storage_") :]
             try:
-                result = self.client.post(
-                    update.effective_user.id,
-                    f"/api/v1/storage/deep-links/{quote(token, safe='.')}/deliver",
+                result = self.client.deliver_storage_link(
+                    token, update.effective_user.id
                 )
                 self.panel.update_from_message(
                     update.effective_message,
                     f"File dikirim: {result.get('display_name', 'storage')}",
-                    storage_menu_markup(),
+                    None,
                 )
             except Exception as exc:
                 self._show_error(update.effective_message, exc)
@@ -179,12 +178,30 @@ class TelegramFrontendApp:
 
     def menu_command(self, update: Update, context: CallbackContext) -> None:
         del context
+        message = update.effective_message
+        if message is None:
+            return
+        # Give immediate feedback before API calls and recover a stale panel ID
+        # left behind when the Telegram chat history was cleared.
+        self.panel.update_from_message(message, "Memuat panelâ€¦")
         actor = self._actor(update)
         if actor is None:
             return
         self._show_export_workspace(
-            update.effective_message, update.effective_user.id, actor
+            message, update.effective_user.id, actor
         )
+
+    def panel_command(self, update: Update, context: CallbackContext) -> None:
+        del context
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        self.pending.pop((message.chat_id, user.id), None)
+        self.panel.recover_from_message(message, "Memuat panelâ€¦")
+        actor = self._actor(update)
+        if actor is not None:
+            self._show_export_workspace(message, user.id, actor)
 
     def help_command(self, update: Update, context: CallbackContext) -> None:
         del context
@@ -294,7 +311,7 @@ class TelegramFrontendApp:
             )
 
     def unknown_command(self, update: Update, context: CallbackContext) -> None:
-        self.menu_command(update, context)
+        self.panel_command(update, context)
 
     def handle_callback(self, update: Update, context: CallbackContext) -> None:
         del context
@@ -361,12 +378,19 @@ class TelegramFrontendApp:
                 )
         except Exception as exc:
             self._show_error(message, exc)
+        finally:
+            self.panel.adopt_replacement(message.chat_id)
 
     def handle_text(self, update: Update, context: CallbackContext) -> None:
         del context
         message = update.effective_message
         user = update.effective_user
         if message is None or user is None or not message.text:
+            return
+        recovery = message.text.strip().casefold()
+        if recovery in {"menu", "panel", "start"}:
+            self.pending.pop((message.chat_id, user.id), None)
+            self.panel_command(update, None)
             return
         actor = self._actor(update)
         if actor is None:
@@ -498,13 +522,32 @@ class TelegramFrontendApp:
                 export_input_cancel_markup(),
             )
             return
+        if data == "ew:overwrite":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.set_overwrite_start_id(not state.overwrite_start_id)
+            notice = (
+                "Overwrite aktif. Tekan Start ID untuk mengisi angka manual."
+                if state.overwrite_start_id
+                else "Overwrite dimatikan; Start ID kembali memakai Last ID + 1."
+            )
+            self._show_export_workspace(message, user_id, actor, notice)
+            return
         if data == "ew:last":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            if not state.overwrite_start_id:
+                self._show_export_workspace(
+                    message,
+                    user_id,
+                    actor,
+                    "Aktifkan Overwrite Start ID sebelum mengisi angka manual.",
+                )
+                return
             self.pending[(message.chat_id, user_id)] = PendingInput(
                 "export_start_id"
             )
             edit_menu_message(
                 message,
-                "Ketik Start ID angka minimal 1, atau 'auto' untuk memakai Last ID + 1.",
+                "Ketik Start ID angka minimal 1, atau 'auto' untuk mematikan overwrite.",
                 export_input_cancel_markup(),
             )
             return
@@ -563,6 +606,7 @@ class TelegramFrontendApp:
             f"Source: {selected}",
             f"Label: {state.label or 'tanpa label'}",
             f"Start ID: {state.effective_start_id if state.chat_ref else 'pilih source dulu'}",
+            f"Overwrite Start ID: {'ON' if state.overwrite_start_id else 'OFF'}",
         ]
         if state.source:
             lines.append(f"Last ID backend: {state.source.get('last_id', 0)}")

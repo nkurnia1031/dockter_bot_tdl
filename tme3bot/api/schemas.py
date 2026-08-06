@@ -296,6 +296,10 @@ class StorageDeliveryRequest(BaseModel):
     method: str = "telegram"
 
 
+class TelegramStorageDeliveryRequest(BaseModel):
+    telegram_user_id: int
+
+
 class WorkerJobRequest(BaseModel):
     job_id: str
     kind: str

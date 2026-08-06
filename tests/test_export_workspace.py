@@ -41,6 +41,22 @@ class ExportWorkspaceTests(unittest.TestCase):
             },
         )
 
+    def test_overwrite_switch_requires_manual_value_and_can_reset_to_auto(self):
+        state = ExportWorkspaceState()
+        state.select_source({"chat_ref": "channel", "last_id": 99})
+        state.set_overwrite_start_id(True)
+
+        with self.assertRaisesRegex(ValueError, "Isi Start ID manual"):
+            state.payload()
+
+        state.set_start_id(12)
+        self.assertTrue(state.overwrite_start_id)
+        self.assertEqual(state.payload()["start_id"], 12)
+        state.set_overwrite_start_id(False)
+        self.assertEqual(state.effective_start_id, 100)
+        self.assertNotIn("start_id", state.payload())
+        self.assertFalse(state.payload()["use_url_message_id"])
+
     def test_new_source_defaults_to_message_one_and_at_is_ignored(self):
         state = ExportWorkspaceState()
         state.select_chat_ref("@NewChannel")
@@ -68,6 +84,7 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertIsNone(state.active_job_id)
         self.assertIsNone(state.job_snapshot)
         self.assertEqual(state.default_start_id, 21)
+        self.assertFalse(state.overwrite_start_id)
 
     def test_report_unwraps_structured_worker_result(self):
         report = export_report(
@@ -106,6 +123,7 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertTrue(any("2026" in value for value in labels))
         self.assertFalse(any("object at" in value for value in labels))
         self.assertFalse(any(value in labels for value in ("Export lagi", "Detail job")))
+        self.assertIn("Overwrite Start ID: OFF", labels)
 
     def test_job_formatter_is_structured_and_omits_missing_fields(self):
         text = format_export_job(

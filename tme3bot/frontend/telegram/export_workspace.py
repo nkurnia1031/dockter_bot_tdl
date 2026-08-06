@@ -153,6 +153,7 @@ class ExportWorkspaceState:
     chat_ref: str | None = None
     label: str | None = None
     start_id: int | None = None
+    overwrite_start_id: bool = False
     active_job_id: str | None = None
     job_snapshot: dict[str, Any] | None = None
     source_page: int = 0
@@ -170,6 +171,7 @@ class ExportWorkspaceState:
         self.source["chat_ref"] = ref
         self.chat_ref = ref
         self.start_id = None
+        self.overwrite_start_id = False
         self.source_page = 0
         self.clear_job_view()
         self.touch()
@@ -183,6 +185,7 @@ class ExportWorkspaceState:
         if self.source is not None:
             self.source["chat_ref"] = ref
         self.start_id = None
+        self.overwrite_start_id = False
         self.source_page = 0
         self.clear_job_view()
         self.touch()
@@ -204,12 +207,20 @@ class ExportWorkspaceState:
     def set_start_id(self, value: str | int | None) -> None:
         if value is None or str(value).strip() == "":
             self.start_id = None
+            self.overwrite_start_id = False
             self.touch()
             return
         parsed = int(str(value).strip())
         if parsed < 1:
             raise ValueError("Start ID harus berupa angka minimal 1.")
         self.start_id = parsed
+        self.overwrite_start_id = True
+        self.touch()
+
+    def set_overwrite_start_id(self, enabled: bool) -> None:
+        self.overwrite_start_id = bool(enabled)
+        if not self.overwrite_start_id:
+            self.start_id = None
         self.touch()
 
     @property
@@ -220,7 +231,9 @@ class ExportWorkspaceState:
 
     @property
     def effective_start_id(self) -> int:
-        return self.start_id if self.start_id is not None else self.default_start_id
+        if self.overwrite_start_id and self.start_id is not None:
+            return self.start_id
+        return self.default_start_id
 
     def payload(self) -> dict[str, Any]:
         if not self.chat_ref:
@@ -228,7 +241,9 @@ class ExportWorkspaceState:
         payload: dict[str, Any] = {"chat_ref": normalize_chat_ref(self.chat_ref)}
         if self.label:
             payload["label"] = self.label
-        if self.start_id is not None:
+        if self.overwrite_start_id:
+            if self.start_id is None:
+                raise ValueError("Isi Start ID manual atau matikan overwrite.")
             payload["start_id"] = self.start_id
             # The worker builds the legacy URL from this value.  This flag tells
             # ExportService to honor the explicit message ID instead of the

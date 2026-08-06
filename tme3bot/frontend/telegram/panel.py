@@ -8,6 +8,8 @@ from telegram import Bot, InlineKeyboardMarkup, Message
 from tme3bot.frontend.telegram.panel_state import PanelViewStore
 
 LOGGER = logging.getLogger(__name__)
+_REPLACEMENT_IDS: dict[int, int] = {}
+_REPLACEMENT_LOCK = threading.RLock()
 UNEDITABLE_ERRORS = (
     "message to edit not found",
     "message can't be edited",
@@ -66,6 +68,8 @@ def edit_menu_message(
             message.message_id,
             replacement.message_id,
         )
+        with _REPLACEMENT_LOCK:
+            _REPLACEMENT_IDS[message.chat_id] = replacement.message_id
         return replacement.message_id
     except Exception:
         LOGGER.exception(
@@ -103,6 +107,15 @@ class PanelManager:
             if message_id is None or current == message_id:
                 self._message_ids.pop(chat_id, None)
 
+    def adopt_replacement(self, chat_id: int) -> int | None:
+        """Remember a replacement created by the legacy callback presenter."""
+        with _REPLACEMENT_LOCK:
+            replacement_id = _REPLACEMENT_IDS.pop(chat_id, None)
+        if replacement_id is not None:
+            with self._lock:
+                self._message_ids[chat_id] = replacement_id
+        return replacement_id
+
     def update(
         self,
         chat_id: int,
@@ -131,11 +144,39 @@ class PanelManager:
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> tuple[int, int]:
         self.invalidate_view(message.chat_id)
-        panel = self.update(
-            message.chat_id, text, reply_markup, reply_to_message_id=message.message_id
-        )
+        # A panel replacement must not depend on the triggering command still
+        # existing.  This is important after a user clears the private chat:
+        # the remembered panel ID is stale and Telegram may reject replies to
+        # the transient command while the old history is being reconciled.
+        panel = self.update(message.chat_id, text, reply_markup)
         self.delete_user_message(message)
         return panel
+
+    def recover_from_message(
+        self,
+        message: Message,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> tuple[int, int]:
+        """Force a fresh panel and remember it before deleting the command."""
+        self.invalidate_view(message.chat_id)
+        self.forget(message.chat_id)
+        panel = self.update(message.chat_id, text, reply_markup)
+        self.delete_user_message(message)
+        return panel
+
+    def edit_existing(
+        self,
+        message: Message,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> int | None:
+        """Edit a callback panel and remember any replacement message ID."""
+        message_id = edit_menu_message(message, text, reply_markup)
+        if message_id is not None:
+            with self._lock:
+                self._message_ids[message.chat_id] = message_id
+        return message_id
 
     @staticmethod
     def delete_user_message(message: Message | None) -> None:

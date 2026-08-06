@@ -9,6 +9,7 @@ class FakeBot:
         self.edit_calls = []
         self.send_calls = []
         self.fail_edit_ids = set()
+        self.fail_send = False
         self.next_message_id = 700
 
     def edit_message_text(self, **kwargs):
@@ -18,6 +19,8 @@ class FakeBot:
         return True
 
     def send_message(self, chat_id, text, **kwargs):
+        if self.fail_send:
+            raise RuntimeError("Telegram send failed")
         self.send_calls.append({"chat_id": chat_id, "text": text, **kwargs})
         message = FakeMessage(
             self,
@@ -83,6 +86,47 @@ class TelegramPanelRecoveryTests(unittest.TestCase):
         self.assertEqual(reused_id, 700)
         self.assertEqual(len(bot.send_calls), 1)
         self.assertEqual(bot.edit_calls[-1]["message_id"], 700)
+
+    def test_force_recovery_creates_fresh_panel_without_reply(self) -> None:
+        bot = FakeBot()
+        manager = PanelManager(bot)
+        manager.remember(FakeMessage(bot, message_id=646))
+        command = FakeMessage(bot, message_id=900, is_bot=False)
+
+        _, replacement_id = manager.recover_from_message(command, "Memuat panelâ€¦")
+        _, reused_id = manager.update(10, "Panel siap")
+
+        self.assertEqual(replacement_id, 700)
+        self.assertEqual(reused_id, 700)
+        self.assertIsNone(bot.send_calls[0].get("reply_to_message_id"))
+        self.assertTrue(command.deleted)
+
+    def test_recovery_keeps_user_command_when_send_fails(self) -> None:
+        bot = FakeBot()
+        bot.fail_send = True
+        manager = PanelManager(bot)
+        command = FakeMessage(bot, message_id=900, is_bot=False)
+
+        with self.assertRaisesRegex(RuntimeError, "Telegram send failed"):
+            manager.recover_from_message(command, "Memuat panelâ€¦")
+
+        self.assertFalse(command.deleted)
+
+    def test_callback_replacement_can_be_adopted_for_future_updates(self) -> None:
+        bot = FakeBot()
+        manager = PanelManager(bot)
+        missing = FakeMessage(
+            bot,
+            message_id=646,
+            edit_error=RuntimeError("Message to edit not found"),
+        )
+
+        edit_menu_message(missing, "Panel pengganti")
+        self.assertEqual(manager.adopt_replacement(10), 700)
+        _, reused_id = manager.update(10, "Update berikutnya")
+
+        self.assertEqual(reused_id, 700)
+        self.assertEqual(len(bot.send_calls), 1)
 
     def test_update_from_callback_never_deletes_bot_panel(self) -> None:
         bot = FakeBot()

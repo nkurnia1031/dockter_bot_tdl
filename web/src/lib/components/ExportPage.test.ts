@@ -42,4 +42,34 @@ describe('ExportPage labels', () => {
     status='succeeded';
     expect(await screen.findByText('12 pesan · 7 media · 4 foto · 3 video', {}, {timeout:2500})).toBeTruthy();
   });
+
+  it('only sends a manual start ID when overwrite is enabled', async () => {
+    const requests:Record<string,unknown>[]=[];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url=String(input);
+      if (url.includes('/sources')) return new Response(JSON.stringify({items:[{chat_ref:'example',last_id:40,label:'arsip'}]}), {status:200});
+      if (url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
+      if (url.endsWith('/exports') && init?.method === 'POST') {
+        requests.push(JSON.parse(String(init.body)));
+        return new Response(JSON.stringify({id:`export-${requests.length}`,status:'queued'}), {status:200});
+      }
+      return new Response(JSON.stringify({items:[]}), {status:200});
+    }));
+    render(ExportPage);
+    const source=await screen.findByLabelText('Pilih source tersimpan');
+    await screen.findByRole('option', {name:/example/});
+    await fireEvent.change(source, {target:{value:'example'}});
+    const start=screen.getByLabelText('Start message ID') as HTMLInputElement;
+    expect(start.disabled).toBe(true);
+
+    await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
+    expect(requests[0]).toMatchObject({chat_ref:'example',use_url_message_id:false});
+    expect(requests[0]).not.toHaveProperty('start_id');
+
+    await fireEvent.click(screen.getByRole('switch', {name:/Overwrite Start ID/}));
+    expect(start.disabled).toBe(false);
+    await fireEvent.input(start, {target:{value:'12'}});
+    await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
+    expect(requests[1]).toMatchObject({chat_ref:'example',start_id:12,use_url_message_id:true});
+  });
 });

@@ -24,6 +24,18 @@ class BackendApiClient:
             {"telegram_user_id": int(telegram_user_id)},
         )
 
+    def deliver_storage_link(
+        self, token: str, telegram_user_id: int
+    ) -> dict[str, Any]:
+        """Redeem a signed capability link without creating an actor JWT."""
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "POST",
+            f"/internal/v1/storage/deep-links/{quote(token, safe='.')}/deliver",
+            {"telegram_user_id": int(telegram_user_id)},
+        )
+
     def me(self, telegram_user_id: int) -> dict[str, Any]:
         return self.get(telegram_user_id, "/api/v1/me")
 

@@ -15,6 +15,7 @@
   let labels = $state<LabelItem[]>([]);
   let chatRef = $state('');
   let startId = $state('1');
+  let overwriteStartId = $state(false);
   let label = $state('');
   let selected = $state('');
   let message = $state('');
@@ -85,11 +86,39 @@
   function choose(value: string) {
     selected = value;
     const found = sources.find((source) => source.chat_ref === value);
-    if (found) { chatRef = found.chat_ref; startId = String(Number(found.last_id || 0) + 1); label = found.label || ''; }
+    overwriteStartId = false;
+    if (found) {
+      chatRef = found.chat_ref;
+      startId = String(Number(found.last_id || 0) + 1);
+      label = found.label || '';
+    } else {
+      chatRef = '';
+      startId = '1';
+      label = '';
+    }
+  }
+  function updateChatRef(value: string) {
+    chatRef = value;
+    if (selected && selected.replace(/^@/, '').toLowerCase() !== value.replace(/^@/, '').toLowerCase()) {
+      selected = '';
+      overwriteStartId = false;
+      startId = '1';
+    }
   }
   async function submit() {
     try {
-      const job=await post<ExportJob>('/exports', { chat_ref: chatRef, start_id: Number(startId), label: label || undefined });
+      const manualStartId=Number(startId);
+      if (overwriteStartId && (!Number.isInteger(manualStartId) || manualStartId < 1)) {
+        message='Start ID manual harus berupa angka minimal 1.';
+        return;
+      }
+      const payload:Record<string,unknown>={
+        chat_ref:chatRef,
+        label:label || undefined,
+        use_url_message_id:overwriteStartId
+      };
+      if (overwriteStartId) payload.start_id=manualStartId;
+      const job=await post<ExportJob>('/exports', payload);
       remember(job);
       message='';
       schedulePoll();
@@ -140,7 +169,8 @@
 <div class="mt-7 grid gap-5 xl:grid-cols-[.84fr_1.16fr]">
   <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Export baru</h2><p class="muted text-sm">Start ID dapat dioverride saat diperlukan.</p></div></div>
     <label class="mt-6 block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
-    <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" bind:value={chatRef} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2" type="number" min="1" bind:value={startId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
+    <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
+    <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId} /><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Aktifkan hanya untuk export ini. Last ID backend tidak akan diturunkan.</span></span></label>
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
     <button class="button mt-6 w-full" onclick={submit}><FileDown size={16}/>Mulai export</button>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>

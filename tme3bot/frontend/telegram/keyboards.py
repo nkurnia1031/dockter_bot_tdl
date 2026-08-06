@@ -26,8 +26,11 @@ def export_workspace_markup(
         source_text += " (source baru)"
 
     label_text = getattr(state, "label", None) or "Kosong"
-    if getattr(state, "start_id", None) is None:
+    overwrite_start_id = bool(getattr(state, "overwrite_start_id", False))
+    if not overwrite_start_id:
         start_text = f"Otomatis: {getattr(state, 'default_start_id', 1)}"
+    elif getattr(state, "start_id", None) is None:
+        start_text = "Manual: belum diisi"
     else:
         start_text = f"Override: {getattr(state, 'start_id')}"
 
@@ -57,6 +60,14 @@ def export_workspace_markup(
         if navigation:
             rows.append(navigation)
     rows.append([InlineKeyboardButton("＋ Source baru", callback_data="ew:new")])
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"Overwrite Start ID: {'ON' if overwrite_start_id else 'OFF'}",
+                callback_data="ew:overwrite",
+            )
+        ]
+    )
     rows.append(
         [
             InlineKeyboardButton(

@@ -50,9 +50,12 @@ pengiriman export dalam satu pesan Telegram. Source tersimpan dipilih melalui
 tombol inline; source baru dapat dimasukkan sebagai username tanpa `@` atau
 numeric chat ID. Username dengan dan tanpa `@` dianggap source yang sama.
 
-`Start ID` kosong memakai `Last ID backend + 1`. Jika diisi manual, bot mengirim
-`use_url_message_id=true` agar override benar-benar dipakai dan tidak ditimpa
-oleh state source. Label custom otomatis masuk daftar label berikutnya.
+`Overwrite Start ID` default OFF dan memakai `Last ID backend + 1`. Saat switch
+ON, user wajib mengisi Start ID angka minimal 1 dan frontend mengirim
+`use_url_message_id=true` agar override dipakai untuk satu job tersebut. Memilih
+source lain mematikan overwrite. Last ID backend tetap monotonic dan tidak
+diturunkan oleh export ulang dari ID lama. Perilaku yang sama berlaku pada form
+Export Web. Label custom otomatis masuk daftar label berikutnya.
 
 Tombol `Workspace full fitur` membuka menu utility, storage, download, backup,
 worker, settings, dan source management lama. Pergantian workspace hanya
@@ -74,6 +77,21 @@ pada setiap polling atau saat job selesai.
 
 Perubahan status Telegram ini hanya mengubah image gateway/frontend Telegram.
 Tidak memerlukan rebuild base Go/TDL atau update worker remote.
+
+Jika chat Telegram dibersihkan, `/panel` memaksa pembuatan panel baru. `/start`,
+`/menu`, unknown command, serta teks `menu`, `panel`, atau `start` juga menjalankan
+recovery. Bot menampilkan `Memuat panelâ€¦` sebelum meminta data backend; command
+user baru dihapus setelah panel berhasil dibuat.
+
+Deep link Storage adalah capability link bertanda tangan. Semua user Telegram
+yang memiliki link valid dapat menerima file walaupun tidak mempunyai
+`identity.json`. Akses ini hanya mengizinkan delivery file aktif; user tersebut
+tidak memperoleh akses katalog, profile, metadata, atau menu admin. Item dalam
+Trash/deleted dan token yang rusak selalu ditolak.
+
+Rollout perubahan ini: publish image gateway, deploy gateway (backend dan
+Telegram), lalu deploy web static. Worker lokal/remote dan base Go/TDL tidak
+perlu dibangun ulang.
 
 ## Sekali saja: konfigurasi gateway dan UI
 
@@ -373,6 +391,7 @@ Gunakan matriks berikut:
 | File yang berubah | Builder | Gateway | Worker remote | Web |
 |---|---:|---:|---:|---:|
 | Hanya `web/` | Tidak | Tidak | Tidak | Deploy |
+| Backend + Telegram + web, tanpa worker | Publish gateway | Deploy gateway | Tidak | Deploy terakhir |
 | Backend/API saja | Publish gateway | Deploy gateway | Tidak | Jika kontrak UI berubah |
 | Worker/TDL/utility | Publish gateway | Deploy gateway | Semua worker | Jika UI progress berubah |
 | Backend + worker + web | Publish gateway | Deploy gateway | Semua worker | Deploy terakhir |

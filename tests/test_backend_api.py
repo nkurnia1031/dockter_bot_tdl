@@ -12,6 +12,7 @@ from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
+from tme3bot.storage_links import sign_storage_item
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
 
 
@@ -78,6 +79,15 @@ class FakeWorkers:
         return self.values.pop(name, None) is not None
 
 
+class FakeTelegramBot:
+    def __init__(self):
+        self.copy_calls = []
+
+    def copy_message(self, **values):
+        self.copy_calls.append(values)
+        return type("CopiedMessage", (), {"message_id": 777})()
+
+
 class BackendApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -91,6 +101,7 @@ class BackendApiTests(unittest.TestCase):
         self.catalog = StorageCatalog(db)
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
+        self.bot = FakeTelegramBot()
         self.control = ControlPlane(
             self.jobs,
             self.dispatcher,
@@ -110,6 +121,8 @@ class BackendApiTests(unittest.TestCase):
             (),
             {
                 "frontend_service_token": "frontend",
+                "auth_jwt_secret": "a" * 48,
+                "bot_username": "my_bot",
                 "backend_internal_token": "internal",
                 "management_api_token": "management",
                 "storage_channel": "123",
@@ -140,6 +153,7 @@ class BackendApiTests(unittest.TestCase):
             ),
             utility_settings=UtilitySettingsStore(root / "settings.json"),
             worker_dispatcher=self.dispatcher,
+            bot=self.bot,
         )
         self.client = TestClient(create_backend_app(context))
 
@@ -472,6 +486,47 @@ class BackendApiTests(unittest.TestCase):
         current = self.catalog.get(item.id)
         self.assertEqual(current.display_name, "Shared metadata")
         self.assertEqual(current.folder, "shared-folder")
+
+    def test_storage_capability_link_delivers_to_user_without_identity(self):
+        item = self.insert_storage_item()
+        token = sign_storage_item(item.id, "a" * 48)
+
+        delivered = self.client.post(
+            f"/internal/v1/storage/deep-links/{token}/deliver",
+            headers={"Authorization": "Bearer frontend"},
+            json={"telegram_user_id": 99},
+        )
+
+        self.assertEqual(delivered.status_code, 200)
+        self.assertEqual(delivered.json()["destination"], 99)
+        self.assertEqual(self.bot.copy_calls[-1]["chat_id"], 99)
+        denied = self.client.post(
+            "/internal/v1/auth/telegram/exchange",
+            headers={"Authorization": "Bearer frontend"},
+            json={"telegram_user_id": 99},
+        )
+        self.assertEqual(denied.status_code, 403)
+
+    def test_storage_capability_link_rejects_tampering_and_trash(self):
+        item = self.insert_storage_item()
+        token = sign_storage_item(item.id, "a" * 48)
+        invalid = self.client.post(
+            f"/internal/v1/storage/deep-links/{token}x/deliver",
+            headers={"Authorization": "Bearer frontend"},
+            json={"telegram_user_id": 99},
+        )
+        self.assertEqual(invalid.status_code, 400)
+
+        self.catalog.trash_items([item.id], 42)
+        unavailable = self.client.post(
+            f"/internal/v1/storage/deep-links/{token}/deliver",
+            headers={"Authorization": "Bearer frontend"},
+            json={"telegram_user_id": 99},
+        )
+        self.assertEqual(unavailable.status_code, 410)
+        self.assertEqual(
+            unavailable.json()["error"]["code"], "STORAGE_ITEM_UNAVAILABLE"
+        )
 
     def test_storage_browser_folder_and_trash_flow(self):
         item = self.insert_storage_item()

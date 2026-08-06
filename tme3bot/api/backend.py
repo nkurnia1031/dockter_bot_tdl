@@ -47,6 +47,7 @@ from tme3bot.api.schemas import (
     StorageItemListResponse,
     StorageItemResponse,
     StorageSettingsResponse,
+    TelegramStorageDeliveryRequest,
     StorageUpdateRequest,
     StorageUploadRequest,
     TokenPairResponse,
@@ -1234,24 +1235,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 "Metode delivery belum didukung.",
                 status_code=400,
             )
-        item = _storage_item(context, item_id)
-        if context.bot is None:
-            raise DomainError(
-                "DELIVERY_UNAVAILABLE",
-                "Telegram delivery adapter belum aktif.",
-                status_code=503,
-            )
-        message = context.bot.copy_message(
-            chat_id=actor.telegram_user_id,
-            from_chat_id=item.channel_id,
-            message_id=item.channel_message_id,
-        )
-        return {
-            "method": "telegram",
-            "destination": actor.telegram_user_id,
-            "message_id": getattr(message, "message_id", None),
-            "display_name": item.display_name,
-        }
+        item = _active_storage_item(context, item_id)
+        return _deliver_storage_telegram(context, item, actor.telegram_user_id)
 
     @app.get(
         "/api/v1/storage/items/{item_id}/deep-link",
@@ -1259,7 +1244,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     )
     def storage_deep_link(item_id: int, actor=Depends(current_actor)):
         del actor
-        _storage_item(context, item_id)
+        _active_storage_item(context, item_id)
         token = sign_storage_item(item_id, context.config.auth_jwt_secret)
         return {
             "url": f"https://t.me/{context.config.bot_username}?start=storage_{token}"
@@ -1276,24 +1261,27 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError(
                 "STORAGE_LINK_INVALID", str(exc), status_code=400
             ) from exc
-        item = _storage_item(context, item_id)
-        if context.bot is None:
+        item = _active_storage_item(context, item_id)
+        return _deliver_storage_telegram(context, item, actor.telegram_user_id)
+
+    @app.post(
+        "/internal/v1/storage/deep-links/{token}/deliver",
+        include_in_schema=False,
+        response_model=ObjectResponse,
+        dependencies=[Depends(require_service)],
+    )
+    def deliver_public_storage_deep_link(
+        token: str, body: TelegramStorageDeliveryRequest
+    ):
+        """Capability-link delivery; does not grant an application actor."""
+        try:
+            item_id = verify_storage_item(token, context.config.auth_jwt_secret)
+        except ValueError as exc:
             raise DomainError(
-                "DELIVERY_UNAVAILABLE",
-                "Telegram delivery adapter belum aktif.",
-                status_code=503,
-            )
-        message = context.bot.copy_message(
-            chat_id=actor.telegram_user_id,
-            from_chat_id=item.channel_id,
-            message_id=item.channel_message_id,
-        )
-        return {
-            "method": "telegram",
-            "destination": actor.telegram_user_id,
-            "message_id": getattr(message, "message_id", None),
-            "display_name": item.display_name,
-        }
+                "STORAGE_LINK_INVALID", str(exc), status_code=400
+            ) from exc
+        item = _active_storage_item(context, item_id)
+        return _deliver_storage_telegram(context, item, body.telegram_user_id)
 
     @app.get("/api/v1/backups", response_model=ItemListResponse)
     def list_backups(actor=Depends(current_actor)):
@@ -1389,6 +1377,46 @@ def _storage_item(context: BackendContext, item_id: int):
             "STORAGE_ITEM_NOT_FOUND", "File storage tidak ditemukan.", status_code=404
         )
     return item
+
+
+def _active_storage_item(context: BackendContext, item_id: int):
+    item = _storage_item(context, item_id)
+    if str(getattr(item, "status", "")) != "active" or getattr(
+        item, "trashed_at", None
+    ):
+        raise DomainError(
+            "STORAGE_ITEM_UNAVAILABLE",
+            "File storage tidak lagi tersedia untuk dikirim.",
+            status_code=410,
+        )
+    return item
+
+
+def _deliver_storage_telegram(context: BackendContext, item, telegram_user_id: int):
+    if context.bot is None:
+        raise DomainError(
+            "DELIVERY_UNAVAILABLE",
+            "Telegram delivery adapter belum aktif.",
+            status_code=503,
+        )
+    try:
+        message = context.bot.copy_message(
+            chat_id=int(telegram_user_id),
+            from_chat_id=item.channel_id,
+            message_id=item.channel_message_id,
+        )
+    except Exception as exc:
+        raise DomainError(
+            "STORAGE_DELIVERY_FAILED",
+            "File Telegram tidak dapat dikirim. Pesan channel mungkin sudah tidak tersedia.",
+            status_code=502,
+        ) from exc
+    return {
+        "method": "telegram",
+        "destination": int(telegram_user_id),
+        "message_id": getattr(message, "message_id", None),
+        "display_name": item.display_name,
+    }
 
 
 def _require_storage_folders_idle(context: BackendContext, folder_ids: list[int]) -> None:
