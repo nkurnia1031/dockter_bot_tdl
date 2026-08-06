@@ -491,6 +491,13 @@ class BackendApiTests(unittest.TestCase):
         item = self.insert_storage_item()
         token = sign_storage_item(item.id, "a" * 48)
 
+        code_response = self.client.get(
+            f"/api/v1/storage/items/{item.id}/deep-link",
+            headers=self.login(42),
+        )
+        self.assertEqual(code_response.status_code, 200)
+        self.assertEqual(code_response.json()["code"], token)
+
         delivered = self.client.post(
             f"/internal/v1/storage/deep-links/{token}/deliver",
             headers={"Authorization": "Bearer frontend"},

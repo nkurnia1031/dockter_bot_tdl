@@ -20,8 +20,8 @@
     "semantic_hash": ""
   },
   "tests/test_app_menu.py": {
-    "mtime": 1786035860.774469,
-    "ast_hash": "281f20048c59117d8e1f0ac477788098",
+    "mtime": 1786041474.145057,
+    "ast_hash": "e8c4e90dfec9e591d60489599b1ba731",
     "semantic_hash": ""
   },
   "tests/test_container.py": {
@@ -55,8 +55,8 @@
     "semantic_hash": ""
   },
   "tests/test_service.py": {
-    "mtime": 1785141689.8274295,
-    "ast_hash": "0e4dc5aa79cefb4a1cf4d49a0ca9bea8",
+    "mtime": 1786040682.9066625,
+    "ast_hash": "c5cf3c33a863242e2cde4128a0330331",
     "semantic_hash": ""
   },
   "tests/test_state.py": {
@@ -130,8 +130,8 @@
     "semantic_hash": ""
   },
   "tme3bot/service.py": {
-    "mtime": 1785140745.427466,
-    "ast_hash": "67bc8c6da261180852da1fe087f22c5c",
+    "mtime": 1786040682.9044585,
+    "ast_hash": "afda26e60fccd1188a3c07df6d99dcbe",
     "semantic_hash": ""
   },
   "tme3bot/state.py": {
@@ -295,8 +295,8 @@
     "semantic_hash": ""
   },
   "tests/test_backend_api.py": {
-    "mtime": 1786035759.6118248,
-    "ast_hash": "dc2adc8335e3c0180fd5028bf5f582ce",
+    "mtime": 1786041491.887272,
+    "ast_hash": "69bd7dd16b4cf308e3b578df2a1e3aa5",
     "semantic_hash": ""
   },
   "tests/test_control_plane.py": {
@@ -320,8 +320,8 @@
     "semantic_hash": ""
   },
   "tme3bot/api/backend.py": {
-    "mtime": 1786035596.5281527,
-    "ast_hash": "f7506aa0db2f5adde7e503a81bbe1059",
+    "mtime": 1786041445.2336447,
+    "ast_hash": "c8fca7f9785fea56b16dc074fce32e48",
     "semantic_hash": ""
   },
   "tme3bot/api/schemas.py": {
@@ -405,8 +405,8 @@
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
-    "mtime": 1786036261.0951512,
-    "ast_hash": "bc9233811933afd1982e3fb48c8b956c",
+    "mtime": 1786041549.195613,
+    "ast_hash": "14d4da3817cef53ae0974ca45bf87451",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/__init__.py": {
@@ -415,13 +415,13 @@
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/app.py": {
-    "mtime": 1786035689.1911697,
-    "ast_hash": "edece3a919a9de439ee942e4d62668cb",
+    "mtime": 1786041508.2311265,
+    "ast_hash": "25e63f1fe816a7e64e4ac34c0b628413",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/keyboards.py": {
-    "mtime": 1786035665.2120373,
-    "ast_hash": "4bff5659751c805fb1262f75afc57c14",
+    "mtime": 1786041445.2281337,
+    "ast_hash": "344648ce148f2fb0ea7d4cca9cf7b915",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/panel.py": {
@@ -635,8 +635,8 @@
     "semantic_hash": ""
   },
   "web/src/lib/components/StoragePage.svelte": {
-    "mtime": 1785075382.6881487,
-    "ast_hash": "4bf748d15466fb45e96a67829996885e",
+    "mtime": 1786041461.5252745,
+    "ast_hash": "0e693789185400b3530ab702615a19ca",
     "semantic_hash": ""
   },
   "web/src/lib/components/UtilityPage.svelte": {

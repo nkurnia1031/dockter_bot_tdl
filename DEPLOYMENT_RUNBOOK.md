@@ -42,6 +42,19 @@ Activity tetap menampilkan job lintas-worker untuk profile aktif. Mengganti
 worker hanya mengubah route job berikutnya; job lama tetap berjalan pada worker
 asal dan tidak dipindahkan.
 
+### Recovery download `CHAT_ID_INVALID`
+
+Cache peer Telegram berada pada sesi TDL download masing-masing worker. Jika
+download mengembalikan `CHAT_ID_INVALID`, worker tidak langsung memindahkan JSON
+ke `failed`. Worker membuat URL warm-up dari `chat_ref` dan ID media pertama,
+menjalankan warm-up pada sesi download worker aktif, lalu mencoba download ulang
+satu kali. Jika warm-up atau retry tetap gagal, barulah artifact masuk ke
+`failed` dengan error yang relevan.
+
+Perubahan ini berada pada image worker Python. Deploy `worker-local` melalui
+deploy gateway dan deploy seluruh worker remote yang dapat menjalankan download.
+Base Go/TDL tidak perlu dibangun ulang.
+
 ## Workspace export Telegram
 
 `/start`, `/menu`, dan `/panel` sekarang membuka `Export fokus` sebagai panel
@@ -88,6 +101,12 @@ yang memiliki link valid dapat menerima file walaupun tidak mempunyai
 `identity.json`. Akses ini hanya mengizinkan delivery file aktif; user tersebut
 tidak memperoleh akses katalog, profile, metadata, atau menu admin. Item dalam
 Trash/deleted dan token yang rusak selalu ditolak.
+
+UX utama pemanggilan file memakai kode capability, bukan perpindahan lewat deep
+link. Web Storage menyediakan tombol `Salin kode file`; pengguna memilih
+`Panggil file dengan kode` pada menu Storage atau menjalankan `/file`, lalu
+menempel kode tersebut. `/file` juga dapat dipakai user tanpa identity. Deep link
+`/start storage_...` tetap tersedia hanya untuk kompatibilitas link lama.
 
 Rollout perubahan ini: publish image gateway, deploy gateway (backend dan
 Telegram), lalu deploy web static. Worker lokal/remote dan base Go/TDL tidak

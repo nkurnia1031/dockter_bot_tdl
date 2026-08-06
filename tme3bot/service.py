@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -263,7 +264,15 @@ class BatchDownloadService:
                     self.progress_tracker.set_phase("warmup")
                     self._warmup_if_needed(export_json, download_dir)
                     self.progress_tracker.set_phase("downloading")
-                    self.tdl_client.download(export_json, download_dir)
+                    try:
+                        self.tdl_client.download(export_json, download_dir)
+                    except TDLCommandError as exc:
+                        if not self._is_chat_id_invalid(exc):
+                            raise
+                        self.progress_tracker.set_phase("warmup")
+                        self._force_warmup(export_json, download_dir, exc)
+                        self.progress_tracker.set_phase("downloading")
+                        self.tdl_client.download(export_json, download_dir)
                 except TDLCommandError as exc:
                     failed_path = unique_path(
                         self.config.export_failed_dir / export_json.name
@@ -334,6 +343,46 @@ class BatchDownloadService:
         finally:
             shutil.rmtree(warmup_dir, ignore_errors=True)
         self.state_store.mark_warmup_done(chat_ref)
+
+    def _force_warmup(
+        self,
+        export_json: Path,
+        download_dir: Path,
+        failure: TDLCommandError,
+    ) -> None:
+        """Resolve a chat in the active download session, then allow one retry."""
+        metadata = self._read_export_metadata(export_json)
+        chat_ref = str(metadata.get("chat_ref") or "").strip()
+        if not chat_ref:
+            output = f"{failure.stdout}\n{failure.stderr}\n{failure}"
+            match = re.search(r"failed to get result from\s+(-?\d+)", output, re.I)
+            if match:
+                chat_ref = match.group(1)
+        warmup_url = str(metadata.get("warmup_url") or "").strip()
+        if not warmup_url and chat_ref:
+            media_ids = media_ids_in_export(export_json)
+            if media_ids:
+                warmup_url = build_telegram_message_url(chat_ref, min(media_ids))
+        if not warmup_url:
+            raise TDLCommandError(
+                failure.command,
+                failure.returncode,
+                failure.stdout,
+                "CHAT_ID_INVALID dan URL warm-up tidak dapat ditentukan dari export JSON.",
+            ) from failure
+
+        warmup_dir = download_dir / "__warmup"
+        try:
+            self.tdl_client.download_url(warmup_url, warmup_dir)
+        finally:
+            shutil.rmtree(warmup_dir, ignore_errors=True)
+        if chat_ref:
+            self.state_store.mark_warmup_done(chat_ref)
+
+    @staticmethod
+    def _is_chat_id_invalid(exc: TDLCommandError) -> bool:
+        output = f"{exc.stdout}\n{exc.stderr}\n{exc}".upper()
+        return "CHAT_ID_INVALID" in output
 
     @staticmethod
     def _read_export_metadata(export_json: Path) -> dict[str, Any]:

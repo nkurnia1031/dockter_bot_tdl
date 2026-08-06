@@ -87,6 +87,26 @@ class AppMenuTests(unittest.TestCase):
         self.assertIn("File dikirim: shared.bin", app.panel.updated[-1][1])
         self.assertIsNone(app.panel.updated[-1][2])
 
+    def test_storage_code_input_does_not_require_actor_exchange(self) -> None:
+        app = self.make_app()
+        update = fake_update("42.signature")
+        app.pending[(10, 99)] = SimpleNamespace(action="storage_redeem")
+
+        app.handle_text(update, None)
+
+        self.assertEqual(app.client.deliveries, [("42.signature", 99)])
+        self.assertEqual(app.client.me_calls, [])
+        self.assertIn("File dikirim: shared.bin", app.panel.updated[-1][1])
+
+    def test_file_command_prompts_for_storage_code_without_actor(self) -> None:
+        app = self.make_app()
+        update = fake_update("/file")
+
+        app.storage_code_command(update, None)
+
+        self.assertEqual(app.pending[(10, 99)].action, "storage_redeem")
+        self.assertEqual(app.client.me_calls, [])
+
 
 if __name__ == "__main__":
     unittest.main()

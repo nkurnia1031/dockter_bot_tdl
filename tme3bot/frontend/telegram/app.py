@@ -105,6 +105,7 @@ class TelegramFrontendApp:
         )
         dispatcher.add_handler(CommandHandler("utility", self.utility_command))
         dispatcher.add_handler(CommandHandler("storage", self.storage_command))
+        dispatcher.add_handler(CommandHandler("file", self.storage_code_command))
         dispatcher.add_handler(CommandHandler("backup", self.backup_command))
         dispatcher.add_handler(CommandHandler("worker", self.worker_command))
         dispatcher.add_handler(CommandHandler("profile", self.profile_command))
@@ -132,6 +133,7 @@ class TelegramFrontendApp:
             BotCommand("check_profil", "Cek identity"),
             BotCommand("utility", "Utility workspace"),
             BotCommand("storage", "Storage channel"),
+            BotCommand("file", "Panggil file dengan kode"),
             BotCommand("backup", "Backup runtime"),
             BotCommand("worker", "Pilih worker"),
             BotCommand("download", "Download JSON pending"),
@@ -255,6 +257,19 @@ class TelegramFrontendApp:
                 "Pilih menu storage channel.",
                 storage_menu_markup(),
             )
+
+    def storage_code_command(self, update: Update, context: CallbackContext) -> None:
+        """Accept a signed file code without requiring an application actor."""
+        del context
+        message, user = update.effective_message, update.effective_user
+        if message is None or user is None:
+            return
+        self.pending[(message.chat_id, user.id)] = PendingInput("storage_redeem")
+        self.panel.update_from_message(
+            message,
+            "Kirim kode file Storage yang disalin dari Web UI.\n\nKetik batal untuk membatalkan.",
+            None,
+        )
 
     def backup_command(self, update: Update, context: CallbackContext) -> None:
         del context
@@ -392,10 +407,24 @@ class TelegramFrontendApp:
             self.pending.pop((message.chat_id, user.id), None)
             self.panel_command(update, None)
             return
+        key = (message.chat_id, user.id)
+        public_pending = self.pending.get(key)
+        if public_pending is not None and public_pending.action == "storage_redeem":
+            self.pending.pop(key, None)
+            value = message.text.strip()
+            if value.casefold() in {"batal", "cancel"}:
+                self.panel.update_from_message(
+                    message, "Pemanggilan file dibatalkan.", None
+                )
+                return
+            try:
+                self._redeem_storage_code(message, user.id, value)
+            except Exception as exc:
+                self._show_error(message, exc)
+            return
         actor = self._actor(update)
         if actor is None:
             return
-        key = (message.chat_id, user.id)
         pending = self.pending.pop(key, None)
         try:
             if pending is not None:
@@ -820,6 +849,13 @@ class TelegramFrontendApp:
     def _storage_callback(self, message, user_id: int, data: str) -> None:
         if data == "storage:menu":
             edit_menu_message(message, "Pilih menu storage.", storage_menu_markup())
+        elif data == "storage:redeem":
+            self.pending[(message.chat_id, user_id)] = PendingInput("storage_redeem")
+            edit_menu_message(
+                message,
+                "Kirim kode file Storage yang disalin dari Web UI.\n\nKetik batal untuk membatalkan.",
+                storage_menu_markup(),
+            )
         elif data == "storage:upload":
             folders = self.client.get(
                 user_id, "/api/v1/utility/folders"
@@ -892,6 +928,17 @@ class TelegramFrontendApp:
             item_id = int(data.rsplit(":", 1)[1])
             self.client.delete(user_id, f"/api/v1/storage/items/{item_id}")
             edit_menu_message(message, "File dipindahkan ke Trash.", storage_menu_markup())
+
+    def _redeem_storage_code(self, message, user_id: int, code: str) -> None:
+        normalized = code.strip()
+        if normalized.startswith("storage_"):
+            normalized = normalized[len("storage_") :]
+        result = self.client.deliver_storage_link(normalized, user_id)
+        self.panel.update_from_message(
+            message,
+            f"File dikirim: {result.get('display_name', 'storage')}",
+            None,
+        )
 
     def _show_storage_results(
         self, message, user_id: int, query: str, *, mine: bool = False

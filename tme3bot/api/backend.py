@@ -1247,6 +1247,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         _active_storage_item(context, item_id)
         token = sign_storage_item(item_id, context.config.auth_jwt_secret)
         return {
+            "code": token,
             "url": f"https://t.me/{context.config.bot_username}?start=storage_{token}"
         }
 

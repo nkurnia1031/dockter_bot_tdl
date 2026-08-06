@@ -7,7 +7,7 @@
   import JobTable from './JobTable.svelte';
   import {
     ArchiveRestore, ArrowUp, ChevronRight, CirclePlus, CloudUpload, Download,
-    ExternalLink, File, FileArchive, FileImage, FileText, Film, Folder,
+    Copy, File, FileArchive, FileImage, FileText, Film, Folder,
     FolderInput, FolderOpen, Grid2X2, HardDrive, Info, LayoutList, MoreVertical,
     Move, Pencil, RefreshCw, Search, Send, Trash2, X
   } from '@lucide/svelte';
@@ -150,9 +150,10 @@
     await post(`/storage/items/${item.id}/deliveries`, {method:'telegram'});
     message=`${item.display_name} dikirim ke Telegram.`;
   }
-  async function deepLink(item:Item) {
-    const result=await api<{url:string}>(`/storage/items/${item.id}/deep-link`);
-    window.open(result.url,'_blank','noopener,noreferrer');
+  async function copyFileCode(item:Item) {
+    const result=await api<{code:string}>(`/storage/items/${item.id}/deep-link`);
+    await navigator.clipboard.writeText(result.code);
+    message=`Kode ${item.display_name} disalin. Buka bot, pilih Panggil file dengan kode, lalu tempel kode tersebut.`;
   }
   function startUpload() { destinationId=folderId; uploadOpen=true; }
   function startMove() { destinationId=folderId; moveOpen=true; }
@@ -313,7 +314,7 @@
       <div class="flex items-center justify-between"><h2 class="text-xl font-black">Detail file</h2><button class="button ghost" onclick={() => detail=null}><X size={18}/></button></div>
       <div class="my-8 text-center"><DetailIcon class="mx-auto text-violet-500" size={68}/><h3 class="mt-4 break-words text-lg font-black">{detail.display_name}</h3><p class="muted mt-1 text-sm">{detail.original_name}</p></div>
       <dl class="grid grid-cols-[110px_1fr] gap-y-3 text-sm"><dt class="muted">Lokasi</dt><dd>{detail.folder||'My Drive'}</dd><dt class="muted">Ukuran</dt><dd>{formatBytes(detail.file_size)}</dd><dt class="muted">Keywords</dt><dd>{detail.keywords||'-'}</dd><dt class="muted">Uploader</dt><dd>{detail.owner_profile||'-'}</dd><dt class="muted">Upload</dt><dd>{formatDate(detail.uploaded_at)}</dd><dt class="muted">Caption</dt><dd>{detail.caption_sync_status||'synced'}</dd></dl>
-      <div class="mt-8 grid grid-cols-2 gap-2"><button class="button" onclick={() => deliver(detail!)}><Send size={15}/>Kirim Telegram</button><button class="button secondary" onclick={() => deepLink(detail!)}><ExternalLink size={15}/>Deep link</button><button class="button secondary" onclick={() => beginItemEdit(detail!)}><Pencil size={15}/>Rename / keyword</button><button class="button secondary" onclick={() => {selectedItems=[detail!.id];detail=null;startMove()}}><FolderInput size={15}/>Move</button><button class="button danger col-span-2" onclick={() => {selectedItems=[detail!.id];detail=null;confirmAction=isTrash?'purge':'trash'}}><Trash2 size={15}/>{isTrash?'Purge permanen':'Pindahkan ke Trash'}</button></div>
+      <div class="mt-8 grid grid-cols-2 gap-2"><button class="button" onclick={() => deliver(detail!)}><Send size={15}/>Kirim Telegram</button><button class="button secondary" onclick={() => copyFileCode(detail!)}><Copy size={15}/>Salin kode file</button><button class="button secondary" onclick={() => beginItemEdit(detail!)}><Pencil size={15}/>Rename / keyword</button><button class="button secondary" onclick={() => {selectedItems=[detail!.id];detail=null;startMove()}}><FolderInput size={15}/>Move</button><button class="button danger col-span-2" onclick={() => {selectedItems=[detail!.id];detail=null;confirmAction=isTrash?'purge':'trash'}}><Trash2 size={15}/>{isTrash?'Purge permanen':'Pindahkan ke Trash'}</button></div>
     </aside>
   </div>
 {/if}

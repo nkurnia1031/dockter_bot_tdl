@@ -34,13 +34,24 @@ class FakeExportTDLClient:
 
 
 class FakeDownloadTDLClient:
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, chat_invalid_once: bool = False) -> None:
         self.fail = fail
+        self.chat_invalid_once = chat_invalid_once
         self.download_calls: list[tuple[Path, Path]] = []
         self.download_url_calls: list[tuple[str, Path]] = []
 
     def download(self, export_path: Path, download_dir: Path) -> None:
         self.download_calls.append((export_path, download_dir))
+        if self.chat_invalid_once:
+            self.chat_invalid_once = False
+            from tme3bot.tdl import TDLCommandError
+
+            raise TDLCommandError(
+                ["tdl", "dl"],
+                1,
+                "",
+                "failed to get result from 7256426551: CHAT_ID_INVALID",
+            )
         if self.fail:
             from tme3bot.tdl import TDLCommandError
 
@@ -243,6 +254,30 @@ class ServiceTests(unittest.TestCase):
             )
             self.assertEqual(list(config.download_root.glob("**/__warmup")), [])
             self.assertTrue(store.get_source("@bot").warmup_done)
+
+    def test_download_chat_id_invalid_forces_warmup_then_retries_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            store.upsert_source("7256426551", "1langs", 9)
+            store.mark_warmup_done("7256426551")
+            config.export_pending_dir.mkdir(parents=True, exist_ok=True)
+            export_json = config.export_pending_dir / "batch.json"
+            export_json.write_text(
+                '{"messages":[{"id":9,"type":"document","file":"x"}],'
+                '"tme3bot":{"label":"1langs"}}',
+                encoding="utf-8",
+            )
+            client = FakeDownloadTDLClient(chat_invalid_once=True)
+
+            result = BatchDownloadService(config, store, client).download_pending_exports()
+
+            self.assertEqual(result.success_count, 1)
+            self.assertEqual(result.failed_count, 0)
+            self.assertEqual(len(client.download_calls), 2)
+            self.assertEqual(client.download_url_calls[0][0], "https://t.me/c/7256426551/9")
+            self.assertEqual(list(config.download_root.glob("**/__warmup")), [])
 
     def test_progress_tracker_maps_descending_tdl_message_id_to_forward_media_position(
         self,

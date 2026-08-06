@@ -162,6 +162,7 @@ def storage_menu_markup() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Upload", callback_data="storage:upload")],
             [InlineKeyboardButton("Cari file", callback_data="storage:search")],
+            [InlineKeyboardButton("Panggil file dengan kode", callback_data="storage:redeem")],
             [InlineKeyboardButton("Kelola file saya", callback_data="storage:mine")],
             [
                 InlineKeyboardButton(
