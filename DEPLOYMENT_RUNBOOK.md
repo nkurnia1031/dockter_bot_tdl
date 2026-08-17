@@ -10,7 +10,7 @@ tidak membutuhkan Node.js atau container web di VPS target.
 
 | Node | Service | Cara update |
 |---|---|---|
-| VPS builder besar | Build image gateway dan worker | `python3 run.py publish gateway` |
+| Mesin lokal dengan Docker | Build image gateway dan worker | `python3 run.py publish gateway` |
 | VPS gateway | `backend`, `telegram`, `worker-local` | `python3 run.py deploy gateway --pull` |
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
 | aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
@@ -226,17 +226,18 @@ worker, image registry, dan `build-info.json`.
 GitHub Actions `Publish static web` akan membuat/update release `web-latest`.
 Tunggu workflow selesai sebelum langkah deploy web.
 
-## B. Langkah di VPS builder besar
+## B. Langkah build lokal
 
-Langkah ini diperlukan karena perubahan menyentuh backend dan worker. Base
-Go/TDL tidak berubah, jadi jangan menjalankan `build-base`.
+Build sekarang dapat dilakukan langsung dari workspace lokal. Docker Desktop
+dengan Linux containers/WSL2 harus aktif. Base Go/TDL dibangun sekali di mesin
+lokal; setelah itu update biasa hanya membangun layer aplikasi.
 
 ```bash
-cd /www/wwwroot/downloads/bot
+cd D:\Laragon\www\dockter_bot_tdl
 git switch main
 git pull --ff-only origin main
 git rev-parse --short=12 HEAD
-docker image inspect tme3bot-base:py310-tdl0203 >/dev/null
+docker version
 ```
 
 Login GHCR bila image private. Jangan menambahkan token sebagai argumen setelah
@@ -252,11 +253,23 @@ printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
 unset GHCR_TOKEN
 ```
 
-Build layer aplikasi dan push image gateway serta worker:
+Build layer aplikasi dan push image gateway serta worker dari mesin lokal:
 
 ```bash
-python3 run.py publish gateway
+python run.py publish gateway
 ```
+
+Jika base image `tme3bot-base:py310-tdl0203` belum ada di Docker lokal, buat
+sekali dari workspace ini:
+
+```bash
+python run.py publish gateway --build-base
+```
+
+`publish` mencoba login registry memakai `GHCR_TOKEN` atau token release yang
+tersimpan di env, melalui stdin Docker sehingga token tidak masuk command/log.
+PAT yang dipakai push wajib memiliki permission `write:packages`. Gunakan
+`--no-login` jika Docker sudah login sebelumnya.
 
 Perintah ini tidak menjalankan service di builder. Karena compose gateway
 memuat target gateway dan worker-local, dua image berikut dipublish dengan Git

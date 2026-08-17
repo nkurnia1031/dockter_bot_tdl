@@ -54,6 +54,26 @@ class RunScriptTests(unittest.TestCase):
             check=True,
         )
 
+    def test_registry_login_passes_token_only_through_stdin(self) -> None:
+        with patch.object(run, "run_docker") as run_docker:
+            run.login_registry(
+                {
+                    "GATEWAY_IMAGE_NAME": "ghcr.io/nkurnia1031/tme3bot-gateway",
+                    "GHCR_USERNAME": "nkurnia1031",
+                    "GHCR_TOKEN": "secret-value",
+                }
+            )
+
+        run_docker.assert_called_once_with(
+            ["login", "ghcr.io", "--username", "nkurnia1031", "--password-stdin"],
+            {
+                "GATEWAY_IMAGE_NAME": "ghcr.io/nkurnia1031/tme3bot-gateway",
+                "GHCR_USERNAME": "nkurnia1031",
+                "GHCR_TOKEN": "secret-value",
+            },
+            stdin_text="secret-value",
+        )
+
     def test_run_compose_accepts_compose_file_from_dotenv(self) -> None:
         env = {"COMPOSE_FILE": "docker-compose.gateway.yml", "COMPOSE_CMD": "docker compose"}
         with patch.object(run.subprocess, "run") as subprocess_run:

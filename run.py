@@ -39,7 +39,7 @@ Commands:
   update        Rebuild with cache, reuse host tdl, recreate running container
   deploy [gateway|worker] [--pull]  Deploy; use --pull on low-memory targets
   deploy web [--rollback]           Install static UI release; no Node/Docker build
-  publish [gateway|worker]  Build on builder VPS and push images to registry
+  publish [gateway|worker] [--build-base]  Build locally and push images to registry
   cleanup       Remove dangling local Docker images left by rebuilds
   clean         Alias for cleanup
   restart       Restart the bot container
@@ -535,11 +535,20 @@ def capture_compose(args: list[str], dotenv: dict[str, str]) -> str:
     return completed.stdout
 
 
-def run_docker(args: list[str], dotenv: dict[str, str]) -> None:
+def run_docker(
+    args: list[str], dotenv: dict[str, str], *, stdin_text: str | None = None
+) -> None:
     docker_cmd = dotenv.get("DOCKER_CMD") or os.getenv("DOCKER_CMD", "docker")
     command = shlex.split(docker_cmd) + args
     print("$ " + shlex.join(command))
-    subprocess.run(command, cwd=PROJECT_DIR, env=compose_env(dotenv), check=True)
+    options: dict[str, object] = {
+        "cwd": PROJECT_DIR,
+        "env": compose_env(dotenv),
+        "check": True,
+    }
+    if stdin_text is not None:
+        options.update({"input": stdin_text, "text": True})
+    subprocess.run(command, **options)
 
 
 def deploy_application(
@@ -750,9 +759,14 @@ def hmac_compare(left: str, right: str) -> bool:
 
 
 def publish_application(env: dict[str, str], arguments: list[str]) -> None:
-    """Build on a capable builder and publish compose images to a registry."""
-    target_args = [item for item in arguments if item != "--pull"]
-    deploy_application(env, target_args, start_services=False)
+    """Build on this machine and publish compose images to a registry."""
+    build_base = "--build-base" in arguments
+    skip_login = "--no-login" in arguments
+    target_args = [
+        item
+        for item in arguments
+        if item not in {"--pull", "--build-base", "--no-login"}
+    ]
     target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
     publish_env = dict(env)
     publish_env["IMAGE_TAG"] = release_image_tag(publish_env)
@@ -760,9 +774,44 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
         publish_env["COMPOSE_FILE"] = "docker-compose.gateway.yml"
     elif target == "worker":
         publish_env["COMPOSE_FILE"] = "docker-compose.worker.yml"
+    if build_base:
+        build_base_image(publish_env)
+    deploy_application(publish_env, target_args, start_services=False)
+    if not skip_login:
+        login_registry(publish_env)
     run_compose(["push"], publish_env)
     print("Image berhasil dipublish. Target low-memory dapat memakai: python3 run.py deploy "
           f"{target or 'gateway'} --pull")
+
+
+def login_registry(env: dict[str, str]) -> None:
+    """Login to the image registry without exposing the PAT in process output."""
+    image = (env.get("GATEWAY_IMAGE_NAME") or env.get("WORKER_IMAGE_NAME") or "").strip()
+    registry = image.split("/", 1)[0] if "/" in image else ""
+    if not registry or "." not in registry:
+        print("Registry login dilewati: image memakai registry lokal/Docker Hub.")
+        return
+
+    token = (env.get("GHCR_TOKEN") or env.get("WEB_RELEASE_TOKEN") or "").strip()
+    if not token:
+        print(
+            f"Registry belum login otomatis. Jalankan `docker login {registry}` "
+            "atau isi GHCR_TOKEN di .env."
+        )
+        return
+
+    username = (env.get("GHCR_USERNAME") or "").strip()
+    if not username and "/" in image:
+        username = image.split("/", 2)[1].strip()
+    if not username:
+        raise RuntimeError("GHCR_USERNAME wajib diisi untuk login registry.")
+
+    print(f"Login registry {registry} sebagai {username} menggunakan token dari env.")
+    run_docker(
+        ["login", registry, "--username", username, "--password-stdin"],
+        env,
+        stdin_text=token,
+    )
 
 
 def release_image_tag(env: dict[str, str]) -> str:
