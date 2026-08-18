@@ -226,6 +226,87 @@ worker, image registry, dan `build-info.json`.
 GitHub Actions `Publish static web` akan membuat/update release `web-latest`.
 Tunggu workflow selesai sebelum langkah deploy web.
 
+## Autentikasi GitHub dan GHCR
+
+Ada tiga kebutuhan autentikasi yang berbeda. Jangan mencampurkan tokennya
+secara sembarangan:
+
+1. **GitHub repository** — untuk `git clone`, `git pull`, dan `git push`.
+2. **GHCR** — untuk `docker push` dari builder dan `docker pull` dari VPS.
+3. **GitHub Release UI** — untuk mengambil release static web private melalui
+   `python3 run.py deploy web`.
+
+### A. Login repository GitHub
+
+Cara yang disarankan untuk VPS adalah SSH deploy key, sehingga PAT tidak perlu
+disimpan di mesin:
+
+```bash
+ssh-keygen -t ed25519 -C "tme3bot-vps"
+cat ~/.ssh/id_ed25519.pub
+```
+
+Tambahkan public key tersebut di GitHub pada **Settings → SSH and GPG keys**
+atau sebagai deploy key repository, lalu verifikasi:
+
+```bash
+ssh -T git@github.com
+git remote set-url origin git@github.com:<owner>/<repository>.git
+git pull --ff-only origin main
+```
+
+Jika memakai HTTPS, gunakan username GitHub dan PAT sebagai password ketika
+Git meminta kredensial. Jangan menaruh PAT langsung di URL remote. Pada mesin
+yang mendukung GitHub CLI, alternatifnya:
+
+```bash
+gh auth login
+gh auth setup-git
+git pull --ff-only origin main
+```
+
+`run.py` tidak melakukan login GitHub Git otomatis. Git tetap menggunakan
+credential helper atau SSH key yang sudah dikonfigurasi di host.
+
+### B. Login GitHub Container Registry
+
+PAT untuk builder wajib memiliki akses package write. VPS target cukup
+memerlukan akses package read. Login melalui stdin agar token tidak muncul di
+history atau daftar proses:
+
+```bash
+export GHCR_USERNAME=<username-github>
+read -rsp "GHCR token: " GHCR_TOKEN
+echo
+printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
+  --username "$GHCR_USERNAME" \
+  --password-stdin
+unset GHCR_TOKEN
+```
+
+Atau isi sementara di `.env` yang hanya berada di host builder/target:
+
+```env
+GHCR_USERNAME=<username-github>
+GHCR_TOKEN=<PAT-dengan-akses-package-yang-sesuai>
+```
+
+Jangan commit `.env`. `python3 run.py publish` akan membaca `GHCR_TOKEN` dan
+menjalankan `docker login` melalui stdin. Token tidak ditampilkan ke log.
+
+### C. Token GitHub Release untuk static web
+
+Jika repository atau release UI bersifat private, isi token terpisah pada
+`.env` gateway:
+
+```env
+WEB_RELEASE_TOKEN=<PAT-dengan-Contents-Read>
+```
+
+Token ini hanya dipakai oleh `python3 run.py deploy web` untuk mengambil
+artefak release. Token tidak diperlukan oleh backend, Telegram frontend,
+worker, atau `.env.backend`.
+
 ## B. Langkah build lokal
 
 Build sekarang dapat dilakukan langsung dari workspace lokal. Docker Desktop
@@ -240,18 +321,9 @@ git rev-parse --short=12 HEAD
 docker version
 ```
 
-Login GHCR bila image private. Jangan menambahkan token sebagai argumen setelah
+Jika image private, lakukan login GHCR mengikuti bagian **Autentikasi GitHub
+dan GHCR** di atas. Jangan menambahkan token sebagai argumen setelah
 `ghcr.io`.
-
-```bash
-export GHCR_USERNAME=<username-github>
-read -rsp "GHCR token: " GHCR_TOKEN
-echo
-printf '%s' "$GHCR_TOKEN" | docker login ghcr.io \
-  --username "$GHCR_USERNAME" \
-  --password-stdin
-unset GHCR_TOKEN
-```
 
 Build layer aplikasi dan push image gateway serta worker dari mesin lokal:
 

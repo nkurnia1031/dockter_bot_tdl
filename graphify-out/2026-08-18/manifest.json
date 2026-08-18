@@ -15,8 +15,8 @@
     "semantic_hash": "82d82243ee7478677cac4bb4cec404c6"
   },
   "run.py": {
-    "mtime": 1787033147.7691588,
-    "ast_hash": "b8a25602e1b44208a941883b9dd53e63",
+    "mtime": 1787043807.0613866,
+    "ast_hash": "1be06f1cecc55c274b45c620184fe439",
     "semantic_hash": ""
   },
   "tests/test_app_menu.py": {
@@ -50,8 +50,8 @@
     "semantic_hash": ""
   },
   "tests/test_run.py": {
-    "mtime": 1787034386.9096088,
-    "ast_hash": "1b51340cff184c0470ca4df2f786076c",
+    "mtime": 1787043823.0675647,
+    "ast_hash": "0c36488e19e8b5d502367aecf1d9f8d4",
     "semantic_hash": ""
   },
   "tests/test_service.py": {
@@ -405,8 +405,8 @@
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
-    "mtime": 1787033788.7997115,
-    "ast_hash": "3047e5aab9f70f5fd0f120b068a72fa6",
+    "mtime": 1787043892.6250203,
+    "ast_hash": "33aefa781eceb100a8fdc4b697a2dc5c",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/__init__.py": {
