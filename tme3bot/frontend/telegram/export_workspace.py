@@ -82,6 +82,8 @@ def format_export_job(job: dict[str, Any]) -> str:
         )
     if job.get("queue_position") is not None:
         lines.append(f"Posisi antrean: {job['queue_position']}")
+    if progress.get("blocked_reason"):
+        lines.append(f"Menunggu: {short_text(progress['blocked_reason'], 140)}")
     if progress.get("message"):
         lines.append(f"Saat ini: {short_text(progress['message'], 160)}")
     batch = progress.get("batch")
@@ -157,6 +159,8 @@ class ExportWorkspaceState:
     active_job_id: str | None = None
     job_snapshot: dict[str, Any] | None = None
     source_page: int = 0
+    source_picker: bool = False
+    source_query: str = ""
     label_page: int = 0
     touched_at: float = field(default_factory=time.monotonic)
 
@@ -173,6 +177,8 @@ class ExportWorkspaceState:
         self.start_id = None
         self.overwrite_start_id = False
         self.source_page = 0
+        self.source_picker = False
+        self.source_query = ""
         self.clear_job_view()
         self.touch()
 
@@ -187,6 +193,8 @@ class ExportWorkspaceState:
         self.start_id = None
         self.overwrite_start_id = False
         self.source_page = 0
+        self.source_picker = False
+        self.source_query = ""
         self.clear_job_view()
         self.touch()
 

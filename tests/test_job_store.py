@@ -129,6 +129,25 @@ class JobStoreTests(unittest.TestCase):
             store.set_archived("job-1", True)
             self.assertTrue(store.purge("job-1"))
 
+    def test_telegram_notification_is_idempotent_and_terminal_stamp_is_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            store.create(self.make_job())
+            first = store.create_telegram_notification("job-1", 7, 7, "default")
+            duplicate = store.create_telegram_notification("job-1", 7, 7, "default")
+
+            self.assertEqual(first["id"], duplicate["id"])
+            store.update_telegram_notification(
+                first["id"],
+                {"status": "terminal", "terminal_notified_at": "2026-01-01T00:00:00+00:00"},
+            )
+            stable = store.update_telegram_notification(
+                first["id"],
+                {"terminal_notified_at": "2026-01-02T00:00:00+00:00"},
+            )
+            self.assertEqual(stable["terminal_notified_at"], "2026-01-01T00:00:00+00:00")
+            self.assertEqual(len(store.pending_telegram_notifications()), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

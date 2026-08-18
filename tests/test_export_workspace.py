@@ -125,6 +125,32 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertFalse(any(value in labels for value in ("Export lagi", "Detail job")))
         self.assertIn("Overwrite Start ID: OFF", labels)
 
+    def test_source_picker_is_compact_and_uses_stable_digest_callbacks(self):
+        state = ExportWorkspaceState(source_picker=True)
+        sources = [
+            {"chat_ref": f"channel-{index}", "label": f"label-{index}"}
+            for index in range(10)
+        ]
+        markup = export_workspace_markup(state, sources, [])
+        buttons = [button for row in markup.inline_keyboard for button in row]
+        source_buttons = [button for button in buttons if button.callback_data.startswith("ew:s:")]
+
+        self.assertEqual(len(source_buttons), 6)
+        self.assertTrue(all(len(button.callback_data.split(":")[-1]) == 12 for button in source_buttons))
+        self.assertIn("🔎 Cari source", [button.text for button in buttons])
+
+    def test_default_export_form_does_not_render_every_source_as_a_button(self):
+        state = ExportWorkspaceState()
+        markup = export_workspace_markup(
+            state,
+            [{"chat_ref": f"source-{index}", "label": f"label-{index}"} for index in range(20)],
+            [],
+        )
+        labels = [button.text for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("Pilih source tersimpan", labels)
+        self.assertFalse(any("source-1" in value for value in labels))
+
     def test_job_formatter_is_structured_and_omits_missing_fields(self):
         text = format_export_job(
             {

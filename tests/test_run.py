@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 from unittest.mock import call, patch
 
@@ -7,10 +8,53 @@ import run
 
 
 class RunScriptTests(unittest.TestCase):
+    def test_bootstrap_retries_over_debian_packages_without_uninstall(self) -> None:
+        with (
+            patch.object(run, "_python_requirements_ready", return_value=False),
+            patch.object(run, "_system_python_install_fallback_available", return_value=True),
+            patch.object(run, "_pip_supports_flag", return_value=True),
+            patch.object(
+                run.subprocess,
+                "run",
+                side_effect=[
+                    None,
+                    subprocess.CalledProcessError(1, ["pip", "install"]),
+                    None,
+                ],
+            ) as subprocess_run,
+        ):
+            run.bootstrap_python_dependencies({}, install=True)
+
+        fallback_command = subprocess_run.call_args_list[2].args[0]
+        self.assertIn("--ignore-installed", fallback_command)
+        self.assertIn("--break-system-packages", fallback_command)
+
     def test_release_image_tag_uses_immutable_git_revision_when_latest(self) -> None:
         with patch.object(run.subprocess, "check_output", return_value="abc123def456\n"):
             self.assertEqual(run.release_image_tag({"IMAGE_TAG": "latest"}), "abc123def456")
         self.assertEqual(run.release_image_tag({"IMAGE_TAG": "release-7"}), "release-7")
+
+    def test_preflight_image_names_have_safe_defaults_and_check_git_tag(self) -> None:
+        self.assertEqual(
+            run.image_names_for_release({}), ["tme3bot-gateway", "tme3bot-worker"]
+        )
+        with patch.object(run, "docker_image_exists", return_value=True) as inspect:
+            self.assertEqual(
+                run.image_release_status("ghcr.io/example/gateway", "abc123", {}),
+                "READY_LOCAL",
+            )
+        inspect.assert_called_once_with("ghcr.io/example/gateway:abc123", {})
+
+    def test_gateway_data_root_is_accepted_by_preflight_helpers(self) -> None:
+        self.assertEqual(run.data_root_value({"GATEWAY_DATA_ROOT": "/srv/gateway"}), "/srv/gateway")
+
+    def test_compose_falls_back_to_legacy_binary(self) -> None:
+        with (
+            patch.object(run, "_compose_available", return_value=False),
+            patch.object(run, "_legacy_compose_available", return_value=True),
+        ):
+            command = run.compose_base_command({"COMPOSE_FILE": "docker-compose.gateway.yml"})
+        self.assertEqual(command[:2], ["docker-compose", "-f"])
 
     def test_cleanup_prunes_only_dangling_images(self) -> None:
         env = {"DOCKER_CMD": "docker"}

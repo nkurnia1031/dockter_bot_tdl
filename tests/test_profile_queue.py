@@ -2,7 +2,7 @@ import threading
 import time
 import unittest
 
-from tme3bot.profile_queue import SerialPerKeyQueue
+from tme3bot.profile_queue import ResourceAwareQueue, SerialPerKeyQueue
 
 
 class SerialPerKeyQueueTests(unittest.TestCase):
@@ -60,6 +60,57 @@ class SerialPerKeyQueueTests(unittest.TestCase):
             self.assertTrue(second_started.wait(timeout=1))
         finally:
             release_first.set()
+
+
+class ResourceAwareQueueTests(unittest.TestCase):
+    def test_disjoint_resources_run_concurrently(self) -> None:
+        started = {name: threading.Event() for name in ("export", "download")}
+        release = threading.Event()
+
+        def handle(job: str, resources: set[str]) -> None:
+            self.assertTrue(resources)
+            started[job].set()
+            if not release.wait(timeout=3):
+                raise TimeoutError(job)
+
+        worker = ResourceAwareQueue[str](handle)
+        worker.start()
+        worker.enqueue({"profile:default:tdl:export"}, "export")
+        worker.enqueue({"profile:default:tdl:download"}, "download")
+        try:
+            self.assertTrue(started["export"].wait(timeout=1))
+            self.assertTrue(started["download"].wait(timeout=1))
+        finally:
+            release.set()
+            worker.stop()
+
+    def test_overlapping_resources_remain_serial(self) -> None:
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+
+        def handle(job: str, resources: set[str]) -> None:
+            del resources
+            if job == "first":
+                first_started.set()
+                if not release_first.wait(timeout=3):
+                    raise TimeoutError(job)
+            else:
+                second_started.set()
+
+        worker = ResourceAwareQueue[str](handle)
+        worker.start()
+        worker.enqueue({"profile:default:tdl:export"}, "first")
+        worker.enqueue({"profile:default:tdl:export"}, "second")
+        try:
+            self.assertTrue(first_started.wait(timeout=1))
+            time.sleep(0.05)
+            self.assertFalse(second_started.is_set())
+            release_first.set()
+            self.assertTrue(second_started.wait(timeout=1))
+        finally:
+            release_first.set()
+            worker.stop()
 
 
 if __name__ == "__main__":

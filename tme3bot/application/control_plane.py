@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import uuid
+import threading
+import time
 from dataclasses import asdict
 from typing import Any, Callable
 
 from tme3bot.application.ports import JobRepository, WorkerDispatcher
+from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 
 
@@ -38,6 +41,8 @@ class ControlPlane:
         self.storage_delivery = storage_delivery
         self.label_store = label_store
         self._event_observers: list[Callable[[JobEvent], None]] = []
+        self._scheduler_stop = threading.Event()
+        self._scheduler_thread: threading.Thread | None = None
 
     def actor(self, telegram_user_id: int) -> Actor:
         profile = self.profile_manager.profile_for_user(telegram_user_id)
@@ -70,6 +75,17 @@ class ControlPlane:
     ) -> Job:
         selected_profile = self.require_profile(actor, profile)
         selected_worker = worker or self.profile_manager.worker_route(selected_profile)
+        available_profiles = ()
+        list_profiles = getattr(self.profile_manager, "list_profiles", None)
+        if callable(list_profiles):
+            available_profiles = list_profiles()
+        execution = build_execution_plan(
+            kind,
+            selected_profile,
+            selected_worker,
+            payload,
+            available_profiles,
+        )
         job = Job(
             id=str(uuid.uuid4()),
             kind=kind,
@@ -80,28 +96,33 @@ class ControlPlane:
             payload=self._redacted_payload(kind, payload),
         )
         self.jobs.create(job)
-        dispatched = JobEvent(
-            job_id=job.id,
-            sequence=1,
-            status=JobStatus.DISPATCHED,
-            event_type="dispatched",
-            progress={"worker": selected_worker},
-        )
-        job = self.jobs.append_event(dispatched)[0]
         command = {
             "job_id": job.id,
             "kind": kind,
             "profile": selected_profile,
             "actor_user_id": actor.telegram_user_id,
+            "worker": selected_worker,
+            "execution": execution.as_dict(),
             "payload": payload,
         }
+        self.jobs.save_execution_plan(job.id, execution.as_dict(), payload)
+        admission = self.jobs.try_acquire_execution(job.id)
+        self.jobs.set_queue_info(
+            job.id, int(admission.get("position", 1)), admission.get("blocked_reason")
+        )
+        if not admission.get("admitted"):
+            return self.jobs.get(job.id) or job
         try:
-            self.dispatcher.dispatch(selected_worker, command)
+            self._dispatch_admitted_job(self.jobs.get(job.id) or job, command)
             return self.jobs.get(job.id) or job
         except Exception as exc:
+            self.jobs.release_execution(job.id)
+            sequence = max(
+                (event.sequence for event in self.jobs.events(job.id)), default=0
+            ) + 1
             failed = JobEvent(
                 job_id=job.id,
-                sequence=2,
+                sequence=sequence,
                 status=JobStatus.FAILED,
                 event_type="dispatch_failed",
                 error={"code": "WORKER_UNAVAILABLE", "message": str(exc)},
@@ -113,14 +134,123 @@ class ControlPlane:
                 status_code=503,
             ) from exc
 
+    def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
+        dispatched = JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.DISPATCHED,
+            event_type="dispatched",
+            progress={"worker": job.worker, "position": 1},
+        )
+        self.jobs.append_event(dispatched)
+        self.dispatcher.dispatch(job.worker, command)
+
+    def start_scheduler(self) -> None:
+        """Resume queued commands after backend restart or terminal events."""
+        if self._scheduler_thread is not None:
+            return
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            daemon=True,
+            name="backend-job-dispatcher",
+        )
+        self._scheduler_thread.start()
+
+    def stop_scheduler(self) -> None:
+        self._scheduler_stop.set()
+
+    def _scheduler_loop(self) -> None:
+        while not self._scheduler_stop.wait(2.0):
+            try:
+                self._dispatch_pending_jobs()
+            except Exception:
+                # A later tick retries; one unavailable worker must not stop
+                # admission for every other profile.
+                import logging
+
+                logging.getLogger(__name__).exception("Pending job dispatch failed")
+
+    def _dispatch_pending_jobs(self, profile: str | None = None) -> None:
+        list_profiles = getattr(self.profile_manager, "list_profiles", None)
+        profiles = [profile] if profile else (
+            list(list_profiles()) if callable(list_profiles) else []
+        )
+        if profile is None and not profiles:
+            profiles = sorted(
+                {
+                    item.profile
+                    for item in self.jobs.list(status=JobStatus.QUEUED.value, limit=200)
+                }
+            )
+        for selected in profiles:
+            for queued in self.jobs.list(
+                profile=selected,
+                status=JobStatus.QUEUED.value,
+                archived=False,
+                offset=0,
+                limit=200,
+            ):
+                admission = self.jobs.try_acquire_execution(queued.id)
+                self.jobs.set_queue_info(
+                    queued.id,
+                    int(admission.get("position", 1)),
+                    admission.get("blocked_reason"),
+                )
+                if not admission.get("admitted"):
+                    continue
+                command_payload = self.jobs.command_payload(queued.id)
+                if not isinstance(command_payload, dict):
+                    self.jobs.release_execution(queued.id)
+                    sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1
+                    self.jobs.append_event(
+                        JobEvent(
+                            job_id=queued.id,
+                            sequence=sequence,
+                            status=JobStatus.FAILED,
+                            event_type="dispatch_failed",
+                            error={
+                                "code": "LEGACY_COMMAND_UNAVAILABLE",
+                                "message": "Payload internal job lama tidak tersedia setelah migrasi scheduler.",
+                            },
+                        )
+                    )
+                    continue
+                command = {
+                    "job_id": queued.id,
+                    "kind": queued.kind,
+                    "profile": queued.profile,
+                    "worker": queued.worker,
+                    "actor_user_id": queued.actor_user_id,
+                    "execution": self.jobs.execution_plan(queued.id) or {},
+                    "payload": command_payload,
+                }
+                try:
+                    self._dispatch_admitted_job(queued, command)
+                except Exception as exc:
+                    self.jobs.release_execution(queued.id)
+                    sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1
+                    self.jobs.append_event(
+                        JobEvent(
+                            job_id=queued.id,
+                            sequence=sequence,
+                            status=JobStatus.FAILED,
+                            event_type="dispatch_failed",
+                            error={"code": "WORKER_UNAVAILABLE", "message": str(exc)},
+                        )
+                    )
+
     def append_worker_event(self, event: JobEvent) -> Job:
         job, inserted = self.jobs.append_event(event)
         # Side effects are idempotent and intentionally replayed when a worker
         # retries an already persisted event after a transient API failure.
         self._apply_event_side_effects(job, event)
         if inserted:
+            if event.status.terminal:
+                self.jobs.release_execution(job.id)
             for observer in tuple(self._event_observers):
                 observer(event)
+            if event.status.terminal:
+                self._dispatch_pending_jobs(job.profile)
         return job
 
     def update_worker_progress(self, event: JobEvent) -> Job:
@@ -157,7 +287,11 @@ class ControlPlane:
         interrupted = forced = 0
         for job in active:
             try:
-                signalled = bool(self.dispatcher.cancel(job.worker, job.id))
+                signalled = (
+                    False
+                    if job.status == JobStatus.QUEUED
+                    else bool(self.dispatcher.cancel(job.worker, job.id))
+                )
             except Exception:
                 signalled = False
             if signalled:
@@ -176,7 +310,10 @@ class ControlPlane:
                     },
                 )
             )
+            self.jobs.release_execution(job.id)
             forced += 1
+        if forced:
+            self._dispatch_pending_jobs(actor.profile)
         return {"total": len(active), "interrupted": interrupted, "force_cancelled": forced}
 
     def cancel_job(self, actor: Actor, job_id: str) -> Job:
@@ -186,6 +323,20 @@ class ControlPlane:
         self.require_profile(actor, job.profile)
         if job.status.terminal:
             return job
+        if job.status == JobStatus.QUEUED:
+            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+            self.jobs.append_event(
+                JobEvent(
+                    job_id=job.id,
+                    sequence=sequence,
+                    status=JobStatus.CANCELLED,
+                    event_type="cancelled_queued",
+                    error={"code": "JOB_TERMINATED", "message": "Job queued dibatalkan."},
+                )
+            )
+            self.jobs.release_execution(job.id)
+            self._dispatch_pending_jobs(job.profile)
+            return self.jobs.get(job.id) or job
         if not self.dispatcher.cancel(job.worker, job.id):
             raise DomainError(
                 "JOB_NOT_CANCELLABLE",

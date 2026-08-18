@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -46,6 +48,10 @@ from tme3bot.frontend.telegram.export_workspace import (
     format_export_status,
     short_text,
 )
+from tme3bot.frontend.telegram.job_notifications import (
+    JobNotificationRegistry,
+    format_job_status,
+)
 from tme3bot.frontend.client import BackendApiClient
 from tme3bot.infrastructure.http_client import JsonHttpError
 
@@ -75,11 +81,17 @@ class TelegramFrontendApp:
         self.utility_selected: dict[int, set[str]] = {}
         self.source_selected: dict[int, set[str]] = {}
         self.export_workspaces = ExportWorkspaceStore()
+        self.job_status_messages = JobNotificationRegistry()
         self._register()
 
     def start(self) -> None:
         self._set_commands()
         self.updater.start_polling(drop_pending_updates=True)
+        threading.Thread(
+            target=self._resume_job_notifications,
+            daemon=True,
+            name="telegram-job-notification-resume",
+        ).start()
         LOGGER.info("Telegram frontend polling started")
         self.updater.idle()
 
@@ -481,8 +493,38 @@ class TelegramFrontendApp:
                 main_menu_markup(actor["profile"]),
             )
             return
+        if data == "ew:source":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.source_picker = True
+            state.source_page = 0
+            state.source_query = ""
+            self._show_export_workspace(message, user_id, actor)
+            return
         if data in {"workspace:export", "ew:refresh"}:
             self._show_export_workspace(message, user_id, actor)
+            return
+        if data == "ew:source:close":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.source_picker = False
+            state.source_query = ""
+            state.source_page = 0
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data == "ew:source:recent":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.source_query = ""
+            state.source_page = 0
+            self._show_export_workspace(message, user_id, actor)
+            return
+        if data == "ew:source:search":
+            self.pending[(message.chat_id, user_id)] = PendingInput(
+                "export_source_search"
+            )
+            edit_menu_message(
+                message,
+                "Ketik nama, label, username, atau numeric ID source.",
+                export_input_cancel_markup(),
+            )
             return
         if data == "ew:new":
             self.pending[(message.chat_id, user_id)] = PendingInput(
@@ -496,10 +538,14 @@ class TelegramFrontendApp:
             return
         if data.startswith("ew:s:"):
             try:
-                index = int(data.split(":", 2)[2])
                 sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
-                source = sources[index]
-            except (ValueError, IndexError, KeyError):
+                digest = data.split(":", 2)[2]
+                source = next(
+                    item
+                    for item in sources
+                    if source_digest(str(item.get("chat_ref", ""))) == digest
+                )
+            except (StopIteration, ValueError, KeyError):
                 self._show_export_workspace(message, user_id, actor, "Source sudah berubah; pilih ulang.")
                 return
             state = self.export_workspaces.get(message.chat_id, user_id)
@@ -618,6 +664,14 @@ class TelegramFrontendApp:
         notice: str | None = None,
     ) -> tuple[str, Any]:
         sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
+        if getattr(state, "source_query", ""):
+            query = state.source_query
+            sources = [
+                item
+                for item in sources
+                if query in str(item.get("chat_ref", "")).lstrip("@").casefold()
+                or query in str(item.get("label", "")).casefold()
+            ]
         labels = self.client.get(user_id, "/api/v1/labels").get("items", [])
         source_map = {
             str(item.get("chat_ref", "")).lstrip("@").casefold(): item
@@ -676,14 +730,16 @@ class TelegramFrontendApp:
             self._show_export_workspace(message, user_id, actor)
             return
         state.set_job(job)
+        notification = self._register_job_notification(job, user_id, message.chat_id)
         text, markup = self._export_panel_content(user_id, actor, state)
         chat_id, _ = self.panel.update_from_message(message, text, markup)
         token = self.panel.begin_view(chat_id)
         status_message = self.panel.send_transient(
             chat_id, format_export_status(job)
         )
+        self._remember_notification_message(notification, status_message, job)
         if job.get("status") in TERMINAL_JOB_STATUSES:
-            self._expire_export_status(status_message, job)
+            self._expire_export_status(status_message, job, notification)
         else:
             self._poll_export_job(
                 chat_id,
@@ -692,10 +748,17 @@ class TelegramFrontendApp:
                 token,
                 actor,
                 status_message,
+                notification,
             )
 
     def _handle_export_input(self, message, user_id: int, pending: PendingInput, value: str) -> None:
         state = self.export_workspaces.get(message.chat_id, user_id)
+        if pending.action == "export_source_search":
+            state.source_picker = True
+            state.source_query = value.strip().casefold()
+            state.source_page = 0
+            self._show_export_workspace(message, user_id, self.client.me(user_id))
+            return
         if pending.action == "export_source_new":
             ref = value.strip()
             sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
@@ -732,6 +795,7 @@ class TelegramFrontendApp:
         panel_token: int,
         actor: dict[str, Any],
         status_message=None,
+        notification: dict[str, Any] | None = None,
     ) -> threading.Thread:
         def loop() -> None:
             last_panel_text = ""
@@ -746,6 +810,13 @@ class TelegramFrontendApp:
                             transient, status_text
                         ):
                             transient = None
+                            self._update_notification_state(
+                                notification,
+                                status="deleted",
+                                error="Pesan status sudah tidak tersedia.",
+                            )
+                        else:
+                            self._update_notification_state(notification, job=job)
                         last_status_text = status_text
 
                     panel_active = self.panel.is_view_active(chat_id, panel_token)
@@ -765,6 +836,9 @@ class TelegramFrontendApp:
                     if terminal:
                         time.sleep(3)
                         self.panel.delete_transient(transient)
+                        self._update_notification_state(
+                            notification, job=job, terminal=True
+                        )
                         return
                 except Exception as exc:
                     LOGGER.exception("Export workspace polling failed for %s", job_id)
@@ -791,15 +865,23 @@ class TelegramFrontendApp:
         thread.start()
         return thread
 
-    def _expire_export_status(self, status_message, job: dict[str, Any]) -> None:
+    def _expire_export_status(
+        self,
+        status_message,
+        job: dict[str, Any],
+        notification: dict[str, Any] | None = None,
+    ) -> None:
         if status_message is None:
+            self._update_notification_state(notification, job=job, terminal=True)
             return
 
         def expire() -> None:
             time.sleep(3)
             self.panel.delete_transient(status_message)
+            self._update_notification_state(notification, job=job, terminal=True)
 
         if not self.panel.update_transient(status_message, format_export_status(job)):
+            self._update_notification_state(notification, job=job, terminal=True)
             return
         threading.Thread(
             target=expire,
@@ -826,11 +908,7 @@ class TelegramFrontendApp:
             )
         elif action == "now":
             result = self.client.post(user_id, "/api/v1/backups")
-            edit_menu_message(
-                message,
-                f"Backup dimulai. Run ID: {result['run_id']}",
-                backup_menu_markup(),
-            )
+            self._show_job(message, user_id, result, backup_menu_markup())
         else:
             status = self.client.get(user_id, "/api/v1/backups/status")
             lines = [
@@ -1433,6 +1511,123 @@ class TelegramFrontendApp:
                 message, user_id, pending.data["source"], value
             )
 
+    def _register_job_notification(
+        self, job: dict[str, Any], user_id: int, chat_id: int
+    ) -> dict[str, Any] | None:
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            return None
+        try:
+            response = self.client.register_job_notification(job_id, user_id, chat_id)
+            notification = response.get("notification")
+            return notification if isinstance(notification, dict) else None
+        except Exception:
+            # A notification outage must never fail the actual job submission.
+            LOGGER.warning(
+                "Could not persist Telegram notification for %s",
+                job_id,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _job_status_hash(job: dict[str, Any]) -> str:
+        return hashlib.sha256(format_job_status(job).encode("utf-8")).hexdigest()
+
+    def _remember_notification_message(
+        self,
+        notification: dict[str, Any] | None,
+        message,
+        job: dict[str, Any],
+    ) -> None:
+        if not notification or message is None:
+            return
+        try:
+            self.client.update_job_notification(
+                int(notification["id"]),
+                {
+                    "message_id": int(message.message_id),
+                    "last_status_hash": self._job_status_hash(job),
+                },
+            )
+        except Exception:
+            LOGGER.warning(
+                "Could not persist Telegram notification message", exc_info=True
+            )
+
+    def _update_notification_state(
+        self,
+        notification: dict[str, Any] | None,
+        *,
+        status: str | None = None,
+        job: dict[str, Any] | None = None,
+        terminal: bool = False,
+        error: str | None = None,
+    ) -> None:
+        if not notification:
+            return
+        values: dict[str, Any] = {}
+        if status:
+            values["status"] = status
+        if job is not None:
+            values["last_status_hash"] = self._job_status_hash(job)
+        if terminal:
+            values["status"] = "terminal"
+            values["terminal_notified_at"] = datetime.now(timezone.utc).isoformat()
+        if error:
+            values["error"] = error[:500]
+        if not values:
+            return
+        try:
+            self.client.update_job_notification(int(notification["id"]), values)
+        except Exception:
+            LOGGER.warning("Could not update Telegram notification state", exc_info=True)
+
+    def _resume_job_notifications(self) -> None:
+        """Recover subscriptions after the Telegram container restarts."""
+        try:
+            items = self.client.pending_job_notifications().get("items", [])
+        except Exception:
+            LOGGER.warning("Could not resume Telegram job notifications", exc_info=True)
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            notification = item.get("notification")
+            job = item.get("job")
+            if not isinstance(notification, dict) or not isinstance(job, dict):
+                continue
+            chat_id = int(notification.get("telegram_chat_id") or 0)
+            user_id = int(notification.get("telegram_user_id") or 0)
+            job_id = str(job.get("id") or "")
+            if not chat_id or not user_id or not job_id:
+                continue
+            status_message = self.panel.send_transient(chat_id, format_job_status(job))
+            if status_message is None:
+                self._update_notification_state(
+                    notification,
+                    status="failed",
+                    error="Pesan status tidak dapat dikirim.",
+                )
+                continue
+            self.job_status_messages.set(job_id, status_message)
+            self._remember_notification_message(notification, status_message, job)
+            if job.get("status") in TERMINAL_JOB_STATUSES:
+                self._expire_job_status(
+                    job_id, status_message, job, notification=notification
+                )
+            else:
+                self._poll_job(
+                    chat_id,
+                    0,
+                    user_id,
+                    job_id,
+                    panel_token=None,
+                    status_message=status_message,
+                    notification=notification,
+                    update_panel=False,
+                )
+
     def _show_job(
         self, message, user_id: int, job: dict[str, Any], markup=None
     ) -> None:
@@ -1441,8 +1636,29 @@ class TelegramFrontendApp:
             message, self._job_text(job), markup
         )
         token = self.panel.begin_view(chat_id)
+        job_id = str(job.get("id", ""))
+        notification = self._register_job_notification(job, user_id, chat_id)
+        status_message = self.job_status_messages.get(job_id)
+        if status_message is None and job_id:
+            status_message = self.panel.send_transient(chat_id, format_job_status(job))
+            if status_message is not None:
+                self.job_status_messages.set(job_id, status_message)
+        self._remember_notification_message(notification, status_message, job)
         if job["status"] not in TERMINAL_JOB_STATUSES:
-            self._poll_job(chat_id, message_id, user_id, job["id"], token, markup)
+            self._poll_job(
+                chat_id,
+                message_id,
+                user_id,
+                job["id"],
+                token,
+                markup,
+                status_message=status_message,
+                notification=notification,
+            )
+        elif status_message is not None:
+            self._expire_job_status(
+                job_id, status_message, job, notification=notification
+            )
 
     def _poll_job(
         self,
@@ -1452,21 +1668,50 @@ class TelegramFrontendApp:
         job_id: str,
         panel_token: int | None = None,
         markup=None,
+        status_message=None,
+        notification: dict[str, Any] | None = None,
+        update_panel: bool = True,
     ) -> None:
         del message_id
         panel_token = panel_token or self.panel.begin_view(chat_id)
 
         def loop() -> None:
             last = ""
+            last_status = ""
+            transient = status_message
+            can_create_status = transient is None
             for _ in range(10800):
-                if not self.panel.is_view_active(chat_id, panel_token):
-                    return
                 try:
                     job = self.client.get(user_id, f"/api/v1/jobs/{job_id}")
+                    if (
+                        transient is None
+                        and can_create_status
+                        and job.get("status") not in TERMINAL_JOB_STATUSES
+                    ):
+                        transient = self.panel.send_transient(
+                            chat_id, format_job_status(job)
+                        )
+                        if transient is not None:
+                            self.job_status_messages.set(job_id, transient)
+                            can_create_status = False
+                    status_text = format_job_status(job)
+                    if transient is not None and status_text != last_status:
+                        if not self.panel.update_transient(transient, status_text):
+                            transient = None
+                            can_create_status = False
+                            self._update_notification_state(
+                                notification,
+                                status="deleted",
+                                error="Pesan status sudah tidak tersedia.",
+                            )
+                        else:
+                            self._update_notification_state(notification, job=job)
+                        last_status = status_text
                     text = self._job_text(job)
-                    if text != last:
-                        if not self.panel.is_view_active(chat_id, panel_token):
-                            return
+                    panel_active = update_panel and self.panel.is_view_active(
+                        chat_id, panel_token
+                    )
+                    if panel_active and text != last:
                         self.panel.update(
                             chat_id,
                             text,
@@ -1474,6 +1719,14 @@ class TelegramFrontendApp:
                         )
                         last = text
                     if job["status"] in TERMINAL_JOB_STATUSES:
+                        time.sleep(3)
+                        self._expire_job_status(
+                            job_id,
+                            transient,
+                            job,
+                            notification=notification,
+                            delay=0,
+                        )
                         return
                 except Exception:
                     LOGGER.exception("Job polling failed for %s", job_id)
@@ -1483,6 +1736,33 @@ class TelegramFrontendApp:
             target=loop,
             daemon=True,
             name=f"telegram-job-poll-{job_id[:8]}",
+        ).start()
+
+    def _expire_job_status(
+        self,
+        job_id: str,
+        status_message,
+        job: dict[str, Any],
+        *,
+        delay: float = 3,
+        notification: dict[str, Any] | None = None,
+    ) -> None:
+        if status_message is None:
+            self._update_notification_state(notification, job=job, terminal=True)
+            return
+
+        def expire() -> None:
+            if delay:
+                time.sleep(delay)
+            self.panel.update_transient(status_message, format_job_status(job))
+            self.panel.delete_transient(status_message)
+            self.job_status_messages.pop(job_id)
+            self._update_notification_state(notification, job=job, terminal=True)
+
+        threading.Thread(
+            target=expire,
+            daemon=True,
+            name=f"telegram-job-status-expire-{job_id[:8] or 'job'}",
         ).start()
 
     @staticmethod

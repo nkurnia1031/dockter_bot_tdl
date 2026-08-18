@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from tme3bot.domain.models import Job, JobEvent, JobStatus
 
@@ -84,6 +85,46 @@ class SqliteJobRepository:
                     PRIMARY KEY(job_id, sequence),
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS job_execution_plans (
+                    job_id TEXT PRIMARY KEY,
+                    concurrency_keys TEXT NOT NULL,
+                    queue_group TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    lane TEXT NOT NULL,
+                    admitted_at TEXT,
+                    released_at TEXT,
+                    blocked_reason TEXT,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS job_resource_leases (
+                    resource_key TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS job_commands (
+                    job_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS job_telegram_notifications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL,
+                    telegram_user_id INTEGER NOT NULL,
+                    telegram_chat_id INTEGER NOT NULL,
+                    profile TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    terminal_notified_at TEXT,
+                    message_id INTEGER,
+                    last_status_hash TEXT,
+                    error TEXT,
+                    UNIQUE(job_id, telegram_chat_id),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS job_telegram_notifications_pending
+                    ON job_telegram_notifications(status, terminal_notified_at);
                 """
             )
             columns = {
@@ -128,6 +169,234 @@ class SqliteJobRepository:
         with self._db() as db:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._job(row)
+
+    def save_execution_plan(
+        self, job_id: str, plan: dict[str, Any], command_payload: dict[str, Any]
+    ) -> None:
+        with self._db() as db:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO job_execution_plans(
+                    job_id, concurrency_keys, queue_group, priority, lane,
+                    admitted_at, released_at, blocked_reason
+                ) VALUES(?, ?, ?, ?, ?, NULL, NULL, NULL)
+                """,
+                (
+                    job_id,
+                    _dump(plan.get("resource_keys", [])),
+                    str(plan.get("queue_group", "")),
+                    int(plan.get("priority", 100)),
+                    str(plan.get("lane", "unknown")),
+                ),
+            )
+            # This is an internal gateway table. It is never returned through
+            # JobResponse; the public jobs.payload remains redacted.
+            db.execute(
+                "INSERT OR REPLACE INTO job_commands(job_id, payload) VALUES(?, ?)",
+                (job_id, _dump(command_payload)),
+            )
+
+    def execution_plan(self, job_id: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM job_execution_plans WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "resource_keys": _load(row["concurrency_keys"], []),
+            "queue_group": str(row["queue_group"]),
+            "priority": int(row["priority"]),
+            "lane": str(row["lane"]),
+            "blocked_reason": row["blocked_reason"],
+        }
+
+    def command_payload(self, job_id: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT payload FROM job_commands WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return _load(row["payload"], None) if row is not None else None
+
+    def create_telegram_notification(
+        self,
+        job_id: str,
+        telegram_user_id: int,
+        telegram_chat_id: int,
+        profile: str,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            row = db.execute(
+                """
+                SELECT * FROM job_telegram_notifications
+                WHERE job_id = ? AND telegram_chat_id = ?
+                """,
+                (job_id, int(telegram_chat_id)),
+            ).fetchone()
+            if row is None:
+                db.execute(
+                    """
+                    INSERT INTO job_telegram_notifications(
+                        job_id, telegram_user_id, telegram_chat_id, profile,
+                        status, created_at
+                    ) VALUES(?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        job_id,
+                        int(telegram_user_id),
+                        int(telegram_chat_id),
+                        profile,
+                        now,
+                    ),
+                )
+                row = db.execute(
+                    "SELECT * FROM job_telegram_notifications WHERE id = last_insert_rowid()"
+                ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def telegram_notification(self, notification_id: int) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM job_telegram_notifications WHERE id = ?",
+                (int(notification_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def pending_telegram_notifications(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._db() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM job_telegram_notifications
+                WHERE status = 'pending' AND terminal_notified_at IS NULL
+                ORDER BY created_at, id
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 500)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def update_telegram_notification(
+        self, notification_id: int, values: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        allowed = {
+            "status",
+            "terminal_notified_at",
+            "message_id",
+            "last_status_hash",
+            "error",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return self.telegram_notification(notification_id)
+        current = self.telegram_notification(notification_id)
+        if current is None:
+            return None
+        if current.get("terminal_notified_at") and updates.get("terminal_notified_at"):
+            updates.pop("terminal_notified_at", None)
+            if not updates:
+                return current
+        if "error" in updates and not isinstance(updates["error"], str):
+            updates["error"] = _dump(updates["error"])
+        assignments = ", ".join(f"{key} = ?" for key in updates)
+        with self._db() as db:
+            db.execute(
+                f"UPDATE job_telegram_notifications SET {assignments} WHERE id = ?",
+                (*updates.values(), int(notification_id)),
+            )
+        return self.telegram_notification(notification_id)
+
+    def try_acquire_execution(self, job_id: str) -> dict[str, Any]:
+        """Acquire all keys or return a deterministic queue position."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                DELETE FROM job_resource_leases
+                WHERE job_id IN (
+                    SELECT id FROM jobs WHERE status IN ('succeeded', 'failed', 'cancelled')
+                )
+                """
+            )
+            plan_row = db.execute(
+                "SELECT * FROM job_execution_plans WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            if plan_row is None:
+                return {"admitted": True, "position": 1, "blocked_reason": None}
+            keys = set(_load(plan_row["concurrency_keys"], []))
+            if not keys:
+                return {"admitted": True, "position": 1, "blocked_reason": None}
+            placeholders = ",".join("?" for _ in keys)
+            conflicts = db.execute(
+                f"SELECT resource_key, job_id FROM job_resource_leases WHERE resource_key IN ({placeholders})",
+                tuple(keys),
+            ).fetchall()
+            conflicts = [item for item in conflicts if str(item["job_id"]) != job_id]
+            if conflicts:
+                queued_rows = db.execute(
+                    """
+                    SELECT p.job_id, p.concurrency_keys
+                    FROM job_execution_plans p
+                    JOIN jobs j ON j.id = p.job_id
+                    WHERE j.status = 'queued' AND j.created_at <= (
+                        SELECT created_at FROM jobs WHERE id = ?
+                    )
+                    ORDER BY j.created_at, p.priority, p.job_id
+                    """,
+                    (job_id,),
+                ).fetchall()
+                position = 1
+                for queued in queued_rows:
+                    if set(_load(queued["concurrency_keys"], [])) & keys:
+                        if str(queued["job_id"]) == job_id:
+                            break
+                        position += 1
+                reason = f"Menunggu {str(conflicts[0]['resource_key'])}"
+                db.execute(
+                    "UPDATE job_execution_plans SET blocked_reason = ? WHERE job_id = ?",
+                    (reason, job_id),
+                )
+                return {"admitted": False, "position": position, "blocked_reason": reason}
+            worker = db.execute(
+                "SELECT worker FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            for key in keys:
+                db.execute(
+                    "INSERT INTO job_resource_leases(resource_key, job_id, acquired_at, worker) VALUES(?, ?, ?, ?)",
+                    (key, job_id, now, str(worker["worker"] if worker else "")),
+                )
+            db.execute(
+                "UPDATE job_execution_plans SET admitted_at = ?, blocked_reason = NULL WHERE job_id = ?",
+                (now, job_id),
+            )
+            return {"admitted": True, "position": 1, "blocked_reason": None}
+
+    def release_execution(self, job_id: str) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            db.execute("DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,))
+            db.execute(
+                "UPDATE job_execution_plans SET released_at = ? WHERE job_id = ?",
+                (now, job_id),
+            )
+
+    def set_queue_info(self, job_id: str, position: int, reason: str | None) -> None:
+        with self._db() as db:
+            row = db.execute("SELECT progress FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                return
+            progress = _load(row["progress"], {})
+            progress["position"] = max(1, int(position))
+            if reason:
+                progress["blocked_reason"] = reason
+            else:
+                progress.pop("blocked_reason", None)
+            db.execute(
+                "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?",
+                (_dump(progress), datetime.now(timezone.utc).isoformat(), job_id),
+            )
 
     def list(
         self,

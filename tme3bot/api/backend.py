@@ -542,6 +542,70 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         job = _owned_job(context, actor, job_id)
         return job_dict(job)
 
+    @app.post(
+        "/internal/v1/jobs/{job_id}/telegram-notifications",
+        include_in_schema=False,
+        dependencies=[Depends(require_service)],
+    )
+    def create_telegram_notification(job_id: str, body: dict[str, Any]):
+        job = context.control_plane.jobs.get(job_id)
+        if job is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        user_id = int(body.get("telegram_user_id") or 0)
+        chat_id = int(body.get("telegram_chat_id") or 0)
+        if user_id <= 0 or chat_id != user_id or user_id != job.actor_user_id:
+            raise DomainError(
+                "TELEGRAM_NOTIFICATION_FORBIDDEN",
+                "Notifikasi hanya dapat didaftarkan oleh actor pembuat job pada private chat.",
+                status_code=403,
+            )
+        notification = context.control_plane.jobs.create_telegram_notification(
+            job.id, user_id, chat_id, job.profile
+        )
+        return {"notification": notification, "job": job_dict(job)}
+
+    @app.get(
+        "/internal/v1/telegram-notifications/pending",
+        include_in_schema=False,
+        dependencies=[Depends(require_service)],
+    )
+    def pending_telegram_notifications(limit: int = Query(100, ge=1, le=500)):
+        items = []
+        for notification in context.control_plane.jobs.pending_telegram_notifications(limit):
+            job = context.control_plane.jobs.get(str(notification["job_id"]))
+            if job is not None:
+                items.append({"notification": notification, "job": job_dict(job)})
+        return {"items": items}
+
+    @app.patch(
+        "/internal/v1/telegram-notifications/{notification_id}",
+        include_in_schema=False,
+        dependencies=[Depends(require_service)],
+    )
+    def update_telegram_notification(notification_id: int, body: dict[str, Any]):
+        if str(body.get("status") or "") not in {
+            "",
+            "pending",
+            "terminal",
+            "deleted",
+            "failed",
+        }:
+            raise DomainError(
+                "INVALID_NOTIFICATION_STATUS",
+                "Status notifikasi tidak valid.",
+                status_code=422,
+            )
+        notification = context.control_plane.jobs.update_telegram_notification(
+            notification_id, body
+        )
+        if notification is None:
+            raise DomainError(
+                "NOTIFICATION_NOT_FOUND",
+                "Subscription notifikasi tidak ditemukan.",
+                status_code=404,
+            )
+        return {"notification": notification}
+
     @app.get("/api/v1/jobs/{job_id}/events", response_model=JobEventListResponse)
     def get_job_events(
         job_id: str,

@@ -22,6 +22,20 @@ class JobRepository(Protocol):
 
     def has_active(self, profile: str) -> bool: ...
 
+    def create_telegram_notification(
+        self,
+        job_id: str,
+        telegram_user_id: int,
+        telegram_chat_id: int,
+        profile: str,
+    ) -> dict[str, Any]: ...
+
+    def pending_telegram_notifications(self, limit: int = 100) -> list[dict[str, Any]]: ...
+
+    def update_telegram_notification(
+        self, notification_id: int, values: dict[str, Any]
+    ) -> dict[str, Any] | None: ...
+
 
 class WorkerDispatcher(Protocol):
     def dispatch(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]: ...

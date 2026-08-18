@@ -418,6 +418,52 @@ class BackendApiTests(unittest.TestCase):
         ).json()["items"]
         self.assertNotIn("progress.snapshot", [event["event_type"] for event in events])
 
+    def test_telegram_job_notification_is_service_authenticated_and_idempotent(self):
+        headers = self.login()
+        created = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/1/2", "use_url_message_id": True},
+        )
+        self.assertEqual(created.status_code, 200)
+        job_id = created.json()["id"]
+        service_headers = {"Authorization": "Bearer frontend"}
+        first = self.client.post(
+            f"/internal/v1/jobs/{job_id}/telegram-notifications",
+            headers=service_headers,
+            json={"telegram_user_id": 42, "telegram_chat_id": 42},
+        )
+        duplicate = self.client.post(
+            f"/internal/v1/jobs/{job_id}/telegram-notifications",
+            headers=service_headers,
+            json={"telegram_user_id": 42, "telegram_chat_id": 42},
+        )
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(
+            first.json()["notification"]["id"], duplicate.json()["notification"]["id"]
+        )
+        pending = self.client.get(
+            "/internal/v1/telegram-notifications/pending",
+            headers=service_headers,
+        )
+        self.assertEqual(len(pending.json()["items"]), 1)
+        notification_id = first.json()["notification"]["id"]
+        updated = self.client.patch(
+            f"/internal/v1/telegram-notifications/{notification_id}",
+            headers=service_headers,
+            json={
+                "message_id": 999,
+                "status": "terminal",
+                "terminal_notified_at": "2026-01-01T00:00:00+00:00",
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        pending_again = self.client.get(
+            "/internal/v1/telegram-notifications/pending",
+            headers=service_headers,
+        )
+        self.assertEqual(pending_again.json()["items"], [])
+
     def test_error_envelope_is_stable(self):
         response = self.client.get("/api/v1/me")
         self.assertEqual(response.status_code, 401)

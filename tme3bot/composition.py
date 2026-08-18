@@ -83,6 +83,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         utility_settings=settings,
         label_store=labels,
     )
+    control_plane.start_scheduler()
     auth_repository = SqliteAuthRepository(config.storage_db_file)
     auth = BotAuthService(
         auth_repository,

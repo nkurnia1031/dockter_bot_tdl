@@ -15,8 +15,12 @@ import urllib.request
 from getpass import getpass
 from pathlib import Path
 
-from tme3bot.infrastructure.http_client import request_json
-from tme3bot.names import normalize_profile_name
+try:
+    from tme3bot.infrastructure.http_client import request_json
+    from tme3bot.names import normalize_profile_name
+except ModuleNotFoundError:  # First-run bootstrap before Python dependencies exist.
+    request_json = None  # type: ignore[assignment]
+    normalize_profile_name = None  # type: ignore[assignment]
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -25,6 +29,7 @@ LEGACY_ENV_FILE = PROJECT_DIR / "env"
 USAGE = """Usage: python3 run.py <command>
 
 Commands:
+  check         Check/install tools, Git state, base image, and published images
   up            Build if needed, start container in background, then show status
   start         Alias for up
   build         Build image only
@@ -39,7 +44,7 @@ Commands:
   update        Rebuild with cache, reuse host tdl, recreate running container
   deploy [gateway|worker] [--pull]  Deploy; use --pull on low-memory targets
   deploy web [--rollback]           Install static UI release; no Node/Docker build
-  publish [gateway|worker] [--build-base]  Build locally and push images to registry
+  publish [gateway|worker|--all] [--build-base]  Build locally and push images
   cleanup       Remove dangling local Docker images left by rebuilds
   clean         Alias for cleanup
   restart       Restart the bot container
@@ -66,13 +71,18 @@ Notes:
 
 
 def main() -> int:
-    action = sys.argv[1] if len(sys.argv) > 1 else "up"
+    action = sys.argv[1] if len(sys.argv) > 1 else "check"
     env = load_env_file()
 
     try:
         if action in {"help", "-h", "--help"}:
             print(USAGE)
             return 0
+        if action == "check":
+            bootstrap_python_dependencies(env, install="--no-install" not in sys.argv[2:])
+            preflight = preflight_report(env, install="--no-install" not in sys.argv[2:])
+            print_preflight_report(preflight)
+            return int(preflight.get("exit_code", 0))
         if action in {"up", "start"}:
             ensure_profile_root(env)
             ensure_base_image_available(env)
@@ -109,6 +119,9 @@ def main() -> int:
         if action == "deploy":
             if len(sys.argv) > 2 and sys.argv[2].strip().lower() == "web":
                 deploy_web(env, sys.argv[3:])
+                return 0
+            if len(sys.argv) == 2 or sys.argv[2].startswith("--"):
+                deploy_all(env, sys.argv[2:])
                 return 0
             deploy_application(env, sys.argv[2:])
             return 0
@@ -176,6 +189,382 @@ def main() -> int:
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+
+def bootstrap_python_dependencies(env: dict[str, str], *, install: bool) -> None:
+    """Install this CLI's Python dependencies when a VPS is truly new."""
+    global request_json, normalize_profile_name
+    if _python_requirements_ready():
+        return
+    requirements = PROJECT_DIR / "requirements.txt"
+    if not install:
+        raise RuntimeError(
+            f"Python dependency belum tersedia. Jalankan python -m pip install -r {requirements}."
+        )
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "--version"],
+            cwd=PROJECT_DIR,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        if not sys.platform.startswith("linux"):
+            raise RuntimeError("pip belum tersedia untuk memasang requirements Python.")
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"], check=True)
+    pip = [sys.executable, "-m", "pip", "install", "-r", str(requirements)]
+    print("$ " + shlex.join(pip))
+    try:
+        subprocess.run(pip, cwd=PROJECT_DIR, check=True)
+    except subprocess.CalledProcessError:
+        # Debian/Ubuntu may provide packages through dpkg. Those packages do
+        # not always contain a pip RECORD file, so pip cannot uninstall them
+        # when requirements pins a newer version (notably PyJWT). Retry only
+        # for the system interpreter and install over the distro package
+        # instead of removing files owned by apt.
+        if not _system_python_install_fallback_available():
+            raise
+        fallback = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--ignore-installed",
+        ]
+        if _pip_supports_flag("--break-system-packages"):
+            fallback.append("--break-system-packages")
+        fallback.extend(["-r", str(requirements)])
+        print(
+            "Instalasi pip normal gagal; menghindari uninstall paket Debian "
+            "dan mencoba instalasi system-safe: " + shlex.join(fallback)
+        )
+        subprocess.run(fallback, cwd=PROJECT_DIR, check=True)
+    from tme3bot.infrastructure.http_client import request_json as imported_request_json
+    from tme3bot.names import normalize_profile_name as imported_normalize_profile_name
+
+    request_json = imported_request_json
+    normalize_profile_name = imported_normalize_profile_name
+
+
+def _system_python_install_fallback_available() -> bool:
+    """Return whether it is safe to use the Debian-package fallback.
+
+    The fallback is deliberately limited to a Linux system interpreter. A
+    virtualenv already owns its site-packages and should keep normal pip
+    uninstall/upgrade semantics instead.
+    """
+
+    return sys.platform.startswith("linux") and sys.prefix == sys.base_prefix
+
+
+def _pip_supports_flag(flag: str) -> bool:
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--help"],
+            cwd=PROJECT_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return flag in (result.stdout or "") or flag in (result.stderr or "")
+
+
+def _python_requirements_ready() -> bool:
+    try:
+        import dotenv  # noqa: F401
+        import fastapi  # noqa: F401
+        import pydantic  # noqa: F401
+        import telegram  # noqa: F401
+        import jwt  # noqa: F401
+    except ImportError:
+        return False
+    return request_json is not None and normalize_profile_name is not None
+
+
+def _command_available(command: str) -> bool:
+    return shutil.which(command) is not None
+
+
+def _compose_available() -> bool:
+    docker = shutil.which("docker")
+    if not docker:
+        return False
+    try:
+        return subprocess.run(
+            [docker, "compose", "version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+    except OSError:
+        return False
+
+
+def _legacy_compose_available() -> bool:
+    return shutil.which("docker-compose") is not None
+
+
+def install_missing_tools(missing: list[str]) -> list[str]:
+    """Best-effort Linux bootstrap; return tools still unavailable."""
+    if not missing:
+        return []
+    if not sys.platform.startswith("linux"):
+        return missing
+    package_manager = shutil.which("apt-get")
+    if not package_manager:
+        return missing
+    packages = {
+        "git": "git",
+        "docker": "docker.io",
+        "docker compose": "docker-compose-plugin",
+        "curl": "curl",
+        "7z": "p7zip-full",
+        "tar": "tar",
+        "openssl": "openssl",
+    }
+    requested = [packages[item] for item in missing if item in packages]
+    if not requested:
+        return missing
+    prefix: list[str] = []
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        if not shutil.which("sudo"):
+            return missing
+        prefix = ["sudo"]
+    subprocess.run(prefix + [package_manager, "update"], check=True)
+    try:
+        subprocess.run(
+            prefix + [package_manager, "install", "-y", *requested], check=True
+        )
+    except subprocess.CalledProcessError:
+        # Some Oracle/Ubuntu images do not expose docker-compose-plugin in the
+        # enabled repositories. docker-compose is a compatible fallback for
+        # this CLI and lets the operator continue without manual guesswork.
+        if "docker-compose-plugin" not in requested:
+            raise
+        fallback = [item for item in requested if item != "docker-compose-plugin"]
+        fallback.append("docker-compose")
+        subprocess.run(
+            prefix + [package_manager, "install", "-y", *fallback], check=True
+        )
+    if shutil.which("systemctl") and shutil.which("docker"):
+        subprocess.run(
+            ["systemctl", "enable", "--now", "docker"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    return [
+        item
+        for item in missing
+        if not (
+            (_compose_available() or _legacy_compose_available())
+            if item == "docker compose"
+            else _command_available(item)
+        )
+    ]
+
+
+def preflight_report(env: dict[str, str], *, install: bool) -> dict[str, object]:
+    tools = ["git", "docker", "docker compose", "curl", "tar", "openssl"]
+    if env.get("REQUIRE_7Z_HOST", "false").strip().lower() in {"1", "true", "yes"}:
+        tools.append("7z")
+    missing = [
+        item
+        for item in tools
+        if not (
+            (_compose_available() or _legacy_compose_available())
+            if item == "docker compose"
+            else _command_available(item)
+        )
+    ]
+    if install and missing:
+        missing = install_missing_tools(missing)
+
+    report: dict[str, object] = {
+        "tools": {item: item not in missing for item in tools},
+        "missing_tools": missing,
+        "git_sha": git_revision(),
+        "remote_git_sha": git_remote_revision(),
+        "git_clean": git_worktree_clean(),
+        "base_image": None,
+        "images": {},
+        "exit_code": 0,
+    }
+    if missing:
+        report["exit_code"] = 10
+        return report
+
+    try:
+        require_env_file()
+        if not data_root_value(env):
+            raise RuntimeError(
+                "PROFILE_ROOT, GATEWAY_DATA_ROOT, atau LOCAL_WORKER_DATA_ROOT belum diisi."
+            )
+        report["env"] = "ok"
+    except RuntimeError as exc:
+        report["env"] = str(exc)
+        report["exit_code"] = 20
+
+    base = configured_base_image(env)
+    report["base_image"] = "READY_LOCAL" if docker_image_exists(base, env) else "MISSING"
+    names = image_names_for_release(env)
+    report["images"] = {
+        name: image_release_status(name, report["git_sha"], env) for name in names
+    }
+    return report
+
+
+def print_preflight_report(report: dict[str, object]) -> None:
+    print("Preflight tme3bot")
+    print(f"Git HEAD: {report.get('git_sha') or '-'}")
+    print(f"Git remote HEAD: {report.get('remote_git_sha') or 'tidak tersedia'}")
+    print(f"Worktree: {'bersih' if report.get('git_clean', True) else 'dirty'}")
+    print(f"Tools missing: {', '.join(report.get('missing_tools', [])) or 'none'}")
+    print(f"Environment: {report.get('env', 'not checked')}")
+    print(f"Base image: {report.get('base_image') or 'not checked'}")
+    images = report.get("images") or {}
+    if isinstance(images, dict):
+        for name, status in images.items():
+            print(f"Image {name}: {status}")
+    print(f"Exit code: {report.get('exit_code', 0)}")
+
+
+def git_revision() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=PROJECT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def git_worktree_clean() -> bool:
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=PROJECT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return True
+    return not output.strip()
+
+
+def git_remote_revision() -> str:
+    """Read origin HEAD when credentials/network are available.
+
+    A failed remote lookup is informational only; an immutable image tag is
+    still checked against the local checkout. This keeps deploy usable on an
+    offline VPS while exposing a useful stale-check when online.
+    """
+    try:
+        branch = subprocess.check_output(
+            ["git", "branch", "--show-current"],
+            cwd=PROJECT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip() or "main"
+        output = subprocess.check_output(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=PROJECT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+    return output.split()[0][:12] if output else ""
+
+
+def image_names_for_release(env: dict[str, str]) -> list[str]:
+    names = []
+    for key, default in (
+        ("GATEWAY_IMAGE_NAME", "tme3bot-gateway"),
+        ("WORKER_IMAGE_NAME", "tme3bot-worker"),
+    ):
+        value = (env.get(key) or default).strip()
+        if value and value not in names:
+            names.append(value)
+    if env.get("WEB_IMAGE_MODE", "").strip().lower() == "container":
+        value = env.get("WEB_IMAGE_NAME", "").strip()
+        if value and value not in names:
+            names.append(value)
+    return names
+
+
+def docker_manifest_exists(image: str, tag: str, env: dict[str, str]) -> bool:
+    docker_cmd = env.get("DOCKER_CMD") or os.getenv("DOCKER_CMD", "docker")
+    command = shlex.split(docker_cmd) + ["manifest", "inspect", f"{image}:{tag}"]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=PROJECT_DIR,
+            env=compose_env(env),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
+
+
+def image_release_status(image: str, revision: object, env: dict[str, str]) -> str:
+    tag = str(revision or "latest")
+    if docker_image_exists(f"{image}:{tag}", env):
+        return "READY_LOCAL"
+    if "." in image.split("/", 1)[0] and docker_manifest_exists(image, tag, env):
+        return "READY_REGISTRY"
+    return "MISSING"
+
+
+def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
+    if "--status" in arguments:
+        report = preflight_report(env, install=False)
+        print_preflight_report(report)
+        return
+    bootstrap_python_dependencies(env, install=True)
+    target = (env.get("DEPLOY_TARGET") or "gateway").strip().lower()
+    target_env = dict(env)
+    if target == "worker":
+        merge_env_file(target_env, target_env.get("WORKER_ENV_FILE", ".env.worker"))
+    report = preflight_report(target_env, install=True)
+    print_preflight_report(report)
+    if int(report.get("exit_code", 0)) != 0:
+        raise RuntimeError("Preflight gagal; selesaikan masalah di atas sebelum deploy.")
+    if target not in {"gateway", "worker"}:
+        raise RuntimeError("DEPLOY_TARGET harus gateway atau worker.")
+    image_status = report.get("images") or {}
+    required_names = (
+        list(image_status)
+        if target == "gateway"
+        else [str(target_env.get("WORKER_IMAGE_NAME") or "tme3bot-worker")]
+    )
+    required_statuses = [image_status.get(name, "MISSING") for name in required_names]
+    if any(value == "MISSING" for value in required_statuses):
+        revision = str(report.get("git_sha") or "unknown")
+        raise RuntimeError(
+            f"Image release {revision} belum dipublish. Jalankan di VPS builder: "
+            f"python3 run.py publish --all --build-base, lalu ulangi python3 run.py deploy."
+        )
+    registry_ready = any(value == "READY_REGISTRY" for value in required_statuses)
+    if registry_ready:
+        deploy_application(target_env, [target, "--pull"])
+    else:
+        ensure_profile_root(target_env)
+        compose_env_values = dict(target_env)
+        compose_env_values["COMPOSE_FILE"] = (
+            "docker-compose.gateway.yml" if target == "gateway" else "docker-compose.worker.yml"
+        )
+        run_compose(["up", "-d", "--remove-orphans"], compose_env_values)
+        run_compose(["ps"], compose_env_values)
 
 
 def require_env_file() -> None:
@@ -432,6 +821,9 @@ def map_data_path(profile_root: Path, container_path: str) -> Path | None:
 def compose_base_command(dotenv: dict[str, str] | None = None) -> list[str]:
     values = dotenv or {}
     compose_cmd = values.get("COMPOSE_CMD") or os.getenv("COMPOSE_CMD", "docker compose")
+    if compose_cmd.strip() == "docker compose" and not _compose_available():
+        if _legacy_compose_available():
+            compose_cmd = "docker-compose"
     command = shlex.split(compose_cmd)
     compose_file = values.get("COMPOSE_FILE") or os.getenv("COMPOSE_FILE", "")
     compose_file = compose_file.strip()
@@ -462,6 +854,7 @@ def shell_service(env: dict[str, str]) -> str:
 def data_root_value(env: dict[str, str]) -> str:
     return (
         env.get("PROFILE_ROOT", "").strip()
+        or env.get("GATEWAY_DATA_ROOT", "").strip()
         or env.get("LOCAL_WORKER_DATA_ROOT", "").strip()
     )
 
@@ -760,28 +1153,38 @@ def hmac_compare(left: str, right: str) -> bool:
 
 def publish_application(env: dict[str, str], arguments: list[str]) -> None:
     """Build on this machine and publish compose images to a registry."""
+    bootstrap_python_dependencies(env, install=True)
+    preflight = preflight_report(env, install=True)
+    if int(preflight.get("exit_code", 0)) != 0:
+        print_preflight_report(preflight)
+        raise RuntimeError("Preflight builder gagal; image belum dibangun atau dipublish.")
     build_base = "--build-base" in arguments
     skip_login = "--no-login" in arguments
+    publish_all = "--all" in arguments
     target_args = [
         item
         for item in arguments
-        if item not in {"--pull", "--build-base", "--no-login"}
+        if item not in {"--pull", "--build-base", "--no-login", "--all"}
     ]
     target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
+    targets = ["gateway", "worker"] if publish_all else [target or "gateway"]
+    if any(item not in {"gateway", "worker"} for item in targets):
+        raise RuntimeError("Target publish harus gateway, worker, atau --all.")
     publish_env = dict(env)
     publish_env["IMAGE_TAG"] = release_image_tag(publish_env)
-    if target == "gateway":
-        publish_env["COMPOSE_FILE"] = "docker-compose.gateway.yml"
-    elif target == "worker":
-        publish_env["COMPOSE_FILE"] = "docker-compose.worker.yml"
     if build_base:
         build_base_image(publish_env)
-    deploy_application(publish_env, target_args, start_services=False)
     if not skip_login:
         login_registry(publish_env)
-    run_compose(["push"], publish_env)
-    print("Image berhasil dipublish. Target low-memory dapat memakai: python3 run.py deploy "
-          f"{target or 'gateway'} --pull")
+    for item in targets:
+        target_env = dict(publish_env)
+        target_env["COMPOSE_FILE"] = (
+            "docker-compose.gateway.yml" if item == "gateway" else "docker-compose.worker.yml"
+        )
+        deploy_application(target_env, [item], start_services=False)
+        run_compose(["push"], target_env)
+        print(f"Image {item} berhasil dipublish dengan tag {target_env['IMAGE_TAG']}.")
+    print("Target low-memory dapat memakai: python3 run.py deploy --pull")
 
 
 def login_registry(env: dict[str, str]) -> None:

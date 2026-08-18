@@ -67,6 +67,8 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     @app.post("/internal/v1/jobs", dependencies=[Depends(authorize)])
     def submit_job(body: WorkerJobRequest):
         payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
+        if not payload.get("execution"):
+            payload.pop("execution", None)
         return {"position": context.executor.enqueue(payload), "job_id": body.job_id}
 
     @app.post(

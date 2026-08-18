@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from tme3bot.frontend.telegram.text import source_digest
+
 
 def export_workspace_markup(
     state,
@@ -11,6 +13,85 @@ def export_workspace_markup(
     labels: list[dict] | None = None,
 ) -> InlineKeyboardMarkup:
     """Single-message export form with inline field pickers."""
+    if bool(getattr(state, "source_picker", False)):
+        return _export_source_picker_markup(state, sources or [])
+    return _export_source_compact_markup(state, sources or [], labels or [])
+
+
+def _export_source_compact_markup(
+    state, sources: list[dict], labels: list[dict]
+) -> InlineKeyboardMarkup:
+    """Render the default form without flooding it with source buttons.
+
+    Source selection has its own paginated/searchable view.  Keeping the main
+    form compact makes the selected source, override switch, and submit action
+    visible at the same time on small Telegram screens.
+    """
+    source = getattr(state, "source", None) or {}
+    selected_ref = str(getattr(state, "chat_ref", "") or "")
+    if not source.get("label") and selected_ref:
+        selected_key = selected_ref.lstrip("@").casefold()
+        source = next(
+            (
+                item
+                for item in sources
+                if str(item.get("chat_ref", "")).lstrip("@").casefold() == selected_key
+            ),
+            source,
+        )
+    source_text = selected_ref or "Belum dipilih"
+    if source.get("label"):
+        source_text = f"{source.get('label')} - {source_text}"
+    if getattr(state, "source", None) is None and selected_ref:
+        source_text += " (source baru)"
+
+    overwrite = bool(getattr(state, "overwrite_start_id", False))
+    if overwrite:
+        start_text = (
+            f"Override: {getattr(state, 'start_id')}"
+            if getattr(state, "start_id", None) is not None
+            else "Manual: belum diisi"
+        )
+    else:
+        start_text = f"Otomatis: {getattr(state, 'default_start_id', 1)}"
+    label_text = getattr(state, "label", None) or "Kosong"
+
+    rows = [
+        [InlineKeyboardButton(f"Source: {source_text}"[:60], callback_data="ew:source")],
+        [InlineKeyboardButton("Pilih source tersimpan", callback_data="ew:source")],
+        [InlineKeyboardButton("+ Source baru", callback_data="ew:new")],
+        [InlineKeyboardButton(f"Overwrite Start ID: {'ON' if overwrite else 'OFF'}", callback_data="ew:overwrite")],
+        [
+            InlineKeyboardButton(f"Label: {label_text}"[:30], callback_data="ew:label"),
+            InlineKeyboardButton(f"Start ID: {start_text}"[:30], callback_data="ew:last"),
+        ],
+    ]
+
+    label_buttons = []
+    for index, item in enumerate((labels or [])[:6]):
+        value = str(item.get("label", "")).strip() if isinstance(item, dict) else ""
+        if value:
+            label_buttons.append(
+                InlineKeyboardButton(value[:18], callback_data=f"ew:l:{index}")
+            )
+    if label_buttons:
+        rows.append(label_buttons[:3])
+        if len(label_buttons) > 3:
+            rows.append(label_buttons[3:6])
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton("Label custom", callback_data="ew:label:custom"),
+                InlineKeyboardButton("Tanpa label", callback_data="ew:label:none"),
+            ],
+            [
+                InlineKeyboardButton("Kirim export", callback_data="ew:submit"),
+                InlineKeyboardButton("Refresh", callback_data="ew:refresh"),
+            ],
+            [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
     sources = sources or []
     labels = labels or []
     source_page = max(0, int(getattr(state, "source_page", 0)))
@@ -112,6 +193,50 @@ def export_workspace_markup(
                 InlineKeyboardButton("↻ Refresh", callback_data="ew:refresh"),
             ],
             [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def _export_source_picker_markup(state, sources: list[dict]) -> InlineKeyboardMarkup:
+    page = max(0, int(getattr(state, "source_page", 0)))
+    page_size = 6
+    start = page * page_size
+    selected = str(getattr(state, "chat_ref", "") or "").lstrip("@").casefold()
+    rows = [
+        [InlineKeyboardButton("Pilih source", callback_data="ew:source:close")],
+        [
+            InlineKeyboardButton("🔎 Cari source", callback_data="ew:source:search"),
+            InlineKeyboardButton("Terbaru", callback_data="ew:source:recent"),
+        ],
+    ]
+    for item in sources[start : start + page_size]:
+        ref = str(item.get("chat_ref", ""))
+        marker = "✓ " if ref.lstrip("@").casefold() == selected else ""
+        label = f"{marker}{item.get('label') + ' — ' if item.get('label') else ''}{ref}"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    label[:60], callback_data=f"ew:s:{source_digest(ref)}"
+                )
+            ]
+        )
+    if len(sources) > page_size:
+        navigation = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton("‹ Source", callback_data=f"ew:p:{page - 1}")
+            )
+        if start + page_size < len(sources):
+            navigation.append(
+                InlineKeyboardButton("Source ›", callback_data=f"ew:p:{page + 1}")
+            )
+        if navigation:
+            rows.append(navigation)
+    rows.extend(
+        [
+            [InlineKeyboardButton("＋ Source baru", callback_data="ew:new")],
+            [InlineKeyboardButton("Kembali ke export", callback_data="ew:source:close")],
         ]
     )
     return InlineKeyboardMarkup(rows)

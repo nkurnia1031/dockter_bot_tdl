@@ -14,7 +14,7 @@ from typing import Any
 from tme3bot.backup_service import BackupService, sha256_file
 from tme3bot.export_catalog import inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
-from tme3bot.profile_queue import SerialPerKeyQueue
+from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.utility import UtilityRunner
@@ -184,9 +184,9 @@ class WorkerJobExecutor:
         self._lock = threading.RLock()
         self._job_log = threading.local()
         self._log_snapshots: dict[str, JobLogSnapshot] = {}
-        self._jobs = SerialPerKeyQueue[str, dict[str, Any]](
+        self._jobs = ResourceAwareQueue[dict[str, Any]](
             self._run,
-            error_handler=self._unhandled,
+            error_handler=self._unhandled_resource,
             thread_name_prefix="tme3-domain-worker",
         )
 
@@ -214,12 +214,15 @@ class WorkerJobExecutor:
         job_id = str(command["job_id"])
         with self._lock:
             if job_id in self._known:
-                return self._jobs.queue_size(str(command["profile"]))
+                return self._jobs.queue_size()
             self._known.add(job_id)
+        execution = command.get("execution") or {}
+        resources = execution.get("resource_keys") or self._resource_keys_for_command(command)
         position = self._jobs.enqueue(
-            str(command["profile"]),
+            resources,
             command,
             priority=0 if command.get("payload", {}).get("priority") == "next" else 100,
+            job_id=job_id,
         )
         try:
             self.publisher.emit(
@@ -233,6 +236,12 @@ class WorkerJobExecutor:
         return position
 
     def cancel(self, job_id: str) -> bool:
+        if self._jobs.cancel_pending(job_id):
+            with self._lock:
+                self._known.discard(job_id)
+            # Returning false tells the backend to persist the terminal
+            # cancelled event for a command that never started.
+            return False
         with self._lock:
             active = self._active.get(job_id)
             utility_runner = self._utility_runners.get(job_id)
@@ -256,14 +265,62 @@ class WorkerJobExecutor:
         return cancelled
 
     def queue_size(self, profile: str) -> int:
-        return self._jobs.queue_size(profile)
+        del profile
+        return self._jobs.queue_size()
 
-    def _unhandled(self, profile: str, command: dict[str, Any], exc: Exception) -> None:
-        LOGGER.exception("Worker queue failed for profile %s", profile)
+    def _unhandled_resource(self, command: dict[str, Any], exc: Exception) -> None:
+        LOGGER.exception("Worker queue failed for job %s", command.get("job_id"))
         self._failed(command, exc)
 
-    def _run(self, command: dict[str, Any], profile_jobs) -> None:
-        del profile_jobs
+    def _resource_keys_for_command(self, command: dict[str, Any]) -> set[str]:
+        profile = str(command.get("profile") or "default")
+        kind = str(command.get("kind") or "unknown")
+        keys: set[str] = {f"profile:{profile}:kind:{kind}"}
+        if kind in {"export", "leave", "storage_upload"}:
+            keys.add(f"profile:{profile}:tdl:export")
+        elif kind in {"download", "download_clear_failed"}:
+            keys.add(f"profile:{profile}:tdl:download")
+        elif kind == "backup_node":
+            # Current backup snapshots all profiles and uploads through the
+            # export client. Keep this conservative until a dedicated lane is
+            # provisioned.
+            for name in self.profile_manager.list_profiles():
+                keys.add(f"profile:{name}:tdl:export")
+                keys.add(f"profile:{name}:tdl:download")
+        elif kind == "utility":
+            payload = command.get("payload") or {}
+            folders = payload.get("folders") or []
+            if folders:
+                keys = set()
+                for folder in folders:
+                    normalized = str(folder).replace("\\", "/").rstrip("/")
+                    parts = [part for part in normalized.split("/") if part]
+                    start = 2 if parts and parts[0].casefold() == "workspace" else 1
+                    if len(parts) < start:
+                        parts = ["workspace"]
+                        start = 1
+                    for index in range(start, len(parts) + 1):
+                        ancestor = "/" + "/".join(parts[:index])
+                        keys.add(
+                            f"profile:{profile}:worker:{command.get('worker', self.config.backup_node_name)}:workspace:{ancestor}"
+                        )
+            else:
+                keys.add(
+                    f"profile:{profile}:worker:{command.get('worker', self.config.backup_node_name)}:workspace"
+                )
+        elif kind.startswith("artifact_"):
+            payload = command.get("payload") or {}
+            artifact_ids = payload.get("artifact_ids") or payload.get("artifact_id") or []
+            if not isinstance(artifact_ids, (list, tuple, set)):
+                artifact_ids = [artifact_ids]
+            keys.update(
+                f"worker:{command.get('worker', self.config.backup_node_name)}:artifact:{item}"
+                for item in artifact_ids
+            )
+        return keys
+
+    def _run(self, command: dict[str, Any], resource_keys: set[str]) -> None:
+        del resource_keys
         job_id = str(command["job_id"])
         profile = str(command["profile"])
         kind = str(command["kind"])

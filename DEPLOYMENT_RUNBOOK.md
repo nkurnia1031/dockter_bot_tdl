@@ -510,3 +510,131 @@ memerlukan penghapusan atau downgrade database.
 - `WEB_RELEASE_TOKEN` hanya untuk repository private dan tidak boleh masuk Git.
 - Password Utility/Backup tidak boleh muncul dalam marker 7z, event progress,
   report, atau terminal log.
+
+## Bootstrap VPS baru dengan `run.py`
+
+Pada VPS baru, checkout repository lalu jalankan check terlebih dahulu:
+
+```bash
+git clone <repository-url> /opt/tme3bot
+cd /opt/tme3bot
+python3 run.py check
+```
+
+`run.py` memeriksa Python dependency, Git, Docker, Docker Compose, curl, tar,
+OpenSSL, env, base image, dan status image berdasarkan Git SHA. Jika dependency
+Python atau tool belum ada, mode default boleh memasangnya pada Linux berbasis
+apt. Compose v2 diprioritaskan dan `docker-compose` menjadi fallback.
+Pada Linux yang menggunakan `apt`, `python3 run.py deploy` dapat memasang tool
+yang belum tersedia. Jika installer tidak didukung, report akan memberikan
+command install yang aman untuk dicopy.
+
+Deploy target baru tidak langsung membangun base Go/TDL yang berat. Alurnya:
+
+```bash
+python3 run.py deploy
+```
+
+Script akan:
+
+1. Memeriksa tools dan memasang yang hilang jika memungkinkan.
+2. Membaca Git HEAD dan menolak worktree dirty kecuali `--allow-dirty`.
+3. Memeriksa base image lokal/registry.
+4. Memeriksa gateway/worker image dengan tag Git SHA dan digest registry.
+5. Pull image jika release SHA sudah dipublish.
+6. Berhenti dengan instruksi builder jika image belum dipublish atau base belum tersedia.
+7. Menjalankan Compose, healthcheck, dan menyimpan deployment state.
+
+`latest` bukan bukti bahwa release terbaru sedang digunakan. Untuk melihat
+status tanpa mengubah service:
+
+```bash
+python3 run.py deploy --status
+```
+
+`python3 run.py` tanpa argumen sama dengan `python3 run.py check`; command ini
+hanya melakukan preflight dan tidak mengubah service. Setelah report siap,
+jalankan `python3 run.py deploy`. Exit code preflight `10` berarti tool masih
+hilang dan `20` berarti env/data root belum siap. Image SHA yang belum ada akan
+ditolak oleh deploy dengan instruksi publish builder. Secret tidak pernah
+dicetak ke report.
+
+### PyJWT `RECORD file not found` pada Ubuntu/Debian
+
+Jika publish menampilkan error seperti:
+
+```text
+Cannot uninstall PyJWT ... RECORD file not found
+```
+
+versi PyJWT lama berasal dari paket `apt/dpkg`, bukan pip. Jangan menghapus
+paket Debian secara manual. Tarik perubahan terbaru lalu jalankan ulang command
+publish; `run.py` akan mencoba instalasi kedua dengan `--ignore-installed`
+dan `--break-system-packages`, sehingga pip memasang versi requirements tanpa
+mencoba meng-uninstall file milik Debian:
+
+```bash
+git pull --ff-only origin main
+python3 run.py publish --all --build-base
+```
+
+Fallback ini hanya dipakai pada Python sistem Linux. Jika VPS menggunakan
+virtualenv, gunakan interpreter virtualenv tersebut dan biarkan pip memakai
+prosedur normalnya.
+
+## Publish di VPS builder
+
+Build berat hanya dilakukan di VPS builder yang cukup kuat:
+
+```bash
+git pull --ff-only origin main
+python3 run.py check
+python3 run.py publish --all --build-base
+```
+
+Untuk update Python tanpa perubahan base, cukup:
+
+```bash
+python3 run.py publish --all
+```
+
+Publish memberi tag immutable berdasarkan Git SHA, memverifikasi seluruh
+manifest, lalu push gateway dan worker. Setelah itu setiap target cukup:
+
+```bash
+git pull --ff-only origin main
+python3 run.py deploy
+```
+
+Tidak ada `docker build` di VPS target jika image SHA sudah tersedia di
+registry.
+
+## Concurrency dan pesan status job
+
+Queue worker memakai resource lane. Export dan download pada profile yang sama
+dapat berjalan bersamaan karena memakai dua sesi `.tdl`; dua export atau dua
+download tetap serial. Leave berbagi lane export. Utility dengan path berbeda
+dapat paralel, sedangkan path yang overlap tetap serial.
+
+Storage upload dan backup tetap memakai lane export pada deployment yang belum
+memiliki sesi TDL storage/backup khusus. Jangan menghapus lock untuk memaksa
+paralel karena Bolt database `.tdl` tidak boleh dibuka bersamaan. Setelah lane
+khusus diprovision, lakukan rollout backend lalu semua worker sebelum
+mengaktifkan lane tersebut.
+
+Setiap job asynchronous yang dibuat dari Telegram membuat satu pesan status
+tanpa keyboard. Pesan yang sama diperbarui saat queued/running, menampilkan
+progress dan report terminal, lalu dihapus setelah sekitar tiga detik. Panel
+utama boleh berubah atau diganti tanpa menghentikan pesan status job. Pesan
+yang sudah dihapus user tidak dibuat ulang. Subscription status disimpan di
+SQLite backend; jika container Telegram restart, subscription yang belum
+terminal-notified dipulihkan dan diproses satu kali. Endpoint subscription
+internal memakai `FRONTEND_SERVICE_TOKEN` dan tidak masuk OpenAPI publik.
+
+## Source picker Export Fokus
+
+Telegram tidak memiliki native select pada inline keyboard. Export Fokus kini
+menampilkan picker ringkas dengan maksimal enam source per halaman, pagination,
+recent source, pencarian input, dan callback digest yang stabil. Source baru
+tetap memakai username/numeric ID. Memilih source baru mereset report panel
+dan overwrite Start ID, tetapi tidak membatalkan job lama.

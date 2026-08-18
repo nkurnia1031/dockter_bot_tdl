@@ -36,6 +36,39 @@ class BackendApiClient:
             {"telegram_user_id": int(telegram_user_id)},
         )
 
+    def register_job_notification(
+        self, job_id: str, telegram_user_id: int, telegram_chat_id: int
+    ) -> dict[str, Any]:
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "POST",
+            f"/internal/v1/jobs/{quote(job_id, safe='')}/telegram-notifications",
+            {
+                "telegram_user_id": int(telegram_user_id),
+                "telegram_chat_id": int(telegram_chat_id),
+            },
+        )
+
+    def pending_job_notifications(self, limit: int = 100) -> dict[str, Any]:
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "GET",
+            f"/internal/v1/telegram-notifications/pending?limit={int(limit)}",
+        )
+
+    def update_job_notification(
+        self, notification_id: int, values: dict[str, Any]
+    ) -> dict[str, Any]:
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "PATCH",
+            f"/internal/v1/telegram-notifications/{int(notification_id)}",
+            values,
+        )
+
     def me(self, telegram_user_id: int) -> dict[str, Any]:
         return self.get(telegram_user_id, "/api/v1/me")
 

@@ -305,6 +305,7 @@ class WorkerJobRequest(BaseModel):
     kind: str
     profile: str
     actor_user_id: int
+    execution: dict[str, Any] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
