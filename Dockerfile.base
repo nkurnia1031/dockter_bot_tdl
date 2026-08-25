@@ -1,4 +1,8 @@
-FROM --platform=$BUILDPLATFORM golang:1.25 AS leave-builder
+# BuildKit defines BUILDPLATFORM automatically, but Docker's legacy builder
+# leaves it empty. Keep a valid default so `docker build --platform ...` also
+# works on older Docker installations.
+ARG BUILDPLATFORM=linux/amd64
+FROM --platform=${BUILDPLATFORM} golang:1.25 AS leave-builder
 WORKDIR /src
 ARG TARGETARCH
 COPY leave-helper/go.mod /src/go.mod
@@ -74,4 +78,3 @@ RUN set -eu; \
     tdl-leave --help >/dev/null 2>&1 || true
 
 RUN mkdir -p /data/root /data/user1 /data/download /data/exports /data/tmp
-

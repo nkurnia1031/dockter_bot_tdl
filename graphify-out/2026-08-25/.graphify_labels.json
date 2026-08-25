@@ -11,7 +11,7 @@
   "9": "run.py",
   "10": "compress.sh",
   "11": "config.py",
-  "12": "Any",
+  "12": "TelegramFrontendApp",
   "13": "boltStorage",
   "14": "format_job_status",
   "15": "TDLCommandError",
@@ -23,7 +23,7 @@
   "21": "ExportService",
   "22": "WorkerJobExecutor",
   "23": "tme3bot-leave-helper",
-  "24": "TelegramFrontendApp",
+  "24": "Update",
   "25": "tme3bot Agent Context",
   "26": "extract.py",
   "27": "ResourceAwareQueue",
@@ -45,7 +45,7 @@
   "43": "StateStore",
   "44": "StorageMaintenanceService",
   "45": "RunScriptTests",
-  "46": "control_plane.py",
+  "46": "Actor",
   "47": "@lucide/svelte",
   "48": "test-setup.ts",
   "49": "DownloadProgressTracker",
@@ -79,5 +79,5 @@
   "81": "6. Source picker Export Fokus",
   "83": "3. Keputusan desain",
   "87": "service.py",
-  "89": "Actor"
+  "89": "ControlPlaneTests"
 }

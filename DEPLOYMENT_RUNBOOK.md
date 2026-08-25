@@ -168,6 +168,25 @@ Jalankan di VPS builder besar:
 python3 run.py build-base
 ```
 
+Pada Docker lama mungkin muncul peringatan:
+
+```text
+DEPRECATED: The legacy builder is deprecated
+```
+
+Peringatan tersebut tidak lagi menjadi blocker. `Dockerfile.base` memiliki
+default `BUILDPLATFORM=linux/amd64`, dan `run.py build-base` juga mengirimkan
+nilai platform secara eksplisit. Pastikan source sudah terbaru:
+
+```bash
+git pull --ff-only origin main
+python3 run.py build-base
+```
+
+Jika Docker menyediakan Buildx, Anda boleh memasangnya untuk menghilangkan
+peringatan legacy builder, tetapi tidak wajib untuk memperbaiki error platform
+kosong seperti `OSAndVersion specifier component ...`.
+
 Download `base-migrate.zip` ke project target, extract dari root project, lalu
 load image sebelum build:
 

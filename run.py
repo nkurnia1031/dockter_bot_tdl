@@ -1414,6 +1414,8 @@ def build_base_image(env: dict[str, str]) -> Path:
             "build",
             "--platform",
             platform,
+            "--build-arg",
+            f"BUILDPLATFORM={platform}",
             "-f",
             "Dockerfile.base",
             "-t",

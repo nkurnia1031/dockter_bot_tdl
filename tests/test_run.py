@@ -266,8 +266,17 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(output, project / "base-migrate.zip")
             self.assertEqual(run_docker.call_count, 2)
             self.assertEqual(
-                run_docker.call_args_list[0].args[0][:6],
-                ["build", "--platform", "linux/amd64", "-f", "Dockerfile.base", "-t"],
+                run_docker.call_args_list[0].args[0][:8],
+                [
+                    "build",
+                    "--platform",
+                    "linux/amd64",
+                    "--build-arg",
+                    "BUILDPLATFORM=linux/amd64",
+                    "-f",
+                    "Dockerfile.base",
+                    "-t",
+                ],
             )
             self.assertEqual(run_docker.call_args_list[1].args[0][:2], ["save", "-o"])
 
