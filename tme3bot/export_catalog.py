@@ -243,7 +243,7 @@ class ExportArtifactCatalog:
     def list(
         self,
         *,
-        profile: str,
+        profile: str | None = None,
         status: str | None = None,
         archived: bool | None = False,
         worker: str | None = None,
@@ -251,7 +251,10 @@ class ExportArtifactCatalog:
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        clauses, params = ["profile=?"], [profile]
+        clauses, params = [], []
+        if profile:
+            clauses.append("profile=?")
+            params.append(profile)
         if status:
             clauses.append("status=?")
             params.append(status)
@@ -362,10 +365,25 @@ class ExportArtifactCatalog:
             db.execute("DELETE FROM export_artifacts WHERE id=?", (artifact_id,))
         return True
 
-    def summary(self, profile: str) -> dict[str, int]:
+    def summary(self, profile: str | None = None, worker: str | None = None) -> dict[str, int]:
+        clauses, params = [], []
+        if profile:
+            clauses.append("profile=?")
+            params.append(profile)
+        if worker:
+            clauses.append("worker=?")
+            params.append(worker)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._db() as db:
             rows = db.execute(
                 """SELECT status, COUNT(*) AS total FROM export_artifacts
-                   WHERE profile=? GROUP BY status""", (profile,)
+                   """ + where + " GROUP BY status", params
             ).fetchall()
         return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def origins(self) -> list[tuple[str, str]]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT DISTINCT profile, worker FROM export_artifacts ORDER BY profile, worker"
+            ).fetchall()
+        return [(str(row["profile"]), str(row["worker"])) for row in rows]

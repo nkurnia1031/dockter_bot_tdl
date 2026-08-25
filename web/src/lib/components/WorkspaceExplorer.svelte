@@ -5,7 +5,7 @@
 
   type TreeItem = { name: string; path: string; kind: 'directory'|'file'; files?: number; directories?: number; has_children?: boolean };
   type TreeResponse = { path: string; items: TreeItem[] };
-  let { selected = $bindable([]), single = false }: { selected?: string[]; single?: boolean } = $props();
+  let { selected = $bindable([]), single = false, worker = '' }: { selected?: string[]; single?: boolean; worker?: string } = $props();
   let current = $state('/workspace');
   let items = $state<TreeItem[]>([]);
   let loading = $state(false);
@@ -18,7 +18,8 @@
     if (!path.startsWith('/workspace')) return;
     loading = true;
     try {
-      const result = await api<TreeResponse>(`/utility/tree?path=${encodeURIComponent(path)}`);
+      const workerQuery = worker ? `&worker=${encodeURIComponent(worker)}` : '';
+      const result = await api<TreeResponse>(`/utility/tree?path=${encodeURIComponent(path)}${workerQuery}`);
       current = result.path;
       items = Array.isArray(result.items) ? result.items : [];
       error = '';
@@ -42,7 +43,16 @@
     load('/' + crumbs.slice(0, index + 1).join('/'));
   }
 
-  onMount(() => load());
+  let lastWorker = '';
+  $effect(() => {
+    if (worker && worker !== lastWorker) {
+      lastWorker = worker;
+      current = '/workspace';
+      selected = [];
+      load('/workspace');
+    }
+  });
+  onMount(() => { if (!worker) load(); });
 </script>
 
 <div class="overflow-hidden rounded-2xl border border-[var(--line)] bg-[var(--panel-strong)]">

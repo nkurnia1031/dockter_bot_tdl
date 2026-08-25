@@ -79,6 +79,18 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(download.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
 
+    def test_same_kind_different_profiles_can_run_in_parallel(self):
+        first = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}, profile="default"
+        )
+        second = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/3"}, profile="archive"
+        )
+
+        self.assertEqual(first.status.value, "dispatched")
+        self.assertEqual(second.status.value, "dispatched")
+        self.assertEqual(len(self.dispatcher.commands), 2)
+
     def test_utility_sibling_paths_can_run_but_nested_path_waits(self):
         first = self.control.submit_job(
             self.actor, "utility", {"utility": "compress", "folders": ["/workspace/a"]}

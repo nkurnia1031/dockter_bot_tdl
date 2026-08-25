@@ -7,6 +7,7 @@ import logging
 import secrets
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response
@@ -24,6 +25,8 @@ from tme3bot.api.schemas import (
     ChallengeExchangeResponse,
     ChallengeResponse,
     ChallengeTokenRequest,
+    ContextVerifyRequest,
+    DownloadBatchRequest,
     DownloadRequest,
     ErrorResponse,
     ExportRequest,
@@ -345,6 +348,62 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if not context.config.management_api_token or token != context.config.management_api_token:
             raise DomainError("MANAGEMENT_UNAUTHORIZED", "Management token tidak valid.", status_code=401)
 
+    def verify_target(actor: Actor, purpose: str, profile: str | None, worker: str | None) -> dict[str, Any]:
+        purpose = str(purpose or "").strip().lower()
+        if purpose not in {"export", "utility", "storage"}:
+            raise DomainError("TARGET_PURPOSE_INVALID", "Purpose target tidak valid.", status_code=422)
+        selected_profile, selected_worker = context.control_plane.resolve_target(
+            actor, profile=profile if purpose == "export" else None, worker=worker
+        )
+        health = "healthy"
+        capabilities: dict[str, Any] = {}
+        checker = getattr(context.worker_dispatcher, "check_worker", None)
+        if callable(checker):
+            try:
+                capabilities = checker(selected_worker) or {}
+            except Exception as exc:
+                raise DomainError(
+                    "WORKER_OFFLINE",
+                    f"Worker {selected_worker} tidak dapat diverifikasi: {exc}",
+                    status_code=503,
+                ) from exc
+        if capabilities.get("healthy") is False:
+            raise DomainError(
+                "WORKER_OFFLINE",
+                f"Worker {selected_worker} tidak sehat.",
+                status_code=503,
+            )
+        health = "healthy" if capabilities.get("healthy", True) else "unknown"
+        available_profiles = capabilities.get("profiles")
+        if purpose == "export" and isinstance(available_profiles, list) and selected_profile not in available_profiles:
+            raise DomainError(
+                "PROFILE_SESSION_UNAVAILABLE",
+                f"Profile {selected_profile} belum tersedia pada worker {selected_worker}.",
+                status_code=409,
+            )
+        storage_profile = str(capabilities.get("storage_profile") or getattr(context.config, "worker_storage_profile", "storage"))
+        if purpose == "storage" and capabilities and not bool(capabilities.get("storage_profile_available")):
+            raise DomainError(
+                "STORAGE_PROFILE_UNAVAILABLE",
+                f"Sesi Storage {storage_profile} belum tersedia pada worker {selected_worker}.",
+                status_code=409,
+            )
+        if purpose == "utility" and capabilities and capabilities.get("workspace") is False:
+            raise DomainError("WORKSPACE_UNAVAILABLE", "Workspace worker tidak tersedia.", status_code=409)
+        return {
+            "verified": True,
+            "purpose": purpose,
+            "profile": selected_profile if purpose == "export" else None,
+            "worker": selected_worker,
+            "worker_health": health,
+            "storage_profile": storage_profile if purpose == "storage" else None,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @app.post("/api/v1/context/verify", response_model=ObjectResponse)
+    def verify_context(body: ContextVerifyRequest, actor=Depends(current_actor)):
+        return verify_target(actor, body.purpose, body.profile, body.worker)
+
     @app.get("/healthz", include_in_schema=False)
     def healthz():
         return {"ok": True, "role": "backend"}
@@ -510,13 +569,18 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         kind: str | None = None,
         status: str | None = None,
         worker: str | None = None,
+        profile: str | None = None,
+        scope: str = Query("current", pattern="^(current|global)$"),
         archived: bool | None = False,
         limit: int = Query(50, ge=1, le=200),
         offset: int = Query(0, ge=0),
         actor=Depends(current_actor),
     ):
+        selected_profile = None if scope == "global" else context.control_plane.require_profile(actor, profile)
+        if profile and scope == "global":
+            selected_profile = context.control_plane.require_profile(actor, profile)
         items = context.control_plane.jobs.list(
-            profile=actor.profile,
+            profile=selected_profile,
             kind=kind,
             status=status,
             worker=worker,
@@ -525,7 +589,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             limit=limit,
         )
         total = context.control_plane.jobs.count(
-            profile=actor.profile,
+            profile=selected_profile,
             kind=kind,
             status=status,
             worker=worker,
@@ -655,8 +719,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         return job_dict(context.control_plane.cancel_job(actor, job_id))
 
     @app.post("/api/v1/jobs/terminate-active", response_model=ObjectResponse)
-    def terminate_active_jobs(actor=Depends(current_actor)):
-        return context.control_plane.terminate_active_jobs(actor)
+    def terminate_active_jobs(
+        scope: str = Query("current", pattern="^(current|global)$"),
+        profile: str | None = None,
+        actor=Depends(current_actor),
+    ):
+        selected_profile = None if scope == "global" else profile
+        return context.control_plane.terminate_active_jobs(actor, profile=selected_profile)
 
     @app.post("/api/v1/jobs/{job_id}/archive", response_model=JobResponse)
     def archive_job(job_id: str, actor=Depends(current_actor)):
@@ -674,8 +743,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         return {"purged": context.control_plane.jobs.purge(job_id)}
 
     @app.get("/api/v1/sources", response_model=SourceListResponse)
-    def list_sources(actor=Depends(current_actor)):
-        store = context.profile_manager.runtime(actor.profile).state_store
+    def list_sources(profile: str | None = None, actor=Depends(current_actor)):
+        selected_profile = context.control_plane.require_profile(actor, profile)
+        store = context.profile_manager.runtime(selected_profile).state_store
         return {
             "items": [
                 {"chat_ref": chat_ref, **source.to_dict()}
@@ -684,22 +754,25 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         }
 
     @app.get("/api/v1/sources/{chat_ref:path}", response_model=SourceResponse)
-    def get_source(chat_ref: str, actor=Depends(current_actor)):
-        source = context.profile_manager.runtime(actor.profile).state_store.get_source(chat_ref)
+    def get_source(chat_ref: str, profile: str | None = None, actor=Depends(current_actor)):
+        selected_profile = context.control_plane.require_profile(actor, profile)
+        source = context.profile_manager.runtime(selected_profile).state_store.get_source(chat_ref)
         if source is None:
             raise DomainError("SOURCE_NOT_FOUND", "Source tidak ditemukan.", status_code=404)
         return {"chat_ref": chat_ref, **source.to_dict()}
 
     @app.delete("/api/v1/sources/{chat_ref:path}", response_model=ObjectResponse)
-    def delete_source(chat_ref: str, actor=Depends(current_actor)):
-        deleted = context.profile_manager.runtime(actor.profile).state_store.delete_source(chat_ref)
+    def delete_source(chat_ref: str, profile: str | None = None, actor=Depends(current_actor)):
+        selected_profile = context.control_plane.require_profile(actor, profile)
+        deleted = context.profile_manager.runtime(selected_profile).state_store.delete_source(chat_ref)
         return {"deleted": deleted}
 
     @app.patch("/api/v1/sources/{chat_ref:path}", response_model=SourceResponse)
     def update_source(
-        chat_ref: str, body: SourceUpdateRequest, actor=Depends(current_actor)
+        chat_ref: str, body: SourceUpdateRequest, profile: str | None = None, actor=Depends(current_actor)
     ):
-        store = context.profile_manager.runtime(actor.profile).state_store
+        selected_profile = context.control_plane.require_profile(actor, profile)
+        store = context.profile_manager.runtime(selected_profile).state_store
         source = store.get_source(chat_ref)
         if source is None:
             raise DomainError(
@@ -715,8 +788,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         return {"chat_ref": chat_ref, **updated.to_dict()}
 
     @app.post("/api/v1/sources/batch-delete", response_model=ObjectResponse)
-    def batch_delete_sources(body: BatchSourcesRequest, actor=Depends(current_actor)):
-        deleted = context.profile_manager.runtime(actor.profile).state_store.delete_sources(body.chat_refs)
+    def batch_delete_sources(body: BatchSourcesRequest, profile: str | None = None, actor=Depends(current_actor)):
+        selected_profile = context.control_plane.require_profile(actor, profile)
+        deleted = context.profile_manager.runtime(selected_profile).state_store.delete_sources(body.chat_refs)
         return {"deleted": deleted}
 
     @app.post("/api/v1/exports", response_model=JobResponse)
@@ -728,9 +802,10 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 "Isi URL lama atau chat_ref username/numeric ID.",
                 status_code=422,
             )
+        verify_target(actor, "export", values.get("profile"), values.get("worker"))
         return job_dict(
             context.control_plane.submit_job(
-                actor, "export", values, profile=actor.profile
+                actor, "export", values, profile=values.get("profile"), worker=values.get("worker")
             )
         )
 
@@ -773,16 +848,15 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     ):
         values = _model_dict(body) if body is not None else {}
         artifact_ids = values.get("artifact_ids") or []
-        active_worker = context.profile_manager.worker_route(actor.profile)
         worker = None
+        selected_profile = None
         artifact_keys: list[str] = []
         artifact_refs: list[dict[str, str]] = []
         for artifact_id in artifact_ids:
             artifact = context.export_catalog.get(str(artifact_id))
-            if artifact is None or artifact["profile"] != actor.profile:
-                raise DomainError(
-                    "ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404
-                )
+            if artifact is None:
+                raise DomainError("ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404)
+            context.control_plane.require_profile(actor, str(artifact["profile"]))
             if artifact["status"] not in {"pending", "failed"}:
                 raise DomainError(
                     "ARTIFACT_NOT_PENDING",
@@ -795,18 +869,15 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     "File artifact sudah tidak tersedia pada worker.",
                     status_code=409,
                 )
-            if str(artifact["worker"]) != active_worker:
+            if selected_profile is not None and selected_profile != artifact["profile"]:
                 raise DomainError(
-                    "ARTIFACT_WORKER_INACTIVE",
-                    f"Pilih worker {artifact['worker']} sebelum menjalankan artifact ini.",
+                    "ARTIFACT_ORIGIN_MIXED",
+                    "Gunakan endpoint batch untuk artifact dari origin berbeda.",
                     status_code=409,
                 )
             if worker is not None and worker != artifact["worker"]:
-                raise DomainError(
-                    "ARTIFACT_WORKER_MISMATCH",
-                    "Pilih artifact dari worker yang sama untuk satu request.",
-                    status_code=409,
-                )
+                raise DomainError("ARTIFACT_ORIGIN_MIXED", "Gunakan endpoint batch untuk artifact dari origin berbeda.", status_code=409)
+            selected_profile = str(artifact["profile"])
             worker = str(artifact["worker"])
             artifact_keys.append(str(artifact["artifact_key"]))
             artifact_refs.append(
@@ -825,13 +896,47 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     "artifacts": artifact_refs,
                     "priority": values.get("priority", "normal"),
                 },
-                profile=actor.profile,
+                profile=selected_profile or actor.profile,
                 worker=worker,
             )
         )
 
+    @app.post("/api/v1/downloads/batch", response_model=ObjectResponse)
+    def submit_download_batch(body: DownloadBatchRequest, actor=Depends(current_actor)):
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for artifact_id in body.artifact_ids:
+            artifact = context.export_catalog.get(str(artifact_id))
+            if artifact is None:
+                raise DomainError("ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404)
+            context.control_plane.require_profile(actor, str(artifact["profile"]))
+            if artifact["status"] not in {"pending", "failed"}:
+                raise DomainError("ARTIFACT_NOT_PENDING", "Artifact tidak berada pada antrean yang dapat dijalankan.", status_code=409)
+            if not bool(artifact.get("available", 1)):
+                raise DomainError("ARTIFACT_UNAVAILABLE", "File artifact sudah tidak tersedia pada worker.", status_code=409)
+            key = (str(artifact["profile"]), str(artifact["worker"]))
+            groups.setdefault(key, []).append(artifact)
+        jobs, response_groups = [], []
+        for (profile, worker), items in groups.items():
+            job = context.control_plane.submit_job(
+                actor,
+                "download",
+                {
+                    "retry_failed": any(item["status"] == "failed" for item in items),
+                    "artifact_keys": [str(item["artifact_key"]) for item in items],
+                    "artifacts": [{"key": str(item["artifact_key"]), "status": str(item["status"])} for item in items],
+                    "priority": body.priority,
+                },
+                profile=profile,
+                worker=worker,
+            )
+            jobs.append(job_dict(job))
+            response_groups.append({"profile": profile, "worker": worker, "artifact_ids": [str(item["id"]) for item in items], "job_id": job.id})
+        return {"jobs": jobs, "groups": response_groups}
+
     @app.get("/api/v1/downloads/artifacts", response_model=ObjectResponse)
     def list_artifacts(
+        scope: str = Query("current", pattern="^(current|global)$"),
+        profile: str | None = None,
         status: str | None = None,
         archived: bool | None = False,
         worker: str | None = None,
@@ -840,8 +945,11 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         offset: int = Query(0, ge=0),
         actor=Depends(current_actor),
     ):
+        selected_profile = None if scope == "global" else context.control_plane.require_profile(actor, profile)
+        if profile:
+            selected_profile = context.control_plane.require_profile(actor, profile)
         items, total = context.export_catalog.list(
-            profile=actor.profile,
+            profile=selected_profile,
             status=status,
             archived=archived,
             worker=worker,
@@ -851,19 +959,34 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         )
         return {"items": items, "total": total}
 
-    @app.post("/api/v1/downloads/artifacts/reconcile", response_model=JobResponse)
-    def reconcile_artifacts(actor=Depends(current_actor)):
-        inventory_id = str(uuid.uuid4())
-        worker = context.profile_manager.worker_route(actor.profile)
-        return job_dict(
-            context.control_plane.submit_job(
-                actor,
-                "artifact_inventory",
-                {"inventory_id": inventory_id},
-                profile=actor.profile,
-                worker=worker,
-            )
-        )
+    @app.post("/api/v1/downloads/artifacts/reconcile", response_model=ObjectResponse)
+    def reconcile_artifacts(
+        scope: str = Query("current", pattern="^(current|global)$"),
+        profile: str | None = None,
+        worker: str | None = None,
+        actor=Depends(current_actor),
+    ):
+        pairs: list[tuple[str, str]] = []
+        if scope == "global":
+            if profile:
+                context.control_plane.require_profile(actor, profile)
+            pairs = list(context.export_catalog.origins()) if context.export_catalog is not None else []
+            if profile:
+                pairs = [pair for pair in pairs if pair[0] == profile]
+            if worker:
+                pairs = [pair for pair in pairs if pair[1] == worker]
+        else:
+            selected_profile = context.control_plane.require_profile(actor, profile)
+            _, selected_worker = context.control_plane.resolve_target(actor, profile=selected_profile, worker=worker)
+            pairs = [(selected_profile, selected_worker)]
+        jobs = []
+        for selected_profile, selected_worker in pairs:
+            inventory_id = str(uuid.uuid4())
+            jobs.append(job_dict(context.control_plane.submit_job(
+                actor, "artifact_inventory", {"inventory_id": inventory_id},
+                profile=selected_profile, worker=selected_worker,
+            )))
+        return {"jobs": jobs, "items": jobs}
 
     @app.post("/api/v1/downloads/artifacts/{artifact_id}/delete-file", response_model=JobResponse)
     def delete_artifact_file(artifact_id: str, actor=Depends(current_actor)):
@@ -880,10 +1003,33 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 actor,
                 "artifact_delete",
                 {"artifact_key": artifact["artifact_key"]},
-                profile=actor.profile,
+                profile=str(artifact["profile"]),
                 worker=str(artifact["worker"]),
             )
         )
+
+    @app.post("/api/v1/downloads/artifacts/actions/delete", response_model=ObjectResponse)
+    def delete_artifacts_batch(body: DownloadBatchRequest, actor=Depends(current_actor)):
+        groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for artifact_id in body.artifact_ids:
+            artifact = context.export_catalog.get(str(artifact_id))
+            if artifact is None:
+                raise DomainError("ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404)
+            context.control_plane.require_profile(actor, str(artifact["profile"]))
+            if artifact["status"] not in {"pending", "failed"}:
+                raise DomainError("ARTIFACT_ACTIVE", "Artifact aktif atau selesai tidak dapat dihapus sebagai file pending.", status_code=409)
+            groups.setdefault((str(artifact["profile"]), str(artifact["worker"])), []).append(artifact)
+        jobs, deleted = [], []
+        for (profile, worker), items in groups.items():
+            for item in items:
+                context.export_catalog.update_status(str(item["id"]), "deleted")
+                deleted.append(str(item["id"]))
+            jobs.append(job_dict(context.control_plane.submit_job(
+                actor, "artifact_delete",
+                {"artifact_keys": [str(item["artifact_key"]) for item in items]},
+                profile=profile, worker=worker,
+            )))
+        return {"deleted": deleted, "jobs": jobs}
 
     @app.post("/api/v1/downloads/artifacts/{artifact_id}/archive", response_model=ObjectResponse)
     def archive_artifact(artifact_id: str, actor=Depends(current_actor)):
@@ -924,13 +1070,34 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             "last_backup": backups[0] if backups else None,
         }
 
-    @app.post("/api/v1/downloads/clear-failed", response_model=JobResponse)
-    def clear_failed(actor=Depends(current_actor)):
-        return job_dict(
-            context.control_plane.submit_job(
-                actor, "download_clear_failed", {}, profile=actor.profile
-            )
+    @app.post("/api/v1/downloads/clear-failed", response_model=ObjectResponse)
+    def clear_failed(
+        scope: str = Query("current", pattern="^(current|global)$"),
+        profile: str | None = None,
+        worker: str | None = None,
+        actor=Depends(current_actor),
+    ):
+        if scope == "global":
+            if profile:
+                context.control_plane.require_profile(actor, profile)
+            pairs = list(context.export_catalog.origins()) if context.export_catalog is not None else []
+            if profile:
+                pairs = [pair for pair in pairs if pair[0] == profile]
+            if worker:
+                pairs = [pair for pair in pairs if pair[1] == worker]
+            jobs = [
+                context.control_plane.submit_job(
+                    actor, "download_clear_failed", {}, profile=selected_profile, worker=selected_worker
+                )
+                for selected_profile, selected_worker in pairs
+            ]
+            return {"jobs": [job_dict(job) for job in jobs]}
+        selected_profile, selected_worker = context.control_plane.resolve_target(
+            actor, profile=profile, worker=worker
         )
+        return {"job": job_dict(context.control_plane.submit_job(
+            actor, "download_clear_failed", {}, profile=selected_profile, worker=selected_worker
+        ))}
 
     @app.put("/api/v1/downloads/mode/{mode}", response_model=ObjectResponse)
     def set_download_mode(mode: str, actor=Depends(current_actor)):
@@ -948,8 +1115,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         return {"items": context.utility_folders.list()}
 
     @app.get("/api/v1/utility/tree", response_model=ObjectResponse)
-    def utility_tree(path: str = "/workspace", actor=Depends(current_actor)):
-        worker = context.profile_manager.worker_route(actor.profile)
+    def utility_tree(path: str = "/workspace", worker: str | None = None, actor=Depends(current_actor)):
+        _, worker = context.control_plane.resolve_target(actor, worker=worker)
         if context.worker_dispatcher is None:
             raise DomainError(
                 "WORKER_INVENTORY_UNAVAILABLE",
@@ -1001,9 +1168,10 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         settings = context.utility_settings.get()
         payload = _model_dict(body)
         payload["settings"] = settings
+        verify_target(actor, "utility", None, payload.get("worker"))
         return job_dict(
             context.control_plane.submit_job(
-                actor, "utility", payload, profile=actor.profile
+                actor, "utility", payload, profile=actor.profile, worker=payload.get("worker")
             )
         )
 
@@ -1214,6 +1382,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.post("/api/v1/storage/uploads", response_model=JobResponse)
     def submit_storage_upload(body: StorageUploadRequest, actor=Depends(current_actor)):
         payload = _model_dict(body)
+        verify_target(actor, "storage", None, payload.get("worker"))
         if payload.get("destination_folder_id") is None and payload.get("folder"):
             folder = context.storage_catalog.ensure_path(
                 str(payload["folder"]), actor.telegram_user_id
@@ -1225,6 +1394,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             if selected is None or selected.status != "active":
                 raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak aktif.", status_code=409)
         payload["destination_folder_path"] = context.storage_catalog.folder_path(destination)
+        _, selected_worker = context.control_plane.resolve_target(actor, worker=payload.get("worker"))
         payload.update(
             {
                 "batch_id": str(uuid.uuid4()),
@@ -1234,7 +1404,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         )
         return job_dict(
             context.control_plane.submit_job(
-                actor, "storage_upload", payload, profile=actor.profile
+                actor, "storage_upload", payload, profile=actor.profile, worker=selected_worker
             )
         )
 
@@ -1513,10 +1683,11 @@ def _profile_artifact(context: BackendContext, actor, artifact_id: str):
             status_code=503,
         )
     item = context.export_catalog.get(artifact_id)
-    if item is None or str(item["profile"]) != actor.profile:
+    if item is None:
         raise DomainError(
             "ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404
         )
+    context.control_plane.require_profile(actor, str(item["profile"]))
     return item
 
 

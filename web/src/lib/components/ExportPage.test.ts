@@ -20,6 +20,9 @@ describe('ExportPage labels', () => {
     let status = 'queued';
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
+      if (url.includes('/context/verify')) {
+        return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
+      }
       if (url.includes('/sources') || url.includes('/labels')) {
         return new Response(JSON.stringify({items:[]}), {status:200});
       }
@@ -35,6 +38,7 @@ describe('ExportPage labels', () => {
     }));
     render(ExportPage);
     await screen.findByText('Export baru');
+    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     const input=screen.getByLabelText('Username atau chat ID');
     await fireEvent.input(input, {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
@@ -47,6 +51,9 @@ describe('ExportPage labels', () => {
     const requests:Record<string,unknown>[]=[];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
+      if (url.includes('/context/verify')) {
+        return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
+      }
       if (url.includes('/sources')) return new Response(JSON.stringify({items:[{chat_ref:'example',last_id:40,label:'arsip'}]}), {status:200});
       if (url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
       if (url.endsWith('/exports') && init?.method === 'POST') {
@@ -56,6 +63,7 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
+    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     const source=await screen.findByLabelText('Pilih source tersimpan');
     await screen.findByRole('option', {name:/example/});
     await fireEvent.change(source, {target:{value:'example'}});

@@ -4,6 +4,7 @@
   import { api, patch, post, remove } from '$lib/api';
   import { formatBytes, formatDate } from '$lib/presentation';
   import WorkspaceExplorer from './WorkspaceExplorer.svelte';
+  import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
   import {
     ArchiveRestore, ArrowUp, ChevronRight, CirclePlus, CloudUpload, Download,
@@ -54,6 +55,8 @@
   let keywords = $state('');
   let displayName = $state('');
   let editKeywords = $state('');
+  let worker = $state('');
+  let verified = $state<any>(null);
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
   const isTrash = $derived(scope === 'trash');
@@ -139,9 +142,10 @@
   }
   async function upload() {
     if (!workspaceFolders[0]) return;
+    if (!verified || verified.worker !== worker) { message = 'Verifikasi worker terlebih dahulu.'; return; }
     await post('/storage/uploads', {
       folder_path:workspaceFolders[0], destination_folder_id:destinationId,
-      preserve_structure:true, keywords
+      preserve_structure:true, keywords, worker
     });
     uploadOpen=false; workspaceFolders=[]; keywords='';
     message='Upload masuk antrean. Struktur subfolder akan dipertahankan.';
@@ -200,6 +204,8 @@
   <div class="page-icon"><HardDrive size={23}/></div>
 </header>
 
+<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified /></div>
+
 {#if message}<div class="mt-5 flex items-center justify-between rounded-2xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-800 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-100"><span>{message}</span><button onclick={() => message=''}><X size={16}/></button></div>{/if}
 
 <section class="card mt-6 overflow-hidden">
@@ -236,7 +242,7 @@
             {/each}
           </div>
           <div class="flex flex-wrap gap-2">
-            {#if !isTrash}<button class="button secondary" onclick={() => createOpen=true}><CirclePlus size={16}/>Folder baru</button><button class="button" onclick={startUpload}><CloudUpload size={16}/>Upload</button>
+            {#if !isTrash}<button class="button secondary" onclick={() => createOpen=true}><CirclePlus size={16}/>Folder baru</button><button class="button" onclick={startUpload} disabled={!verified}><CloudUpload size={16}/>Upload</button>
             {:else if data.items.length || data.folders.length}<button class="button danger" onclick={emptyTrash}><Trash2 size={16}/>Kosongkan Trash</button>{/if}
           </div>
         </div>
@@ -322,7 +328,7 @@
 <Modal open={createOpen} onclose={() => createOpen=false} title="Folder baru" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" placeholder="Dokumen 2026"/></label><p class="muted mt-2 text-xs">Maksimal 120 karakter. Slash, titik tunggal, dan karakter kontrol tidak diperbolehkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => createOpen=false}>Batal</button><button class="button" disabled={!newFolderName.trim()} onclick={createFolder}>Buat folder</button></div></Modal>
 
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
-  <p class="muted mb-4 text-sm">Pilih source worker. Semua subfolder akan dibuat kembali di Storage.</p><WorkspaceExplorer bind:selected={workspaceFolders} single/>
+  <p class="muted mb-4 text-sm">Pilih source dari worker yang sudah diverifikasi. Semua subfolder akan dibuat kembali di Storage.</p><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
   <div class="mt-4 grid gap-3 sm:grid-cols-2"><label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
   <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>Destination dipilih dari folder Storage, bukan input teks. Nested dan empty folder dipertahankan.</p></div>
   <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>

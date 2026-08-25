@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, post, remove } from '$lib/api';
   import WorkspaceExplorer from './WorkspaceExplorer.svelte';
+  import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
   import { FolderCog, Play, Plus, Trash2 } from '@lucide/svelte';
 
@@ -11,6 +12,8 @@
   let password = $state('');
   let pending = $state(false);
   let message = $state('');
+  let worker = $state('');
+  let verified = $state<any>(null);
 
   async function loadSaved() {
     try { saved = (await api<{items:string[]}>('/utility/folders')).items || []; }
@@ -23,7 +26,8 @@
   async function run() {
     pending = true;
     try {
-      await post('/utility/jobs', { utility, folders: selected, ...(password ? { password } : {}) });
+      if (!verified || verified.worker !== worker) { message = 'Verifikasi worker terlebih dahulu.'; return; }
+      await post('/utility/jobs', { utility, folders: selected, worker, ...(password ? { password } : {}) });
       message = `${selected.length} folder masuk antrean utility.`;
     } catch (cause) { message = cause instanceof Error ? cause.message : 'Utility gagal dibuat.'; }
     finally { pending = false; }
@@ -35,8 +39,9 @@
 
 <div class="mt-7 grid gap-5 xl:grid-cols-[1.15fr_.85fr]">
   <section class="card p-5 sm:p-6">
-    <h2 class="font-extrabold">Pilih folder workspace</h2><p class="muted mb-4 mt-1 text-sm">Daftar ini selalu berasal dari worker yang dipilih profile aktif.</p>
-    <WorkspaceExplorer bind:selected />
+    <h2 class="font-extrabold">Worker dan folder workspace</h2><p class="muted mb-4 mt-1 text-sm">Utility berjalan pada worker yang dipilih, tanpa bergantung profile actor.</p>
+    <TargetPicker purpose="utility" requireProfile={false} bind:worker bind:verified />
+    <div class="mt-4"><WorkspaceExplorer bind:selected {worker} /></div>
   </section>
   <section class="card p-5 sm:p-6">
     <label class="block text-sm font-bold">Jenis operasi<select class="field mt-2" bind:value={utility}><option value="pindah">Pindah / group</option><option value="compress">Compress 7z</option><option value="extract">Extract</option><option value="export">Organizer export</option></select></label>

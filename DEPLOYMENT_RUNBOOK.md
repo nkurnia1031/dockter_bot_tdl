@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.7 - Download manager worker-scoped, inventory availability, dan live telemetry
+Versi: 3.8 - Per-feature target context dan Download manager global
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -31,12 +31,12 @@ Worker release ini mengirim inventory generation, milestone JSON download,
 telemetry JSON N/N dan file N/N, speed/ETA, serta snapshot output TDL aktif.
 Seluruh worker harus diperbarui sebelum web static agar kontrak telemetry sama.
 
-Download manager hanya menampilkan artifact dan job milik profile serta worker
-yang sedang dipilih di navbar. Saat context berubah, UI mengosongkan data lama,
-menjalankan reconcile pada worker baru, menunggu inventory selesai, lalu memuat
-ulang katalog. Artifact yang tidak lagi ada di worker dipertahankan untuk audit
-di History dengan status `File tidak tersedia`, tetapi tidak dapat dijalankan.
-`Mulai semua` hanya mengirim file pending yang tersedia pada worker aktif.
+Download manager secara default menampilkan artifact dan job lintas profile serta
+worker. UI mengosongkan selection saat filter berubah, menjalankan reconcile
+global, menunggu inventory relevan selesai, lalu memuat ulang katalog. Artifact
+yang tidak lagi ada di worker dipertahankan untuk audit di History dengan status
+`File tidak tersedia`, tetapi tidak dapat dijalankan. `Mulai semua` memakai
+endpoint batch dan mengelompokkan artifact berdasarkan origin tersimpan.
 
 Activity tetap menampilkan job lintas-worker untuk profile aktif. Mengganti
 worker hanya mengubah route job berikutnya; job lama tetap berjalan pada worker
@@ -411,7 +411,106 @@ Jangan deploy web dahulu. Selesaikan semua worker remote pada bagian D agar UI
 tidak menampilkan kemampuan telemetry baru sementara worker masih memakai
 protokol lama.
 
-## D. Langkah di setiap VPS worker remote
+## D. Menambah worker remote baru
+
+Worker remote membutuhkan dua konfigurasi yang berbeda:
+
+- `.env.worker` berada di VPS remote dan mengatur sesi TDL, workspace, port,
+  `WORKER_API_TOKEN`, serta URL backend.
+- `workers.json` berada di data gateway dan menyimpan nama worker, URL publik,
+  serta token yang dipakai gateway saat mengakses worker.
+
+`WORKER_API_TOKEN` harus sama pada kedua sisi. Jangan menggunakan
+`MANAGEMENT_API_TOKEN` atau `BACKEND_INTERNAL_TOKEN` sebagai token worker.
+`BACKEND_INTERNAL_TOKEN` adalah secret callback antara worker dan backend.
+
+### D.1 Siapkan VPS worker remote
+
+Di VPS remote baru:
+
+```bash
+git clone <repository-url> /www/wwwroot/dockter_bot_tdl
+cd /www/wwwroot/dockter_bot_tdl
+git switch main
+cp .env.worker.example .env.worker
+cp .env.example .env
+```
+
+Edit `.env.worker`:
+
+```env
+APP_ROLE=worker
+PROFILE_ROOT=/www/wwwroot/downloads/HasilConvert/bot/remote-1
+BACKEND_API_URL=https://bot.utama.example.com
+BACKEND_INTERNAL_TOKEN=<sama-dengan-.env.backend-gateway>
+WORKER_API_TOKEN=<token-unik-worker-remote-1>
+WORKER_PORT=5800
+UTILITY_WORKSPACE_HOST=/www/wwwroot/downloads
+```
+
+Buat token worker unik, lalu simpan nilainya hanya di `.env.worker` dan gunakan
+nilai yang sama ketika menjalankan perintah registrasi pada gateway:
+
+```bash
+openssl rand -hex 32
+```
+
+`WORKER_PORT` boleh diganti bebas. Port tersebut hanya bind ke localhost pada
+Docker host. Domain worker harus diproxy aaPanel/Nginx ke
+`127.0.0.1:<WORKER_PORT>` dan meneruskan header `Authorization`.
+
+Jika image registry private, login GHCR pada VPS remote dengan permission pull,
+lalu deploy image yang sudah dipublish:
+
+```bash
+docker login ghcr.io
+python3 run.py deploy worker --pull
+docker compose -f docker-compose.worker.yml ps
+curl -fsS https://worker1.example.com/healthz
+```
+
+Healthcheck `/healthz` tidak memerlukan token. Endpoint internal tetap wajib
+menggunakan bearer token worker.
+
+### D.2 Daftarkan worker pada VPS gateway
+
+Setelah domain worker dapat diakses, jalankan perintah berikut **di VPS
+gateway**, bukan di VPS remote:
+
+```bash
+cd /www/wwwroot/dockter_bot_tdl
+python3 run.py worker add remote-1 https://worker1.example.com
+```
+
+Saat diminta `Worker API token:`, masukkan nilai `WORKER_API_TOKEN` dari
+`.env.worker` remote. Token tidak ditulis sebagai argumen command agar tidak
+masuk shell history atau daftar proses.
+
+Verifikasi registry gateway:
+
+```bash
+python3 run.py worker list
+```
+
+Output akan menampilkan nama, URL, dan token dalam bentuk tersamarkan.
+Perintah `worker add` langsung menulis registry gateway; tidak diperlukan
+rebuild image atau restart worker untuk menambah worker berikutnya.
+
+### D.3 Verifikasi worker dan route legacy
+
+Registrasi worker belum otomatis memindahkan route profile. Untuk alur baru,
+pilih target profile-worker langsung di halaman Export, atau pilih worker di
+Utility/Storage lalu jalankan checker. Halaman **Workers** masih menyediakan
+route profile legacy untuk client lama dan Telegram; perubahan route hanya
+berlaku untuk job baru, sedangkan job yang sudah berjalan tetap pada origin
+asalnya.
+
+Pastikan worker terlihat sehat dan buat satu job percobaan sebelum dipakai
+untuk batch besar. Untuk menambah worker kedua, ulangi langkah D.1–D.3 dengan
+nama berbeda, misalnya `remote-2`, URL berbeda, `PROFILE_ROOT` berbeda, dan
+token berbeda.
+
+## E. Update di setiap VPS worker remote
 
 Ulangi langkah berikut pada `remote-1`, `remote-2`, dan worker lain yang
 terdaftar:
@@ -438,7 +537,7 @@ docker compose -f docker-compose.worker.yml logs --tail=100 worker
 Pastikan tidak ada error autentikasi internal, `401`, atau worker callback yang
 ditolak. Ulangi sampai seluruh worker remote menggunakan SHA yang sama.
 
-## E. Deploy web static di VPS gateway
+## F. Deploy web static di VPS gateway
 
 Pastikan workflow GitHub `Publish static web` untuk commit tersebut sudah hijau.
 Lalu jalankan:
@@ -469,13 +568,16 @@ curl -I https://ui.utama.naufix.space/
 `build-info.json` harus `no-cache`; hanya `/_app/immutable/*` yang boleh memakai
 cache immutable.
 
-## F. Smoke test worker dan Download manager
+## G. Smoke test worker dan Download manager
 
-1. Login ke dashboard dan pastikan selector Profile serta Worker tampil
-   berdampingan di navbar.
-2. Buka Download. Tunggu status reconcile selesai sebelum menekan aksi.
-3. Pastikan daftar hanya berisi artifact milik worker aktif. Ganti worker dari
-   navbar dan pastikan daftar serta Job Monitor berubah tanpa reload browser.
+1. Login ke dashboard dan pastikan navbar hanya menampilkan actor profile,
+   status backend, dan indikator target per fitur; tidak ada selector target
+   operasional global.
+2. Buka Export, pilih profile-worker pada TargetPicker, tekan `Verifikasi
+   target`, lalu pastikan source dan Last ID berasal dari profile tersebut.
+3. Buka Download. Tunggu status reconcile global selesai sebelum menekan aksi.
+   Daftar harus memuat artifact lintas profile-worker dan origin tampil pada
+   setiap artifact. Gunakan filter profile/worker bila diperlukan.
 4. Pastikan Pending/Processing tidak menampilkan artifact yang file JSON-nya
    sudah hilang. Metadata lama boleh tetap terlihat di History dengan badge
    `File tidak tersedia` dan tanpa tombol Start/Retry.
@@ -484,10 +586,12 @@ cache immutable.
    gagal, dan dilewati.
 6. Buka Log saat job masih berjalan. Ringkasan JSON/file harus tampil di atas,
    sedangkan output TDL aktif tampil pada terminal di bawahnya.
-7. Ganti worker ketika job lama masih berjalan. Route baru hanya berlaku pada
-   job berikutnya; job lama tetap terlihat di Activity pada worker asal.
-8. Uji `Mulai semua` dan pastikan hanya artifact pending dari worker aktif yang
-   masuk ke satu job worker tersebut.
+7. Uji `Select all`, `Mulai terpilih`, `Berikutnya`, `Hapus terpilih`, dan
+   `Mulai semua`. Pastikan artifact campuran dikelompokkan menjadi satu job
+   untuk setiap profile-worker asal dan kelompok berbeda dapat paralel.
+8. Buka Utility dan Storage, pilih worker serta verifikasi target sebelum
+   memilih folder. Pastikan Storage menolak worker tanpa profile
+   `WORKER_STORAGE_PROFILE`.
 9. Pastikan job terminal berpindah ke History dan snapshot log terakhir tetap
    dapat dibuka.
 
@@ -702,16 +806,26 @@ registry.
 
 ## Concurrency dan pesan status job
 
-Queue worker memakai resource lane. Export dan download pada profile yang sama
-dapat berjalan bersamaan karena memakai dua sesi `.tdl`; dua export atau dua
-download tetap serial. Leave berbagi lane export. Utility dengan path berbeda
-dapat paralel, sedangkan path yang overlap tetap serial.
+Queue worker memakai resource lane yang menyimpan target eksekusi pada job.
+Export serial per kombinasi `profile + worker + export`; download serial per
+kombinasi `profile + worker + download`. Export dan download pada origin yang
+sama dapat berjalan bersamaan karena memakai dua sesi `.tdl`; origin berbeda
+juga dapat berjalan paralel. Leave berbagi lane export. Utility memakai worker
+dan path workspace; path sibling dapat paralel, path yang overlap tetap serial.
+Storage memakai lane `worker + tdl:storage` dan tidak memakai profile actor.
 
-Storage upload dan backup tetap memakai lane export pada deployment yang belum
-memiliki sesi TDL storage/backup khusus. Jangan menghapus lock untuk memaksa
-paralel karena Bolt database `.tdl` tidak boleh dibuka bersamaan. Setelah lane
-khusus diprovision, lakukan rollout backend lalu semua worker sebelum
-mengaktifkan lane tersebut.
+Setiap worker yang melayani Storage wajib memiliki profile sesi dedicated sesuai
+`WORKER_STORAGE_PROFILE` (default `storage`), misalnya:
+
+```bash
+python3 run.py identity storage
+```
+
+Pastikan sesi tersebut sudah login dan memiliki akses channel Storage sebelum
+menjalankan upload. Jika sesi belum ada, checker mengembalikan
+`STORAGE_PROFILE_UNAVAILABLE`; jangan melewati checker dengan mengubah payload
+manual. Jangan menghapus lock untuk memaksa paralel karena database Bolt `.tdl`
+tidak boleh dibuka bersamaan. Backup tetap mengikuti lane backup yang ada.
 
 Setiap job asynchronous yang dibuat dari Telegram membuat satu pesan status
 tanpa keyboard. Pesan yang sama diperbarui saat queued/running, menampilkan
@@ -729,3 +843,67 @@ menampilkan picker ringkas dengan maksimal enam source per halaman, pagination,
 recent source, pencarian input, dan callback digest yang stabil. Source baru
 tetap memakai username/numeric ID. Memilih source baru mereset report panel
 dan overwrite Start ID, tetapi tidak membatalkan job lama.
+
+## Context target per fitur dan Download global
+
+Navbar web tidak lagi menjadi sumber target operasional. Navbar hanya
+menampilkan identity actor, profile actor untuk audit, status backend, dan
+status worker terakhir. Target dipilih pada fitur yang memakainya:
+
+- Export: pilih `profile` dan `worker`, lalu klik `Verifikasi target`. Source
+  dan Last ID dimuat dari profile target; tombol submit baru aktif setelah
+  response checker valid.
+- Utility: pilih `worker`, verifikasi workspace, lalu pilih folder pada worker
+  tersebut. Profile actor hanya dicatat untuk audit.
+- Storage: pilih `worker`, verifikasi `WORKER_STORAGE_PROFILE`, lalu gunakan
+  Workspace Explorer. Profile Storage dedicated adalah profile TDL worker,
+  bukan profile actor.
+- Download: default `scope=global`, sehingga artifact dari seluruh profile dan
+  worker tampil. Filter profile/worker hanya untuk penyaringan tampilan.
+
+Checker API:
+
+```bash
+curl -X POST "$BACKEND_URL/api/v1/context/verify" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"purpose":"export","profile":"default","worker":"local"}'
+```
+
+Submit job tetap melakukan validasi ulang. Status verified di browser bukan
+otorisasi mandiri. Jika target berubah, verification dihapus dan request lama
+diabaikan memakai generation ID.
+
+### Download batch dan bulk action
+
+Gunakan endpoint batch untuk memilih artifact lintas origin:
+
+```bash
+curl -X POST "$BACKEND_URL/api/v1/downloads/batch" \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"artifact_ids":["id-1","id-2"],"priority":"normal"}'
+```
+
+Backend mengelompokkan artifact berdasarkan `(profile, worker)` dan membuat
+satu job per kelompok. Kelompok berbeda berjalan paralel, sementara artifact
+dalam origin yang sama mengikuti lane download origin tersebut. Artifact
+unavailable atau file fisik yang hilang ditolak/ditandai History dan tidak
+ditampilkan sebagai aksi Start. Hapus file terpilih memakai
+`POST /api/v1/downloads/artifacts/actions/delete`; metadata History tetap ada.
+
+### Urutan rollout perubahan context
+
+Deploy selalu dalam urutan berikut:
+
+1. Gateway/backend: migration SQLite, checker, source profile, download global
+   dan endpoint batch.
+2. Worker-local dan seluruh worker remote: scheduler origin, inventory,
+   capability endpoint, serta `WORKER_STORAGE_PROFILE` dan sesi `.tdl`-nya.
+3. Static web: TargetPicker, filter/download global, dan bulk actions.
+
+Setelah setiap tahap, lakukan health check dan pastikan worker yang relevan
+terdaftar. Job lama tetap memakai `profile/worker` yang tersimpan di dalam job;
+perubahan target atau filter tidak memindahkan job aktif. Jika worker Storage
+belum memiliki profile dedicated, rollback UI atau nonaktifkan upload Storage
+sementara; jangan rollback database dengan menghapus kolom/tabel additive.

@@ -9,7 +9,7 @@
 
   type Job = Record<string, any>;
   type JobEvent = Record<string, any>;
-  let { kind = '', title = 'Aktivitas terbaru', worker = '' }: { kind?: string; title?: string; worker?: string } = $props();
+  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global' } = $props();
   let jobs = $state<Job[]>([]);
   let error = $state('');
   let selected = $state<Job | null>(null);
@@ -39,7 +39,7 @@
   async function load() {
     const request = ++loadGeneration;
     try {
-      const query = `/jobs?limit=30${kind ? `&kind=${encodeURIComponent(kind)}` : ''}${worker ? `&worker=${encodeURIComponent(worker)}` : ''}`;
+      const query = `/jobs?limit=30&scope=${scope}${kind ? `&kind=${encodeURIComponent(kind)}` : ''}${profile ? `&profile=${encodeURIComponent(profile)}` : ''}${worker ? `&worker=${encodeURIComponent(worker)}` : ''}`;
       const next = (await api<{items:Job[]}>(query)).items || [];
       if (request !== loadGeneration) return;
       jobs = next;
@@ -75,7 +75,7 @@
   function requestTerminate(target: 'one'|'all', job?: Job) { if (job) selected = job; confirmTarget = target; confirmOpen = true; }
   async function terminate() {
     try {
-      if (confirmTarget === 'all') await post('/jobs/terminate-active');
+      if (confirmTarget === 'all') await post(`/jobs/terminate-active${scope === 'global' ? '?scope=global' : ''}`);
       else if (selected) await post(`/jobs/${selected.id}/cancel`);
       toastMessage = confirmTarget === 'all' ? 'Terminate dikirim ke semua job aktif.' : 'Terminate dikirim ke job.';
       toastOpen = true; confirmOpen = false; await load();

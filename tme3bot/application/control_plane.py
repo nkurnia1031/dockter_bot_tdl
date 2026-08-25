@@ -56,13 +56,28 @@ class ControlPlane:
 
     def require_profile(self, actor: Actor, profile: str | None) -> str:
         selected = profile or actor.profile
-        if selected != actor.profile:
+        available = getattr(self.profile_manager, "list_profiles", None)
+        profiles = list(available()) if callable(available) else []
+        if profiles and selected not in profiles:
             raise DomainError(
-                "PROFILE_FORBIDDEN",
-                "Actor tidak memiliki akses ke profile tersebut.",
-                status_code=403,
+                "PROFILE_NOT_FOUND",
+                "Profile target tidak ditemukan.",
+                status_code=404,
             )
         return selected
+
+    def resolve_target(
+        self, actor: Actor, *, profile: str | None = None, worker: str | None = None
+    ) -> tuple[str, str]:
+        selected_profile = self.require_profile(actor, profile)
+        selected_worker = str(worker or self.profile_manager.worker_route(selected_profile)).strip().lower()
+        if not selected_worker:
+            raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih.", status_code=422)
+        if self.worker_registry is not None:
+            names = self.worker_registry.names()
+            if names and selected_worker not in names:
+                raise DomainError("WORKER_NOT_FOUND", "Worker target tidak ditemukan.", status_code=404)
+        return selected_profile, selected_worker
 
     def submit_job(
         self,
@@ -73,8 +88,9 @@ class ControlPlane:
         profile: str | None = None,
         worker: str | None = None,
     ) -> Job:
-        selected_profile = self.require_profile(actor, profile)
-        selected_worker = worker or self.profile_manager.worker_route(selected_profile)
+        selected_profile, selected_worker = self.resolve_target(
+            actor, profile=profile, worker=worker
+        )
         available_profiles = ()
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
         if callable(list_profiles):
@@ -250,7 +266,7 @@ class ControlPlane:
             for observer in tuple(self._event_observers):
                 observer(event)
             if event.status.terminal:
-                self._dispatch_pending_jobs(job.profile)
+                self._dispatch_pending_jobs()
         return job
 
     def update_worker_progress(self, event: JobEvent) -> Job:
@@ -267,17 +283,18 @@ class ControlPlane:
         # work remains pinned to its original worker.
         return self.profile_manager.set_worker_route(actor.profile, route)
 
-    def terminate_active_jobs(self, actor: Actor) -> dict[str, int]:
+    def terminate_active_jobs(self, actor: Actor, *, profile: str | None = None) -> dict[str, int]:
         active_statuses = (
             JobStatus.QUEUED.value,
             JobStatus.DISPATCHED.value,
             JobStatus.RUNNING.value,
         )
+        selected_profile = None if profile in {None, "", "global"} else self.require_profile(actor, profile)
         active: list[Job] = []
         for status in active_statuses:
             active.extend(
                 self.jobs.list(
-                    profile=actor.profile,
+                    profile=selected_profile,
                     status=status,
                     archived=False,
                     offset=0,
@@ -313,7 +330,7 @@ class ControlPlane:
             self.jobs.release_execution(job.id)
             forced += 1
         if forced:
-            self._dispatch_pending_jobs(actor.profile)
+            self._dispatch_pending_jobs(selected_profile)
         return {"total": len(active), "interrupted": interrupted, "force_cancelled": forced}
 
     def cancel_job(self, actor: Actor, job_id: str) -> Job:

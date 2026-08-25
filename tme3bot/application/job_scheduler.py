@@ -32,14 +32,19 @@ def build_execution_plan(
     kind = str(kind)
     profile = str(profile)
     worker = str(worker)
-    keys: set[str] = {f"profile:{profile}:kind:{kind}"}
+    # Profile and worker together identify an execution origin.  Jobs from
+    # different origins must not serialize one another.
+    keys: set[str] = {f"profile:{profile}:worker:{worker}:kind:{kind}"}
     lane = "filesystem"
 
-    if kind in {"export", "leave", "storage_upload"}:
-        keys.add(f"profile:{profile}:tdl:export")
+    if kind in {"export", "leave"}:
+        keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         lane = "tdl-export"
+    elif kind == "storage_upload":
+        keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
+        lane = "tdl-storage"
     elif kind in {"download", "download_clear_failed"}:
-        keys.add(f"profile:{profile}:tdl:download")
+        keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         lane = "tdl-download"
     elif kind == "backup_node":
         # Backup currently snapshots all profiles and uploads through the
@@ -67,10 +72,10 @@ def build_execution_plan(
                 for index in range(start, len(parts) + 1):
                     ancestor = "/" + "/".join(parts[:index])
                     keys.add(
-                        f"profile:{profile}:worker:{worker}:workspace:{ancestor}"
+                        f"worker:{worker}:workspace:{ancestor}"
                     )
         else:
-            keys.add(f"profile:{profile}:worker:{worker}:workspace")
+            keys.add(f"worker:{worker}:workspace")
     elif kind.startswith("artifact_"):
         lane = "artifact"
         artifact_ids = payload.get("artifact_ids") or payload.get("artifact_id") or []
@@ -80,7 +85,7 @@ def build_execution_plan(
 
     return JobExecutionPlan(
         resource_keys=frozenset(key for key in keys if key),
-        queue_group=f"profile:{profile}:kind:{kind}",
+        queue_group=f"profile:{profile}:worker:{worker}:kind:{kind}",
         lane=lane,
         priority=0 if payload.get("priority") == "next" else 100,
     )

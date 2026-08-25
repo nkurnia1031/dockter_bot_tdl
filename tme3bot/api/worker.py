@@ -60,6 +60,10 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     def healthz():
         return {"ok": True, "role": "worker"}
 
+    @app.get("/internal/v1/capabilities", dependencies=[Depends(authorize)])
+    def capabilities():
+        return context.executor.capabilities()
+
     @app.get("/internal/v1/workspace/tree", dependencies=[Depends(authorize)])
     def workspace_tree(path: str = Query("/workspace", min_length=1, max_length=4096)):
         return context.executor.workspace_tree(path)

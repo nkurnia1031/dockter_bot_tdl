@@ -75,6 +75,7 @@ class AppConfig:
     worker_routes: dict[str, str] | None = None
     worker_endpoints: dict[str, str] | None = None
     worker_api_tokens: dict[str, str] | None = None
+    worker_storage_profile: str = "storage"
     backend_api_url: str = ""
     backend_bind_host: str = "0.0.0.0"
     backend_port: int = 8080
@@ -290,6 +291,7 @@ class AppConfig:
             worker_routes=routes,
             worker_endpoints=endpoints,
             worker_api_tokens=api_tokens,
+            worker_storage_profile=os.getenv("WORKER_STORAGE_PROFILE", "storage").strip() or "storage",
             backend_api_url=os.getenv("BACKEND_API_URL", "").strip().rstrip("/"),
             backend_bind_host=os.getenv("BACKEND_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0",
             backend_port=int(os.getenv("BACKEND_PORT", os.getenv("GATEWAY_PORT", "8080"))),

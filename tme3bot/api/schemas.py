@@ -214,11 +214,23 @@ class ExportRequest(BaseModel):
     start_id: int | None = Field(default=None, ge=1)
     label: str | None = None
     use_url_message_id: bool = False
+    profile: str | None = None
+    worker: str | None = None
 
 
 class DownloadRequest(BaseModel):
     artifact_ids: list[str] = Field(default_factory=list)
     priority: str = "normal"
+
+
+class DownloadBatchRequest(DownloadRequest):
+    pass
+
+
+class ContextVerifyRequest(BaseModel):
+    purpose: str
+    profile: str | None = None
+    worker: str | None = None
 
 
 class BatchSourcesRequest(BaseModel):
@@ -233,6 +245,7 @@ class UtilityJobRequest(BaseModel):
     utility: str
     folders: list[str]
     password: str | None = None
+    worker: str | None = None
 
 
 class UtilityFolderRequest(BaseModel):
@@ -268,6 +281,7 @@ class StorageUploadRequest(BaseModel):
     destination_folder_id: int | None = None
     preserve_structure: bool = True
     keywords: str = ""
+    worker: str | None = None
 
 
 class StorageUpdateRequest(BaseModel):

@@ -233,7 +233,7 @@ class BackendApiTests(unittest.TestCase):
             self.client.get("/api/v1/me", headers=missing).status_code, 404
         )
 
-    def test_download_rejects_unavailable_or_non_active_worker_artifact(self):
+    def test_download_rejects_unavailable_and_pins_artifact_origin(self):
         headers = self.login()
         unavailable = self.export_catalog.upsert(
             profile="default",
@@ -258,15 +258,15 @@ class BackendApiTests(unittest.TestCase):
             artifact_key="remote.json",
             status="pending",
         )
+        self.workers.values["remote-1"] = {"url": "http://remote", "token": "secret"}
         response = self.client.post(
             "/api/v1/downloads",
             headers=headers,
             json={"artifact_ids": [remote["id"]]},
         )
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(
-            response.json()["error"]["code"], "ARTIFACT_WORKER_INACTIVE"
-        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["worker"], "remote-1")
+        self.assertEqual(response.json()["profile"], "default")
 
     def test_download_artifact_list_can_filter_worker_and_availability(self):
         headers = self.login()
@@ -301,6 +301,44 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             response.json()["items"][0]["artifact_key"], "available.json"
         )
+
+    def test_global_artifact_scope_and_batch_pin_each_origin(self):
+        headers = self.login()
+        self.workers.values["remote-1"] = {"url": "http://remote", "token": "secret"}
+        first = self.export_catalog.upsert(
+            profile="default", worker="local", filename="local.json",
+            artifact_key="local.json", status="pending"
+        )
+        second = self.export_catalog.upsert(
+            profile="archive", worker="remote-1", filename="remote.json",
+            artifact_key="remote.json", status="pending"
+        )
+        listing = self.client.get(
+            "/api/v1/downloads/artifacts?scope=global", headers=headers
+        )
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.json()["total"], 2)
+        response = self.client.post(
+            "/api/v1/downloads/batch", headers=headers,
+            json={"artifact_ids": [first["id"], second["id"]]},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["groups"]), 2)
+        self.assertEqual(
+            {(item["profile"], item["worker"]) for item in response.json()["groups"]},
+            {("default", "local"), ("archive", "remote-1")},
+        )
+
+    def test_context_checker_returns_verified_target(self):
+        headers = self.login()
+        response = self.client.post(
+            "/api/v1/context/verify", headers=headers,
+            json={"purpose": "export", "profile": "archive", "worker": "local"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["verified"])
+        self.assertEqual(response.json()["profile"], "archive")
+        self.assertEqual(response.json()["worker"], "local")
 
     def test_browser_cookie_login_refresh_profile_and_logout_keep_tokens_out_of_json(self):
         challenge = self.client.post("/api/v1/auth/browser/challenge")

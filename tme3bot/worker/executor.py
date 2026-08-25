@@ -16,6 +16,7 @@ from tme3bot.export_catalog import inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
+from tme3bot.profiles import build_profile_config
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.utility import UtilityRunner
 
@@ -251,8 +252,13 @@ class WorkerJobExecutor:
         runtime = self.profile_manager.runtime(profile)
         if kind == "download":
             cancelled = runtime.download_tdl_client.interrupt_current()
-        elif kind in {"export", "storage_upload", "backup_node"}:
+        elif kind in {"export", "backup_node"}:
             cancelled = runtime.export_tdl_client.interrupt_current()
+        elif kind == "storage_upload":
+            storage_runtime = self.profile_manager.runtime(
+                getattr(self.config, "worker_storage_profile", "storage")
+            )
+            cancelled = storage_runtime.export_tdl_client.interrupt_current()
         elif kind == "leave":
             cancelled = runtime.leave_service.runner.interrupt_current()
         elif kind == "utility" and utility_runner is not None:
@@ -268,6 +274,26 @@ class WorkerJobExecutor:
         del profile
         return self._jobs.queue_size()
 
+    def capabilities(self) -> dict[str, Any]:
+        """Return non-secret worker capabilities for backend target checks."""
+        profiles = [str(item) for item in self.profile_manager.list_profiles()]
+        storage_profile = getattr(self.config, "worker_storage_profile", "storage")
+        storage_available = False
+        if storage_profile in profiles:
+            try:
+                runtime_config = build_profile_config(
+                    self.profile_manager.base_config, storage_profile
+                )
+                storage_available = Path(runtime_config.tdl_export_storage).exists()
+            except Exception:
+                storage_available = False
+        return {
+            "profiles": profiles,
+            "storage_profile": storage_profile,
+            "storage_profile_available": storage_available,
+            "workspace": Path(getattr(self.config, "utility_workspace_root", "/workspace")).is_dir(),
+        }
+
     def _unhandled_resource(self, command: dict[str, Any], exc: Exception) -> None:
         LOGGER.exception("Worker queue failed for job %s", command.get("job_id"))
         self._failed(command, exc)
@@ -275,11 +301,14 @@ class WorkerJobExecutor:
     def _resource_keys_for_command(self, command: dict[str, Any]) -> set[str]:
         profile = str(command.get("profile") or "default")
         kind = str(command.get("kind") or "unknown")
-        keys: set[str] = {f"profile:{profile}:kind:{kind}"}
-        if kind in {"export", "leave", "storage_upload"}:
-            keys.add(f"profile:{profile}:tdl:export")
+        worker = str(command.get("worker") or self.config.backup_node_name)
+        keys: set[str] = {f"profile:{profile}:worker:{worker}:kind:{kind}"}
+        if kind in {"export", "leave"}:
+            keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
+        elif kind == "storage_upload":
+            keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
         elif kind in {"download", "download_clear_failed"}:
-            keys.add(f"profile:{profile}:tdl:download")
+            keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         elif kind == "backup_node":
             # Current backup snapshots all profiles and uploads through the
             # export client. Keep this conservative until a dedicated lane is
@@ -302,11 +331,11 @@ class WorkerJobExecutor:
                     for index in range(start, len(parts) + 1):
                         ancestor = "/" + "/".join(parts[:index])
                         keys.add(
-                            f"profile:{profile}:worker:{command.get('worker', self.config.backup_node_name)}:workspace:{ancestor}"
+                            f"worker:{worker}:workspace:{ancestor}"
                         )
             else:
                 keys.add(
-                    f"profile:{profile}:worker:{command.get('worker', self.config.backup_node_name)}:workspace"
+                    f"worker:{worker}:workspace"
                 )
         elif kind.startswith("artifact_"):
             payload = command.get("payload") or {}
@@ -314,7 +343,7 @@ class WorkerJobExecutor:
             if not isinstance(artifact_ids, (list, tuple, set)):
                 artifact_ids = [artifact_ids]
             keys.update(
-                f"worker:{command.get('worker', self.config.backup_node_name)}:artifact:{item}"
+                f"worker:{worker}:artifact:{item}"
                 for item in artifact_ids
             )
         return keys
@@ -518,7 +547,7 @@ class WorkerJobExecutor:
         artifact = {
             **stats,
             "profile": str(command["profile"]),
-            "worker": self.config.backup_node_name,
+            "worker": str(command.get("worker") or self.config.backup_node_name),
             "export_job_id": str(command["job_id"]),
             "filename": result.export_path.name,
             "artifact_key": result.export_path.name,
@@ -607,7 +636,7 @@ class WorkerJobExecutor:
                     result={
                         "artifact": {
                             "profile": str(command["profile"]),
-                            "worker": self.config.backup_node_name,
+                            "worker": str(command.get("worker") or self.config.backup_node_name),
                             "artifact_key": key,
                         }
                     },
@@ -755,7 +784,7 @@ class WorkerJobExecutor:
                     result={
                         "artifact": {
                             "profile": str(command["profile"]),
-                            "worker": self.config.backup_node_name,
+                            "worker": str(command.get("worker") or self.config.backup_node_name),
                             "artifact_key": item.json_path.name,
                             "status": "downloaded" if item.status == "success" else "failed",
                             "download_directory": str(item.download_dir),
@@ -831,7 +860,7 @@ class WorkerJobExecutor:
                         "artifact": {
                             **stats,
                             "profile": str(command["profile"]),
-                            "worker": self.config.backup_node_name,
+                            "worker": str(command.get("worker") or self.config.backup_node_name),
                             "filename": path.name,
                             "artifact_key": path.name,
                             "status": status,
@@ -844,7 +873,7 @@ class WorkerJobExecutor:
         inventory = {
             "inventory_id": inventory_id,
             "profile": str(command["profile"]),
-            "worker": self.config.backup_node_name,
+            "worker": str(command.get("worker") or self.config.backup_node_name),
             "discovered": discovered,
         }
         self.publisher.emit(
@@ -857,22 +886,33 @@ class WorkerJobExecutor:
 
     def _artifact_delete(self, command: dict[str, Any]) -> dict[str, Any]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
-        key = str(command["payload"]["artifact_key"])
-        if Path(key).name != key or not key.lower().endswith(".json"):
-            raise ValueError("Artifact key tidak valid.")
-        for root in (
-            runtime.config.export_pending_dir,
-            runtime.config.export_failed_dir,
-        ):
-            candidate = (root.resolve() / key).resolve()
-            try:
-                candidate.relative_to(root.resolve())
-            except ValueError:
-                continue
-            if candidate.is_file():
-                candidate.unlink()
-                return {"deleted": True, "artifact_key": key}
-        raise FileNotFoundError(f"Artifact tidak ditemukan: {key}")
+        payload = command["payload"]
+        keys = payload.get("artifact_keys") or []
+        if not keys and payload.get("artifact_key"):
+            keys = [payload["artifact_key"]]
+        if not isinstance(keys, (list, tuple, set)):
+            keys = [keys]
+        deleted: list[str] = []
+        missing: list[str] = []
+        for raw_key in keys:
+            key = str(raw_key)
+            if Path(key).name != key or not key.lower().endswith(".json"):
+                raise ValueError("Artifact key tidak valid.")
+            found = False
+            for root in (runtime.config.export_pending_dir, runtime.config.export_failed_dir):
+                candidate = (root.resolve() / key).resolve()
+                try:
+                    candidate.relative_to(root.resolve())
+                except ValueError:
+                    continue
+                if candidate.is_file():
+                    candidate.unlink()
+                    deleted.append(key)
+                    found = True
+                    break
+            if not found:
+                missing.append(key)
+        return {"deleted": deleted, "missing": missing}
 
     def _utility(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
@@ -992,7 +1032,16 @@ class WorkerJobExecutor:
 
     def _storage_upload(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
-        runtime = self.profile_manager.runtime(str(command["profile"]))
+        storage_profile = getattr(self.config, "worker_storage_profile", "storage")
+        if storage_profile not in self.profile_manager.list_profiles():
+            raise ValueError(
+                f"STORAGE_PROFILE_UNAVAILABLE: profile worker {storage_profile} belum memiliki sesi TDL."
+            )
+        runtime = self.profile_manager.runtime(storage_profile)
+        if not Path(runtime.config.tdl_export_storage).exists():
+            raise ValueError(
+                f"STORAGE_PROFILE_UNAVAILABLE: sesi TDL {storage_profile} belum tersedia."
+            )
         reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         reporter.report(
             phase="scanning",

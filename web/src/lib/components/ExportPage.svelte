@@ -3,6 +3,7 @@
   import { api, post, remove } from '$lib/api';
   import type { LabelItem } from '$lib/presentation';
   import JobTable from './JobTable.svelte';
+  import TargetPicker from './TargetPicker.svelte';
   import { CheckCircle2, CircleAlert, Clock3, FileDown, ListFilter, LoaderCircle, Plus, Trash2, X } from '@lucide/svelte';
 
   type ExportJob = {
@@ -22,6 +23,10 @@
   let notices = $state<ExportNotice[]>([]);
   let pollTimer:ReturnType<typeof setTimeout>|undefined;
   let mounted=false;
+  let targetProfile = $state('');
+  let targetWorker = $state('');
+  let targetVerified = $state<any>(null);
+  let lastTargetProfile = '';
 
   const activeStatuses=['queued','dispatched','running'];
   const activeNotice=$derived(notices.some(item => activeStatuses.includes(item.job.status)));
@@ -78,8 +83,9 @@
     schedulePoll();
   }
 
-  async function load() {
-    const [sourceResult, labelResult] = await Promise.all([api<any>('/sources'), api<any>('/labels')]);
+  async function load(profile = targetProfile) {
+    const sourcePath = profile ? `/sources?profile=${encodeURIComponent(profile)}` : '/sources';
+    const [sourceResult, labelResult] = await Promise.all([api<any>(sourcePath), api<any>('/labels')]);
     sources = sourceResult.items || [];
     labels = (labelResult.items || []).filter((item: unknown): item is LabelItem => Boolean(item && typeof item === 'object' && typeof (item as LabelItem).label === 'string'));
   }
@@ -107,6 +113,10 @@
   }
   async function submit() {
     try {
+      if (!targetVerified || targetVerified.profile !== targetProfile || targetVerified.worker !== targetWorker) {
+        message='Verifikasi profile dan worker terlebih dahulu.';
+        return;
+      }
       const manualStartId=Number(startId);
       if (overwriteStartId && (!Number.isInteger(manualStartId) || manualStartId < 1)) {
         message='Start ID manual harus berupa angka minimal 1.';
@@ -115,7 +125,9 @@
       const payload:Record<string,unknown>={
         chat_ref:chatRef,
         label:label || undefined,
-        use_url_message_id:overwriteStartId
+        use_url_message_id:overwriteStartId,
+        profile: targetProfile,
+        worker: targetWorker
       };
       if (overwriteStartId) payload.start_id=manualStartId;
       const job=await post<ExportJob>('/exports', payload);
@@ -126,6 +138,17 @@
     }
     catch (cause) { message = cause instanceof Error ? cause.message : 'Export gagal dibuat.'; }
   }
+  $effect(() => {
+    if (targetProfile && targetProfile !== lastTargetProfile) {
+      lastTargetProfile = targetProfile;
+      sources = [];
+      selected = '';
+      chatRef = '';
+      startId = '1';
+      label = '';
+      load(targetProfile);
+    }
+  });
   onMount(() => {
     mounted=true;
     const saved=JSON.parse(sessionStorage.getItem('tme3-export-notices') || '[]');
@@ -133,7 +156,7 @@
       Promise.all(saved.slice(0,4).map(id => api<ExportJob>(`/jobs/${id}`).catch(() => null)))
         .then(jobs => { notices=jobs.filter((job):job is ExportJob => Boolean(job)).map(job => ({job,announcedTerminal:false})); schedulePoll(); });
     }
-    load();
+    load(targetProfile);
     return () => { mounted=false;if(pollTimer)clearTimeout(pollTimer); };
   });
 </script>
@@ -166,13 +189,15 @@
 
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">EXPORT</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Source & pembuatan export</h1><p class="muted mt-2">Pilih source tersimpan atau masukkan username/numeric chat ID.</p></div><div class="hidden rounded-2xl bg-violet-50 p-3 text-violet-700 sm:block dark:bg-violet-950 dark:text-violet-200"><FileDown size={24}/></div></header>
 
+<div class="mt-6"><TargetPicker purpose="export" bind:profile={targetProfile} bind:worker={targetWorker} bind:verified={targetVerified} /></div>
+
 <div class="mt-7 grid gap-5 xl:grid-cols-[.84fr_1.16fr]">
   <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Export baru</h2><p class="muted text-sm">Start ID dapat dioverride saat diperlukan.</p></div></div>
     <label class="mt-6 block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
     <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
     <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId} /><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Aktifkan hanya untuk export ini. Last ID backend tidak akan diturunkan.</span></span></label>
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
-    <button class="button mt-6 w-full" onclick={submit}><FileDown size={16}/>Mulai export</button>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
+    <button class="button mt-6 w-full" onclick={submit} disabled={!targetVerified}><FileDown size={16}/>Mulai export</button>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>
 
   <section class="card overflow-hidden"><div class="flex items-center justify-between border-b border-[var(--line)] px-5 py-4 sm:px-6"><div class="flex items-center gap-3"><div class="grid size-9 place-items-center rounded-xl bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><ListFilter size={18}/></div><div><h2 class="font-extrabold">Source tersimpan</h2><p class="muted text-sm">Klik source untuk memakai Last ID berikutnya.</p></div></div><span class="badge">{sources.length} source</span></div>

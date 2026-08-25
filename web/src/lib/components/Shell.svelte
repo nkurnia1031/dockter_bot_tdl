@@ -127,20 +127,10 @@
         <div class="flex min-w-0 items-center justify-between gap-2 sm:gap-3">
           <div class="topbar-left flex min-w-0 flex-1 items-center gap-2">
             <button class="button secondary menu-trigger size-10 shrink-0 !rounded-xl !p-0 lg:hidden" onclick={() => mobileOpen = true} aria-label="Buka navigasi"><Menu size={19}/></button>
-            <div class="profile-picker flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-2 py-1 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
-              <div class="profile-icon hidden shrink-0 place-items-center rounded-lg bg-violet-100 text-violet-700 sm:grid dark:bg-violet-950 dark:text-violet-200"><Users size={15}/></div>
-              <div class="hidden min-w-0 sm:block"><p class="muted truncate text-[.68rem] font-bold uppercase tracking-[.12em]">Profile aktif</p></div>
-              <select class="profile-select field h-9 min-w-0 w-[7.5rem] !border-0 !bg-transparent !px-1.5 !py-1 text-sm font-bold shadow-none focus:!ring-0 sm:h-10 sm:w-[9.5rem] sm:!border-[var(--line)] sm:!bg-[var(--panel-strong)] sm:!px-3 sm:shadow-sm" aria-label="Pilih profile" value={session.current.actor?.profile} disabled={session.switching} onchange={(event) => chooseProfile((event.currentTarget as HTMLSelectElement).value)}>
-                {#each session.current.profiles as profile}<option value={profile}>{profile}</option>{/each}
-              </select>
+            <div class="flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2">
+              <Users class="shrink-0 text-violet-500" size={15}/><div class="min-w-0"><p class="muted truncate text-[.65rem] font-bold uppercase tracking-[.12em]">Actor profile</p><b class="block max-w-28 truncate text-sm">{session.current.actor?.profile || '-'}</b></div>
             </div>
-            <div class="profile-picker flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-2 py-1 sm:border-0 sm:bg-transparent sm:px-0 sm:py-0">
-              <div class="profile-icon hidden shrink-0 place-items-center rounded-lg bg-sky-100 text-sky-700 md:grid dark:bg-sky-950 dark:text-sky-200"><Server size={15}/></div>
-              <div class="hidden min-w-0 xl:block"><p class="muted truncate text-[.68rem] font-bold uppercase tracking-[.12em]">Worker aktif</p></div>
-              <select class="profile-select field h-9 min-w-0 w-[7.5rem] !border-0 !bg-transparent !px-1.5 !py-1 text-sm font-bold shadow-none focus:!ring-0 sm:h-10 sm:w-[9.5rem] sm:!border-[var(--line)] sm:!bg-[var(--panel-strong)] sm:!px-3 sm:shadow-sm" aria-label="Pilih worker" value={session.current.actor?.worker_route} disabled={session.switching} onchange={(event) => chooseWorker((event.currentTarget as HTMLSelectElement).value)}>
-                {#each session.workers as worker}<option value={worker.name}>{worker.name}</option>{/each}
-              </select>
-            </div>
+            <div class="hidden min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 md:flex"><Server class="shrink-0 text-sky-500" size={15}/><div><p class="muted text-[.65rem] font-bold uppercase tracking-[.12em]">Target</p><span class="text-xs font-semibold text-[var(--muted)]">Dipilih per fitur</span></div></div>
             <span class="hidden items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-700 md:inline-flex dark:bg-emerald-950 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Backend online</span>
           </div>
           <div class="topbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
@@ -173,9 +163,6 @@
 <style>
   .app-shell { transition: grid-template-columns .24s cubic-bezier(.16, 1, .3, 1); }
   .topbar { box-shadow: 0 1px 0 color-mix(in srgb, var(--line) 75%, transparent); }
-  .profile-picker { transition: border-color .18s ease, background .18s ease, box-shadow .18s ease; }
-  .profile-picker:focus-within { border-color: color-mix(in srgb, var(--brand) 58%, var(--line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 14%, transparent); }
-  .profile-select { text-overflow: ellipsis; }
   .app-sidebar { background: color-mix(in srgb, var(--panel-strong) 92%, transparent); }
   .sidebar-collapsed { grid-template-columns: 5.5rem 1fr; }
   .sidebar-collapsed .brand-copy, .sidebar-collapsed .nav-label, .sidebar-collapsed .worker-card { display: none; }

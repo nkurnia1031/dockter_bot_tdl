@@ -92,6 +92,25 @@ class WorkerHttpDispatcher:
             "/internal/v1/workspace/tree?path=" + quote(path, safe=""),
         )
 
+    def capabilities(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            "/internal/v1/capabilities",
+            timeout=15,
+        )
+
+    def check_worker(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        capabilities = self.capabilities(worker)
+        return {"healthy": True, **capabilities}
+
     def job_log(self, worker: str, job_id: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:
