@@ -39,6 +39,7 @@ describe('ExportPage labels', () => {
     render(ExportPage);
     await screen.findByText('Export baru');
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
+    await screen.findByText('Target backend terverifikasi');
     const input=screen.getByLabelText('Username atau chat ID');
     await fireEvent.input(input, {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
@@ -64,6 +65,7 @@ describe('ExportPage labels', () => {
     }));
     render(ExportPage);
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
+    await screen.findByText('Target backend terverifikasi');
     const source=await screen.findByLabelText('Pilih source tersimpan');
     await screen.findByRole('option', {name:/example/});
     await fireEvent.change(source, {target:{value:'example'}});
