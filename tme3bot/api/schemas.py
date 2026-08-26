@@ -214,6 +214,7 @@ class ExportRequest(BaseModel):
     start_id: int | None = Field(default=None, ge=1)
     label: str | None = None
     use_url_message_id: bool = False
+    save_source: bool | None = None
     profile: str | None = None
     worker: str | None = None
 

@@ -552,6 +552,55 @@ class TelegramFrontendApp:
             state.select_source(source)
             self._show_export_workspace(message, user_id, actor)
             return
+        if data.startswith("ew:del:"):
+            parts = data.split(":")
+            digest = parts[2] if len(parts) > 2 else ""
+            action = parts[3] if len(parts) > 3 else "ask"
+            try:
+                sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
+                source = next(
+                    item
+                    for item in sources
+                    if source_digest(str(item.get("chat_ref", ""))) == digest
+                )
+            except (StopIteration, ValueError, KeyError):
+                self._show_export_workspace(
+                    message, user_id, actor, "Source sudah berubah; refresh ulang."
+                )
+                return
+            chat_ref = str(source.get("chat_ref") or "")
+            if action == "yes":
+                self.client.delete(
+                    user_id,
+                    f"/api/v1/sources/{quote(chat_ref, safe='')}"
+                    f"?profile={quote(str(actor['profile']), safe='')}",
+                )
+                state = self.export_workspaces.get(message.chat_id, user_id)
+                if state.chat_ref and state.chat_ref.lstrip("@").casefold() == chat_ref.lstrip("@").casefold():
+                    state.source = None
+                    state.chat_ref = None
+                    state.start_id = None
+                    state.overwrite_start_id = False
+                    state.save_source = False
+                    state.clear_job_view()
+                self._show_export_workspace(
+                    message, user_id, actor, f"Source {chat_ref} dihapus."
+                )
+                return
+            if action == "no":
+                self._show_export_workspace(message, user_id, actor)
+                return
+            edit_menu_message(
+                message,
+                f"Hapus source {chat_ref}? Last ID dan label source ini akan dihapus dari profile aktif.",
+                InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Ya, hapus", callback_data=f"ew:del:{digest}:yes")],
+                        [InlineKeyboardButton("Batal", callback_data=f"ew:del:{digest}:no")],
+                    ]
+                ),
+            )
+            return
         if data.startswith("ew:p:"):
             try:
                 page = max(0, int(data.split(":", 2)[2]))
@@ -606,6 +655,18 @@ class TelegramFrontendApp:
                 else "Overwrite dimatikan; Start ID kembali memakai Last ID + 1."
             )
             self._show_export_workspace(message, user_id, actor, notice)
+            return
+        if data == "ew:save":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.set_save_source(not state.save_source)
+            self._show_export_workspace(
+                message,
+                user_id,
+                actor,
+                "Source numeric akan disimpan setelah export."
+                if state.save_source
+                else "Source numeric tidak akan disimpan sebagai source baru.",
+            )
             return
         if data == "ew:last":
             state = self.export_workspaces.get(message.chat_id, user_id)

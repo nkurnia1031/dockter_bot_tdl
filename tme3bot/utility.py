@@ -261,6 +261,9 @@ class UtilityRunner:
                 )
                 before = self._snapshot(path)
                 self._run_folder(utility, path, password, settings or DEFAULT_UTILITY_SETTINGS)
+                temporary_json_removed = 0
+                if utility == "pindah":
+                    temporary_json_removed = self._cleanup_pindah_outputs(path)
                 after = self._snapshot(path)
                 detail: dict[str, object] = {
                     "folder": folder,
@@ -271,6 +274,8 @@ class UtilityRunner:
                     "groups": after["directories"],
                     "archives": after["archives"],
                 }
+                if utility == "pindah":
+                    detail["temporary_json_removed"] = temporary_json_removed
                 if utility == "export":
                     detail["organizer"] = self._organizer_log_summary(path)
                 succeeded.append(str(path))
@@ -315,6 +320,10 @@ class UtilityRunner:
                     "unresolved_groups": sum(int(item.get("unresolved_groups", 0)) for item in organizer),
                 }
             )
+        if utility == "pindah":
+            summary["temporary_json_removed"] = sum(
+                int(item.get("temporary_json_removed", 0)) for item in details
+            )
         return UtilityResult(utility, succeeded, failed, details, summary)
 
     def _progress(self, value: dict[str, object]) -> None:
@@ -346,6 +355,28 @@ class UtilityRunner:
             "unresolved_groups": unresolved,
             "log_lines": lines_count,
         }
+
+    @staticmethod
+    def _cleanup_pindah_outputs(folder: Path) -> int:
+        """Remove the two intermediate JSON files produced by ``pindah``.
+
+        ``pindah4.py`` creates ``output.json`` and ``pindah.py`` transforms it
+        into ``new_output.json`` for ``pindah2.py``. They are implementation
+        artifacts, not user deliverables, and are safe to remove only after
+        the complete shell pipeline returned successfully.
+        """
+        removed = 0
+        for name in ("output.json", "new_output.json"):
+            path = folder / name
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                LOGGER.warning("Could not remove Pindah temporary JSON: %s", path)
+                continue
+            removed += 1
+        return removed
 
     @staticmethod
     def _snapshot(folder: Path) -> dict[str, int]:

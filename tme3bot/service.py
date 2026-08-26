@@ -58,11 +58,24 @@ class ExportService:
         return parse_tme3_url(url, self.config.tme3_host)
 
     def export_from_url(
-        self, url: str, use_url_message_id: bool = False
+        self,
+        url: str,
+        use_url_message_id: bool = False,
+        save_source: bool | None = None,
     ) -> ExportJobResult:
         parsed = self.validate_url(url)
         source = self.state_store.get_source(parsed.chat_ref)
         is_new_source = source is None
+        # Numeric Telegram references are often one-off private/channel IDs.
+        # Do not create persistent state for those unless the caller explicitly
+        # opts in. Existing saved numeric sources remain persistent so their
+        # monotonic last_id continues to work as before.
+        is_numeric_source = parsed.chat_ref.strip().lstrip("-").isdigit()
+        persist_source = (
+            bool(save_source)
+            if save_source is not None
+            else (source is not None or not is_numeric_source)
+        )
         start_id = self._resolve_start_id(parsed, source, use_url_message_id)
         export_path = self._next_export_path(parsed)
         temp_path = self._next_temp_path(export_path.name)
@@ -87,14 +100,15 @@ class ExportService:
                 source.last_id if source is not None else export_result.max_message_id,
             )
             latest_id = next_last_id
-            self.state_store.upsert_source(
-                parsed.chat_ref,
-                parsed.canonical_label if parsed.requested_label else None,
-                next_last_id,
-                warmup_url=warmup_url,
-                warmup_done=False if warmup_required else None,
-            )
-        elif source is not None and parsed.requested_label:
+            if persist_source:
+                self.state_store.upsert_source(
+                    parsed.chat_ref,
+                    parsed.canonical_label if parsed.requested_label else None,
+                    next_last_id,
+                    warmup_url=warmup_url,
+                    warmup_done=False if warmup_required else None,
+                )
+        elif persist_source and source is not None and parsed.requested_label:
             self.state_store.upsert_source(
                 parsed.chat_ref, parsed.canonical_label, source.last_id
             )
@@ -334,7 +348,20 @@ class BatchDownloadService:
             return
 
         source = self.state_store.get_source(chat_ref)
-        if source is None or source.warmup_done:
+        if source is None:
+            # A numeric one-off export may deliberately not be persisted as a
+            # source, but its export metadata still carries the warmup URL.
+            # Warm it up once from the artifact metadata so download does not
+            # fail with CHAT_ID_INVALID.
+            if not bool(metadata.get("warmup_required")):
+                return
+            warmup_dir = download_dir / "__warmup"
+            try:
+                self.tdl_client.download_url(warmup_url, warmup_dir)
+            finally:
+                shutil.rmtree(warmup_dir, ignore_errors=True)
+            return
+        if source.warmup_done:
             return
 
         warmup_dir = download_dir / "__warmup"

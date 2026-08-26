@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tme3bot.media import has_downloadable_media
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -34,10 +36,17 @@ def inspect_export_json(path: Path) -> dict[str, Any]:
     for message in messages:
         if not isinstance(message, dict):
             continue
-        file_value = message.get("file")
-        if not file_value:
+        if not has_downloadable_media(message):
             continue
         counts["media_count"] += 1
+        file_value = next(
+            (
+                message.get(key)
+                for key in ("file", "document", "media", "file_name", "FileName")
+                if message.get(key)
+            ),
+            "",
+        )
         name = ""
         size = None
         if isinstance(file_value, dict):
@@ -47,6 +56,9 @@ def inspect_export_json(path: Path) -> dict[str, Any]:
                 size = int(raw_size)
         else:
             name = str(file_value)
+            raw_size = message.get("size")
+            if isinstance(raw_size, (int, float)) and raw_size >= 0:
+                size = int(raw_size)
         kind = str(message.get("type") or "").lower()
         mime = str(message.get("mime_type") or mimetypes.guess_type(name)[0] or "")
         if "photo" in kind or mime.startswith("image/"):
@@ -68,6 +80,29 @@ def inspect_export_json(path: Path) -> dict[str, Any]:
         "chat_ref": str(metadata.get("chat_ref") or payload.get("id") or ""),
         "label": metadata.get("label"),
     }
+
+
+def discard_export_without_media(path: Path, stats: dict[str, Any]) -> bool:
+    """Remove an export JSON when its inspected media count is exactly zero.
+
+    The worker calls this only after the JSON has been parsed successfully.  A
+    missing file is treated as an idempotent success, while an unknown or
+    non-zero media count is never removed.  This keeps a malformed/unsupported
+    export safe and avoids accidentally deleting a useful artifact when the
+    inspector cannot determine its contents.
+    """
+    media_count = stats.get("media_count")
+    if (
+        isinstance(media_count, bool)
+        or not isinstance(media_count, (int, float))
+        or media_count != 0
+    ):
+        return False
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+    return True
 
 
 class ExportArtifactCatalog:

@@ -161,6 +161,13 @@ def format_job_status(job: dict[str, Any]) -> str:
             artifact = artifact or value["artifact"].get("filename")
         if artifact:
             lines.append(f"Artifact: {_short(artifact, 160)}")
+        elif value.get("artifact_deleted"):
+            lines.append("Artifact: JSON dihapus otomatis (tidak ada media)")
+        if value.get("artifact_delete_error"):
+            lines.append(
+                "Peringatan cleanup: "
+                + _short(value.get("artifact_delete_error"), 240)
+            )
         error = job.get("error")
         if isinstance(error, dict):
             error = error.get("message")

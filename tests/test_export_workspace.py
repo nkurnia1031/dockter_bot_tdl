@@ -64,6 +64,15 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertEqual(state.effective_start_id, 1)
         self.assertEqual(state.payload()["chat_ref"], "newchannel")
 
+    def test_numeric_source_defaults_to_not_saved_and_can_opt_in(self):
+        state = ExportWorkspaceState()
+        state.select_chat_ref("-100123")
+
+        self.assertFalse(state.save_source)
+        self.assertFalse(state.payload()["save_source"])
+        state.set_save_source(True)
+        self.assertTrue(state.payload()["save_source"])
+
     def test_store_isolated_by_chat_and_user(self):
         store = ExportWorkspaceStore()
         first = store.get(10, 42)
@@ -151,6 +160,16 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertIn("Pilih source tersimpan", labels)
         self.assertFalse(any("source-1" in value for value in labels))
 
+    def test_source_picker_exposes_delete_action(self):
+        state = ExportWorkspaceState(source_picker=True)
+        markup = export_workspace_markup(
+            state, [{"chat_ref": "channel", "label": "arsip"}], []
+        )
+        buttons = [button for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("Hapus", [button.text for button in buttons])
+        self.assertTrue(any(button.callback_data.startswith("ew:del:") for button in buttons))
+
     def test_job_formatter_is_structured_and_omits_missing_fields(self):
         text = format_export_job(
             {
@@ -194,6 +213,25 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertIn("Media: 10", text)
         self.assertIn("Artifact: export.json", text)
         self.assertNotIn("{'", text)
+
+    def test_status_formatter_explains_media_less_artifact_cleanup(self):
+        text = format_export_status(
+            {
+                "status": "succeeded",
+                "id": "job-empty",
+                "result": {
+                    "value": {
+                        "message_count": 4,
+                        "media_count": 0,
+                        "artifact_deleted": True,
+                        "artifact_delete_reason": "no_media",
+                    }
+                },
+            }
+        )
+
+        self.assertIn("Media: 0", text)
+        self.assertIn("JSON dihapus otomatis (tidak ada media)", text)
 
     def test_status_formatter_includes_active_json_file_speed_and_eta(self):
         text = format_export_status(

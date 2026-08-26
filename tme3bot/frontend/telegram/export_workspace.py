@@ -18,6 +18,11 @@ def normalize_chat_ref(chat_ref: str) -> str:
     return value.lstrip("@").casefold()
 
 
+def is_numeric_chat_ref(chat_ref: str | None) -> bool:
+    value = normalize_chat_ref(str(chat_ref or ""))
+    return bool(value) and value.lstrip("-").isdigit()
+
+
 def short_text(value: Any, limit: int = 80) -> str:
     text = str(value or "").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
@@ -61,6 +66,9 @@ def export_report(job: dict[str, Any]) -> dict[str, Any]:
         "latest_id": value.get("latest_id"),
         "filename": value.get("filename") or artifact.get("filename"),
         "artifact": value.get("artifact_key") or artifact.get("artifact_key"),
+        "artifact_deleted": value.get("artifact_deleted"),
+        "artifact_delete_reason": value.get("artifact_delete_reason"),
+        "artifact_delete_error": value.get("artifact_delete_error"),
         "progress_message": progress.get("message"),
         "error": (job.get("error") or {}).get("message") if isinstance(job.get("error"), dict) else job.get("error"),
     }
@@ -128,6 +136,12 @@ def format_export_job(job: dict[str, Any]) -> str:
                 lines.append(f"{label}: {report[key]}")
         if report["filename"] or report["artifact"]:
             lines.append(f"Artifact: {report['filename'] or report['artifact']}")
+        elif report["artifact_deleted"]:
+            lines.append("Artifact: JSON dihapus otomatis (tidak ada media)")
+        if report["artifact_delete_error"]:
+            lines.append(
+                f"Peringatan cleanup: {short_text(report['artifact_delete_error'], 240)}"
+            )
         if report["error"]:
             lines.append(f"Error: {short_text(report['error'], 240)}")
     return "\n".join(lines)
@@ -156,6 +170,7 @@ class ExportWorkspaceState:
     label: str | None = None
     start_id: int | None = None
     overwrite_start_id: bool = False
+    save_source: bool = False
     active_job_id: str | None = None
     job_snapshot: dict[str, Any] | None = None
     source_page: int = 0
@@ -176,6 +191,7 @@ class ExportWorkspaceState:
         self.chat_ref = ref
         self.start_id = None
         self.overwrite_start_id = False
+        self.save_source = is_numeric_chat_ref(ref)
         self.source_page = 0
         self.source_picker = False
         self.source_query = ""
@@ -192,6 +208,7 @@ class ExportWorkspaceState:
             self.source["chat_ref"] = ref
         self.start_id = None
         self.overwrite_start_id = False
+        self.save_source = source is not None and is_numeric_chat_ref(ref)
         self.source_page = 0
         self.source_picker = False
         self.source_query = ""
@@ -231,6 +248,10 @@ class ExportWorkspaceState:
             self.start_id = None
         self.touch()
 
+    def set_save_source(self, enabled: bool) -> None:
+        self.save_source = bool(enabled)
+        self.touch()
+
     @property
     def default_start_id(self) -> int:
         if self.source is None:
@@ -259,6 +280,8 @@ class ExportWorkspaceState:
             payload["use_url_message_id"] = True
         else:
             payload["use_url_message_id"] = False
+        if is_numeric_chat_ref(self.chat_ref):
+            payload["save_source"] = self.save_source
         return payload
 
 

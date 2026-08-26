@@ -220,6 +220,51 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(client.export_calls[0][0:2], ("4429689667", 11))
             self.assertEqual(store.get_source("4429689667").last_id, 20)
 
+    def test_new_numeric_source_is_not_saved_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            client = FakeExportTDLClient(
+                ExportResult(
+                    export_path=root / "ignored.json",
+                    messages=[{"id": 12}],
+                    exported_count=1,
+                    max_message_id=12,
+                    has_media=False,
+                )
+            )
+
+            result = ExportService(config, store, client).export_from_url(
+                "https://t.me/c/100123/11"
+            )
+
+            self.assertEqual(result.latest_id, 12)
+            self.assertIsNone(store.get_source("100123"))
+
+    def test_numeric_source_can_be_saved_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            client = FakeExportTDLClient(
+                ExportResult(
+                    export_path=root / "ignored.json",
+                    messages=[{"id": 12}],
+                    exported_count=1,
+                    max_message_id=12,
+                    has_media=False,
+                )
+            )
+
+            result = ExportService(config, store, client).export_from_url(
+                "https://t.me/c/100123/11",
+                save_source=True,
+            )
+
+            self.assertEqual(result.latest_id, 12)
+            self.assertEqual(store.get_source("100123").last_id, 12)
+
     def test_download_warmups_new_chat_before_batch_json(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

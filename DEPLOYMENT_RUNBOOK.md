@@ -88,6 +88,14 @@ tetap berjalan walaupun panel utama berpindah source; hanya pembaruan panel yang
 dihentikan ketika view token sudah tidak aktif. Pesan status tidak dibuat ulang
 pada setiap polling atau saat job selesai.
 
+Export yang selesai tanpa media tidak didaftarkan sebagai artifact download.
+Worker membaca statistik JSON terlebih dahulu, menghapus file JSON tersebut
+secara otomatis, dan report job menampilkan `JSON dihapus otomatis (tidak ada
+media)`. Jika penghapusan gagal karena permission atau filesystem, job tetap
+menyimpan report cleanup error dan artifact tetap tidak dibuat sebagai item
+download; perbaiki filesystem lalu biarkan inventory/maintenance berikutnya
+membersihkan file yang tersisa.
+
 Perubahan status Telegram ini hanya mengubah image gateway/frontend Telegram.
 Tidak memerlukan rebuild base Go/TDL atau update worker remote.
 
@@ -843,6 +851,24 @@ menampilkan picker ringkas dengan maksimal enam source per halaman, pagination,
 recent source, pencarian input, dan callback digest yang stabil. Source baru
 tetap memakai username/numeric ID. Memilih source baru mereset report panel
 dan overwrite Start ID, tetapi tidak membatalkan job lama.
+
+## Source management dan cleanup Utility Pindah
+
+Source tersimpan dapat dihapus dari Web pada daftar `Source tersimpan` melalui
+ikon Trash setelah konfirmasi. Pada Telegram, buka `Pilih source tersimpan`
+di Export Fokus lalu gunakan tombol `Hapus`, atau buka `Workspace full fitur`
+dan menu source management untuk penghapusan tunggal maupun batch.
+
+Source dengan chat reference numeric tidak otomatis ditambahkan ke backend.
+Aktifkan `Simpan source numeric` pada panel Telegram atau Web jika ID tersebut
+ingin dipakai lagi dengan Last ID yang tersinkron. Source username tetap
+tersimpan otomatis setelah export sukses, sedangkan source numeric yang sudah
+tersimpan tetap diperbarui monotonic.
+
+Utility `Pindah` membuat `output.json` dan `new_output.json` sebagai file
+perantara. Setelah seluruh pipeline Pindah berhasil, worker menghapus kedua
+file tersebut dan report menyertakan `temporary_json_removed`. Jika pipeline
+gagal, cleanup tidak dijalankan agar diagnosis tetap memungkinkan.
 
 ## Context target per fitur dan Download global
 

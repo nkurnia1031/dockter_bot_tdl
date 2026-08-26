@@ -403,6 +403,11 @@ class ControlPlane:
         if event.event_type == "artifact.discovered" and self.export_catalog is not None:
             artifact = result.get("artifact")
             if isinstance(artifact, dict):
+                # A media-less export is intentionally disposable and should
+                # not become a downloadable artifact, even if an older or
+                # incompatible worker accidentally reports it.
+                if artifact.get("media_count") == 0:
+                    return
                 self.export_catalog.upsert(**artifact)
         if (
             event.event_type == "artifact.inventory_completed"

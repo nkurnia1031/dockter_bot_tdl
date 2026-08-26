@@ -66,6 +66,16 @@ def _export_source_compact_markup(
             InlineKeyboardButton(f"Start ID: {start_text}"[:30], callback_data="ew:last"),
         ],
     ]
+    if selected_ref.lstrip("-").isdigit():
+        rows.insert(
+            4,
+            [
+                InlineKeyboardButton(
+                    f"Simpan source numeric: {'ON' if getattr(state, 'save_source', False) else 'OFF'}",
+                    callback_data="ew:save",
+                )
+            ],
+        )
 
     label_buttons = []
     for index, item in enumerate((labels or [])[:6]):
@@ -78,6 +88,15 @@ def _export_source_compact_markup(
         rows.append(label_buttons[:3])
         if len(label_buttons) > 3:
             rows.append(label_buttons[3:6])
+    if selected_ref and source:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "Hapus source terpilih",
+                    callback_data=f"ew:del:{source_digest(selected_ref)}:ask",
+                )
+            ]
+        )
     rows.extend(
         [
             [
@@ -218,7 +237,10 @@ def _export_source_picker_markup(state, sources: list[dict]) -> InlineKeyboardMa
             [
                 InlineKeyboardButton(
                     label[:60], callback_data=f"ew:s:{source_digest(ref)}"
-                )
+                ),
+                InlineKeyboardButton(
+                    "Hapus", callback_data=f"ew:del:{source_digest(ref)}:ask"
+                ),
             ]
         )
     if len(sources) > page_size:

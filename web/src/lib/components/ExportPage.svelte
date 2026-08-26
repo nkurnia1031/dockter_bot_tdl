@@ -17,6 +17,7 @@
   let chatRef = $state('');
   let startId = $state('1');
   let overwriteStartId = $state(false);
+  let saveNumericSource = $state(false);
   let label = $state('');
   let selected = $state('');
   let message = $state('');
@@ -46,9 +47,11 @@
     persistNotices();
   }
   function resultValue(job:ExportJob) { return job.result?.value || {}; }
+  function isNumericChatRef(value:string) { return /^-?\d+$/.test(value.trim()); }
   function completionText(job:ExportJob) {
     const value=resultValue(job);
     const messages=value.message_count ?? value.exported_count ?? 0;
+    if (value.artifact_deleted) return `${messages} pesan · 0 media · JSON dihapus otomatis`;
     const media=value.media_count;
     const mediaText=typeof media==='number' ? `${media} media` : value.has_media ? 'media tersedia' : '0 media';
     const details=[
@@ -97,10 +100,12 @@
       chatRef = found.chat_ref;
       startId = String(Number(found.last_id || 0) + 1);
       label = found.label || '';
+      saveNumericSource = isNumericChatRef(found.chat_ref);
     } else {
       chatRef = '';
       startId = '1';
       label = '';
+      saveNumericSource = false;
     }
   }
   function updateChatRef(value: string) {
@@ -109,6 +114,7 @@
       selected = '';
       overwriteStartId = false;
       startId = '1';
+      saveNumericSource = false;
     }
   }
   async function submit() {
@@ -129,6 +135,7 @@
         profile: targetProfile,
         worker: targetWorker
       };
+      if (isNumericChatRef(chatRef)) payload.save_source=saveNumericSource;
       if (overwriteStartId) payload.start_id=manualStartId;
       const job=await post<ExportJob>('/exports', payload);
       remember(job);
@@ -146,6 +153,7 @@
       chatRef = '';
       startId = '1';
       label = '';
+      saveNumericSource = false;
       load(targetProfile);
     }
   });
@@ -196,6 +204,7 @@
     <label class="mt-6 block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
     <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
     <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId} /><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Aktifkan hanya untuk export ini. Last ID backend tidak akan diturunkan.</span></span></label>
+    {#if isNumericChatRef(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource} /><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Default mati agar ID sekali pakai tidak memenuhi daftar source. Aktifkan jika Last ID ingin disimpan.</span></span></label>{/if}
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
     <button class="button mt-6 w-full" onclick={submit} disabled={!targetVerified}><FileDown size={16}/>Mulai export</button>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>

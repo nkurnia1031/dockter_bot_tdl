@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from tme3bot.backup_service import BackupService, sha256_file
-from tme3bot.export_catalog import inspect_export_json
+from tme3bot.export_catalog import discard_export_without_media, inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
@@ -542,8 +542,59 @@ class WorkerJobExecutor:
                     result = runtime.export_service.export_from_url(
                         str(url),
                         use_url_message_id=bool(payload.get("use_url_message_id", False)),
+                        save_source=(
+                            bool(payload["save_source"])
+                            if "save_source" in payload
+                            and payload.get("save_source") is not None
+                            else None
+                        ),
                     )
         stats = inspect_export_json(result.export_path)
+        if stats.get("media_count") == 0:
+            artifact_deleted = False
+            artifact_delete_error = None
+            try:
+                artifact_deleted = discard_export_without_media(result.export_path, stats)
+            except OSError as exc:
+                # Export itself succeeded. Keep that result visible, but make
+                # cleanup failure explicit so the leftover file can be fixed
+                # by a later inventory/maintenance pass.
+                artifact_delete_error = str(exc)
+                LOGGER.warning(
+                    "Could not remove media-less export %s: %s",
+                    result.export_path,
+                    exc,
+                )
+            reporter.report(
+                phase="completed",
+                message=(
+                    f"Export selesai: {result.exported_count} message tanpa media; "
+                    + (
+                        "JSON dihapus otomatis"
+                        if artifact_deleted
+                        else "JSON gagal dihapus"
+                    )
+                ),
+                overall={
+                    "current": result.exported_count,
+                    "total": result.exported_count,
+                    "percent": 100,
+                    "unit": "messages",
+                },
+                counters={"succeeded": result.exported_count, "failed": 0, "skipped": 0},
+                force=True,
+            )
+            empty_result = {
+                **asdict(result),
+                **stats,
+                "artifact_deleted": artifact_deleted,
+                "artifact_delete_reason": "no_media",
+            }
+            if artifact_delete_error:
+                empty_result["artifact_delete_error"] = artifact_delete_error
+            # No artifact.discovered event: a media-less JSON must never enter
+            # the download catalog, even if the cleanup encountered an error.
+            return empty_result
         artifact = {
             **stats,
             "profile": str(command["profile"]),
@@ -851,6 +902,20 @@ class WorkerJobExecutor:
                     stats = inspect_export_json(path)
                 except (OSError, ValueError) as exc:
                     LOGGER.warning("Artifact inventory skipped %s: %s", path, exc)
+                    continue
+                if stats.get("media_count") == 0:
+                    try:
+                        discard_export_without_media(path, stats)
+                    except OSError as exc:
+                        LOGGER.warning(
+                            "Could not remove media-less export during inventory %s: %s",
+                            path,
+                            exc,
+                        )
+                    # Do not publish an artifact for an empty export. Existing
+                    # catalog rows are intentionally left to inventory
+                    # completion, which marks files no longer present as
+                    # unavailable for audit/history.
                     continue
                 self.publisher.emit(
                     str(command["job_id"]),

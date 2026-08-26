@@ -3,10 +3,31 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tme3bot.export_catalog import ExportArtifactCatalog, inspect_export_json
+from tme3bot.export_catalog import (
+    ExportArtifactCatalog,
+    discard_export_without_media,
+    inspect_export_json,
+)
 
 
 class ExportArtifactCatalogTests(unittest.TestCase):
+    def test_media_less_export_is_discarded_but_media_export_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            empty = root / "empty.json"
+            empty.write_text(json.dumps({"messages": [{"id": 1, "type": "text"}]}), encoding="utf-8")
+            empty_stats = inspect_export_json(empty)
+            self.assertEqual(empty_stats["media_count"], 0)
+            self.assertTrue(discard_export_without_media(empty, empty_stats))
+            self.assertFalse(empty.exists())
+
+            media = root / "media.json"
+            media.write_text(json.dumps({"messages": [{"id": 2, "file": "a.jpg"}]}), encoding="utf-8")
+            media_stats = inspect_export_json(media)
+            self.assertEqual(media_stats["media_count"], 1)
+            self.assertFalse(discard_export_without_media(media, media_stats))
+            self.assertTrue(media.exists())
+
     def test_inspection_classifies_media_and_preserves_unknown_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "export.json"

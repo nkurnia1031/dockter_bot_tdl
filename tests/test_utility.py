@@ -48,6 +48,24 @@ class UtilitySummaryTests(unittest.TestCase):
         self.assertIn("relative-folder", result.failed)
         self.assertIn("absolut", result.failed["relative-folder"])
 
+    def test_pindah_removes_intermediate_json_after_success(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            runner = UtilityRunner(Path("utility"))
+
+            def fake_run_folder(utility, path, password, settings):
+                self.assertEqual(utility, "pindah")
+                (path / "output.json").write_text("{}", encoding="utf-8")
+                (path / "new_output.json").write_text("{}", encoding="utf-8")
+
+            runner._run_folder = fake_run_folder
+            result = runner.run("pindah", [str(folder)])
+
+            self.assertEqual(result.succeeded, [str(folder)])
+            self.assertFalse((folder / "output.json").exists())
+            self.assertFalse((folder / "new_output.json").exists())
+            self.assertEqual(result.details[0]["temporary_json_removed"], 2)
+
     def test_structured_marker_and_7z_line_become_progress(self):
         values = []
         with tempfile.TemporaryDirectory() as temp_dir:
