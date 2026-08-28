@@ -32,11 +32,20 @@ telemetry JSON N/N dan file N/N, speed/ETA, serta snapshot output TDL aktif.
 Seluruh worker harus diperbarui sebelum web static agar kontrak telemetry sama.
 
 Download manager secara default menampilkan artifact dan job lintas profile serta
-worker. UI mengosongkan selection saat filter berubah, menjalankan reconcile
-global, menunggu inventory relevan selesai, lalu memuat ulang katalog. Artifact
-yang tidak lagi ada di worker dipertahankan untuk audit di History dengan status
-`File tidak tersedia`, tetapi tidak dapat dijalankan. `Mulai semua` memakai
-endpoint batch dan mengelompokkan artifact berdasarkan origin tersimpan.
+worker. UI mengosongkan selection saat filter berubah dan memuat ulang katalog
+tanpa memulai scan worker baru. Reconcile global berjalan saat halaman dibuka di
+background atau saat tombol reconcile ditekan. Artifact yang tidak lagi ada di
+worker dipertahankan untuk audit di History dengan status `File tidak tersedia`,
+tetapi tidak dapat dijalankan. `Mulai semua` memakai endpoint batch dan
+mengelompokkan artifact berdasarkan origin tersimpan.
+
+Reconcile inventory dikirim worker dalam batch (maksimal 100 artifact per event),
+lalu gateway melakukan bulk upsert dalam satu transaksi SQLite. Katalog lama
+ditampilkan lebih dahulu ketika halaman dibuka sehingga pengguna tidak menunggu
+seluruh scan selesai. SQLite tetap menjadi satu sumber kebenaran; database
+terpisah tidak diperlukan untuk optimasi ini. Worker juga menyimpan fingerprint
+file JSON selama proses hidupnya sehingga JSON yang tidak berubah tidak diparse
+ulang pada reconcile berikutnya.
 
 Activity tetap menampilkan job lintas-worker untuk profile aktif. Mengganti
 worker hanya mengubah route job berikutnya; job lama tetap berjalan pada worker

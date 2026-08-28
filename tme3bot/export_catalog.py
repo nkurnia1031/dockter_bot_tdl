@@ -166,6 +166,10 @@ class ExportArtifactCatalog:
                     ON export_artifacts(profile, status, created_at);
                 CREATE INDEX IF NOT EXISTS export_artifacts_worker
                     ON export_artifacts(worker, profile, status);
+                CREATE INDEX IF NOT EXISTS export_artifacts_scope_created
+                    ON export_artifacts(profile, worker, archived_at, created_at DESC);
+                CREATE INDEX IF NOT EXISTS export_artifacts_global_created
+                    ON export_artifacts(archived_at, created_at DESC);
                 """
             )
             self._ensure_column(
@@ -179,6 +183,10 @@ class ExportArtifactCatalog:
             )
             self._ensure_column(db, "export_artifacts", "last_seen_at", "TEXT")
             self._ensure_column(db, "export_artifacts", "missing_at", "TEXT")
+            db.execute(
+                """CREATE INDEX IF NOT EXISTS export_artifacts_inventory
+                   ON export_artifacts(profile, worker, last_seen_inventory_id)"""
+            )
 
     @staticmethod
     def _ensure_column(
@@ -191,11 +199,11 @@ class ExportArtifactCatalog:
         if column not in columns:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
-    def upsert(self, **values: Any) -> dict[str, Any]:
+    @classmethod
+    def _record_from_values(cls, values: dict[str, Any], now: str) -> dict[str, Any]:
         status = str(values.get("status") or "pending")
-        if status not in self.STATUSES:
+        if status not in cls.STATUSES:
             raise ValueError("Status artifact tidak valid.")
-        now = utc_now()
         record = {
             "id": str(values.get("id") or uuid.uuid4()),
             "profile": str(values["profile"]),
@@ -229,6 +237,10 @@ class ExportArtifactCatalog:
             record["last_seen_at"] = now
         if record["available"]:
             record["missing_at"] = None
+        return record
+
+    @staticmethod
+    def _upsert_sql(record: dict[str, Any]) -> str:
         columns = ", ".join(record)
         placeholders = ", ".join(f":{name}" for name in record)
         updates = ", ".join(
@@ -244,18 +256,35 @@ class ExportArtifactCatalog:
                 "archived_at",
             }
         )
+        return f"""INSERT INTO export_artifacts({columns}) VALUES({placeholders})
+            ON CONFLICT(profile, worker, artifact_key) DO UPDATE SET {updates}"""
+
+    def upsert(self, **values: Any) -> dict[str, Any]:
+        now = utc_now()
+        record = self._record_from_values(values, now)
         with self._db() as db:
-            db.execute(
-                f"""INSERT INTO export_artifacts({columns}) VALUES({placeholders})
-                    ON CONFLICT(profile, worker, artifact_key) DO UPDATE SET {updates}""",
-                record,
-            )
+            db.execute(self._upsert_sql(record), record)
             row = db.execute(
                 """SELECT * FROM export_artifacts
                    WHERE profile=? AND worker=? AND artifact_key=?""",
                 (record["profile"], record["worker"], record["artifact_key"]),
             ).fetchone()
         return dict(row)
+
+    def upsert_many(self, values: list[dict[str, Any]]) -> int:
+        """Upsert an inventory batch in one SQLite transaction.
+
+        Inventory can contain hundreds of JSON files.  Keeping one connection,
+        one transaction, and one request per batch avoids the per-file commit
+        and HTTP round-trip that made reconcile appear stalled.
+        """
+        if not values:
+            return 0
+        now = utc_now()
+        records = [self._record_from_values(item, now) for item in values]
+        with self._db() as db:
+            db.executemany(self._upsert_sql(records[0]), records)
+        return len(records)
 
     def get(self, artifact_id: str) -> dict[str, Any] | None:
         with self._db() as db:
@@ -303,7 +332,7 @@ class ExportArtifactCatalog:
             clauses.append("archived_at IS NOT NULL")
         elif archived is False:
             clauses.append("archived_at IS NULL")
-        where = " AND ".join(clauses)
+        where = " AND ".join(clauses) or "1=1"
         with self._db() as db:
             total = int(db.execute(
                 f"SELECT COUNT(*) FROM export_artifacts WHERE {where}", params
@@ -416,9 +445,12 @@ class ExportArtifactCatalog:
             ).fetchall()
         return {str(row["status"]): int(row["total"]) for row in rows}
 
-    def origins(self) -> list[tuple[str, str]]:
+    def origins(self, *, include_archived: bool = False) -> list[tuple[str, str]]:
+        clause = "" if include_archived else " WHERE archived_at IS NULL"
         with self._db() as db:
             rows = db.execute(
-                "SELECT DISTINCT profile, worker FROM export_artifacts ORDER BY profile, worker"
+                "SELECT DISTINCT profile, worker FROM export_artifacts"
+                + clause
+                + " ORDER BY profile, worker"
             ).fetchall()
         return [(str(row["profile"]), str(row["worker"])) for row in rows]

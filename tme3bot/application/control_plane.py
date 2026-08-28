@@ -409,6 +409,16 @@ class ControlPlane:
                 if artifact.get("media_count") == 0:
                     return
                 self.export_catalog.upsert(**artifact)
+        if event.event_type == "artifact.inventory_batch" and self.export_catalog is not None:
+            artifacts = result.get("artifacts")
+            if isinstance(artifacts, list):
+                self.export_catalog.upsert_many(
+                    [
+                        item
+                        for item in artifacts
+                        if isinstance(item, dict) and item.get("media_count") != 0
+                    ]
+                )
         if (
             event.event_type == "artifact.inventory_completed"
             and self.export_catalog is not None

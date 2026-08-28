@@ -76,6 +76,26 @@ class ExportArtifactCatalogTests(unittest.TestCase):
             self.assertTrue(archived["archived_at"])
             self.assertEqual(catalog.restore(first["id"])["status"], "downloaded")
 
+    def test_inventory_batch_upserts_in_one_catalog_operation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = ExportArtifactCatalog(Path(temp_dir) / "app.db")
+            records = [
+                {
+                    "profile": "default",
+                    "worker": "local",
+                    "filename": f"{index}.json",
+                    "artifact_key": f"{index}.json",
+                    "status": "pending",
+                    "media_count": 1,
+                    "last_seen_inventory_id": "inventory-1",
+                }
+                for index in range(3)
+            ]
+            self.assertEqual(catalog.upsert_many(records), 3)
+            items, total = catalog.list(profile="default", worker="local")
+            self.assertEqual(total, 3)
+            self.assertEqual(len(items), 3)
+
     def test_inventory_marks_missing_and_restores_discovered_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = ExportArtifactCatalog(Path(temp_dir) / "app.db")

@@ -185,6 +185,13 @@ class WorkerJobExecutor:
         self._lock = threading.RLock()
         self._job_log = threading.local()
         self._log_snapshots: dict[str, JobLogSnapshot] = {}
+        # Inventory statistics are derived from the JSON file.  Keep a small
+        # process-local fingerprint cache so repeated reconciles do not parse
+        # unchanged exports again.  The cache is intentionally disposable;
+        # a worker restart simply performs one full scan.
+        self._inventory_cache: dict[
+            tuple[str, str], tuple[tuple[int, int, int], dict[str, Any]]
+        ] = {}
         self._jobs = ResourceAwareQueue[dict[str, Any]](
             self._run,
             error_handler=self._unhandled_resource,
@@ -896,13 +903,49 @@ class WorkerJobExecutor:
             ("failed", runtime.config.export_failed_dir),
         )
         discovered = 0
+        inventory_batch: list[dict[str, Any]] = []
+        profile_name = str(command["profile"])
+        seen_cache_keys: set[tuple[str, str]] = set()
+
+        def publish_inventory_batch() -> None:
+            if not inventory_batch:
+                return
+            self.publisher.emit(
+                str(command["job_id"]),
+                "running",
+                "artifact.inventory_batch",
+                result={"artifacts": list(inventory_batch)},
+            )
+            inventory_batch.clear()
+
         for status, root in locations:
             for path in sorted(root.glob("*.json")):
+                cache_key = (profile_name, str(path))
                 try:
-                    stats = inspect_export_json(path)
-                except (OSError, ValueError) as exc:
+                    file_stat = path.stat()
+                    fingerprint = (
+                        int(getattr(file_stat, "st_ino", 0)),
+                        int(file_stat.st_size),
+                        int(file_stat.st_mtime_ns),
+                    )
+                except OSError as exc:
                     LOGGER.warning("Artifact inventory skipped %s: %s", path, exc)
                     continue
+                seen_cache_keys.add(cache_key)
+                with self._lock:
+                    cached = self._inventory_cache.get(cache_key)
+                if cached is not None and cached[0] == fingerprint:
+                    stats = dict(cached[1])
+                else:
+                    try:
+                        stats = inspect_export_json(path)
+                    except (OSError, ValueError) as exc:
+                        with self._lock:
+                            self._inventory_cache.pop(cache_key, None)
+                        LOGGER.warning("Artifact inventory skipped %s: %s", path, exc)
+                        continue
+                    with self._lock:
+                        self._inventory_cache[cache_key] = (fingerprint, dict(stats))
                 if stats.get("media_count") == 0:
                     try:
                         discard_export_without_media(path, stats)
@@ -912,29 +955,37 @@ class WorkerJobExecutor:
                             path,
                             exc,
                         )
+                    with self._lock:
+                        self._inventory_cache.pop(cache_key, None)
                     # Do not publish an artifact for an empty export. Existing
                     # catalog rows are intentionally left to inventory
                     # completion, which marks files no longer present as
                     # unavailable for audit/history.
                     continue
-                self.publisher.emit(
-                    str(command["job_id"]),
-                    "running",
-                    "artifact.discovered",
-                    result={
-                        "artifact": {
-                            **stats,
-                            "profile": str(command["profile"]),
-                            "worker": str(command.get("worker") or self.config.backup_node_name),
-                            "filename": path.name,
-                            "artifact_key": path.name,
-                            "status": status,
-                            "available": True,
-                            "last_seen_inventory_id": inventory_id,
-                        }
-                    },
+                inventory_batch.append(
+                    {
+                        **stats,
+                        "profile": profile_name,
+                        "worker": str(command.get("worker") or self.config.backup_node_name),
+                        "filename": path.name,
+                        "artifact_key": path.name,
+                        "status": status,
+                        "available": True,
+                        "last_seen_inventory_id": inventory_id,
+                    }
                 )
                 discovered += 1
+                if len(inventory_batch) >= 100:
+                    publish_inventory_batch()
+        with self._lock:
+            stale_keys = [
+                key
+                for key in self._inventory_cache
+                if key[0] == profile_name and key not in seen_cache_keys
+            ]
+            for key in stale_keys:
+                self._inventory_cache.pop(key, None)
+        publish_inventory_batch()
         inventory = {
             "inventory_id": inventory_id,
             "profile": str(command["profile"]),

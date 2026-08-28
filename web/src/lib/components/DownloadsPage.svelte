@@ -91,7 +91,7 @@
   }
   async function reconcile() {
     const request = ++generation;
-    syncing=true; pending=true; artifacts=[]; selected=[]; message='Menyinkronkan inventory seluruh profile-worker...';
+    syncing=true; pending=true; selected=[]; message='Menyinkronkan inventory seluruh profile-worker...';
     try {
       const result = await post<{jobs?:Array<{id:string}>; id?:string}>('/downloads/artifacts/reconcile', {scope:'global', profile:profileFilter || null, worker:workerFilter || null});
       const jobs = result.jobs || (result.id ? [{id:result.id}] : []);
@@ -116,8 +116,33 @@
     if (confirm === 'purge') for (const item of selectedItems) await remove(`/downloads/artifacts/${item.id}`);
     confirm=null; selected=[]; await load();
   }
-  function changeFilter() { generation += 1; selected=[]; reconcile(); }
-  onMount(() => { reconcile(); return () => { generation += 1; }; });
+  async function changeFilter() {
+    // Filtering is a catalog read, not a reason to rescan every worker. The
+    // inventory is refreshed on page entry or manual reconcile, so filters
+    // remain responsive even when the workers contain many JSON files.
+    const request = ++generation;
+    selected=[];
+    pending=true;
+    try { await load(request); }
+    catch (cause) {
+      if (request === generation) message = cause instanceof Error ? cause.message : 'Artifact gagal dimuat.';
+    }
+    finally { if (request === generation) pending=false; }
+  }
+  onMount(() => {
+    let disposed=false;
+    void (async () => {
+      try {
+        // Show the catalog immediately. Reconcile continues in the
+        // background and refreshes it when inventory is complete.
+        await load();
+        if (!disposed) await reconcile();
+      } catch (cause) {
+        if (!disposed) message = cause instanceof Error ? cause.message : 'Artifact gagal dimuat.';
+      }
+    })();
+    return () => { disposed=true; generation += 1; };
+  });
 </script>
 
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">DOWNLOAD</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Download manager</h1><p class="muted mt-2">Semua artifact lintas profile dan worker. Origin artifact menentukan runtime download secara otomatis.</p></div><div class="page-icon"><Boxes size={23}/></div></header>
