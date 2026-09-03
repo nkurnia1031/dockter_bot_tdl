@@ -133,6 +133,7 @@ class WorkerResponse(ApiResponse):
     name: str
     url: str
     selected: bool = False
+    enabled: bool = True
 
 
 class WorkerListResponse(ApiResponse):
@@ -265,11 +266,17 @@ class WorkerRequest(BaseModel):
     name: str
     url: str
     token: str
+    enabled: bool = True
 
 
 class WorkerUpdateRequest(BaseModel):
     url: str
-    token: str
+    token: str | None = None
+    enabled: bool | None = None
+
+
+class WorkerEnabledRequest(BaseModel):
+    enabled: bool
 
 
 class WorkerRouteRequest(BaseModel):

@@ -3,8 +3,9 @@ import unittest
 from pathlib import Path
 
 from tme3bot.application.control_plane import ControlPlane
-from tme3bot.domain.models import Actor, JobEvent, JobStatus
+from tme3bot.domain.models import Actor, DomainError, JobEvent, JobStatus
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.worker_registry import WorkerRegistry
 
 
 class FakeProfiles:
@@ -78,6 +79,22 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(second.status.value, "queued")
         self.assertEqual(download.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
+
+    def test_disabled_worker_rejects_new_jobs_and_routes(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "workers.json",
+            {"local": "http://worker-local"},
+            {"local": "worker-token"},
+        )
+        registry.set_enabled("local", False)
+        self.control.worker_registry = registry
+
+        with self.assertRaises(DomainError) as error:
+            self.control.submit_job(self.actor, "export", {"url": "https://t.me/c/1/2"})
+        self.assertEqual(error.exception.code, "WORKER_DISABLED")
+        with self.assertRaises(DomainError) as route_error:
+            self.control.set_worker_route(self.actor, "local")
+        self.assertEqual(route_error.exception.code, "WORKER_DISABLED")
 
     def test_same_kind_different_profiles_can_run_in_parallel(self):
         first = self.control.submit_job(

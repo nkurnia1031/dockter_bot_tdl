@@ -77,6 +77,14 @@ class ControlPlane:
             names = self.worker_registry.names()
             if names and selected_worker not in names:
                 raise DomainError("WORKER_NOT_FOUND", "Worker target tidak ditemukan.", status_code=404)
+            get_worker = getattr(self.worker_registry, "get", None)
+            worker_record = get_worker(selected_worker) if callable(get_worker) else None
+            if worker_record is not None and not bool(worker_record.get("enabled", True)):
+                raise DomainError(
+                    "WORKER_DISABLED",
+                    "Worker sedang dinonaktifkan dan tidak menerima job baru.",
+                    status_code=409,
+                )
         return selected_profile, selected_worker
 
     def submit_job(
@@ -281,6 +289,11 @@ class ControlPlane:
         # Each submitted job already stores its worker. Changing this route
         # therefore only changes the destination of future jobs; in-flight
         # work remains pinned to its original worker.
+        if self.worker_registry is not None:
+            # Validate route and enabled state before persisting it.  A
+            # disabled route may remain visible in the registry so it can be
+            # re-enabled, but it must not become the target for new jobs.
+            self.resolve_target(actor, worker=route)
         return self.profile_manager.set_worker_route(actor.profile, route)
 
     def terminate_active_jobs(self, actor: Actor, *, profile: str | None = None) -> dict[str, int]:

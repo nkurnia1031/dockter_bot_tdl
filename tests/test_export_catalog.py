@@ -96,6 +96,29 @@ class ExportArtifactCatalogTests(unittest.TestCase):
             self.assertEqual(total, 3)
             self.assertEqual(len(items), 3)
 
+    def test_list_filters_label_and_chat_ref_without_distinguishing_at_sign(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = ExportArtifactCatalog(Path(temp_dir) / "app.db")
+            catalog.upsert(
+                profile="default", worker="local", filename="one.json",
+                artifact_key="one.json", status="pending", label="Archive JS",
+                chat_ref="@ExampleChannel",
+            )
+            catalog.upsert(
+                profile="default", worker="local", filename="two.json",
+                artifact_key="two.json", status="pending", label="Other",
+                chat_ref="987654321",
+            )
+            items, total = catalog.list(label="archive")
+            self.assertEqual(total, 1)
+            self.assertEqual(items[0]["filename"], "one.json")
+            items, total = catalog.list(chat_ref="examplechannel")
+            self.assertEqual(total, 1)
+            self.assertEqual(items[0]["filename"], "one.json")
+            items, total = catalog.list(chat_ref="@987654321")
+            self.assertEqual(total, 1)
+            self.assertEqual(items[0]["filename"], "two.json")
+
     def test_inventory_marks_missing_and_restores_discovered_artifacts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = ExportArtifactCatalog(Path(temp_dir) / "app.db")
@@ -146,6 +169,28 @@ class ExportArtifactCatalogTests(unittest.TestCase):
             self.assertTrue(restored["available"])
             self.assertIsNone(restored["missing_at"])
             self.assertEqual(restored["status"], "failed")
+
+    def test_preflight_missing_removes_artifact_from_runnable_queue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = ExportArtifactCatalog(Path(temp_dir) / "app.db")
+            item = catalog.upsert(
+                profile="default",
+                worker="local",
+                filename="gone.json",
+                artifact_key="gone.json",
+                status="pending",
+            )
+
+            missing = catalog.mark_missing("default", "local", "gone.json")
+
+            self.assertEqual(missing["id"], item["id"])
+            self.assertEqual(missing["status"], "deleted")
+            self.assertFalse(missing["available"])
+            pending, total = catalog.list(
+                profile="default", worker="local", status="pending"
+            )
+            self.assertEqual(pending, [])
+            self.assertEqual(total, 0)
 
     def test_reconcile_does_not_unarchive_terminal_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -58,6 +58,7 @@ from tme3bot.api.schemas import (
     UtilityJobRequest,
     WorkerListResponse,
     WorkerEventRequest,
+    WorkerEnabledRequest,
     WorkerRequest,
     WorkerRouteRequest,
     WorkerUpdateRequest,
@@ -857,6 +858,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             if artifact is None:
                 raise DomainError("ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404)
             context.control_plane.require_profile(actor, str(artifact["profile"]))
+            # Validate the pinned origin before creating a download job.
+            context.control_plane.resolve_target(
+                actor,
+                profile=str(artifact["profile"]),
+                worker=str(artifact["worker"]),
+            )
             if artifact["status"] not in {"pending", "failed"}:
                 raise DomainError(
                     "ARTIFACT_NOT_PENDING",
@@ -909,6 +916,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             if artifact is None:
                 raise DomainError("ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404)
             context.control_plane.require_profile(actor, str(artifact["profile"]))
+            # Validate all origins before dispatching any group so a disabled
+            # worker cannot leave a partially-created batch behind.
+            context.control_plane.resolve_target(
+                actor,
+                profile=str(artifact["profile"]),
+                worker=str(artifact["worker"]),
+            )
             if artifact["status"] not in {"pending", "failed"}:
                 raise DomainError("ARTIFACT_NOT_PENDING", "Artifact tidak berada pada antrean yang dapat dijalankan.", status_code=409)
             if not bool(artifact.get("available", 1)):
@@ -940,6 +954,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         status: str | None = None,
         archived: bool | None = False,
         worker: str | None = None,
+        label: str | None = None,
+        chat_ref: str | None = None,
         available: bool | None = None,
         limit: int = Query(50, ge=1, le=200),
         offset: int = Query(0, ge=0),
@@ -953,6 +969,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             status=status,
             archived=archived,
             worker=worker,
+            label=label,
+            chat_ref=chat_ref,
             available=available,
             limit=limit,
             offset=offset,
@@ -1182,6 +1200,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 {
                     "name": name,
                     "url": value["url"],
+                    "enabled": bool(value.get("enabled", True)),
                     "selected": name
                     == context.profile_manager.worker_route(actor.profile),
                 }
@@ -1192,7 +1211,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.post("/api/v1/workers", response_model=ObjectResponse)
     def add_worker(body: WorkerRequest, actor=Depends(current_actor)):
         del actor
-        name = context.worker_registry.upsert(body.name, body.url, body.token)
+        name = context.worker_registry.upsert(
+            body.name, body.url, body.token, enabled=body.enabled
+        )
         return {"name": name}
 
     @app.put("/api/v1/workers/{name}", response_model=ObjectResponse)
@@ -1200,13 +1221,29 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         name: str, body: WorkerUpdateRequest, actor=Depends(current_actor)
     ):
         del actor
+        current = context.worker_registry.get(name)
+        if current is None:
+            raise DomainError(
+                "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
+            )
+        token = str(body.token or current.get("token") or "")
+        return {
+            "name": context.worker_registry.upsert(
+                name, body.url, token, enabled=body.enabled
+            )
+        }
+
+    @app.patch("/api/v1/workers/{name}", response_model=ObjectResponse)
+    def set_worker_enabled(
+        name: str, body: WorkerEnabledRequest, actor=Depends(current_actor)
+    ):
+        del actor
         if context.worker_registry.get(name) is None:
             raise DomainError(
                 "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
             )
-        return {
-            "name": context.worker_registry.upsert(name, body.url, body.token)
-        }
+        context.worker_registry.set_enabled(name, body.enabled)
+        return {"name": name, "enabled": bool(body.enabled)}
 
     @app.delete("/api/v1/workers/{name}", response_model=ObjectResponse)
     def remove_worker(name: str, actor=Depends(current_actor)):
@@ -1801,7 +1838,9 @@ def _add_management_routes(
     )
     def management_add_worker(body: WorkerRequest):
         return {
-            "name": context.worker_registry.upsert(body.name, body.url, body.token)
+            "name": context.worker_registry.upsert(
+                body.name, body.url, body.token, enabled=body.enabled
+            )
         }
 
     @app.delete(

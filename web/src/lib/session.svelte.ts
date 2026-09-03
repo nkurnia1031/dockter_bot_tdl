@@ -1,7 +1,7 @@
 import { api, post, put } from './api';
 
 export type Session = { authenticated: boolean; actor?: { telegram_user_id: number; profile: string; worker_route: string }; profiles: string[] };
-export type SessionWorker = { name: string; url: string; selected?: boolean };
+export type SessionWorker = { name: string; url: string; enabled?: boolean; selected?: boolean };
 let current = $state<Session>({ authenticated: false, profiles: [] });
 let workers = $state<SessionWorker[]>([]);
 let loading = $state(true);

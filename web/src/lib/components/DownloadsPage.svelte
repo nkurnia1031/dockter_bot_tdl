@@ -27,11 +27,20 @@
   let message = $state('');
   let profileFilter = $state('');
   let workerFilter = $state('');
+  let labelFilter = $state('');
+  let chatRefFilter = $state('');
   let confirm = $state<'delete'|'purge'|null>(null);
   let generation = 0;
   let profileOptions = $derived([...new Set([...session.current.profiles, ...artifacts.map(item => item.profile).filter(Boolean) as string[]])].sort());
   let workerOptions = $derived([...new Set([...session.workers.map(item => item.name), ...artifacts.map(item => item.worker || 'local')])].sort());
-  let filtered = $derived(artifacts.filter(item => (!profileFilter || item.profile === profileFilter) && (!workerFilter || (item.worker || 'local') === workerFilter)));
+  let filtered = $derived(artifacts.filter(item => {
+    const label = (item.label || '').toLocaleLowerCase();
+    const chatRef = (item.chat_ref || '').replace(/^@+/, '').toLocaleLowerCase();
+    return (!profileFilter || item.profile === profileFilter)
+      && (!workerFilter || (item.worker || 'local') === workerFilter)
+      && (!labelFilter.trim() || label.includes(labelFilter.trim().toLocaleLowerCase()))
+      && (!chatRefFilter.trim() || chatRef.includes(chatRefFilter.trim().replace(/^@+/, '').toLocaleLowerCase()));
+  }));
   let visible = $derived(filtered.filter(item => activeTab === 'pending'
     ? Boolean(item.available ?? true) && ['pending','failed'].includes(item.status)
     : activeTab === 'processing'
@@ -47,6 +56,8 @@
     const params = new URLSearchParams({scope:'global', limit:'200', offset:'0', archived:String(archived)});
     if (profileFilter) params.set('profile', profileFilter);
     if (workerFilter) params.set('worker', workerFilter);
+    if (labelFilter.trim()) params.set('label', labelFilter.trim());
+    if (chatRefFilter.trim()) params.set('chat_ref', chatRefFilter.trim());
     const page = await api<{items:Artifact[]; total?:number}>(`/downloads/artifacts?${params}`);
     if (request !== generation) return [];
     return page.items || [];
@@ -122,6 +133,7 @@
     // remain responsive even when the workers contain many JSON files.
     const request = ++generation;
     selected=[];
+    syncing=false;
     pending=true;
     try { await load(request); }
     catch (cause) {
@@ -133,10 +145,12 @@
     let disposed=false;
     void (async () => {
       try {
-        // Show the catalog immediately. Reconcile continues in the
-        // background and refreshes it when inventory is complete.
+        // Opening the manager is a catalog read only.  A worker inventory
+        // scan is deliberately not started here; the worker performs a
+        // preflight when a download is submitted and reports missing files
+        // without failing the rest of the batch.  Reconcile remains an
+        // explicit operator action for repairing an out-of-date catalog.
         await load();
-        if (!disposed) await reconcile();
       } catch (cause) {
         if (!disposed) message = cause instanceof Error ? cause.message : 'Artifact gagal dimuat.';
       }
@@ -149,7 +163,7 @@
 <section class="card mt-7 overflow-hidden">
   <div class="border-b border-[var(--line)] p-4 sm:p-5">
     <div class="flex flex-wrap items-center justify-between gap-3"><div class="flex max-w-full gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">{#each tabs as tab}<button class={`rounded-lg px-3 py-2 text-sm font-bold ${activeTab===tab.key?'bg-[var(--panel-strong)] shadow-sm':'muted'}`} onclick={() => {activeTab=tab.key;selected=[];}}>{tab.label}</button>{/each}</div><div class="flex flex-wrap gap-2"><button class="button secondary" onclick={reconcile} disabled={pending}><RefreshCw class={syncing?'animate-spin':''} size={15}/>Reconcile global</button>{#if activeTab==='pending'}<button class="button secondary" onclick={clearFailed} disabled={pending||syncing}><Trash2 size={15}/>Clear failed</button><button class="button secondary" onclick={startAll} disabled={pending||syncing||!selectable.length}><Play size={15}/>Mulai semua</button>{/if}</div></div>
-    <div class="mt-4 grid gap-2 sm:grid-cols-[1fr_1fr_auto]"><label class="text-xs font-bold uppercase text-[var(--muted)]">Profile<select class="field mt-1" bind:value={profileFilter} onchange={changeFilter}><option value="">Semua profile</option>{#each profileOptions as value}<option value={value}>{value}</option>{/each}</select></label><label class="text-xs font-bold uppercase text-[var(--muted)]">Worker / VPS<select class="field mt-1" bind:value={workerFilter} onchange={changeFilter}><option value="">Semua worker</option>{#each workerOptions as value}<option value={value}>{value}</option>{/each}</select></label><button class="button secondary self-end" onclick={selectAll} disabled={pending||syncing||!selectable.length}><CheckSquare size={15}/>{allVisibleSelected?'Clear selection':'Select all'}</button></div>
+    <div class="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1fr_1fr_auto]"><label class="text-xs font-bold uppercase text-[var(--muted)]">Profile<select class="field mt-1" bind:value={profileFilter} onchange={changeFilter}><option value="">Semua profile</option>{#each profileOptions as value}<option value={value}>{value}</option>{/each}</select></label><label class="text-xs font-bold uppercase text-[var(--muted)]">Worker / VPS<select class="field mt-1" bind:value={workerFilter} onchange={changeFilter}><option value="">Semua worker</option>{#each workerOptions as value}<option value={value}>{value}</option>{/each}</select></label><label class="text-xs font-bold uppercase text-[var(--muted)]">Label<input class="field mt-1" bind:value={labelFilter} onchange={changeFilter} placeholder="Cari label"/></label><label class="text-xs font-bold uppercase text-[var(--muted)]">ID / username<input class="field mt-1" bind:value={chatRefFilter} onchange={changeFilter} placeholder="@username atau ID"/></label><button class="button secondary self-end" onclick={selectAll} disabled={pending||syncing||!selectable.length}><CheckSquare size={15}/>{allVisibleSelected?'Clear selection':'Select all'}</button></div>
   </div>
   {#if selected.length}<div class="flex flex-wrap items-center gap-2 border-b border-[var(--line)] bg-violet-50 p-3 dark:bg-violet-950"><b class="mr-auto text-sm">{selected.length} artifact dipilih</b><button class="button" onclick={() => start(selected)} disabled={pending||syncing}><Download size={15}/>Mulai terpilih</button><button class="button secondary" onclick={() => start(selected,'next')} disabled={pending||syncing}><FastForward size={15}/>Berikutnya</button><button class="button danger" onclick={() => confirm='delete'} disabled={pending||syncing}><Trash2 size={15}/>Hapus terpilih</button></div>{/if}
   {#if message}<p class="m-4 rounded-xl bg-[var(--brand-soft)] p-3 text-sm">{message}</p>{/if}

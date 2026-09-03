@@ -34,7 +34,7 @@
 
   $effect(() => {
     if (requireProfile && !profile) profile = session.current.actor?.profile || session.current.profiles[0] || 'default';
-    if (!worker) worker = session.workers[0]?.name || session.current.actor?.worker_route || 'local';
+    if (!worker) worker = session.workers.find((item) => item.enabled !== false)?.name || session.current.actor?.worker_route || 'local';
   });
 
   function invalidate() {
@@ -73,7 +73,7 @@
     <label class="min-w-[10rem] flex-1 text-sm font-bold">Worker target
       <select class="field mt-2" bind:value={worker} onchange={invalidate} disabled={disabled || checking}>
         <option value="" disabled>Pilih worker</option>
-        {#each session.workers as item}<option value={item.name}>{item.name}</option>{/each}
+        {#each session.workers as item}<option value={item.name} disabled={item.enabled === false}>{item.name}{item.enabled === false ? ' (nonaktif)' : ''}</option>{/each}
       </select>
     </label>
     <button class="button secondary shrink-0" onclick={check} disabled={disabled || checking || !worker || (requireProfile && !profile)}>

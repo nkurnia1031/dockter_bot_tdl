@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.8 - Per-feature target context dan Download manager global
+Versi: 3.9 - Download preflight dan kontrol worker
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -33,11 +33,17 @@ Seluruh worker harus diperbarui sebelum web static agar kontrak telemetry sama.
 
 Download manager secara default menampilkan artifact dan job lintas profile serta
 worker. UI mengosongkan selection saat filter berubah dan memuat ulang katalog
-tanpa memulai scan worker baru. Reconcile global berjalan saat halaman dibuka di
-background atau saat tombol reconcile ditekan. Artifact yang tidak lagi ada di
-worker dipertahankan untuk audit di History dengan status `File tidak tersedia`,
-tetapi tidak dapat dijalankan. `Mulai semua` memakai endpoint batch dan
-mengelompokkan artifact berdasarkan origin tersimpan.
+tanpa memulai scan worker baru. Membuka Download manager hanya membaca katalog;
+tidak ada reconcile otomatis. Pemeriksaan fisik dilakukan sebagai preflight saat
+download dikirim. Jika JSON sudah hilang, worker mengirim `artifact.missing`,
+gateway langsung menutupnya dari antrean dengan status `deleted` dan metadata
+tetap disimpan untuk audit/history. Reconcile global masih tersedia sebagai aksi
+manual untuk memperbaiki katalog yang tertinggal. `Mulai semua` memakai endpoint
+batch dan mengelompokkan artifact berdasarkan origin tersimpan.
+
+Filter Download tersedia untuk profile, worker/VPS, label, dan ID/username
+channel. Filter label dan channel menggunakan pencarian sebagian tanpa
+membedakan huruf besar-kecil; awalan `@` pada username diabaikan.
 
 Reconcile inventory dikirim worker dalam batch (maksimal 100 artifact per event),
 lalu gateway melakukan bulk upsert dalam satu transaksi SQLite. Katalog lama
@@ -526,6 +532,28 @@ Pastikan worker terlihat sehat dan buat satu job percobaan sebelum dipakai
 untuk batch besar. Untuk menambah worker kedua, ulangi langkah D.1–D.3 dengan
 nama berbeda, misalnya `remote-2`, URL berbeda, `PROFILE_ROOT` berbeda, dan
 token berbeda.
+
+### D.4 Mengaktifkan atau menonaktifkan worker dari Web UI
+
+Buka menu **Workers** pada Web UI. Setiap worker memiliki status `Siap` atau
+`Nonaktif` dan tombol **Aktifkan/Nonaktifkan**. Status ini adalah kontrol
+admission pada gateway: worker nonaktif tidak menerima job baru dan tidak dapat
+dipilih sebagai route baru, tetapi job yang sudah berjalan tetap menggunakan
+worker asalnya sampai selesai atau dihentikan. Record registry dan worker
+remote tidak dihapus, sehingga tombol **Aktifkan** dapat mengembalikan worker
+setelah maintenance selesai.
+
+Endpoint yang dipakai halaman tersebut adalah:
+
+```bash
+curl -X PATCH https://ui.example.com/api/v1/workers/remote-1 \
+  -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+```
+
+Jangan mematikan container sebagai pengganti toggle ini ketika masih ada job
+aktif. Jika VPS worker harus dimatikan, nonaktifkan dahulu di Web UI, tunggu
+job selesai atau terminate, baru lakukan maintenance host.
 
 ## E. Update di setiap VPS worker remote
 

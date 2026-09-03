@@ -60,7 +60,7 @@ class FakeDispatcher:
 
 class FakeWorkers:
     def __init__(self):
-        self.values = {"local": {"url": "http://worker", "token": "secret"}}
+        self.values = {"local": {"url": "http://worker", "token": "secret", "enabled": True}}
 
     def list(self):
         return dict(self.values)
@@ -71,9 +71,20 @@ class FakeWorkers:
     def get(self, name):
         return self.values.get(name)
 
-    def upsert(self, name, url, token):
-        self.values[name] = {"url": url, "token": token}
+    def upsert(self, name, url, token, enabled=None):
+        current = self.values.get(name, {})
+        self.values[name] = {
+            "url": url,
+            "token": token,
+            "enabled": current.get("enabled", True) if enabled is None else bool(enabled),
+        }
         return name
+
+    def set_enabled(self, name, enabled):
+        if name not in self.values:
+            return False
+        self.values[name]["enabled"] = bool(enabled)
+        return True
 
     def remove(self, name):
         return self.values.pop(name, None) is not None
@@ -188,6 +199,36 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.json()["profiles"], ["remote-1"])
         self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
 
+    def test_worker_can_be_enabled_or_disabled_from_web_api(self):
+        headers = self.login()
+
+        disabled = self.client.patch(
+            "/api/v1/workers/local",
+            headers=headers,
+            json={"enabled": False},
+        )
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(disabled.json()["enabled"])
+        listed = self.client.get("/api/v1/workers", headers=headers)
+        self.assertEqual(listed.status_code, 200)
+        self.assertFalse(listed.json()["items"][0]["enabled"])
+
+        rejected_route = self.client.put(
+            "/api/v1/me/worker-route",
+            headers=headers,
+            json={"route": "local"},
+        )
+        self.assertEqual(rejected_route.status_code, 409)
+        self.assertEqual(rejected_route.json()["error"]["code"], "WORKER_DISABLED")
+
+        enabled = self.client.patch(
+            "/api/v1/workers/local",
+            headers=headers,
+            json={"enabled": True},
+        )
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(enabled.json()["enabled"])
+
     def insert_storage_item(self):
         return self.catalog.insert_item(
             upload_id="upload-1",
@@ -301,6 +342,26 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             response.json()["items"][0]["artifact_key"], "available.json"
         )
+
+    def test_download_artifact_list_can_filter_label_and_chat_ref(self):
+        headers = self.login()
+        self.export_catalog.upsert(
+            profile="default", worker="local", filename="labelled.json",
+            artifact_key="labelled.json", status="pending",
+            label="Archive JS", chat_ref="@ExampleChannel",
+        )
+        self.export_catalog.upsert(
+            profile="default", worker="local", filename="other.json",
+            artifact_key="other.json", status="pending",
+            label="Other", chat_ref="987654321",
+        )
+        response = self.client.get(
+            "/api/v1/downloads/artifacts?scope=global&label=archive&chat_ref=examplechannel",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 1)
+        self.assertEqual(response.json()["items"][0]["artifact_key"], "labelled.json")
 
     def test_global_artifact_scope_and_batch_pin_each_origin(self):
         headers = self.login()

@@ -15,6 +15,12 @@ def normalize_worker_name(value: str) -> str:
     return value.strip().lower()
 
 
+def _as_enabled(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+    return bool(value)
+
+
 class WorkerRegistry:
     """Persistent gateway-owned worker endpoints, editable without a rebuild."""
 
@@ -24,7 +30,7 @@ class WorkerRegistry:
         self.bootstrap_tokens = bootstrap_tokens or {}
         self._lock = threading.RLock()
 
-    def list(self) -> dict[str, dict[str, str]]:
+    def list(self) -> dict[str, dict[str, object]]:
         with self._lock:
             workers = self._read_locked()
             return {name: dict(value) for name, value in workers.items()}
@@ -32,10 +38,26 @@ class WorkerRegistry:
     def names(self) -> list[str]:
         return list(self.list())
 
-    def get(self, name: str) -> dict[str, str] | None:
+    def enabled_names(self) -> list[str]:
+        """Return workers that may receive new jobs.
+
+        A disabled worker remains in ``names()`` and in the registry UI so an
+        operator can turn it back on.  Keeping the two concepts separate also
+        means existing jobs can continue to use their pinned worker while
+        admission of new jobs is blocked.
+        """
+        return [
+            name
+            for name, value in self.list().items()
+            if bool(value.get("enabled", True))
+        ]
+
+    def get(self, name: str) -> dict[str, object] | None:
         return self.list().get(normalize_worker_name(name))
 
-    def upsert(self, name: str, url: str, token: str) -> str:
+    def upsert(
+        self, name: str, url: str, token: str, enabled: bool | None = None
+    ) -> str:
         name = normalize_worker_name(name)
         url, token = url.strip().rstrip("/"), token.strip()
         if not WORKER_NAME_RE.fullmatch(name):
@@ -46,9 +68,26 @@ class WorkerRegistry:
             raise ValueError("Token worker wajib diisi.")
         with self._lock:
             workers = self._read_locked()
-            workers[name] = {"url": url, "token": token}
+            current = workers.get(name, {})
+            workers[name] = {
+                "url": url,
+                "token": token,
+                "enabled": bool(
+                    current.get("enabled", True) if enabled is None else enabled
+                ),
+            }
             self._write_locked(workers)
         return name
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        name = normalize_worker_name(name)
+        with self._lock:
+            workers = self._read_locked()
+            if name not in workers:
+                return False
+            workers[name]["enabled"] = bool(enabled)
+            self._write_locked(workers)
+        return True
 
     def remove(self, name: str) -> bool:
         name = normalize_worker_name(name)
@@ -60,12 +99,13 @@ class WorkerRegistry:
             self._write_locked(workers)
             return True
 
-    def _read_locked(self) -> dict[str, dict[str, str]]:
+    def _read_locked(self) -> dict[str, dict[str, object]]:
         if not self.path.exists():
             workers = {
                 normalize_worker_name(name): {
                     "url": str(url).rstrip("/"),
                     "token": str(self.bootstrap_tokens.get(name, "")),
+                    "enabled": True,
                 }
                 for name, url in self.bootstrap_endpoints.items()
                 if str(url).strip()
@@ -84,6 +124,7 @@ class WorkerRegistry:
             normalize_worker_name(str(name)): {
                 "url": str(value.get("url", "")).strip().rstrip("/"),
                 "token": str(value.get("token", "")).strip(),
+                "enabled": _as_enabled(value.get("enabled", True)),
             }
             for name, value in raw.items()
             if isinstance(value, dict) and str(value.get("url", "")).strip()
@@ -95,13 +136,14 @@ class WorkerRegistry:
                 workers[normalized] = {
                     "url": str(url).strip().rstrip("/"),
                     "token": str(self.bootstrap_tokens.get(name, "")),
+                    "enabled": True,
                 }
                 changed = True
         if changed:
             self._write_locked(workers)
         return workers
 
-    def _write_locked(self, workers: dict[str, dict[str, str]]) -> None:
+    def _write_locked(self, workers: dict[str, dict[str, object]]) -> None:
         write_json_atomic(self.path, {"workers": workers})
         try:
             self.path.chmod(0o600)

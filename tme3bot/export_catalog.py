@@ -170,6 +170,10 @@ class ExportArtifactCatalog:
                     ON export_artifacts(profile, worker, archived_at, created_at DESC);
                 CREATE INDEX IF NOT EXISTS export_artifacts_global_created
                     ON export_artifacts(archived_at, created_at DESC);
+                CREATE INDEX IF NOT EXISTS export_artifacts_label
+                    ON export_artifacts(label COLLATE NOCASE);
+                CREATE INDEX IF NOT EXISTS export_artifacts_chat_ref
+                    ON export_artifacts(chat_ref COLLATE NOCASE);
                 """
             )
             self._ensure_column(
@@ -311,6 +315,8 @@ class ExportArtifactCatalog:
         status: str | None = None,
         archived: bool | None = False,
         worker: str | None = None,
+        label: str | None = None,
+        chat_ref: str | None = None,
         available: bool | None = None,
         limit: int = 50,
         offset: int = 0,
@@ -325,6 +331,14 @@ class ExportArtifactCatalog:
         if worker:
             clauses.append("worker=?")
             params.append(worker)
+        if label and label.strip():
+            value = label.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("LOWER(COALESCE(label, '')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{value.casefold()}%")
+        if chat_ref and chat_ref.strip():
+            value = chat_ref.strip().lstrip("@").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("LOWER(LTRIM(chat_ref, '@')) LIKE ? ESCAPE '\\'")
+            params.append(f"%{value.casefold()}%")
         if available is not None:
             clauses.append("available=?")
             params.append(int(available))
@@ -390,11 +404,20 @@ class ExportArtifactCatalog:
     def mark_missing(
         self, profile: str, worker: str, artifact_key: str
     ) -> dict[str, Any] | None:
+        """Remove a missing file from the runnable queue.
+
+        The physical file is already gone at this point, so there is nothing
+        useful for a delete worker job to do.  Keep the catalog row as
+        ``deleted`` for audit/history, but make it terminal and unavailable so
+        it cannot be offered to the download queue again.
+        """
         now = utc_now()
         with self._db() as db:
             db.execute(
                 """UPDATE export_artifacts
-                   SET available=0, missing_at=COALESCE(missing_at, ?)
+                   SET status='deleted', available=0,
+                       error=COALESCE(error, 'File artifact tidak ditemukan pada worker.'),
+                       missing_at=COALESCE(missing_at, ?)
                    WHERE profile=? AND worker=? AND artifact_key=?""",
                 (now, profile, worker, artifact_key),
             )
