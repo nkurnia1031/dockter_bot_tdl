@@ -91,6 +91,58 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual([path.name for path in videos], ["clip.mp4"])
 
 
+class ExportMilestoneTests(unittest.TestCase):
+    def test_export_publishes_json_ready_milestone_before_post_export_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_path = root / "exports" / "batch.json"
+            export_path.parent.mkdir(parents=True)
+            export_path.write_text('{"messages":[{"id":1,"type":"text"}]}', encoding="utf-8")
+
+            class Publisher:
+                def __init__(self):
+                    self.events = []
+
+                def emit(self, *args, **kwargs):
+                    self.events.append({"event_type": args[2], **kwargs})
+
+            class ExportService:
+                def export_from_url(self, url, **kwargs):
+                    del url, kwargs
+                    return ExportJobResult(
+                        status="exported",
+                        chat_ref="@source",
+                        requested_label=None,
+                        export_path=export_path,
+                        start_id=1,
+                        latest_id=1,
+                        exported_count=1,
+                        has_media=False,
+                        warmup_required=False,
+                    )
+
+            runtime = SimpleNamespace(
+                export_service=ExportService(),
+                export_operation_lock=threading.RLock(),
+                export_tdl_client=SimpleNamespace(output_callback=None, progress_callback=None),
+            )
+            profiles = SimpleNamespace(runtime=lambda profile: runtime)
+            publisher = Publisher()
+            executor = WorkerJobExecutor(SimpleNamespace(), profiles, publisher)
+
+            executor._export(
+                {
+                    "job_id": "export-job",
+                    "profile": "default",
+                    "payload": {"url": "https://t.me/c/1/2"},
+                }
+            )
+
+        milestone = next(event for event in publisher.events if event["event_type"] == "export.json_ready")
+        self.assertEqual(milestone["progress"]["phase"], "json_ready")
+        self.assertEqual(milestone["result"]["json_name"], "batch.json")
+
+
 class QuickPipelineTests(unittest.TestCase):
     def test_pipeline_passes_compress_settings_uploads_both_files_and_cleans_stage(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -132,8 +184,24 @@ class QuickPipelineTests(unittest.TestCase):
                     self.output_callback = None
                     self.progress_callback = None
 
-                def upload(self, path, channel, caption, status_callback=None, as_photo=False):
-                    self.calls.append((path, channel, caption, as_photo))
+                def upload(
+                    self,
+                    path,
+                    channel,
+                    caption,
+                    resolve_after_id=None,
+                    status_callback=None,
+                    as_photo=False,
+                ):
+                    self.calls.append(
+                        {
+                            "path": path,
+                            "channel": channel,
+                            "caption": caption,
+                            "resolve_after_id": resolve_after_id,
+                            "as_photo": as_photo,
+                        }
+                    )
                     return SimpleNamespace(message_id=100 + len(self.calls))
 
             publisher = Publisher()
@@ -252,14 +320,18 @@ class QuickPipelineTests(unittest.TestCase):
             self.assertEqual(FakeUtilityRunner.instances[0].settings["compress_password"], "snapshot-secret")
             self.assertEqual(len(upload_client.calls), 2)
             self.assertEqual(
-                {path.name for path, _, _, _ in upload_client.calls},
+                {call["path"].name for call in upload_client.calls},
                 {"batch.7z.001", "batch.png"},
             )
-            self.assertTrue(all(caption == "batch\n#ModeCepat #2026" for _, _, caption, _ in upload_client.calls))
+            self.assertTrue(
+                all(call["caption"] == "batch\n#ModeCepat #2026" for call in upload_client.calls)
+            )
             self.assertEqual(
-                {path.name: as_photo for path, _, _, as_photo in upload_client.calls},
+                {call["path"].name: call["as_photo"] for call in upload_client.calls},
                 {"batch.7z.001": False, "batch.png": True},
             )
+            self.assertEqual(upload_client.calls[0]["resolve_after_id"], None)
+            self.assertEqual(upload_client.calls[1]["resolve_after_id"], 101)
             self.assertEqual(result["storage_folder"], "ModeCepat/2026")
             self.assertTrue(result["thumbnail_uploaded_as_photo"])
             self.assertTrue(result["staging_cleaned"])

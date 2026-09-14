@@ -24,6 +24,7 @@
   let message = $state('');
   let submitting = $state(false);
   let exportLocked = $state(false);
+  let exportLockJobId = $state('');
   let notices = $state<ExportNotice[]>([]);
   let pollTimer:ReturnType<typeof setTimeout>|undefined;
   let mounted=false;
@@ -35,8 +36,19 @@
   const activeStatuses=['queued','dispatched','running'];
   const activeNotice=$derived(notices.some(item => activeStatuses.includes(item.job.status)));
 
+  function portalToViewport(node: HTMLElement) {
+    document.body.appendChild(node);
+    return { destroy: () => node.remove() };
+  }
+
   function syncExportLock(job: ExportJob) {
-    if (exportLocked && !activeStatuses.includes(job.status)) exportLocked = false;
+    if (!exportLocked || job.id !== exportLockJobId) return;
+    const phase = String(job.progress?.phase || '');
+    const jsonReady = ['json_ready', 'downloading', 'thumbnailing', 'compressing', 'uploading', 'hashing', 'registering', 'completed'].includes(phase);
+    if (jsonReady || !activeStatuses.includes(job.status)) {
+      exportLocked = false;
+      exportLockJobId = '';
+    }
   }
 
   function isExportJob(value: unknown): value is ExportJob {
@@ -172,6 +184,7 @@
     targetVerified = null;
     message = '';
     exportLocked = false;
+    exportLockJobId = '';
   }
   async function submit() {
     if (submitting || exportLocked) return;
@@ -196,10 +209,11 @@
       if (overwriteStartId) payload.start_id=manualStartId;
       if (quickMode) payload.quick_mode=true;
       submitting = true;
-      exportLocked = true;
       const response=await post<unknown>('/exports', payload);
       if (!isExportJob(response)) throw new Error('Respons export dari backend tidak valid.');
       const job=response;
+      exportLocked = true;
+      exportLockJobId = job.id;
       remember(job);
       message='';
       schedulePoll();
@@ -207,6 +221,7 @@
     }
     catch (cause) {
       exportLocked = false;
+      exportLockJobId = '';
       message = cause instanceof Error ? cause.message : 'Export gagal dibuat.';
     }
     finally { submitting = false; }
@@ -235,7 +250,7 @@
   });
 </script>
 
-<div class="pointer-events-none fixed bottom-5 left-3 right-3 z-[70] flex max-h-[calc(100vh-7rem)] flex-col items-end gap-3 overflow-y-auto pr-1 sm:left-auto sm:right-5 sm:w-[390px]" aria-live="polite" aria-atomic="false">
+<div use:portalToViewport class="export-notice-viewport pointer-events-none flex flex-col items-end gap-3 pr-1" aria-live="polite" aria-atomic="false">
   {#each notices as notice (notice.job.id)}
     {@const value=resultValue(notice.job)}
     <section class={`pointer-events-auto w-full overflow-hidden rounded-2xl border bg-[var(--panel)] shadow-2xl transition ${notice.job.status==='succeeded'?'border-emerald-300 dark:border-emerald-800':notice.job.status==='failed'?'border-rose-300 dark:border-rose-800':'border-violet-300 dark:border-violet-800'}`} role="alert">
@@ -274,7 +289,7 @@
     <label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-4 text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" checked={quickMode} onchange={(event) => updateQuickMode((event.currentTarget as HTMLInputElement).checked)} /><span><span class="block text-sm font-extrabold">Quick Mode Export</span><span class="muted mt-1 block text-xs">Download, thumbnail, compress, dan upload otomatis ke ModeCepat/tahun.</span></span></label>
     {#if isNumericChatRef(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource} /><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Default mati agar ID sekali pakai tidak memenuhi daftar source. Aktifkan jika Last ID ingin disimpan.</span></span></label>{/if}
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
-    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={!targetVerified || submitting || exportLocked}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportLocked ? 'Export sedang diproses...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
+    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={!targetVerified || submitting || exportLocked}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportLocked ? 'Menunggu JSON selesai...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>
 
   <section class="card overflow-hidden"><div class="flex items-center justify-between border-b border-[var(--line)] px-5 py-4 sm:px-6"><div class="flex items-center gap-3"><div class="grid size-9 place-items-center rounded-xl bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><ListFilter size={18}/></div><div><h2 class="font-extrabold">Source tersimpan</h2><p class="muted text-sm">Klik source untuk memakai Last ID berikutnya.</p></div></div><span class="badge">{sources.length} source</span></div>
@@ -282,3 +297,28 @@
   </section>
 </div>
 <JobTable kind="export" title="Riwayat export" />
+
+<style>
+  /* The page transition applies transform to .page-enter, which would make a
+     fixed descendant relative to that wrapper instead of the browser viewport.
+     Portal the notices to body and define the viewport boundary explicitly. */
+  .export-notice-viewport {
+    position: fixed;
+    inset-inline-start: 1rem;
+    inset-inline-end: 1rem;
+    bottom: max(1rem, env(safe-area-inset-bottom));
+    z-index: 2147483647;
+    width: min(390px, calc(100vw - 2rem));
+    max-height: calc(100vh - 2rem);
+    max-height: calc(100dvh - 2rem);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  @media (min-width: 640px) {
+    .export-notice-viewport {
+      inset-inline-start: auto;
+      inset-inline-end: max(1rem, env(safe-area-inset-right));
+    }
+  }
+</style>

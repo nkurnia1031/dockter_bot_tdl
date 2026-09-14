@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import ExportPage from './ExportPage.svelte';
 
 describe('ExportPage labels', () => {
@@ -98,10 +98,14 @@ describe('ExportPage labels', () => {
   });
 
   it('keeps export disabled after enqueue and shows the toast in the viewport', async () => {
+    let jsonReady=false;
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
       if (url.includes('/context/verify')) {
         return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
+      }
+      if (url.includes('/jobs/locked-1')) {
+        return new Response(JSON.stringify({id:'locked-1',status:'queued',progress:{phase:jsonReady ? 'json_ready' : 'exporting',message:'Export JSON'}}), {status:200});
       }
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
       if (url.endsWith('/exports') && init?.method === 'POST') {
@@ -115,11 +119,16 @@ describe('ExportPage labels', () => {
     await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
 
-    const lockedButton=await screen.findByRole('button', {name:'Export sedang diproses...'});
-    expect((lockedButton as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByRole('alert').parentElement?.className).toContain('bottom-5');
+     const lockedButton=await screen.findByRole('button', {name:'Menunggu JSON selesai...'});
+     expect((lockedButton as HTMLButtonElement).disabled).toBe(true);
+     const noticeViewport=screen.getByRole('alert').parentElement?.parentElement;
+     expect(noticeViewport).toBe(document.body);
+     expect(screen.getByRole('alert').parentElement?.className).toContain('export-notice-viewport');
 
-    await fireEvent.click(screen.getByRole('button', {name:'Reset form'}));
+     jsonReady=true;
+     await waitFor(() => expect((screen.getByRole('button', {name:'Mulai export'}) as HTMLButtonElement).disabled).toBe(false), {timeout:2500});
+
+     await fireEvent.click(screen.getByRole('button', {name:'Reset form'}));
     expect(screen.getByRole('button', {name:'Mulai export'})).toBeTruthy();
   });
 
@@ -152,5 +161,38 @@ describe('ExportPage labels', () => {
     expect(requests[2].body).toMatchObject({chat_ref:'example',quick_mode:true});
     expect(await screen.findByText(/ModeCepat\/2026/)).toBeTruthy();
     expect(await screen.findByText(/thumbnail sebagai foto/)).toBeTruthy();
+  });
+
+  it('keeps Quick Mode locked until its JSON milestone, then enables another queued export', async () => {
+    let jsonReady=false;
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url=String(input);
+      if (url.includes('/context/verify')) {
+        const body=JSON.parse(String(init?.body || '{}')) as Record<string,unknown>;
+        return new Response(JSON.stringify({ verified:true, purpose:'export', profile:'default', worker:'local', worker_health:'healthy', quick_mode:body.quick_mode === true }), {status:200});
+      }
+      if (url.includes('/jobs/quick-queued')) {
+        return new Response(JSON.stringify({id:'quick-queued',status:'queued',progress:{phase:jsonReady ? 'json_ready' : 'exporting',message:'Export JSON'}}), {status:200});
+      }
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
+      if (url.endsWith('/exports') && init?.method === 'POST') {
+        return new Response(JSON.stringify({id:'quick-queued',status:'queued',progress:{message:'Menunggu worker'}}), {status:200});
+      }
+      return new Response(JSON.stringify({items:[]}), {status:200});
+    }));
+    render(ExportPage);
+    await screen.findByText('Export baru');
+    await fireEvent.click(screen.getByRole('button', {name:'Verifikasi target'}));
+    await screen.findByText('Target backend terverifikasi');
+    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
+    await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
+    await fireEvent.click(screen.getByRole('button', {name:'Verifikasi target'}));
+    await screen.findByText('Target backend terverifikasi');
+    await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
+
+    const lockedButton=await screen.findByRole('button', {name:'Menunggu JSON selesai...'});
+    expect((lockedButton as HTMLButtonElement).disabled).toBe(true);
+    jsonReady=true;
+    await waitFor(() => expect((screen.getByRole('button', {name:'Mulai export'}) as HTMLButtonElement).disabled).toBe(false), {timeout:2500});
   });
 });

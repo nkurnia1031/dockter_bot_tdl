@@ -109,6 +109,28 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(second.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
 
+    def test_export_modes_queue_on_one_worker_but_run_on_different_workers(self):
+        normal = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}, worker="local"
+        )
+        quick_same_worker = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/3", "quick_mode": True},
+            worker="local",
+        )
+        quick_other_worker = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/4", "quick_mode": True},
+            worker="remote-1",
+        )
+
+        self.assertEqual(normal.status.value, "dispatched")
+        self.assertEqual(quick_same_worker.status.value, "queued")
+        self.assertEqual(quick_other_worker.status.value, "dispatched")
+        self.assertEqual([command["worker"] for command in self.dispatcher.commands], ["local", "remote-1"])
+
     def test_quick_export_locks_export_download_and_storage_lanes(self):
         plan = build_execution_plan(
             "export",

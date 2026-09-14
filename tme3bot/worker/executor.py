@@ -603,6 +603,27 @@ class WorkerJobExecutor:
                         ),
                     )
         stats = inspect_export_json(result.export_path)
+        json_ready_progress = reporter.report(
+            phase="json_ready",
+            message=f"File JSON berhasil dibuat: {result.export_path.name}",
+            overall={
+                "current": 1,
+                "total": 1,
+                "percent": 100,
+                "unit": "file",
+            },
+            item={"name": result.export_path.name, "percent": 100},
+            force=True,
+        )
+        reporter.milestone(
+            "export.json_ready",
+            progress=json_ready_progress,
+            result={
+                "json_name": result.export_path.name,
+                "exported_count": result.exported_count,
+                "media_count": stats.get("media_count", 0),
+            },
+        )
         if quick_mode:
             if stats.get("media_count") == 0:
                 reporter.report(
@@ -1480,6 +1501,7 @@ class WorkerJobExecutor:
         total_bytes = sum(file_sizes.values())
         failed, succeeded = [], 0
         completed_bytes = 0
+        last_message_id: int | None = None
         reporter.milestone(
             "phase_changed",
             progress=reporter.report(
@@ -1624,6 +1646,13 @@ class WorkerJobExecutor:
                             runtime.export_tdl_client, upload_progress
                         ):
                             upload_kwargs = {"status_callback": upload_phase}
+                            if last_message_id is not None:
+                                # TDL can finish an upload before it reports the
+                                # channel message ID.  Quick Mode intentionally
+                                # uses the same caption for every file, so the
+                                # delayed resolver must start after the message
+                                # uploaded immediately before this one.
+                                upload_kwargs["resolve_after_id"] = last_message_id
                             if path.name in photo_names:
                                 upload_kwargs["as_photo"] = True
                             result = runtime.export_tdl_client.upload(
@@ -1632,6 +1661,7 @@ class WorkerJobExecutor:
                                 caption,
                                 **upload_kwargs,
                             )
+                        last_message_id = int(result.message_id)
                         reporter.report(
                             phase="hashing",
                             message=f"Memverifikasi {path.name}",
