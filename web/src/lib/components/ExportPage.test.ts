@@ -16,6 +16,19 @@ describe('ExportPage labels', () => {
     expect(screen.queryByText('[object Object]')).toBeNull();
   });
 
+  it('ignores malformed persisted export notices', async () => {
+    sessionStorage.setItem('tme3-export-notices', JSON.stringify(['stale-job']));
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      if (input.includes('/jobs/stale-job')) return new Response(JSON.stringify({items: []}), { status: 200 });
+      if (input.includes('/sources') || input.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+    render(ExportPage);
+    await screen.findByText('Export baru');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('keeps queue and completion alerts visible with media totals', async () => {
     let status = 'queued';
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {

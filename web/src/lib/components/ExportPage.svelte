@@ -39,6 +39,23 @@
     if (exportLocked && !activeStatuses.includes(job.status)) exportLocked = false;
   }
 
+  function isExportJob(value: unknown): value is ExportJob {
+    if (!value || typeof value !== 'object') return false;
+    const job = value as Partial<ExportJob>;
+    return typeof job.id === 'string' && Boolean(job.id) && typeof job.status === 'string';
+  }
+
+  function savedNoticeIds(): string[] {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('tme3-export-notices') || '[]');
+      return Array.isArray(saved)
+        ? saved.filter((id): id is string => typeof id === 'string' && Boolean(id.trim()))
+        : [];
+    } catch {
+      return [];
+    }
+  }
+
   function persistNotices() {
     sessionStorage.setItem('tme3-export-notices', JSON.stringify(notices.map(item => item.job.id)));
   }
@@ -87,7 +104,10 @@
     const active=notices.filter(item => activeStatuses.includes(item.job.status));
     if (!active.length) return;
     const updates=await Promise.all(active.map(async item => {
-      try { return await api<ExportJob>(`/jobs/${item.job.id}`); }
+      try {
+        const job = await api<unknown>(`/jobs/${item.job.id}`);
+        return isExportJob(job) ? job : item.job;
+      }
       catch { return item.job; }
     }));
     let completed=false;
@@ -177,7 +197,9 @@
       if (quickMode) payload.quick_mode=true;
       submitting = true;
       exportLocked = true;
-      const job=await post<ExportJob>('/exports', payload);
+      const response=await post<unknown>('/exports', payload);
+      if (!isExportJob(response)) throw new Error('Respons export dari backend tidak valid.');
+      const job=response;
       remember(job);
       message='';
       schedulePoll();
@@ -203,10 +225,10 @@
   });
   onMount(() => {
     mounted=true;
-    const saved=JSON.parse(sessionStorage.getItem('tme3-export-notices') || '[]');
-    if (Array.isArray(saved)) {
-      Promise.all(saved.slice(0,4).map(id => api<ExportJob>(`/jobs/${id}`).catch(() => null)))
-        .then(jobs => { notices=jobs.filter((job):job is ExportJob => Boolean(job)).map(job => ({job,announcedTerminal:false})); schedulePoll(); });
+    const saved=savedNoticeIds();
+    if (saved.length) {
+      Promise.all(saved.slice(0,4).map(id => api<unknown>(`/jobs/${id}`).catch(() => null)))
+        .then(jobs => { notices=jobs.filter(isExportJob).map(job => ({job,announcedTerminal:false})); schedulePoll(); });
     }
     load(targetProfile);
     return () => { mounted=false;if(pollTimer)clearTimeout(pollTimer); };
@@ -231,7 +253,7 @@
             <p class="mt-1 text-sm text-rose-600 dark:text-rose-300">{notice.job.error?.message || 'Worker tidak dapat menyelesaikan export.'}</p>
           {:else}
             <p class="muted mt-1 text-sm">{notice.job.progress?.message || 'Menunggu worker yang dipilih.'}</p>
-            <p class="muted mt-2 flex items-center gap-1 font-mono text-[11px]"><Clock3 size={12}/>{notice.job.id.slice(0,12)}</p>
+            <p class="muted mt-2 flex items-center gap-1 font-mono text-[11px]"><Clock3 size={12}/>{notice.job.id.substring(0,12)}</p>
           {/if}
         </div>
       </div>

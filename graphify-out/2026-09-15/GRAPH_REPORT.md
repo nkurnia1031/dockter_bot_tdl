@@ -1,7 +1,7 @@
-# Graph Report - dockter_bot_tdl  (2026-09-15)
+# Graph Report - dockter_bot_tdl  (2026-09-14)
 
 ## Corpus Check
-- 148 files · ~96,155 words
+- 148 files · ~96,007 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 9 file(s) not represented in the graph (top: (none) 6, .base 1, .conf 1)
 
@@ -11,7 +11,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `7f419a1b`
+- Built from commit: `02ce9276`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
