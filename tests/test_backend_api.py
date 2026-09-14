@@ -40,6 +40,7 @@ class FakeProfiles:
 class FakeDispatcher:
     def __init__(self):
         self.commands = []
+        self.storage_available = True
 
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
@@ -55,6 +56,15 @@ class FakeDispatcher:
                 "line_count": 1,
                 "truncated": False,
             }
+        }
+
+    def check_worker(self, worker):
+        return {
+            "healthy": True,
+            "profiles": ["default", "archive"],
+            "storage_profile": "storage",
+            "storage_profile_available": self.storage_available,
+            "workspace": True,
         }
 
 
@@ -588,6 +598,31 @@ class BackendApiTests(unittest.TestCase):
             json={"value": "4"},
         )
         self.assertEqual(invalid.status_code, 400)
+
+    def test_quick_export_requires_storage_and_redacts_settings(self):
+        headers = self.login()
+        self.dispatcher.storage_available = False
+        rejected = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/1/2", "quick_mode": True},
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.json()["error"]["code"], "STORAGE_PROFILE_UNAVAILABLE")
+
+        self.dispatcher.storage_available = True
+        created = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/1/2", "quick_mode": True},
+        )
+        self.assertEqual(created.status_code, 200)
+        job = self.client.get(f"/api/v1/jobs/{created.json()['id']}", headers=headers).json()
+        self.assertEqual(job["payload"]["quick_mode"], True)
+        self.assertEqual(job["payload"]["quick_settings"]["compress_password"], "***")
+        command = self.dispatcher.commands[-1][1]
+        self.assertNotEqual(command["payload"]["quick_settings"]["compress_password"], "***")
+        self.assertTrue(command["payload"]["quick_settings"]["compress_password"])
 
     def test_terminate_all_active_jobs_endpoint_handles_stale_jobs(self):
         headers = self.login()

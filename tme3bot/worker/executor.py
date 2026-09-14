@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import mimetypes
+import shutil
 import threading
 import time
 import uuid
@@ -18,7 +19,14 @@ from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.profiles import build_profile_config
 from tme3bot.storage_catalog import build_storage_caption
-from tme3bot.utility import UtilityRunner
+from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
+from tme3bot.worker.quick_export import (
+    QuickModeError,
+    QuickThumbnailBuilder,
+    quick_folder_name,
+    quick_storage_caption,
+    quick_year,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -180,6 +188,8 @@ class WorkerJobExecutor:
         self.publisher = publisher
         self._active: dict[str, tuple[str, str]] = {}
         self._utility_runners: dict[str, UtilityRunner] = {}
+        self._quick_thumbnail_builders: dict[str, QuickThumbnailBuilder] = {}
+        self._quick_active: set[str] = set()
         self._cancel_requested: set[str] = set()
         self._known: set[str] = set()
         self._lock = threading.RLock()
@@ -257,10 +267,28 @@ class WorkerJobExecutor:
             return False
         profile, kind = active
         runtime = self.profile_manager.runtime(profile)
+        with self._lock:
+            quick_active = job_id in self._quick_active
+            thumbnail_builder = self._quick_thumbnail_builders.get(job_id)
         if kind == "download":
             cancelled = runtime.download_tdl_client.interrupt_current()
         elif kind in {"export", "backup_node"}:
             cancelled = runtime.export_tdl_client.interrupt_current()
+            if quick_active:
+                cancelled = (
+                    runtime.download_tdl_client.interrupt_current() or cancelled
+                )
+                storage_runtime = self.profile_manager.runtime(
+                    getattr(self.config, "worker_storage_profile", "storage")
+                )
+                cancelled = (
+                    storage_runtime.export_tdl_client.interrupt_current()
+                    or cancelled
+                )
+                if thumbnail_builder is not None:
+                    cancelled = thumbnail_builder.cancel_current() or cancelled
+                if utility_runner is not None:
+                    cancelled = utility_runner.cancel_current() or cancelled
         elif kind == "storage_upload":
             storage_runtime = self.profile_manager.runtime(
                 getattr(self.config, "worker_storage_profile", "storage")
@@ -272,10 +300,11 @@ class WorkerJobExecutor:
             cancelled = utility_runner.cancel_current()
         else:
             cancelled = False
-        if cancelled:
+        if cancelled or quick_active:
             with self._lock:
                 self._cancel_requested.add(job_id)
-        return cancelled
+            return True
+        return False
 
     def queue_size(self, profile: str) -> int:
         del profile
@@ -312,6 +341,9 @@ class WorkerJobExecutor:
         keys: set[str] = {f"profile:{profile}:worker:{worker}:kind:{kind}"}
         if kind in {"export", "leave"}:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
+            if kind == "export" and bool((command.get("payload") or {}).get("quick_mode")):
+                keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
+                keys.add(f"worker:{worker}:tdl:storage")
         elif kind == "storage_upload":
             keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
         elif kind in {"download", "download_clear_failed"}:
@@ -418,6 +450,8 @@ class WorkerJobExecutor:
                 self._active.pop(job_id, None)
                 self._log_snapshots.pop(job_id, None)
                 self._utility_runners.pop(job_id, None)
+                self._quick_thumbnail_builders.pop(job_id, None)
+                self._quick_active.discard(job_id)
                 self._cancel_requested.discard(job_id)
             self.publisher.forget(job_id)
 
@@ -505,6 +539,10 @@ class WorkerJobExecutor:
         runtime = self.profile_manager.runtime(str(command["profile"]))
         payload = command["payload"]
         reporter = ProgressReporter(self.publisher, str(command["job_id"]))
+        quick_mode = bool(payload.get("quick_mode"))
+        if quick_mode:
+            with self._lock:
+                self._quick_active.add(str(command["job_id"]))
         url = payload.get("url")
         if not url:
             from urllib.parse import quote
@@ -524,6 +562,14 @@ class WorkerJobExecutor:
             indeterminate=True,
             force=True,
         )
+        if quick_mode:
+            reporter.report(
+                phase="exporting",
+                message="Mengekspor JSON untuk Quick Mode",
+                item={"name": str(payload.get("chat_ref") or url)},
+                indeterminate=True,
+                force=True,
+            )
 
         def export_progress(progress) -> None:
             if not _has_transfer_telemetry(progress):
@@ -557,6 +603,25 @@ class WorkerJobExecutor:
                         ),
                     )
         stats = inspect_export_json(result.export_path)
+        if quick_mode:
+            if stats.get("media_count") == 0:
+                reporter.report(
+                    phase="failed",
+                    message="Quick Mode gagal: export tidak memiliki foto maupun video.",
+                    overall={
+                        "current": result.exported_count,
+                        "total": result.exported_count,
+                        "percent": 100,
+                        "unit": "messages",
+                    },
+                    counters={"succeeded": result.exported_count, "failed": 0},
+                    force=True,
+                )
+                discard_export_without_media(result.export_path, stats)
+                raise QuickModeError(
+                    "Quick Mode gagal: export tidak memiliki foto maupun video."
+                )
+            return self._quick_export_pipeline(command, runtime, result, stats, reporter)
         if stats.get("media_count") == 0:
             artifact_deleted = False
             artifact_delete_error = None
@@ -633,6 +698,207 @@ class WorkerJobExecutor:
             result={"artifact": artifact},
         )
         return {**asdict(result), **stats}
+
+    def _quick_export_pipeline(
+        self,
+        command: dict[str, Any],
+        runtime,
+        export_result,
+        stats: dict[str, Any],
+        reporter: ProgressReporter,
+    ) -> dict[str, Any]:
+        """Run the post-export Quick Mode stages while retaining staging on error."""
+        job_id = str(command["job_id"])
+        payload = command["payload"]
+        with self._lock:
+            if job_id in self._cancel_requested:
+                raise QuickModeError("Quick Mode dibatalkan oleh user.")
+        workspace = Path(getattr(self.config, "utility_workspace_root", "/workspace")).resolve()
+        stage_root = (workspace / ".tme3bot-quick" / job_id).resolve()
+        try:
+            stage_root.relative_to(workspace)
+        except ValueError as exc:
+            raise QuickModeError("Staging Quick Mode keluar dari workspace.") from exc
+        folder_name = quick_folder_name(export_result.export_path)
+        media_root = stage_root / folder_name
+        stage_root.mkdir(parents=True, exist_ok=True)
+        media_root.mkdir(parents=True, exist_ok=True)
+
+        reporter.report(
+            phase="downloading",
+            message=f"Mengunduh media ke staging {folder_name}",
+            overall={"current": 0, "total": 1, "percent": 0, "unit": "phase"},
+            force=True,
+        )
+
+        def download_progress(event_type: str, snapshot) -> None:
+            if event_type == "progress" and not snapshot.tdl_percent and snapshot.tdl_file_name is None:
+                return
+            reporter.report(
+                phase="downloading",
+                message=(
+                    f"Mengunduh {snapshot.tdl_file_name}"
+                    if snapshot.tdl_file_name
+                    else "Mengunduh media"
+                ),
+                batch={
+                    "name": snapshot.current_json_name,
+                    "index": snapshot.current_json_index or 1,
+                    "total": snapshot.total_json or 1,
+                    "unit": "json",
+                },
+                item={
+                    "name": snapshot.tdl_file_name,
+                    "index": snapshot.tdl_fraction_current,
+                    "total": snapshot.tdl_fraction_total or snapshot.current_media_total,
+                    "percent": snapshot.tdl_percent,
+                },
+                transfer={
+                    "bytes_current": snapshot.tdl_bytes_current,
+                    "speed_bps": snapshot.tdl_speed_bps,
+                    "eta_seconds": snapshot.tdl_eta_seconds,
+                },
+                counters={
+                    "succeeded": snapshot.success_count,
+                    "failed": snapshot.failed_count,
+                },
+                indeterminate=snapshot.tdl_percent is None and snapshot.active,
+                force=event_type != "progress",
+            )
+
+        previous_callback = runtime.download_progress.set_event_callback(download_progress)
+        try:
+            with runtime.download_operation_lock:
+                with self._capture_tdl_output(runtime.download_tdl_client):
+                    download_result = runtime.download_service.download_export_to(
+                        export_result.export_path,
+                        media_root,
+                        delete_json_on_success=True,
+                    )
+        finally:
+            runtime.download_progress.set_event_callback(previous_callback)
+        if download_result.status != "success_deleted":
+            raise QuickModeError(
+                f"Download Quick Mode gagal: {download_result.error or download_result.status}"
+            )
+        with self._lock:
+            if job_id in self._cancel_requested:
+                raise QuickModeError("Quick Mode dibatalkan oleh user.")
+
+        reporter.report(
+            phase="thumbnailing",
+            message="Membuat thumbnail Quick Mode",
+            overall={"current": 0, "total": 1, "percent": 0, "unit": "phase"},
+            force=True,
+        )
+        thumbnail_path = stage_root / f"{folder_name}.png"
+        builder = QuickThumbnailBuilder(log_callback=self._append_job_log)
+        with self._lock:
+            self._quick_thumbnail_builders[job_id] = builder
+        try:
+            thumbnail = builder.build(media_root, thumbnail_path)
+        finally:
+            with self._lock:
+                self._quick_thumbnail_builders.pop(job_id, None)
+
+        reporter.report(
+            phase="compressing",
+            message="Mengompres hasil download",
+            overall={"current": 0, "total": 1, "percent": 0, "unit": "phase"},
+            force=True,
+        )
+        settings = dict(payload.get("quick_settings") or DEFAULT_UTILITY_SETTINGS)
+        utility_root = Path("/app/utility") if Path("/app/utility").exists() else Path("utility")
+        runner = UtilityRunner(
+            utility_root,
+            log_callback=self._append_job_log,
+            progress_callback=lambda value: reporter.report(
+                phase="compressing",
+                message="Mengompres hasil download",
+                item={"name": folder_name},
+                overall={"current": 0, "total": 1, "unit": "phase"},
+                indeterminate=True,
+                force=True,
+            ),
+        )
+        with self._lock:
+            self._utility_runners[job_id] = runner
+        try:
+            compress_result = runner.run("compress", [str(stage_root)], settings=settings)
+        finally:
+            with self._lock:
+                self._utility_runners.pop(job_id, None)
+        if compress_result.failed:
+            detail = next(iter(compress_result.failed.values()))
+            raise QuickModeError(f"Compress Quick Mode gagal: {detail}")
+        with self._lock:
+            if job_id in self._cancel_requested:
+                raise QuickModeError("Quick Mode dibatalkan oleh user.")
+        archive_files = sorted(
+            path
+            for path in stage_root.iterdir()
+            if path.is_file()
+            and (path.name == f"{folder_name}.7z" or path.name.startswith(f"{folder_name}.7z."))
+        )
+        if not archive_files:
+            raise QuickModeError("Compress Quick Mode tidak menghasilkan file arsip.")
+
+        year = quick_year()
+        storage_folder = f"ModeCepat/{year}"
+        caption = quick_storage_caption(folder_name, year)
+        reporter.report(
+            phase="uploading",
+            message="Mengupload arsip dan thumbnail ke storage",
+            overall={"current": 0, "total": len(archive_files) + 1, "percent": 0, "unit": "files"},
+            force=True,
+        )
+        upload_command = {
+            **command,
+            "kind": "storage_upload",
+            "payload": {
+                "folder_path": str(stage_root),
+                "destination_folder_path": storage_folder,
+                "preserve_structure": False,
+                "root_files_only": True,
+                "allowed_names": [path.name for path in archive_files] + [thumbnail_path.name],
+                "photo_names": [thumbnail_path.name],
+                "owner_user_id": int(command["actor_user_id"]),
+                "owner_profile": str(command["profile"]),
+                "batch_id": f"{job_id}:quick",
+                "caption": caption,
+                "caption_override": True,
+                "keywords": "",
+            },
+        }
+        upload_result = self._storage_upload(upload_command)
+        if upload_result.get("failed") or int(upload_result.get("succeeded", 0)) != len(archive_files) + 1:
+            failures = str(upload_result)
+            raise QuickModeError(
+                f"Upload Quick Mode gagal ({failures[:500]}); staging dipertahankan di {stage_root}."
+            )
+
+        reporter.report(
+            phase="cleanup",
+            message="Membersihkan staging Quick Mode",
+            overall={"current": 1, "total": 1, "percent": 100, "unit": "phase"},
+            force=True,
+        )
+        shutil.rmtree(stage_root)
+        return {
+            **asdict(export_result),
+            **stats,
+            **thumbnail,
+            "quick_mode": True,
+            "quick_mode_status": "completed",
+            "folder_name": folder_name,
+            "storage_folder": storage_folder,
+            "caption": caption,
+            "archive_names": [path.name for path in archive_files],
+            "thumbnail_uploaded_as_photo": True,
+            "uploaded_count": upload_result.get("succeeded", 0),
+            "staging_cleaned": True,
+            "json_deleted": True,
+        }
 
     def _leave(self, command: dict[str, Any]) -> dict[str, Any]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
@@ -1168,7 +1434,20 @@ class WorkerJobExecutor:
         root = self._workspace_path(str(payload["folder_path"]))
         if not root.is_dir():
             raise ValueError(f"Folder storage tidak ditemukan: {root}")
-        files = sorted(path for path in root.rglob("*") if path.is_file())
+        allowed_names = {
+            str(item) for item in (payload.get("allowed_names") or []) if str(item)
+        }
+        photo_names = {
+            str(item) for item in (payload.get("photo_names") or []) if str(item)
+        }
+        if bool(payload.get("root_files_only")):
+            files = sorted(
+                path
+                for path in root.iterdir()
+                if path.is_file() and (not allowed_names or path.name in allowed_names)
+            )
+        else:
+            files = sorted(path for path in root.rglob("*") if path.is_file())
         preserve_structure = bool(payload.get("preserve_structure", True))
         if preserve_structure:
             for relative in storage_relative_folders(root):
@@ -1221,6 +1500,9 @@ class WorkerJobExecutor:
         with runtime.export_operation_lock:
             with self._capture_tdl_output(runtime.export_tdl_client):
                 for index, path in enumerate(files, start=1):
+                    with self._lock:
+                        if str(command["job_id"]) in self._cancel_requested:
+                            raise QuickModeError("Upload dibatalkan oleh user.")
                     size = file_sizes[path]
                     upload_state = {"phase": "uploading"}
                     reporter.reset_transfer()
@@ -1305,9 +1587,18 @@ class WorkerJobExecutor:
                                 f"tme3bot:{payload['batch_id']}:{path.relative_to(root)}",
                             )
                         )
-                        caption = build_storage_caption(
-                            logical_folder, path.name, str(payload.get("keywords", ""))
+                        caption_override = bool(payload.get("caption_override"))
+                        caption = (
+                            str(payload.get("caption") or "")
+                            if caption_override
+                            else build_storage_caption(
+                                logical_folder, path.name, str(payload.get("keywords", ""))
+                            )
                         )
+                        if not caption:
+                            caption = build_storage_caption(
+                                logical_folder, path.name, str(payload.get("keywords", ""))
+                            )
                         reporter.report(
                             phase="uploading",
                             message=f"Mengupload {path.name}",
@@ -1332,11 +1623,14 @@ class WorkerJobExecutor:
                         with self._capture_tdl_progress(
                             runtime.export_tdl_client, upload_progress
                         ):
+                            upload_kwargs = {"status_callback": upload_phase}
+                            if path.name in photo_names:
+                                upload_kwargs["as_photo"] = True
                             result = runtime.export_tdl_client.upload(
                                 path,
                                 runtime.config.storage_channel_ref,
                                 caption,
-                                status_callback=upload_phase,
+                                **upload_kwargs,
                             )
                         reporter.report(
                             phase="hashing",
@@ -1374,6 +1668,7 @@ class WorkerJobExecutor:
                             "relative_folder": relative_parent,
                             "keywords": str(payload.get("keywords", "")),
                             "caption": caption,
+                            "caption_override": caption_override,
                             "file_size": size,
                             "mime_type": mimetypes.guess_type(path.name)[0] or "",
                             "sha256": digest,
@@ -1416,6 +1711,9 @@ class WorkerJobExecutor:
                             result={"item": item},
                         )
                     except Exception as exc:
+                        with self._lock:
+                            if str(command["job_id"]) in self._cancel_requested:
+                                raise
                         LOGGER.exception("Storage upload failed for %s", path)
                         failed.append({"name": path.name, "error": str(exc)})
                         completed_bytes += file_sizes[path]

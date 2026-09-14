@@ -41,6 +41,13 @@ class ExportWorkspaceTests(unittest.TestCase):
             },
         )
 
+    def test_quick_mode_is_sent_only_when_enabled(self):
+        state = ExportWorkspaceState()
+        state.select_source({"chat_ref": "channel", "last_id": 9})
+        self.assertNotIn("quick_mode", state.payload())
+        state.set_quick_mode(True)
+        self.assertTrue(state.payload()["quick_mode"])
+
     def test_overwrite_switch_requires_manual_value_and_can_reset_to_auto(self):
         state = ExportWorkspaceState()
         state.select_source({"chat_ref": "channel", "last_id": 99})
@@ -187,6 +194,27 @@ class ExportWorkspaceTests(unittest.TestCase):
         self.assertNotIn("Foto:", text)
         self.assertNotIn("Video:", text)
         self.assertNotIn("{'", text)
+
+    def test_job_formatter_includes_quick_mode_outputs(self):
+        text = format_export_job(
+            {
+                "status": "succeeded",
+                "result": {
+                    "value": {
+                        "quick_mode": True,
+                        "quick_mode_status": "completed",
+                        "storage_folder": "ModeCepat/2026",
+                        "thumbnail_name": "batch.png",
+                        "archive_names": ["batch.7z.001"],
+                        "staging_cleaned": True,
+                    }
+                },
+            }
+        )
+        self.assertIn("Quick Mode: completed", text)
+        self.assertIn("Storage folder: ModeCepat/2026", text)
+        self.assertIn("Thumbnail: batch.png", text)
+        self.assertIn("Staging: dibersihkan", text)
 
     def test_status_formatter_includes_terminal_report_without_raw_objects(self):
         text = format_export_status(

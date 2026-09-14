@@ -218,6 +218,7 @@ class ExportRequest(BaseModel):
     save_source: bool | None = None
     profile: str | None = None
     worker: str | None = None
+    quick_mode: bool = False
 
 
 class DownloadRequest(BaseModel):
@@ -233,6 +234,7 @@ class ContextVerifyRequest(BaseModel):
     purpose: str
     profile: str | None = None
     worker: str | None = None
+    quick_mode: bool = False
 
 
 class BatchSourcesRequest(BaseModel):

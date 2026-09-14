@@ -656,6 +656,18 @@ class TelegramFrontendApp:
             )
             self._show_export_workspace(message, user_id, actor, notice)
             return
+        if data == "ew:quick":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            state.set_quick_mode(not state.quick_mode)
+            self._show_export_workspace(
+                message,
+                user_id,
+                actor,
+                "Quick Mode aktif: export akan langsung didownload, dikompres, dan diupload ke storage."
+                if state.quick_mode
+                else "Quick Mode dimatikan; export memakai alur biasa.",
+            )
+            return
         if data == "ew:save":
             state = self.export_workspaces.get(message.chat_id, user_id)
             state.set_save_source(not state.save_source)
@@ -751,6 +763,7 @@ class TelegramFrontendApp:
             f"Label: {state.label or 'tanpa label'}",
             f"Start ID: {state.effective_start_id if state.chat_ref else 'pilih source dulu'}",
             f"Overwrite Start ID: {'ON' if state.overwrite_start_id else 'OFF'}",
+            f"Quick Mode: {'ON' if state.quick_mode else 'OFF'}",
         ]
         if state.source:
             lines.append(f"Last ID backend: {state.source.get('last_id', 0)}")

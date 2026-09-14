@@ -69,6 +69,12 @@ def export_report(job: dict[str, Any]) -> dict[str, Any]:
         "artifact_deleted": value.get("artifact_deleted"),
         "artifact_delete_reason": value.get("artifact_delete_reason"),
         "artifact_delete_error": value.get("artifact_delete_error"),
+        "quick_mode": value.get("quick_mode"),
+        "quick_mode_status": value.get("quick_mode_status"),
+        "storage_folder": value.get("storage_folder"),
+        "thumbnail_name": value.get("thumbnail_name"),
+        "archive_names": value.get("archive_names"),
+        "staging_cleaned": value.get("staging_cleaned"),
         "progress_message": progress.get("message"),
         "error": (job.get("error") or {}).get("message") if isinstance(job.get("error"), dict) else job.get("error"),
     }
@@ -142,6 +148,16 @@ def format_export_job(job: dict[str, Any]) -> str:
             lines.append(
                 f"Peringatan cleanup: {short_text(report['artifact_delete_error'], 240)}"
             )
+        if report["quick_mode"]:
+            lines.append(f"Quick Mode: {report['quick_mode_status'] or 'aktif'}")
+            if report["storage_folder"]:
+                lines.append(f"Storage folder: {report['storage_folder']}")
+            if report["thumbnail_name"]:
+                lines.append(f"Thumbnail: {report['thumbnail_name']}")
+            if report["archive_names"]:
+                lines.append(f"Arsip: {len(report['archive_names'])} part")
+            if report["staging_cleaned"]:
+                lines.append("Staging: dibersihkan")
         if report["error"]:
             lines.append(f"Error: {short_text(report['error'], 240)}")
     return "\n".join(lines)
@@ -171,6 +187,7 @@ class ExportWorkspaceState:
     start_id: int | None = None
     overwrite_start_id: bool = False
     save_source: bool = False
+    quick_mode: bool = False
     active_job_id: str | None = None
     job_snapshot: dict[str, Any] | None = None
     source_page: int = 0
@@ -252,6 +269,10 @@ class ExportWorkspaceState:
         self.save_source = bool(enabled)
         self.touch()
 
+    def set_quick_mode(self, enabled: bool) -> None:
+        self.quick_mode = bool(enabled)
+        self.touch()
+
     @property
     def default_start_id(self) -> int:
         if self.source is None:
@@ -282,6 +303,8 @@ class ExportWorkspaceState:
             payload["use_url_message_id"] = False
         if is_numeric_chat_ref(self.chat_ref):
             payload["save_source"] = self.save_source
+        if self.quick_mode:
+            payload["quick_mode"] = True
         return payload
 
 

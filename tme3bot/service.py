@@ -255,6 +255,45 @@ class BatchDownloadService:
         moved_files = [self._move_to_processing(path) for path in failed_files]
         return self._download_files(moved_files, mode="retry_failed")
 
+    def download_export_to(
+        self,
+        export_json: Path,
+        download_dir: Path,
+        *,
+        delete_json_on_success: bool = True,
+    ) -> DownloadedJsonResult:
+        """Download one export into a caller-owned staging directory.
+
+        Quick Mode owns the downloaded tree and must not publish the JSON to
+        the normal Download Manager.  The JSON is still moved through
+        ``processing`` so a failed TDL command follows the regular failed
+        artifact path.
+        """
+        candidate = Path(export_json).resolve()
+        roots = {
+            "pending": self.config.export_pending_dir.resolve(),
+            "failed": self.config.export_failed_dir.resolve(),
+            "processing": self.config.export_processing_dir.resolve(),
+        }
+        source_root = next(
+            (root for root in roots.values() if _is_relative_to(candidate, root)),
+            None,
+        )
+        if source_root is None or not candidate.is_file():
+            raise ValueError("Export JSON Quick Mode tidak berada di direktori yang valid.")
+        moved = (
+            self._move_to_processing(candidate)
+            if source_root != roots["processing"]
+            else candidate
+        )
+        batch = self._download_files(
+            [moved],
+            mode="quick",
+            download_dir_overrides={moved: Path(download_dir)},
+            delete_json_on_success=delete_json_on_success,
+        )
+        return batch.results[0]
+
     def clear_failed_exports(self) -> int:
         failed_files = sorted(self.config.export_failed_dir.glob("*.json"))
         for path in failed_files:
@@ -262,7 +301,12 @@ class BatchDownloadService:
         return len(failed_files)
 
     def _download_files(
-        self, moved_files: list[Path], mode: str
+        self,
+        moved_files: list[Path],
+        mode: str,
+        *,
+        download_dir_overrides: dict[Path, Path] | None = None,
+        delete_json_on_success: bool = False,
     ) -> BatchDownloadResult:
         results: list[DownloadedJsonResult] = []
         self.progress_tracker.start_batch(mode=mode, total_json=len(moved_files))
@@ -273,8 +317,11 @@ class BatchDownloadService:
                 self.progress_tracker.start_json(
                     index, len(moved_files), export_json.name, media_ids
                 )
-                download_dir = self._download_dir_for_export(export_json)
+                download_dir = (download_dir_overrides or {}).get(
+                    export_json, self._download_dir_for_export(export_json)
+                )
                 try:
+                    download_dir.mkdir(parents=True, exist_ok=True)
                     self.progress_tracker.set_phase("warmup")
                     self._warmup_if_needed(export_json, download_dir)
                     self.progress_tracker.set_phase("downloading")
@@ -287,13 +334,17 @@ class BatchDownloadService:
                         self._force_warmup(export_json, download_dir, exc)
                         self.progress_tracker.set_phase("downloading")
                         self.tdl_client.download(export_json, download_dir)
-                except TDLCommandError as exc:
+                except Exception as exc:
                     failed_path = unique_path(
                         self.config.export_failed_dir / export_json.name
                     )
                     failed_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(export_json), str(failed_path))
-                    error = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+                    error = (
+                        str(getattr(exc, "stderr", "") or "").strip()
+                        or str(getattr(exc, "stdout", "") or "").strip()
+                        or str(exc)
+                    )
                     self.progress_tracker.finish_json(False, error=error[:500])
                     results.append(
                         DownloadedJsonResult(
@@ -305,15 +356,21 @@ class BatchDownloadService:
                     )
                     continue
 
-                done_path = unique_path(self.config.export_done_dir / export_json.name)
-                done_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(export_json), str(done_path))
+                if delete_json_on_success:
+                    export_json.unlink()
+                    done_path = export_json
+                    result_status = "success_deleted"
+                else:
+                    done_path = unique_path(self.config.export_done_dir / export_json.name)
+                    done_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(export_json), str(done_path))
+                    result_status = "success"
                 self.progress_tracker.finish_json(True)
                 results.append(
                     DownloadedJsonResult(
                         json_path=done_path,
                         download_dir=download_dir,
-                        status="success",
+                        status=result_status,
                     )
                 )
         finally:
@@ -427,6 +484,14 @@ class BatchDownloadService:
         destination = unique_path(self.config.export_processing_dir / path.name)
         shutil.move(str(path), str(destination))
         return destination
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
 
 
 def unique_path(path: Path) -> Path:

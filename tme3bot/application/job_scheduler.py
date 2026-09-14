@@ -40,6 +40,12 @@ def build_execution_plan(
     if kind in {"export", "leave"}:
         keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         lane = "tdl-export"
+        if kind == "export" and bool(payload.get("quick_mode")):
+            # Quick Mode owns the complete export -> download -> storage
+            # pipeline. Keep all three TDL sessions pinned for its lifetime.
+            keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
+            keys.add(f"worker:{worker}:tdl:storage")
+            lane = "tdl-quick-export"
     elif kind == "storage_upload":
         keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
         lane = "tdl-storage"

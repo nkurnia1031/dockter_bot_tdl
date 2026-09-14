@@ -324,6 +324,53 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(client.download_url_calls[0][0], "https://t.me/c/7256426551/9")
             self.assertEqual(list(config.download_root.glob("**/__warmup")), [])
 
+    def test_quick_download_uses_custom_directory_and_deletes_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            config.export_pending_dir.mkdir(parents=True, exist_ok=True)
+            export_json = config.export_pending_dir / "quick.json"
+            export_json.write_text(
+                '{"messages":[{"id":9,"type":"photo"}],"tme3bot":{"chat_ref":"@bot"}}',
+                encoding="utf-8",
+            )
+
+            class MediaDownloadClient(FakeDownloadTDLClient):
+                def download(self, export_path: Path, download_dir: Path) -> None:
+                    super().download(export_path, download_dir)
+                    download_dir.mkdir(parents=True, exist_ok=True)
+                    (download_dir / "photo.jpg").write_bytes(b"image")
+
+            result = BatchDownloadService(
+                config, store, MediaDownloadClient()
+            ).download_export_to(export_json, root / "staging" / "folder")
+
+            self.assertEqual(result.status, "success_deleted")
+            self.assertFalse(export_json.exists())
+            self.assertTrue((root / "staging" / "folder" / "photo.jpg").exists())
+            self.assertEqual(list(config.export_done_dir.glob("*.json")), [])
+
+    def test_quick_download_moves_json_to_failed_on_tdl_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            config.export_pending_dir.mkdir(parents=True, exist_ok=True)
+            export_json = config.export_pending_dir / "quick.json"
+            export_json.write_text(
+                '{"messages":[{"id":9,"type":"photo"}],"tme3bot":{"chat_ref":"@bot"}}',
+                encoding="utf-8",
+            )
+
+            result = BatchDownloadService(
+                config, store, FakeDownloadTDLClient(fail=True)
+            ).download_export_to(export_json, root / "staging" / "folder")
+
+            self.assertEqual(result.status, "failed")
+            self.assertFalse(export_json.exists())
+            self.assertTrue((config.export_failed_dir / "quick.json").exists())
+
     def test_progress_tracker_maps_descending_tdl_message_id_to_forward_media_position(
         self,
     ) -> None:

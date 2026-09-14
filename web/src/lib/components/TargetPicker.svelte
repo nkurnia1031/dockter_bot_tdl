@@ -10,6 +10,7 @@
     worker: string;
     worker_health?: string;
     storage_profile?: string | null;
+    quick_mode?: boolean;
     checked_at?: string;
   };
 
@@ -19,7 +20,8 @@
     profile = $bindable(''),
     worker = $bindable(''),
     verified = $bindable<Verification | null>(null),
-    disabled = false
+    disabled = false,
+    quickMode = false
   }: {
     purpose?: 'export'|'utility'|'storage';
     requireProfile?: boolean;
@@ -27,6 +29,7 @@
     worker?: string;
     verified?: Verification | null;
     disabled?: boolean;
+    quickMode?: boolean;
   } = $props();
 
   let checking = $state(false);
@@ -49,7 +52,8 @@
       verified = await post<Verification>('/context/verify', {
         purpose,
         ...(requireProfile ? { profile } : {}),
-        worker
+        worker,
+        ...(quickMode ? { quick_mode: true } : {})
       });
     } catch (cause) {
       verified = null;

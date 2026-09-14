@@ -46,6 +46,7 @@ def _export_source_compact_markup(
         source_text += " (source baru)"
 
     overwrite = bool(getattr(state, "overwrite_start_id", False))
+    quick_mode = bool(getattr(state, "quick_mode", False))
     if overwrite:
         start_text = (
             f"Override: {getattr(state, 'start_id')}"
@@ -61,6 +62,7 @@ def _export_source_compact_markup(
         [InlineKeyboardButton("Pilih source tersimpan", callback_data="ew:source")],
         [InlineKeyboardButton("+ Source baru", callback_data="ew:new")],
         [InlineKeyboardButton(f"Overwrite Start ID: {'ON' if overwrite else 'OFF'}", callback_data="ew:overwrite")],
+        [InlineKeyboardButton(f"Quick Mode: {'ON' if quick_mode else 'OFF'}", callback_data="ew:quick")],
         [
             InlineKeyboardButton(f"Label: {label_text}"[:30], callback_data="ew:label"),
             InlineKeyboardButton(f"Start ID: {start_text}"[:30], callback_data="ew:last"),
@@ -127,6 +129,7 @@ def _export_source_compact_markup(
 
     label_text = getattr(state, "label", None) or "Kosong"
     overwrite_start_id = bool(getattr(state, "overwrite_start_id", False))
+    quick_mode = bool(getattr(state, "quick_mode", False))
     if not overwrite_start_id:
         start_text = f"Otomatis: {getattr(state, 'default_start_id', 1)}"
     elif getattr(state, "start_id", None) is None:
@@ -165,6 +168,14 @@ def _export_source_compact_markup(
             InlineKeyboardButton(
                 f"Overwrite Start ID: {'ON' if overwrite_start_id else 'OFF'}",
                 callback_data="ew:overwrite",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                f"Quick Mode: {'ON' if quick_mode else 'OFF'}",
+                callback_data="ew:quick",
             )
         ]
     )

@@ -620,9 +620,10 @@ cache immutable.
    operasional global.
 2. Buka Export, pilih profile-worker pada TargetPicker, tekan `Verifikasi
    target`, lalu pastikan source dan Last ID berasal dari profile tersebut.
-3. Buka Download. Tunggu status reconcile global selesai sebelum menekan aksi.
-   Daftar harus memuat artifact lintas profile-worker dan origin tampil pada
-   setiap artifact. Gunakan filter profile/worker bila diperlukan.
+3. Buka Download. Daftar harus langsung memuat katalog yang tersimpan tanpa
+   menjalankan reconcile otomatis. Origin profile-worker tampil pada setiap
+   artifact. Gunakan filter profile/worker bila diperlukan. Reconcile hanya
+   dijalankan bila operator menekan tombol manualnya.
 4. Pastikan Pending/Processing tidak menampilkan artifact yang file JSON-nya
    sudah hilang. Metadata lama boleh tetap terlihat di History dengan badge
    `File tidak tersedia` dan tanpa tombol Start/Retry.

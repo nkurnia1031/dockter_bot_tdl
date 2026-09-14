@@ -381,7 +381,9 @@ class ControlPlane:
 
     @staticmethod
     def _redacted_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if kind not in {"backup_node", "utility"}:
+        if kind not in {"backup_node", "utility", "export"}:
+            return dict(payload)
+        if kind == "export" and not bool(payload.get("quick_mode")):
             return dict(payload)
         return _redact_secrets(payload)
 

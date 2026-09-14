@@ -295,6 +295,21 @@ class TDLClientTests(unittest.TestCase):
         self.assertIn("--with-content", resolve_command)
         self.assertIn("last", resolve_command)
 
+    def test_upload_can_force_image_as_telegram_photo(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "thumbnail.png"
+            source.write_bytes(b"png")
+            runner = FakeRunner("empty")
+            result = TDLClient(root / "tdl", "default", runner=runner).upload(
+                source, "-100123", "caption", as_photo=True
+            )
+
+        self.assertEqual(result.message_id, 987)
+        command = runner.commands[0]
+        self.assertIn("--photo", command)
+        self.assertLess(command.index("--photo"), command.index("--caption"))
+
 
 if __name__ == "__main__":
     unittest.main()

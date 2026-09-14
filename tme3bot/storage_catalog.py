@@ -377,6 +377,7 @@ class StorageCatalog:
     def insert_item(self, **values) -> StorageItem:
         """Insert a callback result, returning the existing item on retry."""
         upload_id = str(values["upload_id"])
+        caption_override = bool(values.pop("caption_override", False))
         with self._lock, self._db() as db:
             existing = db.execute("SELECT * FROM storage_items WHERE upload_id = ?", (upload_id,)).fetchone()
             if existing is not None:
@@ -405,12 +406,21 @@ class StorageCatalog:
             expected_caption = build_storage_caption(
                 values["folder"], values["display_name"], values.get("keywords", "")
             )
-            caption_needs_sync = bool(
-                values.get("caption") and values.get("caption") != expected_caption
-            )
-            values["caption"] = expected_caption
-            if caption_needs_sync:
-                values["caption_sync_status"] = "pending"
+            supplied_caption = str(values.get("caption") or "")
+            if caption_override and supplied_caption:
+                # Quick Mode deliberately uses a batch caption rather than the
+                # per-file catalog caption. It is already bounded by the
+                # producer and must remain byte-for-byte identical in Storage.
+                values["caption"] = supplied_caption[:CAPTION_LIMIT]
+                values["caption_sync_status"] = "synced"
+                caption_needs_sync = False
+            else:
+                caption_needs_sync = bool(
+                    supplied_caption and supplied_caption != expected_caption
+                )
+                values["caption"] = expected_caption
+                if caption_needs_sync:
+                    values["caption_sync_status"] = "pending"
             db.execute(
                 """INSERT INTO storage_items
                 (upload_id, owner_user_id, owner_profile, channel_id, channel_message_id,

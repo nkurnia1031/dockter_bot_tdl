@@ -39,6 +39,16 @@ class StorageCatalogTests(unittest.TestCase):
             self.assertEqual(len(catalog.search("javascript")), 1)
             self.assertEqual(len(catalog.search("2021jsa")), 1)
 
+    def test_caption_override_is_preserved_for_quick_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            caption = "batch-folder\n#ModeCepat #2026"
+            item = catalog.insert_item(
+                **{**item_values(), "caption": caption, "caption_override": True}
+            )
+            self.assertEqual(item.caption, caption)
+            self.assertEqual(item.caption_sync_status, "synced")
+
     def test_all_authorized_users_can_edit_metadata(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = StorageCatalog(Path(temp_dir) / "storage.db")

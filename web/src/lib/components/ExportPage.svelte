@@ -17,10 +17,13 @@
   let chatRef = $state('');
   let startId = $state('1');
   let overwriteStartId = $state(false);
+  let quickMode = $state(false);
   let saveNumericSource = $state(false);
   let label = $state('');
   let selected = $state('');
   let message = $state('');
+  let submitting = $state(false);
+  let exportLocked = $state(false);
   let notices = $state<ExportNotice[]>([]);
   let pollTimer:ReturnType<typeof setTimeout>|undefined;
   let mounted=false;
@@ -32,6 +35,10 @@
   const activeStatuses=['queued','dispatched','running'];
   const activeNotice=$derived(notices.some(item => activeStatuses.includes(item.job.status)));
 
+  function syncExportLock(job: ExportJob) {
+    if (exportLocked && !activeStatuses.includes(job.status)) exportLocked = false;
+  }
+
   function persistNotices() {
     sessionStorage.setItem('tme3-export-notices', JSON.stringify(notices.map(item => item.job.id)));
   }
@@ -40,6 +47,7 @@
     if (current) current.job=job;
     else notices=[{job,announcedTerminal:false},...notices].slice(0,4);
     notices=[...notices];
+    syncExportLock(job);
     persistNotices();
   }
   function dismiss(jobId:string) {
@@ -60,6 +68,16 @@
     ].filter(Boolean).join(' · ');
     return `${messages} pesan · ${mediaText}${details ? ` · ${details}` : ''}`;
   }
+  function quickCompletionDetails(value: Record<string, any>) {
+    if (!value.quick_mode) return '';
+    const archiveCount=Array.isArray(value.archive_names) ? value.archive_names.length : 0;
+    const parts=['Quick Mode'];
+    if (archiveCount) parts.push(`${archiveCount} arsip`);
+    if (value.thumbnail_name) parts.push(`thumbnail ${value.thumbnail_name}`);
+    if (value.thumbnail_uploaded_as_photo) parts.push('thumbnail sebagai foto');
+    if (value.storage_folder) parts.push(String(value.storage_folder));
+    return parts.join(' / ');
+  }
   function schedulePoll() {
     if (pollTimer) clearTimeout(pollTimer);
     if (!mounted || !activeNotice) return;
@@ -79,6 +97,7 @@
         if (activeStatuses.includes(notices[index].job.status) && !activeStatuses.includes(job.status)) completed=true;
         notices[index]={...notices[index],job};
       }
+      syncExportLock(job);
     }
     notices=[...notices];
     persistNotices();
@@ -117,9 +136,27 @@
       saveNumericSource = false;
     }
   }
+  function updateQuickMode(value: boolean) {
+    quickMode = value;
+    targetVerified = null;
+    message = '';
+  }
+  function resetForm() {
+    chatRef = '';
+    startId = '1';
+    overwriteStartId = false;
+    quickMode = false;
+    saveNumericSource = false;
+    label = '';
+    selected = '';
+    targetVerified = null;
+    message = '';
+    exportLocked = false;
+  }
   async function submit() {
+    if (submitting || exportLocked) return;
     try {
-      if (!targetVerified || targetVerified.profile !== targetProfile || targetVerified.worker !== targetWorker) {
+      if (!targetVerified || targetVerified.profile !== targetProfile || targetVerified.worker !== targetWorker || (quickMode && targetVerified.quick_mode !== true)) {
         message='Verifikasi profile dan worker terlebih dahulu.';
         return;
       }
@@ -137,13 +174,20 @@
       };
       if (isNumericChatRef(chatRef)) payload.save_source=saveNumericSource;
       if (overwriteStartId) payload.start_id=manualStartId;
+      if (quickMode) payload.quick_mode=true;
+      submitting = true;
+      exportLocked = true;
       const job=await post<ExportJob>('/exports', payload);
       remember(job);
       message='';
       schedulePoll();
-      await load();
+      await load().catch(() => {});
     }
-    catch (cause) { message = cause instanceof Error ? cause.message : 'Export gagal dibuat.'; }
+    catch (cause) {
+      exportLocked = false;
+      message = cause instanceof Error ? cause.message : 'Export gagal dibuat.';
+    }
+    finally { submitting = false; }
   }
   $effect(() => {
     if (targetProfile && targetProfile !== lastTargetProfile) {
@@ -169,7 +213,7 @@
   });
 </script>
 
-<div class="pointer-events-none fixed inset-x-3 top-20 z-[70] flex flex-col items-end gap-3 sm:left-auto sm:right-5 sm:w-[390px]" aria-live="polite" aria-atomic="false">
+<div class="pointer-events-none fixed bottom-5 left-3 right-3 z-[70] flex max-h-[calc(100vh-7rem)] flex-col items-end gap-3 overflow-y-auto pr-1 sm:left-auto sm:right-5 sm:w-[390px]" aria-live="polite" aria-atomic="false">
   {#each notices as notice (notice.job.id)}
     {@const value=resultValue(notice.job)}
     <section class={`pointer-events-auto w-full overflow-hidden rounded-2xl border bg-[var(--panel)] shadow-2xl transition ${notice.job.status==='succeeded'?'border-emerald-300 dark:border-emerald-800':notice.job.status==='failed'?'border-rose-300 dark:border-rose-800':'border-violet-300 dark:border-violet-800'}`} role="alert">
@@ -181,6 +225,7 @@
           <div class="flex items-center justify-between gap-2"><b>{notice.job.status==='succeeded'?'Export selesai':notice.job.status==='failed'?'Export gagal':'Export masuk antrean'}</b><button class="rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--brand-soft)]" onclick={() => dismiss(notice.job.id)} aria-label="Tutup notifikasi export"><X size={16}/></button></div>
           {#if notice.job.status==='succeeded'}
             <p class="mt-1 text-sm font-semibold">{completionText(notice.job)}</p>
+            {#if quickCompletionDetails(value)}<p class="muted mt-1 text-xs">{quickCompletionDetails(value)}</p>{/if}
             <p class="muted mt-1 truncate text-xs">{value.chat_ref || chatRef}{value.requested_label ? ` · ${value.requested_label}` : ''}</p>
           {:else if notice.job.status==='failed'}
             <p class="mt-1 text-sm text-rose-600 dark:text-rose-300">{notice.job.error?.message || 'Worker tidak dapat menyelesaikan export.'}</p>
@@ -197,16 +242,17 @@
 
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">EXPORT</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Source & pembuatan export</h1><p class="muted mt-2">Pilih source tersimpan atau masukkan username/numeric chat ID.</p></div><div class="hidden rounded-2xl bg-violet-50 p-3 text-violet-700 sm:block dark:bg-violet-950 dark:text-violet-200"><FileDown size={24}/></div></header>
 
-<div class="mt-6"><TargetPicker purpose="export" bind:profile={targetProfile} bind:worker={targetWorker} bind:verified={targetVerified} /></div>
+<div class="mt-6"><TargetPicker purpose="export" quickMode={quickMode} bind:profile={targetProfile} bind:worker={targetWorker} bind:verified={targetVerified} /></div>
 
 <div class="mt-7 grid gap-5 xl:grid-cols-[.84fr_1.16fr]">
   <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Export baru</h2><p class="muted text-sm">Start ID dapat dioverride saat diperlukan.</p></div></div>
     <label class="mt-6 block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
     <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
     <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId} /><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Aktifkan hanya untuk export ini. Last ID backend tidak akan diturunkan.</span></span></label>
+    <label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-4 text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" checked={quickMode} onchange={(event) => updateQuickMode((event.currentTarget as HTMLInputElement).checked)} /><span><span class="block text-sm font-extrabold">Quick Mode Export</span><span class="muted mt-1 block text-xs">Download, thumbnail, compress, dan upload otomatis ke ModeCepat/tahun.</span></span></label>
     {#if isNumericChatRef(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource} /><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Default mati agar ID sekali pakai tidak memenuhi daftar source. Aktifkan jika Last ID ingin disimpan.</span></span></label>{/if}
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
-    <button class="button mt-6 w-full" onclick={submit} disabled={!targetVerified}><FileDown size={16}/>Mulai export</button>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
+    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={!targetVerified || submitting || exportLocked}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportLocked ? 'Export sedang diproses...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>
 
   <section class="card overflow-hidden"><div class="flex items-center justify-between border-b border-[var(--line)] px-5 py-4 sm:px-6"><div class="flex items-center gap-3"><div class="grid size-9 place-items-center rounded-xl bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><ListFilter size={18}/></div><div><h2 class="font-extrabold">Source tersimpan</h2><p class="muted text-sm">Klik source untuk memakai Last ID berikutnya.</p></div></div><span class="badge">{sources.length} source</span></div>

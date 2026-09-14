@@ -349,7 +349,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if not context.config.management_api_token or token != context.config.management_api_token:
             raise DomainError("MANAGEMENT_UNAUTHORIZED", "Management token tidak valid.", status_code=401)
 
-    def verify_target(actor: Actor, purpose: str, profile: str | None, worker: str | None) -> dict[str, Any]:
+    def verify_target(
+        actor: Actor,
+        purpose: str,
+        profile: str | None,
+        worker: str | None,
+        quick_mode: bool = False,
+    ) -> dict[str, Any]:
         purpose = str(purpose or "").strip().lower()
         if purpose not in {"export", "utility", "storage"}:
             raise DomainError("TARGET_PURPOSE_INVALID", "Purpose target tidak valid.", status_code=422)
@@ -389,6 +395,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 f"Sesi Storage {storage_profile} belum tersedia pada worker {selected_worker}.",
                 status_code=409,
             )
+        if purpose == "export" and quick_mode and (
+            not callable(checker) or not bool(capabilities.get("storage_profile_available"))
+        ):
+            raise DomainError(
+                "STORAGE_PROFILE_UNAVAILABLE",
+                f"Sesi Storage {storage_profile} belum tersedia pada worker {selected_worker} untuk Quick Mode.",
+                status_code=409,
+            )
         if purpose == "utility" and capabilities and capabilities.get("workspace") is False:
             raise DomainError("WORKSPACE_UNAVAILABLE", "Workspace worker tidak tersedia.", status_code=409)
         return {
@@ -397,13 +411,16 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             "profile": selected_profile if purpose == "export" else None,
             "worker": selected_worker,
             "worker_health": health,
-            "storage_profile": storage_profile if purpose == "storage" else None,
+            "storage_profile": storage_profile if purpose == "storage" or quick_mode else None,
+            "quick_mode": bool(quick_mode),
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
     @app.post("/api/v1/context/verify", response_model=ObjectResponse)
     def verify_context(body: ContextVerifyRequest, actor=Depends(current_actor)):
-        return verify_target(actor, body.purpose, body.profile, body.worker)
+        return verify_target(
+            actor, body.purpose, body.profile, body.worker, quick_mode=body.quick_mode
+        )
 
     @app.get("/healthz", include_in_schema=False)
     def healthz():
@@ -803,7 +820,17 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 "Isi URL lama atau chat_ref username/numeric ID.",
                 status_code=422,
             )
-        verify_target(actor, "export", values.get("profile"), values.get("worker"))
+        verify_target(
+            actor,
+            "export",
+            values.get("profile"),
+            values.get("worker"),
+            quick_mode=bool(values.get("quick_mode")),
+        )
+        if bool(values.get("quick_mode")):
+            # Snapshot settings at submission time. The password is retained
+            # only in the internal worker command and redacted from the Job API.
+            values["quick_settings"] = context.utility_settings.get()
         return job_dict(
             context.control_plane.submit_job(
                 actor, "export", values, profile=values.get("profile"), worker=values.get("worker")

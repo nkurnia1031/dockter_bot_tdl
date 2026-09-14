@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from tme3bot.application.control_plane import ControlPlane
+from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, JobEvent, JobStatus
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.worker_registry import WorkerRegistry
@@ -107,6 +108,19 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(first.status.value, "dispatched")
         self.assertEqual(second.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
+
+    def test_quick_export_locks_export_download_and_storage_lanes(self):
+        plan = build_execution_plan(
+            "export",
+            "default",
+            "local",
+            {"quick_mode": True},
+        )
+
+        self.assertEqual(plan.lane, "tdl-quick-export")
+        self.assertIn("profile:default:worker:local:tdl:export", plan.resource_keys)
+        self.assertIn("profile:default:worker:local:tdl:download", plan.resource_keys)
+        self.assertIn("worker:local:tdl:storage", plan.resource_keys)
 
     def test_utility_sibling_paths_can_run_but_nested_path_waits(self):
         first = self.control.submit_job(

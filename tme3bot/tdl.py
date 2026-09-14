@@ -532,8 +532,9 @@ class TDLClient:
         caption: str,
         resolve_after_id: int | None = None,
         status_callback: Callable[[str], None] | None = None,
+        as_photo: bool = False,
     ) -> UploadResult:
-        """Upload exactly one file and return its Telegram channel message id."""
+        """Upload one file and optionally force it to Telegram photo media."""
         if not file_path.is_file():
             raise TDLDataError(f"File upload tidak ditemukan: {file_path}")
         # tdl parses --caption as an expression. Passing raw text makes values
@@ -554,10 +555,11 @@ class TDLClient:
                 caption_path = Path(handle.name)
             # Upload sessions may run through `runuser -u user1`.
             caption_path.chmod(0o644)
-            command = self._wrap_command(
-                self._base_command()
-                + ["up", "-p", str(file_path), "-c", chat_ref, "--caption", str(caption_path)]
-            )
+            upload_args = ["up", "-p", str(file_path), "-c", chat_ref]
+            if as_photo:
+                upload_args.append("--photo")
+            upload_args.extend(["--caption", str(caption_path)])
+            command = self._wrap_command(self._base_command() + upload_args)
             if status_callback is not None:
                 status_callback("uploading")
             result = self.runner.run(

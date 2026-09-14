@@ -59,7 +59,7 @@ describe('ExportPage labels', () => {
       if (url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
       if (url.endsWith('/exports') && init?.method === 'POST') {
         requests.push(JSON.parse(String(init.body)));
-        return new Response(JSON.stringify({id:`export-${requests.length}`,status:'queued'}), {status:200});
+        return new Response(JSON.stringify({id:`export-${requests.length}`,status:'succeeded'}), {status:200});
       }
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
@@ -79,7 +79,65 @@ describe('ExportPage labels', () => {
     await fireEvent.click(screen.getByRole('switch', {name:/Overwrite Start ID/}));
     expect(start.disabled).toBe(false);
     await fireEvent.input(start, {target:{value:'12'}});
+    await screen.findByRole('button', {name:'Mulai export'});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
     expect(requests[1]).toMatchObject({chat_ref:'example',start_id:12,use_url_message_id:true});
+  });
+
+  it('keeps export disabled after enqueue and shows the toast in the viewport', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url=String(input);
+      if (url.includes('/context/verify')) {
+        return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
+      }
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
+      if (url.endsWith('/exports') && init?.method === 'POST') {
+        return new Response(JSON.stringify({id:'locked-1',status:'queued',progress:{message:'Menunggu worker'}}), {status:200});
+      }
+      return new Response(JSON.stringify({items:[]}), {status:200});
+    }));
+    render(ExportPage);
+    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
+    await screen.findByText('Target backend terverifikasi');
+    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
+    await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
+
+    const lockedButton=await screen.findByRole('button', {name:'Export sedang diproses...'});
+    expect((lockedButton as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByRole('alert').parentElement?.className).toContain('bottom-5');
+
+    await fireEvent.click(screen.getByRole('button', {name:'Reset form'}));
+    expect(screen.getByRole('button', {name:'Mulai export'})).toBeTruthy();
+  });
+
+  it('re-verifies and sends quick_mode when Quick Mode is enabled', async () => {
+    const requests: {url:string; body:Record<string,unknown>}[]=[];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url=String(input);
+      if (url.includes('/context/verify')) {
+        const body=JSON.parse(String(init?.body || '{}')) as Record<string,unknown>;
+        requests.push({url, body});
+        return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy', quick_mode: body.quick_mode === true }), { status: 200 });
+      }
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
+      if (url.endsWith('/exports') && init?.method === 'POST') {
+        requests.push({url, body:JSON.parse(String(init.body))});
+        return new Response(JSON.stringify({id:'quick-1',status:'succeeded',result:{value:{quick_mode:true,storage_folder:'ModeCepat/2026',thumbnail_name:'example.png',thumbnail_uploaded_as_photo:true,archive_names:['example.7z.001']}}}), {status:200});
+      }
+      return new Response(JSON.stringify({items:[]}), {status:200});
+    }));
+    render(ExportPage);
+    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
+    await screen.findByText('Target backend terverifikasi');
+    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
+    await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
+    expect(screen.queryByText('Target backend terverifikasi')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
+    expect(requests[1].body).toMatchObject({purpose:'export', quick_mode:true});
+    await screen.findByText('Target backend terverifikasi');
+    await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
+    expect(requests[2].body).toMatchObject({chat_ref:'example',quick_mode:true});
+    expect(await screen.findByText(/ModeCepat\/2026/)).toBeTruthy();
+    expect(await screen.findByText(/thumbnail sebagai foto/)).toBeTruthy();
   });
 });
