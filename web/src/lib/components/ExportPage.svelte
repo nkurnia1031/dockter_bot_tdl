@@ -23,16 +23,17 @@
   let selected = $state('');
   let message = $state('');
   let submitting = $state(false);
-  let exportLocked = $state(false);
-  let exportLockJobId = $state('');
+  let exportCooldown = $state(false);
   let notices = $state<ExportNotice[]>([]);
   let pollTimer:ReturnType<typeof setTimeout>|undefined;
+  let exportCooldownTimer:ReturnType<typeof setTimeout>|undefined;
   let mounted=false;
   let targetProfile = $state('');
   let targetWorker = $state('');
   let targetVerified = $state<any>(null);
   let lastTargetProfile = '';
 
+  const EXPORT_COOLDOWN_MS=500;
   const activeStatuses=['queued','dispatched','running'];
   const activeNotice=$derived(notices.some(item => activeStatuses.includes(item.job.status)));
 
@@ -41,14 +42,19 @@
     return { destroy: () => node.remove() };
   }
 
-  function syncExportLock(job: ExportJob) {
-    if (!exportLocked || job.id !== exportLockJobId) return;
-    const phase = String(job.progress?.phase || '');
-    const jsonReady = ['json_ready', 'downloading', 'thumbnailing', 'compressing', 'uploading', 'hashing', 'registering', 'completed'].includes(phase);
-    if (jsonReady || !activeStatuses.includes(job.status)) {
-      exportLocked = false;
-      exportLockJobId = '';
-    }
+  function clearExportCooldown() {
+    if (exportCooldownTimer !== undefined) clearTimeout(exportCooldownTimer);
+    exportCooldownTimer = undefined;
+    exportCooldown = false;
+  }
+
+  function startExportCooldown() {
+    if (exportCooldownTimer !== undefined) clearTimeout(exportCooldownTimer);
+    exportCooldown = true;
+    exportCooldownTimer = setTimeout(() => {
+      exportCooldownTimer = undefined;
+      exportCooldown = false;
+    }, EXPORT_COOLDOWN_MS);
   }
 
   function isExportJob(value: unknown): value is ExportJob {
@@ -76,7 +82,6 @@
     if (current) current.job=job;
     else notices=[{job,announcedTerminal:false},...notices].slice(0,4);
     notices=[...notices];
-    syncExportLock(job);
     persistNotices();
   }
   function dismiss(jobId:string) {
@@ -129,7 +134,6 @@
         if (activeStatuses.includes(notices[index].job.status) && !activeStatuses.includes(job.status)) completed=true;
         notices[index]={...notices[index],job};
       }
-      syncExportLock(job);
     }
     notices=[...notices];
     persistNotices();
@@ -183,11 +187,10 @@
     selected = '';
     targetVerified = null;
     message = '';
-    exportLocked = false;
-    exportLockJobId = '';
+    clearExportCooldown();
   }
   async function submit() {
-    if (submitting || exportLocked) return;
+    if (submitting || exportCooldown) return;
     try {
       if (!targetVerified || targetVerified.profile !== targetProfile || targetVerified.worker !== targetWorker || (quickMode && targetVerified.quick_mode !== true)) {
         message='Verifikasi profile dan worker terlebih dahulu.';
@@ -212,16 +215,14 @@
       const response=await post<unknown>('/exports', payload);
       if (!isExportJob(response)) throw new Error('Respons export dari backend tidak valid.');
       const job=response;
-      exportLocked = true;
-      exportLockJobId = job.id;
       remember(job);
       message='';
       schedulePoll();
+      startExportCooldown();
       await load().catch(() => {});
     }
     catch (cause) {
-      exportLocked = false;
-      exportLockJobId = '';
+      clearExportCooldown();
       message = cause instanceof Error ? cause.message : 'Export gagal dibuat.';
     }
     finally { submitting = false; }
@@ -246,7 +247,7 @@
         .then(jobs => { notices=jobs.filter(isExportJob).map(job => ({job,announcedTerminal:false})); schedulePoll(); });
     }
     load(targetProfile);
-    return () => { mounted=false;if(pollTimer)clearTimeout(pollTimer); };
+    return () => { mounted=false;if(pollTimer)clearTimeout(pollTimer);clearExportCooldown(); };
   });
 </script>
 
@@ -289,7 +290,7 @@
     <label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-4 text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" checked={quickMode} onchange={(event) => updateQuickMode((event.currentTarget as HTMLInputElement).checked)} /><span><span class="block text-sm font-extrabold">Quick Mode Export</span><span class="muted mt-1 block text-xs">Download, thumbnail, compress, dan upload otomatis ke ModeCepat/tahun.</span></span></label>
     {#if isNumericChatRef(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource} /><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Default mati agar ID sekali pakai tidak memenuhi daftar source. Aktifkan jika Last ID ingin disimpan.</span></span></label>{/if}
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
-    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={!targetVerified || submitting || exportLocked}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportLocked ? 'Menunggu JSON selesai...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
+    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={!targetVerified || submitting || exportCooldown}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportCooldown ? 'Tunggu sebentar...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>
 
   <section class="card overflow-hidden"><div class="flex items-center justify-between border-b border-[var(--line)] px-5 py-4 sm:px-6"><div class="flex items-center gap-3"><div class="grid size-9 place-items-center rounded-xl bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><ListFilter size={18}/></div><div><h2 class="font-extrabold">Source tersimpan</h2><p class="muted text-sm">Klik source untuk memakai Last ID berikutnya.</p></div></div><span class="badge">{sources.length} source</span></div>
