@@ -68,7 +68,8 @@ def visual_media(root: Path) -> tuple[list[Path], list[Path]]:
     ):
         suffix = path.suffix.casefold()
         if suffix in PHOTO_EXTENSIONS:
-            if "thumb" not in path.stem.casefold():
+            stem = path.stem.casefold()
+            if "thumb" not in stem and not stem.startswith(".video-contact-sheet-"):
                 photos.append(path)
         elif suffix in VIDEO_EXTENSIONS:
             videos.append(path)
@@ -76,7 +77,7 @@ def visual_media(root: Path) -> tuple[list[Path], list[Path]]:
 
 
 class QuickThumbnailBuilder:
-    """Build a bounded, padded contact sheet using ffmpeg/ffprobe.
+    """Build a bounded, padded visual collage using ffmpeg/ffprobe.
 
     The process handle is retained so the worker can interrupt an active
     ffmpeg invocation when the enclosing job is cancelled.
@@ -112,27 +113,29 @@ class QuickThumbnailBuilder:
     def build(self, media_root: Path, output_path: Path) -> dict[str, object]:
         media_root = Path(media_root).resolve()
         output_path = Path(output_path).resolve()
-        contact_sheet: Path | None = None
+        contact_sheets: list[Path] = []
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             photos, videos = visual_media(media_root)
             selected = photos[:4]
-            if len(selected) < 4 and videos:
-                contact_sheet = output_path.parent / ".video-contact-sheet.png"
+            for index, video in enumerate(videos[:4], start=1):
+                contact_sheet = output_path.parent / f".video-contact-sheet-{index}.png"
+                contact_sheets.append(contact_sheet)
                 contact_sheet.unlink(missing_ok=True)
-                self._video_contact_sheet(videos[0], contact_sheet)
-                selected.append(contact_sheet)
+                self._video_contact_sheet(video, contact_sheet)
+            selected.extend(contact_sheets)
             if not selected:
                 raise QuickModeError(
                     "Quick Mode tidak menemukan foto atau video yang dapat dibuat thumbnail."
                 )
             self._compose(selected, output_path)
         finally:
-            if contact_sheet is not None:
+            for contact_sheet in contact_sheets:
                 contact_sheet.unlink(missing_ok=True)
         return {
             "photos_used": min(len(photos), 4),
-            "video_contact_sheet": contact_sheet is not None,
+            "video_contact_sheet": bool(contact_sheets),
+            "video_contact_sheets_used": len(contact_sheets),
             "thumbnail_name": output_path.name,
         }
 
@@ -179,23 +182,38 @@ class QuickThumbnailBuilder:
         )
 
     def _compose(self, inputs: list[Path], output_path: Path) -> None:
+        row_counts = {
+            1: [1],
+            2: [2],
+            3: [3],
+            4: [2, 2],
+            5: [3, 2],
+            6: [3, 3],
+            7: [4, 3],
+            8: [4, 4],
+        }[len(inputs)]
+        canvas_width = 1600
+        row_height = 1600 if len(inputs) == 1 else 800
         filters = []
-        for index in range(len(inputs)):
-            filters.append(
-                f"[{index}:v]scale=796:796:force_original_aspect_ratio=decrease,"
-                f"pad=796:796:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[v{index}]"
-            )
-        if len(inputs) == 1:
-            filters.append("[v0]null[vout]")
-        else:
-            layout = "|".join(
-                f"{(index % 2) * 804}_{(index // 2) * 804}"
-                for index in range(len(inputs))
-            )
-            streams = "".join(f"[v{index}]" for index in range(len(inputs)))
-            filters.append(
-                f"{streams}xstack=inputs={len(inputs)}:layout={layout}:fill=black[vout]"
-            )
+        layouts = []
+        input_index = 0
+        for row_index, column_count in enumerate(row_counts):
+            base_width, remainder = divmod(canvas_width, column_count)
+            x = 0
+            for column_index in range(column_count):
+                width = base_width + (1 if column_index >= column_count - remainder else 0)
+                index = input_index
+                filters.append(
+                    f"[{index}:v]scale={width}:{row_height}:force_original_aspect_ratio=decrease,"
+                    f"pad={width}:{row_height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[v{index}]"
+                )
+                layouts.append(f"{x}_{row_index * row_height}")
+                x += width
+                input_index += 1
+        streams = "".join(f"[v{index}]" for index in range(len(inputs)))
+        filters.append(
+            f"{streams}xstack=inputs={len(inputs)}:layout={'|'.join(layouts)}:fill=black[vout]"
+        )
         command = [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y"]
         for path in inputs:
             command.extend(["-i", str(path)])

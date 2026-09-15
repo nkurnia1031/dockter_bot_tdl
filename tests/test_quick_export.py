@@ -25,10 +25,10 @@ class QuickThumbnailTests(unittest.TestCase):
         for name in names:
             (root / name).write_bytes(b"media")
 
-    def test_four_photos_do_not_invoke_video_processing(self) -> None:
+    def test_four_photos_without_videos_do_not_invoke_video_processing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self.make_media(root, ["01.jpg", "02.png", "03.webp", "04.jpeg", "clip.mp4"])
+            self.make_media(root, ["01.jpg", "02.png", "03.webp", "04.jpeg"])
             builder = QuickThumbnailBuilder()
             commands: list[list[str]] = []
 
@@ -45,10 +45,45 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual(len(commands), 1)
             self.assertTrue((root / "result.png").exists())
 
-    def test_missing_photo_slots_are_filled_by_video_contact_sheet(self) -> None:
+    def test_three_photos_are_collaged_without_an_empty_slot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self.make_media(root, ["01.jpg", "clip.mp4"])
+            self.make_media(root, ["01.jpg", "02.png", "03.webp"])
+            builder = QuickThumbnailBuilder()
+            commands: list[list[str]] = []
+
+            def fake_run(command: list[str]) -> str:
+                commands.append(command)
+                Path(command[-1]).write_bytes(b"png")
+                return ""
+
+            builder._run = fake_run  # type: ignore[method-assign]
+            details = builder.build(root, root / "result.png")
+
+            compose = next(command for command in commands if "-filter_complex" in command)
+            filter_value = compose[compose.index("-filter_complex") + 1]
+            self.assertEqual(details["photos_used"], 3)
+            self.assertFalse(details["video_contact_sheet"])
+            self.assertIn("xstack=inputs=3", filter_value)
+            self.assertIn("layout=0_0|533_0|1066_0", filter_value)
+
+    def test_four_photos_and_four_videos_create_eight_collage_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_media(
+                root,
+                [
+                    "01.jpg",
+                    "02.png",
+                    "03.webp",
+                    "04.jpeg",
+                    "clip-1.mp4",
+                    "clip-2.mp4",
+                    "clip-3.mp4",
+                    "clip-4.mp4",
+                    "clip-5.mp4",
+                ],
+            )
             builder = QuickThumbnailBuilder()
             commands: list[list[str]] = []
 
@@ -62,11 +97,19 @@ class QuickThumbnailTests(unittest.TestCase):
             builder._run = fake_run  # type: ignore[method-assign]
             details = builder.build(root, root / "result.png")
 
-            self.assertEqual(details["photos_used"], 1)
+            self.assertEqual(details["photos_used"], 4)
             self.assertTrue(details["video_contact_sheet"])
-            self.assertTrue(any(command[0] == "ffprobe" for command in commands))
-            self.assertTrue(any("tile=4x4" in " ".join(command) for command in commands))
-            self.assertFalse((root / ".video-contact-sheet.png").exists())
+            self.assertEqual(details["video_contact_sheets_used"], 4)
+            self.assertEqual(sum(command[0] == "ffprobe" for command in commands), 4)
+            self.assertEqual(
+                sum("tile=4x4" in " ".join(command) for command in commands),
+                4,
+            )
+            compose = next(command for command in commands if "-filter_complex" in command)
+            filter_value = compose[compose.index("-filter_complex") + 1]
+            self.assertIn("xstack=inputs=8", filter_value)
+            self.assertNotIn("804", filter_value)
+            self.assertFalse(any(path.exists() for path in root.glob(".video-contact-sheet-*.png")))
 
     def test_no_visual_media_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -85,7 +128,10 @@ class QuickThumbnailTests(unittest.TestCase):
     def test_visual_media_ignores_generated_thumbnail(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            self.make_media(root, ["photo.jpg", "photo_thumb.jpg", "clip.mp4"])
+            self.make_media(
+                root,
+                ["photo.jpg", "photo_thumb.jpg", ".video-contact-sheet-1.png", "clip.mp4"],
+            )
             photos, videos = visual_media(root)
             self.assertEqual([path.name for path in photos], ["photo.jpg"])
             self.assertEqual([path.name for path in videos], ["clip.mp4"])
