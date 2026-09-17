@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -18,6 +20,17 @@ from tme3bot.url_parser import slugify_label
 
 class QuickModeError(RuntimeError):
     """A user-actionable error in the Quick Mode pipeline."""
+
+
+QUICK_PHASES = (
+    "exporting",
+    "downloading",
+    "thumbnailing",
+    "compressing",
+    "uploading",
+    "cleanup",
+)
+_STAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 
 
 PHOTO_EXTENSIONS = frozenset({
@@ -56,6 +69,52 @@ def quick_folder_name(export_path: Path) -> str:
 
 def quick_storage_caption(folder_name: str, year: int) -> str:
     return f"{folder_name}\n#ModeCepat #{year}"
+
+
+def quick_stage_root(workspace: Path, stage_job_id: str) -> Path:
+    """Return the visible, validated staging root for one Quick Mode chain."""
+    stage_id = str(stage_job_id).strip()
+    if not _STAGE_ID_RE.fullmatch(stage_id):
+        raise QuickModeError("ID staging Quick Mode tidak valid.")
+    workspace = Path(workspace).resolve()
+    root = (workspace / "quickmode" / stage_id).resolve()
+    try:
+        root.relative_to(workspace)
+    except ValueError as exc:
+        raise QuickModeError("Staging Quick Mode keluar dari workspace.") from exc
+    return root
+
+
+def migrate_legacy_quick_stage(workspace: Path, stage_job_id: str) -> Path:
+    """Move the old hidden staging tree into the admin-visible location."""
+    target = quick_stage_root(workspace, stage_job_id)
+    legacy = (Path(workspace).resolve() / ".tme3bot-quick" / str(stage_job_id)).resolve()
+    if legacy == target or not legacy.exists() or target.exists():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(legacy), str(target))
+    return target
+
+
+def read_quick_manifest(stage_root: Path) -> dict[str, object]:
+    path = Path(stage_root) / "quickmode.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def write_quick_manifest(stage_root: Path, values: dict[str, object]) -> None:
+    """Persist non-secret phase metadata atomically for retry/recovery."""
+    path = Path(stage_root) / "quickmode.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(values, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def visual_media(root: Path) -> tuple[list[Path], list[Path]]:

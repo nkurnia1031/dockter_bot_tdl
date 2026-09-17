@@ -59,11 +59,21 @@ def export_report(job: dict[str, Any]) -> dict[str, Any]:
     artifact = artifact if isinstance(artifact, dict) else {}
     return {
         "status": job.get("status", "-"),
+        "started_at": job.get("started_at") or job.get("created_at"),
+        "finished_at": job.get("finished_at"),
         "message_count": value.get("message_count", value.get("exported_count")),
         "media_count": value.get("media_count"),
         "photo_count": value.get("photo_count"),
         "video_count": value.get("video_count"),
         "latest_id": value.get("latest_id"),
+        "export_start_id": value.get(
+            "export_start_id",
+            value.get("start_id", job.get("export_start_id", progress.get("export_start_id"))),
+        ),
+        "export_end_id": value.get(
+            "export_end_id",
+            value.get("end_id", job.get("export_end_id", progress.get("export_end_id"))),
+        ),
         "filename": value.get("filename") or artifact.get("filename"),
         "artifact": value.get("artifact_key") or artifact.get("artifact_key"),
         "artifact_deleted": value.get("artifact_deleted"),
@@ -131,12 +141,20 @@ def format_export_job(job: dict[str, Any]) -> str:
 
     if job.get("status") in {"succeeded", "failed", "cancelled"}:
         report = export_report(job)
+        if report["started_at"]:
+            lines.append(f"Mulai: {short_text(report['started_at'], 40)}")
+        if report["finished_at"]:
+            lines.append(f"Selesai: {short_text(report['finished_at'], 40)}")
+        if progress.get("staging_path") and not progress.get("staging_cleaned"):
+            lines.append(f"Staging dipertahankan: {short_text(progress['staging_path'], 180)}")
         for label, key in (
             ("Message", "message_count"),
             ("Media", "media_count"),
             ("Foto", "photo_count"),
             ("Video", "video_count"),
             ("Latest ID", "latest_id"),
+            ("Export dari ID", "export_start_id"),
+            ("Export sampai ID", "export_end_id"),
         ):
             if report[key] is not None:
                 lines.append(f"{label}: {report[key]}")

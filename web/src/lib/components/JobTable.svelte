@@ -9,7 +9,7 @@
 
   type Job = Record<string, any>;
   type JobEvent = Record<string, any>;
-  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global' } = $props();
+  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean } = $props();
   let jobs = $state<Job[]>([]);
   let error = $state('');
   let selected = $state<Job | null>(null);
@@ -23,6 +23,7 @@
   let liveLog = $state<Record<string, any> | null>(null);
   let toastOpen = $state(false);
   let toastMessage = $state('');
+  let retrying = $state<Record<string, boolean>>({});
   let timer: ReturnType<typeof setTimeout> | undefined;
   let mounted = false;
   let loadGeneration = 0;
@@ -39,7 +40,13 @@
   async function load() {
     const request = ++loadGeneration;
     try {
-      const query = `/jobs?limit=30&scope=${scope}${kind ? `&kind=${encodeURIComponent(kind)}` : ''}${profile ? `&profile=${encodeURIComponent(profile)}` : ''}${worker ? `&worker=${encodeURIComponent(worker)}` : ''}`;
+      const params = new URLSearchParams({ limit: '30', scope });
+      if (kind) params.set('kind', kind);
+      if (profile) params.set('profile', profile);
+      if (worker) params.set('worker', worker);
+      if (status) params.set('status', status);
+      if (quickMode) params.set('quick_mode', 'true');
+      const query = `/jobs?${params.toString()}`;
       const next = (await api<{items:Job[]}>(query)).items || [];
       if (request !== loadGeneration) return;
       jobs = next;
@@ -75,11 +82,37 @@
   function requestTerminate(target: 'one'|'all', job?: Job) { if (job) selected = job; confirmTarget = target; confirmOpen = true; }
   async function terminate() {
     try {
-      if (confirmTarget === 'all') await post(`/jobs/terminate-active${scope === 'global' ? '?scope=global' : ''}`);
+      if (confirmTarget === 'all') {
+        const params = new URLSearchParams();
+        if (scope === 'global') params.set('scope', 'global');
+        if (kind) params.set('kind', kind);
+        if (quickMode) { params.set('kind', 'export'); params.set('quick_mode', 'true'); }
+        const query = params.toString();
+        await post(`/jobs/terminate-active${query ? `?${query}` : ''}`);
+      }
       else if (selected) await post(`/jobs/${selected.id}/cancel`);
       toastMessage = confirmTarget === 'all' ? 'Terminate dikirim ke semua job aktif.' : 'Terminate dikirim ke job.';
       toastOpen = true; confirmOpen = false; await load();
     } catch (cause) { error = cause instanceof Error ? cause.message : 'Job gagal dihentikan.'; }
+  }
+  async function retry(job: Job) {
+    const quick = Boolean(job.payload?.quick_mode);
+    if (job.status === 'succeeded' && !window.confirm(quick ? 'Jalankan ulang Quick Mode dari export awal?' : 'Jalankan ulang export dari awal?')) return;
+    retrying = { ...retrying, [job.id]: true };
+    try {
+      await post(`/jobs/${encodeURIComponent(job.id)}/retry`);
+      toastMessage = job.status === 'succeeded'
+        ? (quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
+        : (quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
+      toastOpen = true;
+      await load();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Retry export gagal dibuat.';
+    } finally {
+      const next = { ...retrying };
+      delete next[job.id];
+      retrying = next;
+    }
   }
   async function copy(value: string) { await navigator.clipboard?.writeText(value); toastMessage = 'Disalin ke clipboard.'; toastOpen = true; }
   const eventLine = (event: JobEvent) => {
@@ -153,7 +186,7 @@
   {#if historyJobs.length}<div class="px-4 pt-4 sm:px-5"><h3 class="text-sm font-extrabold">History terbaru</h3></div>{/if}
   <div class="divide-y divide-[var(--line)] px-4 sm:px-5">
     {#each historyJobs as job (job.id)}
-      <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center"><div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><b class="capitalize">{job.kind.replaceAll('_',' ')}</b><span class={`badge ${job.status}`}>{job.status}</span><span class="muted text-xs">{job.worker || '-'}</span></div><p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p></div><div class="flex flex-wrap items-center gap-2"><small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small><button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button><button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button></div></article>
+      <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center"><div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><b class="capitalize">{job.kind.replaceAll('_',' ')}</b>{#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}<span class={`badge ${job.status}`}>{job.status}</span><span class="muted text-xs">{job.worker || '-'}</span></div><p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p></div><div class="flex flex-wrap items-center gap-2"><small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small><button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button><button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>{#if retryable && job.kind === 'export' && ['failed','cancelled','succeeded'].includes(job.status)}<button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>{job.status === 'succeeded' ? 'Jalankan lagi' : 'Retry'}</button>{/if}</div></article>
     {/each}
     {#if !historyJobs.length && !activeJobs.length}<div class="py-14 text-center"><ClipboardList class="mx-auto mb-2 text-violet-500"/><b>Belum ada job.</b></div>{/if}
   </div>
@@ -169,7 +202,7 @@
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'raw' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'raw'}>Raw JSON</button>
       </div>
       {#if detailTab === 'summary'}
-        <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div>{#each resultEntries(selected.result) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
+        <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each resultEntries(selected.result?.value || selected.result) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
       {:else if detailTab === 'milestones'}
         <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div><p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p></article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
       {:else}

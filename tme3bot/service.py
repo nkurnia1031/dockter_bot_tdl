@@ -28,6 +28,9 @@ class ExportJobResult:
     has_media: bool
     warmup_required: bool
     warning: str | None = None
+    # The actual upper bound is retained so a later retry can reproduce the
+    # same TDL range even after the JSON has been consumed or removed.
+    end_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +65,8 @@ class ExportService:
         url: str,
         use_url_message_id: bool = False,
         save_source: bool | None = None,
+        export_start_id: int | None = None,
+        export_end_id: int | None = None,
     ) -> ExportJobResult:
         parsed = self.validate_url(url)
         source = self.state_store.get_source(parsed.chat_ref)
@@ -76,13 +81,27 @@ class ExportService:
             if save_source is not None
             else (source is not None or not is_numeric_source)
         )
-        start_id = self._resolve_start_id(parsed, source, use_url_message_id)
+        start_id = (
+            max(1, int(export_start_id))
+            if export_start_id is not None
+            else self._resolve_start_id(parsed, source, use_url_message_id)
+        )
         export_path = self._next_export_path(parsed)
         temp_path = self._next_temp_path(export_path.name)
 
-        export_result = self.tdl_client.export_messages(
-            parsed.chat_ref, start_id, temp_path
-        )
+        if export_end_id is None:
+            # Keep compatibility with lightweight/fake TDL clients that still
+            # implement the original three-argument method.
+            export_result = self.tdl_client.export_messages(
+                parsed.chat_ref, start_id, temp_path
+            )
+        else:
+            export_result = self.tdl_client.export_messages(
+                parsed.chat_ref,
+                start_id,
+                temp_path,
+                end_id=max(start_id, int(export_end_id)),
+            )
         warmup_url = (
             self._select_warmup_url(parsed, export_result) if is_new_source else None
         )
@@ -123,6 +142,7 @@ class ExportService:
             exported_count=export_result.exported_count,
             has_media=export_result.has_media,
             warmup_required=warmup_required,
+            end_id=export_result.max_message_id,
         )
 
     def _resolve_start_id(
@@ -261,6 +281,7 @@ class BatchDownloadService:
         download_dir: Path,
         *,
         delete_json_on_success: bool = True,
+        workspace_root: Path | None = None,
     ) -> DownloadedJsonResult:
         """Download one export into a caller-owned staging directory.
 
@@ -270,6 +291,13 @@ class BatchDownloadService:
         artifact path.
         """
         candidate = Path(export_json).resolve()
+        target_dir = Path(download_dir).resolve()
+        if workspace_root is not None:
+            workspace = Path(workspace_root).resolve()
+            if not _is_relative_to(target_dir, workspace):
+                raise ValueError(
+                    "Direktori download Quick Mode harus berada di dalam workspace."
+                )
         roots = {
             "pending": self.config.export_pending_dir.resolve(),
             "failed": self.config.export_failed_dir.resolve(),
@@ -289,7 +317,7 @@ class BatchDownloadService:
         batch = self._download_files(
             [moved],
             mode="quick",
-            download_dir_overrides={moved: Path(download_dir)},
+            download_dir_overrides={moved: target_dir},
             delete_json_on_success=delete_json_on_success,
         )
         return batch.results[0]

@@ -100,7 +100,9 @@ export function phaseLabel(value: string): string {
     compressing: 'Mengompres',
     extracting: 'Mengekstrak',
     downloading: 'Mendownload media',
+    thumbnailing: 'Membuat thumbnail',
     processing_json: 'Memproses JSON',
+    cleanup: 'Membersihkan staging',
     completed: 'Selesai',
     starting: 'Memulai'
   };

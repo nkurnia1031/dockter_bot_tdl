@@ -13,7 +13,9 @@ from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.quick_export import (
     QuickModeError,
     QuickThumbnailBuilder,
+    migrate_legacy_quick_stage,
     quick_folder_name,
+    quick_stage_root,
     quick_storage_caption,
     visual_media,
 )
@@ -136,6 +138,20 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual([path.name for path in photos], ["photo.jpg"])
             self.assertEqual([path.name for path in videos], ["clip.mp4"])
 
+    def test_legacy_stage_is_migrated_to_visible_quickmode_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            legacy = workspace / ".tme3bot-quick" / "old-job"
+            legacy.mkdir(parents=True)
+            (legacy / "quickmode.json").write_text('{"phase":"uploading"}', encoding="utf-8")
+            (legacy / "batch.7z.001").write_bytes(b"archive")
+
+            target = migrate_legacy_quick_stage(workspace, "old-job")
+
+            self.assertEqual(target, quick_stage_root(workspace, "old-job"))
+            self.assertTrue((workspace / "quickmode" / "old-job" / "batch.7z.001").exists())
+            self.assertFalse(legacy.exists())
+
 
 class ExportMilestoneTests(unittest.TestCase):
     def test_export_publishes_json_ready_milestone_before_post_export_cleanup(self) -> None:
@@ -153,8 +169,10 @@ class ExportMilestoneTests(unittest.TestCase):
                     self.events.append({"event_type": args[2], **kwargs})
 
             class ExportService:
+                calls = []
+
                 def export_from_url(self, url, **kwargs):
-                    del url, kwargs
+                    self.calls.append((url, kwargs))
                     return ExportJobResult(
                         status="exported",
                         chat_ref="@source",
@@ -188,8 +206,101 @@ class ExportMilestoneTests(unittest.TestCase):
         self.assertEqual(milestone["progress"]["phase"], "json_ready")
         self.assertEqual(milestone["result"]["json_name"], "batch.json")
 
+    def test_export_retry_passes_message_id_range_to_export_service(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            export_path = root / "exports" / "batch.json"
+            export_path.parent.mkdir(parents=True)
+            export_path.write_text('{"messages":[{"id":500,"type":"text"}]}', encoding="utf-8")
+
+            class Publisher:
+                def emit(self, *args, **kwargs):
+                    del args, kwargs
+
+            class ExportService:
+                def __init__(self):
+                    self.calls = []
+
+                def export_from_url(self, url, **kwargs):
+                    self.calls.append((url, kwargs))
+                    return ExportJobResult(
+                        status="exported",
+                        chat_ref="@source",
+                        requested_label=None,
+                        export_path=export_path,
+                        start_id=100,
+                        latest_id=500,
+                        exported_count=1,
+                        has_media=False,
+                        warmup_required=False,
+                        end_id=500,
+                    )
+
+            export_service = ExportService()
+            runtime = SimpleNamespace(
+                export_service=export_service,
+                export_operation_lock=threading.RLock(),
+                export_tdl_client=SimpleNamespace(output_callback=None, progress_callback=None),
+            )
+            profiles = SimpleNamespace(runtime=lambda profile: runtime)
+            executor = WorkerJobExecutor(SimpleNamespace(), profiles, Publisher())
+
+            executor._export(
+                {
+                    "job_id": "retry-export-job",
+                    "profile": "default",
+                    "payload": {
+                        "url": "https://t.me/c/1/100",
+                        "export_retry": {"start_id": 100, "end_id": 500},
+                    },
+                }
+            )
+
+        self.assertEqual(export_service.calls[0][1]["export_start_id"], 100)
+        self.assertEqual(export_service.calls[0][1]["export_end_id"], 500)
+
 
 class QuickPipelineTests(unittest.TestCase):
+    def test_quick_cancel_is_best_effort_when_some_runtimes_are_already_gone(self):
+        calls: list[str] = []
+
+        class Client:
+            def __init__(self, name: str, result: bool = False, error: bool = False):
+                self.name = name
+                self.result = result
+                self.error = error
+
+            def interrupt_current(self):
+                calls.append(self.name)
+                if self.error:
+                    raise RuntimeError(f"{self.name} already stopped")
+                return self.result
+
+        class Runner:
+            def cancel_current(self):
+                calls.append("utility")
+                raise RuntimeError("utility already stopped")
+
+        class Profiles:
+            def runtime(self, profile):
+                return storage_runtime if profile == "storage" else export_runtime
+
+        export_runtime = SimpleNamespace(
+            export_tdl_client=Client("export", error=True),
+            download_tdl_client=Client("download", result=True),
+        )
+        storage_runtime = SimpleNamespace(export_tdl_client=Client("storage", error=True))
+        config = SimpleNamespace(worker_storage_profile="storage", backup_node_name="local")
+        executor = WorkerJobExecutor(config, Profiles(), SimpleNamespace())
+        executor._active["quick-cancel"] = ("default", "export")
+        executor._quick_active.add("quick-cancel")
+        executor._quick_thumbnail_builders["quick-cancel"] = Runner()
+        executor._utility_runners["quick-cancel"] = Runner()
+
+        self.assertTrue(executor.cancel("quick-cancel"))
+        self.assertEqual(calls, ["export", "download", "storage", "utility", "utility"])
+        self.assertIn("quick-cancel", executor._cancel_requested)
+
     def test_pipeline_passes_compress_settings_uploads_both_files_and_cleans_stage(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

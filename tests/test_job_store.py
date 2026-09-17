@@ -112,6 +112,31 @@ class JobStoreTests(unittest.TestCase):
             )
             self.assertEqual(len(store.events("job-1")), 3)
 
+    def test_progress_merge_preserves_lifecycle_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            store.create(self.make_job())
+            store.append_event(
+                JobEvent(
+                    "job-1",
+                    1,
+                    JobStatus.RUNNING,
+                    "started",
+                    {"phase": "starting", "started_at": "2026-09-17T01:00:00+00:00"},
+                )
+            )
+            current, updated = store.update_progress_snapshot(
+                JobEvent(
+                    "job-1",
+                    2,
+                    JobStatus.RUNNING,
+                    "progress.snapshot",
+                    {"phase": "downloading"},
+                )
+            )
+            self.assertTrue(updated)
+            self.assertEqual(current.progress["started_at"], "2026-09-17T01:00:00+00:00")
+
     def test_filters_archive_restore_and_purge_terminal_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")
@@ -128,6 +153,25 @@ class JobStoreTests(unittest.TestCase):
             store.set_archived("job-1", False)
             store.set_archived("job-1", True)
             self.assertTrue(store.purge("job-1"))
+
+    def test_quick_mode_filter_only_returns_quick_export_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            store.create(self.make_job())
+            store.create(
+                Job(
+                    id="job-quick",
+                    kind="export",
+                    profile="default",
+                    actor_user_id=7,
+                    worker="local",
+                    status=JobStatus.QUEUED,
+                    payload={"url": "https://t.me/c/1/3", "quick_mode": True},
+                )
+            )
+            self.assertEqual([job.id for job in store.list(quick_mode=True)], ["job-quick"])
+            self.assertEqual([job.id for job in store.list(quick_mode=False)], ["job-1"])
+            self.assertEqual(store.count(kind="export", quick_mode=True), 1)
 
     def test_telegram_notification_is_idempotent_and_terminal_stamp_is_stable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

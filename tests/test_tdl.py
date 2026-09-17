@@ -142,6 +142,19 @@ class TDLClientTests(unittest.TestCase):
             self.assertIsNone(result.max_message_id)
             self.assertFalse(result.has_media)
 
+    def test_export_can_use_explicit_message_id_end_for_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = FakeRunner("empty")
+            client = TDLClient(root / "export", "export", runner=runner)
+
+            client.export_messages("@bot", 100, root / "out.json", end_id=500)
+
+            command = runner.commands[0]
+            self.assertIn("chat", command)
+            self.assertIn("export", command)
+            self.assertEqual(command[command.index("-i") + 1], "100,500")
+
     def test_export_failure_raises(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

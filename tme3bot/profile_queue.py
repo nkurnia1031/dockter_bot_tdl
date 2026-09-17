@@ -116,6 +116,7 @@ class ResourceAwareQueue(Generic[JobT]):
         self._pending: list[tuple[int, int, JobT, frozenset[str]]] = []
         self._active_keys: set[str] = set()
         self._active_jobs: set[str] = set()
+        self._active_resource_keys: dict[str, set[str]] = {}
         self._sequence = itertools.count()
         self._scheduler: threading.Thread | None = None
         self._started = False
@@ -216,6 +217,7 @@ class ResourceAwareQueue(Generic[JobT]):
                 self._active_keys.update(keys)
                 if job_id:
                     self._active_jobs.add(job_id)
+                    self._active_resource_keys[job_id] = set(keys)
             threading.Thread(
                 target=self._run,
                 args=(job, keys, job_id),
@@ -233,6 +235,29 @@ class ResourceAwareQueue(Generic[JobT]):
             return None
         return min(candidates, key=lambda pair: (pair[1][0], pair[1][1]))[0]
 
+    def release_resources(self, job_id: str, resources: set[str] | list[str] | tuple[str, ...]) -> bool:
+        """Release a subset of an active job's resources.
+
+        Long pipelines can change lanes without ending the worker thread.  A
+        Quick Mode job releases its export session after ``json_ready`` while
+        retaining its unique staging lock until cleanup.
+        """
+        target = str(job_id)
+        requested = {str(item) for item in resources if str(item)}
+        if not requested:
+            return False
+        with self._condition:
+            owned = self._active_resource_keys.get(target)
+            if owned is None:
+                return False
+            released = owned.intersection(requested)
+            if not released:
+                return False
+            owned.difference_update(released)
+            self._active_keys.difference_update(released)
+            self._condition.notify_all()
+            return True
+
     def _run(self, job: JobT, keys: frozenset[str], job_id: str) -> None:
         try:
             self._handler(job, set(keys))
@@ -246,7 +271,8 @@ class ResourceAwareQueue(Generic[JobT]):
                     LOGGER.exception("Resource queue error handler failed for %s", job_id)
         finally:
             with self._condition:
-                self._active_keys.difference_update(keys)
+                owned = self._active_resource_keys.pop(job_id, set(keys))
+                self._active_keys.difference_update(owned)
                 if job_id:
                     self._active_jobs.discard(job_id)
                 self._condition.notify_all()

@@ -118,6 +118,38 @@ def _error(
 
 
 def job_dict(job: Job) -> dict[str, Any]:
+    retry_meta = job.payload.get("quick_retry")
+    if not isinstance(retry_meta, dict):
+        retry_meta = job.payload.get("export_retry")
+    if not isinstance(retry_meta, dict):
+        retry_meta = {}
+    result_value = job.result.get("value", job.result) if isinstance(job.result, dict) else {}
+    if not isinstance(result_value, dict):
+        result_value = {}
+    export_start_id = job.progress.get("export_start_id")
+    if export_start_id is None:
+        export_start_id = result_value.get("export_start_id", result_value.get("start_id"))
+    export_end_id = job.progress.get("export_end_id")
+    if export_end_id is None:
+        export_end_id = result_value.get(
+            "export_end_id",
+            result_value.get("end_id", result_value.get("max_message_id", result_value.get("latest_id"))),
+        )
+    # Legacy rows did not have explicit phase timestamps. Their persisted
+    # lifecycle timestamps are the best available audit boundary, while new
+    # worker events provide precise values in progress.
+    started_at = job.progress.get("started_at")
+    if not started_at and job.status in {
+        JobStatus.DISPATCHED,
+        JobStatus.RUNNING,
+        JobStatus.SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    }:
+        started_at = job.created_at.isoformat()
+    finished_at = job.progress.get("finished_at")
+    if not finished_at and job.status.terminal:
+        finished_at = job.updated_at.isoformat()
     return {
         "id": job.id,
         "kind": job.kind,
@@ -131,6 +163,13 @@ def job_dict(job: Job) -> dict[str, Any]:
         "error": job.error,
         "archived_at": job.archived_at.isoformat() if job.archived_at else None,
         "queue_position": job.progress.get("position"),
+        "retryable": job.kind == "export" and job.status.terminal,
+        "retry_of": retry_meta.get("retry_of"),
+        "retry_phase": retry_meta.get("retry_phase"),
+        "export_start_id": export_start_id,
+        "export_end_id": export_end_id,
+        "started_at": started_at,
+        "finished_at": finished_at,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
     }
@@ -588,6 +627,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         status: str | None = None,
         worker: str | None = None,
         profile: str | None = None,
+        quick_mode: bool | None = None,
         scope: str = Query("current", pattern="^(current|global)$"),
         archived: bool | None = False,
         limit: int = Query(50, ge=1, le=200),
@@ -602,6 +642,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             kind=kind,
             status=status,
             worker=worker,
+            quick_mode=quick_mode,
             archived=archived,
             offset=offset,
             limit=limit,
@@ -611,6 +652,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             kind=kind,
             status=status,
             worker=worker,
+            quick_mode=quick_mode,
             archived=archived,
         )
         return {
@@ -740,10 +782,21 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     def terminate_active_jobs(
         scope: str = Query("current", pattern="^(current|global)$"),
         profile: str | None = None,
+        kind: str | None = None,
+        quick_mode: bool | None = None,
         actor=Depends(current_actor),
     ):
         selected_profile = None if scope == "global" else profile
-        return context.control_plane.terminate_active_jobs(actor, profile=selected_profile)
+        return context.control_plane.terminate_active_jobs(
+            actor,
+            profile=selected_profile,
+            kind=kind,
+            quick_mode=quick_mode,
+        )
+
+    @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
+    def retry_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.retry_job(actor, job_id))
 
     @app.post("/api/v1/jobs/{job_id}/archive", response_model=JobResponse)
     def archive_job(job_id: str, actor=Depends(current_actor)):

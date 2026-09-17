@@ -146,6 +146,17 @@ class ProfileTests(unittest.TestCase):
             runtime = build_profile_runtime("default", config)
             self.assertIsInstance(runtime.state_store, StateStore)
 
+    def test_export_and_download_use_distinct_tdl_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime = build_profile_runtime("default", self.make_config(root))
+
+            self.assertIsNot(runtime.export_tdl_client, runtime.download_tdl_client)
+            self.assertNotEqual(
+                runtime.export_tdl_client.storage_root,
+                runtime.download_tdl_client.storage_root,
+            )
+
     def test_profile_registry_rejects_one_telegram_identity_on_two_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ProfileRegistry(Path(temp_dir) / "profiles.json", "default")

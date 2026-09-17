@@ -17,11 +17,18 @@ class FakeExportTDLClient:
     def __init__(self, result: ExportResult) -> None:
         self.result = result
         self.export_calls: list[tuple[str, int, Path]] = []
+        self.export_ranges: list[tuple[int, int | None]] = []
 
     def export_messages(
-        self, chat_ref: str, start_id: int, export_path: Path
+        self,
+        chat_ref: str,
+        start_id: int,
+        export_path: Path,
+        *,
+        end_id: int | None = None,
     ) -> ExportResult:
         self.export_calls.append((chat_ref, start_id, export_path))
+        self.export_ranges.append((start_id, end_id))
         export_path.parent.mkdir(parents=True, exist_ok=True)
         export_path.write_text('{"messages": []}', encoding="utf-8")
         return ExportResult(
@@ -219,6 +226,31 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(result.latest_id, 20)
             self.assertEqual(client.export_calls[0][0:2], ("4429689667", 11))
             self.assertEqual(store.get_source("4429689667").last_id, 20)
+
+    def test_export_retry_range_is_forwarded_to_tdl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            client = FakeExportTDLClient(
+                ExportResult(
+                    export_path=root / "ignored.json",
+                    messages=[{"id": 500}],
+                    exported_count=1,
+                    max_message_id=500,
+                    has_media=False,
+                )
+            )
+
+            result = ExportService(config, store, client).export_from_url(
+                "https://t.me/c/@bot/100",
+                export_start_id=100,
+                export_end_id=500,
+            )
+
+            self.assertEqual(result.start_id, 100)
+            self.assertEqual(result.end_id, 500)
+            self.assertEqual(client.export_ranges, [(100, 500)])
 
     def test_new_numeric_source_is_not_saved_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -297,7 +297,7 @@
     <div class="divide-y divide-[var(--line)] px-5 sm:px-6">{#each sources as source}<article class="group flex items-center justify-between gap-3 py-4"><button class="min-w-0 text-left" onclick={() => choose(source.chat_ref)}><b class="block truncate text-sm group-hover:text-violet-700 dark:group-hover:text-violet-300">{source.chat_ref}</b><p class="muted mt-1 text-sm">{source.label || 'Tanpa label'} · Last ID {source.last_id}</p></button><button class="button ghost size-9 !rounded-lg !p-0 text-rose-600 hover:!bg-rose-50 dark:hover:!bg-rose-950" onclick={async () => { await remove(`/sources/${encodeURIComponent(source.chat_ref)}`); await load(); }} aria-label={`Hapus ${source.chat_ref}`}><Trash2 size={16}/></button></article>{:else}<div class="py-14 text-center"><ListFilter class="mx-auto mb-3 text-violet-500" size={28}/><p class="font-bold">Belum ada source.</p><p class="muted mt-1 text-sm">Export yang sukses akan menyimpan source ini.</p></div>{/each}</div>
   </section>
 </div>
-<JobTable kind="export" title="Riwayat export" />
+<JobTable kind="export" title="Riwayat export" retryable={true} />
 
 <style>
   /* The page transition applies transform to .page-enter, which would make a

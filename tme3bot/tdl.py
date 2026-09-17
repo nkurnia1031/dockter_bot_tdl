@@ -416,6 +416,7 @@ class TDLClient:
         *,
         with_content: bool = False,
         last_count: int | None = None,
+        end_id: int | None = None,
     ) -> ExportResult:
         export_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -423,7 +424,8 @@ class TDLClient:
         if last_count is not None:
             export_args.extend(["-T", "last", "-i", str(max(1, last_count))])
         else:
-            export_args.extend(["-T", "id", "-i", f"{start_id},999999999"])
+            end = 999999999 if end_id is None else max(start_id, int(end_id))
+            export_args.extend(["-T", "id", "-i", f"{start_id},{end}"])
         export_args.extend(["-o", str(export_path)])
         if with_content:
             export_args.append("--with-content")

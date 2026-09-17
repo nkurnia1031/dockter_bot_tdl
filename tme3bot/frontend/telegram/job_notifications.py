@@ -149,6 +149,14 @@ def format_job_status(job: dict[str, Any]) -> str:
             ("Foto", value.get("photo_count")),
             ("Video", value.get("video_count")),
             ("Latest ID", value.get("latest_id")),
+            (
+                "Export dari ID",
+                value.get("export_start_id", job.get("export_start_id", progress.get("export_start_id"))),
+            ),
+            (
+                "Export sampai ID",
+                value.get("export_end_id", job.get("export_end_id", progress.get("export_end_id"))),
+            ),
             ("Group dibuat", value.get("groups_created")),
             ("Item dipindah", value.get("moved_count")),
             ("Part", value.get("part_count", value.get("parts"))),

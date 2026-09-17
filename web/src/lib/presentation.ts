@@ -24,7 +24,8 @@ export function formatDate(value: unknown): string {
 }
 
 export function jobMessage(job: Record<string, any>): string {
-  return textValue(job.progress?.message || job.result?.message || job.result?.status || job.error?.message, 'Menunggu proses');
+  const result = job.result?.value || job.result || {};
+  return textValue(job.progress?.message || result.message || result.quick_mode_status || result.status || job.error?.message, 'Menunggu proses');
 }
 
 export function resultEntries(value: unknown): Array<[string, string]> {

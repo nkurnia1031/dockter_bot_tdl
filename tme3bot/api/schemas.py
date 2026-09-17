@@ -90,6 +90,13 @@ class JobResponse(ApiResponse):
     error: dict[str, Any] | None = None
     archived_at: datetime | None = None
     queue_position: int | None = None
+    retryable: bool = False
+    retry_of: str | None = None
+    retry_phase: str | None = None
+    export_start_id: int | None = None
+    export_end_id: int | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

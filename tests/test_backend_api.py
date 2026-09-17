@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.application.control_plane import ControlPlane
-from tme3bot.domain.models import Actor
+from tme3bot.domain.models import Actor, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.job_store import SqliteJobRepository
@@ -643,6 +643,54 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.get(f"/api/v1/jobs/{created.json()['id']}", headers=headers).json()["status"],
             "cancelled",
+        )
+
+    def test_quick_manager_filters_terminate_and_retries_without_exposing_password(self):
+        headers = self.login()
+        quick = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/123/5", "quick_mode": True},
+        ).json()
+        quick_id = quick["id"]
+        self.control.append_worker_event(
+            JobEvent(quick_id, 2, JobStatus.RUNNING, "progress", {"phase": "compressing"})
+        )
+        self.control.append_worker_event(
+            JobEvent(quick_id, 3, JobStatus.FAILED, "failed", error={"message": "compress failed"})
+        )
+        normal = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/123/4"},
+        ).json()
+
+        listed = self.client.get(
+            "/api/v1/jobs?scope=global&kind=export&quick_mode=true",
+            headers=headers,
+        )
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual([item["id"] for item in listed.json()["items"]], [quick_id])
+
+        retried = self.client.post(f"/api/v1/jobs/{quick_id}/retry", headers=headers)
+        self.assertEqual(retried.status_code, 200)
+        retry_id = retried.json()["id"]
+        self.assertNotEqual(retry_id, quick_id)
+        retry_job = self.client.get(f"/api/v1/jobs/{retry_id}", headers=headers).json()
+        self.assertEqual(retry_job["worker"], quick["worker"])
+        self.assertNotIn("secret", str(retry_job))
+        self.assertEqual(self.jobs.command_payload(retry_id)["quick_retry"]["retry_phase"], "compressing")
+
+        self.dispatcher.cancel = lambda worker, job_id: False
+        terminated = self.client.post(
+            "/api/v1/jobs/terminate-active?scope=global&kind=export&quick_mode=true",
+            headers=headers,
+        )
+        self.assertEqual(terminated.status_code, 200)
+        self.assertEqual(terminated.json()["total"], 1)
+        self.assertEqual(
+            self.client.get(f"/api/v1/jobs/{normal['id']}", headers=headers).json()["status"],
+            "dispatched",
         )
 
     def test_storage_metadata_is_shared_for_all_authorized_users(self):

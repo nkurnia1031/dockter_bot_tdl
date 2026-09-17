@@ -702,6 +702,22 @@ class TelegramFrontendApp:
         if data == "ew:submit":
             self._submit_export_workspace(message, user_id, actor)
             return
+        if data == "ew:retry":
+            state = self.export_workspaces.get(message.chat_id, user_id)
+            snapshot = state.job_snapshot or {}
+            if not state.active_job_id or snapshot.get("status") not in {"failed", "cancelled", "succeeded"}:
+                self._show_export_workspace(message, user_id, actor, "Job export belum siap untuk diulang.")
+                return
+            try:
+                job = self.client.post(
+                    user_id,
+                    f"/api/v1/jobs/{state.active_job_id}/retry",
+                )
+                state.set_job(job)
+                self._show_export_workspace(message, user_id, actor, "Retry export masuk antrean.")
+            except Exception as exc:
+                self._show_export_workspace(message, user_id, actor, f"Retry export gagal: {short_text(exc, 240)}")
+            return
         if data in {"ew:refresh_job", "ew:detail"}:
             state = self.export_workspaces.get(message.chat_id, user_id)
             if not state.active_job_id:

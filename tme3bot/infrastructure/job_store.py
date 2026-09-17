@@ -25,6 +25,16 @@ def _load(value: str | None, fallback):
         return fallback
 
 
+def _quick_mode_sql(quick_mode: bool | None) -> tuple[str, list[object]]:
+    """Filter the compact JSON payload without requiring SQLite JSON1."""
+    marker = "(payload LIKE '%\"quick_mode\":true%' OR payload LIKE '%\"quick_mode\": true%')"
+    if quick_mode is True:
+        return marker, []
+    if quick_mode is False:
+        return f"NOT {marker}", []
+    return "", []
+
+
 class SqliteJobRepository:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -382,6 +392,50 @@ class SqliteJobRepository:
                 (now, job_id),
             )
 
+    def replace_execution_resources(
+        self, job_id: str, resource_keys: set[str] | list[str] | tuple[str, ...]
+    ) -> bool:
+        """Atomically replace an active job's lease set.
+
+        Quick Mode uses this at ``json_ready`` to release the export lane and
+        retain only its staging lock.  If the next phase conflicts with an
+        existing lease, nothing is changed and the caller can keep the old
+        reservation rather than running without a scheduler guard.
+        """
+        desired = {str(item) for item in resource_keys if str(item)}
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT worker FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            plan = db.execute(
+                "SELECT concurrency_keys FROM job_execution_plans WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None or plan is None:
+                return False
+            placeholders = ",".join("?" for _ in desired)
+            conflicts = []
+            if desired:
+                conflicts = db.execute(
+                    f"SELECT resource_key, job_id FROM job_resource_leases "
+                    f"WHERE resource_key IN ({placeholders}) AND job_id != ?",
+                    (*sorted(desired), job_id),
+                ).fetchall()
+            if conflicts:
+                return False
+            db.execute("DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,))
+            for key in sorted(desired):
+                db.execute(
+                    "INSERT INTO job_resource_leases(resource_key, job_id, acquired_at, worker) VALUES(?, ?, ?, ?)",
+                    (key, job_id, datetime.now(timezone.utc).isoformat(), str(row["worker"])),
+                )
+            db.execute(
+                "UPDATE job_execution_plans SET concurrency_keys = ?, released_at = NULL, blocked_reason = NULL WHERE job_id = ?",
+                (_dump(sorted(desired)), job_id),
+            )
+            return True
+
     def set_queue_info(self, job_id: str, position: int, reason: str | None) -> None:
         with self._db() as db:
             row = db.execute("SELECT progress FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -406,6 +460,7 @@ class SqliteJobRepository:
         kind: str | None = None,
         status: str | None = None,
         worker: str | None = None,
+        quick_mode: bool | None = None,
         archived: bool | None = None,
         offset: int = 0,
         limit: int = 50,
@@ -426,6 +481,10 @@ class SqliteJobRepository:
         if worker:
             clauses.append("worker = ?")
             values.append(worker)
+        quick_clause, quick_values = _quick_mode_sql(quick_mode)
+        if quick_clause:
+            clauses.append(quick_clause)
+            values.extend(quick_values)
         if archived is True:
             clauses.append("archived_at IS NOT NULL")
         elif archived is False:
@@ -447,6 +506,7 @@ class SqliteJobRepository:
         kind: str | None = None,
         status: str | None = None,
         worker: str | None = None,
+        quick_mode: bool | None = None,
         archived: bool | None = None,
     ) -> int:
         clauses, values = [], []
@@ -459,6 +519,10 @@ class SqliteJobRepository:
             if value:
                 clauses.append(f"{column} = ?")
                 values.append(value)
+        quick_clause, quick_values = _quick_mode_sql(quick_mode)
+        if quick_clause:
+            clauses.append(quick_clause)
+            values.extend(quick_values)
         if archived is True:
             clauses.append("archived_at IS NOT NULL")
         elif archived is False:
@@ -526,7 +590,10 @@ class SqliteJobRepository:
                     event.created_at.isoformat(),
                 ),
             )
-            progress = event.progress or job.progress
+            # Worker phase telemetry is intentionally sparse.  Merge it with
+            # the previous snapshot so start/end timestamps and transfer
+            # context survive a terminal event or a later progress update.
+            progress = {**job.progress, **(event.progress or {})}
             result = event.result if event.result is not None else job.result
             error = event.error if event.error is not None else job.error
             db.execute(
@@ -579,7 +646,7 @@ class SqliteJobRepository:
                 """,
                 (
                     event.status.value,
-                    _dump(event.progress),
+                    _dump({**job.progress, **(event.progress or {})}),
                     event.sequence,
                     event.created_at.isoformat(),
                     event.job_id,
@@ -589,7 +656,7 @@ class SqliteJobRepository:
                 replace(
                     job,
                     status=event.status,
-                    progress=event.progress,
+                    progress={**job.progress, **(event.progress or {})},
                     updated_at=event.created_at,
                 ),
                 True,

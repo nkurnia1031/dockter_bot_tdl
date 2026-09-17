@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import JobTable from './JobTable.svelte';
 
 describe('JobTable', () => {
@@ -14,5 +14,24 @@ describe('JobTable', () => {
     expect(await screen.findByText('Belum ada job.')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Terminate semua aktif' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Refresh daftar job' })).toBeTruthy();
+  });
+
+  it('filters Quick Mode globally and retries a failed attempt', async () => {
+    const calls: { url: string; method?: string }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method });
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [{ id: 'failed-1', kind: 'export', status: 'failed', profile: 'archive', worker: 'remote-1', updated_at: '2026-09-17T00:00:00Z', error: { message: 'gagal upload' } }] }), { status: 200 });
+      if (url.endsWith('/retry')) return new Response(JSON.stringify({ id: 'retry-1', status: 'queued' }), { status: 200 });
+      if (url.includes('/events') || url.includes('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'export', scope: 'global', quickMode: true, retryable: true });
+    const retryButton = await screen.findByRole('button', { name: 'Retry' });
+    await fireEvent.click(retryButton);
+
+    expect(calls.some((call) => call.url.includes('scope=global') && call.url.includes('kind=export') && call.url.includes('quick_mode=true'))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith('/retry') && call.method === 'POST')).toBe(true);
   });
 });

@@ -3,12 +3,15 @@ from __future__ import annotations
 import uuid
 import threading
 import time
+from copy import deepcopy
 from dataclasses import asdict
 from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 from tme3bot.application.ports import JobRepository, WorkerDispatcher
 from tme3bot.application.job_scheduler import build_execution_plan
-from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
+from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
+from tme3bot.utility import DEFAULT_UTILITY_SETTINGS
 
 
 class ControlPlane:
@@ -269,6 +272,27 @@ class ControlPlane:
         # retries an already persisted event after a transient API failure.
         self._apply_event_side_effects(job, event)
         if inserted:
+            if (
+                event.event_type == "export.json_ready"
+                and event.status in {JobStatus.RUNNING, JobStatus.DISPATCHED}
+                and job.kind == "export"
+                and bool(job.payload.get("quick_mode"))
+            ):
+                # The export TDL session is no longer needed after JSON has
+                # been created.  Let the next Quick Mode begin exporting
+                # while this job uses the separate download/session lanes.
+                plan = self.jobs.execution_plan(job.id) or {}
+                current_keys = set(plan.get("resource_keys") or [])
+                export_keys = {
+                    key
+                    for key in current_keys
+                    if ":kind:export" in str(key) or ":tdl:export" in str(key)
+                }
+                if export_keys:
+                    remaining = current_keys - export_keys
+                    replacer = getattr(self.jobs, "replace_execution_resources", None)
+                    if callable(replacer) and replacer(job.id, remaining):
+                        self._dispatch_pending_jobs()
             if event.status.terminal:
                 self.jobs.release_execution(job.id)
             for observer in tuple(self._event_observers):
@@ -296,7 +320,14 @@ class ControlPlane:
             self.resolve_target(actor, worker=route)
         return self.profile_manager.set_worker_route(actor.profile, route)
 
-    def terminate_active_jobs(self, actor: Actor, *, profile: str | None = None) -> dict[str, int]:
+    def terminate_active_jobs(
+        self,
+        actor: Actor,
+        *,
+        profile: str | None = None,
+        kind: str | None = None,
+        quick_mode: bool | None = None,
+    ) -> dict[str, int]:
         active_statuses = (
             JobStatus.QUEUED.value,
             JobStatus.DISPATCHED.value,
@@ -308,6 +339,8 @@ class ControlPlane:
             active.extend(
                 self.jobs.list(
                     profile=selected_profile,
+                    kind=kind,
+                    quick_mode=quick_mode,
                     status=status,
                     archived=False,
                     offset=0,
@@ -334,6 +367,10 @@ class ControlPlane:
                     sequence=sequence,
                     status=JobStatus.CANCELLED,
                     event_type="force_cancelled",
+                    progress={
+                        "phase": "cancelled",
+                        "finished_at": utc_now().isoformat(),
+                    },
                     error={
                         "code": "JOB_TERMINATED_STALE",
                         "message": "Job dihentikan karena worker tidak lagi memiliki proses aktif.",
@@ -345,6 +382,204 @@ class ControlPlane:
         if forced:
             self._dispatch_pending_jobs(selected_profile)
         return {"total": len(active), "interrupted": interrupted, "force_cancelled": forced}
+
+    def retry_job(self, actor: Actor, job_id: str) -> Job:
+        """Create a new export attempt while preserving the old record."""
+        original = self.jobs.get(job_id)
+        if original is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        self.require_profile(actor, original.profile)
+        if not original.status.terminal:
+            raise DomainError(
+                "JOB_NOT_TERMINAL",
+                "Job masih aktif dan belum dapat diulang.",
+                status_code=409,
+            )
+        if original.kind != "export":
+            raise DomainError(
+                "EXPORT_REQUIRED",
+                "Endpoint ini hanya dapat mengulang job export.",
+                status_code=409,
+            )
+        result_value = original.result.get("value", original.result) if isinstance(original.result, dict) else {}
+        legacy_quick = bool(
+            original.payload.get("quick_mode")
+            or (result_value.get("quick_mode") if isinstance(result_value, dict) else False)
+        )
+        command_getter = getattr(self.jobs, "command_payload", None)
+        command_payload = command_getter(original.id) if callable(command_getter) else None
+        if not isinstance(command_payload, dict):
+            # Jobs created before the internal command table existed can
+            # still be retried from their persisted public payload.  Quick
+            # Mode's password is intentionally not stored in that payload;
+            # use the current configured settings only for this legacy
+            # recovery path.
+            command_payload = deepcopy(original.payload)
+            if legacy_quick or bool(command_payload.get("quick_mode")):
+                settings = command_payload.get("quick_settings")
+                if not isinstance(settings, dict) or settings.get("compress_password") in {
+                    None,
+                    "",
+                    "***",
+                }:
+                    getter = getattr(self.utility_settings, "get", None)
+                    settings = getter() if callable(getter) else dict(DEFAULT_UTILITY_SETTINGS)
+                if not isinstance(settings, dict):
+                    raise DomainError(
+                        "RETRY_PAYLOAD_UNAVAILABLE",
+                        "Snapshot settings Quick Mode job lama tidak tersedia untuk retry.",
+                        status_code=409,
+                    )
+                command_payload["quick_settings"] = settings
+        payload = deepcopy(command_payload)
+        if legacy_quick:
+            settings = payload.get("quick_settings")
+            if not isinstance(settings, dict) or settings.get("compress_password") in {
+                None,
+                "",
+                "***",
+            }:
+                getter = getattr(self.utility_settings, "get", None)
+                settings = getter() if callable(getter) else dict(DEFAULT_UTILITY_SETTINGS)
+            payload["quick_settings"] = settings
+        if legacy_quick or bool(payload.get("quick_mode")):
+            previous_retry = payload.get("quick_retry")
+            previous_retry = previous_retry if isinstance(previous_retry, dict) else {}
+            stage_job_id = str(previous_retry.get("stage_job_id") or original.id)
+            operation_id = str(previous_retry.get("quick_operation_id") or stage_job_id)
+            export_start_id, export_end_id = self._export_message_range(original)
+            payload["quick_mode"] = True
+            payload["quick_retry"] = {
+                "retry_of": original.id,
+                "retry_phase": self._quick_retry_phase(original),
+                "stage_job_id": stage_job_id,
+                "quick_operation_id": operation_id,
+            }
+            self._add_export_range(payload["quick_retry"], export_start_id, export_end_id)
+        else:
+            export_start_id, export_end_id = self._export_message_range(original)
+            payload["quick_mode"] = False
+            payload["export_retry"] = {
+                "retry_of": original.id,
+                "retry_phase": "exporting",
+            }
+            self._add_export_range(payload["export_retry"], export_start_id, export_end_id)
+        return self.submit_job(
+            actor,
+            "export",
+            payload,
+            profile=original.profile,
+            worker=original.worker,
+        )
+
+    @staticmethod
+    def _quick_retry_phase(job: Job) -> str:
+        if job.status == JobStatus.SUCCEEDED:
+            return "exporting"
+        phase = str(job.progress.get("phase") or "").strip().lower()
+        if phase == "json_ready":
+            return "downloading"
+        if phase in {
+            "exporting",
+            "downloading",
+            "thumbnailing",
+            "compressing",
+            "uploading",
+            "cleanup",
+        }:
+            return phase
+        return "exporting"
+
+    @staticmethod
+    def _positive_id(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed >= 1 else None
+
+    def _export_message_range(self, job: Job) -> tuple[int | None, int | None]:
+        """Find the original TDL message range without reading the JSON file.
+
+        New jobs record the range in ``json_ready`` progress and the terminal
+        result.  The event scan also covers a job that failed after exporting
+        but before its final result was persisted.  For old rows we retain
+        compatibility with the historical ``start_id``/``latest_id`` fields
+        and can recover a start ID from a stored t.me URL.
+        """
+        candidates: list[dict[str, Any]] = []
+        payload = job.payload if isinstance(job.payload, dict) else {}
+        for key in ("export_retry", "quick_retry"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                candidates.append(value)
+        if isinstance(job.progress, dict):
+            candidates.append(job.progress)
+        if isinstance(job.result, dict):
+            value = job.result.get("value", job.result)
+            if isinstance(value, dict):
+                candidates.append(value)
+        events_getter = getattr(self.jobs, "events", None)
+        if callable(events_getter):
+            try:
+                events = list(events_getter(job.id))
+            except Exception:
+                events = []
+            for event in reversed(events):
+                progress = getattr(event, "progress", None)
+                result = getattr(event, "result", None)
+                if isinstance(progress, dict):
+                    candidates.append(progress)
+                if isinstance(result, dict):
+                    candidates.append(result)
+                    value = result.get("value")
+                    if isinstance(value, dict):
+                        candidates.append(value)
+        return self._range_from_candidates(job, candidates)
+
+    @classmethod
+    def _range_from_candidates(
+        cls, job: Job, candidates: list[dict[str, Any]]
+    ) -> tuple[int | None, int | None]:
+        start_id: int | None = None
+        end_id: int | None = None
+        for candidate in candidates:
+            if start_id is None:
+                for key in ("export_start_id", "start_id"):
+                    start_id = cls._positive_id(candidate.get(key))
+                    if start_id is not None:
+                        break
+            if end_id is None:
+                for key in ("export_end_id", "end_id", "max_message_id", "latest_id"):
+                    end_id = cls._positive_id(candidate.get(key))
+                    if end_id is not None:
+                        break
+            if start_id is not None and end_id is not None:
+                break
+
+        payload = job.payload if isinstance(job.payload, dict) else {}
+        if start_id is None:
+            start_id = cls._positive_id(payload.get("start_id"))
+        if start_id is None:
+            url = str(payload.get("url") or "").strip()
+            parts = [unquote(part) for part in urlparse(url).path.split("/") if part]
+            if len(parts) >= 3 and parts[0].casefold() == "c":
+                start_id = cls._positive_id(parts[2])
+            elif len(parts) >= 2:
+                start_id = cls._positive_id(parts[1])
+
+        if start_id is not None and end_id is not None:
+            end_id = max(start_id, end_id)
+        return start_id, end_id
+
+    @staticmethod
+    def _add_export_range(
+        metadata: dict[str, Any], start_id: int | None, end_id: int | None
+    ) -> None:
+        if start_id is not None:
+            metadata["start_id"] = start_id
+        if end_id is not None:
+            metadata["end_id"] = max(start_id or 1, end_id)
 
     def cancel_job(self, actor: Actor, job_id: str) -> Job:
         job = self.jobs.get(job_id)
@@ -361,13 +596,31 @@ class ControlPlane:
                     sequence=sequence,
                     status=JobStatus.CANCELLED,
                     event_type="cancelled_queued",
+                    progress={
+                        "phase": "cancelled",
+                        "finished_at": utc_now().isoformat(),
+                    },
                     error={"code": "JOB_TERMINATED", "message": "Job queued dibatalkan."},
                 )
             )
             self.jobs.release_execution(job.id)
             self._dispatch_pending_jobs(job.profile)
             return self.jobs.get(job.id) or job
-        if not self.dispatcher.cancel(job.worker, job.id):
+        try:
+            cancelled = self.dispatcher.cancel(job.worker, job.id)
+        except Exception as exc:
+            current = self.jobs.get(job.id)
+            if current is not None and current.status.terminal:
+                return current
+            raise DomainError(
+                "WORKER_CANCEL_UNAVAILABLE",
+                f"Worker {job.worker} tidak dapat menerima permintaan terminate: {exc}",
+                status_code=503,
+            ) from exc
+        if not cancelled:
+            current = self.jobs.get(job.id)
+            if current is not None and current.status.terminal:
+                return current
             raise DomainError(
                 "JOB_NOT_CANCELLABLE",
                 "Worker tidak memiliki proses aktif yang dapat dihentikan.",

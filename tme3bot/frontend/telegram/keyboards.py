@@ -112,6 +112,17 @@ def _export_source_compact_markup(
             [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
         ]
     )
+    snapshot = getattr(state, "job_snapshot", None) or {}
+    if snapshot.get("id") and snapshot.get("status") in {"failed", "cancelled", "succeeded"}:
+        rows.insert(
+            -1,
+            [
+                InlineKeyboardButton(
+                    "Jalankan lagi" if snapshot.get("status") == "succeeded" else "Retry export",
+                    callback_data="ew:retry",
+                )
+            ],
+        )
     return InlineKeyboardMarkup(rows)
     sources = sources or []
     labels = labels or []
@@ -225,6 +236,17 @@ def _export_source_compact_markup(
             [InlineKeyboardButton("Workspace full fitur", callback_data="workspace:full")],
         ]
     )
+    snapshot = getattr(state, "job_snapshot", None) or {}
+    if snapshot.get("id") and snapshot.get("status") in {"failed", "cancelled", "succeeded"}:
+        rows.insert(
+            -1,
+            [
+                InlineKeyboardButton(
+                    "Jalankan lagi" if snapshot.get("status") == "succeeded" else "Retry export",
+                    callback_data="ew:retry",
+                )
+            ],
+        )
     return InlineKeyboardMarkup(rows)
 
 

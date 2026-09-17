@@ -38,14 +38,42 @@ def build_execution_plan(
     lane = "filesystem"
 
     if kind in {"export", "leave"}:
-        keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         lane = "tdl-export"
         if kind == "export" and bool(payload.get("quick_mode")):
-            # Quick Mode owns the complete export -> download -> storage
-            # pipeline. Keep all three TDL sessions pinned for its lifetime.
-            keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
-            keys.add(f"worker:{worker}:tdl:storage")
+            # Quick Mode is a single job, but its phases use different
+            # sessions.  Only the export phase is admitted on the export
+            # lane.  Once json_ready is emitted, the backend and worker
+            # release these two keys so the next Quick Mode can export while
+            # this job downloads/compresses/uploads.  The actual TDL clients
+            # and runtime locks still serialize operations on each session.
+            retry = payload.get("quick_retry") or {}
+            retry = retry if isinstance(retry, dict) else {}
+            retry_phase = str(retry.get("retry_phase") or "exporting").strip().lower()
+            if retry_phase != "exporting":
+                keys = {
+                    key
+                    for key in keys
+                    if ":kind:export" not in key and ":tdl:export" not in key
+                }
+            else:
+                keys.add(f"profile:{profile}:worker:{worker}:kind:export")
+                keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
+            stage_job_id = retry.get("stage_job_id")
+            if stage_job_id:
+                keys.add(f"worker:{worker}:quick-stage:{str(stage_job_id)}")
+                if retry_phase == "exporting":
+                    # The additions above are kept explicit for readability;
+                    # this branch also documents that a retry from the
+                    # exporting phase owns the export lane.
+                    keys.update(
+                        {
+                            f"profile:{profile}:worker:{worker}:kind:export",
+                            f"profile:{profile}:worker:{worker}:tdl:export",
+                        }
+                    )
             lane = "tdl-quick-export"
+        else:
+            keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
     elif kind == "storage_upload":
         keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
         lane = "tdl-storage"

@@ -11,8 +11,41 @@ class JobRepository(Protocol):
     def get(self, job_id: str) -> Job | None: ...
 
     def list(
-        self, *, actor_user_id: int | None = None, profile: str | None = None, limit: int = 50
+        self,
+        *,
+        actor_user_id: int | None = None,
+        profile: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        worker: str | None = None,
+        quick_mode: bool | None = None,
+        archived: bool | None = None,
+        offset: int = 0,
+        limit: int = 50,
     ) -> list[Job]: ...
+
+    def count(
+        self,
+        *,
+        profile: str | None = None,
+        kind: str | None = None,
+        status: str | None = None,
+        worker: str | None = None,
+        quick_mode: bool | None = None,
+        archived: bool | None = None,
+    ) -> int: ...
+
+    def command_payload(self, job_id: str) -> dict[str, Any] | None: ...
+
+    def try_acquire_execution(self, job_id: str) -> dict[str, Any]: ...
+
+    def set_queue_info(self, job_id: str, position: int, reason: str | None) -> None: ...
+
+    def release_execution(self, job_id: str) -> None: ...
+
+    def replace_execution_resources(
+        self, job_id: str, resource_keys: set[str] | list[str] | tuple[str, ...]
+    ) -> bool: ...
 
     def append_event(self, event: JobEvent) -> tuple[Job, bool]: ...
 

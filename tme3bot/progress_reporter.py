@@ -91,6 +91,7 @@ class ProgressReporter:
         item: dict[str, Any] | None = None,
         transfer: dict[str, Any] | None = None,
         counters: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
         indeterminate: bool = False,
         force: bool = False,
     ) -> dict[str, Any]:
@@ -110,6 +111,7 @@ class ProgressReporter:
             "indeterminate": bool(indeterminate),
             "elapsed_seconds": max(0, int(time.monotonic() - self.started_at)),
             "updated_at": utc_timestamp(),
+            **_without_none(extra or {}),
         }
         self.latest = payload
         now = time.monotonic()

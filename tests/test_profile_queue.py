@@ -112,6 +112,32 @@ class ResourceAwareQueueTests(unittest.TestCase):
             release_first.set()
             worker.stop()
 
+    def test_active_job_can_release_one_lane_before_completion(self) -> None:
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+
+        def handle(job: dict, resources: set[str]) -> None:
+            if job["job_id"] == "first":
+                first_started.set()
+                self.assertIn("stage", resources)
+                if not release_first.wait(timeout=3):
+                    raise TimeoutError(job)
+            else:
+                second_started.set()
+
+        worker = ResourceAwareQueue[str](handle)
+        worker.start()
+        worker.enqueue({"export", "stage"}, {"job_id": "first"}, job_id="first")
+        worker.enqueue({"export"}, {"job_id": "second"}, job_id="second")
+        try:
+            self.assertTrue(first_started.wait(timeout=1))
+            self.assertTrue(worker.release_resources("first", {"export"}))
+            self.assertTrue(second_started.wait(timeout=1))
+        finally:
+            release_first.set()
+            worker.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

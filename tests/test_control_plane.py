@@ -4,7 +4,7 @@ from pathlib import Path
 
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
-from tme3bot.domain.models import Actor, DomainError, JobEvent, JobStatus
+from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.worker_registry import WorkerRegistry
 
@@ -131,7 +131,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(quick_other_worker.status.value, "dispatched")
         self.assertEqual([command["worker"] for command in self.dispatcher.commands], ["local", "remote-1"])
 
-    def test_quick_export_locks_export_download_and_storage_lanes(self):
+    def test_quick_export_releases_export_lane_before_post_export_phases(self):
         plan = build_execution_plan(
             "export",
             "default",
@@ -141,8 +141,20 @@ class ControlPlaneTests(unittest.TestCase):
 
         self.assertEqual(plan.lane, "tdl-quick-export")
         self.assertIn("profile:default:worker:local:tdl:export", plan.resource_keys)
-        self.assertIn("profile:default:worker:local:tdl:download", plan.resource_keys)
-        self.assertIn("worker:local:tdl:storage", plan.resource_keys)
+        self.assertNotIn("profile:default:worker:local:tdl:download", plan.resource_keys)
+        self.assertNotIn("worker:local:tdl:storage", plan.resource_keys)
+
+        retry_plan = build_execution_plan(
+            "export",
+            "default",
+            "local",
+            {
+                "quick_mode": True,
+                "quick_retry": {"stage_job_id": "stage-1", "retry_phase": "downloading"},
+            },
+        )
+        self.assertIn("worker:local:quick-stage:stage-1", retry_plan.resource_keys)
+        self.assertNotIn("profile:default:worker:local:tdl:export", retry_plan.resource_keys)
 
     def test_utility_sibling_paths_can_run_but_nested_path_waits(self):
         first = self.control.submit_job(
@@ -245,6 +257,195 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(result, {"total": 2, "interrupted": 0, "force_cancelled": 2})
         self.assertEqual(self.jobs.get(first.id).status.value, "cancelled")
         self.assertEqual(self.jobs.get(second.id).status.value, "cancelled")
+
+    def test_terminate_quick_mode_filter_does_not_touch_normal_export(self):
+        normal = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        quick = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/3", "quick_mode": True},
+        )
+        self.dispatcher.cancel_result = False
+
+        result = self.control.terminate_active_jobs(
+            self.actor, kind="export", quick_mode=True
+        )
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(self.jobs.get(quick.id).status.value, "cancelled")
+        self.assertEqual(self.jobs.get(normal.id).status.value, "dispatched")
+
+    def test_retry_quick_mode_creates_attempt_and_keeps_snapshot_and_stage(self):
+        original = self.control.submit_job(
+            self.actor,
+            "export",
+            {
+                "url": "https://t.me/c/1/3",
+                "quick_mode": True,
+                "quick_settings": {
+                    "compress_size": "45m",
+                    "compress_password": "secret",
+                },
+            },
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=original.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="progress",
+                progress={"phase": "uploading", "message": "upload"},
+            )
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=original.id,
+                sequence=3,
+                status=JobStatus.FAILED,
+                event_type="failed",
+                error={"message": "storage offline"},
+            )
+        )
+
+        retry = self.control.retry_job(self.actor, original.id)
+
+        self.assertNotEqual(retry.id, original.id)
+        self.assertEqual(retry.profile, original.profile)
+        self.assertEqual(retry.worker, original.worker)
+        self.assertEqual(retry.status.value, "dispatched")
+        internal = self.jobs.command_payload(retry.id)
+        self.assertEqual(internal["quick_settings"]["compress_size"], "45m")
+        self.assertEqual(internal["quick_settings"]["compress_password"], "secret")
+        self.assertEqual(internal["quick_retry"]["retry_of"], original.id)
+        self.assertEqual(internal["quick_retry"]["retry_phase"], "uploading")
+        self.assertEqual(internal["quick_retry"]["stage_job_id"], original.id)
+        self.assertEqual(self.jobs.get(original.id).status.value, "failed")
+
+    def test_retry_succeeded_starts_a_new_quick_operation_from_exporting(self):
+        original = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/3", "quick_mode": True},
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=original.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="started",
+            )
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=original.id,
+                sequence=3,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+            )
+        )
+
+        retry = self.control.retry_job(self.actor, original.id)
+        internal = self.jobs.command_payload(retry.id)
+
+        self.assertEqual(internal["quick_retry"]["retry_phase"], "exporting")
+        self.assertEqual(internal["quick_retry"]["quick_operation_id"], original.id)
+
+    def test_retry_normal_export_creates_a_new_attempt(self):
+        original = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/8"}
+        )
+        self.control.append_worker_event(
+            JobEvent(original.id, 2, JobStatus.FAILED, "failed", error={"message": "tdl"})
+        )
+
+        retry = self.control.retry_job(self.actor, original.id)
+
+        self.assertNotEqual(retry.id, original.id)
+        self.assertEqual(retry.status.value, "dispatched")
+        internal = self.jobs.command_payload(retry.id)
+        self.assertFalse(internal["quick_mode"])
+        self.assertEqual(internal["export_retry"]["retry_of"], original.id)
+        self.assertEqual(internal["export_retry"]["retry_phase"], "exporting")
+
+    def test_legacy_normal_export_without_command_payload_can_be_retried(self):
+        legacy = Job(
+            id="legacy-export",
+            kind="export",
+            profile="default",
+            actor_user_id=self.actor.telegram_user_id,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"url": "https://t.me/c/1/9"},
+        )
+        self.jobs.create(legacy)
+
+        retry = self.control.retry_job(self.actor, legacy.id)
+
+        self.assertEqual(retry.kind, "export")
+        self.assertEqual(retry.worker, "local")
+        self.assertEqual(self.jobs.command_payload(retry.id)["url"], "https://t.me/c/1/9")
+
+    def test_retry_persists_message_id_range_for_reexport_without_json(self):
+        original = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/100"},
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                original.id,
+                2,
+                JobStatus.RUNNING,
+                "export.json_ready",
+                progress={
+                    "phase": "json_ready",
+                    "export_start_id": 100,
+                    "export_end_id": 500,
+                },
+                result={
+                    "json_name": "old.json",
+                    "export_start_id": 100,
+                    "export_end_id": 500,
+                },
+            )
+        )
+        self.control.append_worker_event(
+            JobEvent(original.id, 3, JobStatus.FAILED, "failed", error={"message": "download"})
+        )
+
+        retry = self.control.retry_job(self.actor, original.id)
+        metadata = self.jobs.command_payload(retry.id)["export_retry"]
+
+        self.assertEqual(metadata["start_id"], 100)
+        self.assertEqual(metadata["end_id"], 500)
+
+    def test_quick_json_ready_releases_export_lane_for_next_quick_job(self):
+        first = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/10", "quick_mode": True},
+        )
+        second = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/11", "quick_mode": True},
+        )
+        self.assertEqual(second.status.value, "queued")
+
+        self.control.append_worker_event(
+            JobEvent(
+                first.id,
+                2,
+                JobStatus.RUNNING,
+                "export.json_ready",
+                progress={"phase": "json_ready"},
+            )
+        )
+
+        self.assertEqual(self.jobs.get(second.id).status.value, "dispatched")
+        self.assertEqual(len(self.dispatcher.commands), 2)
 
 
 if __name__ == "__main__":
