@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import mimetypes
 import shutil
@@ -22,8 +23,10 @@ from tme3bot.profiles import build_profile_config
 from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
 from tme3bot.storage_catalog import build_storage_caption
+from tme3bot.tdl import ProcessStalledError, TDLStalledError
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
 from tme3bot.worker.quick_export import (
+    QUICK_PHASES,
     QuickModeError,
     QuickThumbnailBuilder,
     migrate_legacy_quick_stage,
@@ -32,6 +35,9 @@ from tme3bot.worker.quick_export import (
     quick_storage_caption,
     quick_year,
     read_quick_manifest,
+    scan_quick_stages,
+    ensure_quick_tdl_client,
+    ensure_quick_stage_writable,
     visual_media,
     write_quick_manifest,
 )
@@ -206,6 +212,8 @@ class WorkerJobExecutor:
         self._utility_runners: dict[str, UtilityRunner] = {}
         self._rclone_runners: dict[str, RcloneRunner] = {}
         self._quick_thumbnail_builders: dict[str, QuickThumbnailBuilder] = {}
+        self._quick_export_clients: dict[str, Any] = {}
+        self._quick_download_clients: dict[str, Any] = {}
         self._quick_active: set[str] = set()
         self._cancel_requested: set[str] = set()
         self._known: set[str] = set()
@@ -302,6 +310,8 @@ class WorkerJobExecutor:
             active = self._active.get(job_id)
             utility_runner = self._utility_runners.get(job_id)
             rclone_runner = self._rclone_runners.get(job_id)
+            quick_export_client = self._quick_export_clients.get(job_id)
+            quick_download_client = self._quick_download_clients.get(job_id)
         if active is None:
             return False
         profile, kind = active
@@ -349,6 +359,14 @@ class WorkerJobExecutor:
                 getattr(getattr(runtime, "export_tdl_client", None), "interrupt_current", None),
             )
             if quick_active:
+                interrupt(
+                    "quick isolated export",
+                    getattr(quick_export_client, "interrupt_current", None),
+                )
+                interrupt(
+                    "quick isolated download",
+                    getattr(quick_download_client, "interrupt_current", None),
+                )
                 interrupt(
                     "quick download",
                     getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
@@ -439,14 +457,14 @@ class WorkerJobExecutor:
             if kind == "export" and bool((command.get("payload") or {}).get("quick_mode")):
                 retry = (command.get("payload") or {}).get("quick_retry") or {}
                 retry = retry if isinstance(retry, dict) else {}
-                retry_phase = str(retry.get("retry_phase") or "exporting").strip().lower()
-                if retry_phase != "exporting":
-                    keys.clear()
+                retry_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower()
+                stage_job_id = str(retry.get("stage_job_id") or command.get("job_id") or "")
+                if stage_job_id:
+                    keys.add(f"worker:{worker}:quick-stage:{stage_job_id}")
+                if retry_phase not in {"exporting", "auto"}:
+                    keys.discard(f"profile:{profile}:worker:{worker}:kind:{kind}")
                 else:
                     keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
-                stage_job_id = retry.get("stage_job_id")
-                if stage_job_id:
-                    keys.add(f"worker:{worker}:quick-stage:{str(stage_job_id)}")
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         elif kind == "storage_upload":
@@ -602,10 +620,13 @@ class WorkerJobExecutor:
             snapshot.add(f"[job failed: {exc}]")
             self._publish_log_snapshot(job_id, snapshot)
             with self._lock:
+                if isinstance(exc, (ProcessStalledError, TDLStalledError)):
+                    self._cancel_requested.add(job_id)
                 cancelled = job_id in self._cancel_requested
             if cancelled:
                 phase = self._quick_terminal_phase(command, "cancelled")
                 staging_path = self._quick_staging_path(command)
+                stalled = isinstance(exc, (ProcessStalledError, TDLStalledError))
                 self.publisher.emit(
                     job_id,
                     "cancelled",
@@ -616,7 +637,20 @@ class WorkerJobExecutor:
                         **({"staging_path": staging_path, "staging_cleaned": False} if staging_path else {}),
                         "finished_at": utc_now().isoformat(),
                     },
-                    error={"code": "JOB_TERMINATED", "message": self._cancel_error(command)},
+                    error=(
+                        {
+                            "code": "JOB_STALLED",
+                            "message": (
+                                "Job dibatalkan karena tidak ada progress "
+                                f"selama {exc.timeout_seconds} detik."
+                            ),
+                        }
+                        if stalled
+                        else {
+                            "code": "JOB_TERMINATED",
+                            "message": self._cancel_error(command),
+                        }
+                    ),
                 )
             else:
                 self._failed(
@@ -634,6 +668,8 @@ class WorkerJobExecutor:
                 self._utility_runners.pop(job_id, None)
                 self._rclone_runners.pop(job_id, None)
                 self._quick_thumbnail_builders.pop(job_id, None)
+                self._quick_export_clients.pop(job_id, None)
+                self._quick_download_clients.pop(job_id, None)
                 self._quick_active.discard(job_id)
                 self._cancel_requested.discard(job_id)
             self.publisher.forget(job_id)
@@ -737,6 +773,39 @@ class WorkerJobExecutor:
     def _quick_workspace(config) -> Path:
         return Path(getattr(config, "utility_workspace_root", "/workspace")).resolve()
 
+    def _quick_isolated_client(self, runtime, stage_root: Path, mode: str):
+        """Return a per-stage TDL client, with a test/runtime fallback.
+
+        Production profile runtimes always expose the source Bolt directory.
+        Lightweight test doubles from older integrations do not, so those
+        continue using their supplied client rather than copying the current
+        working directory into staging.
+        """
+        config = getattr(runtime, "config", None)
+        if config is None:
+            return getattr(runtime, f"{mode}_tdl_client")
+        source_storage = getattr(config, f"tdl_{mode}_storage", None)
+        source_home = getattr(config, f"tdl_{mode}_home", None)
+        if not source_storage or not Path(source_storage).is_dir():
+            return getattr(runtime, f"{mode}_tdl_client")
+        return ensure_quick_tdl_client(
+            stage_root,
+            mode=mode,
+            source_storage=Path(source_storage),
+            source_home=Path(source_home) if source_home else None,
+            namespace=str(getattr(config, f"tdl_{mode}_namespace", "default")),
+            run_as_user=getattr(config, f"tdl_{mode}_user", None),
+            stall_timeout_seconds=int(
+                getattr(config, f"tdl_{mode}_stall_timeout_seconds", 0)
+            ),
+            progress_callback=getattr(
+                getattr(runtime, f"{mode}_tdl_client", None), "progress_callback", None
+            ),
+            output_callback=getattr(
+                getattr(runtime, f"{mode}_tdl_client", None), "output_callback", None
+            ),
+        )
+
     def _prepare_quick_stage(
         self, command: dict[str, Any], runtime
     ) -> tuple[Path, dict[str, Any], str, str]:
@@ -748,8 +817,12 @@ class WorkerJobExecutor:
         workspace = self._quick_workspace(self.config)
         stage_root = migrate_legacy_quick_stage(workspace, stage_job_id)
         stage_root.mkdir(parents=True, exist_ok=True)
-        requested_phase = str(retry.get("retry_phase") or "exporting").strip().lower()
-        if requested_phase not in {"exporting", "downloading", "thumbnailing", "compressing", "uploading", "cleanup"}:
+        ensure_quick_stage_writable(
+            stage_root,
+            getattr(getattr(runtime, "config", None), "tdl_export_user", None),
+        )
+        requested_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower()
+        if requested_phase not in {"auto", *QUICK_PHASES}:
             requested_phase = "exporting"
         operation_id = str(retry.get("quick_operation_id") or stage_job_id)
         manifest = read_quick_manifest(stage_root)
@@ -757,21 +830,39 @@ class WorkerJobExecutor:
             if retry:
                 self._clear_quick_stage(stage_root)
             manifest = {
-                "version": 1,
+                "version": 2,
                 "stage_job_id": stage_job_id,
                 "quick_operation_id": operation_id,
+                "profile": str(command.get("profile") or ""),
+                "worker": str(command.get("worker") or self.config.backup_node_name),
                 "phase": "exporting",
                 "retry_of": retry.get("retry_of"),
             }
         else:
-            manifest.setdefault("version", 1)
+            manifest.setdefault("version", 2)
             manifest.setdefault("stage_job_id", stage_job_id)
             manifest.setdefault("quick_operation_id", operation_id)
+            manifest.setdefault("profile", str(command.get("profile") or ""))
+            manifest.setdefault("worker", str(command.get("worker") or self.config.backup_node_name))
             manifest.setdefault("retry_of", retry.get("retry_of"))
         write_quick_manifest(stage_root, manifest)
         effective_phase = self._resolve_quick_retry_phase(
-            requested_phase, stage_root, manifest, runtime
+            "auto" if requested_phase == "auto" else requested_phase,
+            stage_root,
+            manifest,
+            runtime,
         )
+        if effective_phase != "exporting":
+            # ``resume_phase=auto`` conservatively reserves the export lane
+            # until the physical folder proves that export is unnecessary.
+            # Release it before download/thumbnail/compress/upload so another
+            # stage on the same profile-worker can export concurrently.
+            self._release_quick_export_lane(command)
+        # _resolve_quick_retry_phase may reconstruct the manifest from the
+        # retained raw export JSON. Persist that reconstruction before the
+        # worker starts the resumed phase so a second retry has the same
+        # source of truth even when the backend record is incomplete.
+        write_quick_manifest(stage_root, manifest)
         return stage_root, manifest, effective_phase, stage_job_id
 
     @staticmethod
@@ -827,6 +918,127 @@ class WorkerJobExecutor:
         return result, dict(raw_stats)
 
     @staticmethod
+    def _quick_export_from_json(
+        export_json: Path,
+    ) -> tuple[ExportJobResult, dict[str, Any]] | None:
+        """Reconstruct Quick Mode metadata when the backend manifest is gone."""
+        try:
+            payload = json.loads(Path(export_json).read_text(encoding="utf-8"))
+            messages = payload.get("messages", []) if isinstance(payload, dict) else []
+            if not isinstance(messages, list):
+                messages = []
+            message_ids = []
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                try:
+                    message_ids.append(int(message["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            stats = inspect_export_json(Path(export_json))
+            metadata = payload.get("tme3bot", {}) if isinstance(payload, dict) else {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            latest_id = max(message_ids) if message_ids else None
+            result = ExportJobResult(
+                status="exported" if messages else "empty_export",
+                chat_ref=str(metadata.get("chat_ref") or stats.get("chat_ref") or ""),
+                requested_label=(
+                    str(metadata["label"])
+                    if metadata.get("label") is not None
+                    else None
+                ),
+                export_path=Path(export_json).resolve(),
+                start_id=min(message_ids) if message_ids else 1,
+                latest_id=latest_id,
+                exported_count=len(messages),
+                has_media=int(stats.get("media_count") or 0) > 0,
+                warmup_required=bool(metadata.get("warmup_required")),
+                warning=None,
+                end_id=latest_id,
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return result, stats
+
+    @staticmethod
+    def _quick_stage_json_path(
+        stage_root: Path, manifest: dict[str, Any]
+    ) -> Path | None:
+        name = Path(str(manifest.get("export_json_name") or "")).name
+        if not name or name != str(manifest.get("export_json_name") or ""):
+            return None
+        candidate = Path(stage_root) / name
+        return candidate if candidate.is_file() else None
+
+    @staticmethod
+    def _ensure_quick_export_json(
+        export_path: Path,
+        stage_root: Path,
+        manifest: dict[str, Any],
+        name: str | None = None,
+    ) -> Path:
+        """Keep a recovery copy of the raw TDL export in Quick Mode staging."""
+        name = str(name or Path(export_path).name)
+        if not name or Path(name).name != name or not name.lower().endswith(".json"):
+            raise QuickModeError("Nama JSON export Quick Mode tidak valid.")
+        target = Path(stage_root) / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_file():
+            try:
+                shutil.copy2(export_path, target)
+            except OSError as exc:
+                raise QuickModeError(
+                    f"JSON export Quick Mode tidak dapat disimpan ke staging: {exc}"
+                ) from exc
+        manifest["export_json_name"] = name
+        manifest["export_json_retained"] = True
+        return target
+
+    @staticmethod
+    def _materialize_quick_json(staged_json: Path) -> Path:
+        """Create a temporary workspace-only input for the download service."""
+        # Keep both the download input and any temporary state inside the
+        # Quick Mode workspace.  The normal /data export queues belong to the
+        # Download Manager and must not receive Quick Mode leftovers.
+        stage_root = Path(staged_json).parent.resolve()
+        processing_root = (stage_root.parent / f".quick-processing-{stage_root.name}").resolve()
+        processing_root.mkdir(parents=True, exist_ok=True)
+        target = processing_root / staged_json.name
+        if target.exists():
+            target = processing_root / (
+                f"{staged_json.stem}.quick-recovery-{uuid.uuid4().hex[:8]}.json"
+            )
+        shutil.copy2(staged_json, target)
+        return target
+
+    def _hydrate_quick_manifest_from_stage(
+        self, stage_root: Path, manifest: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Recover phase metadata from a retained raw export JSON."""
+        candidate = self._quick_stage_json_path(stage_root, manifest)
+        if candidate is None:
+            candidates = sorted(
+                path
+                for path in Path(stage_root).glob("*.json")
+                if path.name != "quickmode.json" and path.is_file()
+            )
+            candidate = candidates[0] if len(candidates) == 1 else None
+        if candidate is None:
+            return manifest
+        inferred = self._quick_export_from_json(candidate)
+        if inferred is None:
+            return manifest
+        result, stats = inferred
+        manifest.setdefault("export_json_name", candidate.name)
+        manifest.setdefault("folder_name", quick_folder_name(candidate))
+        manifest["export_result"] = json_value(asdict(result))
+        manifest["stats"] = json_value(stats)
+        manifest.setdefault("phase", "downloading")
+        manifest.setdefault("json_deleted", True)
+        manifest["export_json_retained"] = True
+        return manifest
+
+    @staticmethod
     def _export_retry_range(payload: dict[str, Any]) -> tuple[int | None, int | None]:
         """Return a persisted message-ID range for export recovery.
 
@@ -856,9 +1068,19 @@ class WorkerJobExecutor:
         return None, None
 
     @staticmethod
-    def _quick_json_path(runtime, manifest: dict[str, Any]) -> Path | None:
+    def _quick_json_path(
+        runtime, manifest: dict[str, Any], stage_root: Path | None = None
+    ) -> Path | None:
         name = Path(str(manifest.get("export_json_name") or "")).name
         if not name or name != str(manifest.get("export_json_name") or ""):
+            return None
+        if stage_root is not None:
+            staged = Path(stage_root) / name
+            if staged.is_file():
+                return staged
+            # Quick Mode must never resume a download from the normal
+            # /data exports queue.  A missing staging JSON is a safe boundary
+            # that falls back to re-exporting into the workspace.
             return None
         for root in (
             getattr(runtime.config, "export_processing_dir", None),
@@ -888,16 +1110,45 @@ class WorkerJobExecutor:
     ) -> str:
         if requested == "exporting":
             return requested
-        if self._quick_manifest_export(manifest) is None:
-            return "exporting"
+        hydrated = self._hydrate_quick_manifest_from_stage(stage_root, manifest)
+        manifest.clear()
+        manifest.update(hydrated)
+        folder_name = Path(str(manifest.get("folder_name") or "")).name
+        if not folder_name or folder_name == ".":
+            archive_candidates = sorted(stage_root.glob("*.7z*"))
+            if archive_candidates:
+                folder_name = archive_candidates[0].name.split(".7z", 1)[0]
+                manifest["folder_name"] = folder_name
+            else:
+                child_dirs = [
+                    path
+                    for path in stage_root.iterdir()
+                    if path.is_dir() and path.name != ".tdl" and not path.is_symlink()
+                ]
+                if len(child_dirs) == 1:
+                    folder_name = child_dirs[0].name
+                    manifest["folder_name"] = folder_name
         media_root = self._quick_media_root(stage_root, manifest)
         has_media = bool(media_root and media_root.is_dir() and visual_media(media_root)[0:2] != ([], []))
-        thumbnail = stage_root / f"{Path(str(manifest.get('folder_name') or '')).name}.png"
+        thumbnail = stage_root / f"{folder_name}.png" if folder_name else stage_root / ".missing.png"
         archives = (
             list(stage_root.glob("*.7z"))
             + list(stage_root.glob("*.7z.*"))
         )
-        has_json = bool(self._quick_json_path(runtime, manifest))
+        has_json = bool(self._quick_json_path(runtime, manifest, stage_root))
+        raw_export = self._quick_manifest_export(manifest)
+        # An orphan with a complete archive and PNG does not need its JSON or
+        # ExportJobResult.  It can safely continue at upload and cleanup.
+        if requested == "auto" and archives and thumbnail.is_file():
+            return "uploading"
+        if raw_export is None and requested not in {"uploading", "cleanup"}:
+            return "downloading" if has_json else ("thumbnailing" if has_media else "exporting")
+        if requested == "auto":
+            if has_media and thumbnail.is_file() and not archives:
+                return "compressing"
+            if has_media and not thumbnail.is_file():
+                return "thumbnailing"
+            return "downloading" if has_json else "exporting"
         if requested == "downloading":
             # A cancellation can arrive just after TDL has deleted the JSON
             # but before the phase checkpoint is written.  Existing media is
@@ -933,18 +1184,20 @@ class WorkerJobExecutor:
                 command, runtime
             )
             retry = payload.get("quick_retry") or {}
-            requested_phase = str(retry.get("retry_phase") or "exporting").strip().lower() if isinstance(retry, dict) else "exporting"
+            requested_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower() if isinstance(retry, dict) else "exporting"
             if resume_phase == "exporting" and requested_phase != "exporting":
                 self._clear_quick_stage(stage_root)
                 quick_manifest = {
-                    "version": 1,
+                    "version": 2,
                     "stage_job_id": str(quick_manifest.get("stage_job_id") or command["job_id"]),
                     "quick_operation_id": str(quick_manifest.get("quick_operation_id") or command["job_id"]),
                     "phase": "exporting",
                 }
                 write_quick_manifest(stage_root, quick_manifest)
             restored = self._quick_manifest_export(quick_manifest)
-            if resume_phase != "exporting" and restored is not None:
+            if resume_phase != "exporting" and (
+                restored is not None or resume_phase in {"uploading", "cleanup"}
+            ):
                 reporter.report(
                     phase=resume_phase,
                     message=f"Melanjutkan Quick Mode dari fase {resume_phase}",
@@ -952,11 +1205,15 @@ class WorkerJobExecutor:
                     indeterminate=True,
                     force=True,
                 )
+                restored_result, restored_stats = restored or (
+                    None,
+                    dict(quick_manifest.get("stats") or {}),
+                )
                 return self._quick_export_pipeline(
                     command,
                     runtime,
-                    restored[0],
-                    restored[1],
+                    restored_result,
+                    restored_stats,
                     reporter,
                     stage_root=stage_root,
                     manifest=quick_manifest,
@@ -1007,23 +1264,35 @@ class WorkerJobExecutor:
                 indeterminate=progress.percent is None,
             )
 
-        with runtime.export_operation_lock:
-            with self._capture_tdl_output(runtime.export_tdl_client):
-                with self._capture_tdl_progress(
-                    runtime.export_tdl_client, export_progress
-                ):
-                    result = runtime.export_service.export_from_url(
-                        str(url),
-                        use_url_message_id=bool(payload.get("use_url_message_id", False)),
-                        save_source=(
-                            bool(payload["save_source"])
-                            if "save_source" in payload
-                            and payload.get("save_source") is not None
-                            else None
-                        ),
-                        export_start_id=export_start_id,
-                        export_end_id=export_end_id,
-                    )
+        export_client = runtime.export_tdl_client
+        if quick_mode and stage_root is not None:
+            export_client = self._quick_isolated_client(runtime, stage_root, "export")
+            with self._lock:
+                self._quick_export_clients[str(command["job_id"])] = export_client
+        try:
+            with runtime.export_operation_lock:
+                with self._capture_tdl_output(export_client):
+                    with self._capture_tdl_progress(
+                        export_client, export_progress
+                    ):
+                        result = runtime.export_service.export_from_url(
+                            str(url),
+                            use_url_message_id=bool(payload.get("use_url_message_id", False)),
+                            save_source=(
+                                bool(payload["save_source"])
+                                if "save_source" in payload
+                                and payload.get("save_source") is not None
+                                else None
+                            ),
+                            export_start_id=export_start_id,
+                            export_end_id=export_end_id,
+                            tdl_client=export_client if quick_mode else None,
+                            output_dir=stage_root if quick_mode else None,
+                        )
+        finally:
+            if quick_mode:
+                with self._lock:
+                    self._quick_export_clients.pop(str(command["job_id"]), None)
         stats = inspect_export_json(result.export_path)
         json_ready_progress = reporter.report(
             phase="json_ready",
@@ -1066,6 +1335,9 @@ class WorkerJobExecutor:
                         "export_result": json_value(asdict(result)),
                         "stats": json_value(stats),
                     }
+                )
+                self._ensure_quick_export_json(
+                    result.export_path, stage_root, quick_manifest
                 )
                 write_quick_manifest(stage_root, quick_manifest)
             if stats.get("media_count") == 0:
@@ -1178,7 +1450,7 @@ class WorkerJobExecutor:
         self,
         command: dict[str, Any],
         runtime,
-        export_result,
+        export_result: ExportJobResult | None,
         stats: dict[str, Any],
         reporter: ProgressReporter,
         *,
@@ -1202,12 +1474,32 @@ class WorkerJobExecutor:
             ) from exc
         manifest = dict(manifest or read_quick_manifest(stage_root))
         operation_id = str(manifest.get("quick_operation_id") or stage_root.name)
-        folder_name = quick_folder_name(export_result.export_path)
+        export_json_name = str(manifest.get("export_json_name") or "")
+        if not export_json_name and export_result is not None:
+            export_json_name = Path(export_result.export_path).name
+        folder_name = str(manifest.get("folder_name") or "")
+        if not folder_name and export_result is not None:
+            folder_name = quick_folder_name(export_result.export_path)
+        if not folder_name:
+            archive_candidate = sorted(stage_root.glob("*.7z*"))
+            if archive_candidate:
+                folder_name = archive_candidate[0].name.split(".7z", 1)[0]
+        if not folder_name:
+            raise QuickModeError("Folder staging Quick Mode tidak dapat ditentukan.")
+        if export_result is not None:
+            self._ensure_quick_export_json(
+                export_result.export_path,
+                stage_root,
+                manifest,
+                name=export_json_name,
+            )
         manifest["phase"] = resume_phase
         manifest["folder_name"] = folder_name
-        manifest["export_json_name"] = export_result.export_path.name
-        manifest["export_result"] = json_value(asdict(export_result))
-        manifest["stats"] = json_value(stats)
+        if export_json_name:
+            manifest["export_json_name"] = export_json_name
+        if export_result is not None:
+            manifest["export_result"] = json_value(asdict(export_result))
+            manifest["stats"] = json_value(stats)
         media_root = stage_root / folder_name
         thumbnail_path = stage_root / f"{folder_name}.png"
         thumbnail = manifest.get("thumbnail")
@@ -1216,6 +1508,8 @@ class WorkerJobExecutor:
         caption = str(manifest.get("caption") or quick_storage_caption(folder_name, quick_year()))
         archive_names = manifest.get("archive_names")
         archive_names = archive_names if isinstance(archive_names, list) else []
+        if not archive_names:
+            archive_names = [path.name for path in sorted(stage_root.glob("*.7z*"))]
         archive_files: list[Path] = [
             stage_root / Path(str(name)).name
             for name in archive_names
@@ -1232,7 +1526,17 @@ class WorkerJobExecutor:
                     raise QuickModeError("Quick Mode dibatalkan oleh user.")
 
         def save_manifest(**updates: Any) -> None:
+            error_value = updates.get("last_error")
+            if error_value:
+                safe_error = str(error_value)
+                settings = payload.get("quick_settings")
+                if isinstance(settings, dict):
+                    password = str(settings.get("compress_password") or "")
+                    if password:
+                        safe_error = safe_error.replace(password, "[redacted]")
+                updates["last_error"] = safe_error[:1000]
             manifest.update(updates)
+            manifest["last_progress_at"] = utc_now().isoformat()
             write_quick_manifest(stage_root, manifest)
 
         try:
@@ -1240,12 +1544,15 @@ class WorkerJobExecutor:
             save_manifest(
                 phase=resume_phase,
                 folder_name=folder_name,
-                export_json_name=export_result.export_path.name,
-                export_result=json_value(asdict(export_result)),
-                stats=json_value(stats),
                 storage_folder=storage_folder,
                 caption=caption,
             )
+            if export_result is not None:
+                save_manifest(
+                    export_json_name=export_json_name,
+                    export_result=json_value(asdict(export_result)),
+                    stats=json_value(stats),
+                )
             phase = resume_phase
             if phase == "downloading":
                 ensure_not_cancelled()
@@ -1295,18 +1602,39 @@ class WorkerJobExecutor:
                         force=event_type != "progress",
                     )
 
-                json_path = self._quick_json_path(runtime, manifest) or export_result.export_path
+                json_path = self._quick_json_path(runtime, manifest, stage_root)
+                if json_path is None and export_result is not None:
+                    json_path = export_result.export_path
+                if json_path is None:
+                    raise QuickModeError(
+                        "JSON export Quick Mode tidak tersedia untuk fase download."
+                    )
+                staged_json = self._quick_stage_json_path(stage_root, manifest)
+                temporary_json_dir: Path | None = None
+                if staged_json is not None and json_path == staged_json:
+                    json_path = self._materialize_quick_json(staged_json)
+                    temporary_json_dir = json_path.parent
                 previous_callback = runtime.download_progress.set_event_callback(download_progress)
+                download_client = self._quick_isolated_client(runtime, stage_root, "download")
+                with self._lock:
+                    self._quick_download_clients[job_id] = download_client
                 try:
-                    with runtime.download_operation_lock:
-                        with self._capture_tdl_output(runtime.download_tdl_client):
-                            download_result = runtime.download_service.download_export_to(
-                                json_path,
-                                media_root,
-                                delete_json_on_success=True,
-                                workspace_root=workspace,
-                            )
+                    try:
+                        with runtime.download_operation_lock:
+                            with self._capture_tdl_output(download_client):
+                                download_result = runtime.download_service.download_export_to(
+                                    json_path,
+                                    media_root,
+                                    delete_json_on_success=True,
+                                    workspace_root=workspace,
+                                    tdl_client=download_client,
+                                )
+                    finally:
+                        if temporary_json_dir is not None:
+                            shutil.rmtree(temporary_json_dir, ignore_errors=True)
                 finally:
+                    with self._lock:
+                        self._quick_download_clients.pop(job_id, None)
                     runtime.download_progress.set_event_callback(previous_callback)
                 if download_result.status != "success_deleted":
                     save_manifest(
@@ -1329,7 +1657,12 @@ class WorkerJobExecutor:
                     overall={"current": 0, "total": 1, "percent": 0, "unit": "phase"},
                     force=True,
                 )
-                builder = QuickThumbnailBuilder(log_callback=self._append_job_log)
+                builder = QuickThumbnailBuilder(
+                    log_callback=self._append_job_log,
+                    stall_timeout_seconds=getattr(
+                        self.config, "job_stall_timeout_seconds", 600
+                    ),
+                )
                 with self._lock:
                     self._quick_thumbnail_builders[job_id] = builder
                 try:
@@ -1360,6 +1693,9 @@ class WorkerJobExecutor:
                 runner = UtilityRunner(
                     utility_root,
                     log_callback=self._append_job_log,
+                    stall_timeout_seconds=getattr(
+                        self.config, "job_stall_timeout_seconds", 600
+                    ),
                     progress_callback=lambda value: reporter.report(
                         phase="compressing",
                         message="Mengompres hasil download",
@@ -1476,7 +1812,7 @@ class WorkerJobExecutor:
                 )
                 shutil.rmtree(stage_root)
                 return {
-                    **asdict(export_result),
+                    **(asdict(export_result) if export_result is not None else {}),
                     **stats,
                     **thumbnail,
                     "quick_mode": True,
@@ -1996,6 +2332,9 @@ class WorkerJobExecutor:
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
             log_callback=self._append_job_log,
+            stall_timeout_seconds=getattr(
+                self.config, "job_stall_timeout_seconds", 600
+            ),
             progress_callback=utility_progress,
         )
         job_id = str(command["job_id"])
@@ -2044,7 +2383,10 @@ class WorkerJobExecutor:
         """Upload workspace files through the worker-local rclone config."""
         job_id = str(command["job_id"])
         workspace = self._quick_workspace(self.config)
-        config_path = workspace / ".config" / "rclone.conf"
+        config_path = Path(
+            getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+        ).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
 
         def progress(index: int, total: int, name: str) -> None:
             # A telemetry outage must not turn an already completed remote
@@ -2081,6 +2423,9 @@ class WorkerJobExecutor:
             log_callback=self._append_job_log,
             progress_callback=progress,
             cancel_check=cancelled,
+            stall_timeout_seconds=getattr(
+                self.config, "job_stall_timeout_seconds", 600
+            ),
         )
         with self._lock:
             self._rclone_runners[job_id] = runner
@@ -2091,6 +2436,7 @@ class WorkerJobExecutor:
                 destination,
                 config_path,
                 workspace_root=workspace,
+                config_root=config_root,
                 **kwargs,
             )
         finally:
@@ -2773,6 +3119,17 @@ class WorkerJobExecutor:
                     size = None
                 items.append({"name": entry.name, "path": item_path, "kind": "file", "size": size})
         return {"path": display_path, "items": items}
+
+    def quickmode_scan(self) -> dict[str, Any]:
+        """Return derived Quick Mode staging state for the manager UI."""
+        workspace = self._quick_workspace(self.config)
+        return {
+            "worker": str(getattr(self.config, "backup_node_name", "local")),
+            "items": scan_quick_stages(
+                workspace,
+                worker=str(getattr(self.config, "backup_node_name", "local")),
+            ),
+        }
 
     @staticmethod
     def _digest(path: Path) -> tuple[str, int]:

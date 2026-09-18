@@ -68,6 +68,10 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     def workspace_tree(path: str = Query("/workspace", min_length=1, max_length=4096)):
         return context.executor.workspace_tree(path)
 
+    @app.get("/internal/v1/quickmode/scan", dependencies=[Depends(authorize)])
+    def quickmode_scan():
+        return context.executor.quickmode_scan()
+
     @app.post("/internal/v1/jobs", dependencies=[Depends(authorize)])
     def submit_job(body: WorkerJobRequest):
         payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()

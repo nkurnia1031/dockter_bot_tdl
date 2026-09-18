@@ -787,6 +787,13 @@ def ensure_host_subdirs(profile_root: Path, env: dict[str, str]) -> None:
             if key == "DOWNLOAD_ROOT":
                 (host_path / "berlabel").mkdir(parents=True, exist_ok=True)
                 (host_path / "biasa").mkdir(parents=True, exist_ok=True)
+    rclone_config = map_data_path(
+        profile_root,
+        env.get("RCLONE_CONFIG_PATH", "/data/.config/rclone.conf").strip()
+        or "/data/.config/rclone.conf",
+    )
+    if rclone_config is not None:
+        rclone_config.parent.mkdir(parents=True, exist_ok=True)
 
 
 def write_profile_identity(env: dict[str, str], profile_name: str | None) -> None:
@@ -1486,7 +1493,7 @@ def ensure_container_profile_dirs(env: dict[str, str], profile: str) -> None:
     )
     if profile == default_profile:
         command = (
-            "mkdir -p /data/root/.tdl /data/user1/.tdl /data/download /data/download/berlabel /data/download/biasa "
+            "mkdir -p /data/.config /data/root/.tdl /data/user1/.tdl /data/download /data/download/berlabel /data/download/biasa "
             "/data/exports/pending /data/exports/processing /data/exports/done "
             "/data/exports/failed /data/tmp "
             "&& chown -R user1:user1 /data/user1 /data/exports/pending /data/tmp"

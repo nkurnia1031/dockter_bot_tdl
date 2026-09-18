@@ -1,10 +1,11 @@
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
-from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
+from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.worker_registry import WorkerRegistry
 
@@ -235,6 +236,46 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(returned.status.value, "dispatched")
         self.assertTrue(self.jobs.has_active("default"))
         self.assertFalse(any(event.status.value == "cancelled" for event in self.jobs.events(job.id)))
+
+    def test_backend_force_cancels_stalled_job_after_worker_grace(self):
+        control = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            job_stall_timeout_seconds=10,
+            job_cancel_grace_seconds=5,
+        )
+        job = control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        stale_at = utc_now() - timedelta(seconds=20)
+        control.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="running",
+                created_at=stale_at,
+            )
+        )
+
+        control._recover_stale_jobs(now=stale_at + timedelta(seconds=11))
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertTrue(self.dispatcher.cancel_result)
+
+        control._recover_stale_jobs(now=stale_at + timedelta(seconds=17))
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
+        self.assertEqual(self.jobs.get(job.id).error["code"], "JOB_STALLED")
+
+        late = control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=3,
+                status=JobStatus.RUNNING,
+                event_type="late_running",
+            )
+        )
+        self.assertEqual(late.status, JobStatus.CANCELLED)
 
     def test_dispatch_failure_is_terminal_after_dispatched_event(self):
         control = ControlPlane(self.jobs, FailingDispatcher(), self.profiles)

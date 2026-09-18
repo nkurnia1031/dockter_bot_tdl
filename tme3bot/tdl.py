@@ -26,6 +26,14 @@ from tme3bot.tdl_output import (
 LOGGER = logging.getLogger(__name__)
 
 
+class ProcessStalledError(RuntimeError):
+    """Raised when a worker subprocess stops making meaningful progress."""
+
+    def __init__(self, message: str, timeout_seconds: int) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(message)
+
+
 class TDLCommandError(RuntimeError):
     def __init__(
         self, command: list[str], returncode: int, stdout: str, stderr: str
@@ -36,6 +44,24 @@ class TDLCommandError(RuntimeError):
         self.stderr = stderr
         detail = stderr.strip() or stdout.strip() or "unknown error"
         super().__init__(f"TDL command failed ({returncode}): {detail}")
+
+
+class TDLStalledError(TDLCommandError):
+    """Raised when a TDL subprocess stops making semantic progress."""
+
+    def __init__(
+        self,
+        command: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        timeout_seconds: int,
+    ) -> None:
+        self.timeout_seconds = timeout_seconds
+        super().__init__(command, returncode, stdout, stderr)
+        self.args = (
+            f"TDL command stalled for {timeout_seconds}s: {' '.join(command)}",
+        )
 
 
 class TDLDataError(RuntimeError):
@@ -67,6 +93,7 @@ class SubprocessRunner:
         self._current_process: subprocess.Popen[bytes] | None = None
         self._current_command: list[str] | None = None
         self._last_output_at: float | None = None
+        self._last_progress_signature: tuple[Any, ...] | None = None
 
     def run(
         self,
@@ -88,6 +115,7 @@ class SubprocessRunner:
         output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
+        stalled = False
 
         try:
             process = subprocess.Popen(
@@ -106,6 +134,7 @@ class SubprocessRunner:
             self._current_process = process
             self._current_command = command
             self._last_output_at = started_at
+            self._last_progress_signature = None
 
         stdout_thread = threading.Thread(
             target=self._read_stream,
@@ -139,6 +168,7 @@ class SubprocessRunner:
                         stall_timeout_seconds,
                     )
                     self._terminate_process(process)
+                    stalled = True
                     break
                 time.sleep(0.2)
 
@@ -156,6 +186,7 @@ class SubprocessRunner:
                     self._current_process = None
                     self._current_command = None
                     self._last_output_at = None
+                    self._last_progress_signature = None
 
         stdout = "".join(stdout_lines)
         stderr = "".join(stderr_lines)
@@ -164,6 +195,14 @@ class SubprocessRunner:
         LOGGER.info("%s finished with exit code %s", log_prefix, returncode)
         if output_callback is not None:
             output_callback(f"[process exited with code {returncode}]")
+        if stalled:
+            raise TDLStalledError(
+                command,
+                returncode,
+                stdout,
+                stderr,
+                stall_timeout_seconds,
+            )
         return subprocess.CompletedProcess(command, returncode, stdout, stderr)
 
     def cancel_current(self) -> bool:
@@ -245,8 +284,6 @@ class SubprocessRunner:
             target_lines = stderr_lines if stream_name == "stderr" else stdout_lines
             target_lines.append(clean_line + "\n")
             if is_nonsemantic_tdl_output_line(clean_line):
-                with self._lock:
-                    self._last_output_at = time.time()
                 LOGGER.debug(
                     "%s %s skipped nonsemantic tdl line | %s",
                     log_prefix,
@@ -256,8 +293,11 @@ class SubprocessRunner:
                 continue
 
             progress = parse_tdl_progress_line(clean_line, stream_name)
+            signature = self._progress_signature(progress)
             with self._lock:
-                self._last_output_at = progress.updated_at
+                if signature != self._last_progress_signature:
+                    self._last_progress_signature = signature
+                    self._last_output_at = progress.updated_at
 
             if progress_callback is not None:
                 try:
@@ -306,13 +346,39 @@ class SubprocessRunner:
     def _terminate_process(process: subprocess.Popen[bytes]) -> None:
         if process.poll() is not None:
             return
-        process.terminate()
+        if os.name != "nt":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        else:  # pragma: no cover - production workers run on Linux
+            process.terminate()
         try:
             process.wait(timeout=15)
             return
         except subprocess.TimeoutExpired:
-            process.kill()
+            if os.name != "nt":
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+            else:  # pragma: no cover - production workers run on Linux
+                process.kill()
             process.wait(timeout=15)
+
+    @staticmethod
+    def _progress_signature(progress: CommandProgress) -> tuple[Any, ...]:
+        values = (
+            progress.message_id,
+            progress.fraction_current,
+            progress.fraction_total,
+            progress.percent,
+            progress.transferred_bytes,
+            progress.file_name,
+        )
+        if any(value is not None for value in values):
+            return ("progress", *values)
+        return ("line", progress.line)
 
 
 def prepare_subprocess_command(

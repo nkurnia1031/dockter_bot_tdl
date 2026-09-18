@@ -7,11 +7,13 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from tme3bot.persistence import write_json_atomic
+from tme3bot.tdl import ProcessStalledError
 from tme3bot.tdl_output import parse_tdl_progress_line
 
 LOGGER = logging.getLogger(__name__)
@@ -243,10 +245,12 @@ class UtilityRunner:
         utility_root: Path,
         log_callback: Callable[[str], None] | None = None,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
+        stall_timeout_seconds: int = 0,
     ) -> None:
         self.root = utility_root
         self.log_callback = log_callback
         self.progress_callback = progress_callback
+        self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
         self._process_lock = threading.RLock()
         self._current_process: subprocess.Popen[str] | None = None
 
@@ -262,6 +266,10 @@ class UtilityRunner:
                 return False
         else:  # pragma: no cover - production workers run on Linux
             process.send_signal(signal.CTRL_BREAK_EVENT)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._terminate_process(process)
         return True
 
     def run(self, utility: str, folders: list[str], password: str | None = None, settings: dict[str, str] | None = None) -> UtilityResult:
@@ -329,6 +337,8 @@ class UtilityRunner:
                     }
                 )
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
+                if isinstance(exc, ProcessStalledError):
+                    raise
         summary: dict[str, object] = {
             "folders_processed": len(succeeded),
             "folders_failed": len(failed),
@@ -463,9 +473,35 @@ class UtilityRunner:
         assert process.stdout is not None
         lines: list[str] = []
         marker: dict[str, object] = {}
+        last_progress_at = time.monotonic()
+        last_progress_signature: object = None
+        stalled = threading.Event()
+        watchdog_stop = threading.Event()
+
+        def watchdog() -> None:
+            if self.stall_timeout_seconds <= 0:
+                return
+            while not watchdog_stop.wait(1.0):
+                if time.monotonic() - last_progress_at <= self.stall_timeout_seconds:
+                    continue
+                stalled.set()
+                LOGGER.error(
+                    "%s stalled for %ss; terminating process",
+                    prefix,
+                    self.stall_timeout_seconds,
+                )
+                self._terminate_process(process)
+                return
+
+        watchdog_thread = threading.Thread(
+            target=watchdog,
+            daemon=True,
+            name=f"utility-watchdog-{prefix}",
+        )
+        watchdog_thread.start()
 
         def consume_line(raw_line: str) -> None:
-            nonlocal marker
+            nonlocal marker, last_progress_at, last_progress_signature
             clean = raw_line.strip()
             if not clean:
                 return
@@ -478,6 +514,10 @@ class UtilityRunner:
                     decoded = json.loads(clean.removeprefix("TME3_PROGRESS "))
                     if isinstance(decoded, dict):
                         marker = decoded
+                        signature = json.dumps(decoded, sort_keys=True, default=str)
+                        if signature != last_progress_signature:
+                            last_progress_signature = signature
+                            last_progress_at = time.monotonic()
                         self._progress({"command": prefix, **decoded})
                 except json.JSONDecodeError:
                     LOGGER.warning("Invalid utility progress marker: %s", clean)
@@ -488,6 +528,14 @@ class UtilityRunner:
                 or parsed.speed_bps is not None
                 or parsed.eta_seconds is not None
             ):
+                signature = (
+                    parsed.percent,
+                    parsed.transferred_bytes,
+                    parsed.file_name,
+                )
+                if signature != last_progress_signature:
+                    last_progress_signature = signature
+                    last_progress_at = time.monotonic()
                 self._progress(
                     {
                         "command": prefix,
@@ -517,9 +565,38 @@ class UtilityRunner:
                 consume_line("".join(buffer))
             code = process.wait()
         finally:
+            watchdog_stop.set()
+            watchdog_thread.join(timeout=2)
             process.stdout.close()
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+        if stalled.is_set():
+            raise ProcessStalledError(
+                f"{prefix} stalled for {self.stall_timeout_seconds}s",
+                self.stall_timeout_seconds,
+            )
         if code != 0:
             raise RuntimeError(f"{prefix} exit code {code}: {' | '.join(lines[-5:])}")
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        else:  # pragma: no cover - production workers run on Linux
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if os.name != "nt":
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+            else:  # pragma: no cover - production workers run on Linux
+                process.kill()

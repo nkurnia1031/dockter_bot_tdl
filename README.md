@@ -217,9 +217,18 @@ python3 run.py backup list
 
 Quick Mode mengirim thumbnail sebagai foto ke channel Storage dan hanya file
 arsip hasil compress ke Google Drive melalui rclone. Worker membaca konfigurasi
-rclone dari `/workspace/.config/rclone.conf`; tujuan default
+rclone dari `/data/.config/rclone.conf`; tujuan default
 `googledrive:backup` dapat diubah pada Pengaturan. Upload Storage biasa juga
 memiliki checklist untuk menyalin file ke tujuan rclone tersebut.
+
+Quick Mode menyimpan salinan JSON export mentah di root staging
+`/workspace/quickmode/<stage_job_id>/` sampai seluruh pipeline berhasil. Jika
+manifest atau metadata backend tidak tersedia, worker dapat membaca JSON ini
+untuk memulihkan nama folder, rentang message, statistik media, dan fase retry.
+
+Image runtime juga membawa `pkg_resources.py` kecil berbasis
+`importlib.metadata` untuk kompatibilitas APScheduler lama yang masih dipakai
+python-telegram-bot 13.x pada setuptools modern.
 
 ## Verifikasi
 

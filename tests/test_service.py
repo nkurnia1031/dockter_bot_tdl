@@ -403,6 +403,32 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(export_json.exists())
             self.assertTrue((config.export_failed_dir / "quick.json").exists())
 
+    def test_quick_download_accepts_json_from_workspace_without_processing_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            staging = root / "workspace" / "quickmode" / "job-1" / ".quick-processing"
+            staging.mkdir(parents=True)
+            export_json = staging / "quick.json"
+            export_json.write_text(
+                '{"messages":[{"id":9,"type":"photo"}],"tme3bot":{"chat_ref":"@bot"}}',
+                encoding="utf-8",
+            )
+
+            client = FakeDownloadTDLClient()
+            result = BatchDownloadService(config, store, client).download_export_to(
+                export_json,
+                root / "workspace" / "quickmode" / "job-1" / "folder",
+                workspace_root=root / "workspace",
+            )
+
+            self.assertEqual(result.status, "success_deleted")
+            self.assertFalse(export_json.exists())
+            self.assertEqual(client.download_calls[0][0], export_json)
+            self.assertEqual(list(config.export_processing_dir.glob("*.json")), [])
+            self.assertEqual(list(config.export_failed_dir.glob("*.json")), [])
+
     def test_progress_tracker_maps_descending_tdl_message_id_to_forward_media_position(
         self,
     ) -> None:

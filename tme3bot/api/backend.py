@@ -666,6 +666,174 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         job = _owned_job(context, actor, job_id)
         return job_dict(job)
 
+    @app.get("/api/v1/quick-mode/staging", response_model=ObjectResponse)
+    def quick_mode_staging(actor=Depends(current_actor)):
+        """Merge persisted Quick Mode jobs with physical worker staging."""
+        del actor
+        jobs = context.control_plane.jobs.list(
+            kind="export",
+            quick_mode=True,
+            archived=False,
+            offset=0,
+            limit=1000,
+        )
+        by_stage: dict[tuple[str, str], dict[str, Any]] = {}
+        for job in jobs:
+            retry = job.payload.get("quick_retry")
+            retry = retry if isinstance(retry, dict) else {}
+            result_value = job.result.get("value", job.result) if isinstance(job.result, dict) else {}
+            result_value = result_value if isinstance(result_value, dict) else {}
+            stage_id = str(
+                retry.get("stage_job_id")
+                or result_value.get("stage_job_id")
+                or job.id
+            )
+            # Keep the newest attempt as the linked backend row, while the
+            # response still includes the stable stage identity.
+            by_stage[(str(job.worker), stage_id)] = {
+                "id": stage_id,
+                "job": job_dict(job),
+                "backend_job_id": job.id,
+            }
+
+        items: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        dispatcher = context.worker_dispatcher
+        worker_names = context.worker_registry.names() if context.worker_registry is not None else []
+        scanner = getattr(dispatcher, "quickmode_scan", None) if dispatcher is not None else None
+        for worker in worker_names:
+            try:
+                response = scanner(worker) if callable(scanner) else {"worker": worker, "items": []}
+                scanned = response.get("items", []) if isinstance(response, dict) else []
+                if not isinstance(scanned, list):
+                    scanned = []
+                for raw in scanned:
+                    if not isinstance(raw, dict):
+                        continue
+                    item = dict(raw)
+                    stage_id = str(item.get("stage_job_id") or "")
+                    if not stage_id:
+                        continue
+                    linked = by_stage.get((worker, stage_id))
+                    item["worker"] = str(item.get("worker") or worker)
+                    item["backend_job"] = linked["job"] if linked else None
+                    item["backend_job_id"] = linked["backend_job_id"] if linked else None
+                    item["orphan"] = linked is None
+                    items.append(item)
+            except Exception as exc:
+                # One remote worker being offline must not hide staging from
+                # the remaining workers.
+                errors.append({"worker": worker, "error": str(exc)[:500]})
+
+        # A backend row without a physical scan is retained as a diagnosis
+        # entry, rather than silently disappearing from the manager.
+        scanned_ids = {
+            (str(item.get("worker") or ""), str(item.get("stage_job_id") or ""))
+            for item in items
+        }
+        for (job_worker, stage_id), linked in by_stage.items():
+            if (job_worker, stage_id) in scanned_ids:
+                continue
+            job = linked["job"]
+            items.append(
+                {
+                    "stage_job_id": stage_id,
+                    "quick_operation_id": stage_id,
+                    "profile": job.get("profile") or "",
+                    "worker": job_worker,
+                    "folder_name": "",
+                    "phase": job.get("progress", {}).get("phase") or job.get("status"),
+                    "resume_phase": job.get("retry_phase") or "auto",
+                    "json_present": False,
+                    "expected_media_count": 0,
+                    "actual_media_count": 0,
+                    "archive_parts": 0,
+                    "thumbnail_present": False,
+                    "tdl_export_present": False,
+                    "tdl_download_present": False,
+                    "staging_path": job.get("progress", {}).get("staging_path"),
+                    "backend_job": job,
+                    "backend_job_id": linked["backend_job_id"],
+                    "orphan": False,
+                    "scan_missing": True,
+                }
+            )
+        return {"items": items, "errors": errors}
+
+    @app.post("/api/v1/quick-mode/recover", response_model=ObjectResponse)
+    def recover_quick_mode(body: dict[str, Any], actor=Depends(current_actor)):
+        worker = str(body.get("worker") or "").strip().lower()
+        stage_id = str(body.get("stage_job_id") or "").strip()
+        if not worker or not stage_id:
+            raise DomainError(
+                "RECOVERY_TARGET_REQUIRED",
+                "Worker dan stage_job_id wajib diisi.",
+                status_code=422,
+            )
+        if context.worker_registry is not None and context.worker_registry.get(worker) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker recovery tidak ditemukan.", status_code=404)
+        jobs = context.control_plane.jobs.list(
+            kind="export", quick_mode=True, archived=False, offset=0, limit=1000
+        )
+        linked = None
+        for candidate in jobs:
+            retry = candidate.payload.get("quick_retry")
+            retry = retry if isinstance(retry, dict) else {}
+            if str(retry.get("stage_job_id") or candidate.id) == stage_id and candidate.worker == worker:
+                linked = candidate
+        if linked is not None:
+            if not linked.status.terminal:
+                raise DomainError(
+                    "JOB_NOT_TERMINAL",
+                    "Folder Quick Mode sudah memiliki job aktif.",
+                    status_code=409,
+                )
+            return {"job": job_dict(context.control_plane.retry_job(actor, linked.id)), "imported": False}
+
+        scanner = getattr(context.worker_dispatcher, "quickmode_scan", None)
+        try:
+            response = scanner(worker) if callable(scanner) else {"items": []}
+        except Exception as exc:
+            raise DomainError("WORKER_OFFLINE", f"Worker recovery tidak tersedia: {exc}", status_code=503) from exc
+        item = next(
+            (value for value in response.get("items", []) if isinstance(value, dict) and str(value.get("stage_job_id")) == stage_id),
+            None,
+        )
+        if item is None:
+            raise DomainError("STAGING_NOT_FOUND", "Folder staging Quick Mode tidak ditemukan.", status_code=404)
+        profile = str(body.get("profile") or item.get("profile") or "").strip()
+        if not profile:
+            raise DomainError("PROFILE_REQUIRED", "Profile wajib dipilih untuk folder recovery ini.", status_code=422)
+        context.control_plane.require_profile(actor, profile)
+        has_upload_assets = bool(item.get("archive_parts", 0)) and bool(item.get("thumbnail_present"))
+        payload: dict[str, Any] = {
+            "quick_mode": True,
+            "quick_settings": context.utility_settings.get(),
+            "quick_retry": {
+                "retry_phase": "auto",
+                "resume_phase": "auto",
+                "stage_job_id": stage_id,
+                "quick_operation_id": str(item.get("quick_operation_id") or stage_id),
+            },
+        }
+        for key in ("url", "chat_ref", "start_id", "label", "save_source", "use_url_message_id"):
+            if body.get(key) is not None:
+                payload[key] = body[key]
+        if not item.get("json_present") and not has_upload_assets and not payload.get("url") and not payload.get("chat_ref"):
+            raise DomainError(
+                "RECOVERY_SOURCE_REQUIRED",
+                "Folder tidak memiliki JSON atau hasil upload lengkap. Berikan URL/chat ID untuk export ulang.",
+                status_code=422,
+            )
+        job = context.control_plane.submit_job(
+            actor,
+            "export",
+            payload,
+            profile=profile,
+            worker=worker,
+        )
+        return {"job": job_dict(job), "imported": True}
+
     @app.post(
         "/internal/v1/jobs/{job_id}/telegram-notifications",
         include_in_schema=False,

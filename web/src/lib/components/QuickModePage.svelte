@@ -5,9 +5,10 @@
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
-  import { CheckCircle2, Clock3, FileDown, Gauge, ListFilter, Plus, RefreshCw, Zap } from '@lucide/svelte';
+  import { CheckCircle2, Clock3, Download, FileDown, FolderOpen, Gauge, Image, Plus, RefreshCw, ShieldCheck, Upload, XCircle, Zap } from '@lucide/svelte';
 
   type Job = Record<string, any>;
+  type Stage = Record<string, any>;
   type Verification = {
     verified: boolean;
     purpose: string;
@@ -36,10 +37,15 @@
   let sourceLoading = $state(false);
   let statsLoading = $state(false);
   let allJobs = $state<Job[]>([]);
+  let staging = $state<Stage[]>([]);
+  let stagingErrors = $state<{worker: string; error: string}[]>([]);
+  let stagingLoading = $state(false);
+  let stageAction = $state<string | null>(null);
   let filterProfile = $state('');
   let filterWorker = $state('');
   let filterStatus = $state('');
   let statsTimer: ReturnType<typeof setTimeout> | undefined;
+  let stagingTimer: number | undefined;
   let mounted = false;
   let lastProfile = '';
 
@@ -54,6 +60,11 @@
     cancelled: allJobs.filter((job) => job.status === 'cancelled').length,
     succeeded: allJobs.filter((job) => job.status === 'succeeded').length
   });
+  const filteredStaging = $derived(staging.filter((item) =>
+    (!filterProfile || item.profile === filterProfile || item.backend_job?.profile === filterProfile) &&
+    (!filterWorker || item.worker === filterWorker) &&
+    (!filterStatus || item.backend_job?.status === filterStatus)
+  ));
 
   async function loadSources(profile = targetProfile) {
     sourceLoading = true;
@@ -84,6 +95,75 @@
         if (statsTimer) clearTimeout(statsTimer);
         statsTimer = activeJobs.length ? setTimeout(loadStats, 1500) : undefined;
       }
+    }
+  }
+
+  async function loadStaging() {
+    stagingLoading = true;
+    try {
+      const response = await api<{items: Stage[]; errors?: {worker: string; error: string}[]}>(`/quick-mode/staging`);
+      staging = response.items || [];
+      stagingErrors = response.errors || [];
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Scan staging Quick Mode gagal.';
+    } finally {
+      stagingLoading = false;
+    }
+  }
+
+  function stageProfile(item: Stage) {
+    return String(item.profile || item.backend_job?.profile || targetProfile || '');
+  }
+
+  function stageSourcePayload(): Record<string, unknown> {
+    return {
+      ...(url.trim() ? { url: url.trim() } : chatRef.trim() ? { chat_ref: chatRef.trim() } : {}),
+      ...(label.trim() ? { label: label.trim() } : {}),
+      ...(overwriteStartId ? { start_id: Number(startId), use_url_message_id: true } : {})
+    };
+  }
+
+  async function recoverStage(item: Stage) {
+    const profile = stageProfile(item);
+    if (!profile) {
+      message = 'Pilih profile pada form Quick Mode sebelum mengimport folder ini.';
+      return;
+    }
+    const source = stageSourcePayload();
+    if (!item.json_present && !item.archive_parts && !source.url && !source.chat_ref) {
+      message = 'Folder ini tidak memiliki JSON. Isi URL atau chat ID untuk export ulang.';
+      return;
+    }
+    const key = `${item.worker}:${item.stage_job_id}`;
+    stageAction = key;
+    try {
+      await post('/quick-mode/recover', {
+        worker: item.worker,
+        stage_job_id: item.stage_job_id,
+        profile,
+        ...source
+      });
+      message = 'Folder Quick Mode dimasukkan kembali ke antrean.';
+      await Promise.all([loadStaging(), loadStats()]);
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Recovery Quick Mode gagal.';
+    } finally {
+      stageAction = null;
+    }
+  }
+
+  async function cancelStage(item: Stage) {
+    const jobId = item.backend_job_id || item.backend_job?.id;
+    if (!jobId) return;
+    stageAction = `${item.worker}:${item.stage_job_id}`;
+    try {
+      await post(`/jobs/${encodeURIComponent(jobId)}/cancel`);
+      message = 'Permintaan cancel dikirim ke worker.';
+      await loadStats();
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Cancel Quick Mode gagal.';
+    } finally {
+      stageAction = null;
     }
   }
 
@@ -201,12 +281,15 @@
     mounted = true;
     loadSources(targetProfile);
     loadStats();
-    const refresh = () => loadStats();
+    loadStaging();
+    stagingTimer = window.setInterval(loadStaging, 15000);
+    const refresh = () => { loadStats(); loadStaging(); };
     window.addEventListener('tme3:data-mutated', refresh);
     return () => {
       mounted = false;
       if (cooldownTimer) clearTimeout(cooldownTimer);
       if (statsTimer) clearTimeout(statsTimer);
+      if (stagingTimer) clearInterval(stagingTimer);
       window.removeEventListener('tme3:data-mutated', refresh);
     };
   });
@@ -247,6 +330,31 @@
     <label class="text-sm font-bold">Profile<select class="field mt-2" bind:value={filterProfile}><option value="">Semua profile</option>{#each session.current.profiles as item}<option value={item}>{item}</option>{/each}</select></label>
     <label class="text-sm font-bold">Worker<select class="field mt-2" bind:value={filterWorker}><option value="">Semua worker</option>{#each session.workers as item}<option value={item.name}>{item.name}</option>{/each}</select></label>
     <label class="text-sm font-bold">Status<select class="field mt-2" bind:value={filterStatus}><option value="">Semua status</option>{#each statuses as item}<option value={item}>{item}</option>{/each}</select></label>
+  </div>
+</section>
+
+<section class="card mt-6 p-4 sm:p-5">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-200"><FolderOpen size={19}/></div><div><p class="eyebrow">PHYSICAL STAGING</p><h2 class="mt-1 text-lg font-extrabold">Folder Quick Mode di worker</h2><p class="muted text-sm">Scan langsung dari workspace, termasuk folder orphan setelah restart worker.</p></div></div>
+    <button class="button secondary" onclick={loadStaging} disabled={stagingLoading}><RefreshCw size={15} class={stagingLoading ? 'animate-spin' : ''}/>Refresh scan</button>
+  </div>
+  {#if stagingErrors.length}<div class="mt-4 space-y-2">{#each stagingErrors as item}<p class="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">Worker {item.worker} tidak dapat discan: {item.error}</p>{/each}</div>{/if}
+  {#if !filteredStaging.length && !stagingLoading}<p class="muted mt-5 rounded-xl border border-dashed border-[var(--line)] p-5 text-center text-sm">Belum ada folder staging Quick Mode.</p>{/if}
+  <div class="mt-4 space-y-3">
+    {#each filteredStaging as item}
+      {@const linked = item.backend_job}
+      {@const active = linked && ['queued','dispatched','running'].includes(linked.status)}
+      {@const actionKey = `${item.worker}:${item.stage_job_id}`}
+      <article class="rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><b class="truncate">{item.folder_name || item.stage_job_id}</b>{#if item.orphan}<span class="badge failed">Orphan</span>{/if}<span class="badge running">{item.phase}</span>{#if linked}<span class={`badge ${linked.status}`}>{linked.status}</span>{/if}</div><p class="muted mt-1 break-all text-xs">{item.worker} · {stageProfile(item) || 'profile belum dipilih'} · {item.staging_path}</p></div>
+          <div class="flex flex-wrap gap-2">{#if active}<button class="button danger" onclick={() => cancelStage(item)} disabled={stageAction === actionKey}><XCircle size={15}/>Cancel</button>{:else}<button class="button secondary" onclick={() => recoverStage(item)} disabled={stageAction === actionKey}>{#if item.orphan && !item.json_present && !item.actual_media_count && !item.archive_parts}<ShieldCheck size={15}/>Import orphan{:else if item.archive_parts && item.thumbnail_present}<Upload size={15}/>Upload{:else if item.json_present && item.expected_media_count && item.actual_media_count < item.expected_media_count}<Download size={15}/>Resume Download{:else if !item.thumbnail_present}<Image size={15}/>Thumbnail{:else}<ShieldCheck size={15}/>Compress{/if}</button>{/if}</div>
+        </div>
+        <div class="mt-3 flex flex-wrap gap-2 text-xs font-bold"><span class={`rounded-full px-2.5 py-1 ${item.json_present ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>JSON {item.json_present ? 'ada' : 'tidak ada'}</span><span class={`rounded-full px-2.5 py-1 ${item.actual_media_count ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>Media {item.actual_media_count}/{item.expected_media_count || '?'}</span><span class={`rounded-full px-2.5 py-1 ${item.thumbnail_present ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>PNG {item.thumbnail_present ? 'ada' : 'belum'}</span><span class={`rounded-full px-2.5 py-1 ${item.archive_parts ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>Archive {item.archive_parts}</span><span class={`rounded-full px-2.5 py-1 ${item.tdl_export_present && item.tdl_download_present ? 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>.tdl {item.tdl_export_present ? 'E' : '-'} / {item.tdl_download_present ? 'D' : '-'}</span></div>
+        {#if item.last_error}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/40 dark:text-rose-200">{item.last_error}</p>{/if}
+        {#if linked}<p class="muted mt-2 text-xs">Job backend: {linked.id} · storage: {item.storage_folder || '-'}</p>{/if}
+      </article>
+    {/each}
   </div>
 </section>
 

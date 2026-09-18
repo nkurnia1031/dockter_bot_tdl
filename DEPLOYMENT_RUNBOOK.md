@@ -841,8 +841,9 @@ dan path workspace; path sibling dapat paralel, path yang overlap tetap serial.
 Storage memakai lane `worker + tdl:storage` dan tidak memakai profile actor.
 
 Quick Mode juga membutuhkan binary `rclone` dan file konfigurasi worker pada
-`/workspace/.config/rclone.conf`. Binary sudah dipasang pada `Dockerfile.base`;
-letakkan config pada workspace host yang di-mount ke worker. Destination remote
+`/data/.config/rclone.conf`. Binary sudah dipasang pada `Dockerfile.base`;
+letakkan config pada data root host yang di-mount sebagai `/data` pada worker.
+Destination remote
 diatur dari Web/Telegram Pengaturan, defaultnya `googledrive:backup`. Quick Mode
 hanya mengirim arsip `*.7z*` ke rclone, tidak mengirim thumbnail. Upload Storage
 memiliki pilihan terpisah untuk menyalin file ke remote yang sama. Sumber dan

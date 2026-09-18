@@ -38,7 +38,10 @@ def is_standalone_tdl_progress_bar(line: str) -> bool:
     if " -> " in line or parse_message_id(line) is not None:
         return False
     return bool(
-        re.match(r"^\[[#=.>\-\s]+\]\s+\[[^\]]*(?:/s|ETA|\d+s|\d+m|\d+h)[^\]]*\]$", line)
+        re.search(
+            r"(?:^|\s)\[[#=.><\-\s]+\]\s+\[[^\]]*(?:/s|ETA|\d+s|\d+m|\d+h)[^\]]*\]$",
+            line,
+        )
     )
 
 

@@ -10,11 +10,14 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from tme3bot.export_catalog import inspect_export_json
+from tme3bot.tdl import ProcessStalledError, TDLClient
 from tme3bot.url_parser import slugify_label
 
 
@@ -30,6 +33,7 @@ QUICK_PHASES = (
     "uploading",
     "cleanup",
 )
+QUICK_MANIFEST_VERSION = 2
 _STAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 
 
@@ -109,12 +113,232 @@ def write_quick_manifest(stage_root: Path, values: dict[str, object]) -> None:
     """Persist non-secret phase metadata atomically for retry/recovery."""
     path = Path(stage_root) / "quickmode.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    values = _sanitize_manifest(values)
     temporary = path.with_name(f".{path.name}.tmp")
     temporary.write_text(
         json.dumps(values, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def _sanitize_manifest(value):
+    sensitive = {"password", "compress_password", "token", "credential", "secret"}
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_manifest(item)
+            for key, item in value.items()
+            if str(key).casefold() not in sensitive
+        }
+    if isinstance(value, list):
+        return [_sanitize_manifest(item) for item in value]
+    return value
+
+
+def _safe_stage_file(path: Path, root: Path) -> bool:
+    """Return whether *path* is a direct, non-symlink child of *root*."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        return path.resolve().parent == root.resolve()
+    except OSError:
+        return False
+
+
+def _archive_files(stage_root: Path, folder_name: str) -> list[Path]:
+    prefix = f"{folder_name}.7z"
+    return sorted(
+        path
+        for path in Path(stage_root).iterdir()
+        if _safe_stage_file(path, Path(stage_root))
+        and (path.name == prefix or path.name.startswith(prefix + "."))
+    )
+
+
+def _json_media_stats(path: Path) -> dict[str, object]:
+    """Read only safe, derived counts from a raw export JSON."""
+    try:
+        return dict(inspect_export_json(path))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def scan_quick_stages(workspace: Path, *, worker: str | None = None) -> list[dict[str, object]]:
+    """Scan Quick Mode staging without returning JSON, credentials, or TDL data."""
+    workspace = Path(workspace).resolve()
+    legacy_root = workspace / ".tme3bot-quick"
+    if legacy_root.is_dir():
+        for candidate in sorted(legacy_root.iterdir()):
+            if candidate.is_dir() and not candidate.is_symlink():
+                try:
+                    migrate_legacy_quick_stage(workspace, candidate.name)
+                except (OSError, QuickModeError):
+                    # One damaged legacy folder must not hide all other stages.
+                    continue
+        try:
+            legacy_root.rmdir()
+        except OSError:
+            pass
+
+    root = workspace / "quickmode"
+    if not root.is_dir():
+        return []
+    results: list[dict[str, object]] = []
+    for stage in sorted(root.iterdir(), key=lambda item: item.name.casefold()):
+        if not stage.is_dir() or stage.is_symlink() or not _STAGE_ID_RE.fullmatch(stage.name):
+            continue
+        manifest = read_quick_manifest(stage)
+        manifest = manifest if isinstance(manifest, dict) else {}
+        json_candidates = sorted(
+            path for path in stage.glob("*.json")
+            if path.name != "quickmode.json" and _safe_stage_file(path, stage)
+        )
+        json_path = None
+        requested_json = Path(str(manifest.get("export_json_name") or "")).name
+        if requested_json and requested_json != "." and _safe_stage_file(stage / requested_json, stage):
+            json_path = stage / requested_json
+        elif len(json_candidates) == 1:
+            json_path = json_candidates[0]
+        stats = _json_media_stats(json_path) if json_path else {}
+        folder_name = Path(str(manifest.get("folder_name") or "")).name
+        if not folder_name or folder_name == ".":
+            child_dirs = [
+                path for path in stage.iterdir()
+                if path.is_dir() and path.name != ".tdl" and not path.is_symlink()
+            ]
+            archive_candidates = sorted(stage.glob("*.7z*"))
+            folder_name = (
+                quick_folder_name(json_path)
+                if json_path
+                else archive_candidates[0].name.split(".7z", 1)[0]
+                if archive_candidates
+                else child_dirs[0].name if len(child_dirs) == 1 else stage.name
+            )
+        media_root = stage / folder_name
+        photos, videos = visual_media(media_root) if media_root.is_dir() else ([], [])
+        actual_media_count = len(photos) + len(videos)
+        try:
+            expected_media_count = int(
+                stats.get("media_count") or manifest.get("expected_media_count") or 0
+            )
+        except (TypeError, ValueError):
+            expected_media_count = 0
+        thumbnail_present = (stage / f"{folder_name}.png").is_file()
+        archives = _archive_files(stage, folder_name)
+        has_media = actual_media_count > 0
+        if archives and thumbnail_present:
+            phase = "uploading"
+            resume_phase = "uploading"
+        elif json_path and expected_media_count and actual_media_count >= expected_media_count and not thumbnail_present:
+            phase = "thumbnailing"
+            resume_phase = "thumbnailing"
+        elif json_path and has_media and expected_media_count and actual_media_count >= expected_media_count and thumbnail_present and not archives:
+            phase = "compressing"
+            resume_phase = "compressing"
+        elif json_path:
+            phase = "downloading"
+            resume_phase = "downloading"
+        else:
+            phase = str(manifest.get("phase") or "exporting").strip().lower()
+            if phase not in QUICK_PHASES:
+                phase = "exporting"
+            resume_phase = phase
+        tdl_root = stage / ".tdl"
+        try:
+            manifest_version = int(manifest.get("version") or 1)
+        except (TypeError, ValueError):
+            manifest_version = 1
+        item: dict[str, object] = {
+            "stage_job_id": stage.name,
+            "quick_operation_id": str(manifest.get("quick_operation_id") or stage.name),
+            "profile": str(manifest.get("profile") or ""),
+            "worker": str(manifest.get("worker") or worker or ""),
+            "folder_name": folder_name,
+            "phase": phase,
+            "resume_phase": resume_phase,
+            "json_present": bool(json_path),
+            "expected_media_count": expected_media_count,
+            "actual_media_count": actual_media_count,
+            "photo_count": len(photos),
+            "video_count": len(videos),
+            "archive_parts": len(archives),
+            "archive_names": [path.name for path in archives],
+            "thumbnail_present": thumbnail_present,
+            "tdl_export_present": (tdl_root / "export-home" / ".tdl").is_dir(),
+            "tdl_download_present": (tdl_root / "download-home" / ".tdl").is_dir(),
+            "storage_folder": str(manifest.get("storage_folder") or f"ModeCepat/{quick_year()}"),
+            "last_progress_at": manifest.get("last_progress_at"),
+            "last_error": str(manifest.get("last_error") or "")[:1000],
+            "staging_path": str(stage),
+            "manifest_version": manifest_version,
+        }
+        # Only derived metadata is exposed.  In particular, do not return the
+        # manifest itself, raw chat JSON, password settings, or session files.
+        results.append(item)
+    return results
+
+
+def _clone_tree(source: Path, destination: Path) -> None:
+    source = Path(source)
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    if source != Path(".") and source.is_dir():
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+
+
+def _chown_tree(path: Path, username: str | None) -> None:
+    if not username or username == "root" or os.name == "nt":
+        return
+    try:
+        import pwd
+
+        info = pwd.getpwnam(username)
+    except (ImportError, KeyError):
+        return
+    for current, directories, files in os.walk(path):
+        for name in [current, *directories, *files]:
+            try:
+                os.chown(name, info.pw_uid, info.pw_gid)
+            except OSError:
+                continue
+
+
+def ensure_quick_tdl_client(
+    stage_root: Path,
+    *,
+    mode: str,
+    source_storage: Path | None,
+    source_home: Path | None,
+    namespace: str,
+    run_as_user: str | None,
+    stall_timeout_seconds: int = 0,
+    progress_callback=None,
+    output_callback=None,
+) -> TDLClient:
+    """Create/reuse the isolated export or download TDL session for a stage."""
+    if mode not in {"export", "download"}:
+        raise QuickModeError("Mode TDL Quick Mode tidak valid.")
+    mode_root = Path(stage_root) / ".tdl" / f"{mode}-home"
+    storage_root = mode_root / ".tdl"
+    if not storage_root.exists() or not any(storage_root.iterdir()):
+        _clone_tree(Path(source_storage) if source_storage else Path(), storage_root)
+    mode_root.mkdir(parents=True, exist_ok=True)
+    _chown_tree(mode_root, run_as_user)
+    return TDLClient(
+        storage_root=storage_root,
+        namespace=namespace,
+        run_as_user=run_as_user,
+        home=mode_root,
+        log_prefix=f"tdl-quick-{mode}:{Path(stage_root).name}",
+        stall_timeout_seconds=stall_timeout_seconds,
+        progress_callback=progress_callback,
+        output_callback=output_callback,
+    )
+
+
+def ensure_quick_stage_writable(stage_root: Path, username: str | None) -> None:
+    Path(stage_root).mkdir(parents=True, exist_ok=True)
+    _chown_tree(Path(stage_root), username)
 
 
 def visual_media(root: Path) -> tuple[list[Path], list[Path]]:
@@ -148,10 +372,12 @@ class QuickThumbnailBuilder:
         ffmpeg: str = "ffmpeg",
         ffprobe: str = "ffprobe",
         log_callback: Callable[[str], None] | None = None,
+        stall_timeout_seconds: int = 0,
     ) -> None:
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.log_callback = log_callback
+        self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
         self._process_lock = threading.RLock()
         self._current_process: subprocess.Popen[str] | None = None
 
@@ -167,6 +393,10 @@ class QuickThumbnailBuilder:
                 process.send_signal(signal.CTRL_BREAK_EVENT)
         except (OSError, ProcessLookupError):
             return False
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._terminate_process(process)
         return True
 
     def build(self, media_root: Path, output_path: Path) -> dict[str, object]:
@@ -305,18 +535,67 @@ class QuickThumbnailBuilder:
         )
         with self._process_lock:
             self._current_process = process
+        stalled = threading.Event()
+        watchdog_stop = threading.Event()
+        started_at = time.monotonic()
+
+        def watchdog() -> None:
+            if self.stall_timeout_seconds <= 0:
+                return
+            while not watchdog_stop.wait(1.0):
+                if time.monotonic() - started_at <= self.stall_timeout_seconds:
+                    continue
+                stalled.set()
+                self._terminate_process(process)
+                return
+
+        watchdog_thread = threading.Thread(
+            target=watchdog,
+            daemon=True,
+            name="quick-thumbnail-watchdog",
+        )
+        watchdog_thread.start()
         try:
             stdout, stderr = process.communicate()
         finally:
+            watchdog_stop.set()
+            watchdog_thread.join(timeout=2)
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+        if stalled.is_set():
+            raise ProcessStalledError(
+                f"thumbnail process stalled for {self.stall_timeout_seconds}s",
+                self.stall_timeout_seconds,
+            )
         if process.returncode:
             detail = (stderr or stdout or "ffmpeg gagal").strip()
             if self.log_callback:
                 self.log_callback(detail[-2_000:])
             raise QuickModeError(f"Pemrosesan thumbnail gagal: {detail[-500:]}")
         return stdout or ""
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name != "nt":
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                return
+        else:  # pragma: no cover - production workers run on Linux
+            process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            if os.name != "nt":
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    return
+            else:  # pragma: no cover - production workers run on Linux
+                process.kill()
 
 
 def cleanup_quick_stage(stage_root: Path) -> None:

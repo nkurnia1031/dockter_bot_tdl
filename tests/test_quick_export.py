@@ -18,6 +18,7 @@ from tme3bot.worker.quick_export import (
     quick_stage_root,
     quick_storage_caption,
     visual_media,
+    scan_quick_stages,
 )
 
 
@@ -138,6 +139,54 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual([path.name for path in photos], ["photo.jpg"])
             self.assertEqual([path.name for path in videos], ["clip.mp4"])
 
+    def test_scan_classifies_json_only_and_incomplete_media(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            stage = workspace / "quickmode" / "json-job"
+            stage.mkdir(parents=True)
+            (stage / "export.json").write_text(
+                '{"messages":[{"id":1,"type":"photo","file":"a.jpg"},'
+                '{"id":2,"type":"video","file":"b.mp4"}]}',
+                encoding="utf-8",
+            )
+            item = scan_quick_stages(workspace, worker="remote-1")[0]
+            self.assertEqual(item["phase"], "downloading")
+            self.assertEqual(item["expected_media_count"], 2)
+            self.assertEqual(item["actual_media_count"], 0)
+            media = stage / "export"
+            media.mkdir()
+            (media / "a.jpg").write_bytes(b"photo")
+            item = scan_quick_stages(workspace, worker="remote-1")[0]
+            self.assertEqual(item["phase"], "downloading")
+            self.assertEqual(item["actual_media_count"], 1)
+
+    def test_scan_archive_and_png_is_upload_only_without_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            stage = workspace / "quickmode" / "upload-job"
+            stage.mkdir(parents=True)
+            (stage / "upload.7z.001").write_bytes(b"archive")
+            (stage / "upload.png").write_bytes(b"png")
+            item = scan_quick_stages(workspace, worker="local")[0]
+            self.assertEqual(item["phase"], "uploading")
+            self.assertFalse(item["json_present"])
+            self.assertEqual(item["archive_parts"], 1)
+
+    def test_scan_does_not_return_manifest_secrets_or_tdl_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            stage = workspace / "quickmode" / "safe-job"
+            (stage / ".tdl" / "export-home" / ".tdl").mkdir(parents=True)
+            (stage / "quickmode.json").write_text(
+                '{"profile":"default","compress_password":"do-not-return",'
+                '"quick_operation_id":"op-1","phase":"uploading"}',
+                encoding="utf-8",
+            )
+            item = scan_quick_stages(workspace)[0]
+            self.assertNotIn("compress_password", item)
+            self.assertNotIn("quickmode.json", str(item))
+            self.assertTrue(item["tdl_export_present"])
+
     def test_legacy_stage_is_migrated_to_visible_quickmode_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "workspace"
@@ -151,6 +200,28 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual(target, quick_stage_root(workspace, "old-job"))
             self.assertTrue((workspace / "quickmode" / "old-job" / "batch.7z.001").exists())
             self.assertFalse(legacy.exists())
+
+    def test_retained_export_json_rebuilds_quick_manifest_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            stage = Path(temp_dir) / "workspace" / "quickmode" / "job-1"
+            stage.mkdir(parents=True)
+            export_json = stage / "label_source.json"
+            export_json.write_text(
+                '{"messages":[{"id":100,"type":"photo","file":"a.jpg"}],'
+                '"tme3bot":{"chat_ref":"@source","label":"label"}}',
+                encoding="utf-8",
+            )
+            executor = WorkerJobExecutor(
+                SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
+            )
+
+            manifest = executor._hydrate_quick_manifest_from_stage(stage, {})
+
+            self.assertEqual(manifest["export_json_name"], "label_source.json")
+            self.assertEqual(manifest["folder_name"], "label_source")
+            self.assertTrue(manifest["export_json_retained"])
+            self.assertEqual(manifest["export_result"]["chat_ref"], "@source")
+            self.assertEqual(manifest["stats"]["media_count"], 1)
 
 
 class ExportMilestoneTests(unittest.TestCase):
@@ -306,7 +377,9 @@ class QuickPipelineTests(unittest.TestCase):
             root = Path(temp_dir)
             workspace = root / "workspace"
             pending = root / "exports" / "pending"
+            processing = root / "exports" / "processing"
             pending.mkdir(parents=True)
+            processing.mkdir(parents=True)
             export_json = pending / "batch.json"
             export_json.write_text('{"messages":[]}', encoding="utf-8")
             storage_session = root / "storage.tdl"
@@ -368,6 +441,7 @@ class QuickPipelineTests(unittest.TestCase):
                 tdl_export_storage=str(storage_session),
                 storage_channel_ref="-100123",
                 storage_channel_id=-100123,
+                export_processing_dir=processing,
             )
             export_client = SimpleNamespace(
                 output_callback=None,
@@ -470,11 +544,12 @@ class QuickPipelineTests(unittest.TestCase):
                     self.kwargs = kwargs
                     self.__class__.instances.append(self)
 
-                def copy_files(self, files, destination, config_path, *, workspace_root):
+                def copy_files(self, files, destination, config_path, *, workspace_root, config_root=None):
                     self.files = list(files)
                     self.destination = destination
                     self.config_path = config_path
                     self.workspace_root = workspace_root
+                    self.config_root = config_root
                     return {
                         "destination": destination,
                         "total": len(self.files),

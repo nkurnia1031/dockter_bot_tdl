@@ -28,6 +28,7 @@ def build_execution_plan(
     worker: str,
     payload: dict[str, Any],
     profiles: Iterable[str] = (),
+    stage_job_id: str | None = None,
 ) -> JobExecutionPlan:
     kind = str(kind)
     profile = str(profile)
@@ -48,8 +49,8 @@ def build_execution_plan(
             # and runtime locks still serialize operations on each session.
             retry = payload.get("quick_retry") or {}
             retry = retry if isinstance(retry, dict) else {}
-            retry_phase = str(retry.get("retry_phase") or "exporting").strip().lower()
-            if retry_phase != "exporting":
+            retry_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower()
+            if retry_phase not in {"exporting", "auto"}:
                 keys = {
                     key
                     for key in keys
@@ -58,10 +59,13 @@ def build_execution_plan(
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:kind:export")
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
-            stage_job_id = retry.get("stage_job_id")
+            stage_job_id = retry.get("stage_job_id") or payload.get("stage_job_id") or stage_job_id
+            # Initial jobs do not yet have retry metadata.  The job ID is the
+            # stable physical staging identity for the whole retry chain.
+            stage_job_id = stage_job_id or payload.get("job_id")
             if stage_job_id:
                 keys.add(f"worker:{worker}:quick-stage:{str(stage_job_id)}")
-                if retry_phase == "exporting":
+                if retry_phase in {"exporting", "auto"}:
                     # The additions above are kept explicit for readability;
                     # this branch also documents that a retry from the
                     # exporting phase owns the export lane.

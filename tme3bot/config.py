@@ -46,8 +46,11 @@ class AppConfig:
     app_role: str = "backend"
     leave_helper_binary: str = "/usr/local/bin/tdl-leave"
     utility_workspace_root: Path = Path("/workspace")
+    rclone_config_path: Path = Path("/data/.config/rclone.conf")
     utility_folders_file: Path = Path("/data/utility_folders.json")
     utility_settings_file: Path = Path("/data/utility_settings.json")
+    job_stall_timeout_seconds: int = 600
+    job_cancel_grace_seconds: int = 30
     storage_channel_ref: str = ""
     storage_channel_id: int = 0
     storage_channel_username: str = ""
@@ -180,11 +183,20 @@ class AppConfig:
             os.getenv("TDL_EXPORT_STALL_TIMEOUT_SECONDS", "300")
         )
         tdl_download_stall_timeout_seconds = int(
-            os.getenv("TDL_DOWNLOAD_STALL_TIMEOUT_SECONDS", "1800")
+            os.getenv("TDL_DOWNLOAD_STALL_TIMEOUT_SECONDS", "300")
         )
         temp_root = Path(os.getenv("TEMP_ROOT", "/data/tmp"))
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
         utility_workspace_root = Path(os.getenv("UTILITY_WORKSPACE_ROOT", "/workspace"))
+        rclone_config_path = Path(
+            os.getenv("RCLONE_CONFIG_PATH", "/data/.config/rclone.conf")
+        )
+        job_stall_timeout_seconds = max(
+            0, int(os.getenv("JOB_STALL_TIMEOUT_SECONDS", "600"))
+        )
+        job_cancel_grace_seconds = max(
+            0, int(os.getenv("JOB_CANCEL_GRACE_SECONDS", "30"))
+        )
         utility_folders_file = Path(os.getenv("UTILITY_FOLDERS_FILE", "/data/utility_folders.json"))
         utility_settings_file = Path(os.getenv("UTILITY_SETTINGS_FILE", "/data/utility_settings.json"))
         storage_channel = compact_channel_ref(os.getenv("STORAGE_CHANNEL", "").strip() or os.getenv("STORAGE_CHANNEL_REF", "").strip())
@@ -262,8 +274,11 @@ class AppConfig:
             log_level=log_level,
             leave_helper_binary=os.getenv("LEAVE_HELPER_BINARY", "/usr/local/bin/tdl-leave"),
             utility_workspace_root=utility_workspace_root,
+            rclone_config_path=rclone_config_path,
             utility_folders_file=utility_folders_file,
             utility_settings_file=utility_settings_file,
+            job_stall_timeout_seconds=job_stall_timeout_seconds,
+            job_cancel_grace_seconds=job_cancel_grace_seconds,
             storage_channel_ref=storage_channel_ref,
             storage_channel_id=storage_channel_id,
             storage_channel_username=storage_channel_username,

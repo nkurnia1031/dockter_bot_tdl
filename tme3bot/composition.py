@@ -82,6 +82,8 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         utility_folders=folders,
         utility_settings=settings,
         label_store=labels,
+        job_stall_timeout_seconds=config.job_stall_timeout_seconds,
+        job_cancel_grace_seconds=config.job_cancel_grace_seconds,
     )
     control_plane.start_scheduler()
     auth_repository = SqliteAuthRepository(config.storage_db_file)

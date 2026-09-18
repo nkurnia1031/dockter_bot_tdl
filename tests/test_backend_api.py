@@ -41,6 +41,7 @@ class FakeDispatcher:
     def __init__(self):
         self.commands = []
         self.storage_available = True
+        self.quick_scan = {"local": {"worker": "local", "items": []}}
 
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
@@ -66,6 +67,9 @@ class FakeDispatcher:
             "storage_profile_available": self.storage_available,
             "workspace": True,
         }
+
+    def quickmode_scan(self, worker):
+        return self.quick_scan.get(worker, {"worker": worker, "items": []})
 
 
 class FakeWorkers:
@@ -715,6 +719,42 @@ class BackendApiTests(unittest.TestCase):
             self.client.get(f"/api/v1/jobs/{normal['id']}", headers=headers).json()["status"],
             "dispatched",
         )
+
+    def test_quick_staging_scan_merges_orphan_and_recovery_creates_job_on_origin_worker(self):
+        headers = self.login()
+        self.dispatcher.quick_scan["local"] = {
+            "worker": "local",
+            "items": [{
+                "stage_job_id": "orphan-1",
+                "quick_operation_id": "op-1",
+                "profile": "default",
+                "worker": "local",
+                "folder_name": "batch",
+                "phase": "downloading",
+                "resume_phase": "downloading",
+                "json_present": True,
+                "expected_media_count": 2,
+                "actual_media_count": 1,
+                "archive_parts": 0,
+                "thumbnail_present": False,
+                "tdl_export_present": True,
+                "tdl_download_present": True,
+                "staging_path": "/workspace/quickmode/orphan-1",
+            }],
+        }
+        scanned = self.client.get("/api/v1/quick-mode/staging", headers=headers)
+        self.assertEqual(scanned.status_code, 200)
+        self.assertTrue(scanned.json()["items"][0]["orphan"])
+        recovered = self.client.post(
+            "/api/v1/quick-mode/recover",
+            headers=headers,
+            json={"worker": "local", "stage_job_id": "orphan-1", "profile": "default"},
+        )
+        self.assertEqual(recovered.status_code, 200)
+        command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["worker"], "local")
+        self.assertEqual(command["payload"]["quick_retry"]["stage_job_id"], "orphan-1")
+        self.assertNotIn("A1031@bokep@1031A", str(recovered.json()))
 
     def test_storage_metadata_is_shared_for_all_authorized_users(self):
         item = self.insert_storage_item()

@@ -19,6 +19,9 @@ class FakeExecutor:
     def workspace_tree(self, path):
         return {"path": path, "items": [{"name": "biasa", "path": "/workspace/biasa", "kind": "directory"}]}
 
+    def quickmode_scan(self):
+        return {"worker": "local", "items": [{"stage_job_id": "stage-1", "phase": "uploading"}]}
+
     def job_log_snapshot(self, job_id):
         if job_id != "active":
             return None
@@ -71,6 +74,16 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["path"], "/workspace/biasa")
+
+    def test_quickmode_scan_requires_token_and_returns_derived_staging(self):
+        denied = self.client.get("/internal/v1/quickmode/scan")
+        self.assertEqual(denied.status_code, 401)
+        accepted = self.client.get(
+            "/internal/v1/quickmode/scan",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["items"][0]["stage_job_id"], "stage-1")
 
     def test_active_job_log_snapshot_requires_token_and_handles_missing(self):
         denied = self.client.get("/internal/v1/jobs/active/log-snapshot")

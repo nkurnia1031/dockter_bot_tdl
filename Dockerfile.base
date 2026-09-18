@@ -79,4 +79,4 @@ RUN set -eu; \
     tdl version; \
     tdl-leave --help >/dev/null 2>&1 || true
 
-RUN mkdir -p /data/root /data/user1 /data/download /data/exports /data/tmp
+RUN mkdir -p /data/.config /data/root /data/user1 /data/download /data/exports /data/tmp

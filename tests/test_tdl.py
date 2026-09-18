@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from tme3bot.tdl import (
     SubprocessRunner,
     TDLClient,
     TDLCommandError,
+    TDLStalledError,
     clean_tdl_output_line,
     decode_process_output,
     is_nonsemantic_tdl_output_line,
@@ -245,11 +247,37 @@ class TDLClientTests(unittest.TestCase):
                 "[################################################################################################################################################################################################################.] [45s; 1.17 MB/s]"
             )
         )
+        self.assertTrue(
+            is_nonsemantic_tdl_output_line(
+                "Another collection-1588718424 ... [<#>.............................................] [0 in 201ms; 0/s]"
+            )
+        )
         self.assertFalse(
             is_nonsemantic_tdl_output_line(
                 "File Total(8777367678):2539 -> /data/download/file.mp4 ... 87.5% [7.02 MB in 6.011s; 1.17 MB/s]"
             )
         )
+
+    def test_runner_cancels_when_only_standstill_progress_bars_repeat(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import time; "
+                "print('[>................................] [0 in 1s; 0/s]', flush=True); "
+                "time.sleep(10)"
+            ),
+        ]
+        started = time.monotonic()
+        with self.assertRaises(TDLStalledError) as raised:
+            SubprocessRunner().run(
+                command,
+                env={**os.environ, "TDL_FORCE_PTY": "0"},
+                stall_timeout_seconds=1,
+            )
+
+        self.assertEqual(raised.exception.timeout_seconds, 1)
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_parses_full_upload_progress_line(self) -> None:
         progress = parse_tdl_progress_line(

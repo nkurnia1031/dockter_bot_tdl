@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import logging
 import threading
 import time
 from copy import deepcopy
@@ -31,6 +32,8 @@ class ControlPlane:
         backup_coordinator=None,
         storage_delivery=None,
         label_store=None,
+        job_stall_timeout_seconds: int = 600,
+        job_cancel_grace_seconds: int = 30,
     ) -> None:
         self.jobs = jobs
         self.dispatcher = dispatcher
@@ -43,9 +46,12 @@ class ControlPlane:
         self.backup_coordinator = backup_coordinator
         self.storage_delivery = storage_delivery
         self.label_store = label_store
+        self.job_stall_timeout_seconds = max(0, int(job_stall_timeout_seconds))
+        self.job_cancel_grace_seconds = max(0, int(job_cancel_grace_seconds))
         self._event_observers: list[Callable[[JobEvent], None]] = []
         self._scheduler_stop = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
+        self._stale_cancel_requested: dict[str, Any] = {}
 
     def actor(self, telegram_user_id: int) -> Actor:
         profile = self.profile_manager.profile_for_user(telegram_user_id)
@@ -106,15 +112,17 @@ class ControlPlane:
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
         if callable(list_profiles):
             available_profiles = list_profiles()
+        job_id = str(uuid.uuid4())
         execution = build_execution_plan(
             kind,
             selected_profile,
             selected_worker,
             payload,
             available_profiles,
+            stage_job_id=job_id if kind == "export" and bool(payload.get("quick_mode")) else None,
         )
         job = Job(
-            id=str(uuid.uuid4()),
+            id=job_id,
             kind=kind,
             profile=selected_profile,
             actor_user_id=actor.telegram_user_id,
@@ -189,6 +197,7 @@ class ControlPlane:
     def _scheduler_loop(self) -> None:
         while not self._scheduler_stop.wait(2.0):
             try:
+                self._recover_stale_jobs()
                 self._dispatch_pending_jobs()
             except Exception:
                 # A later tick retries; one unavailable worker must not stop
@@ -196,6 +205,93 @@ class ControlPlane:
                 import logging
 
                 logging.getLogger(__name__).exception("Pending job dispatch failed")
+
+    def _recover_stale_jobs(self, *, now=None) -> None:
+        """Cancel jobs whose worker has stopped reporting progress.
+
+        Worker cancellation is deliberately best-effort.  The backend still
+        needs a terminal state when a worker, network connection, or a child
+        process is wedged, otherwise the lane remains occupied forever.
+        """
+        if self.job_stall_timeout_seconds <= 0:
+            return
+        current_time = now or utc_now()
+        active_statuses = (JobStatus.DISPATCHED.value, JobStatus.RUNNING.value)
+        active_ids: set[str] = set()
+        forced = False
+        for status in active_statuses:
+            for job in self.jobs.list(
+                status=status,
+                archived=False,
+                offset=0,
+                limit=1000,
+            ):
+                active_ids.add(job.id)
+                updated_at = job.updated_at or job.created_at
+                age = (current_time - updated_at).total_seconds()
+                if age <= self.job_stall_timeout_seconds:
+                    self._stale_cancel_requested.pop(job.id, None)
+                    continue
+
+                requested_at = self._stale_cancel_requested.get(job.id)
+                if requested_at is None:
+                    try:
+                        signalled = bool(self.dispatcher.cancel(job.worker, job.id))
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Stale job cancellation failed for %s", job.id
+                        )
+                        signalled = False
+                    if signalled:
+                        self._stale_cancel_requested[job.id] = current_time
+                    else:
+                        self._force_cancel_stale_job(job, age)
+                        forced = True
+                    continue
+
+                grace_age = (current_time - requested_at).total_seconds()
+                if grace_age >= self.job_cancel_grace_seconds:
+                    self._force_cancel_stale_job(job, age)
+                    forced = True
+
+        for job_id in tuple(self._stale_cancel_requested):
+            if job_id not in active_ids:
+                self._stale_cancel_requested.pop(job_id, None)
+        if forced:
+            self._dispatch_pending_jobs()
+
+    def _force_cancel_stale_job(self, job: Job, age_seconds: float) -> None:
+        current = self.jobs.get(job.id)
+        if current is None or current.status.terminal:
+            self._stale_cancel_requested.pop(job.id, None)
+            return
+        sequence = max(
+            (item.sequence for item in self.jobs.events(job.id)), default=0
+        ) + 1
+        phase = str(job.progress.get("phase") or "cancelled")
+        self.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=sequence,
+                status=JobStatus.CANCELLED,
+                event_type="backend_stall_cancelled",
+                progress={
+                    "phase": phase,
+                    "terminal_phase": "cancelled",
+                    "finished_at": utc_now().isoformat(),
+                    "stale_seconds": round(age_seconds, 1),
+                },
+                error={
+                    "code": "JOB_STALLED",
+                    "message": (
+                        "Job dibatalkan backend karena tidak ada progress "
+                        f"selama {round(age_seconds)} detik."
+                    ),
+                },
+            )
+        )
+        self.jobs.release_execution(job.id)
+        self._stale_cancel_requested.pop(job.id, None)
 
     def _dispatch_pending_jobs(self, profile: str | None = None) -> None:
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
@@ -267,7 +363,21 @@ class ControlPlane:
                     )
 
     def append_worker_event(self, event: JobEvent) -> Job:
+        current = self.jobs.get(event.job_id)
+        if current is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        if current.status.terminal:
+            # A worker can finish an interrupt race after the backend already
+            # forced a terminal state.  Do not turn that harmless late event
+            # into an INTERNAL_ERROR or resurrect the lane.
+            logging.getLogger(__name__).warning(
+                "Ignoring late worker event %s for terminal job %s",
+                event.event_type,
+                event.job_id,
+            )
+            return current
         job, inserted = self.jobs.append_event(event)
+        self._stale_cancel_requested.pop(event.job_id, None)
         # Side effects are idempotent and intentionally replayed when a worker
         # retries an already persisted event after a transient API failure.
         self._apply_event_side_effects(job, event)
@@ -460,7 +570,11 @@ class ControlPlane:
             payload["quick_mode"] = True
             payload["quick_retry"] = {
                 "retry_of": original.id,
+                # Keep the historical phase for reports/backwards-compatible
+                # clients, while explicitly telling the worker to inspect the
+                # physical folder before choosing the actual resume phase.
                 "retry_phase": self._quick_retry_phase(original),
+                "resume_phase": "auto",
                 "stage_job_id": stage_job_id,
                 "quick_operation_id": operation_id,
             }

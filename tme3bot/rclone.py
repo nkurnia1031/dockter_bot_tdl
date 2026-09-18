@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Callable, Iterable
 
-from tme3bot.tdl import SubprocessRunner, TDLCommandError
+from tme3bot.tdl import SubprocessRunner, TDLCommandError, TDLStalledError
 from tme3bot.utility import validate_rclone_destination
 
 
@@ -22,11 +22,13 @@ class RcloneRunner:
         log_callback: Callable[[str], None] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
+        stall_timeout_seconds: int = 0,
     ) -> None:
         self.runner = runner or SubprocessRunner()
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         self.cancel_check = cancel_check
+        self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
 
     def cancel_current(self) -> bool:
         return self.runner.interrupt_current()
@@ -38,6 +40,7 @@ class RcloneRunner:
         config_path: Path,
         *,
         workspace_root: Path,
+        config_root: Path | None = None,
         remote_names: Iterable[str] | None = None,
     ) -> dict[str, object]:
         destination = str(destination or "").strip()
@@ -48,10 +51,13 @@ class RcloneRunner:
 
         workspace = Path(workspace_root).resolve()
         config = Path(config_path).resolve()
+        allowed_config_root = Path(config_root or workspace).resolve()
         try:
-            config.relative_to(workspace)
+            config.relative_to(allowed_config_root)
         except ValueError as exc:
-            raise RcloneError("Konfigurasi rclone harus berada di dalam workspace.") from exc
+            raise RcloneError(
+                "Konfigurasi rclone harus berada di dalam direktori data yang diizinkan."
+            ) from exc
         if not config.is_file():
             raise RcloneError(f"Konfigurasi rclone tidak ditemukan: {config}")
         if shutil.which("rclone") is None:
@@ -93,7 +99,10 @@ class RcloneRunner:
                     command,
                     log_prefix="rclone-upload",
                     output_callback=self.log_callback,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
                 )
+            except TDLStalledError:
+                raise
             except TDLCommandError as exc:
                 raise RcloneError(
                     f"rclone gagal untuk {path.name} (exit code {exc.returncode})."

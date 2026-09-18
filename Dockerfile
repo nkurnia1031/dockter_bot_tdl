@@ -4,6 +4,7 @@ FROM ${TME3BOT_BASE_IMAGE} AS runtime-base
 WORKDIR /app
 
 COPY bot.py /app/bot.py
+COPY pkg_resources.py /app/pkg_resources.py
 COPY tme3bot /app/tme3bot
 COPY utility /app/utility
 

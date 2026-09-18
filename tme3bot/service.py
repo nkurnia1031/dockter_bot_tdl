@@ -12,7 +12,7 @@ from tme3bot.config import AppConfig
 from tme3bot.media import has_downloadable_media, is_image_message
 from tme3bot.progress import DownloadProgressTracker
 from tme3bot.state import SourceState, StateStore
-from tme3bot.tdl import ExportResult, TDLClient, TDLCommandError
+from tme3bot.tdl import ExportResult, TDLClient, TDLCommandError, TDLStalledError
 from tme3bot.url_parser import ParsedTme3Url, parse_tme3_url, slugify_label
 
 
@@ -67,6 +67,9 @@ class ExportService:
         save_source: bool | None = None,
         export_start_id: int | None = None,
         export_end_id: int | None = None,
+        *,
+        tdl_client: TDLClient | None = None,
+        output_dir: Path | None = None,
     ) -> ExportJobResult:
         parsed = self.validate_url(url)
         source = self.state_store.get_source(parsed.chat_ref)
@@ -86,17 +89,22 @@ class ExportService:
             if export_start_id is not None
             else self._resolve_start_id(parsed, source, use_url_message_id)
         )
-        export_path = self._next_export_path(parsed)
-        temp_path = self._next_temp_path(export_path.name)
+        client = tdl_client or self.tdl_client
+        export_path = self._next_export_path(parsed, output_dir=output_dir)
+        temp_path = (
+            unique_path(Path(output_dir).resolve() / f".{export_path.name}.tmp")
+            if output_dir is not None
+            else self._next_temp_path(export_path.name)
+        )
 
         if export_end_id is None:
             # Keep compatibility with lightweight/fake TDL clients that still
             # implement the original three-argument method.
-            export_result = self.tdl_client.export_messages(
+            export_result = client.export_messages(
                 parsed.chat_ref, start_id, temp_path
             )
         else:
-            export_result = self.tdl_client.export_messages(
+            export_result = client.export_messages(
                 parsed.chat_ref,
                 start_id,
                 temp_path,
@@ -155,14 +163,17 @@ class ExportService:
             return parsed.bootstrap_message_id
         return source.last_id + 1
 
-    def _next_export_path(self, parsed: ParsedTme3Url) -> Path:
+    def _next_export_path(
+        self, parsed: ParsedTme3Url, *, output_dir: Path | None = None
+    ) -> Path:
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         chat_component = slugify_label(parsed.chat_ref.lstrip("@") or parsed.chat_ref)
         parts = [timestamp, chat_component]
         label = parsed.canonical_label if parsed.requested_label else None
         if label:
             parts.insert(0, label)
-        return self.config.export_pending_dir / ("_".join(parts) + ".json")
+        root = Path(output_dir) if output_dir is not None else self.config.export_pending_dir
+        return root / ("_".join(parts) + ".json")
 
     def _next_temp_path(self, filename: str) -> Path:
         self.config.temp_root.mkdir(parents=True, exist_ok=True)
@@ -282,6 +293,7 @@ class BatchDownloadService:
         *,
         delete_json_on_success: bool = True,
         workspace_root: Path | None = None,
+        tdl_client: TDLClient | None = None,
     ) -> DownloadedJsonResult:
         """Download one export into a caller-owned staging directory.
 
@@ -303,15 +315,25 @@ class BatchDownloadService:
             "failed": self.config.export_failed_dir.resolve(),
             "processing": self.config.export_processing_dir.resolve(),
         }
+        workspace_source = False
         source_root = next(
             (root for root in roots.values() if _is_relative_to(candidate, root)),
             None,
         )
+        # Quick Mode can keep its recovery JSON entirely inside its workspace
+        # staging tree.  It must not be copied into the normal export
+        # processing directory, where a failed job could leave an orphan that
+        # is invisible from the Quick Mode manager.
+        if source_root is None and workspace_root is not None:
+            workspace = Path(workspace_root).resolve()
+            if _is_relative_to(candidate, workspace):
+                source_root = workspace
+                workspace_source = True
         if source_root is None or not candidate.is_file():
             raise ValueError("Export JSON Quick Mode tidak berada di direktori yang valid.")
         moved = (
             self._move_to_processing(candidate)
-            if source_root != roots["processing"]
+            if source_root != roots["processing"] and not workspace_source
             else candidate
         )
         batch = self._download_files(
@@ -319,6 +341,8 @@ class BatchDownloadService:
             mode="quick",
             download_dir_overrides={moved: target_dir},
             delete_json_on_success=delete_json_on_success,
+            tdl_client=tdl_client,
+            retain_json_on_failure=workspace_source,
         )
         return batch.results[0]
 
@@ -335,6 +359,8 @@ class BatchDownloadService:
         *,
         download_dir_overrides: dict[Path, Path] | None = None,
         delete_json_on_success: bool = False,
+        tdl_client: TDLClient | None = None,
+        retain_json_on_failure: bool = False,
     ) -> BatchDownloadResult:
         results: list[DownloadedJsonResult] = []
         self.progress_tracker.start_batch(mode=mode, total_json=len(moved_files))
@@ -351,23 +377,27 @@ class BatchDownloadService:
                 try:
                     download_dir.mkdir(parents=True, exist_ok=True)
                     self.progress_tracker.set_phase("warmup")
-                    self._warmup_if_needed(export_json, download_dir)
+                    client = tdl_client or self.tdl_client
+                    self._warmup_if_needed(export_json, download_dir, client=client)
                     self.progress_tracker.set_phase("downloading")
                     try:
-                        self.tdl_client.download(export_json, download_dir)
+                        client.download(export_json, download_dir)
                     except TDLCommandError as exc:
                         if not self._is_chat_id_invalid(exc):
                             raise
                         self.progress_tracker.set_phase("warmup")
-                        self._force_warmup(export_json, download_dir, exc)
+                        self._force_warmup(export_json, download_dir, exc, client=client)
                         self.progress_tracker.set_phase("downloading")
-                        self.tdl_client.download(export_json, download_dir)
+                        client.download(export_json, download_dir)
                 except Exception as exc:
-                    failed_path = unique_path(
-                        self.config.export_failed_dir / export_json.name
-                    )
-                    failed_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(export_json), str(failed_path))
+                    if retain_json_on_failure:
+                        failed_path = export_json
+                    else:
+                        failed_path = unique_path(
+                            self.config.export_failed_dir / export_json.name
+                        )
+                        failed_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(export_json), str(failed_path))
                     error = (
                         str(getattr(exc, "stderr", "") or "").strip()
                         or str(getattr(exc, "stdout", "") or "").strip()
@@ -382,6 +412,11 @@ class BatchDownloadService:
                             error=error,
                         )
                     )
+                    if isinstance(exc, TDLStalledError):
+                        # A stalled TDL process must stop the batch so the
+                        # worker can publish a cancelled/stalled terminal
+                        # event instead of silently moving on to another JSON.
+                        raise
                     continue
 
                 if delete_json_on_success:
@@ -425,7 +460,10 @@ class BatchDownloadService:
         plain_name = slugify_label(export_json.stem) or "tanpa-label"
         return self.config.download_root / "biasa" / plain_name
 
-    def _warmup_if_needed(self, export_json: Path, download_dir: Path) -> None:
+    def _warmup_if_needed(
+        self, export_json: Path, download_dir: Path, *, client: TDLClient | None = None
+    ) -> None:
+        client = client or self.tdl_client
         metadata = self._read_export_metadata(export_json)
         chat_ref = str(metadata.get("chat_ref") or "")
         warmup_url = str(metadata.get("warmup_url") or "")
@@ -442,7 +480,7 @@ class BatchDownloadService:
                 return
             warmup_dir = download_dir / "__warmup"
             try:
-                self.tdl_client.download_url(warmup_url, warmup_dir)
+                client.download_url(warmup_url, warmup_dir)
             finally:
                 shutil.rmtree(warmup_dir, ignore_errors=True)
             return
@@ -451,7 +489,7 @@ class BatchDownloadService:
 
         warmup_dir = download_dir / "__warmup"
         try:
-            self.tdl_client.download_url(warmup_url, warmup_dir)
+            client.download_url(warmup_url, warmup_dir)
         finally:
             shutil.rmtree(warmup_dir, ignore_errors=True)
         self.state_store.mark_warmup_done(chat_ref)
@@ -461,8 +499,11 @@ class BatchDownloadService:
         export_json: Path,
         download_dir: Path,
         failure: TDLCommandError,
+        *,
+        client: TDLClient | None = None,
     ) -> None:
         """Resolve a chat in the active download session, then allow one retry."""
+        client = client or self.tdl_client
         metadata = self._read_export_metadata(export_json)
         chat_ref = str(metadata.get("chat_ref") or "").strip()
         if not chat_ref:
@@ -485,7 +526,7 @@ class BatchDownloadService:
 
         warmup_dir = download_dir / "__warmup"
         try:
-            self.tdl_client.download_url(warmup_url, warmup_dir)
+            client.download_url(warmup_url, warmup_dir)
         finally:
             shutil.rmtree(warmup_dir, ignore_errors=True)
         if chat_ref:
