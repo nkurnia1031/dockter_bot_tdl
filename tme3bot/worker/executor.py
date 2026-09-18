@@ -19,6 +19,7 @@ from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.profiles import build_profile_config
+from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
@@ -203,6 +204,7 @@ class WorkerJobExecutor:
         self.publisher = publisher
         self._active: dict[str, tuple[str, str]] = {}
         self._utility_runners: dict[str, UtilityRunner] = {}
+        self._rclone_runners: dict[str, RcloneRunner] = {}
         self._quick_thumbnail_builders: dict[str, QuickThumbnailBuilder] = {}
         self._quick_active: set[str] = set()
         self._cancel_requested: set[str] = set()
@@ -299,6 +301,7 @@ class WorkerJobExecutor:
         with self._lock:
             active = self._active.get(job_id)
             utility_runner = self._utility_runners.get(job_id)
+            rclone_runner = self._rclone_runners.get(job_id)
         if active is None:
             return False
         profile, kind = active
@@ -369,6 +372,8 @@ class WorkerJobExecutor:
                     interrupt("quick thumbnail", thumbnail_builder.cancel_current)
                 if utility_runner is not None:
                     interrupt("quick utility", utility_runner.cancel_current)
+                if rclone_runner is not None:
+                    interrupt("quick rclone", rclone_runner.cancel_current)
         elif kind == "storage_upload":
             try:
                 storage_runtime = self.profile_manager.runtime(
@@ -380,6 +385,8 @@ class WorkerJobExecutor:
                 "storage upload",
                 getattr(getattr(storage_runtime, "export_tdl_client", None), "interrupt_current", None),
             )
+            if rclone_runner is not None:
+                interrupt("storage rclone", rclone_runner.cancel_current)
         elif kind == "leave":
             interrupt(
                 "leave",
@@ -625,6 +632,7 @@ class WorkerJobExecutor:
                 self._active.pop(job_id, None)
                 self._log_snapshots.pop(job_id, None)
                 self._utility_runners.pop(job_id, None)
+                self._rclone_runners.pop(job_id, None)
                 self._quick_thumbnail_builders.pop(job_id, None)
                 self._quick_active.discard(job_id)
                 self._cancel_requested.discard(job_id)
@@ -1215,6 +1223,8 @@ class WorkerJobExecutor:
         ]
         upload_result = manifest.get("upload_result")
         upload_result = dict(upload_result) if isinstance(upload_result, dict) else {"succeeded": 0}
+        rclone_result = manifest.get("rclone_result")
+        rclone_result = dict(rclone_result) if isinstance(rclone_result, dict) else None
 
         def ensure_not_cancelled() -> None:
             with self._lock:
@@ -1431,9 +1441,25 @@ class WorkerJobExecutor:
                     raise QuickModeError(
                         f"Upload Quick Mode gagal ({failures[:500]}); staging dipertahankan di {stage_root}."
                     )
+                quick_settings = payload.get("quick_settings") or {}
+                rclone_destination = (
+                    quick_settings.get("rclone_destination", "googledrive:backup")
+                    if isinstance(quick_settings, dict)
+                    else "googledrive:backup"
+                )
+                # Legacy commands without the new snapshot use the documented
+                # default, so every Quick Mode result still reaches Drive.
+                rclone_result = self._rclone_upload_files(
+                    command,
+                    archive_files,
+                    str(rclone_destination),
+                    reporter,
+                )
                 save_manifest(
                     phase="cleanup",
                     upload_result=upload_result,
+                    rclone_destination=rclone_destination,
+                    rclone_result=rclone_result,
                     storage_folder=storage_folder,
                     caption=caption,
                     last_error=None,
@@ -1461,6 +1487,21 @@ class WorkerJobExecutor:
                     "archive_names": [path.name for path in archive_files],
                     "thumbnail_uploaded_as_photo": True,
                     "uploaded_count": upload_result.get("succeeded", 0),
+                    "rclone_destination": (
+                        rclone_result.get("destination")
+                        if isinstance(rclone_result, dict)
+                        else None
+                    ),
+                    "rclone_uploaded_count": (
+                        rclone_result.get("succeeded", 0)
+                        if isinstance(rclone_result, dict)
+                        else 0
+                    ),
+                    "rclone_archive_names": (
+                        rclone_result.get("files", [])
+                        if isinstance(rclone_result, dict)
+                        else []
+                    ),
                     "stage_job_id": manifest.get("stage_job_id") or stage_root.name,
                     "quick_operation_id": operation_id,
                     "staging_path": str(stage_root),
@@ -1992,6 +2033,70 @@ class WorkerJobExecutor:
             with self._lock:
                 self._utility_runners.pop(job_id, None)
 
+    def _rclone_upload_files(
+        self,
+        command: dict[str, Any],
+        files: list[Path],
+        destination: str,
+        reporter: ProgressReporter,
+        remote_names: list[str] | None = None,
+    ) -> dict[str, object]:
+        """Upload workspace files through the worker-local rclone config."""
+        job_id = str(command["job_id"])
+        workspace = self._quick_workspace(self.config)
+        config_path = workspace / ".config" / "rclone.conf"
+
+        def progress(index: int, total: int, name: str) -> None:
+            # A telemetry outage must not turn an already completed remote
+            # copy into a false physical upload failure.
+            try:
+                reporter.report(
+                    phase="uploading",
+                    message=f"Mengupload {name} ke Google Drive",
+                    overall={
+                        "current": index,
+                        "total": total,
+                        "percent": index * 100 / total if total else 100,
+                        "unit": "files",
+                    },
+                    item={
+                        "name": name,
+                        "index": index,
+                        "total": total,
+                        "percent": 100,
+                    },
+                    counters={"succeeded": index, "failed": 0},
+                    force=True,
+                )
+            except Exception:
+                LOGGER.warning(
+                    "Could not publish rclone progress for %s", job_id, exc_info=True
+                )
+
+        def cancelled() -> bool:
+            with self._lock:
+                return job_id in self._cancel_requested
+
+        runner = RcloneRunner(
+            log_callback=self._append_job_log,
+            progress_callback=progress,
+            cancel_check=cancelled,
+        )
+        with self._lock:
+            self._rclone_runners[job_id] = runner
+        try:
+            kwargs = {"remote_names": remote_names} if remote_names is not None else {}
+            return runner.copy_files(
+                files,
+                destination,
+                config_path,
+                workspace_root=workspace,
+                **kwargs,
+            )
+        finally:
+            with self._lock:
+                self._rclone_runners.pop(job_id, None)
+
     def _storage_upload(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]
         storage_profile = getattr(self.config, "worker_storage_profile", "storage")
@@ -2055,12 +2160,15 @@ class WorkerJobExecutor:
                 "succeeded": 0,
                 "failed": [],
                 "total": 0,
+                "rclone_upload": bool(payload.get("rclone_upload")),
+                "rclone_uploaded": 0,
             }
         file_sizes = {path: path.stat().st_size for path in files}
         total_bytes = sum(file_sizes.values())
         failed, succeeded = [], 0
         completed_bytes = 0
         last_message_id: int | None = None
+        rclone_result: dict[str, object] | None = None
         reporter.milestone(
             "phase_changed",
             progress=reporter.report(
@@ -2356,6 +2464,36 @@ class WorkerJobExecutor:
                             progress=progress_payload,
                             error={"message": str(exc)[:500], "item": path.name},
                         )
+        if payload.get("rclone_upload"):
+            with self._lock:
+                if str(command["job_id"]) in self._cancel_requested:
+                    raise QuickModeError("Upload dibatalkan oleh user.")
+            reporter.report(
+                phase="uploading",
+                message="Mengupload file ke Google Drive dengan rclone",
+                overall={
+                    "current": 0,
+                    "total": len(files),
+                    "percent": 0,
+                    "unit": "files",
+                },
+                counters={"succeeded": 0, "failed": 0},
+                indeterminate=True,
+                force=True,
+            )
+            rclone_result = self._rclone_upload_files(
+                command,
+                files,
+                str(payload.get("rclone_destination") or ""),
+                reporter,
+                remote_names=[
+                    path.relative_to(root).as_posix()
+                    if preserve_structure
+                    else path.name
+                    for path in files
+                ],
+            )
+
         reporter.report(
             phase="completed",
             message=f"Upload selesai: {succeeded} berhasil, {len(failed)} gagal",
@@ -2370,7 +2508,17 @@ class WorkerJobExecutor:
             counters={"succeeded": succeeded, "failed": len(failed)},
             force=True,
         )
-        return {"total": len(files), "succeeded": succeeded, "failed": failed}
+        return {
+            "total": len(files),
+            "succeeded": succeeded,
+            "failed": failed,
+            "rclone_upload": bool(payload.get("rclone_upload")),
+            "rclone_destination": (
+                rclone_result.get("destination") if rclone_result else None
+            ),
+            "rclone_uploaded": rclone_result.get("succeeded", 0) if rclone_result else 0,
+            "rclone_files": rclone_result.get("files", []) if rclone_result else [],
+        }
 
     def _backup(self, command: dict[str, Any]) -> dict[str, Any]:
         payload = command["payload"]

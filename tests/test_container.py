@@ -23,6 +23,7 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("tdl version", basefile)
         self.assertIn("ARG TARGETARCH", basefile)
         self.assertIn("ARG BUILDPLATFORM=linux/amd64", basefile)
+        self.assertIn("rclone", basefile)
         self.assertIn("FROM --platform=${BUILDPLATFORM}", basefile)
         self.assertIn("RUN go mod download", basefile)
         self.assertIn("go build -mod=mod -p=1", basefile)

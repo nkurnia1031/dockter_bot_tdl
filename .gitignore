@@ -2,18 +2,49 @@ __pycache__/
 *.py[cod]
 .env
 .env.backend
-        .env.example
-        .env.telegram
-        .env.web
+.env.telegram
+.env.web
+.env.*
+!.env.example
+!.env.backend.example
+!.env.telegram.example
+!.env.web.example
+!.env.worker.example
+!.env.worker.local.example
 env
 env.*
-.env.*
 .venv/
 .pytest_cache/
 .ruff_cache/
 *.zip
 .docker/tdl/tdl
 .docker/tdl/*.tmp
+# Runtime state, credentials, sessions, logs, and generated media.
+.tdl/
+**/.tdl/
+akultan/
+data/
+profiles/
+workspace/
+exports/
+download/
+downloads/
+*.log
+*.kv
+identity.json
+profile_state.json
+state.json
+max.json
+labels.json
+utility_folders.json
+utility_settings.json
+*.session
+*.session-journal
+*.sqlite
+*.sqlite3
+*.db
+.config/rclone.conf
+**/.config/rclone.conf
 graphify-out/cost.json
 graphify-out/cache/
 graphify-out/.graphify_root

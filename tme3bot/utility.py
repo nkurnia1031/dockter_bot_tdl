@@ -21,6 +21,7 @@ DEFAULT_UTILITY_SETTINGS = {
     "move_size": "4g",
     "compress_size": "4g",
     "compress_password": "A1031@bokep@1031A",
+    "rclone_destination": "googledrive:backup",
 }
 UTILITY_SETTING_SPECS = {
     "move_size": {
@@ -43,6 +44,13 @@ UTILITY_SETTING_SPECS = {
         "format": "8–128 karakter.",
         "examples": (),
         "secret": True,
+    },
+    "rclone_destination": {
+        "label": "Tujuan Google Drive (rclone)",
+        "description": "Remote dan path rclone untuk arsip Quick Mode atau upload Storage yang dicentang.",
+        "format": "remote:path, misalnya googledrive:backup.",
+        "examples": ("googledrive:backup",),
+        "secret": False,
     },
 }
 
@@ -70,6 +78,8 @@ class UtilitySettingsStore:
             raise ValueError("Nilai pengaturan tidak boleh kosong.")
         if key == "compress_password":
             _validate_password(value)
+        elif key == "rclone_destination":
+            validate_rclone_destination(value)
         else:
             _validate_size(value)
         with self._lock:
@@ -94,8 +104,16 @@ class UtilitySettingsStore:
         raw = values if isinstance(values, dict) else {}
         self._settings = dict(DEFAULT_UTILITY_SETTINGS)
         for key in DEFAULT_UTILITY_SETTINGS:
-            if str(raw.get(key, "")).strip():
-                self._settings[key] = str(raw[key]).strip()
+            candidate = str(raw.get(key, "")).strip()
+            if not candidate:
+                continue
+            if key == "rclone_destination":
+                try:
+                    validate_rclone_destination(candidate)
+                except ValueError:
+                    LOGGER.warning("Tujuan rclone pada settings tidak valid; memakai default.")
+                    continue
+            self._settings[key] = candidate
         write_json_atomic(self.path, self._settings)
         try:
             self.path.chmod(0o600)
@@ -113,6 +131,14 @@ def _validate_size(value: str) -> None:
 def _validate_password(value: str) -> None:
     if not 8 <= len(value) <= 128:
         raise ValueError("Password compress harus terdiri dari 8 sampai 128 karakter.")
+
+
+def validate_rclone_destination(value: str) -> None:
+    """Validate a remote destination before it reaches a worker command."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*:[^\x00-\x1f]+", value):
+        raise ValueError(
+            "Tujuan rclone harus berupa remote:path, misalnya googledrive:backup."
+        )
 
 
 def utility_setting_specs() -> list[dict[str, object]]:

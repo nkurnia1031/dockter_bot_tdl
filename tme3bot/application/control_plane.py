@@ -441,6 +441,15 @@ class ControlPlane:
             }:
                 getter = getattr(self.utility_settings, "get", None)
                 settings = getter() if callable(getter) else dict(DEFAULT_UTILITY_SETTINGS)
+            if isinstance(settings, dict) and not settings.get("rclone_destination"):
+                getter = getattr(self.utility_settings, "get", None)
+                current = getter() if callable(getter) else DEFAULT_UTILITY_SETTINGS
+                settings = dict(settings)
+                settings["rclone_destination"] = str(
+                    current.get("rclone_destination", "googledrive:backup")
+                    if isinstance(current, dict)
+                    else "googledrive:backup"
+                )
             payload["quick_settings"] = settings
         if legacy_quick or bool(payload.get("quick_mode")):
             previous_retry = payload.get("quick_retry")

@@ -84,30 +84,48 @@ python3 run.py logs
 Compose membangun image gateway satu kali. Container `telegram` menggunakan
 image yang sama tanpa build kedua.
 
-## Build image dasar satu kali
+## Build Docker melalui GitHub Actions
 
-Build Go helper, dependency Python, TDL, dan paket sistem dipindahkan ke image
-dasar yang immutable. Di VPS besar jalankan:
+Release Docker dibangun oleh workflow
+`.github/workflows/docker-images.yml`. Workflow tersebut membuat image dasar
+Go/TDL/Python terlebih dahulu, kemudian membangun image gateway dan worker dari
+base image immutable, lalu mem-publish semuanya ke GHCR. VPS tidak perlu lagi
+menjalankan `docker build` atau mengompilasi Go.
 
-```bash
-python3 run.py build-base
+Push ke `main` akan menghasilkan tag image berdasarkan 12 karakter SHA commit:
+
+```text
+ghcr.io/<owner>/tme3bot-base:py310-tdl0203-<sha12>
+ghcr.io/<owner>/tme3bot-gateway:<sha12>
+ghcr.io/<owner>/tme3bot-worker:<sha12>
 ```
 
-Perintah ini membuat `base-migrate.zip`. Upload arsip tersebut ke VPS target,
-lalu jalankan:
+Workflow juga memperbarui tag `latest` untuk penggunaan sederhana. Untuk
+produksi, gunakan tag SHA agar gateway dan worker tetap immutable.
 
-```bash
-unzip base-migrate.zip
-docker load -i images/tme3bot-base.tar
-cp .env.example .env
-python3 run.py migrate
+Pada VPS, isi `.env` dengan nama package GHCR dan tag commit yang sama:
+
+```env
+GATEWAY_IMAGE_NAME=ghcr.io/<owner>/tme3bot-gateway
+WORKER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-worker
+IMAGE_TAG=<sha12>
 ```
 
-Build aplikasi berikutnya hanya memakai `TME3BOT_BASE_IMAGE` dari `.env` dan
-tidak lagi mengompilasi Go. Jika arsitektur target bukan AMD64, ubah
-`BASE_PLATFORM`, misalnya `linux/arm64`, lalu buat image dasar untuk arsitektur
-tersebut. Image dasar perlu dibuat ulang hanya jika versi TDL, dependency
-Python, atau kode `leave-helper` berubah.
+Setelah workflow berhasil dan VPS sudah login ke GHCR, deploy hanya perlu
+pull lalu menjalankan container:
+
+```bash
+docker compose -f docker-compose.gateway.yml pull
+docker compose -f docker-compose.gateway.yml up -d --remove-orphans
+```
+
+`python3 run.py deploy gateway --pull` dan `python3 run.py deploy worker --pull`
+tetap dapat dipakai sebagai wrapper. Build lokal dan `base-migrate.zip` masih
+tersedia sebagai fallback untuk recovery atau deployment offline.
+
+Jika arsitektur target bukan AMD64, workflow perlu ditambah target platform
+tersebut dan image multi-arsitektur harus dibangun sebelum VPS ARM melakukan
+pull.
 
 Setelah `base-migrate.zip` diekstrak di project, `python3 build.py` otomatis
 memasukkan `images/tme3bot-base.tar` dan manifest base ke `output.zip`. Jika
@@ -196,6 +214,12 @@ python3 run.py backup now
 python3 run.py backup status
 python3 run.py backup list
 ```
+
+Quick Mode mengirim thumbnail sebagai foto ke channel Storage dan hanya file
+arsip hasil compress ke Google Drive melalui rclone. Worker membaca konfigurasi
+rclone dari `/workspace/.config/rclone.conf`; tujuan default
+`googledrive:backup` dapat diubah pada Pengaturan. Upload Storage biasa juga
+memiliki checklist untuk menyalin file ke tujuan rclone tersebut.
 
 ## Verifikasi
 

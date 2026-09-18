@@ -586,6 +586,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(settings.status_code, 200)
         self.assertNotIn("compress_password", settings.json())
         self.assertTrue(settings.json()["compress_password_configured"])
+        self.assertEqual(settings.json()["rclone_destination"], "googledrive:backup")
 
         metadata = self.client.get("/api/v1/utility/settings/meta", headers=headers)
         self.assertEqual(metadata.status_code, 200)
@@ -620,9 +621,31 @@ class BackendApiTests(unittest.TestCase):
         job = self.client.get(f"/api/v1/jobs/{created.json()['id']}", headers=headers).json()
         self.assertEqual(job["payload"]["quick_mode"], True)
         self.assertEqual(job["payload"]["quick_settings"]["compress_password"], "***")
+        self.assertEqual(
+            job["payload"]["quick_settings"]["rclone_destination"],
+            "googledrive:backup",
+        )
         command = self.dispatcher.commands[-1][1]
         self.assertNotEqual(command["payload"]["quick_settings"]["compress_password"], "***")
         self.assertTrue(command["payload"]["quick_settings"]["compress_password"])
+
+    def test_storage_upload_can_snapshot_rclone_destination(self):
+        headers = self.login()
+        created = self.client.post(
+            "/api/v1/storage/uploads",
+            headers=headers,
+            json={
+                "folder_path": "/workspace/biasa",
+                "worker": "local",
+                "rclone_upload": True,
+            },
+        )
+        self.assertEqual(created.status_code, 200)
+        command = self.dispatcher.commands[-1][1]
+        self.assertTrue(command["payload"]["rclone_upload"])
+        self.assertEqual(
+            command["payload"]["rclone_destination"], "googledrive:backup"
+        )
 
     def test_terminate_all_active_jobs_endpoint_handles_stale_jobs(self):
         headers = self.login()

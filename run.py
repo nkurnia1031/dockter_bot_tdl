@@ -551,8 +551,10 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
     if any(value == "MISSING" for value in required_statuses):
         revision = str(report.get("git_sha") or "unknown")
         raise RuntimeError(
-            f"Image release {revision} belum dipublish. Jalankan di VPS builder: "
-            f"python3 run.py publish --all --build-base, lalu ulangi python3 run.py deploy."
+            f"Image release {revision} belum dipublish oleh GitHub Actions. "
+            "Tunggu workflow `Build and publish Docker images` selesai, atau "
+            "gunakan fallback lokal `python3 run.py publish --all --build-base`, "
+            "lalu ulangi deploy."
         )
     registry_ready = any(value == "READY_REGISTRY" for value in required_statuses)
     if registry_ready:

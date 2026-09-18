@@ -3,9 +3,9 @@
   import { api, put } from '$lib/api';
   import { HardDrive, Save, Settings2, ShieldCheck } from '@lucide/svelte';
 
-  type Settings = { move_size: string; compress_size: string; compress_password_configured: boolean };
+  type Settings = { move_size: string; compress_size: string; rclone_destination: string; compress_password_configured: boolean };
   type Meta = { key: string; label: string; description: string; format: string; examples: string[]; secret: boolean };
-  let settings = $state<Settings>({ move_size: '', compress_size: '', compress_password_configured: false });
+  let settings = $state<Settings>({ move_size: '', compress_size: '', rclone_destination: '', compress_password_configured: false });
   let meta = $state<Meta[]>([]);
   let drafts = $state<Record<string,string>>({});
   let storage = $state<any>(null);
@@ -18,7 +18,7 @@
         api<Settings>('/utility/settings'), api<{items:Meta[]}>('/utility/settings/meta'), api<any>('/storage/settings').catch(() => null)
       ]);
       settings = valueResult; meta = metaResult.items || []; storage = storageResult;
-      drafts = { move_size: settings.move_size, compress_size: settings.compress_size, compress_password: '' };
+      drafts = { move_size: settings.move_size, compress_size: settings.compress_size, rclone_destination: settings.rclone_destination, compress_password: '' };
     } catch (cause) { message = cause instanceof Error ? cause.message : 'Pengaturan gagal dimuat.'; }
   }
   async function save(item: Meta) {

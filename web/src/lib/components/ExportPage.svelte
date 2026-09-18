@@ -37,11 +37,6 @@
   const activeStatuses=['queued','dispatched','running'];
   const activeNotice=$derived(notices.some(item => activeStatuses.includes(item.job.status)));
 
-  function portalToViewport(node: HTMLElement) {
-    document.body.appendChild(node);
-    return { destroy: () => node.remove() };
-  }
-
   function clearExportCooldown() {
     if (exportCooldownTimer !== undefined) clearTimeout(exportCooldownTimer);
     exportCooldownTimer = undefined;
@@ -110,6 +105,7 @@
     if (value.thumbnail_name) parts.push(`thumbnail ${value.thumbnail_name}`);
     if (value.thumbnail_uploaded_as_photo) parts.push('thumbnail sebagai foto');
     if (value.storage_folder) parts.push(String(value.storage_folder));
+    if (value.rclone_uploaded_count) parts.push(`${value.rclone_uploaded_count} arsip ke ${value.rclone_destination || 'Google Drive'}`);
     return parts.join(' / ');
   }
   function schedulePoll() {
@@ -219,7 +215,10 @@
       message='';
       schedulePoll();
       startExportCooldown();
-      await load().catch(() => {});
+      // Do not let the secondary source refresh consume the short visual
+      // cooldown. The button should show that the enqueue request succeeded
+      // immediately, even if this refresh is slow or temporarily unavailable.
+      void load().catch(() => {});
     }
     catch (cause) {
       clearExportCooldown();
@@ -251,7 +250,7 @@
   });
 </script>
 
-<div use:portalToViewport class="export-notice-viewport pointer-events-none flex flex-col items-end gap-3 pr-1" aria-live="polite" aria-atomic="false">
+<div class="export-notice-viewport pointer-events-none flex flex-col items-end gap-3 pr-1" aria-live="polite" aria-atomic="false">
   {#each notices as notice (notice.job.id)}
     {@const value=resultValue(notice.job)}
     <section class={`pointer-events-auto w-full overflow-hidden rounded-2xl border bg-[var(--panel)] shadow-2xl transition ${notice.job.status==='succeeded'?'border-emerald-300 dark:border-emerald-800':notice.job.status==='failed'?'border-rose-300 dark:border-rose-800':'border-violet-300 dark:border-violet-800'}`} role="alert">
@@ -300,9 +299,8 @@
 <JobTable kind="export" title="Riwayat export" retryable={true} />
 
 <style>
-  /* The page transition applies transform to .page-enter, which would make a
-     fixed descendant relative to that wrapper instead of the browser viewport.
-     Portal the notices to body and define the viewport boundary explicitly. */
+  /* Keep the notice container fixed to the browser viewport.  It intentionally
+     stays in the Svelte tree so route changes can destroy the page normally. */
   .export-notice-viewport {
     position: fixed;
     inset-inline-start: 1rem;

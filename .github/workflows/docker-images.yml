@@ -1,0 +1,109 @@
+name: Build and publish Docker images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.base'
+      - '.dockerignore'
+      - '.docker/**'
+      - 'requirements.txt'
+      - 'leave-helper/**'
+      - 'bot.py'
+      - 'tme3bot/**'
+      - 'utility/**'
+      - '.github/workflows/docker-images.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  base:
+    name: Build runtime base image
+    runs-on: ubuntu-latest
+    outputs:
+      owner: ${{ steps.meta.outputs.owner }}
+      tag: ${{ steps.meta.outputs.tag }}
+      base_ref: ${{ steps.meta.outputs.base_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve image names
+        id: meta
+        shell: bash
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          tag="${GITHUB_SHA:0:12}"
+          base_ref="ghcr.io/${owner}/tme3bot-base:py310-tdl0203-${tag}"
+          echo "owner=${owner}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "base_ref=${base_ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish base image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.base
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.owner }}/tme3bot-base:py310-tdl0203-${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ steps.meta.outputs.owner }}/tme3bot-base:py310-tdl0203
+          cache-from: type=gha,scope=tme3bot-base
+          cache-to: type=gha,mode=max,scope=tme3bot-base
+
+  application:
+    name: Build ${{ matrix.target }} image
+    needs: base
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [gateway, worker]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish application image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            TME3BOT_BASE_IMAGE=${{ needs.base.outputs.base_ref }}
+          tags: |
+            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.target }}:${{ needs.base.outputs.tag }}
+            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.target }}:latest
+          cache-from: type=gha,scope=tme3bot-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=tme3bot-${{ matrix.target }}

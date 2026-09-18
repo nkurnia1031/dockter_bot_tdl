@@ -299,6 +299,7 @@ class StorageUploadRequest(BaseModel):
     preserve_structure: bool = True
     keywords: str = ""
     worker: str | None = None
+    rclone_upload: bool = False
 
 
 class StorageUpdateRequest(BaseModel):

@@ -1,5 +1,9 @@
 ﻿.env
 .tdl
+**/.tdl/
+akultan/
+profiles/
+workspace/
 __pycache__/
 tests/__pycache__/
 web/node_modules/
@@ -8,3 +12,15 @@ exports/
 download/
 downloads/
 state.json
+identity.json
+profile_state.json
+max.json
+labels.json
+utility_folders.json
+utility_settings.json
+*.session
+*.session-journal
+*.sqlite
+*.sqlite3
+*.db
+.config/

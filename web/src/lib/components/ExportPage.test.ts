@@ -120,7 +120,7 @@ describe('ExportPage labels', () => {
     const lockedButton=await screen.findByRole('button', {name:'Tunggu sebentar...'});
     expect((lockedButton as HTMLButtonElement).disabled).toBe(true);
     const noticeViewport=screen.getByRole('alert').parentElement?.parentElement;
-    expect(noticeViewport).toBe(document.body);
+    expect(noticeViewport).not.toBe(document.body);
     expect(screen.getByRole('alert').parentElement?.className).toContain('export-notice-viewport');
 
     await fireEvent.click(lockedButton);

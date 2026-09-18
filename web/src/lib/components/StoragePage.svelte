@@ -53,6 +53,7 @@
   let destinationId = $state<number|null>(null);
   let workspaceFolders = $state<string[]>([]);
   let keywords = $state('');
+  let rcloneUpload = $state(false);
   let displayName = $state('');
   let editKeywords = $state('');
   let worker = $state('');
@@ -145,9 +146,9 @@
     if (!verified || verified.worker !== worker) { message = 'Verifikasi worker terlebih dahulu.'; return; }
     await post('/storage/uploads', {
       folder_path:workspaceFolders[0], destination_folder_id:destinationId,
-      preserve_structure:true, keywords, worker
+      preserve_structure:true, keywords, worker, rclone_upload:rcloneUpload
     });
-    uploadOpen=false; workspaceFolders=[]; keywords='';
+    uploadOpen=false; workspaceFolders=[]; keywords=''; rcloneUpload=false;
     message='Upload masuk antrean. Struktur subfolder akan dipertahankan.';
   }
   async function deliver(item:Item) {
@@ -159,7 +160,7 @@
     await navigator.clipboard.writeText(result.code);
     message=`Kode ${item.display_name} disalin. Buka bot, pilih Panggil file dengan kode, lalu tempel kode tersebut.`;
   }
-  function startUpload() { destinationId=folderId; uploadOpen=true; }
+  function startUpload() { destinationId=folderId; rcloneUpload=false; uploadOpen=true; }
   function startMove() { destinationId=folderId; moveOpen=true; }
   function beginItemEdit(item:Item) {
     editItem=item; displayName=item.display_name; editKeywords=item.keywords || '';
@@ -330,6 +331,7 @@
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
   <p class="muted mb-4 text-sm">Pilih source dari worker yang sudah diverifikasi. Semua subfolder akan dibuat kembali di Storage.</p><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
   <div class="mt-4 grid gap-3 sm:grid-cols-2"><label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
+  <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--line)] p-3 text-sm"><input class="mt-1" type="checkbox" bind:checked={rcloneUpload}/><span><b>Salin juga ke Google Drive</b><small class="muted mt-1 block">Memakai tujuan rclone pada Pengaturan dan konfigurasi <code>/workspace/.config/rclone.conf</code>.</small></span></label>
   <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>Destination dipilih dari folder Storage, bukan input teks. Nested dan empty folder dipertahankan.</p></div>
   <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
 </Modal>

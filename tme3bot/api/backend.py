@@ -884,6 +884,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             # Snapshot settings at submission time. The password is retained
             # only in the internal worker command and redacted from the Job API.
             values["quick_settings"] = context.utility_settings.get()
+            values["quick_settings"].setdefault(
+                "rclone_destination", "googledrive:backup"
+            )
         return job_dict(
             context.control_plane.submit_job(
                 actor, "export", values, profile=values.get("profile"), worker=values.get("worker")
@@ -1242,6 +1245,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         return {
             "move_size": values["move_size"],
             "compress_size": values["compress_size"],
+            "rclone_destination": values.get("rclone_destination", "googledrive:backup"),
             "compress_password_configured": bool(values.get("compress_password")),
         }
 
@@ -1258,6 +1262,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         return {
             "move_size": values["move_size"],
             "compress_size": values["compress_size"],
+            "rclone_destination": values.get("rclone_destination", "googledrive:backup"),
             "compress_password_configured": bool(values.get("compress_password")),
         }
 
@@ -1499,6 +1504,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.post("/api/v1/storage/uploads", response_model=JobResponse)
     def submit_storage_upload(body: StorageUploadRequest, actor=Depends(current_actor)):
         payload = _model_dict(body)
+        if payload.get("rclone_upload"):
+            # Snapshot the destination at enqueue time. The rclone config is
+            # never sent through the browser or persisted in the API payload.
+            payload["rclone_destination"] = context.utility_settings.get().get(
+                "rclone_destination", "googledrive:backup"
+            )
         verify_target(actor, "storage", None, payload.get("worker"))
         if payload.get("destination_folder_id") is None and payload.get("folder"):
             folder = context.storage_catalog.ensure_path(

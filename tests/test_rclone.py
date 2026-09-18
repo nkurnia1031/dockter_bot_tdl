@@ -1,0 +1,71 @@
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from tme3bot.rclone import RcloneRunner
+
+
+class FakeSubprocessRunner:
+    def __init__(self):
+        self.commands = []
+
+    def run(self, command, **kwargs):
+        self.commands.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    def interrupt_current(self):
+        return False
+
+
+class RcloneRunnerTests(unittest.TestCase):
+    def test_uploads_only_the_given_workspace_files_with_explicit_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            thumbnail = workspace / "result.png"
+            archive.write_bytes(b"archive")
+            thumbnail.write_bytes(b"thumbnail")
+            subprocess_runner = FakeSubprocessRunner()
+
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(subprocess_runner).copy_files(
+                    [archive],
+                    "googledrive:backup",
+                    config,
+                    workspace_root=workspace,
+                )
+
+            self.assertEqual(result["files"], ["result.7z.001"])
+            self.assertEqual(len(subprocess_runner.commands), 1)
+            command = subprocess_runner.commands[0][0]
+            self.assertEqual(command[:4], ["rclone", "copyto", str(archive), "googledrive:backup/result.7z.001"])
+            self.assertEqual(command[command.index("--config") + 1], str(config.resolve()))
+            self.assertNotIn(str(thumbnail), command)
+
+    def test_rejects_sources_and_config_outside_workspace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            workspace.mkdir()
+            outside = Path(temp_dir) / "outside.7z"
+            outside.write_bytes(b"archive")
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[remote]\n", encoding="utf-8")
+
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RuntimeError):
+                    RcloneRunner(FakeSubprocessRunner()).copy_files(
+                        [outside],
+                        "googledrive:backup",
+                        config,
+                        workspace_root=workspace,
+                    )
+
+
+if __name__ == "__main__":
+    unittest.main()

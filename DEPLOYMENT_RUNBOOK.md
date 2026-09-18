@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 3.9 - Download preflight dan kontrol worker
+Versi: 4.0 - GitHub Actions Docker release dan pull-only VPS
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -10,7 +10,7 @@ tidak membutuhkan Node.js atau container web di VPS target.
 
 | Node | Service | Cara update |
 |---|---|---|
-| Mesin lokal dengan Docker | Build image gateway dan worker | `python3 run.py publish gateway` |
+| GitHub Actions | Build dan publish base, gateway, serta worker ke GHCR | Push ke `main` |
 | VPS gateway | `backend`, `telegram`, `worker-local` | `python3 run.py deploy gateway --pull` |
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
 | aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
@@ -172,18 +172,23 @@ Pada `.env` semua node, image harus mengarah ke registry yang sama:
 ```env
 GATEWAY_IMAGE_NAME=ghcr.io/<owner>/tme3bot-gateway
 WORKER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-worker
-IMAGE_TAG=latest
+# Set this to the 12-character SHA tag published by GitHub Actions.
+IMAGE_TAG=<sha12>
 TME3BOT_BASE_IMAGE=tme3bot-base:py310-tdl0203
 ```
 
-`run.py` mengganti `latest` dengan 12 karakter Git SHA saat publish/deploy,
-sehingga target mengambil image immutable dari commit yang sama.
+Jika `IMAGE_TAG=latest`, `run.py` menggantinya dengan 12 karakter Git SHA saat
+publish/deploy. Untuk pull-only VPS, isi `IMAGE_TAG` langsung dengan SHA yang
+dipublish workflow agar source checkout tidak harus dipakai untuk menentukan
+versi image.
 
 ### Jika base image terhapus setelah cleanup Docker
 
-Build aplikasi tidak membuat ulang Go/TDL base image. Jika muncul error seperti
-`failed to resolve source metadata for tme3bot-base:py310-tdl0203`, berarti base
-image lokal sudah terhapus atau belum pernah di-load pada mesin tersebut.
+Bagian ini hanya berlaku untuk fallback build lokal. Deployment normal dengan
+`--pull` tidak membutuhkan base image secara terpisah karena seluruh layer base
+sudah menjadi bagian dari image aplikasi yang dipublish GitHub Actions. Jika
+muncul error ini ketika melakukan build lokal, berarti base image lokal sudah
+terhapus atau belum pernah di-load pada mesin tersebut.
 
 Jalankan di VPS builder besar:
 
@@ -312,9 +317,10 @@ credential helper atau SSH key yang sudah dikonfigurasi di host.
 
 ### B. Login GitHub Container Registry
 
-PAT untuk builder wajib memiliki akses package write. VPS target cukup
-memerlukan akses package read. Login melalui stdin agar token tidak muncul di
-history atau daftar proses:
+Workflow GitHub Actions memakai `GITHUB_TOKEN` dengan permission
+`packages: write`; tidak perlu menyimpan PAT builder di repository. VPS target
+private cukup memerlukan akses package read. Login melalui stdin agar token
+tidak muncul di history atau daftar proses:
 
 ```bash
 export GHCR_USERNAME=<username-github>
@@ -349,52 +355,44 @@ Token ini hanya dipakai oleh `python3 run.py deploy web` untuk mengambil
 artefak release. Token tidak diperlukan oleh backend, Telegram frontend,
 worker, atau `.env.backend`.
 
-## B. Langkah build lokal
+## B. Build melalui GitHub Actions
 
-Build sekarang dapat dilakukan langsung dari workspace lokal. Docker Desktop
-dengan Linux containers/WSL2 harus aktif. Base Go/TDL dibangun sekali di mesin
-lokal; setelah itu update biasa hanya membangun layer aplikasi.
+Workflow `.github/workflows/docker-images.yml` berjalan saat perubahan runtime
+di-push ke `main`, atau dapat dijalankan manual dari tab Actions. Workflow
+menggunakan runner Linux standar untuk:
 
-```bash
-cd D:\Laragon\www\dockter_bot_tdl
-git switch main
-git pull --ff-only origin main
-git rev-parse --short=12 HEAD
-docker version
-```
+1. membangun `Dockerfile.base` yang berisi Go helper, Python, TDL, ffmpeg,
+   rclone, dan dependency sistem;
+2. mem-publish base image immutable ke GHCR;
+3. membangun dan mem-publish target `gateway` dan `worker` secara paralel dari
+   base image tersebut.
 
-Jika image private, lakukan login GHCR mengikuti bagian **Autentikasi GitHub
-dan GHCR** di atas. Jangan menambahkan token sebagai argumen setelah
-`ghcr.io`.
-
-Build layer aplikasi dan push image gateway serta worker dari mesin lokal:
-
-```bash
-python run.py publish gateway
-```
-
-Jika base image `tme3bot-base:py310-tdl0203` belum ada di Docker lokal, buat
-sekali dari workspace ini:
-
-```bash
-python run.py publish gateway --build-base
-```
-
-`publish` mencoba login registry memakai `GHCR_TOKEN` atau token release yang
-tersimpan di env, melalui stdin Docker sehingga token tidak masuk command/log.
-PAT yang dipakai push wajib memiliki permission `write:packages`. Gunakan
-`--no-login` jika Docker sudah login sebelumnya.
-
-Perintah ini tidak menjalankan service di builder. Karena compose gateway
-memuat target gateway dan worker-local, dua image berikut dipublish dengan Git
-SHA yang sama:
+Image aplikasi diberi tag 12 karakter SHA commit yang sama:
 
 ```text
-ghcr.io/<owner>/tme3bot-gateway:<git-sha-12>
-ghcr.io/<owner>/tme3bot-worker:<git-sha-12>
+ghcr.io/<owner>/tme3bot-base:py310-tdl0203-<sha12>
+ghcr.io/<owner>/tme3bot-gateway:<sha12>
+ghcr.io/<owner>/tme3bot-worker:<sha12>
 ```
 
-Tidak perlu menjalankan `publish worker` lagi untuk release yang sama.
+Tag `latest` juga dipublish untuk penggunaan sederhana. Deployment produksi
+tetap sebaiknya memakai tag SHA agar tidak berubah tanpa pergantian konfigurasi.
+
+Setelah workflow berhasil, konfigurasi `.env` pada setiap VPS dengan package
+GHCR yang sesuai dan tag hasil workflow:
+
+```env
+GATEWAY_IMAGE_NAME=ghcr.io/<owner>/tme3bot-gateway
+WORKER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-worker
+IMAGE_TAG=<sha12>
+```
+
+`TME3BOT_BASE_IMAGE` hanya dibutuhkan bila seseorang menjalankan build lokal;
+workflow mengirimkan referensi base image commit tersebut melalui build arg.
+
+Untuk repository private, login GHCR di VPS satu kali dengan token read package
+seperti pada bagian autentikasi di atas. Setelah itu VPS tidak membutuhkan
+Dockerfile, Go, pnpm, atau proses build untuk deployment image.
 
 ## C. Langkah di VPS gateway
 
@@ -664,11 +662,11 @@ Gunakan matriks berikut:
 | File yang berubah | Builder | Gateway | Worker remote | Web |
 |---|---:|---:|---:|---:|
 | Hanya `web/` | Tidak | Tidak | Tidak | Deploy |
-| Backend + Telegram + web, tanpa worker | Publish gateway | Deploy gateway | Tidak | Deploy terakhir |
-| Backend/API saja | Publish gateway | Deploy gateway | Tidak | Jika kontrak UI berubah |
-| Worker/TDL/utility | Publish gateway | Deploy gateway | Semua worker | Jika UI progress berubah |
-| Backend + worker + web | Publish gateway | Deploy gateway | Semua worker | Deploy terakhir |
-| Base/Go/TDL binary | `build-base` dahulu | Deploy gateway | Semua worker | Sesuai perubahan |
+| Backend + Telegram + web, tanpa worker | GitHub Actions | Deploy gateway | Tidak | Deploy terakhir |
+| Backend/API saja | GitHub Actions | Deploy gateway | Tidak | Jika kontrak UI berubah |
+| Worker/TDL/utility | GitHub Actions | Deploy gateway | Semua worker | Jika UI progress berubah |
+| Backend + worker + web | GitHub Actions | Deploy gateway | Semua worker | Deploy terakhir |
+| Base/Go/TDL binary | GitHub Actions | Deploy gateway | Semua worker | Sesuai perubahan |
 
 ### Hanya web
 
@@ -679,12 +677,9 @@ python3 run.py deploy web
 
 ### Backend atau worker
 
-Di builder:
-
-```bash
-git pull --ff-only origin main
-python3 run.py publish gateway
-```
+Push perubahan ke `main` dan tunggu workflow `Build and publish Docker images`
+berhasil. Catat SHA pendek yang tampil pada tag image, lalu isi `IMAGE_TAG`
+yang sama di `.env` setiap target.
 
 Di gateway:
 
@@ -770,7 +765,7 @@ Pada Linux yang menggunakan `apt`, `python3 run.py deploy` dapat memasang tool
 yang belum tersedia. Jika installer tidak didukung, report akan memberikan
 command install yang aman untuk dicopy.
 
-Deploy target baru tidak langsung membangun base Go/TDL yang berat. Alurnya:
+Deploy target baru tidak membangun base Go/TDL. Alurnya:
 
 ```bash
 python3 run.py deploy
@@ -780,11 +775,10 @@ Script akan:
 
 1. Memeriksa tools dan memasang yang hilang jika memungkinkan.
 2. Membaca Git HEAD dan menolak worktree dirty kecuali `--allow-dirty`.
-3. Memeriksa base image lokal/registry.
-4. Memeriksa gateway/worker image dengan tag Git SHA dan digest registry.
-5. Pull image jika release SHA sudah dipublish.
-6. Berhenti dengan instruksi builder jika image belum dipublish atau base belum tersedia.
-7. Menjalankan Compose, healthcheck, dan menyimpan deployment state.
+3. Memeriksa gateway/worker image dengan tag Git SHA dan digest registry.
+4. Pull image jika release SHA sudah dipublish.
+5. Berhenti dengan instruksi GitHub Actions jika image belum dipublish.
+6. Menjalankan Compose, healthcheck, dan menyimpan deployment state.
 
 `latest` bukan bukti bahwa release terbaru sedang digunakan. Untuk melihat
 status tanpa mengubah service:
@@ -797,8 +791,8 @@ python3 run.py deploy --status
 hanya melakukan preflight dan tidak mengubah service. Setelah report siap,
 jalankan `python3 run.py deploy`. Exit code preflight `10` berarti tool masih
 hilang dan `20` berarti env/data root belum siap. Image SHA yang belum ada akan
-ditolak oleh deploy dengan instruksi publish builder. Secret tidak pernah
-dicetak ke report.
+ditolak oleh deploy dengan instruksi menunggu workflow GitHub Actions. Secret
+tidak pernah dicetak ke report.
 
 ### PyJWT `RECORD file not found` pada Ubuntu/Debian
 
@@ -823,32 +817,18 @@ Fallback ini hanya dipakai pada Python sistem Linux. Jika VPS menggunakan
 virtualenv, gunakan interpreter virtualenv tersebut dan biarkan pip memakai
 prosedur normalnya.
 
-## Publish di VPS builder
+## Fallback build lokal
 
-Build berat hanya dilakukan di VPS builder yang cukup kuat:
+Build lokal tetap tersedia untuk recovery, pengujian Docker, atau deployment
+offline. Jalankan pada mesin yang memiliki Docker dan resource cukup:
 
 ```bash
-git pull --ff-only origin main
 python3 run.py check
 python3 run.py publish --all --build-base
 ```
 
-Untuk update Python tanpa perubahan base, cukup:
-
-```bash
-python3 run.py publish --all
-```
-
-Publish memberi tag immutable berdasarkan Git SHA, memverifikasi seluruh
-manifest, lalu push gateway dan worker. Setelah itu setiap target cukup:
-
-```bash
-git pull --ff-only origin main
-python3 run.py deploy
-```
-
-Tidak ada `docker build` di VPS target jika image SHA sudah tersedia di
-registry.
+Jalur release normal tidak memakai fallback ini. GitHub Actions adalah builder
+resmi, sedangkan VPS target hanya melakukan pull image SHA yang sudah dipublish.
 
 ## Concurrency dan pesan status job
 
@@ -859,6 +839,15 @@ sama dapat berjalan bersamaan karena memakai dua sesi `.tdl`; origin berbeda
 juga dapat berjalan paralel. Leave berbagi lane export. Utility memakai worker
 dan path workspace; path sibling dapat paralel, path yang overlap tetap serial.
 Storage memakai lane `worker + tdl:storage` dan tidak memakai profile actor.
+
+Quick Mode juga membutuhkan binary `rclone` dan file konfigurasi worker pada
+`/workspace/.config/rclone.conf`. Binary sudah dipasang pada `Dockerfile.base`;
+letakkan config pada workspace host yang di-mount ke worker. Destination remote
+diatur dari Web/Telegram Pengaturan, defaultnya `googledrive:backup`. Quick Mode
+hanya mengirim arsip `*.7z*` ke rclone, tidak mengirim thumbnail. Upload Storage
+memiliki pilihan terpisah untuk menyalin file ke remote yang sama. Sumber dan
+arsip rclone selalu divalidasi berada di bawah `/workspace`; staging Quick Mode
+yang gagal tetap berada di `/workspace/quickmode` untuk diagnosis/retry.
 
 Setiap worker yang melayani Storage wajib memiliki profile sesi dedicated sesuai
 `WORKER_STORAGE_PROFILE` (default `storage`), misalnya:

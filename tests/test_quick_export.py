@@ -428,6 +428,7 @@ class QuickPipelineTests(unittest.TestCase):
                     "quick_settings": {
                         "compress_size": "55m",
                         "compress_password": "snapshot-secret",
+                        "rclone_destination": "googledrive:backup",
                     },
                 },
             }
@@ -462,9 +463,33 @@ class QuickPipelineTests(unittest.TestCase):
                 def cancel_current(self):
                     return False
 
+            class FakeRcloneRunner:
+                instances = []
+
+                def __init__(self, **kwargs):
+                    self.kwargs = kwargs
+                    self.__class__.instances.append(self)
+
+                def copy_files(self, files, destination, config_path, *, workspace_root):
+                    self.files = list(files)
+                    self.destination = destination
+                    self.config_path = config_path
+                    self.workspace_root = workspace_root
+                    return {
+                        "destination": destination,
+                        "total": len(self.files),
+                        "succeeded": len(self.files),
+                        "files": [path.name for path in self.files],
+                    }
+
+                def cancel_current(self):
+                    return False
+
             with patch("tme3bot.worker.executor.QuickThumbnailBuilder", FakeThumbnailBuilder), patch(
                 "tme3bot.worker.executor.UtilityRunner", FakeUtilityRunner
-            ), patch("tme3bot.worker.executor.quick_year", return_value=2026):
+            ), patch("tme3bot.worker.executor.RcloneRunner", FakeRcloneRunner), patch(
+                "tme3bot.worker.executor.quick_year", return_value=2026
+            ):
                 result = executor._quick_export_pipeline(
                     command,
                     export_runtime,
@@ -475,6 +500,11 @@ class QuickPipelineTests(unittest.TestCase):
 
             self.assertEqual(FakeUtilityRunner.instances[0].settings["compress_size"], "55m")
             self.assertEqual(FakeUtilityRunner.instances[0].settings["compress_password"], "snapshot-secret")
+            self.assertEqual(
+                [path.name for path in FakeRcloneRunner.instances[0].files],
+                ["batch.7z.001"],
+            )
+            self.assertEqual(FakeRcloneRunner.instances[0].destination, "googledrive:backup")
             self.assertEqual(len(upload_client.calls), 2)
             self.assertEqual(
                 {call["path"].name for call in upload_client.calls},
