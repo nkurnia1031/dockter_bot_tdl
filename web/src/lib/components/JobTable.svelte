@@ -4,7 +4,7 @@
   import { AlertTriangle, ClipboardList, Copy, FileText, RefreshCw, SquareTerminal, XCircle } from '@lucide/svelte';
   import { api, post } from '$lib/api';
   import { formatBytes, formatDate, jobMessage, resultEntries, textValue } from '$lib/presentation';
-  import { formatDuration, normalizeJobProgress } from '$lib/job-progress';
+  import { formatDuration, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
   import JobProgressCard from './JobProgressCard.svelte';
 
   type Job = Record<string, any>;
@@ -175,7 +175,7 @@
   {#if activeJobs.length}
     <div class="border-b border-[var(--line)] bg-[var(--brand-soft)]/20 p-4 sm:p-5">
       <div class="mb-3 flex items-center justify-between"><h3 class="font-extrabold">Sedang berjalan</h3><span class="badge running">{activeJobs.length} aktif</span></div>
-      <div class="grid gap-4 xl:grid-cols-2">
+      <div class="space-y-2.5">
         {#each activeJobs as job (job.id)}
           <JobProgressCard job={job} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)}/>
         {/each}
@@ -202,6 +202,17 @@
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'raw' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'raw'}>Raw JSON</button>
       </div>
       {#if detailTab === 'summary'}
+        {#if active(selected) && selectedProgress}
+          <div class="mb-4 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-3.5 sm:p-4">
+            <div class="mb-2 flex justify-between gap-2 text-xs">
+              <b>Progress ({phaseLabel(selectedProgress.phase)})</b>
+              <span class="font-mono">{selectedProgress.overall.current ?? 0}{selectedProgress.overall.total ? ` / ${selectedProgress.overall.total}` : ''} ({selectedProgress.overall.percent !== undefined ? `${selectedProgress.overall.percent.toFixed(1)}%` : selectedProgress.item.percent !== undefined ? `${selectedProgress.item.percent.toFixed(1)}%` : '...'})</span>
+            </div>
+            <div class={`progress-track !h-2.5 ${selectedProgress.indeterminate ? 'indeterminate' : ''}`}>
+              <div class="progress-fill" style={`width:${selectedProgress.overall.percent ?? selectedProgress.item.percent ?? 0}%`}></div>
+            </div>
+          </div>
+        {/if}
         <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each resultEntries(selected.result?.value || selected.result) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
       {:else if detailTab === 'milestones'}
         <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div><p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p></article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>

@@ -103,16 +103,53 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual(details["photos_used"], 4)
             self.assertTrue(details["video_contact_sheet"])
             self.assertEqual(details["video_contact_sheets_used"], 4)
+            self.assertEqual(details["video_frames_used"], 4)
             self.assertEqual(sum(command[0] == "ffprobe" for command in commands), 4)
+            # Verify fast seeking with -ss is used instead of slow tile decoding
             self.assertEqual(
-                sum("tile=4x4" in " ".join(command) for command in commands),
+                sum("-ss" in command for command in commands),
                 4,
             )
             compose = next(command for command in commands if "-filter_complex" in command)
             filter_value = compose[compose.index("-filter_complex") + 1]
             self.assertIn("xstack=inputs=8", filter_value)
             self.assertNotIn("804", filter_value)
-            self.assertFalse(any(path.exists() for path in root.glob(".video-contact-sheet-*.png")))
+            self.assertFalse(any(path.exists() for path in root.glob(".video-frame-*.png")))
+
+    def test_single_long_video_fulfills_quota_eight_with_fast_sampling(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_media(root, ["long_movie.mp4"])
+            builder = QuickThumbnailBuilder()
+            commands: list[list[str]] = []
+
+            def fake_run(command: list[str]) -> str:
+                commands.append(command)
+                if command[0] == "ffprobe":
+                    return "7200.0"  # 2 hours duration
+                Path(command[-1]).write_bytes(b"png")
+                return ""
+
+            builder._run = fake_run  # type: ignore[method-assign]
+            details = builder.build(root, root / "result.png")
+
+            self.assertEqual(details["photos_used"], 0)
+            self.assertTrue(details["video_contact_sheet"])
+            self.assertEqual(details["video_frames_used"], 8)
+            # 1 ffprobe duration check + 8 frame extractions + 1 compose
+            self.assertEqual(sum(command[0] == "ffprobe" for command in commands), 1)
+            frame_extractions = [cmd for cmd in commands if "-ss" in cmd]
+            self.assertEqual(len(frame_extractions), 8)
+            # Ensure extracted timestamps are across the 7200s duration and sorted
+            timestamps = [float(cmd[cmd.index("-ss") + 1]) for cmd in frame_extractions]
+            self.assertEqual(len(timestamps), 8)
+            self.assertEqual(timestamps, sorted(timestamps))
+            self.assertGreater(timestamps[0], 0.0)
+            self.assertLess(timestamps[-1], 7200.0)
+            compose = next(command for command in commands if "-filter_complex" in command)
+            filter_value = compose[compose.index("-filter_complex") + 1]
+            self.assertIn("xstack=inputs=8", filter_value)
+            self.assertFalse(any(path.exists() for path in root.glob(".video-frame-*.png")))
 
     def test_no_visual_media_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -133,7 +170,13 @@ class QuickThumbnailTests(unittest.TestCase):
             root = Path(temp_dir)
             self.make_media(
                 root,
-                ["photo.jpg", "photo_thumb.jpg", ".video-contact-sheet-1.png", "clip.mp4"],
+                [
+                    "photo.jpg",
+                    "photo_thumb.jpg",
+                    ".video-contact-sheet-1.png",
+                    ".video-frame-1.png",
+                    "clip.mp4",
+                ],
             )
             photos, videos = visual_media(root)
             self.assertEqual([path.name for path in photos], ["photo.jpg"])

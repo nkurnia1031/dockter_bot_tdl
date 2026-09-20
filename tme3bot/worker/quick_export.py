@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
 import shutil
 import signal
@@ -352,7 +353,11 @@ def visual_media(root: Path) -> tuple[list[Path], list[Path]]:
         suffix = path.suffix.casefold()
         if suffix in PHOTO_EXTENSIONS:
             stem = path.stem.casefold()
-            if "thumb" not in stem and not stem.startswith(".video-contact-sheet-"):
+            if (
+                "thumb" not in stem
+                and not stem.startswith(".video-contact-sheet-")
+                and not stem.startswith(".video-frame-")
+            ):
                 photos.append(path)
         elif suffix in VIDEO_EXTENSIONS:
             videos.append(path)
@@ -402,33 +407,49 @@ class QuickThumbnailBuilder:
     def build(self, media_root: Path, output_path: Path) -> dict[str, object]:
         media_root = Path(media_root).resolve()
         output_path = Path(output_path).resolve()
-        contact_sheets: list[Path] = []
+        frame_files: list[Path] = []
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             photos, videos = visual_media(media_root)
-            selected = photos[:4]
-            for index, video in enumerate(videos[:4], start=1):
-                contact_sheet = output_path.parent / f".video-contact-sheet-{index}.png"
-                contact_sheets.append(contact_sheet)
-                contact_sheet.unlink(missing_ok=True)
-                self._video_contact_sheet(video, contact_sheet)
-            selected.extend(contact_sheets)
+            photos_to_use = min(len(photos), 4 if videos else 8)
+            selected = list(photos[:photos_to_use])
+            video_quota = 8 - len(selected)
+
+            if videos and video_quota > 0:
+                videos_to_use = videos[:min(len(videos), video_quota)]
+                base_count, remainder = divmod(video_quota, len(videos_to_use))
+                frame_idx = 0
+                for v_idx, video in enumerate(videos_to_use):
+                    count = base_count + (1 if v_idx < remainder else 0)
+                    if count <= 0:
+                        continue
+                    duration = self._video_duration(video)
+                    timestamps = self._sample_timestamps(duration, count)
+                    for ts in timestamps:
+                        frame_idx += 1
+                        frame_path = output_path.parent / f".video-frame-{frame_idx}.png"
+                        frame_files.append(frame_path)
+                        frame_path.unlink(missing_ok=True)
+                        self._extract_video_frame(video, ts, frame_path)
+                        selected.append(frame_path)
+
             if not selected:
                 raise QuickModeError(
                     "Quick Mode tidak menemukan foto atau video yang dapat dibuat thumbnail."
                 )
             self._compose(selected, output_path)
         finally:
-            for contact_sheet in contact_sheets:
-                contact_sheet.unlink(missing_ok=True)
+            for frame_path in frame_files:
+                frame_path.unlink(missing_ok=True)
         return {
-            "photos_used": min(len(photos), 4),
-            "video_contact_sheet": bool(contact_sheets),
-            "video_contact_sheets_used": len(contact_sheets),
+            "photos_used": len(selected) - len(frame_files),
+            "video_contact_sheet": bool(frame_files),
+            "video_contact_sheets_used": len(frame_files),
+            "video_frames_used": len(frame_files),
             "thumbnail_name": output_path.name,
         }
 
-    def _video_contact_sheet(self, video: Path, output_path: Path) -> None:
+    def _video_duration(self, video: Path) -> float:
         duration_text = self._run(
             [
                 self.ffprobe,
@@ -447,12 +468,27 @@ class QuickThumbnailBuilder:
             duration = 0.0
         if not math.isfinite(duration) or duration <= 0:
             duration = 1.0
-        filter_value = (
-            f"fps=16/{duration:.6f},"
-            "scale=396:396:force_original_aspect_ratio=decrease,"
-            "pad=396:396:(ow-iw)/2:(oh-ih)/2:color=black,"
-            "tile=4x4:padding=4:margin=4:color=black"
-        )
+        return duration
+
+    @staticmethod
+    def _sample_timestamps(duration: float, count: int) -> list[float]:
+        if count <= 0:
+            return []
+        if duration <= 1.0:
+            return [round(duration / 2.0, 3)] * count
+        margin = min(1.0, duration * 0.05)
+        start = margin
+        end = max(start + 0.1, duration - margin)
+        span = end - start
+        step = span / count
+        timestamps: list[float] = []
+        for i in range(count):
+            seg_start = start + i * step
+            seg_end = start + (i + 1) * step
+            timestamps.append(round(random.uniform(seg_start, seg_end), 3))
+        return sorted(timestamps)
+
+    def _extract_video_frame(self, video: Path, timestamp: float, output_path: Path) -> None:
         self._run(
             [
                 self.ffmpeg,
@@ -460,10 +496,10 @@ class QuickThumbnailBuilder:
                 "-loglevel",
                 "error",
                 "-y",
+                "-ss",
+                f"{timestamp:.3f}",
                 "-i",
                 str(video),
-                "-vf",
-                filter_value,
                 "-frames:v",
                 "1",
                 str(output_path),

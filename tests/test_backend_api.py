@@ -756,6 +756,27 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(command["payload"]["quick_retry"]["stage_job_id"], "orphan-1")
         self.assertNotIn("A1031@bokep@1031A", str(recovered.json()))
 
+    def test_quickmode_staging_excludes_backend_jobs_without_physical_folder(self):
+        headers = self.login()
+        # Create a quick mode export job in the database
+        job_res = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={
+                "chat_ref": "@past_channel",
+                "profile": "default",
+                "worker": "local",
+                "quick_mode": True,
+            },
+        )
+        self.assertEqual(job_res.status_code, 200)
+        # Scanner reports empty items (meaning no physical folders on disk)
+        self.dispatcher.quick_scan["local"] = {"worker": "local", "items": []}
+        scanned = self.client.get("/api/v1/quick-mode/staging", headers=headers)
+        self.assertEqual(scanned.status_code, 200)
+        # Verify no items are returned since physical folder does not exist
+        self.assertEqual(len(scanned.json()["items"]), 0)
+
     def test_storage_metadata_is_shared_for_all_authorized_users(self):
         item = self.insert_storage_item()
         headers = self.login(43)

@@ -61,6 +61,7 @@
     succeeded: allJobs.filter((job) => job.status === 'succeeded').length
   });
   const filteredStaging = $derived(staging.filter((item) =>
+    !item.scan_missing &&
     (!filterProfile || item.profile === filterProfile || item.backend_job?.profile === filterProfile) &&
     (!filterWorker || item.worker === filterWorker) &&
     (!filterStatus || item.backend_job?.status === filterStatus)

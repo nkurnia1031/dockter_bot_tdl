@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import JobProgressCard from './JobProgressCard.svelte';
 
 describe('JobProgressCard', () => {
@@ -35,5 +35,32 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('12 dtk')).toBeTruthy();
     expect(screen.getByText('3')).toBeTruthy();
     expect(screen.getByText('1')).toBeTruthy();
+  });
+
+  it('toggles detail drawer when clicking Detail button', async () => {
+    render(JobProgressCard, {
+      job: {
+        kind: 'download',
+        status: 'running',
+        profile: 'default',
+        worker: 'local',
+        created_at: new Date().toISOString(),
+        progress: {
+          phase: 'uploading',
+          message: 'batch.json',
+          overall: { current: 3, total: 10, percent: 32, unit: 'files' },
+          counters: { succeeded: 3, failed: 1, skipped: 0 }
+        }
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn()
+    });
+    expect(screen.queryByText('Detail Progress Job')).toBeNull();
+    const toggleBtn = screen.getByRole('button', { name: /toggle detail progress/i });
+    await fireEvent.click(toggleBtn);
+    expect(screen.getByText('Detail Progress Job')).toBeTruthy();
+    await fireEvent.click(toggleBtn);
+    expect(screen.queryByText('Detail Progress Job')).toBeNull();
   });
 });

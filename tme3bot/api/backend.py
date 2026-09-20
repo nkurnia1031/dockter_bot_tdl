@@ -725,39 +725,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 # the remaining workers.
                 errors.append({"worker": worker, "error": str(exc)[:500]})
 
-        # A backend row without a physical scan is retained as a diagnosis
-        # entry, rather than silently disappearing from the manager.
-        scanned_ids = {
-            (str(item.get("worker") or ""), str(item.get("stage_job_id") or ""))
-            for item in items
-        }
-        for (job_worker, stage_id), linked in by_stage.items():
-            if (job_worker, stage_id) in scanned_ids:
-                continue
-            job = linked["job"]
-            items.append(
-                {
-                    "stage_job_id": stage_id,
-                    "quick_operation_id": stage_id,
-                    "profile": job.get("profile") or "",
-                    "worker": job_worker,
-                    "folder_name": "",
-                    "phase": job.get("progress", {}).get("phase") or job.get("status"),
-                    "resume_phase": job.get("retry_phase") or "auto",
-                    "json_present": False,
-                    "expected_media_count": 0,
-                    "actual_media_count": 0,
-                    "archive_parts": 0,
-                    "thumbnail_present": False,
-                    "tdl_export_present": False,
-                    "tdl_download_present": False,
-                    "staging_path": job.get("progress", {}).get("staging_path"),
-                    "backend_job": job,
-                    "backend_job_id": linked["backend_job_id"],
-                    "orphan": False,
-                    "scan_missing": True,
-                }
-            )
         return {"items": items, "errors": errors}
 
     @app.post("/api/v1/quick-mode/recover", response_model=ObjectResponse)
