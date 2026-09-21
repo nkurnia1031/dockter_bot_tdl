@@ -777,6 +777,70 @@ class BackendApiTests(unittest.TestCase):
         # Verify no items are returned since physical folder does not exist
         self.assertEqual(len(scanned.json()["items"]), 0)
 
+    def test_quickmode_recover_honors_resume_phase_and_blocks_active_job(self):
+        headers = self.login()
+        # 1. Create a job that is active
+        active_res = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={
+                "chat_ref": "@stage_chan",
+                "profile": "default",
+                "worker": "local",
+                "quick_mode": True,
+            },
+        )
+        self.assertEqual(active_res.status_code, 200)
+        active_job = active_res.json()
+
+        # Trying to recover while job is active must return 409
+        busy_res = self.client.post(
+            "/api/v1/quick-mode/recover",
+            headers=headers,
+            json={
+                "worker": "local",
+                "stage_job_id": active_job["id"],
+                "profile": "default",
+                "resume_phase": "uploading",
+            },
+        )
+        self.assertEqual(busy_res.status_code, 409)
+        self.assertEqual(busy_res.json()["error"]["code"], "JOB_NOT_TERMINAL")
+
+        # 2. Mark the job as failed (terminal)
+        self.client.post(
+            f"/internal/v1/jobs/{active_job['id']}/events",
+            headers={"Authorization": "Bearer internal"},
+            json={
+                "sequence": 2,
+                "status": "failed",
+                "event_type": "failed",
+                "progress": {"phase": "downloading"},
+                "error": {"code": "DOWNLOAD_FAILED", "message": "network drop"},
+            },
+        )
+
+        # 3. Recover with resume_phase="uploading"
+        recovered = self.client.post(
+            "/api/v1/quick-mode/recover",
+            headers=headers,
+            json={
+                "worker": "local",
+                "stage_job_id": active_job["id"],
+                "profile": "default",
+                "resume_phase": "uploading",
+                "single_phase": True,
+            },
+        )
+        self.assertEqual(recovered.status_code, 200)
+        retried_job = recovered.json()["job"]
+        command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["job_id"], retried_job["id"])
+        self.assertEqual(command["payload"]["quick_retry"]["resume_phase"], "uploading")
+        self.assertEqual(command["payload"]["quick_retry"]["retry_phase"], "uploading")
+        self.assertTrue(command["payload"]["quick_retry"]["single_phase"])
+        self.assertEqual(command["payload"]["quick_retry"]["stage_job_id"], active_job["id"])
+
     def test_storage_metadata_is_shared_for_all_authorized_users(self):
         item = self.insert_storage_item()
         headers = self.login(43)

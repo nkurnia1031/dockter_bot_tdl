@@ -690,11 +690,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             )
             # Keep the newest attempt as the linked backend row, while the
             # response still includes the stable stage identity.
-            by_stage[(str(job.worker), stage_id)] = {
-                "id": stage_id,
-                "job": job_dict(job),
-                "backend_job_id": job.id,
-            }
+            key = (str(job.worker), stage_id)
+            if key not in by_stage:
+                by_stage[key] = {
+                    "id": stage_id,
+                    "job": job_dict(job),
+                    "backend_job_id": job.id,
+                }
 
         items: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
@@ -731,6 +733,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     def recover_quick_mode(body: dict[str, Any], actor=Depends(current_actor)):
         worker = str(body.get("worker") or "").strip().lower()
         stage_id = str(body.get("stage_job_id") or "").strip()
+        resume_phase = str(body.get("resume_phase") or "").strip().lower() or None
+        if resume_phase not in {None, "auto", "exporting", "downloading", "thumbnailing", "compressing", "uploading", "cleanup"}:
+            raise DomainError(
+                "INVALID_QUICK_PHASE",
+                "Fase recovery Quick Mode tidak dikenal.",
+                status_code=422,
+            )
         if not worker or not stage_id:
             raise DomainError(
                 "RECOVERY_TARGET_REQUIRED",
@@ -746,16 +755,32 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         for candidate in jobs:
             retry = candidate.payload.get("quick_retry")
             retry = retry if isinstance(retry, dict) else {}
-            if str(retry.get("stage_job_id") or candidate.id) == stage_id and candidate.worker == worker:
+            candidate_stage = str(
+                retry.get("stage_job_id")
+                or candidate.id
+            ).strip()
+            if candidate_stage == stage_id and candidate.worker == worker:
                 linked = candidate
+                break
         if linked is not None:
             if not linked.status.terminal:
                 raise DomainError(
                     "JOB_NOT_TERMINAL",
                     "Folder Quick Mode sudah memiliki job aktif.",
+                    details={"job_id": linked.id, "message": f"Folder Quick Mode sedang diproses oleh job #{linked.id[:8]}."},
                     status_code=409,
                 )
-            return {"job": job_dict(context.control_plane.retry_job(actor, linked.id)), "imported": False}
+            return {
+                "job": job_dict(
+                    context.control_plane.retry_job(
+                        actor,
+                        linked.id,
+                        resume_phase=resume_phase,
+                        single_phase=bool(body.get("single_phase")),
+                    )
+                ),
+                "imported": False,
+            }
 
         scanner = getattr(context.worker_dispatcher, "quickmode_scan", None)
         try:
@@ -777,8 +802,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             "quick_mode": True,
             "quick_settings": context.utility_settings.get(),
             "quick_retry": {
-                "retry_phase": "auto",
-                "resume_phase": "auto",
+                "retry_phase": resume_phase or "auto",
+                "resume_phase": resume_phase or "auto",
+                "single_phase": bool(body.get("single_phase")) and resume_phase not in {None, "", "auto", "exporting"},
                 "stage_job_id": stage_id,
                 "quick_operation_id": str(item.get("quick_operation_id") or stage_id),
             },
@@ -786,7 +812,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         for key in ("url", "chat_ref", "start_id", "label", "save_source", "use_url_message_id"):
             if body.get(key) is not None:
                 payload[key] = body[key]
-        if not item.get("json_present") and not has_upload_assets and not payload.get("url") and not payload.get("chat_ref"):
+        if (
+            not item.get("json_present")
+            and not item.get("actual_media_count")
+            and not has_upload_assets
+            and not payload.get("url")
+            and not payload.get("chat_ref")
+        ):
             raise DomainError(
                 "RECOVERY_SOURCE_REQUIRED",
                 "Folder tidak memiliki JSON atau hasil upload lengkap. Berikan URL/chat ID untuk export ulang.",

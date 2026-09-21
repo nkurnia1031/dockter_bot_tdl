@@ -375,6 +375,129 @@ class ExportMilestoneTests(unittest.TestCase):
 
 
 class QuickPipelineTests(unittest.TestCase):
+    def test_targeted_thumbnail_phase_does_not_start_compress(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            stage = workspace / "quickmode" / "stage-1"
+            media = stage / "batch"
+            media.mkdir(parents=True)
+            (media / "photo.jpg").write_bytes(b"photo")
+
+            class Publisher:
+                def emit(self, *args, **kwargs):
+                    del args, kwargs
+
+            class FakeThumbnailBuilder:
+                def __init__(self, **kwargs):
+                    del kwargs
+
+                def build(self, media_root, output_path):
+                    self.media_root = media_root
+                    output_path.write_bytes(b"thumbnail")
+                    return {"photos_used": 1, "video_contact_sheet": False, "thumbnail_name": output_path.name}
+
+            executor = WorkerJobExecutor(
+                SimpleNamespace(utility_workspace_root=workspace, backup_node_name="local"),
+                SimpleNamespace(),
+                Publisher(),
+            )
+            command = {
+                "job_id": "phase-job",
+                "profile": "default",
+                "worker": "local",
+                "payload": {
+                    "quick_mode": True,
+                    "quick_retry": {
+                        "stage_job_id": "stage-1",
+                        "quick_operation_id": "operation-1",
+                        "single_phase": True,
+                    },
+                },
+            }
+            with patch("tme3bot.worker.executor.QuickThumbnailBuilder", FakeThumbnailBuilder), patch(
+                "tme3bot.worker.executor.UtilityRunner",
+                side_effect=AssertionError("compress must not run for thumbnail-only action"),
+            ):
+                result = executor._quick_export_pipeline(
+                    command,
+                    SimpleNamespace(),
+                    None,
+                    {"media_count": 1, "photo_count": 1, "video_count": 0},
+                    ProgressReporter(Publisher(), "phase-job"),
+                    stage_root=stage,
+                    manifest={
+                        "version": 2,
+                        "stage_job_id": "stage-1",
+                        "quick_operation_id": "operation-1",
+                        "folder_name": "batch",
+                    },
+                    resume_phase="thumbnailing",
+                )
+
+            self.assertEqual(result["quick_phase"], "thumbnailing")
+            self.assertTrue((stage / "batch.png").exists())
+            self.assertFalse(list(stage.glob("*.7z*")))
+            self.assertTrue(stage.exists())
+
+    def test_targeted_upload_phase_does_not_cleanup_or_reprocess(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            stage = workspace / "quickmode" / "stage-2"
+            stage.mkdir(parents=True)
+            (stage / "batch.7z.001").write_bytes(b"archive")
+            (stage / "batch.png").write_bytes(b"thumbnail")
+
+            class Publisher:
+                def emit(self, *args, **kwargs):
+                    del args, kwargs
+
+            executor = WorkerJobExecutor(
+                SimpleNamespace(utility_workspace_root=workspace, backup_node_name="local"),
+                SimpleNamespace(),
+                Publisher(),
+            )
+            executor._storage_upload = lambda command: {"total": 2, "succeeded": 2, "failed": []}
+            command = {
+                "job_id": "upload-phase-job",
+                "profile": "default",
+                "worker": "local",
+                "actor_user_id": 42,
+                "payload": {
+                    "quick_mode": True,
+                    "quick_retry": {
+                        "stage_job_id": "stage-2",
+                        "quick_operation_id": "operation-2",
+                        "single_phase": True,
+                    },
+                },
+            }
+            with patch.object(
+                executor,
+                "_rclone_upload_files",
+                return_value={"destination": "googledrive:backup", "succeeded": 1, "files": ["batch.7z.001"]},
+            ):
+                result = executor._quick_export_pipeline(
+                    command,
+                    SimpleNamespace(),
+                    None,
+                    {},
+                    ProgressReporter(Publisher(), "upload-phase-job"),
+                    stage_root=stage,
+                    manifest={
+                        "version": 2,
+                        "stage_job_id": "stage-2",
+                        "quick_operation_id": "operation-2",
+                        "folder_name": "batch",
+                    },
+                    resume_phase="uploading",
+                )
+
+            self.assertEqual(result["quick_phase"], "uploading")
+            self.assertEqual(result["uploaded_count"], 2)
+            self.assertTrue(stage.exists())
+
     def test_quick_cancel_is_best_effort_when_some_runtimes_are_already_gone(self):
         calls: list[str] = []
 

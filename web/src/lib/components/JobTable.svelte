@@ -24,7 +24,7 @@
   let toastOpen = $state(false);
   let toastMessage = $state('');
   let retrying = $state<Record<string, boolean>>({});
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let lastRefreshed = $state<Date | null>(null);
   let mounted = false;
   let loadGeneration = 0;
 
@@ -36,6 +36,11 @@
   const latestSnapshot = $derived([...events].reverse().find((event) => event.event_type === 'log.snapshot' && Array.isArray(event.result?.log?.lines)));
   const logLines = $derived(liveLog?.log?.lines || latestSnapshot?.result?.log?.lines || []);
   const selectedProgress = $derived(selected ? normalizeJobProgress(selected) : null);
+
+  function formatClock(d: Date | null): string {
+    if (!d) return '-';
+    return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
 
   async function load() {
     const request = ++loadGeneration;
@@ -50,13 +55,12 @@
       const next = (await api<{items:Job[]}>(query)).items || [];
       if (request !== loadGeneration) return;
       jobs = next;
+      lastRefreshed = new Date();
       if (selected) selected = next.find((job) => job.id === selected?.id) || selected;
       error = '';
     } catch (cause) {
       if (request !== loadGeneration) return;
       error = cause instanceof Error ? cause.message : 'Tidak dapat memuat job.';
-    } finally {
-      if (mounted && request === loadGeneration) schedule();
     }
   }
   async function loadEvents() {
@@ -133,18 +137,11 @@
     ...(informativeEvents.length && logLines.length ? ['──────── raw worker output ────────'] : []),
     ...logLines
   ]);
-  function schedule() {
-    if (timer) clearTimeout(timer);
-    const running = jobs.filter(active);
-    if (!running.length) return;
-    timer = setTimeout(load, running.some((job) => job.status === 'running') ? 1000 : 3000);
-  }
   onMount(() => {
     mounted = true;
     const refresh = () => load();
     const contextRefresh = () => {
       loadGeneration += 1;
-      if (timer) clearTimeout(timer);
       jobs = [];
       selected = null;
       events = [];
@@ -158,7 +155,6 @@
     load();
     return () => {
       mounted = false;
-      if (timer) clearTimeout(timer);
       window.removeEventListener('tme3:data-mutated', refresh);
       window.removeEventListener('tme3:context-changed', contextRefresh);
     };
@@ -168,7 +164,13 @@
 <section class="card mt-7 overflow-hidden">
   <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-4 sm:px-5">
     <div><p class="eyebrow">JOB MONITOR</p><h2 class="mt-1 text-lg font-extrabold">{title}</h2></div>
-    <div class="flex flex-wrap gap-2"><button class="button danger" onclick={() => requestTerminate('all')}><XCircle size={16}/>Terminate semua aktif</button><button class="button secondary" onclick={load} aria-label="Refresh daftar job"><RefreshCw size={16}/>Refresh</button></div>
+    <div class="flex flex-wrap items-center gap-2">
+      {#if lastRefreshed}
+        <span class="muted text-xs">Terakhir diperbarui: {formatClock(lastRefreshed)}</span>
+      {/if}
+      <button class="button danger" onclick={() => requestTerminate('all')}><XCircle size={16}/>Terminate semua aktif</button>
+      <button class="button secondary" onclick={load} aria-label="Refresh daftar job"><RefreshCw size={16}/>Refresh</button>
+    </div>
   </div>
   {#if error}<p class="m-4 rounded-xl bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{error}</p>{/if}
 
@@ -186,7 +188,32 @@
   {#if historyJobs.length}<div class="px-4 pt-4 sm:px-5"><h3 class="text-sm font-extrabold">History terbaru</h3></div>{/if}
   <div class="divide-y divide-[var(--line)] px-4 sm:px-5">
     {#each historyJobs as job (job.id)}
-      <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center"><div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><b class="capitalize">{job.kind.replaceAll('_',' ')}</b>{#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}<span class={`badge ${job.status}`}>{job.status}</span><span class="muted text-xs">{job.worker || '-'}</span></div><p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p></div><div class="flex flex-wrap items-center gap-2"><small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small><button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button><button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>{#if retryable && job.kind === 'export' && ['failed','cancelled','succeeded'].includes(job.status)}<button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>{job.status === 'succeeded' ? 'Jalankan lagi' : 'Retry'}</button>{/if}</div></article>
+      {@const stageId = job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null)}
+      <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+        <div class="min-w-0">
+          <div class="flex flex-wrap items-center gap-2">
+            {#if job.id}
+              <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
+            {/if}
+            <b class="capitalize">{job.kind.replaceAll('_',' ')}</b>
+            {#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}
+            {#if stageId}
+              <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {String(stageId).slice(0, 8)}</span>
+            {/if}
+            <span class={`badge ${job.status}`}>{job.status}</span>
+            <span class="muted text-xs">{job.worker || '-'}</span>
+          </div>
+          <p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small>
+          <button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button>
+          <button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>
+          {#if retryable && job.kind === 'export' && ['failed','cancelled','succeeded'].includes(job.status)}
+            <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>{job.status === 'succeeded' ? 'Jalankan lagi' : 'Retry'}</button>
+          {/if}
+        </div>
+      </article>
     {/each}
     {#if !historyJobs.length && !activeJobs.length}<div class="py-14 text-center"><ClipboardList class="mx-auto mb-2 text-violet-500"/><b>Belum ada job.</b></div>{/if}
   </div>

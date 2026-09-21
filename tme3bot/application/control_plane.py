@@ -493,7 +493,14 @@ class ControlPlane:
             self._dispatch_pending_jobs(selected_profile)
         return {"total": len(active), "interrupted": interrupted, "force_cancelled": forced}
 
-    def retry_job(self, actor: Actor, job_id: str) -> Job:
+    def retry_job(
+        self,
+        actor: Actor,
+        job_id: str,
+        *,
+        resume_phase: str | None = None,
+        single_phase: bool = False,
+    ) -> Job:
         """Create a new export attempt while preserving the old record."""
         original = self.jobs.get(job_id)
         if original is None:
@@ -568,13 +575,19 @@ class ControlPlane:
             operation_id = str(previous_retry.get("quick_operation_id") or stage_job_id)
             export_start_id, export_end_id = self._export_message_range(original)
             payload["quick_mode"] = True
+            target_phase = (
+                resume_phase.strip().lower()
+                if isinstance(resume_phase, str) and resume_phase.strip()
+                else None
+            )
             payload["quick_retry"] = {
                 "retry_of": original.id,
                 # Keep the historical phase for reports/backwards-compatible
                 # clients, while explicitly telling the worker to inspect the
                 # physical folder before choosing the actual resume phase.
-                "retry_phase": self._quick_retry_phase(original),
-                "resume_phase": "auto",
+                "retry_phase": target_phase or self._quick_retry_phase(original),
+                "resume_phase": target_phase or "auto",
+                "single_phase": bool(single_phase and target_phase and target_phase not in {"auto", "exporting"}),
                 "stage_job_id": stage_job_id,
                 "quick_operation_id": operation_id,
             }

@@ -18,6 +18,7 @@
   const speed = $derived(progress.transfer.speed_bps ? `${formatBytes(progress.transfer.speed_bps)}/dtk` : progress.transfer.speed_text || 'Menghitung...');
   const headline = $derived(progress.batch.name || progress.item.name || progress.message);
   const elapsed = $derived(formatDuration(progress.elapsedSeconds ?? ((Date.now() - new Date(job.created_at).getTime()) / 1000)));
+  const stageId = $derived(job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null));
 </script>
 
 <article class="idm-row">
@@ -26,7 +27,13 @@
       <!-- Main Info & Progress Bar (IDM Style) -->
       <div class="min-w-0 flex-1">
         <div class="flex flex-wrap items-center gap-2">
+          {#if job.id}
+            <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
+          {/if}
           <span class="badge running shrink-0">{phaseLabel(progress.phase)}</span>
+          {#if stageId}
+            <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {stageId.slice(0, 8)}</span>
+          {/if}
           <b class="truncate text-sm font-extrabold text-[var(--ink)]">{headline}</b>
           {#if progress.batch.index}
             <span class="rounded bg-[var(--brand-soft)] px-1.5 py-0.5 text-xs font-bold text-[var(--brand)]">JSON {progress.batch.index}/{progress.batch.total || '?'}</span>
@@ -96,9 +103,15 @@
   {#if expanded}
     <div class="border-t border-[var(--line)] bg-[var(--surface-soft)] p-4 sm:p-5">
       <div class="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <div class="flex items-center gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <b class="text-xs font-extrabold uppercase tracking-wider text-[var(--muted)]">Detail Progress Job</b>
+          {#if job.id}
+            <span class="font-mono text-xs text-slate-500">#{job.id}</span>
+          {/if}
           <span class="badge running">{job.kind.replaceAll('_',' ')}</span>
+          {#if stageId}
+            <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">📁 Folder: {stageId}</span>
+          {/if}
         </div>
         <div class="flex items-center gap-1 text-xs text-[var(--muted)]">
           <Clock3 size={13}/> Berjalan {elapsed}

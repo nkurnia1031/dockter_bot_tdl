@@ -1144,6 +1144,10 @@ class WorkerJobExecutor:
         if raw_export is None and requested not in {"uploading", "cleanup"}:
             return "downloading" if has_json else ("thumbnailing" if has_media else "exporting")
         if requested == "auto":
+            if archives and thumbnail.is_file():
+                return "uploading"
+            if raw_export is None:
+                return "downloading" if has_json else ("thumbnailing" if has_media else "exporting")
             if has_media and thumbnail.is_file() and not archives:
                 return "compressing"
             if has_media and not thumbnail.is_file():
@@ -1195,9 +1199,15 @@ class WorkerJobExecutor:
                 }
                 write_quick_manifest(stage_root, quick_manifest)
             restored = self._quick_manifest_export(quick_manifest)
-            if resume_phase != "exporting" and (
-                restored is not None or resume_phase in {"uploading", "cleanup"}
-            ):
+            can_resume = resume_phase != "exporting" and (
+                restored is not None
+                or resume_phase in {"thumbnailing", "compressing", "uploading", "cleanup"}
+                or (
+                    resume_phase == "downloading"
+                    and bool(self._quick_json_path(runtime, quick_manifest, stage_root))
+                )
+            )
+            if can_resume:
                 reporter.report(
                     phase=resume_phase,
                     message=f"Melanjutkan Quick Mode dari fase {resume_phase}",
@@ -1474,6 +1484,9 @@ class WorkerJobExecutor:
             ) from exc
         manifest = dict(manifest or read_quick_manifest(stage_root))
         operation_id = str(manifest.get("quick_operation_id") or stage_root.name)
+        retry = payload.get("quick_retry") or {}
+        retry = retry if isinstance(retry, dict) else {}
+        single_phase = bool(retry.get("single_phase"))
         export_json_name = str(manifest.get("export_json_name") or "")
         if not export_json_name and export_result is not None:
             export_json_name = Path(export_result.export_path).name
@@ -1538,6 +1551,44 @@ class WorkerJobExecutor:
             manifest.update(updates)
             manifest["last_progress_at"] = utc_now().isoformat()
             write_quick_manifest(stage_root, manifest)
+
+        def phase_result(completed_phase: str, next_phase: str) -> dict[str, Any]:
+            """Return a successful targeted-phase result without deleting staging."""
+            save_manifest(phase=next_phase, last_error=None)
+            return {
+                **(asdict(export_result) if export_result is not None else {}),
+                **stats,
+                **thumbnail,
+                "quick_mode": True,
+                "quick_mode_status": "phase_completed",
+                "quick_phase": completed_phase,
+                "folder_name": folder_name,
+                "storage_folder": storage_folder,
+                "caption": caption,
+                "archive_names": [path.name for path in archive_files],
+                "thumbnail_uploaded_as_photo": completed_phase == "uploading",
+                "uploaded_count": upload_result.get("succeeded", 0),
+                "rclone_destination": (
+                    rclone_result.get("destination")
+                    if isinstance(rclone_result, dict)
+                    else None
+                ),
+                "rclone_uploaded_count": (
+                    rclone_result.get("succeeded", 0)
+                    if isinstance(rclone_result, dict)
+                    else 0
+                ),
+                "rclone_archive_names": (
+                    rclone_result.get("files", [])
+                    if isinstance(rclone_result, dict)
+                    else []
+                ),
+                "stage_job_id": manifest.get("stage_job_id") or stage_root.name,
+                "quick_operation_id": operation_id,
+                "staging_path": str(stage_root),
+                "staging_cleaned": False,
+                "json_deleted": bool(manifest.get("json_deleted")),
+            }
 
         try:
             stage_root.mkdir(parents=True, exist_ok=True)
@@ -1647,6 +1698,8 @@ class WorkerJobExecutor:
                     )
                 save_manifest(phase="thumbnailing", json_deleted=True, last_error=None)
                 phase = "thumbnailing"
+                if single_phase:
+                    return phase_result("downloading", "thumbnailing")
 
             if phase == "thumbnailing":
                 ensure_not_cancelled()
@@ -1672,6 +1725,8 @@ class WorkerJobExecutor:
                         self._quick_thumbnail_builders.pop(job_id, None)
                 save_manifest(phase="compressing", thumbnail=thumbnail, last_error=None)
                 phase = "compressing"
+                if single_phase:
+                    return phase_result("thumbnailing", "compressing")
 
             if phase == "compressing":
                 ensure_not_cancelled()
@@ -1730,6 +1785,8 @@ class WorkerJobExecutor:
                     last_error=None,
                 )
                 phase = "uploading"
+                if single_phase:
+                    return phase_result("compressing", "uploading")
 
             if phase == "uploading":
                 ensure_not_cancelled()
@@ -1801,6 +1858,8 @@ class WorkerJobExecutor:
                     last_error=None,
                 )
                 phase = "cleanup"
+                if single_phase:
+                    return phase_result("uploading", "cleanup")
 
             if phase == "cleanup":
                 ensure_not_cancelled()

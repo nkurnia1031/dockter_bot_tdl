@@ -39,4 +39,48 @@ describe('QuickModePage', () => {
     expect(requests.find((item) => item.url.endsWith('/exports'))?.body).toMatchObject({ chat_ref: 'example', quick_mode: true });
     await waitFor(() => expect(calls.some((item) => item.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true'))).toBe(true));
   });
+
+  it('hides physical staging actions while its backend job is active', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true')) {
+        return new Response(JSON.stringify({ items: [{
+          id: 'active-stage-job-1234',
+          kind: 'export',
+          status: 'running',
+          profile: 'default',
+          worker: 'local',
+          payload: { quick_mode: true, quick_retry: { stage_job_id: 'stage-active' } }
+        }] }), { status: 200 });
+      }
+      if (url.includes('/quick-mode/staging')) {
+        return new Response(JSON.stringify({ items: [{
+          stage_job_id: 'stage-active',
+          folder_name: 'batch',
+          worker: 'local',
+          profile: 'default',
+          phase: 'thumbnailing',
+          json_present: true,
+          expected_media_count: 1,
+          actual_media_count: 1,
+          thumbnail_present: false,
+          archive_parts: 0,
+          tdl_export_present: true,
+          tdl_download_present: true,
+          staging_path: '/workspace/quickmode/stage-active'
+        }] }), { status: 200 });
+      }
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(QuickModePage);
+    expect(await screen.findByText('Sedang processing (#active-s)')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Thumbnail' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Upload' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Compress' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Resume Download' })).toBeNull();
+  });
 });

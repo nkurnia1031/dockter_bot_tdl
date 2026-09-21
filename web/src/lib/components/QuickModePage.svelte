@@ -44,8 +44,8 @@
   let filterProfile = $state('');
   let filterWorker = $state('');
   let filterStatus = $state('');
-  let statsTimer: ReturnType<typeof setTimeout> | undefined;
-  let stagingTimer: number | undefined;
+  let lastStatsRefreshed = $state<Date | null>(null);
+  let lastStagingRefreshed = $state<Date | null>(null);
   let mounted = false;
   let lastProfile = '';
 
@@ -66,6 +66,44 @@
     (!filterWorker || item.worker === filterWorker) &&
     (!filterStatus || item.backend_job?.status === filterStatus)
   ));
+
+  function formatClock(d: Date | null): string {
+    if (!d) return '-';
+    return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function getStageResumePhase(item: Stage): { phase: string; label: string; icon: any } {
+    if (item.orphan && !item.json_present && !item.actual_media_count && !item.archive_parts) {
+      return { phase: 'exporting', label: 'Import orphan', icon: ShieldCheck };
+    }
+    if (item.archive_parts && item.thumbnail_present) {
+      return { phase: 'uploading', label: 'Upload', icon: Upload };
+    }
+    if (item.json_present && item.expected_media_count && item.actual_media_count < item.expected_media_count) {
+      return { phase: 'downloading', label: 'Resume Download', icon: Download };
+    }
+    if (!item.thumbnail_present) {
+      return { phase: 'thumbnailing', label: 'Thumbnail', icon: Image };
+    }
+    if (item.thumbnail_present && !item.archive_parts) {
+      return { phase: 'compressing', label: 'Compress', icon: ShieldCheck };
+    }
+    return { phase: 'exporting', label: 'Re-Export', icon: ShieldCheck };
+  }
+
+  function findActiveJobForStage(item: Stage): Job | null {
+    const matching = activeJobs.find(
+      (j) =>
+        j.worker === item.worker &&
+        (String(j.payload?.quick_retry?.stage_job_id || j.result?.stage_job_id || j.id) === item.stage_job_id ||
+         (item.backend_job_id && j.id === item.backend_job_id))
+    );
+    if (matching) return matching;
+    if (item.backend_job && activeStatuses.includes(item.backend_job.status)) {
+      return item.backend_job;
+    }
+    return null;
+  }
 
   async function loadSources(profile = targetProfile) {
     sourceLoading = true;
@@ -88,15 +126,10 @@
     try {
       const response = await api<{items: Job[]}>(`/jobs?limit=200&scope=global&kind=export&quick_mode=true&archived=false`);
       allJobs = response.items || [];
+      lastStatsRefreshed = new Date();
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Statistik Quick Mode tidak dapat dimuat.';
-    } finally {
-      statsLoading = false;
-      if (mounted) {
-        if (statsTimer) clearTimeout(statsTimer);
-        statsTimer = activeJobs.length ? setTimeout(loadStats, 1500) : undefined;
-      }
-    }
+    } finally { statsLoading = false; }
   }
 
   async function loadStaging() {
@@ -105,6 +138,7 @@
       const response = await api<{items: Stage[]; errors?: {worker: string; error: string}[]}>(`/quick-mode/staging`);
       staging = response.items || [];
       stagingErrors = response.errors || [];
+      lastStagingRefreshed = new Date();
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Scan staging Quick Mode gagal.';
     } finally {
@@ -124,14 +158,14 @@
     };
   }
 
-  async function recoverStage(item: Stage) {
+  async function recoverStage(item: Stage, resumePhase?: string) {
     const profile = stageProfile(item);
     if (!profile) {
       message = 'Pilih profile pada form Quick Mode sebelum mengimport folder ini.';
       return;
     }
     const source = stageSourcePayload();
-    if (!item.json_present && !item.archive_parts && !source.url && !source.chat_ref) {
+    if (!item.json_present && !item.actual_media_count && !item.archive_parts && !source.url && !source.chat_ref) {
       message = 'Folder ini tidak memiliki JSON. Isi URL atau chat ID untuk export ulang.';
       return;
     }
@@ -142,6 +176,8 @@
         worker: item.worker,
         stage_job_id: item.stage_job_id,
         profile,
+        resume_phase: resumePhase,
+        single_phase: Boolean(resumePhase && !['auto', 'exporting'].includes(resumePhase)),
         ...source
       });
       message = 'Folder Quick Mode dimasukkan kembali ke antrean.';
@@ -156,11 +192,12 @@
   async function cancelStage(item: Stage) {
     const jobId = item.backend_job_id || item.backend_job?.id;
     if (!jobId) return;
-    stageAction = `${item.worker}:${item.stage_job_id}`;
+    const actionKey = `${item.worker}:${item.stage_job_id}`;
+    stageAction = actionKey;
     try {
       await post(`/jobs/${encodeURIComponent(jobId)}/cancel`);
       message = 'Permintaan cancel dikirim ke worker.';
-      await loadStats();
+      await Promise.all([loadStats(), loadStaging()]);
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Cancel Quick Mode gagal.';
     } finally {
@@ -283,14 +320,11 @@
     loadSources(targetProfile);
     loadStats();
     loadStaging();
-    stagingTimer = window.setInterval(loadStaging, 15000);
     const refresh = () => { loadStats(); loadStaging(); };
     window.addEventListener('tme3:data-mutated', refresh);
     return () => {
       mounted = false;
       if (cooldownTimer) clearTimeout(cooldownTimer);
-      if (statsTimer) clearTimeout(statsTimer);
-      if (stagingTimer) clearInterval(stagingTimer);
       window.removeEventListener('tme3:data-mutated', refresh);
     };
   });
@@ -326,7 +360,15 @@
 </section>
 
 <section class="card mt-6 p-4 sm:p-5">
-  <div class="flex flex-wrap items-center justify-between gap-3"><div><p class="eyebrow">FILTER</p><h2 class="mt-1 text-lg font-extrabold">Semua job Quick Mode</h2></div>{#if statsLoading}<RefreshCw size={17} class="animate-spin text-violet-600"/>{/if}</div>
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div><p class="eyebrow">FILTER</p><h2 class="mt-1 text-lg font-extrabold">Semua job Quick Mode</h2></div>
+    <div class="flex items-center gap-2">
+      {#if lastStatsRefreshed}<span class="muted text-xs">Terakhir diperbarui: {formatClock(lastStatsRefreshed)}</span>{/if}
+      <button class="button secondary !py-1.5 !px-3 text-xs" onclick={loadStats} disabled={statsLoading} aria-label="Refresh job list">
+        <RefreshCw size={14} class={statsLoading ? 'animate-spin' : ''}/>Refresh
+      </button>
+    </div>
+  </div>
   <div class="mt-4 grid gap-3 sm:grid-cols-3">
     <label class="text-sm font-bold">Profile<select class="field mt-2" bind:value={filterProfile}><option value="">Semua profile</option>{#each session.current.profiles as item}<option value={item}>{item}</option>{/each}</select></label>
     <label class="text-sm font-bold">Worker<select class="field mt-2" bind:value={filterWorker}><option value="">Semua worker</option>{#each session.workers as item}<option value={item.name}>{item.name}</option>{/each}</select></label>
@@ -337,23 +379,51 @@
 <section class="card mt-6 p-4 sm:p-5">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-200"><FolderOpen size={19}/></div><div><p class="eyebrow">PHYSICAL STAGING</p><h2 class="mt-1 text-lg font-extrabold">Folder Quick Mode di worker</h2><p class="muted text-sm">Scan langsung dari workspace, termasuk folder orphan setelah restart worker.</p></div></div>
-    <button class="button secondary" onclick={loadStaging} disabled={stagingLoading}><RefreshCw size={15} class={stagingLoading ? 'animate-spin' : ''}/>Refresh scan</button>
+    <div class="flex items-center gap-3">
+      {#if lastStagingRefreshed}<span class="muted text-xs">Terakhir discan: {formatClock(lastStagingRefreshed)}</span>{/if}
+      <button class="button secondary" onclick={loadStaging} disabled={stagingLoading}><RefreshCw size={15} class={stagingLoading ? 'animate-spin' : ''}/>Refresh scan</button>
+    </div>
   </div>
   {#if stagingErrors.length}<div class="mt-4 space-y-2">{#each stagingErrors as item}<p class="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">Worker {item.worker} tidak dapat discan: {item.error}</p>{/each}</div>{/if}
   {#if !filteredStaging.length && !stagingLoading}<p class="muted mt-5 rounded-xl border border-dashed border-[var(--line)] p-5 text-center text-sm">Belum ada folder staging Quick Mode.</p>{/if}
   <div class="mt-4 space-y-3">
     {#each filteredStaging as item}
       {@const linked = item.backend_job}
-      {@const active = linked && ['queued','dispatched','running'].includes(linked.status)}
+      {@const activeJob = findActiveJobForStage(item)}
+      {@const targetAction = getStageResumePhase(item)}
+      {@const ActionIcon = targetAction.icon}
       {@const actionKey = `${item.worker}:${item.stage_job_id}`}
+      {@const backendId = item.backend_job_id || item.backend_job?.id || (activeJob ? activeJob.id : null)}
       <article class="rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4">
         <div class="flex flex-wrap items-start justify-between gap-3">
-          <div class="min-w-0"><div class="flex flex-wrap items-center gap-2"><b class="truncate">{item.folder_name || item.stage_job_id}</b>{#if item.orphan}<span class="badge failed">Orphan</span>{/if}<span class="badge running">{item.phase}</span>{#if linked}<span class={`badge ${linked.status}`}>{linked.status}</span>{/if}</div><p class="muted mt-1 break-all text-xs">{item.worker} · {stageProfile(item) || 'profile belum dipilih'} · {item.staging_path}</p></div>
-          <div class="flex flex-wrap gap-2">{#if active}<button class="button danger" onclick={() => cancelStage(item)} disabled={stageAction === actionKey}><XCircle size={15}/>Cancel</button>{:else}<button class="button secondary" onclick={() => recoverStage(item)} disabled={stageAction === actionKey}>{#if item.orphan && !item.json_present && !item.actual_media_count && !item.archive_parts}<ShieldCheck size={15}/>Import orphan{:else if item.archive_parts && item.thumbnail_present}<Upload size={15}/>Upload{:else if item.json_present && item.expected_media_count && item.actual_media_count < item.expected_media_count}<Download size={15}/>Resume Download{:else if !item.thumbnail_present}<Image size={15}/>Thumbnail{:else}<ShieldCheck size={15}/>Compress{/if}</button>{/if}</div>
+          <div class="min-w-0">
+            <div class="flex flex-wrap items-center gap-2">
+              {#if backendId}
+                <span class="font-mono text-xs font-semibold text-slate-500" title="Job backend: {backendId}">#{backendId.slice(0, 8)}</span>
+              {/if}
+              <b class="truncate">{item.folder_name || item.stage_job_id}</b>
+              {#if item.orphan}<span class="badge failed">Orphan</span>{/if}
+              <span class="badge running">{item.phase}</span>
+              {#if item.backend_job}<span class={`badge ${item.backend_job.status}`}>{item.backend_job.status}</span>{/if}
+            </div>
+            <p class="muted mt-1 break-all text-xs">{item.worker} · {stageProfile(item) || 'profile belum dipilih'} · {item.staging_path}</p>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            {#if activeJob}
+              <span class="badge running animate-pulse">Sedang processing (#{activeJob.id.slice(0, 8)})</span>
+              <button class="button danger !py-1.5 !px-3 text-xs" onclick={() => cancelStage(item)} disabled={stageAction === actionKey}>
+                <XCircle size={15}/>Cancel
+              </button>
+            {:else}
+              <button class="button secondary !py-1.5 !px-3 text-xs" onclick={() => recoverStage(item, targetAction.phase)} disabled={stageAction === actionKey}>
+                <ActionIcon size={15}/>{targetAction.label}
+              </button>
+            {/if}
+          </div>
         </div>
         <div class="mt-3 flex flex-wrap gap-2 text-xs font-bold"><span class={`rounded-full px-2.5 py-1 ${item.json_present ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>JSON {item.json_present ? 'ada' : 'tidak ada'}</span><span class={`rounded-full px-2.5 py-1 ${item.actual_media_count ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>Media {item.actual_media_count}/{item.expected_media_count || '?'}</span><span class={`rounded-full px-2.5 py-1 ${item.thumbnail_present ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>PNG {item.thumbnail_present ? 'ada' : 'belum'}</span><span class={`rounded-full px-2.5 py-1 ${item.archive_parts ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>Archive {item.archive_parts}</span><span class={`rounded-full px-2.5 py-1 ${item.tdl_export_present && item.tdl_download_present ? 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>.tdl {item.tdl_export_present ? 'E' : '-'} / {item.tdl_download_present ? 'D' : '-'}</span></div>
         {#if item.last_error}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/40 dark:text-rose-200">{item.last_error}</p>{/if}
-        {#if linked}<p class="muted mt-2 text-xs">Job backend: {linked.id} · storage: {item.storage_folder || '-'}</p>{/if}
+        {#if backendId}<p class="muted mt-2 text-xs">Job backend: {backendId} · storage: {item.storage_folder || '-'}</p>{/if}
       </article>
     {/each}
   </div>
