@@ -49,7 +49,12 @@ def build_execution_plan(
             # and runtime locks still serialize operations on each session.
             retry = payload.get("quick_retry") or {}
             retry = retry if isinstance(retry, dict) else {}
-            retry_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower()
+            retry_phase = str(
+                retry.get("resume_phase")
+                or payload.get("quick_phase")
+                or retry.get("retry_phase")
+                or "exporting"
+            ).strip().lower()
             if retry_phase not in {"exporting", "auto"}:
                 keys = {
                     key

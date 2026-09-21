@@ -82,7 +82,7 @@
     if (item.json_present && item.expected_media_count && item.actual_media_count < item.expected_media_count) {
       return { phase: 'downloading', label: 'Resume Download', icon: Download };
     }
-    if (!item.thumbnail_present) {
+    if (item.actual_media_count > 0 && !item.thumbnail_present) {
       return { phase: 'thumbnailing', label: 'Thumbnail', icon: Image };
     }
     if (item.thumbnail_present && !item.archive_parts) {

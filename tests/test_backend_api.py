@@ -839,6 +839,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(command["payload"]["quick_retry"]["resume_phase"], "uploading")
         self.assertEqual(command["payload"]["quick_retry"]["retry_phase"], "uploading")
         self.assertTrue(command["payload"]["quick_retry"]["single_phase"])
+        self.assertEqual(command["payload"]["quick_phase"], "uploading")
         self.assertEqual(command["payload"]["quick_retry"]["stage_job_id"], active_job["id"])
 
     def test_storage_metadata_is_shared_for_all_authorized_users(self):

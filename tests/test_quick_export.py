@@ -375,6 +375,73 @@ class ExportMilestoneTests(unittest.TestCase):
 
 
 class QuickPipelineTests(unittest.TestCase):
+    def test_export_entrypoint_honors_thumbnail_phase_without_calling_export(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            stage = workspace / "quickmode" / "stage-thumbnail"
+            media = stage / "batch"
+            media.mkdir(parents=True)
+            (media / "photo.jpg").write_bytes(b"photo")
+            (stage / "quickmode.json").write_text(
+                '{"version":2,"stage_job_id":"stage-thumbnail",'
+                '"quick_operation_id":"operation-thumbnail",'
+                '"folder_name":"batch","phase":"thumbnailing"}',
+                encoding="utf-8",
+            )
+
+            class Publisher:
+                def emit(self, *args, **kwargs):
+                    del args, kwargs
+
+            class ExportService:
+                def export_from_url(self, *args, **kwargs):
+                    raise AssertionError("Thumbnail recovery must not export JSON again")
+
+            runtime = SimpleNamespace(
+                config=SimpleNamespace(),
+                export_service=ExportService(),
+            )
+            profiles = SimpleNamespace(runtime=lambda profile: runtime)
+            executor = WorkerJobExecutor(
+                SimpleNamespace(
+                    utility_workspace_root=workspace,
+                    backup_node_name="local",
+                ),
+                profiles,
+                Publisher(),
+            )
+            observed: dict[str, object] = {}
+
+            def fake_pipeline(command, runtime_value, export_result, stats, reporter, **kwargs):
+                del command, runtime_value, export_result, stats, reporter
+                observed.update(kwargs)
+                return {"quick_mode_status": "phase_completed"}
+
+            command = {
+                "job_id": "retry-thumbnail",
+                "kind": "export",
+                "profile": "default",
+                "worker": "local",
+                "payload": {
+                    "quick_mode": True,
+                    "quick_phase": "thumbnailing",
+                    "quick_retry": {
+                        "stage_job_id": "stage-thumbnail",
+                        "quick_operation_id": "operation-thumbnail",
+                        "resume_phase": "thumbnailing",
+                        "retry_phase": "thumbnailing",
+                        "single_phase": True,
+                    },
+                },
+            }
+            with patch.object(executor, "_release_quick_export_lane"), patch.object(
+                executor, "_quick_export_pipeline", side_effect=fake_pipeline
+            ):
+                result = executor._export(command)
+
+            self.assertEqual(result["quick_mode_status"], "phase_completed")
+            self.assertEqual(observed["resume_phase"], "thumbnailing")
+
     def test_targeted_thumbnail_phase_does_not_start_compress(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

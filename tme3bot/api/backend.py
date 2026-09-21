@@ -800,6 +800,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         has_upload_assets = bool(item.get("archive_parts", 0)) and bool(item.get("thumbnail_present"))
         payload: dict[str, Any] = {
             "quick_mode": True,
+            "quick_phase": resume_phase or "auto",
             "quick_settings": context.utility_settings.get(),
             "quick_retry": {
                 "retry_phase": resume_phase or "auto",

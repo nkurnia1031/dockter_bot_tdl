@@ -457,7 +457,12 @@ class WorkerJobExecutor:
             if kind == "export" and bool((command.get("payload") or {}).get("quick_mode")):
                 retry = (command.get("payload") or {}).get("quick_retry") or {}
                 retry = retry if isinstance(retry, dict) else {}
-                retry_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower()
+                retry_phase = str(
+                    retry.get("resume_phase")
+                    or payload.get("quick_phase")
+                    or retry.get("retry_phase")
+                    or "exporting"
+                ).strip().lower()
                 stage_job_id = str(retry.get("stage_job_id") or command.get("job_id") or "")
                 if stage_job_id:
                     keys.add(f"worker:{worker}:quick-stage:{stage_job_id}")
@@ -821,7 +826,12 @@ class WorkerJobExecutor:
             stage_root,
             getattr(getattr(runtime, "config", None), "tdl_export_user", None),
         )
-        requested_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower()
+        requested_phase = str(
+            retry.get("resume_phase")
+            or payload.get("quick_phase")
+            or retry.get("retry_phase")
+            or "exporting"
+        ).strip().lower()
         if requested_phase not in {"auto", *QUICK_PHASES}:
             requested_phase = "exporting"
         operation_id = str(retry.get("quick_operation_id") or stage_job_id)
@@ -1141,8 +1151,6 @@ class WorkerJobExecutor:
         # ExportJobResult.  It can safely continue at upload and cleanup.
         if requested == "auto" and archives and thumbnail.is_file():
             return "uploading"
-        if raw_export is None and requested not in {"uploading", "cleanup"}:
-            return "downloading" if has_json else ("thumbnailing" if has_media else "exporting")
         if requested == "auto":
             if archives and thumbnail.is_file():
                 return "uploading"
@@ -1158,19 +1166,43 @@ class WorkerJobExecutor:
             # but before the phase checkpoint is written.  Existing media is
             # then the safe dependency boundary: continue with thumbnailing
             # instead of exporting the chat a second time.
-            return "downloading" if has_json else ("thumbnailing" if has_media else "exporting")
+            if has_json:
+                return "downloading"
+            if has_media:
+                return "thumbnailing"
+            raise QuickModeError(
+                "Resume Download tidak dapat dimulai: JSON dan media staging tidak tersedia."
+            )
         if requested == "thumbnailing":
-            return "thumbnailing" if has_media else ("downloading" if has_json else "exporting")
+            if has_media:
+                return "thumbnailing"
+            if has_json:
+                return "downloading"
+            raise QuickModeError(
+                "Thumbnail tidak dapat dibuat: media staging tidak tersedia. Gunakan Resume Download."
+            )
         if requested == "compressing":
             if has_media and thumbnail.is_file():
                 return "compressing"
-            return "thumbnailing" if has_media else ("downloading" if has_json else "exporting")
+            if has_media:
+                return "thumbnailing"
+            if has_json:
+                return "downloading"
+            raise QuickModeError(
+                "Compress tidak dapat dimulai: media staging tidak tersedia."
+            )
         if requested == "uploading":
             if archives and thumbnail.is_file():
                 return "uploading"
             if has_media and thumbnail.is_file():
                 return "compressing"
-            return "thumbnailing" if has_media else ("downloading" if has_json else "exporting")
+            if has_media:
+                return "thumbnailing"
+            if has_json:
+                return "downloading"
+            raise QuickModeError(
+                "Upload tidak dapat dimulai: arsip atau thumbnail belum tersedia."
+            )
         return "cleanup" if requested == "cleanup" else "exporting"
 
     def _export(self, command: dict[str, Any]) -> Any:
@@ -1188,7 +1220,12 @@ class WorkerJobExecutor:
                 command, runtime
             )
             retry = payload.get("quick_retry") or {}
-            requested_phase = str(retry.get("resume_phase") or retry.get("retry_phase") or "exporting").strip().lower() if isinstance(retry, dict) else "exporting"
+            requested_phase = str(
+                retry.get("resume_phase")
+                or payload.get("quick_phase")
+                or retry.get("retry_phase")
+                or "exporting"
+            ).strip().lower() if isinstance(retry, dict) else str(payload.get("quick_phase") or "exporting").strip().lower()
             if resume_phase == "exporting" and requested_phase != "exporting":
                 self._clear_quick_stage(stage_root)
                 quick_manifest = {

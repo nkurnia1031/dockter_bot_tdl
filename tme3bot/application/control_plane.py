@@ -574,12 +574,14 @@ class ControlPlane:
             stage_job_id = str(previous_retry.get("stage_job_id") or original.id)
             operation_id = str(previous_retry.get("quick_operation_id") or stage_job_id)
             export_start_id, export_end_id = self._export_message_range(original)
-            payload["quick_mode"] = True
             target_phase = (
                 resume_phase.strip().lower()
                 if isinstance(resume_phase, str) and resume_phase.strip()
                 else None
             )
+            payload["quick_mode"] = True
+            if target_phase:
+                payload["quick_phase"] = target_phase
             payload["quick_retry"] = {
                 "retry_of": original.id,
                 # Keep the historical phase for reports/backwards-compatible
