@@ -3479,7 +3479,22 @@ class WorkerJobExecutor:
                 if not channel_ref:
                     raise QuickModeError("Storage channel belum dikonfigurasi.")
                 verify_root = stage_root / ".quickmode-verify"
-                verify_root.mkdir(parents=True, exist_ok=True)
+                verify_root.mkdir(mode=0o770, parents=True, exist_ok=True)
+                storage_user = getattr(client, "run_as_user", None) or getattr(
+                    storage_runtime.config, "tdl_export_user", None
+                )
+                # The executor may run as root while TDL storage runs as
+                # user1. Make only this disposable directory writable by the
+                # TDL user; never chown the stage's cloned sessions.
+                ensure_quick_stage_writable(verify_root, storage_user)
+                try:
+                    verify_root.chmod(0o770)
+                except OSError:
+                    LOGGER.warning(
+                        "Could not chmod Quick Mode verification directory %s",
+                        verify_root,
+                        exc_info=True,
+                    )
                 fallback_messages: list[dict[str, Any]] | None = None
                 with storage_runtime.export_operation_lock:
                     with self._capture_tdl_output(client):
@@ -3550,7 +3565,14 @@ class WorkerJobExecutor:
                     config_root=Path(getattr(self.config, "profile_root", "/data")),
                 )
                 drive_found = int(drive_result.get("found", 0))
-                if drive_found < len(archive_files):
+                drive_errors = drive_result.get("errors")
+                if drive_errors:
+                    drive_reason = (
+                        "Rclone gagal memverifikasi Google Drive. Periksa file konfigurasi "
+                        f"{getattr(self.config, 'rclone_config_path', '/data/.config/rclone.conf')}: "
+                        f"{str(drive_errors)[:500]}"
+                    )
+                elif drive_found < len(archive_files):
                     drive_reason = str(drive_result.get("missing") or "Archive belum lengkap di Google Drive.")[:500]
             except Exception as exc:
                 drive_reason = str(exc)[:500]

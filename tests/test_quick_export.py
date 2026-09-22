@@ -94,6 +94,7 @@ class QuickThumbnailTests(unittest.TestCase):
 
             class StorageClient:
                 output_callback = None
+                run_as_user = "storage-user"
 
                 def export_messages(self, channel, start_id, target, **kwargs):
                     name = "batch.png" if int(start_id) == 102 else "batch.7z.001"
@@ -151,7 +152,9 @@ class QuickThumbnailTests(unittest.TestCase):
             )
             publisher = SimpleNamespace(emit=lambda *args, **kwargs: None)
             executor = WorkerJobExecutor(config, Profiles(), publisher)
-            with patch("tme3bot.worker.executor.RcloneRunner", VerifyRclone):
+            with patch("tme3bot.worker.executor.RcloneRunner", VerifyRclone), patch(
+                "tme3bot.worker.executor.ensure_quick_stage_writable"
+            ) as ensure_writable:
                 result = executor.quickmode_verify("verify-stage")
 
             self.assertEqual(result["status"], "verified")
@@ -159,6 +162,7 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual(result["drive_found"], 1)
             self.assertTrue(result["staging_cleaned"])
             self.assertFalse(stage.exists())
+            ensure_writable.assert_called_once_with(stage / ".quickmode-verify", "storage-user")
 
     def test_four_photos_without_videos_do_not_invoke_video_processing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -282,6 +286,32 @@ class QuickThumbnailTests(unittest.TestCase):
             filter_value = compose[compose.index("-filter_complex") + 1]
             self.assertIn("xstack=inputs=8", filter_value)
             self.assertFalse(any(path.exists() for path in root.glob(".video-frame-*.png")))
+
+    def test_corrupt_video_is_skipped_and_next_video_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_media(root, ["broken.mp4", "healthy.mp4"])
+            builder = QuickThumbnailBuilder()
+            commands: list[list[str]] = []
+
+            def fake_run(command: list[str]) -> str:
+                commands.append(command)
+                if command[0] == "ffprobe" and "broken.mp4" in command[-1]:
+                    raise QuickModeError("moov atom not found")
+                if command[0] == "ffprobe":
+                    return "30"
+                Path(command[-1]).write_bytes(b"png")
+                return ""
+
+            builder._run = fake_run  # type: ignore[method-assign]
+            details = builder.build(root, root / "result.png")
+
+            self.assertTrue((root / "result.png").exists())
+            self.assertEqual(details["video_frames_used"], 8)
+            self.assertEqual(details["skipped_media"][0]["name"], "broken.mp4")
+            self.assertTrue(
+                any("healthy.mp4" in " ".join(command) for command in commands if "-i" in command)
+            )
 
     def test_no_visual_media_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

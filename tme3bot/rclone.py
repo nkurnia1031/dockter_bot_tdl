@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Callable, Iterable
 
+from tme3bot.command_audit import bounded_output_tail, sanitize_text
 from tme3bot.tdl import CommandCallback, SubprocessRunner, TDLCommandError, TDLStalledError
 from tme3bot.utility import validate_rclone_destination
 
@@ -34,6 +35,19 @@ class RcloneRunner:
 
     def cancel_current(self) -> bool:
         return self.runner.interrupt_current()
+
+    @staticmethod
+    def _command_output(result) -> str:
+        output = "\n".join(
+            value
+            for value in (
+                getattr(result, "stdout", "") or "",
+                getattr(result, "stderr", "") or "",
+            )
+            if value
+        )
+        lines, _ = bounded_output_tail(output, max_lines=12, max_bytes=2048)
+        return "\n".join(sanitize_text(line) for line in lines)
 
     def copy_files(
         self,
@@ -166,8 +180,15 @@ class RcloneRunner:
             if not path.is_file():
                 raise RcloneError(f"File rclone tidak ditemukan: {path.name}")
 
+        self._verify_destination_access(
+            destination,
+            config,
+            log_prefix="rclone-verify-preflight",
+        )
+
         found: list[str] = []
         missing: list[dict[str, str]] = []
+        errors: list[dict[str, str]] = []
         for path, raw_name in zip(paths, names):
             remote_name = str(raw_name).replace("\\", "/").strip("/")
             remote_parts = [part for part in remote_name.split("/") if part]
@@ -194,16 +215,74 @@ class RcloneRunner:
                     command_callback=self.command_callback,
                 )
             except (TDLStalledError, TDLCommandError, OSError) as exc:
-                missing.append({"name": remote_name, "error": str(exc)[:300]})
+                errors.append({"name": remote_name, "error": str(exc)[:300]})
                 continue
             if result.returncode == 0:
                 found.append(remote_name)
+            elif int(result.returncode) == 1:
+                missing.append(
+                    {
+                        "name": remote_name,
+                        "error": "File belum ditemukan atau ukuran berbeda (rclone exit code 1).",
+                    }
+                )
             else:
-                missing.append({"name": remote_name, "error": f"exit code {result.returncode}"})
+                errors.append(
+                    {
+                        "name": remote_name,
+                        "error": (
+                            f"Rclone gagal memeriksa file (exit code {result.returncode}): "
+                            f"{self._command_output(result) or 'detail tidak tersedia'}"
+                        )[:500],
+                    }
+                )
         return {
             "destination": destination,
             "expected": len(paths),
             "found": len(found),
             "files": found,
             "missing": missing,
+            "errors": errors,
+            "status": "error" if errors else ("complete" if not missing else "incomplete"),
         }
+
+    def _verify_destination_access(
+        self,
+        destination: str,
+        config: Path,
+        *,
+        log_prefix: str,
+    ) -> None:
+        """Check remote/config access separately from per-file differences."""
+        command = [
+            "rclone",
+            "lsf",
+            destination,
+            "--max-depth",
+            "1",
+            "--config",
+            str(config),
+            "--log-level",
+            "ERROR",
+        ]
+        try:
+            result = self.runner.run(
+                command,
+                log_prefix=log_prefix,
+                output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except (TDLStalledError, TDLCommandError, OSError) as exc:
+            raise RcloneError(
+                "Rclone tidak dapat mengakses Google Drive. "
+                f"Periksa file konfigurasi {config} dan koneksi remote '{destination}'. "
+                f"Detail: {str(exc)[:400]}"
+            ) from exc
+        if result.returncode != 0:
+            detail = self._command_output(result) or "detail tidak tersedia"
+            raise RcloneError(
+                "Rclone tidak dapat mengakses Google Drive. "
+                f"Periksa file konfigurasi {config} dan koneksi remote '{destination}'. "
+                f"Detail: {detail[:400]}"
+            )

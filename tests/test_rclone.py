@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tme3bot.rclone import RcloneRunner
+from tme3bot.rclone import RcloneError, RcloneRunner
 
 
 class FakeSubprocessRunner:
@@ -87,9 +87,39 @@ class RcloneRunnerTests(unittest.TestCase):
             self.assertEqual(result["expected"], 1)
             self.assertEqual(result["found"], 1)
             self.assertEqual(result["files"], ["result.7z.001"])
-            command = subprocess_runner.commands[0][0]
+            self.assertEqual(subprocess_runner.commands[0][0][:2], ["rclone", "lsf"])
+            command = subprocess_runner.commands[1][0]
             self.assertEqual(command[:3], ["rclone", "check", str(archive)])
             self.assertIn("--size-only", command)
+
+    def test_verify_reports_remote_configuration_failure(self):
+        class FailedPreflightRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsf":
+                    return SimpleNamespace(
+                        returncode=1,
+                        stdout="",
+                        stderr="invalid_grant: token expired",
+                    )
+                return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            archive.write_bytes(b"archive")
+
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaisesRegex(RcloneError, "Periksa file konfigurasi"):
+                    RcloneRunner(FailedPreflightRunner()).verify_files(
+                        [archive],
+                        "googledrive:backup",
+                        config,
+                        workspace_root=workspace,
+                    )
 
 
 if __name__ == "__main__":

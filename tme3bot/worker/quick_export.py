@@ -431,7 +431,18 @@ class QuickThumbnailBuilder:
         media_root = Path(media_root).resolve()
         output_path = Path(output_path).resolve()
         frame_files: list[Path] = []
+        skipped_media: list[dict[str, str]] = []
         output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def skip_media(path: Path, error: Exception) -> None:
+            detail = str(error).strip() or error.__class__.__name__
+            detail = detail[-500:]
+            skipped_media.append({"name": path.name, "error": detail})
+            if self.log_callback:
+                self.log_callback(
+                    f"Thumbnail melewati media rusak {path.name}: {detail}"
+                )
+
         try:
             photos, videos = visual_media(media_root)
             photos_to_use = min(len(photos), 4 if videos else 8)
@@ -439,26 +450,74 @@ class QuickThumbnailBuilder:
             video_quota = 8 - len(selected)
 
             if videos and video_quota > 0:
-                videos_to_use = videos[:min(len(videos), video_quota)]
-                base_count, remainder = divmod(video_quota, len(videos_to_use))
+                valid_videos: list[tuple[Path, float]] = []
+                next_video_index = 0
+                target_video_count = min(len(videos), video_quota)
+
+                def probe_next_video() -> bool:
+                    nonlocal next_video_index
+                    while next_video_index < len(videos):
+                        video = videos[next_video_index]
+                        next_video_index += 1
+                        try:
+                            valid_videos.append((video, self._video_duration(video)))
+                            return True
+                        except ProcessStalledError:
+                            raise
+                        except Exception as exc:
+                            skip_media(video, exc)
+                    return False
+
+                while len(valid_videos) < target_video_count and probe_next_video():
+                    pass
+
+                remaining = video_quota
                 frame_idx = 0
-                for v_idx, video in enumerate(videos_to_use):
-                    count = base_count + (1 if v_idx < remainder else 0)
-                    if count <= 0:
+                candidate_index = 0
+                while remaining > 0:
+                    if candidate_index >= len(valid_videos):
+                        if not probe_next_video():
+                            break
                         continue
-                    duration = self._video_duration(video)
+                    video, duration = valid_videos[candidate_index]
+                    candidate_index += 1
+                    candidates_left = (
+                        len(valid_videos) - candidate_index
+                        + len(videos) - next_video_index
+                    )
+                    count = min(
+                        remaining,
+                        max(1, math.ceil(remaining / max(1, candidates_left + 1))),
+                    )
                     timestamps = self._sample_timestamps(duration, count)
+                    extracted = 0
                     for ts in timestamps:
                         frame_idx += 1
                         frame_path = output_path.parent / f".video-frame-{frame_idx}.png"
                         frame_files.append(frame_path)
                         frame_path.unlink(missing_ok=True)
-                        self._extract_video_frame(video, ts, frame_path)
+                        try:
+                            self._extract_video_frame(video, ts, frame_path)
+                        except ProcessStalledError:
+                            raise
+                        except Exception as exc:
+                            frame_path.unlink(missing_ok=True)
+                            skip_media(video, exc)
+                            # One failed frame is enough to discard this
+                            # video; use the next candidate instead of
+                            # repeatedly invoking ffmpeg on a broken input.
+                            break
                         selected.append(frame_path)
+                        extracted += 1
+                    remaining -= extracted
 
             if not selected:
+                detail = ""
+                if skipped_media:
+                    detail = f" Detail: {skipped_media[0]['name']} dilewati."
                 raise QuickModeError(
                     "Quick Mode tidak menemukan foto atau video yang dapat dibuat thumbnail."
+                    + detail
                 )
             self._compose(selected, output_path)
         finally:
@@ -469,6 +528,7 @@ class QuickThumbnailBuilder:
             "video_contact_sheet": bool(frame_files),
             "video_contact_sheets_used": len(frame_files),
             "video_frames_used": len(frame_files),
+            "skipped_media": skipped_media,
             "thumbnail_name": output_path.name,
         }
 
