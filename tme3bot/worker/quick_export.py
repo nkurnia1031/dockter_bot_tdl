@@ -18,7 +18,13 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from tme3bot.export_catalog import inspect_export_json
-from tme3bot.tdl import CommandCallback, ProcessStalledError, TDLClient
+from tme3bot.tdl import (
+    CommandCallback,
+    ProcessStalledError,
+    TDLClient,
+    notify_command_completed,
+    notify_command_started,
+)
 from tme3bot.url_parser import slugify_label
 
 
@@ -245,6 +251,13 @@ def scan_quick_stages(workspace: Path, *, worker: str | None = None) -> list[dic
                 phase = "exporting"
             resume_phase = phase
         tdl_root = stage / ".tdl"
+        worker_log = stage / "worker.log"
+        try:
+            worker_log_present = worker_log.is_file()
+            worker_log_bytes = worker_log.stat().st_size if worker_log_present else 0
+        except OSError:
+            worker_log_present = False
+            worker_log_bytes = 0
         try:
             manifest_version = int(manifest.get("version") or 1)
         except (TypeError, ValueError):
@@ -267,6 +280,8 @@ def scan_quick_stages(workspace: Path, *, worker: str | None = None) -> list[dic
             "thumbnail_present": thumbnail_present,
             "tdl_export_present": (tdl_root / "export-home" / ".tdl").is_dir(),
             "tdl_download_present": (tdl_root / "download-home" / ".tdl").is_dir(),
+            "worker_log_present": worker_log_present,
+            "worker_log_bytes": worker_log_bytes,
             "storage_folder": str(manifest.get("storage_folder") or f"ModeCepat/{quick_year()}"),
             "last_progress_at": manifest.get("last_progress_at"),
             "last_error": str(manifest.get("last_error") or "")[:1000],
@@ -655,11 +670,18 @@ class QuickThumbnailBuilder:
             )
         except OSError as exc:
             if self.command_callback is not None:
-                try:
-                    self.command_callback(command, -1, str(exc), 0.0, "quick-thumbnail")
-                except Exception:
-                    pass
+                notify_command_completed(
+                    self.command_callback,
+                    command,
+                    -1,
+                    str(exc),
+                    0.0,
+                    "quick-thumbnail",
+                )
             raise
+        command_id = notify_command_started(
+            self.command_callback, command, "quick-thumbnail"
+        )
         with self._process_lock:
             self._current_process = process
         stalled = threading.Event()
@@ -693,16 +715,15 @@ class QuickThumbnailBuilder:
                 if self._current_process is process:
                     self._current_process = None
             if self.command_callback is not None:
-                try:
-                    self.command_callback(
-                        command,
-                        int(process.returncode if process.returncode is not None else -1),
-                        f"{stdout}\n{stderr}",
-                        max(0.0, time.monotonic() - started_at),
-                        "quick-thumbnail",
-                    )
-                except Exception:
-                    pass
+                notify_command_completed(
+                    self.command_callback,
+                    command,
+                    int(process.returncode if process.returncode is not None else -1),
+                    f"{stdout}\n{stderr}",
+                    max(0.0, time.monotonic() - started_at),
+                    "quick-thumbnail",
+                    command_id,
+                )
         if stalled.is_set():
             raise ProcessStalledError(
                 f"thumbnail process stalled for {self.stall_timeout_seconds}s",

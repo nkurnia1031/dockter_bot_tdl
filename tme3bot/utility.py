@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Callable
 
 from tme3bot.persistence import write_json_atomic
-from tme3bot.tdl import CommandCallback, ProcessStalledError
+from tme3bot.tdl import (
+    CommandCallback,
+    ProcessStalledError,
+    notify_command_completed,
+    notify_command_started,
+)
 from tme3bot.tdl_output import parse_tdl_progress_line
 
 LOGGER = logging.getLogger(__name__)
@@ -474,11 +479,16 @@ class UtilityRunner:
             )
         except OSError as exc:
             if self.command_callback is not None:
-                try:
-                    self.command_callback(command, -1, str(exc), time.monotonic() - started_at, prefix)
-                except Exception:
-                    LOGGER.exception("Command callback failed for %s", prefix)
+                notify_command_completed(
+                    self.command_callback,
+                    command,
+                    -1,
+                    str(exc),
+                    time.monotonic() - started_at,
+                    prefix,
+                )
             raise
+        command_id = notify_command_started(self.command_callback, command, prefix)
         with self._process_lock:
             self._current_process = process
         assert process.stdout is not None
@@ -584,16 +594,15 @@ class UtilityRunner:
                 if self._current_process is process:
                     self._current_process = None
         if self.command_callback is not None:
-            try:
-                self.command_callback(
-                    command,
-                    int(code),
-                    "\n".join(lines),
-                    time.monotonic() - started_at,
-                    prefix,
-                )
-            except Exception:
-                LOGGER.exception("Command callback failed for %s", prefix)
+            notify_command_completed(
+                self.command_callback,
+                command,
+                int(code),
+                "\n".join(lines),
+                time.monotonic() - started_at,
+                prefix,
+                command_id,
+            )
         if stalled.is_set():
             raise ProcessStalledError(
                 f"{prefix} stalled for {self.stall_timeout_seconds}s",

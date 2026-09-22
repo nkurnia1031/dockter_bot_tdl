@@ -88,6 +88,60 @@ OutputCallback = Callable[[str], None]
 CommandCallback = Callable[[list[str], int, str, float, str], None]
 
 
+def notify_command_started(
+    callback: CommandCallback | None,
+    command: list[str],
+    log_prefix: str,
+) -> object | None:
+    """Notify an observer without making telemetry a process dependency.
+
+    New observers may expose ``command_started`` and return an opaque command
+    id which is passed back to ``notify_command_completed``.  The callable
+    callback form remains supported for older integrations.
+    """
+    if callback is None:
+        return None
+    observer = getattr(callback, "command_started", None)
+    declared = getattr(type(callback), "command_started", None)
+    if callable(observer) and callable(declared):
+        try:
+            return observer(command, log_prefix)
+        except Exception:
+            LOGGER.warning("Command start callback failed for %s", log_prefix, exc_info=True)
+            return None
+    return None
+
+
+def notify_command_completed(
+    callback: CommandCallback | None,
+    command: list[str],
+    returncode: int,
+    output: str,
+    duration_seconds: float,
+    log_prefix: str,
+    command_id: object | None = None,
+) -> None:
+    """Notify completion, supporting both new and legacy command observers."""
+    if callback is None:
+        return
+    observer = getattr(callback, "command_completed", None)
+    declared = getattr(type(callback), "command_completed", None)
+    try:
+        if callable(observer) and callable(declared):
+            observer(
+                command,
+                returncode,
+                output,
+                duration_seconds,
+                log_prefix,
+                command_id,
+            )
+        else:
+            callback(command, returncode, output, duration_seconds, log_prefix)
+    except Exception:
+        LOGGER.warning("Command callback failed for %s", log_prefix, exc_info=True)
+
+
 class SubprocessRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -132,11 +186,17 @@ class SubprocessRunner:
             )
         except FileNotFoundError as exc:
             if command_callback is not None:
-                try:
-                    command_callback(command, -1, str(exc), max(0.0, time.monotonic() - started_monotonic), log_prefix)
-                except Exception:
-                    LOGGER.exception("Command callback failed for %s", log_prefix)
+                notify_command_completed(
+                    command_callback,
+                    command,
+                    -1,
+                    str(exc),
+                    max(0.0, time.monotonic() - started_monotonic),
+                    log_prefix,
+                )
             raise TDLCommandError(command, -1, "", str(exc)) from exc
+
+        command_id = notify_command_started(command_callback, command, log_prefix)
 
         with self._lock:
             self._current_process = process
@@ -204,16 +264,15 @@ class SubprocessRunner:
         if output_callback is not None:
             output_callback(f"[process exited with code {returncode}]")
         if command_callback is not None:
-            try:
-                command_callback(
-                    command,
-                    int(returncode),
-                    f"{stdout}\n{stderr}",
-                    max(0.0, time.monotonic() - started_monotonic),
-                    log_prefix,
-                )
-            except Exception:
-                LOGGER.exception("Command callback failed for %s", log_prefix)
+            notify_command_completed(
+                command_callback,
+                command,
+                int(returncode),
+                f"{stdout}\n{stderr}",
+                max(0.0, time.monotonic() - started_monotonic),
+                log_prefix,
+                command_id,
+            )
         if stalled:
             raise TDLStalledError(
                 command,

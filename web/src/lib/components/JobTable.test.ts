@@ -5,6 +5,7 @@ import JobTable from './JobTable.svelte';
 describe('JobTable', () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -47,5 +48,18 @@ describe('JobTable', () => {
     expect(await screen.findByText('Sedang berjalan')).toBeTruthy();
     expect(urls.some((url) => decodeURIComponent(url).includes('status=queued,dispatched,running'))).toBe(true);
     expect(screen.queryByText('History terbaru')).toBeNull();
+  });
+
+  it('auto polls monitor views that also contain history', async () => {
+    const interval = vi.spyOn(globalThis, 'setInterval');
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      return new Response(JSON.stringify({ items: [{ id: 'active-1', kind: 'utility', status: 'running', progress: { phase: 'compressing' } }] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'utility', title: 'Utility monitor' });
+    expect(await screen.findByText('Sedang berjalan')).toBeTruthy();
+
+    expect(interval).toHaveBeenCalledWith(expect.any(Function), 2500);
+    expect(screen.getByText('Live · 2,5 detik')).toBeTruthy();
   });
 });

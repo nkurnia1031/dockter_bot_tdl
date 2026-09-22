@@ -153,6 +153,71 @@ class CommandMilestoneRecorder:
         self.publisher = publisher
         self.job_id = job_id
         self.secrets = secrets
+        self._counter = 0
+        self._lock = threading.Lock()
+
+    def command_started(self, command: list[str], log_prefix: str) -> str:
+        """Create the pending milestone before a subprocess begins work."""
+        with self._lock:
+            self._counter += 1
+            command_id = f"{self.job_id}:command:{self._counter}"
+        try:
+            self.publisher.emit(
+                self.job_id,
+                "running",
+                "command.started",
+                result={
+                    "command_id": command_id,
+                    "command": sanitize_command(command, self.secrets),
+                    "log_prefix": str(log_prefix),
+                    "status": "running",
+                },
+            )
+        except Exception:
+            LOGGER.warning(
+                "Command start milestone failed for job %s; physical command continues",
+                self.job_id,
+                exc_info=True,
+            )
+        return command_id
+
+    def command_completed(
+        self,
+        command: list[str],
+        returncode: int,
+        output: str,
+        duration_seconds: float,
+        log_prefix: str,
+        command_id: object | None = None,
+    ) -> None:
+        """Complete the pending milestone with bounded, sanitized output."""
+        try:
+            tail, truncated = bounded_output_tail(sanitize_text(output, self.secrets))
+            result = {
+                "command": sanitize_command(command, self.secrets),
+                "log_prefix": str(log_prefix),
+                "returncode": int(returncode),
+                "duration_seconds": round(max(0.0, float(duration_seconds)), 3),
+                "output_tail": [
+                    sanitize_text(line, self.secrets)
+                    for line in tail
+                ],
+                "output_truncated": bool(truncated),
+            }
+            if command_id is not None:
+                result["command_id"] = str(command_id)
+            self.publisher.emit(
+                self.job_id,
+                "running",
+                "command.completed",
+                result=result,
+            )
+        except Exception:
+            LOGGER.warning(
+                "Command milestone failed for job %s; physical command already finished",
+                self.job_id,
+                exc_info=True,
+            )
 
     def __call__(
         self,
@@ -162,30 +227,13 @@ class CommandMilestoneRecorder:
         duration_seconds: float,
         log_prefix: str,
     ) -> None:
-        try:
-            tail, truncated = bounded_output_tail(sanitize_text(output, self.secrets))
-            self.publisher.emit(
-                self.job_id,
-                "running",
-                "command.completed",
-                result={
-                    "command": sanitize_command(command, self.secrets),
-                    "log_prefix": str(log_prefix),
-                    "returncode": int(returncode),
-                    "duration_seconds": round(max(0.0, float(duration_seconds)), 3),
-                    "output_tail": [
-                        sanitize_text(line, self.secrets)
-                        for line in tail
-                    ],
-                    "output_truncated": bool(truncated),
-                },
-            )
-        except Exception:
-            LOGGER.warning(
-                "Command milestone failed for job %s; physical command already finished",
-                self.job_id,
-                exc_info=True,
-            )
+        self.command_completed(
+            command,
+            returncode,
+            output,
+            duration_seconds,
+            log_prefix,
+        )
 
 
 def json_value(value: Any) -> Any:
@@ -632,6 +680,25 @@ class WorkerJobExecutor:
             return None
         return str(stage) if stage.exists() else None
 
+    def _quick_log_path(self, command: dict[str, Any]) -> Path | None:
+        """Create the persistent, redacted worker log inside Quick staging."""
+        payload = command.get("payload") or {}
+        if not bool(payload.get("quick_mode")):
+            return None
+        retry = payload.get("quick_retry") or {}
+        retry = retry if isinstance(retry, dict) else {}
+        stage_id = str(retry.get("stage_job_id") or command.get("job_id") or "")
+        if not stage_id:
+            return None
+        stage = migrate_legacy_quick_stage(self._quick_workspace(self.config), stage_id)
+        stage.mkdir(parents=True, exist_ok=True)
+        path = (stage / "worker.log").resolve()
+        try:
+            path.parent.relative_to(stage.resolve())
+        except ValueError as exc:
+            raise QuickModeError("File log Quick Mode keluar dari staging.") from exc
+        return path
+
     def _cancel_error(self, command: dict[str, Any]) -> str:
         staging = self._quick_staging_path(command)
         if staging:
@@ -645,7 +712,6 @@ class WorkerJobExecutor:
         kind = str(command["kind"])
         started_at = utc_now().isoformat()
         snapshot = JobLogSnapshot()
-        snapshot.add(f"[job {job_id} started: {kind}]")
         self._job_log.snapshot = snapshot
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
         quick_settings = payload.get("quick_settings") if isinstance(payload, dict) else {}
@@ -660,6 +726,19 @@ class WorkerJobExecutor:
             job_id,
             [value for value in secrets if value],
         )
+        self._job_log.job_id = job_id
+        self._job_log.secrets = [value for value in secrets if value]
+        try:
+            self._job_log.file_path = self._quick_log_path(command)
+        except Exception:
+            self._job_log.file_path = None
+            LOGGER.warning(
+                "Could not initialize Quick Mode worker log for %s",
+                job_id,
+                exc_info=True,
+            )
+        self._job_log.heartbeat_at = 0.0
+        self._append_job_log(f"[job {job_id} started: {kind}]")
         with self._lock:
             self._active[job_id] = (profile, kind)
             self._log_snapshots[job_id] = snapshot
@@ -682,7 +761,7 @@ class WorkerJobExecutor:
             result = self._execute(command)
             with self._lock:
                 cancelled = job_id in self._cancel_requested
-            snapshot.add("[job terminated]" if cancelled else "[job completed]")
+            self._append_job_log("[job terminated]" if cancelled else "[job completed]")
             self._publish_log_snapshot(job_id, snapshot)
             if cancelled:
                 phase = self._quick_terminal_phase(command, "cancelled")
@@ -712,7 +791,7 @@ class WorkerJobExecutor:
                 )
         except Exception as exc:
             LOGGER.exception("Job %s (%s) failed", job_id, kind)
-            snapshot.add(f"[job failed: {exc}]")
+            self._append_job_log(f"[job failed: {exc}]")
             self._publish_log_snapshot(job_id, snapshot)
             with self._lock:
                 if isinstance(exc, (ProcessStalledError, TDLStalledError)):
@@ -758,6 +837,9 @@ class WorkerJobExecutor:
         finally:
             del self._job_log.snapshot
             del self._job_log.audit
+            for name in ("job_id", "secrets", "file_path", "heartbeat_at"):
+                if hasattr(self._job_log, name):
+                    delattr(self._job_log, name)
             with self._lock:
                 self._active.pop(job_id, None)
                 # Job IDs are stable across retries. Allow the next attempt
@@ -806,9 +888,52 @@ class WorkerJobExecutor:
         snapshot = getattr(self._job_log, "snapshot", None)
         if snapshot is not None:
             snapshot.add(line)
+        file_path = getattr(self._job_log, "file_path", None)
+        if isinstance(file_path, Path):
+            secrets = getattr(self._job_log, "secrets", [])
+            safe_lines = sanitize_text(str(line), secrets).splitlines() or [str(line)]
+            try:
+                with file_path.open("a", encoding="utf-8") as stream:
+                    for value in safe_lines:
+                        stream.write(f"[{utc_now().isoformat()}] {value.rstrip()}\n")
+            except OSError:
+                # Diagnostics must never break the physical command.
+                LOGGER.warning(
+                    "Could not append Quick Mode worker log %s",
+                    file_path,
+                    exc_info=True,
+                )
+
+        # Raw TDL/utility/ffmpeg output is meaningful activity even when it
+        # does not contain a parseable percentage. Refresh the backend
+        # watchdog from that activity, but throttle network calls so a busy
+        # subprocess cannot be slowed by telemetry.
+        job_id = getattr(self._job_log, "job_id", None)
+        if job_id:
+            now = time.monotonic()
+            last = float(getattr(self._job_log, "heartbeat_at", 0.0) or 0.0)
+            if now - last >= 15.0:
+                self._job_log.heartbeat_at = now
+                try:
+                    self.publisher.emit(
+                        str(job_id),
+                        "running",
+                        "progress.snapshot",
+                        transient=True,
+                        progress={
+                            "worker_output_at": utc_now().isoformat(),
+                            "heartbeat": True,
+                        },
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "Could not publish worker output heartbeat for %s",
+                        job_id,
+                        exc_info=True,
+                    )
 
     def _command_callback(self):
-        return getattr(getattr(self._job_log, "audit", None), "__call__", None)
+        return getattr(self._job_log, "audit", None)
 
     def _publish_log_snapshot(self, job_id: str, snapshot: JobLogSnapshot) -> None:
         self.publisher.emit(
@@ -993,7 +1118,7 @@ class WorkerJobExecutor:
     @staticmethod
     def _clear_quick_stage(stage_root: Path) -> None:
         for child in Path(stage_root).iterdir():
-            if child.name == "quickmode.json":
+            if child.name in {"quickmode.json", "worker.log"}:
                 continue
             if child.is_dir():
                 shutil.rmtree(child, ignore_errors=True)

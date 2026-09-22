@@ -64,6 +64,63 @@ class QuickThumbnailTests(unittest.TestCase):
         self.assertTrue(result["output_truncated"])
         self.assertNotIn("secret-value", str(result))
 
+    def test_command_milestone_is_started_then_completed_with_same_id(self) -> None:
+        events = []
+
+        class Publisher:
+            def emit(self, *args, **kwargs):
+                events.append((args, kwargs))
+
+        recorder = CommandMilestoneRecorder(Publisher(), "job-1", [])
+        command_id = recorder.command_started(["ffmpeg", "-i", "input.mp4"], "thumbnail")
+        recorder.command_completed(
+            ["ffmpeg", "-i", "input.mp4"],
+            0,
+            "frame=1\n",
+            0.5,
+            "thumbnail",
+            command_id,
+        )
+
+        self.assertEqual([event[0][2] for event in events], ["command.started", "command.completed"])
+        self.assertEqual(events[0][1]["result"]["command_id"], command_id)
+        self.assertEqual(events[1][1]["result"]["command_id"], command_id)
+
+    def test_quickmode_worker_log_is_persistent_and_heartbeat_is_best_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            events = []
+
+            class Publisher:
+                def emit(self, *args, **kwargs):
+                    events.append((args, kwargs))
+
+            executor = WorkerJobExecutor(
+                SimpleNamespace(utility_workspace_root=workspace),
+                SimpleNamespace(),
+                Publisher(),
+            )
+            stage = quick_stage_root(workspace, "log-stage")
+            stage.mkdir(parents=True)
+            executor._job_log.snapshot = JobLogSnapshot()
+            executor._job_log.job_id = "log-job"
+            executor._job_log.file_path = stage / "worker.log"
+            executor._job_log.secrets = ["secret-value"]
+            executor._job_log.heartbeat_at = 0.0
+            try:
+                executor._append_job_log("progress secret-value")
+            finally:
+                del executor._job_log.snapshot
+                del executor._job_log.job_id
+                del executor._job_log.file_path
+                del executor._job_log.secrets
+                del executor._job_log.heartbeat_at
+
+            content = (stage / "worker.log").read_text(encoding="utf-8")
+            self.assertIn("progress [redacted]", content)
+            self.assertNotIn("secret-value", content)
+            self.assertTrue(any(event[0][2] == "progress.snapshot" for event in events))
+
     def test_quickmode_verify_requires_channel_and_drive_before_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)

@@ -34,9 +34,11 @@
   const active = (job: Job) => activeStates.includes(job.status);
   const activeJobs = $derived(jobs.filter(active));
   const historyJobs = $derived(jobs.filter((job) => !active(job)));
-  const milestones = $derived([...events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type))].reverse());
-  const latestSnapshot = $derived([...events].reverse().find((event) => event.event_type === 'log.snapshot' && Array.isArray(event.result?.log?.lines)));
-  const rawLogLines = $derived(liveLog?.log?.lines || latestSnapshot?.result?.log?.lines || []);
+  const newestFirst = (items: JobEvent[]) => [...items].sort((left, right) => Number(right.sequence || 0) - Number(left.sequence || 0));
+  const milestones = $derived(newestFirst(events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type))));
+  const latestSnapshot = $derived(newestFirst(events.filter((event) => event.event_type === 'log.snapshot' && Array.isArray(event.result?.log?.lines)))[0]);
+  const liveLogLines = $derived(liveLog?.log?.lines);
+  const rawLogLines = $derived(Array.isArray(liveLogLines) && liveLogLines.length ? liveLogLines : latestSnapshot?.result?.log?.lines || []);
   const logLines = $derived(
     (liveLog?.log?.order || latestSnapshot?.result?.log?.order) === 'newest_first'
       ? rawLogLines
@@ -149,11 +151,11 @@
     const detail = [position, media, event.progress?.message || event.error?.message || event.result?.status].filter(Boolean).join(' · ');
     return `#${event.sequence} [${event.status}] ${event.event_type}: ${textValue(detail, 'Event tercatat')}`;
   };
-  const informativeEvents = $derived([...events.filter((event) =>
+  const informativeEvents = $derived(newestFirst(events.filter((event) =>
     event.event_type.startsWith('download.')
     || event.event_type === 'artifact.missing'
     || (!logLines.length && !['log.snapshot', 'progress.snapshot'].includes(event.event_type))
-  )].reverse().map(eventLine));
+  )).map(eventLine));
   const displayLogLines = $derived([
     ...informativeEvents,
     ...(informativeEvents.length && logLines.length ? ['──────── raw worker output ────────'] : []),
@@ -177,7 +179,9 @@
     window.addEventListener('tme3:context-changed', contextRefresh);
     window.addEventListener('tme3:job-finished', jobFinished);
     load();
-    if (view === 'active') pollTimer = setInterval(() => load(), 2500);
+    // Every monitor view may contain active jobs. History-only remains an
+    // explicit read so opening old records does not create background traffic.
+    if (view !== 'history') pollTimer = setInterval(() => load(), 2500);
     return () => {
       mounted = false;
       if (pollTimer) clearInterval(pollTimer);
@@ -192,7 +196,7 @@
   <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-4 sm:px-5">
     <div><p class="eyebrow">{view === 'history' ? 'HISTORY' : 'JOB MONITOR'}</p><h2 class="mt-1 text-lg font-extrabold">{title}</h2></div>
     <div class="flex flex-wrap items-center gap-2">
-      {#if view === 'active'}<span class="badge running">Live · 2,5 detik</span>{:else if view === 'history'}<span class="muted text-xs">Refresh manual atau saat job selesai</span>{/if}
+      {#if view !== 'history'}<span class="badge running">Live · 2,5 detik</span>{:else}<span class="muted text-xs">Refresh manual atau saat job selesai</span>{/if}
       {#if lastRefreshed}
         <span class="muted text-xs">Terakhir diperbarui: {formatClock(lastRefreshed)}</span>
       {/if}
@@ -270,7 +274,7 @@
         {/if}
         <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each resultEntries(selected.result?.value || selected.result) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
       {:else if detailTab === 'milestones'}
-        <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div>{#if event.event_type === 'command.completed'}<p class="mt-2 break-all font-mono text-xs">$ {(event.result?.command || []).join(' ')}</p>{#if event.result?.output_tail?.length}<pre class="terminal mt-2 max-h-48 overflow-auto whitespace-pre-wrap p-3 text-xs">{event.result.output_tail.join('\n')}</pre>{/if}<p class="muted mt-2 text-xs">exit {event.result?.returncode ?? '?'} · {event.result?.duration_seconds ?? 0}s{event.result?.output_truncated ? ' · output lama dipangkas' : ''}</p>{:else}<p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p>{/if}</article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
+        <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div>{#if event.event_type === 'command.started' || event.event_type === 'command.completed'}<p class="mt-2 break-all font-mono text-xs">$ {(event.result?.command || []).join(' ')}</p>{#if event.event_type === 'command.started'}<p class="muted mt-2 text-sm">Command dikirim, menunggu hasil...</p>{:else}{#if event.result?.output_tail?.length}<pre class="terminal mt-2 max-h-48 overflow-auto whitespace-pre-wrap p-3 text-xs">{event.result.output_tail.join('\n')}</pre>{/if}<p class="muted mt-2 text-xs">exit {event.result?.returncode ?? '?'} · {event.result?.duration_seconds ?? 0}s{event.result?.output_truncated ? ' · output lama dipangkas' : ''}</p>{/if}{:else}<p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p>{/if}</article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
       {:else}
         <div class="mb-2 flex justify-end"><button class="button secondary" onclick={() => copy(JSON.stringify({job:selected,events}, null, 2))}><Copy size={14}/>Salin</button></div><pre class="terminal max-h-[48dvh] overflow-auto p-4 text-xs">{JSON.stringify({job:selected,events}, null, 2)}</pre>
       {/if}
