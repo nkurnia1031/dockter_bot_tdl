@@ -9,7 +9,7 @@
 
   type Job = Record<string, any>;
   type JobEvent = Record<string, any>;
-  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean } = $props();
+  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false, view = 'all' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean; view?: 'all'|'active'|'history' } = $props();
   let jobs = $state<Job[]>([]);
   let error = $state('');
   let selected = $state<Job | null>(null);
@@ -27,6 +27,8 @@
   let lastRefreshed = $state<Date | null>(null);
   let mounted = false;
   let loadGeneration = 0;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let hasLoaded = false;
 
   const activeStates = ['queued', 'dispatched', 'running'];
   const active = (job: Job) => activeStates.includes(job.status);
@@ -44,12 +46,19 @@
 
   async function load() {
     const request = ++loadGeneration;
+    const previousActiveIds = new Set(jobs.filter(active).map((job) => String(job.id)));
     try {
       const params = new URLSearchParams({ limit: '30', scope });
       if (kind) params.set('kind', kind);
       if (profile) params.set('profile', profile);
       if (worker) params.set('worker', worker);
-      if (status) params.set('status', status);
+      if (view === 'active') {
+        params.set('status', 'queued,dispatched,running');
+      } else if (view === 'history') {
+        params.set('status', status || 'succeeded,failed,cancelled');
+      } else if (status) {
+        params.set('status', status);
+      }
       if (quickMode) params.set('quick_mode', 'true');
       const query = `/jobs?${params.toString()}`;
       const next = (await api<{items:Job[]}>(query)).items || [];
@@ -57,6 +66,14 @@
       jobs = next;
       lastRefreshed = new Date();
       if (selected) selected = next.find((job) => job.id === selected?.id) || selected;
+      if (view === 'active' && hasLoaded) {
+        const currentActiveIds = new Set(next.filter(active).map((job) => String(job.id)));
+        const finished = [...previousActiveIds].filter((id) => !currentActiveIds.has(id));
+        if (finished.length && typeof window !== 'undefined') {
+          window.dispatchEvent(new CustomEvent('tme3:job-finished', { detail: { jobIds: finished } }));
+        }
+      }
+      hasLoaded = true;
       error = '';
     } catch (cause) {
       if (request !== loadGeneration) return;
@@ -139,7 +156,8 @@
   ]);
   onMount(() => {
     mounted = true;
-    const refresh = () => load();
+    const refresh = () => { if (view !== 'history') load(); };
+    const jobFinished = () => { if (view === 'history') load(); };
     const contextRefresh = () => {
       loadGeneration += 1;
       jobs = [];
@@ -152,29 +170,34 @@
     };
     window.addEventListener('tme3:data-mutated', refresh);
     window.addEventListener('tme3:context-changed', contextRefresh);
+    window.addEventListener('tme3:job-finished', jobFinished);
     load();
+    if (view === 'active') pollTimer = setInterval(() => load(), 2500);
     return () => {
       mounted = false;
+      if (pollTimer) clearInterval(pollTimer);
       window.removeEventListener('tme3:data-mutated', refresh);
       window.removeEventListener('tme3:context-changed', contextRefresh);
+      window.removeEventListener('tme3:job-finished', jobFinished);
     };
   });
 </script>
 
 <section class="card mt-7 overflow-hidden">
   <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-4 sm:px-5">
-    <div><p class="eyebrow">JOB MONITOR</p><h2 class="mt-1 text-lg font-extrabold">{title}</h2></div>
+    <div><p class="eyebrow">{view === 'history' ? 'HISTORY' : 'JOB MONITOR'}</p><h2 class="mt-1 text-lg font-extrabold">{title}</h2></div>
     <div class="flex flex-wrap items-center gap-2">
+      {#if view === 'active'}<span class="badge running">Live · 2,5 detik</span>{:else if view === 'history'}<span class="muted text-xs">Refresh manual atau saat job selesai</span>{/if}
       {#if lastRefreshed}
         <span class="muted text-xs">Terakhir diperbarui: {formatClock(lastRefreshed)}</span>
       {/if}
-      <button class="button danger" onclick={() => requestTerminate('all')}><XCircle size={16}/>Terminate semua aktif</button>
-      <button class="button secondary" onclick={load} aria-label="Refresh daftar job"><RefreshCw size={16}/>Refresh</button>
+      {#if view !== 'history'}<button class="button danger" onclick={() => requestTerminate('all')}><XCircle size={16}/>Terminate semua aktif</button>{/if}
+      <button class="button secondary" onclick={load} aria-label={view === 'active' ? 'Refresh monitor' : 'Refresh daftar job'}><RefreshCw size={16}/>Refresh</button>
     </div>
   </div>
   {#if error}<p class="m-4 rounded-xl bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{error}</p>{/if}
 
-  {#if activeJobs.length}
+  {#if view !== 'history' && activeJobs.length}
     <div class="border-b border-[var(--line)] bg-[var(--brand-soft)]/20 p-4 sm:p-5">
       <div class="mb-3 flex items-center justify-between"><h3 class="font-extrabold">Sedang berjalan</h3><span class="badge running">{activeJobs.length} aktif</span></div>
       <div class="space-y-2.5">
@@ -185,9 +208,9 @@
     </div>
   {/if}
 
-  {#if historyJobs.length}<div class="px-4 pt-4 sm:px-5"><h3 class="text-sm font-extrabold">History terbaru</h3></div>{/if}
+  {#if view !== 'active' && historyJobs.length}<div class="px-4 pt-4 sm:px-5"><h3 class="text-sm font-extrabold">History terbaru</h3></div>{/if}
   <div class="divide-y divide-[var(--line)] px-4 sm:px-5">
-    {#each historyJobs as job (job.id)}
+    {#each (view === 'active' ? [] : historyJobs) as job (job.id)}
       {@const stageId = job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null)}
       <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
         <div class="min-w-0">
@@ -215,7 +238,7 @@
         </div>
       </article>
     {/each}
-    {#if !historyJobs.length && !activeJobs.length}<div class="py-14 text-center"><ClipboardList class="mx-auto mb-2 text-violet-500"/><b>Belum ada job.</b></div>{/if}
+    {#if !historyJobs.length && !activeJobs.length}<div class="py-14 text-center"><ClipboardList class="mx-auto mb-2 text-violet-500"/><b>{view === 'active' ? 'Tidak ada job yang sedang berjalan atau antri.' : 'Belum ada job.'}</b></div>{/if}
   </div>
 </section>
 

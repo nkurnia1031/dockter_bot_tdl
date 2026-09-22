@@ -104,6 +104,7 @@ class ControlPlane:
         *,
         profile: str | None = None,
         worker: str | None = None,
+        job_id: str | None = None,
     ) -> Job:
         selected_profile, selected_worker = self.resolve_target(
             actor, profile=profile, worker=worker
@@ -112,25 +113,74 @@ class ControlPlane:
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
         if callable(list_profiles):
             available_profiles = list_profiles()
-        job_id = str(uuid.uuid4())
+        job_id = str(job_id or uuid.uuid4())
+        redacted_payload = self._redacted_payload(kind, payload)
+        existing = self.jobs.get(job_id)
+        if existing is not None and existing.status.terminal:
+            # Retry is an in-place reset. The event stream remains attached to
+            # the stable ID, while the current row becomes the new attempt.
+            job = self.jobs.reset_for_retry(job_id, redacted_payload)
+            retry_attempt = 1 + sum(
+                1
+                for event in self.jobs.events(job_id)
+                if event.event_type == "retry_started"
+            )
+            retry_meta = payload.get("quick_retry") or payload.get("export_retry") or {}
+            retry_meta = retry_meta if isinstance(retry_meta, dict) else {}
+            retry_phase = str(
+                retry_meta.get("resume_phase")
+                or retry_meta.get("retry_phase")
+                or "exporting"
+            )
+            sequence = max(
+                (event.sequence for event in self.jobs.events(job_id)), default=0
+            ) + 1
+            self.jobs.append_event(
+                JobEvent(
+                    job_id=job_id,
+                    sequence=sequence,
+                    status=JobStatus.QUEUED,
+                    event_type="retry_started",
+                    progress={
+                        "phase": "queued",
+                        "retry_attempt": retry_attempt,
+                        "retry_phase": retry_phase,
+                    },
+                )
+            )
+            job = self.jobs.get(job_id) or job
+        elif existing is not None:
+            raise DomainError(
+                "JOB_NOT_TERMINAL",
+                "Job dengan ID tersebut masih aktif dan belum dapat digunakan ulang.",
+                status_code=409,
+            )
+        else:
+            job = Job(
+                id=job_id,
+                kind=kind,
+                profile=selected_profile,
+                actor_user_id=actor.telegram_user_id,
+                worker=selected_worker,
+                status=JobStatus.QUEUED,
+                payload=redacted_payload,
+            )
+            self.jobs.create(job)
+        retry_meta = payload.get("quick_retry") or {}
+        retry_meta = retry_meta if isinstance(retry_meta, dict) else {}
+        stable_stage_id = retry_meta.get("stage_job_id")
         execution = build_execution_plan(
             kind,
             selected_profile,
             selected_worker,
             payload,
             available_profiles,
-            stage_job_id=job_id if kind == "export" and bool(payload.get("quick_mode")) else None,
+            stage_job_id=(
+                str(stable_stage_id or job_id)
+                if kind == "export" and bool(payload.get("quick_mode"))
+                else None
+            ),
         )
-        job = Job(
-            id=job_id,
-            kind=kind,
-            profile=selected_profile,
-            actor_user_id=actor.telegram_user_id,
-            worker=selected_worker,
-            status=JobStatus.QUEUED,
-            payload=self._redacted_payload(kind, payload),
-        )
-        self.jobs.create(job)
         command = {
             "job_id": job.id,
             "kind": kind,
@@ -170,9 +220,13 @@ class ControlPlane:
             ) from exc
 
     def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
+        sequence = max(
+            (event.sequence for event in self.jobs.events(job.id)), default=0
+        ) + 1
+        command["event_sequence_start"] = sequence
         dispatched = JobEvent(
             job_id=job.id,
-            sequence=1,
+            sequence=sequence,
             status=JobStatus.DISPATCHED,
             event_type="dispatched",
             progress={"worker": job.worker, "position": 1},
@@ -376,6 +430,14 @@ class ControlPlane:
                 event.job_id,
             )
             return current
+        # A reused job ID keeps its old event history. Events from an older
+        # worker attempt therefore have a sequence at or below the last
+        # persisted event and must not be applied to the new attempt.
+        latest_sequence = max(
+            (item.sequence for item in self.jobs.events(event.job_id)), default=0
+        )
+        if event.sequence <= latest_sequence:
+            return current
         job, inserted = self.jobs.append_event(event)
         self._stale_cancel_requested.pop(event.job_id, None)
         # Side effects are idempotent and intentionally replayed when a worker
@@ -501,7 +563,7 @@ class ControlPlane:
         resume_phase: str | None = None,
         single_phase: bool = False,
     ) -> Job:
-        """Create a new export attempt while preserving the old record."""
+        """Restart an export attempt while preserving its stable job ID."""
         original = self.jobs.get(job_id)
         if original is None:
             raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
@@ -608,6 +670,7 @@ class ControlPlane:
             payload,
             profile=original.profile,
             worker=original.worker,
+            job_id=original.id,
         )
 
     @staticmethod

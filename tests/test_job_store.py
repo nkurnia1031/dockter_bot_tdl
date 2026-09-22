@@ -69,6 +69,27 @@ class JobStoreTests(unittest.TestCase):
                     JobEvent("job-1", 2, JobStatus.RUNNING, "started")
                 )
 
+    def test_reset_for_retry_reuses_id_and_preserves_event_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            store.create(self.make_job())
+            store.append_event(JobEvent("job-1", 1, JobStatus.DISPATCHED, "dispatched"))
+            store.append_event(JobEvent("job-1", 2, JobStatus.RUNNING, "started"))
+            store.append_event(JobEvent("job-1", 3, JobStatus.FAILED, "failed"))
+            notification = store.create_telegram_notification("job-1", 7, 7, "default")
+            store.update_telegram_notification(
+                notification["id"],
+                {"status": "terminal", "terminal_notified_at": "2026-01-01T00:00:00+00:00"},
+            )
+
+            retry = store.reset_for_retry("job-1", {"url": "https://t.me/c/1/2", "retry": True})
+
+            self.assertEqual(retry.id, "job-1")
+            self.assertEqual(retry.status, JobStatus.QUEUED)
+            self.assertEqual(retry.payload["retry"], True)
+            self.assertEqual(len(store.events("job-1")), 3)
+            self.assertEqual(store.pending_telegram_notifications()[0]["job_id"], "job-1")
+
     def test_transient_progress_keeps_only_latest_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")

@@ -40,6 +40,7 @@
   let staging = $state<Stage[]>([]);
   let stagingErrors = $state<{worker: string; error: string}[]>([]);
   let stagingLoading = $state(false);
+  let stagingRequested = $state(false);
   let stageAction = $state<string | null>(null);
   let filterProfile = $state('');
   let filterWorker = $state('');
@@ -50,7 +51,7 @@
   let lastProfile = '';
 
   const activeStatuses = ['queued', 'dispatched', 'running'];
-  const statuses = ['queued', 'running', 'failed', 'cancelled', 'succeeded'];
+  const statuses = ['failed', 'cancelled', 'succeeded'];
   const isNumeric = (value: string) => /^-?\d+$/.test(value.trim());
   const activeJobs = $derived(allJobs.filter((job) => activeStatuses.includes(job.status)));
   const stats = $derived({
@@ -133,6 +134,7 @@
   }
 
   async function loadStaging() {
+    stagingRequested = true;
     stagingLoading = true;
     try {
       const response = await api<{items: Stage[]; errors?: {worker: string; error: string}[]}>(`/quick-mode/staging`);
@@ -319,13 +321,12 @@
     mounted = true;
     loadSources(targetProfile);
     loadStats();
-    loadStaging();
-    const refresh = () => { loadStats(); loadStaging(); };
-    window.addEventListener('tme3:data-mutated', refresh);
+    const jobFinished = () => { loadStats(); loadStaging(); };
+    window.addEventListener('tme3:job-finished', jobFinished);
     return () => {
       mounted = false;
       if (cooldownTimer) clearTimeout(cooldownTimer);
-      window.removeEventListener('tme3:data-mutated', refresh);
+      window.removeEventListener('tme3:job-finished', jobFinished);
     };
   });
 </script>
@@ -359,13 +360,15 @@
   {#if message}<p class={`mt-3 rounded-xl px-3 py-2 text-sm ${message.includes('berhasil') ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-200'}`}>{message}</p>{/if}
 </section>
 
+<JobTable kind="export" title="Quick Mode berjalan dan antri" scope="global" profile={filterProfile} worker={filterWorker} quickMode={true} view="active"/>
+
 <section class="card mt-6 p-4 sm:p-5">
   <div class="flex flex-wrap items-center justify-between gap-3">
-    <div><p class="eyebrow">FILTER</p><h2 class="mt-1 text-lg font-extrabold">Semua job Quick Mode</h2></div>
+    <div><p class="eyebrow">HISTORY FILTER</p><h2 class="mt-1 text-lg font-extrabold">Filter history Quick Mode</h2></div>
     <div class="flex items-center gap-2">
       {#if lastStatsRefreshed}<span class="muted text-xs">Terakhir diperbarui: {formatClock(lastStatsRefreshed)}</span>{/if}
-      <button class="button secondary !py-1.5 !px-3 text-xs" onclick={loadStats} disabled={statsLoading} aria-label="Refresh job list">
-        <RefreshCw size={14} class={statsLoading ? 'animate-spin' : ''}/>Refresh
+      <button class="button secondary !py-1.5 !px-3 text-xs" onclick={loadStats} disabled={statsLoading} aria-label="Refresh statistik Quick Mode">
+        <RefreshCw size={14} class={statsLoading ? 'animate-spin' : ''}/>Refresh statistik
       </button>
     </div>
   </div>
@@ -385,7 +388,7 @@
     </div>
   </div>
   {#if stagingErrors.length}<div class="mt-4 space-y-2">{#each stagingErrors as item}<p class="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-200">Worker {item.worker} tidak dapat discan: {item.error}</p>{/each}</div>{/if}
-  {#if !filteredStaging.length && !stagingLoading}<p class="muted mt-5 rounded-xl border border-dashed border-[var(--line)] p-5 text-center text-sm">Belum ada folder staging Quick Mode.</p>{/if}
+  {#if !stagingRequested && !stagingLoading}<p class="muted mt-5 rounded-xl border border-dashed border-[var(--line)] p-5 text-center text-sm">Tekan <b>Refresh scan</b> untuk memuat folder staging Quick Mode.</p>{:else if !filteredStaging.length && !stagingLoading}<p class="muted mt-5 rounded-xl border border-dashed border-[var(--line)] p-5 text-center text-sm">Belum ada folder staging Quick Mode.</p>{/if}
   <div class="mt-4 space-y-3">
     {#each filteredStaging as item}
       {@const linked = item.backend_job}
@@ -429,4 +432,4 @@
   </div>
 </section>
 
-<JobTable kind="export" title="Riwayat Quick Mode lintas worker" scope="global" profile={filterProfile} worker={filterWorker} status={filterStatus} quickMode={true} retryable={true}/>
+<JobTable kind="export" title="History Quick Mode lintas worker" scope="global" profile={filterProfile} worker={filterWorker} status={filterStatus} quickMode={true} retryable={true} view="history"/>

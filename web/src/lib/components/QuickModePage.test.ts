@@ -76,6 +76,7 @@ describe('QuickModePage', () => {
     }));
 
     render(QuickModePage);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Refresh scan' }));
     expect(await screen.findByText('Sedang processing (#active-s)')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Thumbnail' })).toBeNull();

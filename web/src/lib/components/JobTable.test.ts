@@ -34,4 +34,18 @@ describe('JobTable', () => {
     expect(calls.some((call) => call.url.includes('scope=global') && call.url.includes('kind=export') && call.url.includes('quick_mode=true'))).toBe(true);
     expect(calls.some((call) => call.url.endsWith('/retry') && call.method === 'POST')).toBe(true);
   });
+
+  it('uses a live active monitor query separate from terminal history', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      urls.push(String(input));
+      return new Response(JSON.stringify({ items: [{ id: 'active-1', kind: 'export', status: 'running', profile: 'default', worker: 'local', payload: { quick_mode: true }, progress: { phase: 'downloading' } }] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'export', scope: 'global', quickMode: true, view: 'active', title: 'Monitor aktif' });
+
+    expect(await screen.findByText('Sedang berjalan')).toBeTruthy();
+    expect(urls.some((url) => decodeURIComponent(url).includes('status=queued,dispatched,running'))).toBe(true);
+    expect(screen.queryByText('History terbaru')).toBeNull();
+  });
 });

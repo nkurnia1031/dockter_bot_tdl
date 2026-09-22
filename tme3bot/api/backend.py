@@ -637,24 +637,60 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         selected_profile = None if scope == "global" else context.control_plane.require_profile(actor, profile)
         if profile and scope == "global":
             selected_profile = context.control_plane.require_profile(actor, profile)
-        items = context.control_plane.jobs.list(
-            profile=selected_profile,
-            kind=kind,
-            status=status,
-            worker=worker,
-            quick_mode=quick_mode,
-            archived=archived,
-            offset=offset,
-            limit=limit,
-        )
-        total = context.control_plane.jobs.count(
-            profile=selected_profile,
-            kind=kind,
-            status=status,
-            worker=worker,
-            quick_mode=quick_mode,
-            archived=archived,
-        )
+        # The monitor needs one request for all active lifecycle states while
+        # the repository intentionally keeps its indexed status filter scalar.
+        # Accepting a comma-separated value here keeps the public API backward
+        # compatible with the existing single-status query.
+        status_values = [
+            value.strip().lower()
+            for value in str(status or "").split(",")
+            if value.strip()
+        ]
+        if len(status_values) <= 1:
+            items = context.control_plane.jobs.list(
+                profile=selected_profile,
+                kind=kind,
+                status=status_values[0] if status_values else None,
+                worker=worker,
+                quick_mode=quick_mode,
+                archived=archived,
+                offset=offset,
+                limit=limit,
+            )
+            total = context.control_plane.jobs.count(
+                profile=selected_profile,
+                kind=kind,
+                status=status_values[0] if status_values else None,
+                worker=worker,
+                quick_mode=quick_mode,
+                archived=archived,
+            )
+        else:
+            matching: list[Job] = []
+            total = 0
+            for status_value in dict.fromkeys(status_values):
+                matching.extend(
+                    context.control_plane.jobs.list(
+                        profile=selected_profile,
+                        kind=kind,
+                        status=status_value,
+                        worker=worker,
+                        quick_mode=quick_mode,
+                        archived=archived,
+                        offset=0,
+                        limit=200,
+                    )
+                )
+                total += context.control_plane.jobs.count(
+                    profile=selected_profile,
+                    kind=kind,
+                    status=status_value,
+                    worker=worker,
+                    quick_mode=quick_mode,
+                    archived=archived,
+                )
+            matching.sort(key=lambda item: item.updated_at, reverse=True)
+            items = matching[offset : offset + limit]
         return {
             "items": [job_dict(item) for item in items],
             "total": total,

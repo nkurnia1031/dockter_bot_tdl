@@ -318,7 +318,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(quick.id).status.value, "cancelled")
         self.assertEqual(self.jobs.get(normal.id).status.value, "dispatched")
 
-    def test_retry_quick_mode_creates_attempt_and_keeps_snapshot_and_stage(self):
+    def test_retry_quick_mode_reuses_id_and_keeps_snapshot_and_stage(self):
         original = self.control.submit_job(
             self.actor,
             "export",
@@ -352,7 +352,7 @@ class ControlPlaneTests(unittest.TestCase):
 
         retry = self.control.retry_job(self.actor, original.id)
 
-        self.assertNotEqual(retry.id, original.id)
+        self.assertEqual(retry.id, original.id)
         self.assertEqual(retry.profile, original.profile)
         self.assertEqual(retry.worker, original.worker)
         self.assertEqual(retry.status.value, "dispatched")
@@ -362,7 +362,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(internal["quick_retry"]["retry_of"], original.id)
         self.assertEqual(internal["quick_retry"]["retry_phase"], "uploading")
         self.assertEqual(internal["quick_retry"]["stage_job_id"], original.id)
-        self.assertEqual(self.jobs.get(original.id).status.value, "failed")
+        self.assertEqual(self.jobs.get(original.id).status.value, "dispatched")
 
     def test_retry_succeeded_starts_a_new_quick_operation_from_exporting(self):
         original = self.control.submit_job(
@@ -393,7 +393,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(internal["quick_retry"]["retry_phase"], "exporting")
         self.assertEqual(internal["quick_retry"]["quick_operation_id"], original.id)
 
-    def test_retry_normal_export_creates_a_new_attempt(self):
+    def test_retry_normal_export_reuses_id(self):
         original = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/8"}
         )
@@ -403,12 +403,29 @@ class ControlPlaneTests(unittest.TestCase):
 
         retry = self.control.retry_job(self.actor, original.id)
 
-        self.assertNotEqual(retry.id, original.id)
+        self.assertEqual(retry.id, original.id)
         self.assertEqual(retry.status.value, "dispatched")
         internal = self.jobs.command_payload(retry.id)
         self.assertFalse(internal["quick_mode"])
         self.assertEqual(internal["export_retry"]["retry_of"], original.id)
         self.assertEqual(internal["export_retry"]["retry_phase"], "exporting")
+
+    def test_reused_retry_ignores_late_event_from_previous_attempt(self):
+        original = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/12"}
+        )
+        self.control.append_worker_event(
+            JobEvent(original.id, 2, JobStatus.FAILED, "failed", error={"message": "tdl"})
+        )
+
+        retry = self.control.retry_job(self.actor, original.id)
+        self.assertEqual(retry.id, original.id)
+        current = self.control.append_worker_event(
+            JobEvent(original.id, 2, JobStatus.RUNNING, "late_old_attempt")
+        )
+
+        self.assertEqual(current.status, JobStatus.DISPATCHED)
+        self.assertEqual(self.jobs.get(original.id).status, JobStatus.DISPATCHED)
 
     def test_legacy_normal_export_without_command_payload_can_be_retried(self):
         legacy = Job(

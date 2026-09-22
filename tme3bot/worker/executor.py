@@ -196,6 +196,15 @@ class WorkerEventPublisher:
         assert last_error is not None
         raise last_error
 
+    def begin(self, job_id: str, sequence_start: int | None) -> None:
+        """Seed event numbering for a reused job ID."""
+        if sequence_start is None:
+            return
+        with self._lock:
+            self._sequences[str(job_id)] = max(
+                self._sequences.get(str(job_id), 0), int(sequence_start)
+            )
+
     def forget(self, job_id: str) -> None:
         with self._lock:
             self._sequences.pop(job_id, None)
@@ -276,6 +285,7 @@ class WorkerJobExecutor:
 
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])
+        self.publisher.begin(job_id, command.get("event_sequence_start"))
         with self._lock:
             if job_id in self._known:
                 return self._jobs.queue_size()
@@ -669,6 +679,9 @@ class WorkerJobExecutor:
             del self._job_log.snapshot
             with self._lock:
                 self._active.pop(job_id, None)
+                # Job IDs are stable across retries. Allow the next attempt
+                # to be enqueued after this run has reached a terminal event.
+                self._known.discard(job_id)
                 self._log_snapshots.pop(job_id, None)
                 self._utility_runners.pop(job_id, None)
                 self._rclone_runners.pop(job_id, None)

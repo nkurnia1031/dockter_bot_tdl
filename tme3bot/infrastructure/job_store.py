@@ -180,6 +180,64 @@ class SqliteJobRepository:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._job(row)
 
+    def reset_for_retry(self, job_id: str, payload: dict[str, Any]) -> Job:
+        """Reset a terminal row for a new attempt without changing its ID.
+
+        The old lifecycle remains in ``job_events``. A monotonically
+        increasing event sequence lets the worker publish the new attempt
+        without colliding with the previous attempt's telemetry.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown job: {job_id}")
+            if not JobStatus(str(row["status"])).terminal:
+                raise ValueError("Hanya job terminal yang dapat diulang.")
+            max_sequence = int(
+                db.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM job_events WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()[0]
+            )
+            db.execute(
+                """
+                UPDATE jobs
+                SET status = 'queued', payload = ?, progress = ?, result = NULL,
+                    error = NULL, progress_sequence = ?, archived_at = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    _dump(payload),
+                    _dump({"phase": "queued", "retry_sequence": max_sequence + 1}),
+                    max_sequence,
+                    now,
+                    job_id,
+                ),
+            )
+            db.execute(
+                "DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,)
+            )
+            # A reused job ID also reuses its Telegram status message, but it
+            # must become eligible for a fresh terminal notification.
+            db.execute(
+                """
+                UPDATE job_telegram_notifications
+                SET status = 'pending', terminal_notified_at = NULL,
+                    last_status_hash = NULL, error = NULL
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+        result = self.get(job_id)
+        if result is None:
+            raise KeyError(f"Unknown job: {job_id}")
+        return result
+
     def save_execution_plan(
         self, job_id: str, plan: dict[str, Any], command_payload: dict[str, Any]
     ) -> None:

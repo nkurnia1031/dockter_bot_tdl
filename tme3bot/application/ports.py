@@ -10,6 +10,8 @@ class JobRepository(Protocol):
 
     def get(self, job_id: str) -> Job | None: ...
 
+    def reset_for_retry(self, job_id: str, payload: dict[str, Any]) -> Job: ...
+
     def list(
         self,
         *,

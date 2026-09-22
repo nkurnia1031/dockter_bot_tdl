@@ -702,7 +702,13 @@ class BackendApiTests(unittest.TestCase):
         retried = self.client.post(f"/api/v1/jobs/{quick_id}/retry", headers=headers)
         self.assertEqual(retried.status_code, 200)
         retry_id = retried.json()["id"]
-        self.assertNotEqual(retry_id, quick_id)
+        self.assertEqual(retry_id, quick_id)
+        active_listed = self.client.get(
+            "/api/v1/jobs?scope=global&kind=export&quick_mode=true&status=queued,dispatched,running",
+            headers=headers,
+        )
+        self.assertEqual(active_listed.status_code, 200)
+        self.assertEqual([item["id"] for item in active_listed.json()["items"]], [quick_id])
         retry_job = self.client.get(f"/api/v1/jobs/{retry_id}", headers=headers).json()
         self.assertEqual(retry_job["worker"], quick["worker"])
         self.assertNotIn("secret", str(retry_job))
