@@ -104,6 +104,19 @@ class WorkerHttpDispatcher:
             timeout=30,
         )
 
+    def quickmode_verify(self, worker: str, stage_job_id: str, expected_phase: str = "uploading") -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            "/internal/v1/quickmode/verify",
+            {"stage_job_id": stage_job_id, "expected_phase": expected_phase},
+            timeout=120,
+        )
+
     def capabilities(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

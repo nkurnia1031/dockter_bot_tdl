@@ -4,6 +4,7 @@
   import { Drawer, Dropdown, DropdownItem, Sidebar, Toast, Tooltip } from 'flowbite-svelte';
   import { session } from '$lib/session.svelte';
   import Login from './Login.svelte';
+  import RequestIndicator from './RequestIndicator.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
     LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, Users, Wrench, Zap
@@ -74,6 +75,8 @@
     session.restore();
   });
 </script>
+
+<RequestIndicator />
 
 {#snippet navigation(compact = false, onNavigate: (() => void) | undefined = undefined, scope = 'nav')}
   <nav class="grid gap-1.5" aria-label="Menu utama">

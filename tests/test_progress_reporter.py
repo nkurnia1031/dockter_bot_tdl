@@ -20,6 +20,20 @@ class FakePublisher:
 
 
 class ProgressReporterTests(unittest.TestCase):
+    def test_telemetry_failure_does_not_raise_from_progress_or_milestone(self):
+        class BrokenPublisher:
+            def emit(self, *args, **kwargs):
+                raise RuntimeError("backend unavailable")
+
+        reporter = ProgressReporter(BrokenPublisher(), "job-telemetry")
+        reporter.report(
+            phase="uploading",
+            message="archive",
+            force=True,
+        )
+        reporter.milestone("storage.item_uploaded", result={"name": "archive"})
+        self.assertEqual(reporter.latest["phase"], "uploading")
+
     def test_telemetry_is_transient_and_throttled_by_percent(self):
         publisher = FakePublisher()
         reporter = ProgressReporter(

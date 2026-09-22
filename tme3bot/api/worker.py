@@ -72,6 +72,20 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     def quickmode_scan():
         return context.executor.quickmode_scan()
 
+    @app.post("/internal/v1/quickmode/verify", dependencies=[Depends(authorize)])
+    def quickmode_verify(body: dict[str, Any]):
+        stage_job_id = str(body.get("stage_job_id") or "").strip()
+        if not stage_job_id:
+            raise DomainError(
+                "STAGE_JOB_ID_REQUIRED",
+                "stage_job_id wajib diisi.",
+                status_code=422,
+            )
+        return context.executor.quickmode_verify(
+            stage_job_id,
+            str(body.get("expected_phase") or "uploading"),
+        )
+
     @app.post("/internal/v1/jobs", dependencies=[Depends(authorize)])
     def submit_job(body: WorkerJobRequest):
         payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()

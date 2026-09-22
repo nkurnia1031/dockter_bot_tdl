@@ -66,6 +66,31 @@ class RcloneRunnerTests(unittest.TestCase):
                         workspace_root=workspace,
                     )
 
+    def test_verifies_exact_workspace_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            archive.write_bytes(b"archive")
+            subprocess_runner = FakeSubprocessRunner()
+
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(subprocess_runner).verify_files(
+                    [archive],
+                    "googledrive:backup",
+                    config,
+                    workspace_root=workspace,
+                )
+
+            self.assertEqual(result["expected"], 1)
+            self.assertEqual(result["found"], 1)
+            self.assertEqual(result["files"], ["result.7z.001"])
+            command = subprocess_runner.commands[0][0]
+            self.assertEqual(command[:3], ["rclone", "check", str(archive)])
+            self.assertIn("--size-only", command)
+
 
 if __name__ == "__main__":
     unittest.main()

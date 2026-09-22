@@ -18,7 +18,7 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 
 from tme3bot.export_catalog import inspect_export_json
-from tme3bot.tdl import ProcessStalledError, TDLClient
+from tme3bot.tdl import CommandCallback, ProcessStalledError, TDLClient
 from tme3bot.url_parser import slugify_label
 
 
@@ -272,6 +272,27 @@ def scan_quick_stages(workspace: Path, *, worker: str | None = None) -> list[dic
             "last_error": str(manifest.get("last_error") or "")[:1000],
             "staging_path": str(stage),
             "manifest_version": manifest_version,
+            "rclone_destination": str(manifest.get("rclone_destination") or ""),
+            "rclone_archive_names": [
+                str(name)
+                for name in (
+                    manifest.get("rclone_result", {}).get("files", [])
+                    if isinstance(manifest.get("rclone_result"), dict)
+                    else manifest.get("rclone_archive_names", [])
+                )
+                if str(name)
+            ],
+            "telegram_uploaded_count": len(
+                manifest.get("upload_result", {}).get("uploaded_items", [])
+                if isinstance(manifest.get("upload_result"), dict)
+                and isinstance(manifest.get("upload_result", {}).get("uploaded_items"), list)
+                else []
+            ),
+            "cleanup_verification": (
+                dict(manifest.get("cleanup_verification"))
+                if isinstance(manifest.get("cleanup_verification"), dict)
+                else None
+            ),
         }
         # Only derived metadata is exposed.  In particular, do not return the
         # manifest itself, raw chat JSON, password settings, or session files.
@@ -378,11 +399,13 @@ class QuickThumbnailBuilder:
         ffprobe: str = "ffprobe",
         log_callback: Callable[[str], None] | None = None,
         stall_timeout_seconds: int = 0,
+        command_callback: CommandCallback | None = None,
     ) -> None:
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.log_callback = log_callback
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
+        self.command_callback = command_callback
         self._process_lock = threading.RLock()
         self._current_process: subprocess.Popen[str] | None = None
 
@@ -561,14 +584,22 @@ class QuickThumbnailBuilder:
         creationflags = (
             subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         )
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=os.name != "nt",
-            creationflags=creationflags,
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=os.name != "nt",
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            if self.command_callback is not None:
+                try:
+                    self.command_callback(command, -1, str(exc), 0.0, "quick-thumbnail")
+                except Exception:
+                    pass
+            raise
         with self._process_lock:
             self._current_process = process
         stalled = threading.Event()
@@ -591,6 +622,8 @@ class QuickThumbnailBuilder:
             name="quick-thumbnail-watchdog",
         )
         watchdog_thread.start()
+        stdout = ""
+        stderr = ""
         try:
             stdout, stderr = process.communicate()
         finally:
@@ -599,6 +632,17 @@ class QuickThumbnailBuilder:
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+            if self.command_callback is not None:
+                try:
+                    self.command_callback(
+                        command,
+                        int(process.returncode if process.returncode is not None else -1),
+                        f"{stdout}\n{stderr}",
+                        max(0.0, time.monotonic() - started_at),
+                        "quick-thumbnail",
+                    )
+                except Exception:
+                    pass
         if stalled.is_set():
             raise ProcessStalledError(
                 f"thumbnail process stalled for {self.stall_timeout_seconds}s",

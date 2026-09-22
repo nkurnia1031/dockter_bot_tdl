@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from tme3bot.backup_service import BackupService, sha256_file
+from tme3bot.command_audit import bounded_output_tail, sanitize_command, sanitize_text
 from tme3bot.domain.models import utc_now
 from tme3bot.export_catalog import discard_export_without_media, inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
@@ -64,6 +65,19 @@ def storage_logical_folder(
     return logical, relative
 
 
+def _quick_message_matches(message: dict[str, Any], name: str, caption: str, message_id: int | None = None) -> bool:
+    """Match a storage message without persisting or returning its contents."""
+    if message_id is not None:
+        try:
+            if int(message.get("id")) != int(message_id):
+                return False
+        except (TypeError, ValueError):
+            return False
+    haystack = json.dumps(message, ensure_ascii=False, default=str).casefold()
+    caption_parts = [part.strip().casefold() for part in str(caption).splitlines() if part.strip()]
+    return all(part in haystack for part in caption_parts) and str(name).casefold() in haystack
+
+
 def _utility_progress_message(utility: str, phase: str, item: str) -> str:
     labels = {
         "compressing": "Mengompres",
@@ -107,19 +121,71 @@ class JobLogSnapshot:
                 line = raw_line.rstrip()
                 if not line:
                     continue
-                if len(self._lines) >= self.max_lines or self._characters + len(line) + 1 > self.max_characters:
+                line_size = len(line) + 1
+                while self._lines and (
+                    len(self._lines) >= self.max_lines
+                    or self._characters + line_size > self.max_characters
+                ):
+                    removed = self._lines.pop(0)
+                    self._characters -= len(removed) + 1
                     self.truncated = True
-                    return
+                if line_size > self.max_characters:
+                    line = line[-max(1, self.max_characters - 1) :]
+                    line_size = len(line) + 1
+                    self.truncated = True
                 self._lines.append(line)
-                self._characters += len(line) + 1
+                self._characters += line_size
 
     def value(self) -> dict[str, Any]:
         with self._lock:
             return {
-                "lines": list(self._lines),
+                "lines": list(reversed(self._lines)),
                 "line_count": len(self._lines),
                 "truncated": self.truncated,
+                "order": "newest_first",
             }
+
+
+class CommandMilestoneRecorder:
+    """Persist bounded command results without allowing telemetry to fail work."""
+
+    def __init__(self, publisher: WorkerEventPublisher, job_id: str, secrets: list[str]):
+        self.publisher = publisher
+        self.job_id = job_id
+        self.secrets = secrets
+
+    def __call__(
+        self,
+        command: list[str],
+        returncode: int,
+        output: str,
+        duration_seconds: float,
+        log_prefix: str,
+    ) -> None:
+        try:
+            tail, truncated = bounded_output_tail(sanitize_text(output, self.secrets))
+            self.publisher.emit(
+                self.job_id,
+                "running",
+                "command.completed",
+                result={
+                    "command": sanitize_command(command, self.secrets),
+                    "log_prefix": str(log_prefix),
+                    "returncode": int(returncode),
+                    "duration_seconds": round(max(0.0, float(duration_seconds)), 3),
+                    "output_tail": [
+                        sanitize_text(line, self.secrets)
+                        for line in tail
+                    ],
+                    "output_truncated": bool(truncated),
+                },
+            )
+        except Exception:
+            LOGGER.warning(
+                "Command milestone failed for job %s; physical command already finished",
+                self.job_id,
+                exc_info=True,
+            )
 
 
 def json_value(value: Any) -> Any:
@@ -224,6 +290,7 @@ class WorkerJobExecutor:
         self._quick_export_clients: dict[str, Any] = {}
         self._quick_download_clients: dict[str, Any] = {}
         self._quick_active: set[str] = set()
+        self._quick_verify_active: set[str] = set()
         self._cancel_requested: set[str] = set()
         self._known: set[str] = set()
         self._lock = threading.RLock()
@@ -580,6 +647,19 @@ class WorkerJobExecutor:
         snapshot = JobLogSnapshot()
         snapshot.add(f"[job {job_id} started: {kind}]")
         self._job_log.snapshot = snapshot
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        quick_settings = payload.get("quick_settings") if isinstance(payload, dict) else {}
+        secrets = [
+            str(payload.get("password") or "") if isinstance(payload, dict) else "",
+            str(quick_settings.get("compress_password") or "")
+            if isinstance(quick_settings, dict)
+            else "",
+        ]
+        self._job_log.audit = CommandMilestoneRecorder(
+            self.publisher,
+            job_id,
+            [value for value in secrets if value],
+        )
         with self._lock:
             self._active[job_id] = (profile, kind)
             self._log_snapshots[job_id] = snapshot
@@ -677,6 +757,7 @@ class WorkerJobExecutor:
                 )
         finally:
             del self._job_log.snapshot
+            del self._job_log.audit
             with self._lock:
                 self._active.pop(job_id, None)
                 # Job IDs are stable across retries. Allow the next attempt
@@ -726,6 +807,9 @@ class WorkerJobExecutor:
         if snapshot is not None:
             snapshot.add(line)
 
+    def _command_callback(self):
+        return getattr(getattr(self._job_log, "audit", None), "__call__", None)
+
     def _publish_log_snapshot(self, job_id: str, snapshot: JobLogSnapshot) -> None:
         self.publisher.emit(
             job_id,
@@ -742,6 +826,7 @@ class WorkerJobExecutor:
     @contextmanager
     def _capture_tdl_output(self, client):
         previous = client.output_callback
+        previous_command = getattr(client, "command_callback", None)
 
         def capture(line: str) -> None:
             self._append_job_log(line)
@@ -749,10 +834,27 @@ class WorkerJobExecutor:
                 previous(line)
 
         client.output_callback = capture
+        callback = self._command_callback()
+        if callback is not None:
+            client.command_callback = callback
         try:
             yield
         finally:
             client.output_callback = previous
+            if hasattr(client, "command_callback"):
+                client.command_callback = previous_command
+
+    @contextmanager
+    def _capture_tdl_commands(self, client):
+        previous = getattr(client, "command_callback", None)
+        callback = self._command_callback()
+        if callback is not None:
+            client.command_callback = callback
+        try:
+            yield
+        finally:
+            if hasattr(client, "command_callback"):
+                client.command_callback = previous
 
     @contextmanager
     def _capture_tdl_progress(self, client, callback):
@@ -1762,6 +1864,7 @@ class WorkerJobExecutor:
                 )
                 builder = QuickThumbnailBuilder(
                     log_callback=self._append_job_log,
+                    command_callback=self._command_callback(),
                     stall_timeout_seconds=getattr(
                         self.config, "job_stall_timeout_seconds", 600
                     ),
@@ -1798,6 +1901,7 @@ class WorkerJobExecutor:
                 runner = UtilityRunner(
                     utility_root,
                     log_callback=self._append_job_log,
+                    command_callback=self._command_callback(),
                     stall_timeout_seconds=getattr(
                         self.config, "job_stall_timeout_seconds", 600
                     ),
@@ -1877,19 +1981,51 @@ class WorkerJobExecutor:
                         "keywords": "",
                     },
                 }
-                upload_result = self._storage_upload(upload_command)
-                if upload_result.get("failed") or int(upload_result.get("succeeded", 0)) != len(archive_files) + 1:
-                    failures = str(upload_result)
-                    save_manifest(phase="uploading", last_error=failures[:500])
-                    raise QuickModeError(
-                        f"Upload Quick Mode gagal ({failures[:500]}); staging dipertahankan di {stage_root}."
-                    )
                 quick_settings = payload.get("quick_settings") or {}
                 rclone_destination = (
                     quick_settings.get("rclone_destination", "googledrive:backup")
                     if isinstance(quick_settings, dict)
                     else "googledrive:backup"
                 )
+
+                def persist_uploaded_items(items: list[dict[str, Any]]) -> None:
+                    try:
+                        save_manifest(
+                            phase="uploading",
+                            upload_result={
+                                "total": len(archive_files) + 1,
+                                "succeeded": len(items),
+                                "failed": [],
+                                "uploaded_items": list(items),
+                            },
+                            rclone_destination=rclone_destination,
+                            storage_folder=storage_folder,
+                            caption=caption,
+                            last_error=None,
+                        )
+                    except Exception:
+                        # Physical Telegram success must remain recoverable even
+                        # when a transient manifest write fails.
+                        LOGGER.warning(
+                            "Could not persist Quick Mode upload evidence for %s",
+                            job_id,
+                            exc_info=True,
+                        )
+
+                upload_result = self._storage_upload(
+                    upload_command,
+                    upload_item_callback=persist_uploaded_items,
+                )
+                # Persist Telegram's physical upload evidence immediately. The
+                # next rclone call or telemetry callback may fail, but recovery
+                # must still know which channel messages already exist.
+                persist_uploaded_items(upload_result.get("uploaded_items", []))
+                if upload_result.get("failed") or int(upload_result.get("succeeded", 0)) != len(archive_files) + 1:
+                    failures = str(upload_result)
+                    save_manifest(phase="uploading", last_error=failures[:500])
+                    raise QuickModeError(
+                        f"Upload Quick Mode gagal ({failures[:500]}); staging dipertahankan di {stage_root}."
+                    )
                 # Legacy commands without the new snapshot use the documented
                 # default, so every Quick Mode result still reaches Drive.
                 rclone_result = self._rclone_upload_files(
@@ -1972,6 +2108,7 @@ class WorkerJobExecutor:
             result = runtime.leave_service.leave(
                 [str(item) for item in command["payload"].get("chat_refs", [])],
                 output_callback=self._append_job_log,
+                command_callback=self._command_callback(),
             )
             deleted = runtime.state_store.delete_sources(result.succeeded)
         return {"succeeded": deleted, "failed": result.failed}
@@ -2441,6 +2578,7 @@ class WorkerJobExecutor:
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
             log_callback=self._append_job_log,
+            command_callback=self._command_callback(),
             stall_timeout_seconds=getattr(
                 self.config, "job_stall_timeout_seconds", 600
             ),
@@ -2530,6 +2668,7 @@ class WorkerJobExecutor:
 
         runner = RcloneRunner(
             log_callback=self._append_job_log,
+            command_callback=self._command_callback(),
             progress_callback=progress,
             cancel_check=cancelled,
             stall_timeout_seconds=getattr(
@@ -2552,7 +2691,12 @@ class WorkerJobExecutor:
             with self._lock:
                 self._rclone_runners.pop(job_id, None)
 
-    def _storage_upload(self, command: dict[str, Any]) -> dict[str, Any]:
+    def _storage_upload(
+        self,
+        command: dict[str, Any],
+        *,
+        upload_item_callback=None,
+    ) -> dict[str, Any]:
         payload = command["payload"]
         storage_profile = getattr(self.config, "worker_storage_profile", "storage")
         if storage_profile not in self.profile_manager.list_profiles():
@@ -2621,6 +2765,7 @@ class WorkerJobExecutor:
         file_sizes = {path: path.stat().st_size for path in files}
         total_bytes = sum(file_sizes.values())
         failed, succeeded = [], 0
+        uploaded_items: list[dict[str, Any]] = []
         completed_bytes = 0
         last_message_id: int | None = None
         rclone_result: dict[str, object] | None = None
@@ -2834,6 +2979,16 @@ class WorkerJobExecutor:
                             "status": "active",
                             "uploaded_at": None,
                         }
+                        uploaded_items.append(dict(item))
+                        if upload_item_callback is not None:
+                            try:
+                                upload_item_callback(list(uploaded_items))
+                            except Exception:
+                                LOGGER.warning(
+                                    "Storage upload evidence callback failed for %s",
+                                    path,
+                                    exc_info=True,
+                                )
                         succeeded += 1
                         counted_success = True
                         completed_bytes += file_sizes[path]
@@ -2973,6 +3128,7 @@ class WorkerJobExecutor:
             ),
             "rclone_uploaded": rclone_result.get("succeeded", 0) if rclone_result else 0,
             "rclone_files": rclone_result.get("files", []) if rclone_result else [],
+            "uploaded_items": uploaded_items,
         }
 
     def _backup(self, command: dict[str, Any]) -> dict[str, Any]:
@@ -3228,6 +3384,240 @@ class WorkerJobExecutor:
                     size = None
                 items.append({"name": entry.name, "path": item_path, "kind": "file", "size": size})
         return {"path": display_path, "items": items}
+
+    def quickmode_verify(self, stage_job_id: str, expected_phase: str = "uploading") -> dict[str, Any]:
+        """Verify completed Quick Mode uploads before deleting retained staging."""
+        workspace = self._quick_workspace(self.config)
+        stage_root = migrate_legacy_quick_stage(workspace, str(stage_job_id))
+        if not stage_root.is_dir():
+            return {
+                "stage_job_id": str(stage_job_id),
+                "status": "missing",
+                "staging_cleaned": False,
+            }
+        stage_root = stage_root.resolve()
+        try:
+            stage_root.relative_to(workspace)
+        except ValueError:
+            return {
+                "stage_job_id": str(stage_job_id),
+                "status": "failed",
+                "staging_cleaned": False,
+                "reason": "Staging berada di luar workspace.",
+            }
+        with self._lock:
+            if str(stage_job_id) in self._quick_active:
+                return {
+                    "stage_job_id": str(stage_job_id),
+                    "status": "deferred_active",
+                    "staging_cleaned": False,
+                    "reason": "Job Quick Mode masih aktif.",
+                }
+            if str(stage_job_id) in self._quick_verify_active:
+                return {
+                    "stage_job_id": str(stage_job_id),
+                    "status": "deferred_active",
+                    "staging_cleaned": False,
+                    "reason": "Verifikasi staging sedang berjalan.",
+                }
+            self._quick_verify_active.add(str(stage_job_id))
+
+        try:
+            manifest = read_quick_manifest(stage_root)
+            manifest = manifest if isinstance(manifest, dict) else {}
+            phase = str(manifest.get("phase") or expected_phase).strip().lower()
+            if phase not in {"uploading", "cleanup"}:
+                return {
+                    "stage_job_id": str(stage_job_id),
+                    "status": "pending",
+                    "staging_cleaned": False,
+                    "reason": f"Fase fisik {phase} belum siap diverifikasi.",
+                }
+            folder_name = Path(str(manifest.get("folder_name") or "")).name
+            if not folder_name or folder_name == ".":
+                archives = sorted(stage_root.glob("*.7z*"))
+                folder_name = archives[0].name.split(".7z", 1)[0] if archives else ""
+            archive_files = sorted(
+                path
+                for path in stage_root.iterdir()
+                if path.is_file()
+                and (path.name == f"{folder_name}.7z" or path.name.startswith(f"{folder_name}.7z."))
+            ) if folder_name else []
+            thumbnail_path = stage_root / f"{folder_name}.png" if folder_name else Path("")
+            if not archive_files or not thumbnail_path.is_file():
+                return {
+                    "stage_job_id": str(stage_job_id),
+                    "status": "pending",
+                    "staging_cleaned": False,
+                    "reason": "Archive atau thumbnail belum lengkap di staging.",
+                    "channel_expected": len(archive_files) + (1 if thumbnail_path.is_file() else 0),
+                    "drive_expected": len(archive_files),
+                }
+
+            upload_result = manifest.get("upload_result")
+            upload_result = upload_result if isinstance(upload_result, dict) else {}
+            uploaded_items = upload_result.get("uploaded_items")
+            uploaded_items = uploaded_items if isinstance(uploaded_items, list) else []
+            caption = str(manifest.get("caption") or quick_storage_caption(folder_name, quick_year()))
+            expected_names = [path.name for path in archive_files] + [thumbnail_path.name]
+            known_items = {
+                str(item.get("original_name") or item.get("display_name") or ""): item
+                for item in uploaded_items
+                if isinstance(item, dict)
+            }
+
+            channel_found = 0
+            channel_reason = ""
+            storage_profile = str(getattr(self.config, "worker_storage_profile", "storage"))
+            verify_root: Path | None = None
+            try:
+                if storage_profile not in self.profile_manager.list_profiles():
+                    raise QuickModeError("Profile storage worker tidak tersedia.")
+                storage_runtime = self.profile_manager.runtime(storage_profile)
+                client = storage_runtime.export_tdl_client
+                channel_ref = str(getattr(storage_runtime.config, "storage_channel_ref", "") or "")
+                if not channel_ref:
+                    raise QuickModeError("Storage channel belum dikonfigurasi.")
+                verify_root = stage_root / ".quickmode-verify"
+                verify_root.mkdir(parents=True, exist_ok=True)
+                fallback_messages: list[dict[str, Any]] | None = None
+                with storage_runtime.export_operation_lock:
+                    with self._capture_tdl_output(client):
+                        for name in expected_names:
+                            item = known_items.get(name)
+                            raw_id = item.get("channel_message_id") if isinstance(item, dict) else None
+                            try:
+                                message_id = int(raw_id) if raw_id is not None else None
+                            except (TypeError, ValueError):
+                                message_id = None
+                            if message_id is not None:
+                                target = verify_root / f"channel-{message_id}.json"
+                                exported = client.export_messages(
+                                    channel_ref,
+                                    message_id,
+                                    target,
+                                    with_content=True,
+                                    end_id=message_id,
+                                )
+                                matches = any(
+                                    _quick_message_matches(message, name, caption, message_id)
+                                    for message in exported.messages
+                                )
+                            else:
+                                if fallback_messages is None:
+                                    target = verify_root / "channel-recent.json"
+                                    fallback_messages = client.export_messages(
+                                        channel_ref,
+                                        1,
+                                        target,
+                                        with_content=True,
+                                        last_count=1000,
+                                    ).messages
+                                matches = any(
+                                    _quick_message_matches(message, name, caption)
+                                    for message in fallback_messages
+                                )
+                            if matches:
+                                channel_found += 1
+            except Exception as exc:
+                channel_reason = str(exc)[:500]
+            finally:
+                if verify_root is not None:
+                    shutil.rmtree(verify_root, ignore_errors=True)
+
+            drive_found = 0
+            drive_reason = ""
+            destination = str(
+                manifest.get("rclone_destination")
+                or (
+                    manifest.get("rclone_result", {}).get("destination", "")
+                    if isinstance(manifest.get("rclone_result"), dict)
+                    else ""
+                )
+                or "googledrive:backup"
+            )
+            try:
+                verify_runner = RcloneRunner(
+                    log_callback=self._append_job_log,
+                    command_callback=self._command_callback(),
+                    stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
+                )
+                drive_result = verify_runner.verify_files(
+                    archive_files,
+                    destination,
+                    Path(getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")),
+                    workspace_root=workspace,
+                    config_root=Path(getattr(self.config, "profile_root", "/data")),
+                )
+                drive_found = int(drive_result.get("found", 0))
+                if drive_found < len(archive_files):
+                    drive_reason = str(drive_result.get("missing") or "Archive belum lengkap di Google Drive.")[:500]
+            except Exception as exc:
+                drive_reason = str(exc)[:500]
+
+            channel_expected = len(expected_names)
+            drive_expected = len(archive_files)
+            if channel_found == channel_expected and drive_found == drive_expected and not channel_reason and not drive_reason:
+                try:
+                    shutil.rmtree(stage_root)
+                except OSError as exc:
+                    verification = {
+                        "status": "failed",
+                        "channel_expected": channel_expected,
+                        "channel_found": channel_found,
+                        "drive_expected": drive_expected,
+                        "drive_found": drive_found,
+                        "checked_at": utc_now().isoformat(),
+                        "reason": f"Cleanup staging gagal: {str(exc)[:400]}",
+                    }
+                    if stage_root.exists():
+                        try:
+                            write_quick_manifest(
+                                stage_root,
+                                {**manifest, "cleanup_verification": verification},
+                            )
+                        except OSError:
+                            LOGGER.warning(
+                                "Could not persist Quick Mode cleanup failure for %s",
+                                stage_job_id,
+                                exc_info=True,
+                            )
+                    return {
+                        "stage_job_id": str(stage_job_id),
+                        **verification,
+                        "staging_cleaned": False,
+                    }
+                return {
+                    "stage_job_id": str(stage_job_id),
+                    "status": "verified",
+                    "staging_cleaned": True,
+                    "channel_expected": channel_expected,
+                    "channel_found": channel_found,
+                    "drive_expected": drive_expected,
+                    "drive_found": drive_found,
+                    "checked_at": utc_now().isoformat(),
+                }
+
+            status = "failed" if channel_reason or drive_reason else "pending"
+            verification = {
+                "status": status,
+                "channel_expected": channel_expected,
+                "channel_found": channel_found,
+                "drive_expected": drive_expected,
+                "drive_found": drive_found,
+                "checked_at": utc_now().isoformat(),
+                "reason": "; ".join(value for value in (channel_reason, drive_reason) if value)
+                or "Sebagian file belum terdeteksi.",
+            }
+            write_quick_manifest(stage_root, {**manifest, "cleanup_verification": verification})
+            return {
+                "stage_job_id": str(stage_job_id),
+                **verification,
+                "staging_cleaned": False,
+            }
+        finally:
+            with self._lock:
+                self._quick_verify_active.discard(str(stage_job_id))
 
     def quickmode_scan(self) -> dict[str, Any]:
         """Return derived Quick Mode staging state for the manager UI."""

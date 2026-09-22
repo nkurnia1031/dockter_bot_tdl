@@ -9,7 +9,7 @@ from tme3bot.progress import DownloadProgressTracker
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.service import ExportJobResult, DownloadedJsonResult
 from tme3bot.utility import UtilityResult
-from tme3bot.worker.executor import WorkerJobExecutor
+from tme3bot.worker.executor import CommandMilestoneRecorder, JobLogSnapshot, WorkerJobExecutor
 from tme3bot.worker.quick_export import (
     QuickModeError,
     QuickThumbnailBuilder,
@@ -19,6 +19,7 @@ from tme3bot.worker.quick_export import (
     quick_storage_caption,
     visual_media,
     scan_quick_stages,
+    write_quick_manifest,
 )
 
 
@@ -27,6 +28,137 @@ class QuickThumbnailTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         for name in names:
             (root / name).write_bytes(b"media")
+
+    def test_job_log_keeps_newest_tail_and_returns_newest_first(self) -> None:
+        snapshot = JobLogSnapshot()
+        snapshot.max_lines = 3
+        for value in ("old", "middle", "new", "newest"):
+            snapshot.add(value)
+        self.assertEqual(snapshot.value()["lines"], ["newest", "new", "middle"])
+        self.assertTrue(snapshot.value()["truncated"])
+        self.assertEqual(snapshot.value()["order"], "newest_first")
+
+    def test_command_milestone_is_bounded_and_redacts_secret(self) -> None:
+        events = []
+
+        class Publisher:
+            def emit(self, *args, **kwargs):
+                events.append((args, kwargs))
+
+        recorder = CommandMilestoneRecorder(Publisher(), "job-1", ["secret-value"])
+        recorder(
+            ["utility", "--password", "secret-value"],
+            1,
+            "\n".join([f"line-{index}" for index in range(100)]) + "\nsecret-value",
+            1.25,
+            "utility-test",
+        )
+        result = events[0][1]["result"]
+        self.assertEqual(events[0][0][2], "command.completed")
+        self.assertEqual(result["command"], ["utility", "--password", "[redacted]"])
+        self.assertLessEqual(len(result["output_tail"]), 40)
+        self.assertLessEqual(
+            sum(len(line.encode("utf-8")) + 1 for line in result["output_tail"]),
+            8 * 1024,
+        )
+        self.assertTrue(result["output_truncated"])
+        self.assertNotIn("secret-value", str(result))
+
+    def test_quickmode_verify_requires_channel_and_drive_before_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            stage = quick_stage_root(workspace, "verify-stage")
+            stage.mkdir(parents=True)
+            (stage / "batch.7z.001").write_bytes(b"archive")
+            (stage / "batch.png").write_bytes(b"thumbnail")
+            config_path = workspace / ".config" / "rclone.conf"
+            config_path.parent.mkdir()
+            config_path.write_text("[googledrive]\n", encoding="utf-8")
+            caption = "batch\n#ModeCepat #2026"
+            write_quick_manifest(
+                stage,
+                {
+                    "stage_job_id": "verify-stage",
+                    "folder_name": "batch",
+                    "phase": "uploading",
+                    "caption": caption,
+                    "rclone_destination": "googledrive:backup",
+                    "upload_result": {
+                        "uploaded_items": [
+                            {"original_name": "batch.7z.001", "channel_message_id": 101},
+                            {"original_name": "batch.png", "channel_message_id": 102},
+                        ]
+                    },
+                },
+            )
+
+            class StorageClient:
+                output_callback = None
+
+                def export_messages(self, channel, start_id, target, **kwargs):
+                    name = "batch.png" if int(start_id) == 102 else "batch.7z.001"
+                    return SimpleNamespace(
+                        messages=[
+                            {
+                                "id": int(start_id),
+                                "caption": caption,
+                                "file": {"name": name},
+                            }
+                        ]
+                    )
+
+            storage_config = SimpleNamespace(storage_channel_ref="-100123")
+            storage_runtime = SimpleNamespace(
+                config=storage_config,
+                export_tdl_client=StorageClient(),
+                export_operation_lock=threading.RLock(),
+            )
+
+            class Profiles:
+                def list_profiles(self):
+                    return ["storage"]
+
+                def runtime(self, profile):
+                    if profile != "storage":
+                        raise AssertionError(profile)
+                    return storage_runtime
+
+            class VerifyRclone:
+                def __init__(self, **kwargs):
+                    del kwargs
+
+                def verify_files(self, files, destination, config, **kwargs):
+                    del kwargs
+                    names = [path.name for path in files]
+                    if destination != "googledrive:backup":
+                        raise AssertionError(destination)
+                    if config != config_path.resolve():
+                        raise AssertionError(config)
+                    return {
+                        "destination": destination,
+                        "expected": len(names),
+                        "found": len(names),
+                        "files": names,
+                        "missing": [],
+                    }
+
+            config = SimpleNamespace(
+                utility_workspace_root=workspace,
+                worker_storage_profile="storage",
+                rclone_config_path=config_path,
+                profile_root=workspace,
+                job_stall_timeout_seconds=30,
+            )
+            publisher = SimpleNamespace(emit=lambda *args, **kwargs: None)
+            executor = WorkerJobExecutor(config, Profiles(), publisher)
+            with patch("tme3bot.worker.executor.RcloneRunner", VerifyRclone):
+                result = executor.quickmode_verify("verify-stage")
+
+            self.assertEqual(result["status"], "verified")
+            self.assertEqual(result["channel_found"], 2)
+            self.assertEqual(result["drive_found"], 1)
+            self.assertTrue(result["staging_cleaned"])
+            self.assertFalse(stage.exists())
 
     def test_four_photos_without_videos_do_not_invoke_video_processing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -525,7 +657,7 @@ class QuickPipelineTests(unittest.TestCase):
                 SimpleNamespace(),
                 Publisher(),
             )
-            executor._storage_upload = lambda command: {"total": 2, "succeeded": 2, "failed": []}
+            executor._storage_upload = lambda command, **kwargs: {"total": 2, "succeeded": 2, "failed": []}
             command = {
                 "job_id": "upload-phase-job",
                 "profile": "default",

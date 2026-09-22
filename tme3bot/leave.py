@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from tme3bot.tdl import SubprocessRunner, TDLCommandError
+from tme3bot.tdl import CommandCallback, SubprocessRunner, TDLCommandError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ class LeaveService:
         chat_refs: list[str],
         *,
         output_callback: Callable[[str], None] | None = None,
+        command_callback: CommandCallback | None = None,
     ) -> LeaveResult:
         command = [
             self.config.leave_helper_binary,
@@ -46,6 +47,7 @@ class LeaveService:
             env=env,
             log_prefix="tdl-leave",
             output_callback=output_callback,
+            command_callback=command_callback,
         )
         if result.returncode != 0:
             raise TDLCommandError(command, result.returncode, result.stdout, result.stderr)

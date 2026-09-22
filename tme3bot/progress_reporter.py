@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 from tme3bot.tdl_output import CommandProgress
+
+LOGGER = logging.getLogger(__name__)
 
 
 def utc_timestamp() -> str:
@@ -125,13 +128,22 @@ class ProgressReporter:
         )
         if not force and now - self._last_emit_at < self.min_interval_seconds and not changed_enough:
             return payload
-        self.publisher.emit(
-            self.job_id,
-            "running",
-            "progress.snapshot",
-            transient=True,
-            progress=payload,
-        )
+        try:
+            self.publisher.emit(
+                self.job_id,
+                "running",
+                "progress.snapshot",
+                transient=True,
+                progress=payload,
+            )
+        except Exception:
+            # Progress is advisory. A transient backend/telemetry failure must
+            # never turn a physical command or upload into a failed operation.
+            LOGGER.warning(
+                "Progress snapshot could not be published for job %s",
+                self.job_id,
+                exc_info=True,
+            )
         self._last_emit_at = now
         if percent is not None:
             self._last_percent = percent
@@ -146,14 +158,25 @@ class ProgressReporter:
         error: dict[str, Any] | None = None,
     ) -> None:
         payload = progress or self.latest
-        self.publisher.emit(
-            self.job_id,
-            "running",
-            event_type,
-            progress=payload,
-            result=result,
-            error=error,
-        )
+        try:
+            self.publisher.emit(
+                self.job_id,
+                "running",
+                event_type,
+                progress=payload,
+                result=result,
+                error=error,
+            )
+        except Exception:
+            # A physical transfer may already have completed. Telemetry is
+            # retried by the next scan/recovery and must not turn that file
+            # into a false failed upload.
+            LOGGER.warning(
+                "Milestone %s could not be published for job %s",
+                event_type,
+                self.job_id,
+                exc_info=True,
+            )
 
 
 def _progress_percent(payload: dict[str, Any]) -> float | None:

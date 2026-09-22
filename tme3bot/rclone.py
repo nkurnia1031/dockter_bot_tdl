@@ -4,7 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Callable, Iterable
 
-from tme3bot.tdl import SubprocessRunner, TDLCommandError, TDLStalledError
+from tme3bot.tdl import CommandCallback, SubprocessRunner, TDLCommandError, TDLStalledError
 from tme3bot.utility import validate_rclone_destination
 
 
@@ -23,12 +23,14 @@ class RcloneRunner:
         progress_callback: Callable[[int, int, str], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         stall_timeout_seconds: int = 0,
+        command_callback: CommandCallback | None = None,
     ) -> None:
         self.runner = runner or SubprocessRunner()
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         self.cancel_check = cancel_check
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
+        self.command_callback = command_callback
 
     def cancel_current(self) -> bool:
         return self.runner.interrupt_current()
@@ -100,6 +102,7 @@ class RcloneRunner:
                     log_prefix="rclone-upload",
                     output_callback=self.log_callback,
                     stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
                 )
             except TDLStalledError:
                 raise
@@ -119,4 +122,88 @@ class RcloneRunner:
             "total": len(paths),
             "succeeded": len(uploaded),
             "files": uploaded,
+        }
+
+    def verify_files(
+        self,
+        files: Iterable[Path],
+        destination: str,
+        config_path: Path,
+        *,
+        workspace_root: Path,
+        config_root: Path | None = None,
+        remote_names: Iterable[str] | None = None,
+    ) -> dict[str, object]:
+        """Verify exact remote files without downloading or mutating them."""
+        destination = str(destination or "").strip()
+        try:
+            validate_rclone_destination(destination)
+        except ValueError as exc:
+            raise RcloneError(str(exc)) from exc
+        workspace = Path(workspace_root).resolve()
+        config = Path(config_path).resolve()
+        allowed_config_root = Path(config_root or workspace).resolve()
+        try:
+            config.relative_to(allowed_config_root)
+        except ValueError as exc:
+            raise RcloneError(
+                "Konfigurasi rclone harus berada di dalam direktori data yang diizinkan."
+            ) from exc
+        if not config.is_file():
+            raise RcloneError(f"Konfigurasi rclone tidak ditemukan: {config}")
+        if shutil.which("rclone") is None:
+            raise RcloneError("Binary rclone belum tersedia pada worker.")
+
+        paths = [Path(item).resolve() for item in files]
+        names = list(remote_names) if remote_names is not None else [path.name for path in paths]
+        if len(names) != len(paths):
+            raise RcloneError("Jumlah nama tujuan rclone tidak sesuai dengan file.")
+        for path in paths:
+            try:
+                path.relative_to(workspace)
+            except ValueError as exc:
+                raise RcloneError("File rclone harus berada di dalam workspace.") from exc
+            if not path.is_file():
+                raise RcloneError(f"File rclone tidak ditemukan: {path.name}")
+
+        found: list[str] = []
+        missing: list[dict[str, str]] = []
+        for path, raw_name in zip(paths, names):
+            remote_name = str(raw_name).replace("\\", "/").strip("/")
+            remote_parts = [part for part in remote_name.split("/") if part]
+            if not remote_parts or any(part in {".", ".."} for part in remote_parts):
+                raise RcloneError(f"Nama tujuan rclone tidak valid untuk {path.name}.")
+            target = f"{destination.rstrip('/')}/{'/'.join(remote_parts)}"
+            command = [
+                "rclone",
+                "check",
+                str(path),
+                target,
+                "--size-only",
+                "--config",
+                str(config),
+                "--log-level",
+                "ERROR",
+            ]
+            try:
+                result = self.runner.run(
+                    command,
+                    log_prefix="rclone-verify",
+                    output_callback=self.log_callback,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
+                )
+            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                missing.append({"name": remote_name, "error": str(exc)[:300]})
+                continue
+            if result.returncode == 0:
+                found.append(remote_name)
+            else:
+                missing.append({"name": remote_name, "error": f"exit code {result.returncode}"})
+        return {
+            "destination": destination,
+            "expected": len(paths),
+            "found": len(found),
+            "files": found,
+            "missing": missing,
         }

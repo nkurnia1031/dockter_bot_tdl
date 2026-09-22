@@ -34,9 +34,14 @@
   const active = (job: Job) => activeStates.includes(job.status);
   const activeJobs = $derived(jobs.filter(active));
   const historyJobs = $derived(jobs.filter((job) => !active(job)));
-  const milestones = $derived(events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type)));
+  const milestones = $derived([...events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type))].reverse());
   const latestSnapshot = $derived([...events].reverse().find((event) => event.event_type === 'log.snapshot' && Array.isArray(event.result?.log?.lines)));
-  const logLines = $derived(liveLog?.log?.lines || latestSnapshot?.result?.log?.lines || []);
+  const rawLogLines = $derived(liveLog?.log?.lines || latestSnapshot?.result?.log?.lines || []);
+  const logLines = $derived(
+    (liveLog?.log?.order || latestSnapshot?.result?.log?.order) === 'newest_first'
+      ? rawLogLines
+      : [...rawLogLines].reverse()
+  );
   const selectedProgress = $derived(selected ? normalizeJobProgress(selected) : null);
 
   function formatClock(d: Date | null): string {
@@ -144,11 +149,11 @@
     const detail = [position, media, event.progress?.message || event.error?.message || event.result?.status].filter(Boolean).join(' · ');
     return `#${event.sequence} [${event.status}] ${event.event_type}: ${textValue(detail, 'Event tercatat')}`;
   };
-  const informativeEvents = $derived(events.filter((event) =>
+  const informativeEvents = $derived([...events.filter((event) =>
     event.event_type.startsWith('download.')
     || event.event_type === 'artifact.missing'
     || (!logLines.length && !['log.snapshot', 'progress.snapshot'].includes(event.event_type))
-  ).map(eventLine));
+  )].reverse().map(eventLine));
   const displayLogLines = $derived([
     ...informativeEvents,
     ...(informativeEvents.length && logLines.length ? ['──────── raw worker output ────────'] : []),
@@ -265,7 +270,7 @@
         {/if}
         <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each resultEntries(selected.result?.value || selected.result) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
       {:else if detailTab === 'milestones'}
-        <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div><p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p></article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
+        <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div>{#if event.event_type === 'command.completed'}<p class="mt-2 break-all font-mono text-xs">$ {(event.result?.command || []).join(' ')}</p>{#if event.result?.output_tail?.length}<pre class="terminal mt-2 max-h-48 overflow-auto whitespace-pre-wrap p-3 text-xs">{event.result.output_tail.join('\n')}</pre>{/if}<p class="muted mt-2 text-xs">exit {event.result?.returncode ?? '?'} · {event.result?.duration_seconds ?? 0}s{event.result?.output_truncated ? ' · output lama dipangkas' : ''}</p>{:else}<p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p>{/if}</article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
       {:else}
         <div class="mb-2 flex justify-end"><button class="button secondary" onclick={() => copy(JSON.stringify({job:selected,events}, null, 2))}><Copy size={14}/>Salin</button></div><pre class="terminal max-h-[48dvh] overflow-auto p-4 text-xs">{JSON.stringify({job:selected,events}, null, 2)}</pre>
       {/if}
@@ -276,7 +281,7 @@
 
 <Modal bind:open={logOpen} title={selected ? `Log ${selected.id.slice(0,12)}` : 'Log job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex h-[78dvh] min-h-0 flex-col bg-[#080d19] text-slate-100">
-    <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-700 px-4 py-3"><div><b>{displayLogLines.length} baris</b>{#if liveLog?.log?.truncated || latestSnapshot?.result?.log?.truncated}<span class="ml-2 text-xs text-amber-300">terpotong</span>{/if}</div><div class="flex gap-2"><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={loadEvents} disabled={loadingEvents}><RefreshCw class={loadingEvents ? 'animate-spin' : ''} size={15}/>Refresh</button><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={() => copy(displayLogLines.join('\n'))}><Copy size={15}/>Copy</button></div></div>
+    <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-700 px-4 py-3"><div><b>{displayLogLines.length} baris</b>{#if liveLog?.log?.truncated || latestSnapshot?.result?.log?.truncated}<span class="ml-2 text-xs text-amber-300">log lama dipangkas · terbaru di atas</span>{/if}</div><div class="flex gap-2"><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={loadEvents} disabled={loadingEvents}><RefreshCw class={loadingEvents ? 'animate-spin' : ''} size={15}/>Refresh</button><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={() => copy(displayLogLines.join('\n'))}><Copy size={15}/>Copy</button></div></div>
     {#if selectedProgress}<div class="grid shrink-0 gap-2 border-b border-slate-700 bg-slate-900/80 p-3 text-xs sm:grid-cols-4">
       <div class="rounded-lg border border-slate-700 p-2"><span class="text-slate-400">JSON</span><b class="mt-1 block truncate text-white">{selectedProgress.batch.name || 'Menunggu JSON'}</b><span class="text-violet-300">{selectedProgress.batch.index ? `${selectedProgress.batch.index}/${selectedProgress.batch.total || '?'}` : '-'}</span></div>
       <div class="rounded-lg border border-slate-700 p-2"><span class="text-slate-400">File aktif</span><b class="mt-1 block truncate text-white">{selectedProgress.item.name || 'Menunggu media'}</b><span class="text-sky-300">{selectedProgress.item.index ? `${selectedProgress.item.index}/${selectedProgress.item.total || '?'}` : '-'}</span></div>

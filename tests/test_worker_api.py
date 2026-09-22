@@ -22,6 +22,14 @@ class FakeExecutor:
     def quickmode_scan(self):
         return {"worker": "local", "items": [{"stage_job_id": "stage-1", "phase": "uploading"}]}
 
+    def quickmode_verify(self, stage_job_id, expected_phase="uploading"):
+        return {
+            "stage_job_id": stage_job_id,
+            "status": "verified",
+            "expected_phase": expected_phase,
+            "staging_cleaned": True,
+        }
+
     def job_log_snapshot(self, job_id):
         if job_id != "active":
             return None
@@ -84,6 +92,21 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["items"][0]["stage_job_id"], "stage-1")
+
+    def test_quickmode_verify_requires_token_and_returns_cleanup_result(self):
+        denied = self.client.post(
+            "/internal/v1/quickmode/verify",
+            json={"stage_job_id": "stage-1", "expected_phase": "uploading"},
+        )
+        self.assertEqual(denied.status_code, 401)
+        accepted = self.client.post(
+            "/internal/v1/quickmode/verify",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"stage_job_id": "stage-1", "expected_phase": "uploading"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["status"], "verified")
+        self.assertTrue(accepted.json()["staging_cleaned"])
 
     def test_active_job_log_snapshot_requires_token_and_handles_missing(self):
         denied = self.client.get("/internal/v1/jobs/active/log-snapshot")

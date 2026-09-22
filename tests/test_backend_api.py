@@ -42,6 +42,7 @@ class FakeDispatcher:
         self.commands = []
         self.storage_available = True
         self.quick_scan = {"local": {"worker": "local", "items": []}}
+        self.quick_verifications = []
 
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
@@ -70,6 +71,18 @@ class FakeDispatcher:
 
     def quickmode_scan(self, worker):
         return self.quick_scan.get(worker, {"worker": worker, "items": []})
+
+    def quickmode_verify(self, worker, stage_job_id, expected_phase="uploading"):
+        self.quick_verifications.append((worker, stage_job_id, expected_phase))
+        return {
+            "stage_job_id": stage_job_id,
+            "status": "verified",
+            "channel_expected": 3,
+            "channel_found": 3,
+            "drive_expected": 2,
+            "drive_found": 2,
+            "staging_cleaned": True,
+        }
 
 
 class FakeWorkers:
@@ -510,6 +523,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(log_snapshot.status_code, 200)
         self.assertEqual(log_snapshot.json()["source"], "worker")
         self.assertEqual(log_snapshot.json()["log"]["line_count"], 1)
+        self.assertEqual(log_snapshot.json()["log"]["order"], "newest_first")
         completed = self.client.post(
             f"/internal/v1/jobs/{job['id']}/events",
             headers={"Authorization": "Bearer internal"},
@@ -761,6 +775,31 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(command["worker"], "local")
         self.assertEqual(command["payload"]["quick_retry"]["stage_job_id"], "orphan-1")
         self.assertNotIn("A1031@bokep@1031A", str(recovered.json()))
+
+    def test_quick_staging_scan_verifies_inactive_uploading_folder(self):
+        headers = self.login()
+        self.dispatcher.quick_scan["local"] = {
+            "worker": "local",
+            "items": [{
+                "stage_job_id": "uploaded-1",
+                "folder_name": "batch",
+                "phase": "uploading",
+                "archive_parts": 2,
+                "thumbnail_present": True,
+                "staging_path": "/workspace/quickmode/uploaded-1",
+            }],
+        }
+
+        response = self.client.get("/api/v1/quick-mode/staging", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["items"][0]
+        self.assertEqual(item["cleanup_verification"]["status"], "verified")
+        self.assertTrue(item["staging_cleaned"])
+        self.assertEqual(
+            self.dispatcher.quick_verifications,
+            [("local", "uploaded-1", "uploading")],
+        )
 
     def test_quickmode_staging_excludes_backend_jobs_without_physical_folder(self):
         headers = self.login()

@@ -96,6 +96,27 @@ def _model_dict(model) -> dict[str, Any]:
     return model.dict()
 
 
+def _newest_first_log_response(value: Any) -> dict[str, Any]:
+    """Normalize current and legacy worker snapshots for the public API."""
+    response = dict(value) if isinstance(value, dict) else {}
+    raw_log = response.get("log")
+    log = dict(raw_log) if isinstance(raw_log, dict) else {}
+    lines = log.get("lines")
+    if not isinstance(lines, list):
+        lines = []
+    if log.get("order") != "newest_first":
+        lines = list(reversed(lines))
+    log["lines"] = lines
+    try:
+        log["line_count"] = int(log.get("line_count") or len(lines))
+    except (TypeError, ValueError):
+        log["line_count"] = len(lines)
+    log["truncated"] = bool(log.get("truncated"))
+    log["order"] = "newest_first"
+    response["log"] = log
+    return response
+
+
 def _error(
     request: Request,
     code: str,
@@ -757,6 +778,24 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     item["backend_job"] = linked["job"] if linked else None
                     item["backend_job_id"] = linked["backend_job_id"] if linked else None
                     item["orphan"] = linked is None
+                    linked_status = str(linked["job"].get("status") or "") if linked else ""
+                    verifier = getattr(dispatcher, "quickmode_verify", None) if dispatcher is not None else None
+                    if (
+                        str(item.get("phase") or "") == "uploading"
+                        and linked_status not in {"queued", "dispatched", "running"}
+                        and callable(verifier)
+                    ):
+                        try:
+                            verification = verifier(worker, stage_id, "uploading")
+                            if isinstance(verification, dict):
+                                item["cleanup_verification"] = verification
+                                item["staging_cleaned"] = bool(verification.get("staging_cleaned"))
+                        except Exception as exc:
+                            item["cleanup_verification"] = {
+                                "status": "failed",
+                                "reason": str(exc)[:500],
+                                "staging_cleaned": False,
+                            }
                     items.append(item)
             except Exception as exc:
                 # One remote worker being offline must not hide staging from
@@ -955,8 +994,11 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         job = _owned_job(context, actor, job_id)
         if context.worker_dispatcher is not None:
             try:
+                worker_log = _newest_first_log_response(
+                    context.worker_dispatcher.job_log(job.worker, job.id)
+                )
                 return {
-                    **context.worker_dispatcher.job_log(job.worker, job.id),
+                    **worker_log,
                     "source": "worker",
                 }
             except Exception:
@@ -972,9 +1014,17 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 and isinstance(event.result, dict)
                 and isinstance(event.result.get("log"), dict)
             ):
-                return {"log": event.result["log"], "source": "history"}
+                return {
+                    **_newest_first_log_response({"log": event.result["log"]}),
+                    "source": "history",
+                }
         return {
-            "log": {"lines": [], "line_count": 0, "truncated": False},
+            "log": {
+                "lines": [],
+                "line_count": 0,
+                "truncated": False,
+                "order": "newest_first",
+            },
             "source": "empty",
         }
 

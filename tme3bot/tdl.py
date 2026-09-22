@@ -85,6 +85,7 @@ class UploadResult:
 
 ProgressCallback = Callable[[CommandProgress], None]
 OutputCallback = Callable[[str], None]
+CommandCallback = Callable[[list[str], int, str, float, str], None]
 
 
 class SubprocessRunner:
@@ -103,6 +104,7 @@ class SubprocessRunner:
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
         output_callback: OutputCallback | None = None,
+        command_callback: CommandCallback | None = None,
     ) -> subprocess.CompletedProcess[str]:
         process_command = prepare_subprocess_command(command, env)
         if process_command == command:
@@ -112,6 +114,7 @@ class SubprocessRunner:
         if output_callback is not None:
             output_callback(f"$ {' '.join(command)}")
         started_at = time.time()
+        started_monotonic = time.monotonic()
         output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
@@ -128,6 +131,11 @@ class SubprocessRunner:
                 start_new_session=os.name != "nt",
             )
         except FileNotFoundError as exc:
+            if command_callback is not None:
+                try:
+                    command_callback(command, -1, str(exc), max(0.0, time.monotonic() - started_monotonic), log_prefix)
+                except Exception:
+                    LOGGER.exception("Command callback failed for %s", log_prefix)
             raise TDLCommandError(command, -1, "", str(exc)) from exc
 
         with self._lock:
@@ -195,6 +203,17 @@ class SubprocessRunner:
         LOGGER.info("%s finished with exit code %s", log_prefix, returncode)
         if output_callback is not None:
             output_callback(f"[process exited with code {returncode}]")
+        if command_callback is not None:
+            try:
+                command_callback(
+                    command,
+                    int(returncode),
+                    f"{stdout}\n{stderr}",
+                    max(0.0, time.monotonic() - started_monotonic),
+                    log_prefix,
+                )
+            except Exception:
+                LOGGER.exception("Command callback failed for %s", log_prefix)
         if stalled:
             raise TDLStalledError(
                 command,
@@ -450,6 +469,7 @@ class TDLClient:
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
         output_callback: OutputCallback | None = None,
+        command_callback: CommandCallback | None = None,
         upload_resolve_timeout_seconds: float | None = None,
         upload_resolve_interval_seconds: float | None = None,
     ) -> None:
@@ -463,6 +483,7 @@ class TDLClient:
         self.stall_timeout_seconds = stall_timeout_seconds
         self.progress_callback = progress_callback
         self.output_callback = output_callback
+        self.command_callback = command_callback
         self.upload_resolve_timeout_seconds = (
             float(upload_resolve_timeout_seconds)
             if upload_resolve_timeout_seconds is not None
@@ -503,6 +524,7 @@ class TDLClient:
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
             output_callback=self.output_callback,
+            **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
         )
         self._ensure_success(command, result)
 
@@ -560,6 +582,7 @@ class TDLClient:
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
             output_callback=self.output_callback,
+            **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
         )
         self._ensure_success(command, result)
         return result
@@ -589,6 +612,7 @@ class TDLClient:
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
             output_callback=self.output_callback,
+            **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
         )
         self._ensure_success(command, result)
         return result
@@ -637,6 +661,7 @@ class TDLClient:
                 stall_timeout_seconds=self.stall_timeout_seconds,
                 progress_callback=self.progress_callback,
                 output_callback=self.output_callback,
+                **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
             )
             self._ensure_success(command, result)
             message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")

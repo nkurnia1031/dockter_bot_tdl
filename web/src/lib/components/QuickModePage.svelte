@@ -425,6 +425,15 @@
           </div>
         </div>
         <div class="mt-3 flex flex-wrap gap-2 text-xs font-bold"><span class={`rounded-full px-2.5 py-1 ${item.json_present ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>JSON {item.json_present ? 'ada' : 'tidak ada'}</span><span class={`rounded-full px-2.5 py-1 ${item.actual_media_count ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>Media {item.actual_media_count}/{item.expected_media_count || '?'}</span><span class={`rounded-full px-2.5 py-1 ${item.thumbnail_present ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>PNG {item.thumbnail_present ? 'ada' : 'belum'}</span><span class={`rounded-full px-2.5 py-1 ${item.archive_parts ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>Archive {item.archive_parts}</span><span class={`rounded-full px-2.5 py-1 ${item.tdl_export_present && item.tdl_download_present ? 'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200' : 'bg-slate-100 text-slate-500 dark:bg-slate-800'}`}>.tdl {item.tdl_export_present ? 'E' : '-'} / {item.tdl_download_present ? 'D' : '-'}</span></div>
+        {#if item.cleanup_verification}
+          {@const verification = item.cleanup_verification}
+          <div class={`mt-3 rounded-xl px-3 py-2 text-xs ${verification.status === 'verified' ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200' : 'bg-amber-50 text-amber-800 dark:bg-amber-950/40 dark:text-amber-200'}`}>
+            <b>Crosscheck upload: {verification.status}</b>
+            <span class="ml-2">Telegram {verification.channel_found ?? 0}/{verification.channel_expected ?? 0} · Google Drive {verification.drive_found ?? 0}/{verification.drive_expected ?? 0}</span>
+            {#if verification.reason}<p class="mt-1">{verification.reason}</p>{/if}
+          </div>
+        {/if}
+        {#if item.staging_cleaned}<p class="mt-3 rounded-xl bg-emerald-50 px-3 py-2 text-xs text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-200">Staging dibersihkan setelah archive dan thumbnail terverifikasi.</p>{/if}
         {#if item.last_error}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:bg-rose-950/40 dark:text-rose-200">{item.last_error}</p>{/if}
         {#if backendId}<p class="muted mt-2 text-xs">Job backend: {backendId} · storage: {item.storage_folder || '-'}</p>{/if}
       </article>

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from tme3bot.persistence import write_json_atomic
-from tme3bot.tdl import ProcessStalledError
+from tme3bot.tdl import CommandCallback, ProcessStalledError
 from tme3bot.tdl_output import parse_tdl_progress_line
 
 LOGGER = logging.getLogger(__name__)
@@ -246,11 +246,13 @@ class UtilityRunner:
         log_callback: Callable[[str], None] | None = None,
         progress_callback: Callable[[dict[str, object]], None] | None = None,
         stall_timeout_seconds: int = 0,
+        command_callback: CommandCallback | None = None,
     ) -> None:
         self.root = utility_root
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
+        self.command_callback = command_callback
         self._process_lock = threading.RLock()
         self._current_process: subprocess.Popen[str] | None = None
 
@@ -453,21 +455,30 @@ class UtilityRunner:
 
     def _command(self, command: list[str], cwd: Path, prefix: str, settings: dict[str, str] | None = None) -> None:
         LOGGER.info("%s start folder=%s", prefix, cwd)
+        started_at = time.monotonic()
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
         if settings:
             env["UTILITY_MOVE_SIZE"] = settings.get("move_size", "4g")
             env["UTILITY_COMPRESS_SIZE"] = settings.get("compress_size", "4g")
             env["UTILITY_COMPRESS_PASSWORD"] = settings.get("compress_password", "")
-        process = subprocess.Popen(
-            command,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            start_new_session=os.name != "nt",
-        )
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+                start_new_session=os.name != "nt",
+            )
+        except OSError as exc:
+            if self.command_callback is not None:
+                try:
+                    self.command_callback(command, -1, str(exc), time.monotonic() - started_at, prefix)
+                except Exception:
+                    LOGGER.exception("Command callback failed for %s", prefix)
+            raise
         with self._process_lock:
             self._current_process = process
         assert process.stdout is not None
@@ -549,6 +560,7 @@ class UtilityRunner:
                     }
                 )
 
+        code = -1
         try:
             buffer: list[str] = []
             while True:
@@ -571,6 +583,17 @@ class UtilityRunner:
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+        if self.command_callback is not None:
+            try:
+                self.command_callback(
+                    command,
+                    int(code),
+                    "\n".join(lines),
+                    time.monotonic() - started_at,
+                    prefix,
+                )
+            except Exception:
+                LOGGER.exception("Command callback failed for %s", prefix)
         if stalled.is_set():
             raise ProcessStalledError(
                 f"{prefix} stalled for {self.stall_timeout_seconds}s",
