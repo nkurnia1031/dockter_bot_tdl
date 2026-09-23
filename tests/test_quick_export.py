@@ -9,7 +9,12 @@ from tme3bot.progress import DownloadProgressTracker
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.service import ExportJobResult, DownloadedJsonResult
 from tme3bot.utility import UtilityResult
-from tme3bot.worker.executor import CommandMilestoneRecorder, JobLogSnapshot, WorkerJobExecutor
+from tme3bot.worker.executor import (
+    CommandMilestoneRecorder,
+    JobLogSnapshot,
+    WorkerEventPublisher,
+    WorkerJobExecutor,
+)
 from tme3bot.worker.quick_export import (
     QuickModeError,
     QuickThumbnailBuilder,
@@ -37,6 +42,61 @@ class QuickThumbnailTests(unittest.TestCase):
         self.assertEqual(snapshot.value()["lines"], ["newest", "new", "middle"])
         self.assertTrue(snapshot.value()["truncated"])
         self.assertEqual(snapshot.value()["order"], "newest_first")
+
+    def test_job_log_keeps_only_the_latest_progress_bar_per_transfer(self) -> None:
+        snapshot = JobLogSnapshot()
+        snapshot.add("archive.7z.001 -> channel ... 10.0% [#####........................................] [1s; 1 MB/s]")
+        snapshot.add("[#####................................................................................................................] [1s; 1 MB/s]")
+        snapshot.add("message after progress")
+        snapshot.add("archive.7z.001 -> channel ... 20.0% [##########.................................] [2s; 2 MB/s]")
+        snapshot.add("[##########........................................................................................................] [2s; 2 MB/s]")
+
+        lines = snapshot.value()["lines"]
+        progress = [line for line in lines if "archive.7z.001 -> channel" in line]
+        self.assertEqual(len(progress), 1)
+        self.assertIn("20.0%", progress[0])
+        self.assertEqual(sum("[" in line and "/s]" in line for line in lines), 1)
+
+    def test_worker_event_audit_records_delivery_without_payload_secrets(self) -> None:
+        events: list[str] = []
+        publisher = WorkerEventPublisher("http://backend", "internal-token")
+        publisher.register_audit_callback("job-audit", events.append)
+        with patch("tme3bot.worker.executor.request_json", return_value={}):
+            publisher.begin("job-audit", 10)
+            publisher.emit(
+                "job-audit",
+                "running",
+                "progress.snapshot",
+                transient=True,
+                progress={"message": "safe"},
+            )
+
+        self.assertTrue(any("send sequence=11" in line for line in events))
+        self.assertTrue(any("delivered sequence=11" in line for line in events))
+        self.assertNotIn("internal-token", "\n".join(events))
+
+    def test_worker_file_log_compacts_redraws_but_keeps_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "worker.log"
+            path.write_text(
+                "\n".join(
+                    [
+                        "[2026-09-23T01:00:00+07:00] $ tdl up archive.7z.001",
+                        "[2026-09-23T01:00:01+07:00] archive.7z.001 -> channel ... 1.0% [#...............................................] [1s; 1 MB/s]",
+                        "[2026-09-23T01:00:02+07:00] [#................................................................................] [1s; 1 MB/s]",
+                        "[2026-09-23T01:00:03+07:00] archive.7z.001 -> channel ... 2.0% [##..............................................] [2s; 2 MB/s]",
+                        "[2026-09-23T01:00:04+07:00] [##...............................................................................] [2s; 2 MB/s]",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            WorkerJobExecutor._compact_quick_log(path)
+            content = path.read_text(encoding="utf-8")
+            self.assertEqual(content.count("archive.7z.001 -> channel"), 1)
+            self.assertIn("2.0%", content)
+            self.assertIn("$ tdl up archive.7z.001", content)
+            self.assertNotIn("[##................................................................", content)
 
     def test_command_milestone_is_bounded_and_redacts_secret(self) -> None:
         events = []
@@ -119,6 +179,7 @@ class QuickThumbnailTests(unittest.TestCase):
             content = (stage / "worker.log").read_text(encoding="utf-8")
             self.assertIn("progress [redacted]", content)
             self.assertNotIn("secret-value", content)
+            self.assertIn("+07:00", content)
             self.assertTrue(any(event[0][2] == "progress.snapshot" for event in events))
 
     def test_quickmode_verify_requires_channel_and_drive_before_cleanup(self) -> None:

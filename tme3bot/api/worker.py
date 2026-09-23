@@ -91,6 +91,8 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
         if not payload.get("execution"):
             payload.pop("execution", None)
+        if payload.get("event_sequence_start") is None:
+            payload.pop("event_sequence_start", None)
         return {"position": context.executor.enqueue(payload), "job_id": body.job_id}
 
     @app.post(

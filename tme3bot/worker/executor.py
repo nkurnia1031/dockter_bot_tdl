@@ -4,14 +4,17 @@ import hashlib
 import json
 import logging
 import mimetypes
+import re
 import shutil
 import threading
 import time
 import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from tme3bot.backup_service import BackupService, sha256_file
 from tme3bot.command_audit import bounded_output_tail, sanitize_command, sanitize_text
@@ -44,6 +47,32 @@ from tme3bot.worker.quick_export import (
 )
 
 LOGGER = logging.getLogger(__name__)
+JAKARTA_TZ = ZoneInfo("Asia/Jakarta")
+
+
+def jakarta_timestamp() -> str:
+    """Return human-facing worker log timestamps in the project timezone."""
+    return datetime.now(JAKARTA_TZ).isoformat()
+
+
+_PROGRESS_BAR_RE = re.compile(r"\[[ .#<>-]{8,}\]\s*\[[^\]]+\]")
+
+
+def progress_line_key(value: str) -> str | None:
+    """Return a stable key for a repeated TDL progress-bar line.
+
+    TDL prints the same transfer state repeatedly, often with a separate
+    full-width bar line.  The text before the first bar identifies the active
+    transfer; a blank prefix is the bar-only companion line.
+    """
+    line = str(value).strip()
+    match = _PROGRESS_BAR_RE.search(line)
+    if match is None:
+        return None
+    prefix = line[: match.start()].strip()
+    # The percentage is part of the changing bar state, not its identity.
+    prefix = re.sub(r"\s+\d+(?:\.\d+)?%\s*$", "", prefix)
+    return prefix[:240] or "__bar_only__"
 
 
 def storage_relative_folders(root: Path) -> list[str]:
@@ -121,6 +150,40 @@ class JobLogSnapshot:
                 line = raw_line.rstrip()
                 if not line:
                     continue
+                if line.startswith("$ "):
+                    retained = [
+                        existing
+                        for existing in self._lines
+                        if progress_line_key(existing) is None
+                    ]
+                    self._lines = retained
+                    self._characters = sum(len(existing) + 1 for existing in retained)
+                progress_key = progress_line_key(line)
+                if progress_key == "__bar_only__" and any(
+                    progress_line_key(existing) not in {None, "__bar_only__"}
+                    for existing in self._lines
+                ):
+                    # TDL emits a descriptive transfer line followed by a
+                    # full-width companion bar. Keep the informative line;
+                    # retaining both duplicates the same state in the UI.
+                    continue
+                if progress_key is not None:
+                    if progress_key != "__bar_only__":
+                        retained = [
+                            existing
+                            for existing in self._lines
+                            if progress_line_key(existing) != "__bar_only__"
+                        ]
+                        self._lines = retained
+                        self._characters = sum(len(existing) + 1 for existing in retained)
+                    # Keep one current bar per transfer instead of filling the
+                    # bounded snapshot with identical TDL redraws.
+                    for index in range(len(self._lines) - 1, -1, -1):
+                        if progress_line_key(self._lines[index]) != progress_key:
+                            continue
+                        removed = self._lines.pop(index)
+                        self._characters -= len(removed) + 1
+                        break
                 line_size = len(line) + 1
                 while self._lines and (
                     len(self._lines) >= self.max_lines
@@ -255,7 +318,29 @@ class WorkerEventPublisher:
         self.backend_url = backend_url
         self.token = token
         self._sequences: dict[str, int] = {}
+        self._audit_callbacks: dict[str, Callable[[str], None]] = {}
         self._lock = threading.RLock()
+
+    def register_audit_callback(
+        self, job_id: str, callback: Callable[[str], None]
+    ) -> None:
+        with self._lock:
+            self._audit_callbacks[str(job_id)] = callback
+
+    def unregister_audit_callback(self, job_id: str) -> None:
+        with self._lock:
+            self._audit_callbacks.pop(str(job_id), None)
+
+    def _audit(self, job_id: str, message: str) -> None:
+        with self._lock:
+            callback = self._audit_callbacks.get(str(job_id))
+        if callback is None:
+            return
+        try:
+            callback(message)
+        except Exception:
+            # A diagnostic sink must never affect telemetry or physical work.
+            LOGGER.debug("Worker telemetry audit callback failed", exc_info=True)
 
     def emit(
         self,
@@ -267,6 +352,8 @@ class WorkerEventPublisher:
         progress: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
+        timeout_seconds: float = 5.0,
+        max_attempts: int = 1,
     ) -> None:
         with self._lock:
             sequence = self._sequences.get(job_id, 1) + 1
@@ -281,15 +368,37 @@ class WorkerEventPublisher:
             "error": json_value(error) if error is not None else None,
         }
         last_error: Exception | None = None
-        for attempt in range(3):
+        attempts = max(1, int(max_attempts))
+        timeout = max(0.5, float(timeout_seconds))
+        started_monotonic = time.monotonic()
+        self._audit(
+            job_id,
+            "[telemetry] send "
+            f"sequence={sequence} event={event_type} transient={bool(transient)} "
+            f"attempts={attempts} timeout={timeout:g}s",
+        )
+        for attempt in range(attempts):
             try:
-                request_json(
+                response = request_json(
                     self.backend_url,
                     self.token,
                     "POST",
                     f"/internal/v1/jobs/{job_id}/events",
                     payload,
-                    timeout=30,
+                    timeout=timeout,
+                )
+                if isinstance(response, dict) and response.get("accepted") is False:
+                    self._audit(
+                        job_id,
+                        "[telemetry] ignored "
+                        f"sequence={sequence} event={event_type} reason=backend_rejected",
+                    )
+                    return
+                self._audit(
+                    job_id,
+                    "[telemetry] delivered "
+                    f"sequence={sequence} event={event_type} "
+                    f"duration={time.monotonic() - started_monotonic:.3f}s",
                 )
                 return
             except Exception as exc:
@@ -303,9 +412,22 @@ class WorkerEventPublisher:
                         event_type,
                         job_id,
                     )
+                    self._audit(
+                        job_id,
+                        "[telemetry] ignored "
+                        f"sequence={sequence} event={event_type} status=409 terminal",
+                    )
                     return
                 last_error = exc
-                if attempt < 2:
+                status = getattr(exc, "status", None)
+                status_text = f" status={status}" if status is not None else ""
+                self._audit(
+                    job_id,
+                    "[telemetry] failed "
+                    f"sequence={sequence} event={event_type} attempt={attempt + 1}"
+                    f" error_type={type(exc).__name__}{status_text}",
+                )
+                if attempt + 1 < attempts:
                     time.sleep(0.5 * (attempt + 1))
         assert last_error is not None
         raise last_error
@@ -322,6 +444,7 @@ class WorkerEventPublisher:
     def forget(self, job_id: str) -> None:
         with self._lock:
             self._sequences.pop(job_id, None)
+            self._audit_callbacks.pop(job_id, None)
 
 
 class WorkerJobExecutor:
@@ -344,6 +467,10 @@ class WorkerJobExecutor:
         self._lock = threading.RLock()
         self._job_log = threading.local()
         self._log_snapshots: dict[str, JobLogSnapshot] = {}
+        self._quick_log_paths: dict[str, Path] = {}
+        self._quick_log_locks: dict[str, threading.RLock] = {}
+        self._quick_log_named_progress: dict[str, bool] = {}
+        self._quick_log_state_lock = threading.RLock()
         # Inventory statistics are derived from the JSON file.  Keep a small
         # process-local fingerprint cache so repeated reconciles do not parse
         # unchanged exports again.  The cache is intentionally disposable;
@@ -447,19 +574,34 @@ class WorkerJobExecutor:
             # between two interrupt calls; the worker must still terminate
             # instead of entering the next Quick Mode phase.
             self._cancel_requested.add(job_id)
+        self._write_quick_log_line(
+            job_id,
+            f"[cancel] request received kind={kind} quick_mode={quick_active}",
+        )
 
         cancelled = False
 
         def interrupt(label: str, callback) -> None:
             nonlocal cancelled
             if callback is None:
+                self._write_quick_log_line(
+                    job_id, f"[cancel] interrupt={label} result=unavailable"
+                )
                 return
             try:
-                cancelled = bool(callback()) or cancelled
-            except Exception:
+                result = bool(callback())
+                cancelled = result or cancelled
+                self._write_quick_log_line(
+                    job_id, f"[cancel] interrupt={label} result={result}"
+                )
+            except Exception as exc:
                 # Cancellation is best effort.  One missing runtime/client
                 # must not turn the API request into an HTTP 500 or prevent
                 # the remaining resources from receiving the signal.
+                self._write_quick_log_line(
+                    job_id,
+                    f"[cancel] interrupt={label} error_type={type(exc).__name__}",
+                )
                 LOGGER.warning(
                     "Could not interrupt %s for job %s", label, job_id, exc_info=True
                 )
@@ -737,8 +879,15 @@ class WorkerJobExecutor:
                 job_id,
                 exc_info=True,
             )
+        if isinstance(self._job_log.file_path, Path):
+            self._register_quick_log(job_id, self._job_log.file_path)
         self._job_log.heartbeat_at = 0.0
-        self._append_job_log(f"[job {job_id} started: {kind}]")
+        self._append_job_log(
+            f"[job {job_id} started: {kind} "
+            f"event_sequence_start={command.get('event_sequence_start', 'missing')}]"
+        )
+        heartbeat_stop = threading.Event()
+        heartbeat_thread: threading.Thread | None = None
         with self._lock:
             self._active[job_id] = (profile, kind)
             self._log_snapshots[job_id] = snapshot
@@ -758,6 +907,13 @@ class WorkerJobExecutor:
                     "indeterminate": True,
                 },
             )
+            heartbeat_thread = threading.Thread(
+                target=self._worker_heartbeat_loop,
+                args=(job_id, heartbeat_stop),
+                daemon=True,
+                name=f"worker-heartbeat-{job_id[:8]}",
+            )
+            heartbeat_thread.start()
             result = self._execute(command)
             with self._lock:
                 cancelled = job_id in self._cancel_requested
@@ -835,6 +991,17 @@ class WorkerJobExecutor:
                     staging_path=self._quick_staging_path(command),
                 )
         finally:
+            heartbeat_stop.set()
+            if heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=2)
+            file_path = getattr(self._job_log, "file_path", None)
+            if isinstance(file_path, Path):
+                self._compact_quick_log(file_path)
+            self.publisher.unregister_audit_callback(job_id)
+            with self._quick_log_state_lock:
+                self._quick_log_paths.pop(job_id, None)
+                self._quick_log_locks.pop(job_id, None)
+                self._quick_log_named_progress.pop(job_id, None)
             del self._job_log.snapshot
             del self._job_log.audit
             for name in ("job_id", "secrets", "file_path", "heartbeat_at"):
@@ -884,6 +1051,107 @@ class WorkerJobExecutor:
         except Exception:
             LOGGER.exception("Could not publish failure for job %s", command.get("job_id"))
 
+    def _register_quick_log(self, job_id: str, file_path: Path) -> None:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._quick_log_state_lock:
+            self._quick_log_paths[str(job_id)] = file_path
+            self._quick_log_locks[str(job_id)] = threading.RLock()
+            self._quick_log_named_progress[str(job_id)] = False
+        self.publisher.register_audit_callback(
+            str(job_id),
+            lambda message, current_job=str(job_id): self._write_quick_log_line(
+                current_job, message
+            ),
+        )
+
+    def _write_quick_log_line(
+        self,
+        job_id: str,
+        line: str,
+        secrets: list[str] | None = None,
+        fallback_path: Path | None = None,
+    ) -> None:
+        with self._quick_log_state_lock:
+            file_path = self._quick_log_paths.get(str(job_id)) or fallback_path
+            lock = self._quick_log_locks.get(str(job_id)) or self._quick_log_state_lock
+        if file_path is None or lock is None:
+            return
+        safe_line = sanitize_text(str(line), secrets or "").rstrip()
+        if not safe_line:
+            return
+        progress_key = progress_line_key(safe_line)
+        with self._quick_log_state_lock:
+            if progress_key == "__bar_only__":
+                if self._quick_log_named_progress.get(str(job_id), False):
+                    return
+            elif progress_key is not None:
+                self._quick_log_named_progress[str(job_id)] = True
+            elif safe_line.startswith("$ ") or "process exited with code" in safe_line:
+                self._quick_log_named_progress[str(job_id)] = False
+        try:
+            with lock:
+                with file_path.open("a", encoding="utf-8") as stream:
+                    stream.write(f"[{jakarta_timestamp()}] {safe_line}\n")
+        except OSError:
+            LOGGER.warning(
+                "Could not append Quick Mode worker log %s", file_path, exc_info=True
+            )
+
+    @staticmethod
+    def _compact_quick_log(file_path: Path) -> None:
+        """Remove stale progress redraws while retaining diagnostic lines."""
+        try:
+            lines = file_path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return
+        compacted: list[str] = []
+        positions: dict[str, int] = {}
+        for line in lines:
+            body = re.sub(r"^\[[^]]+\]\s*", "", line, count=1)
+            key = progress_line_key(body)
+            if key is None and body.startswith("$ "):
+                compacted = [
+                    existing
+                    for existing in compacted
+                    if progress_line_key(
+                        re.sub(r"^\[[^]]+\]\s*", "", existing, count=1)
+                    )
+                    is None
+                ]
+                positions.clear()
+            if key not in {None, "__bar_only__"} and "__bar_only__" in positions:
+                bar_index = positions.pop("__bar_only__")
+                compacted.pop(bar_index)
+                positions = {
+                    name: index - 1 if index > bar_index else index
+                    for name, index in positions.items()
+                }
+            if key == "__bar_only__" and any(
+                name != "__bar_only__" for name in positions
+            ):
+                continue
+            if key is None:
+                compacted.append(line)
+                continue
+            old_index = positions.get(key)
+            if old_index is not None:
+                compacted.pop(old_index)
+                positions = {
+                    name: index - 1 if index > old_index else index
+                    for name, index in positions.items()
+                    if name != key
+                }
+            positions[key] = len(compacted)
+            compacted.append(line)
+        if len(compacted) == len(lines):
+            return
+        temporary = file_path.with_name(f".{file_path.name}.compact.tmp")
+        try:
+            temporary.write_text("\n".join(compacted) + ("\n" if compacted else ""), encoding="utf-8")
+            temporary.replace(file_path)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+
     def _append_job_log(self, line: str) -> None:
         snapshot = getattr(self._job_log, "snapshot", None)
         if snapshot is not None:
@@ -892,17 +1160,12 @@ class WorkerJobExecutor:
         if isinstance(file_path, Path):
             secrets = getattr(self._job_log, "secrets", [])
             safe_lines = sanitize_text(str(line), secrets).splitlines() or [str(line)]
-            try:
-                with file_path.open("a", encoding="utf-8") as stream:
-                    for value in safe_lines:
-                        stream.write(f"[{utc_now().isoformat()}] {value.rstrip()}\n")
-            except OSError:
-                # Diagnostics must never break the physical command.
-                LOGGER.warning(
-                    "Could not append Quick Mode worker log %s",
-                    file_path,
-                    exc_info=True,
-                )
+            job_id = getattr(self._job_log, "job_id", None)
+            if job_id:
+                for value in safe_lines:
+                    self._write_quick_log_line(
+                        str(job_id), value, secrets, fallback_path=file_path
+                    )
 
         # Raw TDL/utility/ffmpeg output is meaningful activity even when it
         # does not contain a parseable percentage. Refresh the backend
@@ -931,6 +1194,35 @@ class WorkerJobExecutor:
                         job_id,
                         exc_info=True,
                     )
+
+    def _worker_heartbeat_loop(
+        self, job_id: str, stop_event: threading.Event
+    ) -> None:
+        """Keep backend liveness independent from noisy subprocess output.
+
+        A Quick Mode upload can spend a long time inside Telegram/rclone even
+        when no new parseable progress line is produced.  This heartbeat is
+        deliberately small and advisory; it never changes the physical job
+        result and stops before the executor publishes its terminal event.
+        """
+        while not stop_event.wait(10.0):
+            try:
+                self.publisher.emit(
+                    job_id,
+                    "running",
+                    "progress.snapshot",
+                    transient=True,
+                    progress={
+                        "heartbeat": True,
+                        "worker_heartbeat_at": utc_now().isoformat(),
+                    },
+                )
+            except Exception:
+                LOGGER.warning(
+                    "Could not publish worker heartbeat for %s",
+                    job_id,
+                    exc_info=True,
+                )
 
     def _command_callback(self):
         return getattr(self._job_log, "audit", None)

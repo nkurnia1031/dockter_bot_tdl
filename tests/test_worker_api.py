@@ -73,6 +73,23 @@ class WorkerApiTests(unittest.TestCase):
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 404)
 
+    def test_worker_preserves_event_sequence_start_for_reused_job_ids(self):
+        payload = {
+            "job_id": "retry-job",
+            "kind": "export",
+            "profile": "default",
+            "actor_user_id": 42,
+            "event_sequence_start": 983,
+            "payload": {"quick_mode": True},
+        }
+        response = self.client.post(
+            "/internal/v1/jobs",
+            headers={"Authorization": "Bearer worker-secret"},
+            json=payload,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.executor.commands[-1]["event_sequence_start"], 983)
+
     def test_workspace_tree_requires_token(self):
         denied = self.client.get("/internal/v1/workspace/tree")
         self.assertEqual(denied.status_code, 401)

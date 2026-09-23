@@ -487,6 +487,18 @@ class BackendApiTests(unittest.TestCase):
             {"chat_id", "message_id", "panel_view_token"} & set(command)
         )
 
+        stale = self.client.post(
+            f"/internal/v1/jobs/{job['id']}/events",
+            headers={"Authorization": "Bearer internal"},
+            json={
+                "sequence": 1,
+                "status": "running",
+                "event_type": "stale_worker_event",
+            },
+        )
+        self.assertEqual(stale.status_code, 200)
+        self.assertFalse(stale.json()["accepted"])
+
         running = self.client.post(
             f"/internal/v1/jobs/{job['id']}/events",
             headers={"Authorization": "Bearer internal"},

@@ -263,7 +263,29 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
         self.assertTrue(self.dispatcher.cancel_result)
 
+        # Worker output can arrive just after the first watchdog tick.  It is
+        # proof of liveness and must prevent the grace timer from force
+        # cancelling a healthy upload.
+        control.update_worker_progress(
+            JobEvent(
+                job_id=job.id,
+                sequence=3,
+                status=JobStatus.RUNNING,
+                event_type="progress.snapshot",
+                progress={"heartbeat": True},
+                created_at=stale_at + timedelta(seconds=12),
+            )
+        )
+        self.assertNotIn(job.id, control._stale_cancel_requested)
+
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=17))
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+
+        # If the worker goes silent again, the normal watchdog path still
+        # cancels it after the configured grace period.
+        control._recover_stale_jobs(now=stale_at + timedelta(seconds=30))
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        control._recover_stale_jobs(now=stale_at + timedelta(seconds=36))
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
         self.assertEqual(self.jobs.get(job.id).error["code"], "JOB_STALLED")
 

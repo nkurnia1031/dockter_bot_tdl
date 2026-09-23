@@ -337,6 +337,10 @@ class WorkerJobRequest(BaseModel):
     kind: str
     profile: str
     actor_user_id: int
+    # Backend dispatches start numbering because a retry reuses the same job
+    # ID and therefore retains its previous event history.  This field must
+    # reach the worker; dropping it makes every worker event look stale.
+    event_sequence_start: int | None = None
     execution: dict[str, Any] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
 

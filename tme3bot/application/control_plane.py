@@ -475,8 +475,18 @@ class ControlPlane:
 
     def update_worker_progress(self, event: JobEvent) -> Job:
         """Update the latest telemetry without growing persistent event history."""
-        job, _ = self.jobs.update_progress_snapshot(event)
+        job, _ = self.update_worker_progress_result(event)
         return job
+
+    def update_worker_progress_result(self, event: JobEvent) -> tuple[Job, bool]:
+        """Return whether a transient worker snapshot advanced the job."""
+        job, updated = self.jobs.update_progress_snapshot(event)
+        if updated:
+            # A valid worker heartbeat proves that the worker is alive.  Clear
+            # a previous watchdog cancellation request so a delayed scheduler
+            # tick cannot force-cancel a job that has resumed reporting.
+            self._stale_cancel_requested.pop(event.job_id, None)
+        return job, updated
 
     def add_event_observer(self, observer: Callable[[JobEvent], None]) -> None:
         self._event_observers.append(observer)

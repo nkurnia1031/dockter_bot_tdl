@@ -1967,12 +1967,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             result=body.result,
             error=body.error,
         )
-        job = (
-            context.control_plane.update_worker_progress(event)
-            if body.transient
-            else context.control_plane.append_worker_event(event)
-        )
-        return {"ok": True, "job": job_dict(job)}
+        if body.transient:
+            job, accepted = context.control_plane.update_worker_progress_result(event)
+        else:
+            before = len(context.control_plane.jobs.events(job_id))
+            job = context.control_plane.append_worker_event(event)
+            accepted = len(context.control_plane.jobs.events(job_id)) > before
+        return {"ok": True, "accepted": bool(accepted), "job": job_dict(job)}
 
     _add_internal_state_routes(app, context, require_internal)
     _add_management_routes(app, context, require_management)
