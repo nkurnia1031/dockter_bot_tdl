@@ -813,6 +813,31 @@ class BackendApiTests(unittest.TestCase):
             [("local", "uploaded-1", "uploading")],
         )
 
+    def test_quick_staging_scan_verifies_inactive_cleanup_folder(self):
+        headers = self.login()
+        self.dispatcher.quick_scan["local"] = {
+            "worker": "local",
+            "items": [{
+                "stage_job_id": "cleanup-1",
+                "folder_name": "batch",
+                "phase": "cleanup",
+                "archive_parts": 2,
+                "thumbnail_present": True,
+                "staging_path": "/workspace/quickmode/cleanup-1",
+            }],
+        }
+
+        response = self.client.get("/api/v1/quick-mode/staging", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        item = response.json()["items"][0]
+        self.assertEqual(item["cleanup_verification"]["status"], "verified")
+        self.assertTrue(item["staging_cleaned"])
+        self.assertEqual(
+            self.dispatcher.quick_verifications,
+            [("local", "cleanup-1", "cleanup")],
+        )
+
     def test_quickmode_staging_excludes_backend_jobs_without_physical_folder(self):
         headers = self.login()
         # Create a quick mode export job in the database

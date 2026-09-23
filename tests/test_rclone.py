@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -120,6 +121,44 @@ class RcloneRunnerTests(unittest.TestCase):
                         config,
                         workspace_root=workspace,
                     )
+
+    def test_verify_recovers_matching_duplicate_from_remote_inventory(self):
+        class DuplicateRemoteRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "check":
+                    return SimpleNamespace(returncode=1, stdout="", stderr="")
+                if command[1] == "lsjson":
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {"Path": "result.7z.001", "Size": 7},
+                            {"Path": "result.7z.001", "Size": 8},
+                        ]),
+                        stderr="",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            archive.write_bytes(b"1234567")
+            runner = DuplicateRemoteRunner()
+
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(runner).verify_files(
+                    [archive],
+                    "googledrive:backup",
+                    config,
+                    workspace_root=workspace,
+                )
+
+            self.assertEqual(result["found"], 1)
+            self.assertEqual(result["missing"], [])
+            self.assertTrue(any(command[0][1] == "lsjson" for command in runner.commands))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.tdl import ProcessStalledError, TDLStalledError
+from tme3bot.tdl_output import is_tdl_telemetry_line
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
 from tme3bot.worker.quick_export import (
     QUICK_PHASES,
@@ -56,6 +57,12 @@ def jakarta_timestamp() -> str:
 
 
 _PROGRESS_BAR_RE = re.compile(r"\[[ .#<>-]{8,}\]\s*\[[^\]]+\]")
+BAR_ONLY_PROGRESS_KEY = "__bar_only__"
+RUNTIME_STATS_KEY = "__runtime_stats__"
+
+
+def _is_named_progress_key(value: str | None) -> bool:
+    return value not in {None, BAR_ONLY_PROGRESS_KEY, RUNTIME_STATS_KEY}
 
 
 def progress_line_key(value: str) -> str | None:
@@ -66,13 +73,15 @@ def progress_line_key(value: str) -> str | None:
     transfer; a blank prefix is the bar-only companion line.
     """
     line = str(value).strip()
+    if is_tdl_telemetry_line(line):
+        return RUNTIME_STATS_KEY
     match = _PROGRESS_BAR_RE.search(line)
     if match is None:
         return None
     prefix = line[: match.start()].strip()
     # The percentage is part of the changing bar state, not its identity.
     prefix = re.sub(r"\s+\d+(?:\.\d+)?%\s*$", "", prefix)
-    return prefix[:240] or "__bar_only__"
+    return prefix[:240] or BAR_ONLY_PROGRESS_KEY
 
 
 def storage_relative_folders(root: Path) -> list[str]:
@@ -102,6 +111,11 @@ def _quick_message_matches(message: dict[str, Any], name: str, caption: str, mes
                 return False
         except (TypeError, ValueError):
             return False
+        # The manifest stores the channel message ID immediately after the
+        # physical upload. For photos, TDL may omit the original local name
+        # from the exported message JSON, so an exact message ID is stronger
+        # evidence than requiring the name to be repeated in the payload.
+        return True
     haystack = json.dumps(message, ensure_ascii=False, default=str).casefold()
     caption_parts = [part.strip().casefold() for part in str(caption).splitlines() if part.strip()]
     return all(part in haystack for part in caption_parts) and str(name).casefold() in haystack
@@ -159,8 +173,8 @@ class JobLogSnapshot:
                     self._lines = retained
                     self._characters = sum(len(existing) + 1 for existing in retained)
                 progress_key = progress_line_key(line)
-                if progress_key == "__bar_only__" and any(
-                    progress_line_key(existing) not in {None, "__bar_only__"}
+                if progress_key == BAR_ONLY_PROGRESS_KEY and any(
+                    _is_named_progress_key(progress_line_key(existing))
                     for existing in self._lines
                 ):
                     # TDL emits a descriptive transfer line followed by a
@@ -168,11 +182,11 @@ class JobLogSnapshot:
                     # retaining both duplicates the same state in the UI.
                     continue
                 if progress_key is not None:
-                    if progress_key != "__bar_only__":
+                    if _is_named_progress_key(progress_key):
                         retained = [
                             existing
                             for existing in self._lines
-                            if progress_line_key(existing) != "__bar_only__"
+                            if progress_line_key(existing) != BAR_ONLY_PROGRESS_KEY
                         ]
                         self._lines = retained
                         self._characters = sum(len(existing) + 1 for existing in retained)
@@ -1081,10 +1095,10 @@ class WorkerJobExecutor:
             return
         progress_key = progress_line_key(safe_line)
         with self._quick_log_state_lock:
-            if progress_key == "__bar_only__":
+            if progress_key == BAR_ONLY_PROGRESS_KEY:
                 if self._quick_log_named_progress.get(str(job_id), False):
                     return
-            elif progress_key is not None:
+            elif _is_named_progress_key(progress_key):
                 self._quick_log_named_progress[str(job_id)] = True
             elif safe_line.startswith("$ ") or "process exited with code" in safe_line:
                 self._quick_log_named_progress[str(job_id)] = False
@@ -1119,15 +1133,15 @@ class WorkerJobExecutor:
                     is None
                 ]
                 positions.clear()
-            if key not in {None, "__bar_only__"} and "__bar_only__" in positions:
-                bar_index = positions.pop("__bar_only__")
+            if _is_named_progress_key(key) and BAR_ONLY_PROGRESS_KEY in positions:
+                bar_index = positions.pop(BAR_ONLY_PROGRESS_KEY)
                 compacted.pop(bar_index)
                 positions = {
                     name: index - 1 if index > bar_index else index
                     for name, index in positions.items()
                 }
-            if key == "__bar_only__" and any(
-                name != "__bar_only__" for name in positions
+            if key == BAR_ONLY_PROGRESS_KEY and any(
+                _is_named_progress_key(name) for name in positions
             ):
                 continue
             if key is None:
@@ -1241,17 +1255,17 @@ class WorkerJobExecutor:
         return snapshot.value() if snapshot is not None else None
 
     @contextmanager
-    def _capture_tdl_output(self, client):
+    def _capture_tdl_output(self, client, *, log_callback=None, command_callback=None):
         previous = client.output_callback
         previous_command = getattr(client, "command_callback", None)
 
         def capture(line: str) -> None:
-            self._append_job_log(line)
+            (log_callback or self._append_job_log)(line)
             if previous is not None:
                 previous(line)
 
         client.output_callback = capture
-        callback = self._command_callback()
+        callback = command_callback or self._command_callback()
         if callback is not None:
             client.command_callback = callback
         try:
@@ -3885,6 +3899,15 @@ class WorkerJobExecutor:
 
             channel_found = 0
             channel_reason = ""
+            worker_log = stage_root / "worker.log"
+
+            def verify_log(line: str) -> None:
+                self._write_quick_log_line(
+                    str(stage_job_id),
+                    line,
+                    fallback_path=worker_log,
+                )
+
             storage_profile = str(getattr(self.config, "worker_storage_profile", "storage"))
             verify_root: Path | None = None
             try:
@@ -3914,7 +3937,7 @@ class WorkerJobExecutor:
                     )
                 fallback_messages: list[dict[str, Any]] | None = None
                 with storage_runtime.export_operation_lock:
-                    with self._capture_tdl_output(client):
+                    with self._capture_tdl_output(client, log_callback=verify_log):
                         for name in expected_names:
                             item = known_items.get(name)
                             raw_id = item.get("channel_message_id") if isinstance(item, dict) else None
@@ -3970,7 +3993,7 @@ class WorkerJobExecutor:
             )
             try:
                 verify_runner = RcloneRunner(
-                    log_callback=self._append_job_log,
+                    log_callback=verify_log,
                     command_callback=self._command_callback(),
                     stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
                 )

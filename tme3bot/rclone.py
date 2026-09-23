@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 from typing import Callable, Iterable
@@ -189,6 +190,71 @@ class RcloneRunner:
         found: list[str] = []
         missing: list[dict[str, str]] = []
         errors: list[dict[str, str]] = []
+        inventory: list[dict[str, object]] | None = None
+        inventory_error: str | None = None
+
+        def remote_inventory() -> list[dict[str, object]] | None:
+            nonlocal inventory, inventory_error
+            if inventory is not None or inventory_error is not None:
+                return inventory
+            command = [
+                "rclone",
+                "lsjson",
+                destination,
+                "--files-only",
+                "--recursive",
+                "--config",
+                str(config),
+                "--log-level",
+                "ERROR",
+            ]
+            try:
+                result = self.runner.run(
+                    command,
+                    log_prefix="rclone-verify-inventory",
+                    output_callback=self.log_callback,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
+                )
+            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                inventory_error = str(exc)[:400]
+                return None
+            if result.returncode != 0:
+                inventory_error = (
+                    f"exit code {result.returncode}: "
+                    f"{self._command_output(result) or 'detail tidak tersedia'}"
+                )[:500]
+                return None
+            try:
+                value = json.loads(getattr(result, "stdout", "") or "")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                inventory_error = f"output lsjson tidak valid: {exc}"[:500]
+                return None
+            if not isinstance(value, list):
+                inventory_error = "output lsjson bukan daftar file."[:500]
+                return None
+            inventory = [item for item in value if isinstance(item, dict)]
+            return inventory
+
+        def inventory_matches(remote_name: str, local_size: int) -> tuple[bool, bool]:
+            entries = remote_inventory()
+            if entries is None:
+                return False, False
+            normalized_name = remote_name.strip("/")
+            has_name = False
+            for entry in entries:
+                candidate = str(entry.get("Path") or entry.get("Name") or "")
+                candidate = candidate.replace("\\", "/").strip("/")
+                if candidate != normalized_name:
+                    continue
+                has_name = True
+                try:
+                    if int(entry.get("Size")) == int(local_size):
+                        return True, True
+                except (TypeError, ValueError):
+                    continue
+            return False, has_name
+
         for path, raw_name in zip(paths, names):
             remote_name = str(raw_name).replace("\\", "/").strip("/")
             remote_parts = [part for part in remote_name.split("/") if part]
@@ -220,12 +286,30 @@ class RcloneRunner:
             if result.returncode == 0:
                 found.append(remote_name)
             elif int(result.returncode) == 1:
-                missing.append(
-                    {
-                        "name": remote_name,
-                        "error": "File belum ditemukan atau ukuran berbeda (rclone exit code 1).",
-                    }
-                )
+                recovered, has_name = inventory_matches(remote_name, path.stat().st_size)
+                if recovered:
+                    found.append(remote_name)
+                elif inventory_error:
+                    errors.append(
+                        {
+                            "name": remote_name,
+                            "error": (
+                                "Rclone gagal mengambil daftar file Google Drive: "
+                                f"{inventory_error}"
+                            )[:500],
+                        }
+                    )
+                else:
+                    missing.append(
+                        {
+                            "name": remote_name,
+                            "error": (
+                                "File Google Drive ditemukan tetapi ukuran berbeda."
+                                if has_name
+                                else "File belum ditemukan di lokasi Google Drive yang diharapkan."
+                            ),
+                        }
+                    )
             else:
                 errors.append(
                     {

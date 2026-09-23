@@ -781,12 +781,16 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     linked_status = str(linked["job"].get("status") or "") if linked else ""
                     verifier = getattr(dispatcher, "quickmode_verify", None) if dispatcher is not None else None
                     if (
-                        str(item.get("phase") or "") == "uploading"
+                        str(item.get("phase") or "") in {"uploading", "cleanup"}
                         and linked_status not in {"queued", "dispatched", "running"}
                         and callable(verifier)
                     ):
                         try:
-                            verification = verifier(worker, stage_id, "uploading")
+                            verification = verifier(
+                                worker,
+                                stage_id,
+                                str(item.get("phase") or "uploading"),
+                            )
                             if isinstance(verification, dict):
                                 item["cleanup_verification"] = verification
                                 item["staging_cleaned"] = bool(verification.get("staging_cleaned"))

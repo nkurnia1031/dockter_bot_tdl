@@ -57,6 +57,15 @@ class QuickThumbnailTests(unittest.TestCase):
         self.assertIn("20.0%", progress[0])
         self.assertEqual(sum("[" in line and "/s]" in line for line in lines), 1)
 
+    def test_job_log_keeps_only_the_latest_runtime_statistics(self) -> None:
+        snapshot = JobLogSnapshot()
+        snapshot.add("CPU: 2.03% Memory: 52.32 MB Goroutines: 46")
+        snapshot.add("CPU: 0.00% Memory: 52.32 MB Goroutines: 46")
+
+        lines = snapshot.value()["lines"]
+        runtime = [line for line in lines if line.startswith("CPU:")]
+        self.assertEqual(runtime, ["CPU: 0.00% Memory: 52.32 MB Goroutines: 46"])
+
     def test_worker_event_audit_records_delivery_without_payload_secrets(self) -> None:
         events: list[str] = []
         publisher = WorkerEventPublisher("http://backend", "internal-token")
@@ -86,6 +95,8 @@ class QuickThumbnailTests(unittest.TestCase):
                         "[2026-09-23T01:00:02+07:00] [#................................................................................] [1s; 1 MB/s]",
                         "[2026-09-23T01:00:03+07:00] archive.7z.001 -> channel ... 2.0% [##..............................................] [2s; 2 MB/s]",
                         "[2026-09-23T01:00:04+07:00] [##...............................................................................] [2s; 2 MB/s]",
+                        "[2026-09-23T01:00:05+07:00] CPU: 2.03% Memory: 52.32 MB Goroutines: 46",
+                        "[2026-09-23T01:00:06+07:00] CPU: 0.00% Memory: 52.32 MB Goroutines: 46",
                     ]
                 )
                 + "\n",
@@ -97,6 +108,8 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertIn("2.0%", content)
             self.assertIn("$ tdl up archive.7z.001", content)
             self.assertNotIn("[##................................................................", content)
+            self.assertEqual(content.count("CPU:"), 1)
+            self.assertIn("CPU: 0.00% Memory: 52.32 MB Goroutines: 46", content)
 
     def test_command_milestone_is_bounded_and_redacts_secret(self) -> None:
         events = []
@@ -215,7 +228,7 @@ class QuickThumbnailTests(unittest.TestCase):
                 run_as_user = "storage-user"
 
                 def export_messages(self, channel, start_id, target, **kwargs):
-                    name = "batch.png" if int(start_id) == 102 else "batch.7z.001"
+                    name = "photo-without-original-name.jpg" if int(start_id) == 102 else "batch.7z.001"
                     return SimpleNamespace(
                         messages=[
                             {
