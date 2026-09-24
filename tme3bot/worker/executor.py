@@ -1104,12 +1104,55 @@ class WorkerJobExecutor:
                 self._quick_log_named_progress[str(job_id)] = False
         try:
             with lock:
+                # Cleanup can detach this job's log while an audit callback is
+                # waiting for the same lock. Skip a stale path after that.
+                with self._quick_log_state_lock:
+                    registered_path = self._quick_log_paths.get(str(job_id))
+                    if registered_path is None and fallback_path is None:
+                        return
+                    if registered_path is not None and registered_path != file_path:
+                        return
                 with file_path.open("a", encoding="utf-8") as stream:
                     stream.write(f"[{jakarta_timestamp()}] {safe_line}\n")
         except OSError:
             LOGGER.warning(
                 "Could not append Quick Mode worker log %s", file_path, exc_info=True
             )
+
+    def _cleanup_quick_stage(self, job_id: str, stage_root: Path) -> None:
+        """Remove a completed stage without racing heartbeat audit writes."""
+        job_id = str(job_id)
+        unregister = getattr(self.publisher, "unregister_audit_callback", None)
+        if callable(unregister):
+            unregister(job_id)
+
+        with self._quick_log_state_lock:
+            log_lock = self._quick_log_locks.get(job_id)
+        if log_lock is not None:
+            log_lock.acquire()
+
+        with self._quick_log_state_lock:
+            log_path = self._quick_log_paths.pop(job_id, None)
+        try:
+            try:
+                shutil.rmtree(stage_root)
+            except OSError:
+                # Retain the stage and its diagnostics if deletion fails.
+                if log_path is not None:
+                    with self._quick_log_state_lock:
+                        self._quick_log_paths[job_id] = log_path
+                raise
+
+            active_log_path = getattr(self._job_log, "file_path", None)
+            if isinstance(active_log_path, Path):
+                try:
+                    if active_log_path.parent.resolve() == Path(stage_root).resolve():
+                        self._job_log.file_path = None
+                except OSError:
+                    self._job_log.file_path = None
+        finally:
+            if log_lock is not None:
+                log_lock.release()
 
     @staticmethod
     def _compact_quick_log(file_path: Path) -> None:
@@ -1301,6 +1344,16 @@ class WorkerJobExecutor:
             yield
         finally:
             client.progress_callback = previous
+
+    @contextmanager
+    def _download_progress_operation(self, runtime, callback):
+        """Bind the shared tracker callback only while owning its TDL lock."""
+        with runtime.download_operation_lock:
+            previous = runtime.download_progress.set_event_callback(callback)
+            try:
+                yield
+            finally:
+                runtime.download_progress.set_event_callback(previous)
 
     def _execute(self, command: dict[str, Any]) -> Any:
         kind = str(command["kind"])
@@ -2248,13 +2301,12 @@ class WorkerJobExecutor:
                 if staged_json is not None and json_path == staged_json:
                     json_path = self._materialize_quick_json(staged_json)
                     temporary_json_dir = json_path.parent
-                previous_callback = runtime.download_progress.set_event_callback(download_progress)
                 download_client = self._quick_isolated_client(runtime, stage_root, "download")
                 with self._lock:
                     self._quick_download_clients[job_id] = download_client
                 try:
                     try:
-                        with runtime.download_operation_lock:
+                        with self._download_progress_operation(runtime, download_progress):
                             with self._capture_tdl_output(download_client):
                                 download_result = runtime.download_service.download_export_to(
                                     json_path,
@@ -2269,7 +2321,6 @@ class WorkerJobExecutor:
                 finally:
                     with self._lock:
                         self._quick_download_clients.pop(job_id, None)
-                    runtime.download_progress.set_event_callback(previous_callback)
                 if download_result.status != "success_deleted":
                     save_manifest(
                         phase="downloading",
@@ -2486,7 +2537,7 @@ class WorkerJobExecutor:
                     overall={"current": 1, "total": 1, "percent": 100, "unit": "phase"},
                     force=True,
                 )
-                shutil.rmtree(stage_root)
+                self._cleanup_quick_stage(str(command["job_id"]), stage_root)
                 return {
                     **(asdict(export_result) if export_result is not None else {}),
                     **stats,
@@ -2688,52 +2739,48 @@ class WorkerJobExecutor:
                     ),
                 )
 
-        previous_callback = runtime.download_progress.set_event_callback(
-            progress_event
-        )
-        try:
-            with runtime.download_operation_lock:
-                with self._capture_tdl_output(runtime.download_tdl_client):
-                    if payload.get("retry_failed") and not artifact_refs:
-                        result = runtime.download_service.retry_failed_exports()
-                    elif artifact_refs:
-                        if not existing_refs:
-                            progress = reporter.report(
-                                phase="completed",
-                                message=(
-                                    f"Tidak ada JSON tersedia; "
-                                    f"{len(missing_keys)} dilewati"
-                                ),
-                                overall={
-                                    "current": 0,
-                                    "total": 0,
-                                    "percent": 100,
-                                    "unit": "json",
-                                },
-                                counters={"skipped": len(missing_keys)},
-                                force=True,
-                            )
-                            reporter.milestone(
-                                "download.completed",
-                                progress=progress,
-                                result={
-                                    "success_count": 0,
-                                    "failed_count": 0,
-                                    "skipped_missing": len(missing_keys),
-                                },
-                            )
-                            return {
-                                "moved_count": 0,
+        with self._download_progress_operation(runtime, progress_event):
+            with self._capture_tdl_output(runtime.download_tdl_client):
+                if payload.get("retry_failed") and not artifact_refs:
+                    result = runtime.download_service.retry_failed_exports()
+                elif artifact_refs:
+                    if not existing_refs:
+                        progress = reporter.report(
+                            phase="completed",
+                            message=(
+                                f"Tidak ada JSON tersedia; "
+                                f"{len(missing_keys)} dilewati"
+                            ),
+                            overall={
+                                "current": 0,
+                                "total": 0,
+                                "percent": 100,
+                                "unit": "json",
+                            },
+                            counters={"skipped": len(missing_keys)},
+                            force=True,
+                        )
+                        reporter.milestone(
+                            "download.completed",
+                            progress=progress,
+                            result={
                                 "success_count": 0,
                                 "failed_count": 0,
                                 "skipped_missing": len(missing_keys),
-                                "results": [],
-                            }
-                        result = runtime.download_service.download_selected_artifacts(
-                            existing_refs
+                            },
                         )
-                    else:
-                        result = runtime.download_service.download_pending_exports()
+                        return {
+                            "moved_count": 0,
+                            "success_count": 0,
+                            "failed_count": 0,
+                            "skipped_missing": len(missing_keys),
+                            "results": [],
+                        }
+                    result = runtime.download_service.download_selected_artifacts(
+                        existing_refs
+                    )
+                else:
+                    result = runtime.download_service.download_pending_exports()
             for item in result.results:
                 self.publisher.emit(
                     str(command["job_id"]),
@@ -2784,8 +2831,6 @@ class WorkerJobExecutor:
                 },
             )
             return summary
-        finally:
-            runtime.download_progress.set_event_callback(previous_callback)
 
     def _download_clear_failed(self, command: dict[str, Any]) -> dict[str, int]:
         runtime = self.profile_manager.runtime(str(command["profile"]))

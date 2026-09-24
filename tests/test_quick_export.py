@@ -1,3 +1,4 @@
+import shutil
 import tempfile
 import threading
 import unittest
@@ -194,6 +195,113 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertNotIn("secret-value", content)
             self.assertIn("+07:00", content)
             self.assertTrue(any(event[0][2] == "progress.snapshot" for event in events))
+
+    def test_quick_stage_cleanup_detaches_heartbeat_log_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            stage = quick_stage_root(workspace, "cleanup-stage")
+            stage.mkdir(parents=True)
+            log_path = stage / "worker.log"
+            log_path.write_text("before cleanup\n", encoding="utf-8")
+
+            class Publisher:
+                def __init__(self):
+                    self.audit_callbacks = {}
+
+                def register_audit_callback(self, job_id, callback):
+                    self.audit_callbacks[job_id] = callback
+
+                def unregister_audit_callback(self, job_id):
+                    self.audit_callbacks.pop(job_id, None)
+
+            publisher = Publisher()
+            executor = WorkerJobExecutor(
+                SimpleNamespace(utility_workspace_root=workspace),
+                SimpleNamespace(),
+                publisher,
+            )
+            executor._job_log.job_id = "cleanup-job"
+            executor._job_log.file_path = log_path
+            executor._register_quick_log("cleanup-job", log_path)
+            stale_callback = publisher.audit_callbacks["cleanup-job"]
+            rmtree = shutil.rmtree
+
+            def rmtree_with_heartbeat(path):
+                # Simulate a heartbeat that already captured the callback when
+                # cleanup began. It must not recreate worker.log in the stage.
+                stale_callback("[telemetry] delivered heartbeat")
+                self.assertEqual(log_path.read_text(encoding="utf-8"), "before cleanup\n")
+                rmtree(path)
+
+            try:
+                with patch("tme3bot.worker.executor.shutil.rmtree", side_effect=rmtree_with_heartbeat):
+                    executor._cleanup_quick_stage("cleanup-job", stage)
+
+                self.assertFalse(stage.exists())
+                self.assertNotIn("cleanup-job", publisher.audit_callbacks)
+                self.assertIsNone(executor._job_log.file_path)
+            finally:
+                del executor._job_log.job_id
+                del executor._job_log.file_path
+
+    def test_download_progress_callbacks_follow_the_download_lock_owner(self) -> None:
+        tracker = DownloadProgressTracker()
+        runtime = SimpleNamespace(
+            download_progress=tracker,
+            download_operation_lock=threading.Lock(),
+        )
+        executor = WorkerJobExecutor(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+        events: list[tuple[str, str]] = []
+        first_entered = threading.Event()
+        second_attempting = threading.Event()
+        first_ready_to_release = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def first_callback(event_type, snapshot):
+            events.append(("first", snapshot.phase))
+
+        def second_callback(event_type, snapshot):
+            events.append(("second", snapshot.phase))
+
+        def first_download():
+            with executor._download_progress_operation(runtime, first_callback):
+                tracker.set_phase("first-running")
+                first_entered.set()
+                second_attempting.wait(timeout=2)
+                tracker.set_phase("first-still-running")
+                first_ready_to_release.set()
+                release_first.wait(timeout=2)
+
+        def second_download():
+            first_entered.wait(timeout=2)
+            second_attempting.set()
+            with executor._download_progress_operation(runtime, second_callback):
+                second_entered.set()
+                tracker.set_phase("second-running")
+
+        first_thread = threading.Thread(target=first_download)
+        second_thread = threading.Thread(target=second_download)
+        first_thread.start()
+        second_thread.start()
+        try:
+            self.assertTrue(first_ready_to_release.wait(timeout=2))
+            self.assertFalse(second_entered.is_set())
+        finally:
+            release_first.set()
+            first_thread.join(timeout=2)
+            second_thread.join(timeout=2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(
+            events,
+            [
+                ("first", "first-running"),
+                ("first", "first-still-running"),
+                ("second", "second-running"),
+            ],
+        )
 
     def test_quickmode_verify_requires_channel_and_drive_before_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
