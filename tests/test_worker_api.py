@@ -16,6 +16,12 @@ class FakeExecutor:
     def cancel(self, job_id):
         return job_id == "known"
 
+    def pause(self, job_id):
+        return job_id == "known"
+
+    def resume(self, job_id, event_sequence_start=None):
+        return job_id == "known" and event_sequence_start == 12
+
     def workspace_tree(self, path):
         return {"path": path, "items": [{"name": "biasa", "path": "/workspace/biasa", "kind": "directory"}]}
 
@@ -89,6 +95,21 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.executor.commands[-1]["event_sequence_start"], 983)
+
+    def test_pause_and_resume_endpoints_are_internal_and_forward_sequence(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        denied = self.client.post("/internal/v1/jobs/known/pause")
+        self.assertEqual(denied.status_code, 401)
+        paused = self.client.post("/internal/v1/jobs/known/pause", headers=headers)
+        self.assertEqual(paused.status_code, 200)
+        self.assertTrue(paused.json()["paused"])
+        resumed = self.client.post(
+            "/internal/v1/jobs/known/resume",
+            headers=headers,
+            json={"event_sequence_start": 12},
+        )
+        self.assertEqual(resumed.status_code, 200)
+        self.assertTrue(resumed.json()["resumed"])
 
     def test_workspace_tree_requires_token(self):
         denied = self.client.get("/internal/v1/workspace/tree")

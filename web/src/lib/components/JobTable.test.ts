@@ -46,8 +46,44 @@ describe('JobTable', () => {
     render(JobTable, { kind: 'export', scope: 'global', quickMode: true, view: 'active', title: 'Monitor aktif' });
 
     expect(await screen.findByText('Sedang berjalan')).toBeTruthy();
-    expect(urls.some((url) => decodeURIComponent(url).includes('status=queued,dispatched,running'))).toBe(true);
+    expect(urls.some((url) => decodeURIComponent(url).includes('status=queued,dispatched,running,paused'))).toBe(true);
     expect(screen.queryByText('History terbaru')).toBeNull();
+  });
+
+  it('pauses and resumes Quick Mode jobs from the active monitor', async () => {
+    const calls: { url: string; method?: string }[] = [];
+    const job = {
+      id: 'quick-live-1',
+      kind: 'export',
+      status: 'running',
+      profile: 'default',
+      worker: 'local',
+      payload: { quick_mode: true },
+      progress: { phase: 'downloading', message: 'file.mp4' },
+      created_at: new Date().toISOString()
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method });
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [job] }), { status: 200 });
+      if (url.endsWith('/pause')) {
+        job.status = 'paused';
+        return new Response(JSON.stringify({ ...job }), { status: 200 });
+      }
+      if (url.endsWith('/resume')) {
+        job.status = 'queued';
+        return new Response(JSON.stringify({ ...job }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'export', scope: 'global', quickMode: true, view: 'active' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Jeda job' }));
+    expect(await screen.findByRole('button', { name: 'Lanjutkan job' })).toBeTruthy();
+    expect(calls.some((call) => call.url.endsWith('/pause') && call.method === 'POST')).toBe(true);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Lanjutkan job' }));
+    expect(calls.some((call) => call.url.endsWith('/resume') && call.method === 'POST')).toBe(true);
   });
 
   it('auto polls monitor views that also contain history', async () => {

@@ -194,6 +194,37 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual([job.id for job in store.list(quick_mode=False)], ["job-1"])
             self.assertEqual(store.count(kind="export", quick_mode=True), 1)
 
+    def test_resumed_quick_jobs_receive_monotonic_fifo_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            now = datetime.now(timezone.utc)
+            first = self.make_job()
+            first = Job(**{**first.__dict__, "payload": {"quick_mode": True}})
+            second = Job(
+                id="job-2",
+                kind="export",
+                profile="archive",
+                actor_user_id=7,
+                worker="local",
+                status=JobStatus.QUEUED,
+                payload={"quick_mode": True},
+            )
+            for job in (first, second):
+                store.create(job)
+                store.save_execution_plan(
+                    job.id,
+                    {"resource_keys": [f"stage:{job.id}"], "queue_group": "quick", "lane": "quick"},
+                    job.payload,
+                )
+                store.append_event(JobEvent(job.id, 1, JobStatus.PAUSED, "paused", created_at=now))
+            store.append_event(JobEvent(first.id, 2, JobStatus.QUEUED, "resumed", created_at=now))
+            store.append_event(JobEvent(second.id, 2, JobStatus.QUEUED, "resumed", created_at=now))
+
+            self.assertLess(
+                store.execution_plan(first.id)["queued_at"],
+                store.execution_plan(second.id)["queued_at"],
+            )
+
     def test_telegram_notification_is_idempotent_and_terminal_stamp_is_stable(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")

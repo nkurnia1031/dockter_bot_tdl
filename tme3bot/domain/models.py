@@ -30,6 +30,7 @@ class JobStatus(str, Enum):
     QUEUED = "queued"
     DISPATCHED = "dispatched"
     RUNNING = "running"
+    PAUSED = "paused"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -47,15 +48,24 @@ ALLOWED_JOB_TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
     JobStatus.QUEUED: {
         JobStatus.DISPATCHED,
         JobStatus.RUNNING,
+        JobStatus.PAUSED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
     },
     JobStatus.DISPATCHED: {
         JobStatus.RUNNING,
+        JobStatus.PAUSED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
     },
     JobStatus.RUNNING: {
+        JobStatus.PAUSED,
+        JobStatus.SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+    },
+    JobStatus.PAUSED: {
+        JobStatus.QUEUED,
         JobStatus.SUCCEEDED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,

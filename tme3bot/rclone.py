@@ -37,6 +37,12 @@ class RcloneRunner:
     def cancel_current(self) -> bool:
         return self.runner.interrupt_current()
 
+    def pause_current(self, owner_job_id: str | None = None) -> bool:
+        return self.runner.pause_current(owner_job_id)
+
+    def resume_current(self, owner_job_id: str | None = None) -> bool:
+        return self.runner.resume_current(owner_job_id)
+
     @staticmethod
     def _command_output(result) -> str:
         output = "\n".join(

@@ -26,12 +26,17 @@ class FakeDispatcher:
     def __init__(self):
         self.commands = []
         self.cancel_result = True
+        self.resume_result = False
 
     def dispatch(self, worker, command):
         self.commands.append(command)
 
     def cancel(self, worker, job_id):
         return self.cancel_result
+
+    def resume(self, worker, job_id, event_sequence_start):
+        del worker, job_id, event_sequence_start
+        return self.resume_result
 
 
 class FailingDispatcher(FakeDispatcher):
@@ -525,7 +530,50 @@ class ControlPlaneTests(unittest.TestCase):
         )
 
         self.assertEqual(self.jobs.get(second.id).status.value, "dispatched")
-        self.assertEqual(len(self.dispatcher.commands), 2)
+
+    def test_quick_mode_limit_is_per_worker_and_resume_rejoins_fifo_with_checkpoint(self):
+        first = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/31", "quick_mode": True},
+        )
+        second = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/32", "quick_mode": True},
+            profile="archive",
+        )
+        third = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/33", "quick_mode": True},
+            profile="other",
+        )
+
+        self.assertEqual([first.status.value, second.status.value, third.status.value], ["dispatched", "dispatched", "queued"])
+        self.assertEqual(self.jobs.quickmode_limits(["local"]), [{"worker": "local", "max_concurrent": 2, "active": 2, "queued": 1}])
+
+        self.control.append_worker_event(
+            JobEvent(
+                first.id,
+                2,
+                JobStatus.PAUSED,
+                "paused",
+                {"phase": "downloading", "paused_phase": "downloading", "pause_kind": "worker"},
+            )
+        )
+        self.control.resume_job(self.actor, first.id)
+        self.assertEqual(self.jobs.get(third.id).status, JobStatus.DISPATCHED)
+        self.assertEqual(self.jobs.get(first.id).status, JobStatus.QUEUED)
+
+        self.control.append_worker_event(JobEvent(second.id, 2, JobStatus.RUNNING, "started"))
+        self.control.append_worker_event(JobEvent(second.id, 3, JobStatus.SUCCEEDED, "completed"))
+
+        self.assertEqual(self.jobs.get(first.id).status, JobStatus.DISPATCHED)
+        resumed_payload = self.jobs.command_payload(first.id)
+        self.assertEqual(resumed_payload["quick_retry"]["stage_job_id"], first.id)
+        self.assertEqual(resumed_payload["quick_retry"]["resume_phase"], "auto")
+        self.assertEqual(len(self.dispatcher.commands), 4)
 
 
 if __name__ == "__main__":

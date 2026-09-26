@@ -46,6 +46,26 @@ class TDLCommandError(RuntimeError):
         super().__init__(f"TDL command failed ({returncode}): {detail}")
 
 
+def pause_process_group(process: subprocess.Popen[Any]) -> bool:
+    if process.poll() is not None or os.name == "nt":  # pragma: no cover - workers run on Linux
+        return False
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGSTOP)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def resume_process_group(process: subprocess.Popen[Any]) -> bool:
+    if process.poll() is not None or os.name == "nt":  # pragma: no cover - workers run on Linux
+        return False
+    try:
+        os.killpg(os.getpgid(process.pid), signal.SIGCONT)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
 class TDLStalledError(TDLCommandError):
     """Raised when a TDL subprocess stops making semantic progress."""
 
@@ -144,9 +164,14 @@ def notify_command_completed(
 
 class SubprocessRunner:
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._pause_condition = threading.Condition(self._lock)
+        self._pause_requested = False
+        self._paused = False
+        self._pause_owner: str | None = None
         self._current_process: subprocess.Popen[bytes] | None = None
         self._current_command: list[str] | None = None
+        self._current_owner: str | None = None
         self._last_output_at: float | None = None
         self._last_progress_signature: tuple[Any, ...] | None = None
 
@@ -160,6 +185,10 @@ class SubprocessRunner:
         output_callback: OutputCallback | None = None,
         command_callback: CommandCallback | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        command_owner = str(getattr(command_callback, "job_id", "") or "") or None
+        with self._pause_condition:
+            while self._pause_requested and self._pause_owner in {None, command_owner}:
+                self._pause_condition.wait(timeout=1.0)
         process_command = prepare_subprocess_command(command, env)
         if process_command == command:
             LOGGER.info("%s start: %s", log_prefix, " ".join(command))
@@ -201,6 +230,7 @@ class SubprocessRunner:
         with self._lock:
             self._current_process = process
             self._current_command = command
+            self._current_owner = command_owner
             self._last_output_at = started_at
             self._last_progress_signature = None
 
@@ -253,8 +283,13 @@ class SubprocessRunner:
                 if self._current_process is process:
                     self._current_process = None
                     self._current_command = None
+                    self._current_owner = None
                     self._last_output_at = None
                     self._last_progress_signature = None
+                    self._paused = False
+                    self._pause_requested = False
+                    self._pause_owner = None
+                    self._pause_condition.notify_all()
 
         stdout = "".join(stdout_lines)
         stderr = "".join(stderr_lines)
@@ -285,6 +320,50 @@ class SubprocessRunner:
 
     def cancel_current(self) -> bool:
         return self.interrupt_current()
+
+    def pause_current(self, owner_job_id: str | None = None) -> bool:
+        with self._pause_condition:
+            owner = str(owner_job_id) if owner_job_id is not None else None
+            process = self._current_process
+            if process is not None and owner is not None and self._current_owner != owner:
+                return False
+            self._pause_requested = True
+            self._pause_owner = owner
+            if process is None or process.poll() is not None:
+                return True
+            try:
+                if os.name == "nt":  # pragma: no cover - production workers run on Linux
+                    return False
+                os.killpg(os.getpgid(process.pid), signal.SIGSTOP)
+                self._paused = True
+                return True
+            except (OSError, ProcessLookupError):
+                return False
+
+    def resume_current(self, owner_job_id: str | None = None) -> bool:
+        with self._pause_condition:
+            process = self._current_process
+            owner = str(owner_job_id) if owner_job_id is not None else None
+            if owner is not None and self._pause_owner not in {None, owner}:
+                return False
+            if process is not None and owner is not None and self._current_owner != owner:
+                return False
+            resumed = process is None or process.poll() is not None
+            if process is not None and process.poll() is None and self._paused:
+                try:
+                    if os.name == "nt":  # pragma: no cover - production workers run on Linux
+                        return False
+                    os.killpg(os.getpgid(process.pid), signal.SIGCONT)
+                    resumed = True
+                except (OSError, ProcessLookupError):
+                    resumed = False
+            self._paused = False
+            self._pause_requested = False
+            self._pause_owner = None
+            if process is not None:
+                self._last_output_at = time.time()
+            self._pause_condition.notify_all()
+            return resumed
 
     def interrupt_current(self) -> bool:
         with self._lock:
@@ -416,6 +495,9 @@ class SubprocessRunner:
     def _is_stalled(self, stall_timeout_seconds: int) -> bool:
         with self._lock:
             last_output_at = self._last_output_at
+            paused = self._paused
+        if paused:
+            return False
         if last_output_at is None:
             return False
         return time.time() - last_output_at > stall_timeout_seconds
@@ -815,6 +897,12 @@ class TDLClient:
 
     def cancel_current(self) -> bool:
         return self.runner.cancel_current()
+
+    def pause_current(self, owner_job_id: str | None = None) -> bool:
+        return self.runner.pause_current(owner_job_id)
+
+    def resume_current(self, owner_job_id: str | None = None) -> bool:
+        return self.runner.resume_current(owner_job_id)
 
     def _base_command(self) -> list[str]:
         command = [

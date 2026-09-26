@@ -101,6 +101,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .badge.succeeded { background: #dcfce8; color: #087443; }.dark .badge.succeeded { background: #083e31; color: #86f0bd; }
 .badge.failed { background: #ffe3e8; color: #bd214b; }.dark .badge.failed { background: #5c1e37; color: #ffc0cf; }
 .badge.running,.badge.queued,.badge.dispatched { background: #fff3cf; color: #9b6400; }.dark .badge.running,.dark .badge.queued,.dark .badge.dispatched { background: #4c3910; color: #ffe083; }
+.badge.paused { background: #e9e8ff; color: #5144b6; }.dark .badge.paused { background: #302b63; color: #c9c4ff; }
 .badge.cancelled { background: #eceff3; color: #647084; }
 
 .page-enter { animation: page-enter .34s ease-out both; }

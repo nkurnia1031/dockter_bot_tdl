@@ -24,13 +24,14 @@
   let toastOpen = $state(false);
   let toastMessage = $state('');
   let retrying = $state<Record<string, boolean>>({});
+  let jobActionPending = $state<Record<string, boolean>>({});
   let lastRefreshed = $state<Date | null>(null);
   let mounted = false;
   let loadGeneration = 0;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let hasLoaded = false;
 
-  const activeStates = ['queued', 'dispatched', 'running'];
+  const activeStates = ['queued', 'dispatched', 'running', 'paused'];
   const active = (job: Job) => activeStates.includes(job.status);
   const activeJobs = $derived(jobs.filter(active));
   const historyJobs = $derived(jobs.filter((job) => !active(job)));
@@ -60,7 +61,7 @@
       if (profile) params.set('profile', profile);
       if (worker) params.set('worker', worker);
       if (view === 'active') {
-        params.set('status', 'queued,dispatched,running');
+        params.set('status', 'queued,dispatched,running,paused');
       } else if (view === 'history') {
         params.set('status', status || 'succeeded,failed,cancelled');
       } else if (status) {
@@ -142,6 +143,21 @@
       retrying = next;
     }
   }
+  async function togglePause(job: Job) {
+    jobActionPending = { ...jobActionPending, [job.id]: true };
+    try {
+      await post(`/jobs/${encodeURIComponent(job.id)}/${job.status === 'paused' ? 'resume' : 'pause'}`);
+      toastMessage = job.status === 'paused' ? 'Job masuk kembali ke antrean.' : 'Job Quick Mode dijeda.';
+      toastOpen = true;
+      await load();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Kontrol pause/resume gagal.';
+    } finally {
+      const next = { ...jobActionPending };
+      delete next[job.id];
+      jobActionPending = next;
+    }
+  }
   async function copy(value: string) { await navigator.clipboard?.writeText(value); toastMessage = 'Disalin ke clipboard.'; toastOpen = true; }
   const eventLine = (event: JobEvent) => {
     const batch = event.progress?.batch;
@@ -208,10 +224,10 @@
 
   {#if view !== 'history' && activeJobs.length}
     <div class="border-b border-[var(--line)] bg-[var(--brand-soft)]/20 p-4 sm:p-5">
-      <div class="mb-3 flex items-center justify-between"><h3 class="font-extrabold">Sedang berjalan</h3><span class="badge running">{activeJobs.length} aktif</span></div>
+      <div class="mb-3 flex items-center justify-between"><h3 class="font-extrabold">Sedang berjalan</h3><span class="badge running">{activeJobs.length} aktif / antre</span></div>
       <div class="space-y-2.5">
         {#each activeJobs as job (job.id)}
-          <JobProgressCard job={job} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)}/>
+          <JobProgressCard job={job} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)} onPauseToggle={quickMode && job.payload?.quick_mode ? () => togglePause(job) : undefined} actionPending={Boolean(jobActionPending[job.id])}/>
         {/each}
       </div>
     </div>

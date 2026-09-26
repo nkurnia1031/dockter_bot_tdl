@@ -353,20 +353,32 @@ class ControlPlane:
             list(list_profiles()) if callable(list_profiles) else []
         )
         if profile is None and not profiles:
+            queued_lister = getattr(self.jobs, "list_queued_for_scheduler", None)
+            queued_rows = (
+                queued_lister(limit=5000)
+                if callable(queued_lister)
+                else self.jobs.list(status=JobStatus.QUEUED.value, limit=200)
+            )
             profiles = sorted(
                 {
                     item.profile
-                    for item in self.jobs.list(status=JobStatus.QUEUED.value, limit=200)
+                    for item in queued_rows
                 }
             )
         for selected in profiles:
-            for queued in self.jobs.list(
-                profile=selected,
-                status=JobStatus.QUEUED.value,
-                archived=False,
-                offset=0,
-                limit=200,
-            ):
+            queued_lister = getattr(self.jobs, "list_queued_for_scheduler", None)
+            queued_jobs = (
+                queued_lister(profile=selected, limit=5000)
+                if callable(queued_lister)
+                else self.jobs.list(
+                    profile=selected,
+                    status=JobStatus.QUEUED.value,
+                    archived=False,
+                    offset=0,
+                    limit=200,
+                )
+            )
+            for queued in queued_jobs:
                 admission = self.jobs.try_acquire_execution(queued.id)
                 self.jobs.set_queue_info(
                     queued.id,
@@ -402,7 +414,45 @@ class ControlPlane:
                     "payload": command_payload,
                 }
                 try:
-                    self._dispatch_admitted_job(queued, command)
+                    pause_kind = str(queued.progress.get("pause_kind") or "")
+                    resumed = False
+                    if pause_kind == "worker":
+                        resume = getattr(self.dispatcher, "resume", None)
+                        if callable(resume):
+                            sequence = max(
+                                (event.sequence for event in self.jobs.events(queued.id)),
+                                default=0,
+                            ) + 1
+                            self.jobs.append_event(
+                                JobEvent(
+                                    job_id=queued.id,
+                                    sequence=sequence,
+                                    status=JobStatus.DISPATCHED,
+                                    event_type="resuming",
+                                    progress={"worker": queued.worker, "position": 1},
+                                )
+                            )
+                            command["event_sequence_start"] = sequence + 1
+                            resumed = bool(resume(queued.worker, queued.id, sequence + 1))
+                    if resumed:
+                        continue
+                    else:
+                        payload = command.get("payload")
+                        if isinstance(payload, dict) and bool(payload.get("quick_mode")):
+                            retry = payload.get("quick_retry")
+                            retry = dict(retry) if isinstance(retry, dict) else {}
+                            retry["stage_job_id"] = str(retry.get("stage_job_id") or queued.id)
+                            retry["resume_phase"] = "auto"
+                            payload["quick_retry"] = retry
+                            self.jobs.update_command_payload(queued.id, payload)
+                        if pause_kind == "worker":
+                            command["event_sequence_start"] = max(
+                                (event.sequence for event in self.jobs.events(queued.id)),
+                                default=0,
+                            ) + 1
+                            self.dispatcher.dispatch(queued.worker, command)
+                        else:
+                            self._dispatch_admitted_job(queued, command)
                 except Exception as exc:
                     self.jobs.release_execution(queued.id)
                     sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1
@@ -471,6 +521,8 @@ class ControlPlane:
                 observer(event)
             if event.status.terminal:
                 self._dispatch_pending_jobs()
+            elif event.status == JobStatus.PAUSED:
+                self._dispatch_pending_jobs()
         return job
 
     def update_worker_progress(self, event: JobEvent) -> Job:
@@ -514,6 +566,7 @@ class ControlPlane:
             JobStatus.QUEUED.value,
             JobStatus.DISPATCHED.value,
             JobStatus.RUNNING.value,
+            JobStatus.PAUSED.value,
         )
         selected_profile = None if profile in {None, "", "global"} else self.require_profile(actor, profile)
         active: list[Job] = []
@@ -799,6 +852,21 @@ class ControlPlane:
         self.require_profile(actor, job.profile)
         if job.status.terminal:
             return job
+        if job.status == JobStatus.PAUSED and job.progress.get("pause_kind") == "queued":
+            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+            self.jobs.append_event(
+                JobEvent(
+                    job_id=job.id,
+                    sequence=sequence,
+                    status=JobStatus.CANCELLED,
+                    event_type="cancelled_paused_queue",
+                    progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
+                    error={"code": "JOB_TERMINATED", "message": "Job antrean Quick Mode dibatalkan."},
+                )
+            )
+            self.jobs.release_execution(job.id)
+            self._dispatch_pending_jobs()
+            return self.jobs.get(job.id) or job
         if job.status == JobStatus.QUEUED:
             sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
             self.jobs.append_event(
@@ -842,6 +910,77 @@ class ControlPlane:
         # would reject late log/final events and make the UI lie about a still
         # running process.
         return self.jobs.get(job.id) or job
+
+    def pause_job(self, actor: Actor, job_id: str) -> Job:
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        self.require_profile(actor, job.profile)
+        if not bool(job.payload.get("quick_mode")):
+            raise DomainError("JOB_NOT_PAUSABLE", "Pause saat ini tersedia untuk Quick Mode.", status_code=409)
+        if job.status == JobStatus.PAUSED:
+            return job
+        if job.status.terminal:
+            raise DomainError("JOB_NOT_PAUSABLE", "Job sudah selesai.", status_code=409)
+        if job.status == JobStatus.QUEUED:
+            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+            self.jobs.append_event(
+                JobEvent(
+                    job_id=job.id,
+                    sequence=sequence,
+                    status=JobStatus.PAUSED,
+                    event_type="paused",
+                    progress={"phase": job.progress.get("phase", "queued"), "pause_kind": "queued"},
+                )
+            )
+            return self.jobs.get(job.id) or job
+        pause = getattr(self.dispatcher, "pause", None)
+        if not callable(pause):
+            raise DomainError("WORKER_PAUSE_UNAVAILABLE", "Worker belum mendukung pause.", status_code=503)
+        try:
+            paused = bool(pause(job.worker, job.id))
+        except Exception as exc:
+            raise DomainError(
+                "WORKER_PAUSE_UNAVAILABLE",
+                f"Worker {job.worker} tidak dapat menjeda job: {exc}",
+                status_code=503,
+            ) from exc
+        if not paused:
+            current = self.jobs.get(job.id)
+            if current is not None and current.status == JobStatus.PAUSED:
+                return current
+            raise DomainError("JOB_NOT_PAUSABLE", "Worker tidak memiliki proses aktif yang dapat dijeda.", status_code=409)
+        return self.jobs.get(job.id) or job
+
+    def resume_job(self, actor: Actor, job_id: str) -> Job:
+        job = self.jobs.get(job_id)
+        if job is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        self.require_profile(actor, job.profile)
+        if job.status != JobStatus.PAUSED:
+            raise DomainError("JOB_NOT_PAUSED", "Job tidak sedang dijeda.", status_code=409)
+        sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+        self.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=sequence,
+                status=JobStatus.QUEUED,
+                event_type="resumed_queued",
+                progress={
+                    "phase": job.progress.get("paused_phase") or job.progress.get("phase") or "queued",
+                    "pause_kind": job.progress.get("pause_kind", "queued"),
+                    "message": "Job masuk kembali ke antrean Quick Mode",
+                },
+            )
+        )
+        self._dispatch_pending_jobs()
+        return self.jobs.get(job.id) or job
+
+    def set_quickmode_limit(self, worker: str, max_concurrent: int) -> dict[str, Any]:
+        """Persist a worker's Quick Mode capacity and dispatch any new slots."""
+        item = self.jobs.set_quickmode_limit(worker, max_concurrent)
+        self._dispatch_pending_jobs()
+        return item
 
     @staticmethod
     def _redacted_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:

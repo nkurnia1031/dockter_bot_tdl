@@ -226,15 +226,24 @@ class JobLogSnapshot:
 class CommandMilestoneRecorder:
     """Persist bounded command results without allowing telemetry to fail work."""
 
-    def __init__(self, publisher: WorkerEventPublisher, job_id: str, secrets: list[str]):
+    def __init__(
+        self,
+        publisher: WorkerEventPublisher,
+        job_id: str,
+        secrets: list[str],
+        before_command: Callable[[], None] | None = None,
+    ):
         self.publisher = publisher
         self.job_id = job_id
         self.secrets = secrets
+        self.before_command = before_command
         self._counter = 0
         self._lock = threading.Lock()
 
     def command_started(self, command: list[str], log_prefix: str) -> str:
         """Create the pending milestone before a subprocess begins work."""
+        if self.before_command is not None:
+            self.before_command()
         with self._lock:
             self._counter += 1
             command_id = f"{self.job_id}:command:{self._counter}"
@@ -469,6 +478,7 @@ class WorkerJobExecutor:
         self.profile_manager = profile_manager
         self.publisher = publisher
         self._active: dict[str, tuple[str, str]] = {}
+        self._active_commands: dict[str, dict[str, Any]] = {}
         self._utility_runners: dict[str, UtilityRunner] = {}
         self._rclone_runners: dict[str, RcloneRunner] = {}
         self._quick_thumbnail_builders: dict[str, QuickThumbnailBuilder] = {}
@@ -477,6 +487,8 @@ class WorkerJobExecutor:
         self._quick_active: set[str] = set()
         self._quick_verify_active: set[str] = set()
         self._cancel_requested: set[str] = set()
+        self._pause_events: dict[str, threading.Event] = {}
+        self._paused_pending_ids: set[str] = set()
         self._known: set[str] = set()
         self._lock = threading.RLock()
         self._job_log = threading.local()
@@ -566,6 +578,30 @@ class WorkerJobExecutor:
         return position
 
     def cancel(self, job_id: str) -> bool:
+        with self._lock:
+            was_paused = job_id in self._pause_events and self._pause_events[job_id].is_set()
+            if was_paused:
+                self._pause_events[job_id].clear()
+            paused_pending = job_id in self._paused_pending_ids
+            if paused_pending:
+                self._paused_pending_ids.discard(job_id)
+        if paused_pending and self._jobs.cancel_pending(job_id):
+            with self._lock:
+                self._known.discard(job_id)
+            try:
+                self.publisher.emit(
+                    job_id,
+                    "cancelled",
+                    "cancelled",
+                    progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
+                    error={"code": "JOB_TERMINATED", "message": "Job antrean Quick Mode dibatalkan."},
+                )
+                return True
+            except Exception:
+                LOGGER.warning("Could not publish cancellation for paused queued job %s", job_id, exc_info=True)
+                return False
+        if was_paused:
+            self._set_job_process_paused(job_id, False)
         if self._jobs.cancel_pending(job_id):
             with self._lock:
                 self._known.discard(job_id)
@@ -700,6 +736,129 @@ class WorkerJobExecutor:
         # An active Quick Mode job is cancellable even when its current phase
         # has no subprocess (for example while resolving a Telegram result).
         return bool(cancelled or quick_active or kind in {"export", "backup_node"})
+
+    def pause(self, job_id: str) -> bool:
+        target = str(job_id)
+        if self._jobs.pause_pending(target):
+            try:
+                self.publisher.emit(
+                    target,
+                    "paused",
+                    "paused",
+                    progress={"phase": "queued", "paused_phase": "queued", "pause_kind": "worker"},
+                )
+                with self._lock:
+                    self._paused_pending_ids.add(target)
+                return True
+            except Exception:
+                LOGGER.warning("Could not publish pause for queued job %s", target, exc_info=True)
+                self._jobs.resume_pending(target)
+                return False
+        if self._jobs.is_active(target):
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline:
+                with self._lock:
+                    if target in self._active_commands:
+                        break
+                time.sleep(0.01)
+        with self._lock:
+            active = self._active.get(target)
+            command = self._active_commands.get(target)
+            if active is None or command is None:
+                return False
+            pause_event = self._pause_events.setdefault(target, threading.Event())
+            if pause_event.is_set():
+                return True
+            pause_event.set()
+        self._set_job_process_paused(target, True)
+        phase = self._quick_terminal_phase(command, "running")
+        try:
+            self.publisher.emit(
+                target,
+                "paused",
+                "paused",
+                progress={
+                    "phase": phase,
+                    "paused_phase": phase,
+                    "pause_kind": "worker",
+                    "message": "Quick Mode dijeda",
+                },
+            )
+            return True
+        except Exception:
+            LOGGER.warning("Could not publish pause for job %s", target, exc_info=True)
+            with self._lock:
+                pause_event.clear()
+            self._set_job_process_paused(target, False)
+            return False
+
+    def resume(self, job_id: str, event_sequence_start: int | None = None) -> bool:
+        target = str(job_id)
+        self.publisher.begin(target, event_sequence_start)
+        if self._jobs.resume_pending(target, event_sequence_start=event_sequence_start):
+            with self._lock:
+                self._paused_pending_ids.discard(target)
+            return True
+        with self._lock:
+            pause_event = self._pause_events.get(target)
+            active = self._active.get(target)
+            if pause_event is None or not pause_event.is_set() or active is None:
+                return False
+            pause_event.clear()
+        self._set_job_process_paused(target, False)
+        try:
+            self.publisher.emit(
+                target,
+                "running",
+                "resumed",
+                progress={
+                    "phase": "resuming",
+                    "message": "Quick Mode dilanjutkan",
+                    "resumed_at": utc_now().isoformat(),
+                },
+            )
+            return True
+        except Exception:
+            LOGGER.warning("Could not publish resume for job %s", target, exc_info=True)
+            return False
+
+    def _set_job_process_paused(self, job_id: str, paused: bool) -> None:
+        with self._lock:
+            active = self._active.get(job_id)
+            command = self._active_commands.get(job_id)
+            clients = [
+                self._quick_export_clients.get(job_id),
+                self._quick_download_clients.get(job_id),
+                self._quick_thumbnail_builders.get(job_id),
+                self._utility_runners.get(job_id),
+                self._rclone_runners.get(job_id),
+            ]
+        if active is not None:
+            try:
+                runtime = self.profile_manager.runtime(active[0])
+            except Exception:
+                runtime = None
+            try:
+                storage_profile = getattr(self.config, "worker_storage_profile", "storage")
+                storage_runtime = self.profile_manager.runtime(storage_profile)
+                clients.append(getattr(storage_runtime, "export_tdl_client", None))
+            except Exception:
+                pass
+            if command and command.get("kind") == "leave" and runtime is not None:
+                clients.append(getattr(getattr(runtime, "leave_service", None), "runner", None))
+        seen: set[int] = set()
+        for client in clients:
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+            method = getattr(client, "pause_current" if paused else "resume_current", None)
+            if method is None and isinstance(client, RcloneRunner):
+                method = getattr(client.runner, "pause_current" if paused else "resume_current", None)
+            if callable(method):
+                try:
+                    method(job_id)
+                except Exception:
+                    LOGGER.warning("Could not %s process for job %s", "pause" if paused else "resume", job_id, exc_info=True)
 
     def queue_size(self, profile: str) -> int:
         del profile
@@ -881,6 +1040,7 @@ class WorkerJobExecutor:
             self.publisher,
             job_id,
             [value for value in secrets if value],
+            before_command=lambda: self._wait_if_paused(job_id),
         )
         self._job_log.job_id = job_id
         self._job_log.secrets = [value for value in secrets if value]
@@ -904,8 +1064,11 @@ class WorkerJobExecutor:
         heartbeat_thread: threading.Thread | None = None
         with self._lock:
             self._active[job_id] = (profile, kind)
+            self._active_commands[job_id] = command
+            self._pause_events.setdefault(job_id, threading.Event())
             self._log_snapshots[job_id] = snapshot
         try:
+            self._wait_if_paused(job_id)
             self.publisher.emit(
                 job_id,
                 "running",
@@ -929,6 +1092,7 @@ class WorkerJobExecutor:
             )
             heartbeat_thread.start()
             result = self._execute(command)
+            self._wait_if_paused(job_id)
             with self._lock:
                 cancelled = job_id in self._cancel_requested
             self._append_job_log("[job terminated]" if cancelled else "[job completed]")
@@ -1023,6 +1187,8 @@ class WorkerJobExecutor:
                     delattr(self._job_log, name)
             with self._lock:
                 self._active.pop(job_id, None)
+                self._active_commands.pop(job_id, None)
+                self._pause_events.pop(job_id, None)
                 # Job IDs are stable across retries. Allow the next attempt
                 # to be enqueued after this run has reached a terminal event.
                 self._known.discard(job_id)
@@ -1264,9 +1430,12 @@ class WorkerJobExecutor:
         """
         while not stop_event.wait(10.0):
             try:
+                with self._lock:
+                    pause_event = self._pause_events.get(job_id)
+                    is_paused = pause_event is not None and pause_event.is_set()
                 self.publisher.emit(
                     job_id,
-                    "running",
+                    "paused" if is_paused else "running",
                     "progress.snapshot",
                     transient=True,
                     progress={
@@ -1280,6 +1449,16 @@ class WorkerJobExecutor:
                     job_id,
                     exc_info=True,
                 )
+
+    def _wait_if_paused(self, job_id: str) -> None:
+        while True:
+            with self._lock:
+                pause_event = self._pause_events.get(job_id)
+                is_paused = pause_event is not None and pause_event.is_set()
+            if not is_paused:
+                return
+            self._set_job_process_paused(job_id, True)
+            pause_event.wait(timeout=1.0)
 
     def _command_callback(self):
         return getattr(self._job_log, "audit", None)

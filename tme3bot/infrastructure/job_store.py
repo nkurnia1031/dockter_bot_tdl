@@ -5,7 +5,7 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +101,7 @@ class SqliteJobRepository:
                     queue_group TEXT NOT NULL,
                     priority INTEGER NOT NULL DEFAULT 100,
                     lane TEXT NOT NULL,
+                    queued_at TEXT,
                     admitted_at TEXT,
                     released_at TEXT,
                     blocked_reason TEXT,
@@ -113,6 +114,19 @@ class SqliteJobRepository:
                     worker TEXT NOT NULL,
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS quickmode_worker_limits (
+                    worker TEXT PRIMARY KEY,
+                    max_concurrent INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS job_quickmode_slots (
+                    job_id TEXT PRIMARY KEY,
+                    worker TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS job_quickmode_slots_worker
+                    ON job_quickmode_slots(worker);
                 CREATE TABLE IF NOT EXISTS job_commands (
                     job_id TEXT PRIMARY KEY,
                     payload TEXT NOT NULL,
@@ -147,6 +161,34 @@ class SqliteJobRepository:
                 db.execute(
                     "ALTER TABLE jobs ADD COLUMN progress_sequence INTEGER NOT NULL DEFAULT 0"
                 )
+            plan_columns = {
+                str(row["name"])
+                for row in db.execute(
+                    "PRAGMA table_info(job_execution_plans)"
+                ).fetchall()
+            }
+            if "queued_at" not in plan_columns:
+                db.execute("ALTER TABLE job_execution_plans ADD COLUMN queued_at TEXT")
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS job_execution_plans_queued_at "
+                "ON job_execution_plans(queued_at, priority, job_id)"
+            )
+            db.execute(
+                """
+                UPDATE job_execution_plans SET queued_at = (
+                    SELECT created_at FROM jobs WHERE jobs.id = job_execution_plans.job_id
+                ) WHERE queued_at IS NULL
+                """
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO job_quickmode_slots(job_id, worker, acquired_at)
+                SELECT id, worker, updated_at FROM jobs
+                WHERE status IN ('dispatched', 'running')
+                  AND (payload LIKE '%\"quick_mode\":true%'
+                       OR payload LIKE '%\"quick_mode\": true%')
+                """
+            )
 
     def create(self, job: Job) -> Job:
         with self._db() as db:
@@ -246,8 +288,8 @@ class SqliteJobRepository:
                 """
                 INSERT OR REPLACE INTO job_execution_plans(
                     job_id, concurrency_keys, queue_group, priority, lane,
-                    admitted_at, released_at, blocked_reason
-                ) VALUES(?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    queued_at, admitted_at, released_at, blocked_reason
+                ) VALUES(?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (
                     job_id,
@@ -255,6 +297,7 @@ class SqliteJobRepository:
                     str(plan.get("queue_group", "")),
                     int(plan.get("priority", 100)),
                     str(plan.get("lane", "unknown")),
+                    datetime.now(timezone.utc).isoformat(),
                 ),
             )
             # This is an internal gateway table. It is never returned through
@@ -276,6 +319,7 @@ class SqliteJobRepository:
             "queue_group": str(row["queue_group"]),
             "priority": int(row["priority"]),
             "lane": str(row["lane"]),
+            "queued_at": str(row["queued_at"] or ""),
             "blocked_reason": row["blocked_reason"],
         }
 
@@ -285,6 +329,64 @@ class SqliteJobRepository:
                 "SELECT payload FROM job_commands WHERE job_id = ?", (job_id,)
             ).fetchone()
         return _load(row["payload"], None) if row is not None else None
+
+    def update_command_payload(self, job_id: str, payload: dict[str, Any]) -> None:
+        with self._db() as db:
+            db.execute(
+                "UPDATE job_commands SET payload = ? WHERE job_id = ?",
+                (_dump(payload), job_id),
+            )
+
+    def quickmode_limits(self, workers: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
+        names = sorted({str(item).strip().lower() for item in workers if str(item).strip()})
+        with self._db() as db:
+            limits = {
+                str(row["worker"]): int(row["max_concurrent"])
+                for row in db.execute(
+                    "SELECT worker, max_concurrent FROM quickmode_worker_limits"
+                ).fetchall()
+            }
+            active = {
+                str(row["worker"]): int(row["count"])
+                for row in db.execute(
+                    "SELECT worker, COUNT(*) AS count FROM job_quickmode_slots GROUP BY worker"
+                ).fetchall()
+            }
+            queued = {
+                str(row["worker"]): int(row["count"])
+                for row in db.execute(
+                    """
+                    SELECT worker, COUNT(*) AS count FROM jobs
+                    WHERE status = 'queued'
+                      AND (payload LIKE '%\"quick_mode\":true%' OR payload LIKE '%\"quick_mode\": true%')
+                    GROUP BY worker
+                    """
+                ).fetchall()
+            }
+        return [
+            {
+                "worker": name,
+                "max_concurrent": limits.get(name, 2),
+                "active": active.get(name, 0),
+                "queued": queued.get(name, 0),
+            }
+            for name in names
+        ]
+
+    def set_quickmode_limit(self, worker: str, max_concurrent: int) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            db.execute(
+                """
+                INSERT INTO quickmode_worker_limits(worker, max_concurrent, updated_at)
+                VALUES(?, ?, ?)
+                ON CONFLICT(worker) DO UPDATE SET
+                    max_concurrent = excluded.max_concurrent,
+                    updated_at = excluded.updated_at
+                """,
+                (str(worker).strip().lower(), int(max_concurrent), now),
+            )
+        return next(item for item in self.quickmode_limits([worker]))
 
     def create_telegram_notification(
         self,
@@ -389,12 +491,82 @@ class SqliteJobRepository:
                 """
             )
             plan_row = db.execute(
-                "SELECT * FROM job_execution_plans WHERE job_id = ?", (job_id,)
+                """
+                SELECT p.*, j.worker, j.status, j.payload
+                FROM job_execution_plans p JOIN jobs j ON j.id = p.job_id
+                WHERE p.job_id = ?
+                """,
+                (job_id,),
             ).fetchone()
             if plan_row is None:
                 return {"admitted": True, "position": 1, "blocked_reason": None}
+            is_quick_mode = _quick_mode_sql(True)[0] and bool(
+                db.execute(
+                    "SELECT 1 FROM jobs WHERE id = ? AND " + _quick_mode_sql(True)[0],
+                    (job_id,),
+                ).fetchone()
+            )
+            worker_name = str(plan_row["worker"])
+            if is_quick_mode:
+                # Keep one FIFO for every profile assigned to this worker.
+                # queue_info updates jobs.updated_at, so ordering must use the
+                # scheduler's own timestamp instead of the visible job row.
+                earlier = db.execute(
+                    """
+                    SELECT p.job_id
+                    FROM job_execution_plans p
+                    JOIN jobs j ON j.id = p.job_id
+                    WHERE j.worker = ? AND j.status = 'queued'
+                      AND j.id != ? AND p.queued_at <= ?
+                      AND (j.payload LIKE '%\"quick_mode\":true%'
+                           OR j.payload LIKE '%\"quick_mode\": true%')
+                    ORDER BY p.queued_at, p.priority, p.job_id
+                    """,
+                    (worker_name, job_id, str(plan_row["queued_at"] or now)),
+                ).fetchall()
+                if earlier:
+                    active_slots = int(
+                        db.execute(
+                            "SELECT COUNT(*) FROM job_quickmode_slots WHERE worker = ?",
+                            (worker_name,),
+                        ).fetchone()[0]
+                    )
+                    position = active_slots + len(earlier) + 1
+                    reason = "Menunggu giliran FIFO Quick Mode"
+                    db.execute(
+                        "UPDATE job_execution_plans SET blocked_reason = ? WHERE job_id = ?",
+                        (reason, job_id),
+                    )
+                    return {"admitted": False, "position": position, "blocked_reason": reason}
+                limit_row = db.execute(
+                    "SELECT max_concurrent FROM quickmode_worker_limits WHERE worker = ?",
+                    (worker_name,),
+                ).fetchone()
+                max_concurrent = int(limit_row["max_concurrent"]) if limit_row else 2
+                slot = db.execute(
+                    "SELECT 1 FROM job_quickmode_slots WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                active_slots = int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM job_quickmode_slots WHERE worker = ?",
+                        (worker_name,),
+                    ).fetchone()[0]
+                )
+                if slot is None and active_slots >= max_concurrent:
+                    position = active_slots + 1
+                    reason = f"Batas Quick Mode worker tercapai ({active_slots}/{max_concurrent})"
+                    db.execute(
+                        "UPDATE job_execution_plans SET blocked_reason = ? WHERE job_id = ?",
+                        (reason, job_id),
+                    )
+                    return {"admitted": False, "position": position, "blocked_reason": reason}
             keys = set(_load(plan_row["concurrency_keys"], []))
             if not keys:
+                if is_quick_mode:
+                    db.execute(
+                        "INSERT OR IGNORE INTO job_quickmode_slots(job_id, worker, acquired_at) VALUES(?, ?, ?)",
+                        (job_id, worker_name, now),
+                    )
                 return {"admitted": True, "position": 1, "blocked_reason": None}
             placeholders = ",".join("?" for _ in keys)
             conflicts = db.execute(
@@ -432,8 +604,13 @@ class SqliteJobRepository:
             ).fetchone()
             for key in keys:
                 db.execute(
-                    "INSERT INTO job_resource_leases(resource_key, job_id, acquired_at, worker) VALUES(?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO job_resource_leases(resource_key, job_id, acquired_at, worker) VALUES(?, ?, ?, ?)",
                     (key, job_id, now, str(worker["worker"] if worker else "")),
+                )
+            if is_quick_mode:
+                db.execute(
+                    "INSERT OR IGNORE INTO job_quickmode_slots(job_id, worker, acquired_at) VALUES(?, ?, ?)",
+                    (job_id, worker_name, now),
                 )
             db.execute(
                 "UPDATE job_execution_plans SET admitted_at = ?, blocked_reason = NULL WHERE job_id = ?",
@@ -445,6 +622,7 @@ class SqliteJobRepository:
         now = datetime.now(timezone.utc).isoformat()
         with self._db() as db:
             db.execute("DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,))
+            db.execute("DELETE FROM job_quickmode_slots WHERE job_id = ?", (job_id,))
             db.execute(
                 "UPDATE job_execution_plans SET released_at = ? WHERE job_id = ?",
                 (now, job_id),
@@ -553,6 +731,26 @@ class SqliteJobRepository:
         with self._db() as db:
             rows = db.execute(
                 f"SELECT * FROM jobs{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                values,
+            ).fetchall()
+        return [job for row in rows if (job := self._job(row)) is not None]
+
+    def list_queued_for_scheduler(
+        self, *, profile: str | None = None, limit: int = 1000
+    ) -> list[Job]:
+        """Return oldest queued commands using scheduler timestamps."""
+        clauses = ["j.status = 'queued'", "j.archived_at IS NULL"]
+        values: list[object] = []
+        if profile is not None:
+            clauses.append("j.profile = ?")
+            values.append(str(profile))
+        values.append(max(1, min(int(limit), 5000)))
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT j.* FROM jobs j "
+                "LEFT JOIN job_execution_plans p ON p.job_id = j.id "
+                "WHERE " + " AND ".join(clauses) +
+                " ORDER BY COALESCE(p.queued_at, j.created_at), p.priority, j.id LIMIT ?",
                 values,
             ).fetchall()
         return [job for row in rows if (job := self._job(row)) is not None]
@@ -671,6 +869,44 @@ class SqliteJobRepository:
                     event.job_id,
                 ),
             )
+            if event.status == JobStatus.PAUSED:
+                # A paused Quick Mode job still owns its physical resource
+                # leases, but no longer consumes a scheduler concurrency slot.
+                db.execute(
+                    "DELETE FROM job_quickmode_slots WHERE job_id = ?",
+                    (event.job_id,),
+                )
+            elif event.status.terminal:
+                db.execute(
+                    "DELETE FROM job_quickmode_slots WHERE job_id = ?",
+                    (event.job_id,),
+                )
+            elif job.status == JobStatus.PAUSED and event.status == JobStatus.QUEUED:
+                # Resume order is operator click order, independent of the
+                # original job creation time.
+                queued_at = event.created_at
+                queued_at_row = db.execute(
+                    """
+                    SELECT MAX(p.queued_at) AS queued_at
+                    FROM job_execution_plans p JOIN jobs j ON j.id = p.job_id
+                    WHERE j.worker = ? AND j.status = 'queued' AND j.id != ?
+                      AND (j.payload LIKE '%\"quick_mode\":true%'
+                           OR j.payload LIKE '%\"quick_mode\": true%')
+                    """,
+                    (job.worker, event.job_id),
+                ).fetchone()
+                latest_queued_at = queued_at_row["queued_at"] if queued_at_row else None
+                if latest_queued_at:
+                    try:
+                        latest = datetime.fromisoformat(str(latest_queued_at))
+                        if latest >= queued_at:
+                            queued_at = latest + timedelta(microseconds=1)
+                    except ValueError:
+                        pass
+                db.execute(
+                    "UPDATE job_execution_plans SET queued_at = ?, admitted_at = NULL, blocked_reason = NULL WHERE job_id = ?",
+                    (queued_at.isoformat(), event.job_id),
+                )
             return (
                 replace(
                     job,
@@ -737,10 +973,11 @@ class SqliteJobRepository:
             JobStatus.QUEUED.value,
             JobStatus.DISPATCHED.value,
             JobStatus.RUNNING.value,
+            JobStatus.PAUSED.value,
         )
         with self._db() as db:
             row = db.execute(
-                "SELECT 1 FROM jobs WHERE profile = ? AND status IN (?, ?, ?) LIMIT 1",
+                "SELECT 1 FROM jobs WHERE profile = ? AND status IN (?, ?, ?, ?) LIMIT 1",
                 (profile, *active),
             ).fetchone()
         return row is not None

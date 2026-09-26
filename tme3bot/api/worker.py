@@ -101,6 +101,22 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     def cancel_job(job_id: str):
         return {"cancelled": context.executor.cancel(job_id)}
 
+    @app.post(
+        "/internal/v1/jobs/{job_id}/pause", dependencies=[Depends(authorize)]
+    )
+    def pause_job(job_id: str):
+        return {"paused": context.executor.pause(job_id)}
+
+    @app.post(
+        "/internal/v1/jobs/{job_id}/resume", dependencies=[Depends(authorize)]
+    )
+    def resume_job(job_id: str, body: dict[str, Any]):
+        return {
+            "resumed": context.executor.resume(
+                job_id, body.get("event_sequence_start")
+            )
+        }
+
     @app.get(
         "/internal/v1/jobs/{job_id}/log-snapshot",
         dependencies=[Depends(authorize)],

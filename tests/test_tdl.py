@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -88,6 +89,39 @@ class FakeRunner:
 
 
 class TDLClientTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "SIGSTOP/SIGCONT process groups are Linux worker behavior")
+    def test_subprocess_runner_freezes_and_resumes_current_process(self):
+        runner = SubprocessRunner()
+        ready = threading.Event()
+        finished = threading.Event()
+        errors = []
+
+        def output(line: str) -> None:
+            if "READY" in line:
+                ready.set()
+            if "DONE" in line:
+                finished.set()
+
+        def run() -> None:
+            try:
+                runner.run(
+                    [sys.executable, "-c", "import time; print('READY', flush=True); time.sleep(2); print('DONE', flush=True)"],
+                    output_callback=output,
+                )
+            except Exception as exc:  # pragma: no cover - assertion reports worker failure
+                errors.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(timeout=3))
+        self.assertTrue(runner.pause_current())
+        time.sleep(0.5)
+        self.assertFalse(finished.is_set())
+        self.assertTrue(runner.resume_current())
+        self.assertTrue(finished.wait(timeout=4))
+        thread.join(timeout=3)
+        self.assertFalse(errors)
+
     def test_decodes_invalid_utf8_without_losing_surrounding_output(self) -> None:
         self.assertEqual(
             decode_process_output(b"before \xa8 after\n"),

@@ -18,6 +18,8 @@ from tme3bot.tdl import (
     ProcessStalledError,
     notify_command_completed,
     notify_command_started,
+    pause_process_group,
+    resume_process_group,
 )
 from tme3bot.tdl_output import parse_tdl_progress_line
 
@@ -259,7 +261,37 @@ class UtilityRunner:
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
         self.command_callback = command_callback
         self._process_lock = threading.RLock()
+        self._pause_condition = threading.Condition(self._process_lock)
+        self._pause_requested = False
+        self._paused = False
         self._current_process: subprocess.Popen[str] | None = None
+
+    def pause_current(self, owner_job_id: str | None = None) -> bool:
+        del owner_job_id
+        with self._pause_condition:
+            self._pause_requested = True
+            process = self._current_process
+            if process is None or process.poll() is not None:
+                return True
+            self._paused = pause_process_group(process)
+            return self._paused
+
+    def resume_current(self, owner_job_id: str | None = None) -> bool:
+        del owner_job_id
+        with self._pause_condition:
+            process = self._current_process
+            resumed = process is None or process.poll() is not None
+            if process is not None and process.poll() is None and self._paused:
+                resumed = resume_process_group(process)
+            self._paused = False
+            self._pause_requested = False
+            self._pause_condition.notify_all()
+            return resumed
+
+    def _wait_until_resumed(self) -> None:
+        with self._pause_condition:
+            while self._pause_requested:
+                self._pause_condition.wait(timeout=1.0)
 
     def cancel_current(self) -> bool:
         with self._process_lock:
@@ -460,6 +492,7 @@ class UtilityRunner:
 
     def _command(self, command: list[str], cwd: Path, prefix: str, settings: dict[str, str] | None = None) -> None:
         LOGGER.info("%s start folder=%s", prefix, cwd)
+        self._wait_until_resumed()
         started_at = time.monotonic()
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
@@ -500,9 +533,14 @@ class UtilityRunner:
         watchdog_stop = threading.Event()
 
         def watchdog() -> None:
+            nonlocal last_progress_at
             if self.stall_timeout_seconds <= 0:
                 return
             while not watchdog_stop.wait(1.0):
+                with self._process_lock:
+                    if self._paused:
+                        last_progress_at = time.monotonic()
+                        continue
                 if time.monotonic() - last_progress_at <= self.stall_timeout_seconds:
                     continue
                 stalled.set()
@@ -593,6 +631,9 @@ class UtilityRunner:
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+                    self._paused = False
+                    self._pause_requested = False
+                    self._pause_condition.notify_all()
         if self.command_callback is not None:
             notify_command_completed(
                 self.command_callback,

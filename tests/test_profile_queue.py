@@ -138,6 +138,37 @@ class ResourceAwareQueueTests(unittest.TestCase):
             release_first.set()
             worker.stop()
 
+    def test_pending_job_can_pause_and_resume_without_losing_queue_entry(self) -> None:
+        first_started = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+
+        def handle(job: dict, resources: set[str]) -> None:
+            del resources
+            if job["job_id"] == "first":
+                first_started.set()
+                if not release_first.wait(timeout=3):
+                    raise TimeoutError("first")
+            else:
+                second_started.set()
+
+        worker = ResourceAwareQueue[dict](handle)
+        worker.start()
+        worker.enqueue({"tdl"}, {"job_id": "first"}, job_id="first")
+        worker.enqueue({"tdl"}, {"job_id": "second"}, job_id="second")
+        try:
+            self.assertTrue(first_started.wait(timeout=1))
+            self.assertTrue(worker.pause_pending("second"))
+            self.assertEqual(worker.queue_size(), 0)
+            self.assertFalse(second_started.is_set())
+            self.assertTrue(worker.resume_pending("second", event_sequence_start=9))
+            self.assertEqual(worker.queue_size(), 1)
+            release_first.set()
+            self.assertTrue(second_started.wait(timeout=1))
+        finally:
+            release_first.set()
+            worker.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

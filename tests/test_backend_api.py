@@ -813,6 +813,46 @@ class BackendApiTests(unittest.TestCase):
             [("local", "uploaded-1", "uploading")],
         )
 
+    def test_quick_mode_limit_pause_and_resume_api_preserve_worker_fifo(self):
+        headers = self.login()
+        saved = self.client.put(
+            "/api/v1/quick-mode/limits/local",
+            headers=headers,
+            json={"max_concurrent": 1},
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json()["max_concurrent"], 1)
+
+        first = self.control.submit_job(
+            Actor(42, "default"),
+            "export",
+            {"url": "https://t.me/c/1/41", "quick_mode": True},
+        )
+        second = self.control.submit_job(
+            Actor(42, "default"),
+            "export",
+            {"url": "https://t.me/c/1/42", "quick_mode": True},
+            profile="archive",
+        )
+        self.assertEqual(first.status.value, "dispatched")
+        self.assertEqual(second.status.value, "queued")
+
+        limits = self.client.get("/api/v1/quick-mode/limits", headers=headers)
+        self.assertEqual(limits.status_code, 200)
+        self.assertEqual(limits.json()["items"][0]["active"], 1)
+        self.assertEqual(limits.json()["items"][0]["queued"], 1)
+
+        paused = self.client.post(f"/api/v1/jobs/{second.id}/pause", headers=headers)
+        self.assertEqual(paused.status_code, 200)
+        self.assertEqual(paused.json()["status"], "paused")
+        resumed = self.client.post(f"/api/v1/jobs/{second.id}/resume", headers=headers)
+        self.assertEqual(resumed.status_code, 200)
+        self.assertEqual(resumed.json()["status"], "queued")
+
+        self.control.append_worker_event(JobEvent(first.id, 2, JobStatus.RUNNING, "started"))
+        self.control.append_worker_event(JobEvent(first.id, 3, JobStatus.SUCCEEDED, "completed"))
+        self.assertEqual(self.jobs.get(second.id).status, JobStatus.DISPATCHED)
+
     def test_quick_staging_scan_verifies_inactive_cleanup_folder(self):
         headers = self.login()
         self.dispatcher.quick_scan["local"] = {

@@ -81,6 +81,31 @@ class WorkerHttpDispatcher:
         )
         return bool(result.get("cancelled"))
 
+    def pause(self, worker: str, job_id: str) -> bool:
+        record = self.worker_registry.get(worker)
+        if not record:
+            return False
+        result = request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            f"/internal/v1/jobs/{job_id}/pause",
+        )
+        return bool(result.get("paused"))
+
+    def resume(self, worker: str, job_id: str, event_sequence_start: int) -> bool:
+        record = self.worker_registry.get(worker)
+        if not record:
+            return False
+        result = request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            f"/internal/v1/jobs/{job_id}/resume",
+            {"event_sequence_start": int(event_sequence_start)},
+        )
+        return bool(result.get("resumed"))
+
     def workspace_tree(self, worker: str, path: str = "/workspace") -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

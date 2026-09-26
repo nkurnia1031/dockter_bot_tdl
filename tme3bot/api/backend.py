@@ -163,6 +163,7 @@ def job_dict(job: Job) -> dict[str, Any]:
     if not started_at and job.status in {
         JobStatus.DISPATCHED,
         JobStatus.RUNNING,
+        JobStatus.PAUSED,
         JobStatus.SUCCEEDED,
         JobStatus.FAILED,
         JobStatus.CANCELLED,
@@ -782,7 +783,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     verifier = getattr(dispatcher, "quickmode_verify", None) if dispatcher is not None else None
                     if (
                         str(item.get("phase") or "") in {"uploading", "cleanup"}
-                        and linked_status not in {"queued", "dispatched", "running"}
+                        and linked_status not in {"queued", "dispatched", "running", "paused"}
                         and callable(verifier)
                     ):
                         try:
@@ -807,6 +808,27 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 errors.append({"worker": worker, "error": str(exc)[:500]})
 
         return {"items": items, "errors": errors}
+
+    @app.get("/api/v1/quick-mode/limits", response_model=ObjectResponse)
+    def quick_mode_limits(actor=Depends(current_actor)):
+        del actor
+        workers = context.worker_registry.names() if context.worker_registry is not None else []
+        return {"items": context.control_plane.jobs.quickmode_limits(workers)}
+
+    @app.put("/api/v1/quick-mode/limits/{worker}", response_model=ObjectResponse)
+    def update_quick_mode_limit(worker: str, body: dict[str, Any], actor=Depends(current_actor)):
+        del actor
+        names = context.worker_registry.names() if context.worker_registry is not None else []
+        if worker not in names:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        try:
+            limit = int(body.get("max_concurrent"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("INVALID_QUICKMODE_LIMIT", "max_concurrent harus berupa angka 1 sampai 32.", status_code=422) from exc
+        if not 1 <= limit <= 32:
+            raise DomainError("INVALID_QUICKMODE_LIMIT", "Batas Quick Mode harus antara 1 sampai 32.", status_code=422)
+        item = context.control_plane.set_quickmode_limit(worker, limit)
+        return item
 
     @app.post("/api/v1/quick-mode/recover", response_model=ObjectResponse)
     def recover_quick_mode(body: dict[str, Any], actor=Depends(current_actor)):
@@ -1006,7 +1028,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     "source": "worker",
                 }
             except Exception:
-                if job.status.value in {"queued", "dispatched", "running"}:
+                if job.status.value in {"queued", "dispatched", "running", "paused"}:
                     raise DomainError(
                         "JOB_LOG_UNAVAILABLE",
                         "Snapshot log worker belum tersedia.",
@@ -1035,6 +1057,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobResponse)
     def cancel_job(job_id: str, actor=Depends(current_actor)):
         return job_dict(context.control_plane.cancel_job(actor, job_id))
+
+    @app.post("/api/v1/jobs/{job_id}/pause", response_model=JobResponse)
+    def pause_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.pause_job(actor, job_id))
+
+    @app.post("/api/v1/jobs/{job_id}/resume", response_model=JobResponse)
+    def resume_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.resume_job(actor, job_id))
 
     @app.post("/api/v1/jobs/terminate-active", response_model=ObjectResponse)
     def terminate_active_jobs(
@@ -1410,7 +1440,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         jobs = context.control_plane.jobs
         active = sum(
             jobs.count(profile=actor.profile, status=status, archived=False)
-            for status in ("queued", "dispatched", "running")
+            for status in ("queued", "dispatched", "running", "paused")
         )
         artifact_counts = context.export_catalog.summary(actor.profile)
         storage_items = context.storage_catalog.search("", limit=1, offset=0)

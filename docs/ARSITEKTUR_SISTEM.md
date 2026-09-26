@@ -3,9 +3,10 @@
 Panduan ini menjelaskan susunan komponen, batas tanggung jawab, aliran job,
 penyimpanan, keamanan, dan deployment tme3bot untuk maintainer dan developer.
 
-Status di bawah diverifikasi terhadap source pada branch `main`, commit
-`a6730b3`, tanggal 26 September 2026. Source code adalah acuan utama jika
-perilaku implementasi berubah.
+Peta komponen diverifikasi terhadap source pada branch `main`, commit
+`62c491c`, tanggal 26 September 2026. Bagian rekomendasi mencatat bahwa prioritas
+kendali concurrency Quick Mode sudah diterapkan pada source kerja saat ini.
+Source code adalah acuan utama jika perilaku implementasi berubah.
 
 ## Gambaran sistem
 
@@ -166,21 +167,22 @@ berada di direktori `tests/` serta `web/src`.
 
 ## Rekomendasi perbaikan
 
-Rekomendasi ini belum menjadi fitur atau refactor yang tersedia di source pada
-commit yang dicatat di atas.
+Prioritas 1 di bawah sudah diterapkan pada source. Prioritas 2–4 tetap menjadi
+rekomendasi untuk pekerjaan berikutnya.
 
 ### Prioritas 1 — Kendali concurrency Quick Mode
 
-Quick Mode memakai sesi dan staging terpisah per job, sehingga resource key
-stage yang unik memungkinkan banyak pipeline menghabiskan CPU bersamaan.
-Tambahkan limit aktif yang dapat diatur per worker, antrean FIFO, serta aksi
-pause/resume di monitor. Pause harus menahan proses milik job itu saja tanpa
-menghentikan heartbeat worker, membebaskan slot concurrency, dan mengecualikan
-waktu jeda dari watchdog stall. Kelola resource lease terpisah: job lain tidak
-boleh memakai sesi atau folder eksklusif yang masih ditahan job paused. Bila
-worker restart, proses yang dibekukan sudah hilang; Resume harus memakai recovery
-fase dari manifest dan mengulang verifikasi yang diperlukan sebelum melanjutkan.
-Ini menjawab langsung risiko CPU dari banyak job yang berjalan bersamaan.
+Quick Mode memiliki batas aktif yang dapat diatur per worker, dengan default 2
+dan rentang 1–32. Antrean FIFO berlaku lintas profile pada worker tersebut;
+job yang di-resume mendapat urutan berdasarkan waktu klik Resume. Monitor
+menampilkan kuota worker dan menyediakan Pause/Resume pada setiap job.
+
+Pause membekukan process group yang sedang dipakai job, mempertahankan heartbeat
+worker dan mengecualikan waktu jeda dari watchdog stall. Pause melepas slot
+concurrency, tetapi mempertahankan resource lease agar job lain tidak memakai
+sesi atau folder eksklusif yang masih ditahan. Jika worker restart, Resume
+mengirim ulang job dengan stage ID yang sama dan meminta recovery otomatis dari
+manifest Quick Mode.
 
 ### Prioritas 2 — Pecah modul orkestrasi besar
 

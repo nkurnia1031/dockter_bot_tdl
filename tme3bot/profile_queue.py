@@ -114,6 +114,7 @@ class ResourceAwareQueue(Generic[JobT]):
         self._thread_name_prefix = thread_name_prefix
         self._condition = threading.Condition(threading.RLock())
         self._pending: list[tuple[int, int, JobT, frozenset[str]]] = []
+        self._paused_pending: dict[str, tuple[int, int, JobT, frozenset[str]]] = {}
         self._active_keys: set[str] = set()
         self._active_jobs: set[str] = set()
         self._active_resource_keys: dict[str, set[str]] = {}
@@ -166,12 +167,16 @@ class ResourceAwareQueue(Generic[JobT]):
         with self._condition:
             return len(self._active_jobs)
 
+    def is_active(self, job_id: str) -> bool:
+        with self._condition:
+            return str(job_id) in self._active_jobs
+
     def cancel_pending(self, job_id: str) -> bool:
         """Remove a queued command without interrupting an active thread."""
         target = str(job_id)
         with self._condition:
             kept = []
-            removed = False
+            removed = self._paused_pending.pop(target, None) is not None
             for item in self._pending:
                 candidate = item[2]
                 candidate_id = str(
@@ -188,6 +193,46 @@ class ResourceAwareQueue(Generic[JobT]):
                 heapq.heapify(self._pending)
                 self._condition.notify_all()
             return removed
+
+    def pause_pending(self, job_id: str) -> bool:
+        """Move one pending command out of dispatch until it is resumed."""
+        target = str(job_id)
+        with self._condition:
+            kept = []
+            paused = None
+            for item in self._pending:
+                candidate = item[2]
+                candidate_id = str(
+                    getattr(candidate, "get", lambda _key, _default=None: _default)(
+                        "job_id", ""
+                    )
+                )
+                if candidate_id == target and paused is None:
+                    paused = item
+                    continue
+                kept.append(item)
+            if paused is None:
+                return False
+            self._pending = kept
+            heapq.heapify(self._pending)
+            self._paused_pending[target] = paused
+            self._condition.notify_all()
+            return True
+
+    def resume_pending(self, job_id: str, *, event_sequence_start: int | None = None) -> bool:
+        target = str(job_id)
+        with self._condition:
+            item = self._paused_pending.pop(target, None)
+            if item is None:
+                return False
+            priority, sequence, job, keys = item
+            if event_sequence_start is not None:
+                setter = getattr(job, "__setitem__", None)
+                if callable(setter):
+                    setter("event_sequence_start", int(event_sequence_start))
+            heapq.heappush(self._pending, (priority, sequence, job, keys))
+            self._condition.notify_all()
+            return True
 
     def _position_for(self, keys: frozenset[str], sequence: int) -> int:
         position = 1

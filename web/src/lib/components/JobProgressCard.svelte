@@ -1,13 +1,15 @@
 <script lang="ts">
   import { formatBytes } from '$lib/presentation';
   import { formatDuration, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
-  import { ChevronDown, Clock3, FileText, Gauge, SquareTerminal, Timer, XCircle } from '@lucide/svelte';
+  import { ChevronDown, Clock3, FileText, Gauge, Pause, Play, SquareTerminal, Timer, XCircle } from '@lucide/svelte';
 
-  let { job, onReport, onLog, onTerminate }: {
+  let { job, onReport, onLog, onTerminate, onPauseToggle, actionPending = false }: {
     job: Record<string, any>;
     onReport: () => void;
     onLog: () => void;
     onTerminate: () => void;
+    onPauseToggle?: () => void;
+    actionPending?: boolean;
   } = $props();
 
   let expanded = $state(false);
@@ -30,7 +32,7 @@
           {#if job.id}
             <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
           {/if}
-          <span class="badge running shrink-0">{phaseLabel(progress.phase)}</span>
+          <span class={`badge ${job.status === 'paused' ? 'paused' : 'running'} shrink-0`}>{job.status === 'paused' ? 'Dijeda' : phaseLabel(progress.phase)}</span>
           {#if stageId}
             <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {stageId.slice(0, 8)}</span>
           {/if}
@@ -82,6 +84,11 @@
           <Clock3 size={13}/>{elapsed}
         </div>
         <div class="flex items-center gap-2">
+          {#if onPauseToggle}
+            <button class={`button ${job.status === 'paused' ? '' : 'secondary'} !py-1.5 !px-3 text-xs`} onclick={onPauseToggle} disabled={actionPending || !['queued','dispatched','running','paused'].includes(job.status)} aria-label={job.status === 'paused' ? 'Lanjutkan job' : 'Jeda job'}>
+              {#if job.status === 'paused'}<Play size={14}/><span>{actionPending ? 'Melanjutkan...' : 'Resume'}</span>{:else}<Pause size={14}/><span>{actionPending ? 'Menjeda...' : 'Pause'}</span>{/if}
+            </button>
+          {/if}
           <button class="button secondary !py-1.5 !px-3 text-xs" onclick={() => expanded = !expanded} aria-label="Toggle detail progress">
             <ChevronDown size={14} class={`transition-transform duration-200 ${expanded ? 'rotate-180' : ''}`}/>
             <span>{expanded ? 'Tutup' : 'Detail'}</span>

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, post } from '$lib/api';
+  import { api, post, put } from '$lib/api';
   import { session } from '$lib/session.svelte';
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
@@ -37,6 +37,9 @@
   let sourceLoading = $state(false);
   let statsLoading = $state(false);
   let allJobs = $state<Job[]>([]);
+  let quickLimits = $state<{worker: string; max_concurrent: number; active: number; queued: number}[]>([]);
+  let quickLimitDrafts = $state<Record<string, string>>({});
+  let quickLimitSaving = $state<Record<string, boolean>>({});
   let staging = $state<Stage[]>([]);
   let stagingErrors = $state<{worker: string; error: string}[]>([]);
   let stagingLoading = $state(false);
@@ -50,13 +53,14 @@
   let mounted = false;
   let lastProfile = '';
 
-  const activeStatuses = ['queued', 'dispatched', 'running'];
+  const activeStatuses = ['queued', 'dispatched', 'running', 'paused'];
   const statuses = ['failed', 'cancelled', 'succeeded'];
   const isNumeric = (value: string) => /^-?\d+$/.test(value.trim());
   const activeJobs = $derived(allJobs.filter((job) => activeStatuses.includes(job.status)));
   const stats = $derived({
     queued: allJobs.filter((job) => job.status === 'queued' || job.status === 'dispatched').length,
     running: allJobs.filter((job) => job.status === 'running').length,
+    paused: allJobs.filter((job) => job.status === 'paused').length,
     failed: allJobs.filter((job) => job.status === 'failed').length,
     cancelled: allJobs.filter((job) => job.status === 'cancelled').length,
     succeeded: allJobs.filter((job) => job.status === 'succeeded').length
@@ -131,6 +135,42 @@
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Statistik Quick Mode tidak dapat dimuat.';
     } finally { statsLoading = false; }
+  }
+
+  async function loadQuickLimits() {
+    try {
+      const response = await api<{items: {worker: string; max_concurrent: number; active: number; queued: number}[]}>('/quick-mode/limits');
+      quickLimits = response.items || [];
+      const drafts = { ...quickLimitDrafts };
+      for (const item of quickLimits) {
+        if (drafts[item.worker] === undefined || !quickLimitSaving[item.worker]) {
+          drafts[item.worker] = String(item.max_concurrent);
+        }
+      }
+      quickLimitDrafts = drafts;
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Batas Quick Mode tidak dapat dimuat.';
+    }
+  }
+
+  async function saveQuickLimit(worker: string) {
+    const value = Number(quickLimitDrafts[worker]);
+    if (!Number.isInteger(value) || value < 1 || value > 32) {
+      message = 'Batas job per worker harus berupa angka 1 sampai 32.';
+      return;
+    }
+    quickLimitSaving = { ...quickLimitSaving, [worker]: true };
+    try {
+      await put(`/quick-mode/limits/${encodeURIComponent(worker)}`, { max_concurrent: value });
+      message = `Batas worker ${worker} disimpan.`;
+      await Promise.all([loadQuickLimits(), loadStats()]);
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Batas Quick Mode gagal disimpan.';
+    } finally {
+      const next = { ...quickLimitSaving };
+      delete next[worker];
+      quickLimitSaving = next;
+    }
   }
 
   async function loadStaging() {
@@ -321,11 +361,14 @@
     mounted = true;
     loadSources(targetProfile);
     loadStats();
+    loadQuickLimits();
+    const monitorTimer = setInterval(() => { loadStats(); loadQuickLimits(); }, 2500);
     const jobFinished = () => { loadStats(); loadStaging(); };
     window.addEventListener('tme3:job-finished', jobFinished);
     return () => {
       mounted = false;
       if (cooldownTimer) clearTimeout(cooldownTimer);
+      clearInterval(monitorTimer);
       window.removeEventListener('tme3:job-finished', jobFinished);
     };
   });
@@ -336,8 +379,27 @@
   <div class="hidden rounded-2xl bg-violet-50 p-3 text-violet-700 sm:block dark:bg-violet-950 dark:text-violet-200"><Zap size={25}/></div>
 </header>
 
-<div class="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
-  {#each [{label:'Queued', key:'queued', icon:Clock3}, {label:'Running', key:'running', icon:Gauge}, {label:'Failed', key:'failed', icon:RefreshCw}, {label:'Cancelled', key:'cancelled', icon:RefreshCw}, {label:'Succeeded', key:'succeeded', icon:CheckCircle2}] as item}
+<section class="card mt-6 p-4 sm:p-5">
+  <div class="mb-4"><p class="eyebrow">WORKER CONCURRENCY</p><h2 class="mt-1 text-lg font-extrabold">Batas job Quick Mode bersamaan</h2><p class="muted mt-1 text-sm">Batas berlaku untuk semua profile pada worker yang sama. Job yang di-resume masuk antrean FIFO.</p></div>
+  {#if quickLimits.length}
+    <div class="grid gap-3 lg:grid-cols-2">
+      {#each quickLimits as item (item.worker)}
+        <div class="flex flex-wrap items-end justify-between gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-3.5">
+          <div><b>{item.worker}</b><p class="muted mt-1 text-xs">{item.active} aktif dari batas {item.max_concurrent} · {item.queued} menunggu</p></div>
+          <div class="flex items-end gap-2">
+            <label class="text-xs font-bold">Maksimum aktif<input class="field mt-1 w-24" type="number" min="1" max="32" step="1" value={quickLimitDrafts[item.worker] ?? String(item.max_concurrent)} oninput={(event) => quickLimitDrafts = { ...quickLimitDrafts, [item.worker]: (event.currentTarget as HTMLInputElement).value }}/></label>
+            <button class="button secondary !py-2" onclick={() => saveQuickLimit(item.worker)} disabled={quickLimitSaving[item.worker]}>{quickLimitSaving[item.worker] ? 'Menyimpan...' : 'Simpan'}</button>
+          </div>
+        </div>
+      {/each}
+    </div>
+  {:else}
+    <p class="muted rounded-xl border border-dashed border-[var(--line)] p-4 text-sm">Belum ada worker yang terdaftar.</p>
+  {/if}
+</section>
+
+<div class="mt-6 grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
+  {#each [{label:'Queued', key:'queued', icon:Clock3}, {label:'Running', key:'running', icon:Gauge}, {label:'Paused', key:'paused', icon:Clock3}, {label:'Failed', key:'failed', icon:RefreshCw}, {label:'Cancelled', key:'cancelled', icon:RefreshCw}, {label:'Succeeded', key:'succeeded', icon:CheckCircle2}] as item}
     {@const Icon = item.icon}
     <div class="card flex items-center gap-3 p-4"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Icon size={18}/></div><div><p class="muted text-xs font-bold uppercase">{item.label}</p><b class="mt-1 block text-2xl">{stats[item.key as keyof typeof stats]}</b></div></div>
   {/each}
