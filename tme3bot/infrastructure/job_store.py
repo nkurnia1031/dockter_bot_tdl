@@ -35,6 +35,19 @@ def _quick_mode_sql(quick_mode: bool | None) -> tuple[str, list[object]]:
     return "", []
 
 
+def _elapsed_between(started_at: str, finished_at: str) -> float:
+    try:
+        started = datetime.fromisoformat(str(started_at))
+        finished = datetime.fromisoformat(str(finished_at))
+    except (TypeError, ValueError):
+        return 0.0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    if finished.tzinfo is None:
+        finished = finished.replace(tzinfo=timezone.utc)
+    return max(0.0, (finished - started).total_seconds())
+
+
 class SqliteJobRepository:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -625,6 +638,33 @@ class SqliteJobRepository:
                 "UPDATE job_execution_plans SET released_at = ? WHERE job_id = ?",
                 (now, job_id),
             )
+            row = db.execute(
+                """
+                SELECT j.progress, p.queued_at, p.admitted_at
+                FROM jobs j LEFT JOIN job_execution_plans p ON p.job_id = j.id
+                WHERE j.id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is not None:
+                progress = _load(row["progress"], {})
+                timing = progress.get("timing")
+                timing = dict(timing) if isinstance(timing, dict) else {}
+                queued_at = str(row["queued_at"] or "")
+                admitted_at = str(row["admitted_at"] or "")
+                timing.update({"released_at": now})
+                if queued_at:
+                    timing["queued_at"] = queued_at
+                if admitted_at:
+                    timing["admitted_at"] = admitted_at
+                    timing["worker_seconds"] = round(
+                        _elapsed_between(admitted_at, now), 3
+                    )
+                progress["timing"] = timing
+                db.execute(
+                    "UPDATE jobs SET progress = ? WHERE id = ?",
+                    (_dump(progress), job_id),
+                )
 
     def replace_execution_resources(
         self, job_id: str, resource_keys: set[str] | list[str] | tuple[str, ...]
@@ -672,10 +712,32 @@ class SqliteJobRepository:
 
     def set_queue_info(self, job_id: str, position: int, reason: str | None) -> None:
         with self._db() as db:
-            row = db.execute("SELECT progress FROM jobs WHERE id = ?", (job_id,)).fetchone()
+            row = db.execute(
+                """
+                SELECT j.progress, j.created_at, p.queued_at, p.admitted_at,
+                    p.released_at
+                FROM jobs j LEFT JOIN job_execution_plans p ON p.job_id = j.id
+                WHERE j.id = ?
+                """,
+                (job_id,),
+            ).fetchone()
             if row is None:
                 return
             progress = _load(row["progress"], {})
+            timing = progress.get("timing")
+            timing = dict(timing) if isinstance(timing, dict) else {}
+            queued_at = str(row["queued_at"] or row["created_at"] or "")
+            admitted_at = str(row["admitted_at"] or "")
+            now = datetime.now(timezone.utc)
+            timing["queued_at"] = queued_at or None
+            timing["queue_wait_seconds"] = round(
+                _elapsed_between(queued_at, admitted_at or now.isoformat()), 3
+            )
+            if admitted_at:
+                timing["admitted_at"] = admitted_at
+            if row["released_at"]:
+                timing["released_at"] = str(row["released_at"])
+            progress["timing"] = timing
             progress["position"] = max(1, int(position))
             if reason:
                 progress["blocked_reason"] = reason
@@ -685,6 +747,168 @@ class SqliteJobRepository:
                 "UPDATE jobs SET progress = ?, updated_at = ? WHERE id = ?",
                 (_dump(progress), datetime.now(timezone.utc).isoformat(), job_id),
             )
+
+    def monitor_metrics(
+        self,
+        *,
+        profile: str | None = None,
+        worker: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate queue, phase, and worker event metrics for the monitor."""
+        current_time = now or datetime.now(timezone.utc)
+        window_start = (current_time - timedelta(hours=24)).isoformat()
+        active_states = ("queued", "dispatched", "running", "paused")
+        clauses = [
+            "((j.status IN (?, ?, ?, ?)) OR "
+            "(COALESCE(p.admitted_at, j.created_at) >= ? AND j.archived_at IS NULL))"
+        ]
+        values: list[object] = [*active_states, window_start]
+        if profile:
+            clauses.append("j.profile = ?")
+            values.append(str(profile))
+        if worker:
+            clauses.append("j.worker = ?")
+            values.append(str(worker))
+        with self._db() as db:
+            rows = db.execute(
+                """
+                SELECT j.worker, j.status, j.kind, j.payload, j.progress,
+                    j.created_at, j.updated_at, p.queued_at, p.admitted_at
+                FROM jobs j LEFT JOIN job_execution_plans p ON p.job_id = j.id
+                WHERE """ + " AND ".join(clauses),
+                values,
+            ).fetchall()
+
+        workers: dict[str, dict[str, Any]] = {}
+        queue_wait_samples: list[float] = []
+        latency_total = 0.0
+        latency_count = 0
+        phase_totals: dict[str, float] = {}
+        for row in rows:
+            name = str(row["worker"] or "")
+            if not name:
+                continue
+            metrics = workers.setdefault(
+                name,
+                {
+                    "worker": name,
+                    "queued_jobs": 0,
+                    "dispatched_jobs": 0,
+                    "running_jobs": 0,
+                    "paused_jobs": 0,
+                    "quickmode_queued": 0,
+                    "quickmode_active": 0,
+                    "quickmode_paused": 0,
+                    "average_queue_wait_seconds": None,
+                    "event_latency": {"count": 0, "average_ms": None},
+                    "phase_seconds": {},
+                    "last_seen_at": None,
+                },
+            )
+            status = str(row["status"])
+            if status in active_states:
+                metrics[f"{status}_jobs"] += 1
+            payload = _load(row["payload"], {})
+            progress = _load(row["progress"], {})
+            if not isinstance(progress, dict):
+                progress = {}
+            quick_mode = bool(payload.get("quick_mode")) if isinstance(payload, dict) else False
+            active = status in {"dispatched", "running"}
+            if quick_mode and status == "queued":
+                metrics["quickmode_queued"] += 1
+            elif quick_mode and active:
+                metrics["quickmode_active"] += 1
+            elif quick_mode and status == "paused":
+                metrics["quickmode_paused"] += 1
+
+            queued_at = str(row["queued_at"] or row["created_at"] or "")
+            admitted_at = str(row["admitted_at"] or "")
+            if admitted_at and queued_at and admitted_at >= window_start:
+                wait = _elapsed_between(queued_at, admitted_at)
+                queue_wait_samples.append(wait)
+                metrics.setdefault("_queue_wait_samples", []).append(wait)
+
+            observability = progress.get("observability") if isinstance(progress, dict) else {}
+            observability = observability if isinstance(observability, dict) else {}
+            last_seen = str(
+                observability.get("last_event_at")
+                or progress.get("worker_heartbeat_at")
+                or progress.get("worker_output_at")
+                or (row["updated_at"] if active else "")
+            )
+            if last_seen and (
+                not metrics["last_seen_at"] or last_seen > metrics["last_seen_at"]
+            ):
+                metrics["last_seen_at"] = last_seen
+
+            latency = observability.get("event_latency")
+            if isinstance(latency, dict):
+                count = int(latency.get("count") or 0)
+                total = float(latency.get("total_ms") or 0.0)
+                metrics["event_latency"]["count"] += count
+                metrics["event_latency"]["_total_ms"] = (
+                    float(metrics["event_latency"].get("_total_ms") or 0.0) + total
+                )
+                latency_count += count
+                latency_total += total
+
+            durations = observability.get("phase_durations_seconds")
+            if isinstance(durations, dict):
+                for phase, seconds in durations.items():
+                    if isinstance(seconds, (int, float)) and seconds >= 0:
+                        metrics["phase_seconds"][str(phase)] = (
+                            float(metrics["phase_seconds"].get(str(phase), 0.0))
+                            + float(seconds)
+                        )
+                        phase_totals[str(phase)] = phase_totals.get(str(phase), 0.0) + float(seconds)
+            current_phase = str(observability.get("phase") or "")
+            current_seconds = observability.get("phase_elapsed_seconds")
+            if (
+                current_phase
+                and not JobStatus(status).terminal
+                and isinstance(current_seconds, (int, float))
+                and current_seconds > 0
+            ):
+                metrics["phase_seconds"][current_phase] = (
+                    float(metrics["phase_seconds"].get(current_phase, 0.0))
+                    + float(current_seconds)
+                )
+                phase_totals[current_phase] = phase_totals.get(current_phase, 0.0) + float(current_seconds)
+
+        for metrics in workers.values():
+            samples = metrics.pop("_queue_wait_samples", [])
+            if samples:
+                metrics["average_queue_wait_seconds"] = round(sum(samples) / len(samples), 3)
+            latency = metrics["event_latency"]
+            total = float(latency.pop("_total_ms", 0.0))
+            latency["average_ms"] = round(total / latency["count"], 3) if latency["count"] else None
+            metrics["phase_seconds"] = {
+                phase: round(seconds, 3)
+                for phase, seconds in metrics["phase_seconds"].items()
+            }
+
+        return {
+            "measured_at": current_time.isoformat(),
+            "window_hours": 24,
+            "queued_jobs": sum(item["queued_jobs"] for item in workers.values()),
+            "dispatched_jobs": sum(item["dispatched_jobs"] for item in workers.values()),
+            "running_jobs": sum(item["running_jobs"] for item in workers.values()),
+            "paused_jobs": sum(item["paused_jobs"] for item in workers.values()),
+            "average_queue_wait_seconds": round(
+                sum(queue_wait_samples) / len(queue_wait_samples), 3
+            ) if queue_wait_samples else None,
+            "event_latency": {
+                "count": latency_count,
+                "average_ms": round(latency_total / latency_count, 3)
+                if latency_count
+                else None,
+            },
+            "phase_seconds": {
+                phase: round(seconds, 3) for phase, seconds in phase_totals.items()
+            },
+            "workers": [workers[name] for name in sorted(workers)],
+        }
 
     def list(
         self,

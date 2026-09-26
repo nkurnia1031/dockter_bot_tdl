@@ -1,11 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, post, put } from '$lib/api';
+  import { api, post, put, remove } from '$lib/api';
   import { session } from '$lib/session.svelte';
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
-  import { CheckCircle2, Clock3, Download, FileDown, FolderOpen, Gauge, Image, Plus, RefreshCw, ShieldCheck, Upload, XCircle, Zap } from '@lucide/svelte';
+  import { CheckCircle2, Clock3, Download, FileDown, FolderOpen, Gauge, Image, Plus, RefreshCw, ShieldCheck, Trash2, Upload, XCircle, Zap } from '@lucide/svelte';
 
   type Job = Record<string, any>;
   type Stage = Record<string, any>;
@@ -247,6 +247,33 @@
     }
   }
 
+  async function deleteStage(item: Stage) {
+    if (findActiveJobForStage(item)) {
+      message = 'Folder staging tidak bisa dihapus selama job masih aktif atau mengantre.';
+      return;
+    }
+    const folderName = String(item.folder_name || item.stage_job_id);
+    if (!window.confirm(
+      `Hapus folder staging Quick Mode "${folderName}" di worker ${item.worker}?\n\nSemua isinya, termasuk quickmode.json, worker.log, media, archive, dan sesi .tdl, akan dihapus permanen. Riwayat job tetap disimpan.`
+    )) return;
+
+    const actionKey = `${item.worker}:${item.stage_job_id}`;
+    stageAction = actionKey;
+    try {
+      const result = await remove<{ deleted?: boolean }>(
+        `/quick-mode/staging/${encodeURIComponent(item.worker)}/${encodeURIComponent(item.stage_job_id)}`
+      );
+      message = result.deleted
+        ? `Folder staging "${folderName}" berhasil dihapus.`
+        : `Folder staging "${folderName}" sudah tidak ada.`;
+      await loadStaging();
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Folder staging Quick Mode gagal dihapus.';
+    } finally {
+      stageAction = null;
+    }
+  }
+
   function choose(value: string) {
     selected = value;
     const found = sources.find((source) => source.chat_ref === value);
@@ -482,6 +509,9 @@
             {:else}
               <button class="button secondary !py-1.5 !px-3 text-xs" onclick={() => recoverStage(item, targetAction.phase)} disabled={stageAction === actionKey}>
                 <ActionIcon size={15}/>{targetAction.label}
+              </button>
+              <button class="button danger !py-1.5 !px-3 text-xs" onclick={() => deleteStage(item)} disabled={stageAction === actionKey} aria-label="Hapus staging">
+                <Trash2 size={15}/>Hapus
               </button>
             {/if}
           </div>

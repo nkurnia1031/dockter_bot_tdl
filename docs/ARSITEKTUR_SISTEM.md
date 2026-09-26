@@ -1,230 +1,254 @@
 # Arsitektur Sistem tme3bot
 
-Panduan ini menjelaskan susunan komponen, batas tanggung jawab, aliran job,
-penyimpanan, keamanan, dan deployment tme3bot untuk maintainer dan developer.
+Dokumen ini menjelaskan bagian utama tme3bot, alur job, data yang disimpan,
+serta pengembangan yang disarankan. Peta ini diperiksa terhadap source dan
+perubahan working tree pada 27 September 2026. Jika dokumen dan source berbeda,
+ikuti source.
 
-Peta komponen diverifikasi terhadap source pada branch `main` dan worktree
-tanggal 26 September 2026. Prioritas kendali concurrency Quick Mode dan pemisahan
-modul fitur sudah diterapkan pada source kerja. Source code adalah acuan utama
-jika perilaku implementasi berubah.
+## Ringkasan
 
-## Gambaran sistem
+tme3bot punya tiga bagian utama: antarmuka, backend, dan worker. Web dan bot
+Telegram mengirim permintaan ke backend. Backend memeriksa akses, menyimpan
+job, lalu memilih worker. Worker menjalankan tugas dan mengirim status serta
+progress kembali ke backend.
 
-tme3bot memisahkan antarmuka, control plane, dan eksekusi job. Web dan bot
-Telegram meminta operasi melalui backend. Backend memvalidasi actor dan target,
-menyimpan lifecycle job, lalu mengirim command JSON ke worker yang dipilih.
-Worker menjalankan operasi pada sesi dan filesystem miliknya, kemudian
-mengirim event progress kembali ke backend.
+Web dipasang sebagai file statis di aaPanel. Backend dan worker berjalan di
+Docker. Worker lokal berjalan bersama backend di VPS gateway; worker lain dapat
+berjalan di VPS terpisah.
+
+## Bagian sistem
 
 ```mermaid
 flowchart LR
   Browser[Browser]
   Web["Web statis<br/>SvelteKit"]
   Telegram[Telegram Bot API]
-  TGApp["Frontend Telegram<br/>APP_ROLE=telegram"]
-  Backend["Backend FastAPI<br/>APP_ROLE=backend"]
-  DB[(SQLite /data/storage.db)]
-  State[(State dan konfigurasi JSON)]
-  Local["Worker lokal<br/>APP_ROLE=worker"]
-  Remote["Worker remote<br/>APP_ROLE=worker"]
-  TDL[Telegram dan sesi TDL]
-  Drive[Google Drive melalui rclone]
+  TGApp["Aplikasi bot Telegram"]
+  Backend["Backend API<br/>FastAPI"]
+  DB[("SQLite<br/>/data/storage.db")]
+  JSON[("File konfigurasi<br/>JSON di /data")]
+  Local["Worker lokal"]
+  Remote["Worker remote"]
+  TDL["Telegram dan sesi TDL"]
+  Drive["Google Drive<br/>melalui rclone"]
 
   Browser --> Web
   Web -->|HTTPS /api/v1| Backend
   Telegram <--> TGApp
   TGApp -->|BackendApiClient| Backend
   Backend --> DB
-  Backend --> State
-  Backend -->|command JSON /internal/v1| Local
-  Backend -->|command JSON /internal/v1| Remote
+  Backend --> JSON
+  Backend -->|command /internal/v1| Local
+  Backend -->|command /internal/v1| Remote
   Local --> TDL
   Remote --> TDL
   Local --> Drive
   Remote --> Drive
-  Local -. event job .-> Backend
-  Remote -. event job .-> Backend
+  Local -. event progress .-> Backend
+  Remote -. event progress .-> Backend
 ```
 
-Web dibangun sebagai aset statis dan dilayani terpisah dari container backend.
-Di production, release Web dipasang ke document root aaPanel. Tidak ada Node.js
-runtime atau container Web di VPS tersebut.
+| Bagian | Tugas utama | Source utama |
+|---|---|---|
+| Web | Menampilkan Quick Mode, export, download, storage, utility, worker, dan activity. | `web/src/` |
+| Bot Telegram | Menangani pesan, tombol, dan input Telegram. Data job tetap diminta dari backend. | `tme3bot/frontend/telegram/` |
+| Backend API | Memeriksa user dan target, menyediakan API, menyimpan job, dan memilih worker. | `tme3bot/api/` |
+| Control plane | Mengatur antrean, lifecycle job, retry, pause/resume, dispatch, dan event. | `tme3bot/application/control_plane.py` |
+| Domain | Menyimpan model job, actor, event, status, dan aturan perubahan status. | `tme3bot/domain/` |
+| Infrastructure | Menghubungkan aplikasi ke SQLite, autentikasi, dan API worker. | `tme3bot/infrastructure/` |
+| Worker | Menjalankan export, download, Quick Mode, utility, storage, backup, dan workspace. | `tme3bot/worker/` |
+| Runtime | Membuka sesi per profile dan menjalankan TDL, rclone, serta utility. | `profiles.py`, `service.py`, `tdl.py`, `rclone.py`, `utility.py` |
 
-## Komponen dan tanggung jawab
+`app.py` dan `composition.py` menyusun dependency sesuai role aplikasi:
+`backend`, `telegram`, atau `worker`. Worker tidak bergantung pada tampilan Web
+atau Telegram.
 
-| Komponen | Tanggung jawab |
-|---|---|
-| Web (`web/src`) | Halaman SvelteKit untuk Quick Mode, export, download, storage, utility, worker, dan activity. `lib/api.ts` memanggil public API backend. |
-| Frontend Telegram (`tme3bot/frontend/telegram`) | Polling Bot API, keyboard, panel, input user, dan penyajian status. Akses domain dilakukan melalui `BackendApiClient`. |
-| Backend API (`tme3bot/api/backend.py`, `tme3bot/api/routes/`) | Factory, middleware, autentikasi, dan registrasi route per fitur untuk job, source, download, utility, worker, storage, dan backup. |
-| Control plane (`tme3bot/application/control_plane.py`) | Use case job, lifecycle, retry/cancel, admission resource, dispatch ke worker, serta pemrosesan event. |
-| Domain (`tme3bot/domain`) | Model actor/job/event, error domain, status, dan aturan transisi job. |
-| Infrastructure (`tme3bot/infrastructure`) | Repository SQLite, auth, dan adapter HTTP untuk komunikasi dengan worker. |
-| Worker (`tme3bot/worker`) | API internal, antrean resource lokal, lifecycle executor, progress/event publisher, dan mixin operasi Quick Mode, download, utility, storage, backup, serta workspace tanpa dependency UI Telegram. |
-| Runtime dan service | `profiles.py` membangun runtime sesi per profile; `service.py`, `tdl.py`, `utility.py`, `rclone.py`, dan modul terkait mengerjakan operasi spesifik. |
-| Composition (`tme3bot/app.py`, `tme3bot/composition.py`) | Memilih dan menyambungkan dependency untuk role `backend`, `telegram`, atau `worker`. |
-
-Alur utama pembuatan job:
+## Alur job
 
 ```mermaid
 sequenceDiagram
   participant UI as Web atau Telegram
   participant API as Backend API
-  participant CP as ControlPlane
-  participant Store as SQLite Job Repository
-  participant Worker as Worker API dan executor
+  participant CP as Control plane
+  participant DB as SQLite
+  participant W as Worker
 
-  UI->>API: Submit operasi
-  API->>CP: Validasi actor, profile, worker, payload
-  CP->>Store: Simpan job queued dan execution plan
-  CP->>Store: Admission resource dan posisi antrean
-  alt Resource tersedia
-    CP->>Worker: Kirim command JSON
-    Worker-->>API: Event dispatched/running/progress/terminal
-    API->>Store: Validasi sequence dan simpan event
-  else Resource sedang dipakai
-    CP-->>UI: Job tetap queued dengan posisi antrean
-  end
-  UI->>API: Poll job dan events
-  API-->>UI: Status serta progress tersimpan
+  UI->>API: Minta operasi
+  API->>CP: Periksa akses, target, dan data
+  CP->>DB: Simpan job dan aturan resource
+  CP->>W: Kirim command JSON saat slot tersedia
+  W-->>API: Kirim event status dan progress
+  API->>DB: Periksa event dan simpan progress
+  UI->>API: Minta status terbaru
+  API-->>UI: Berikan status job
 ```
 
-Job memiliki status `queued`, `dispatched`, `running`, lalu status terminal
-`succeeded`, `failed`, atau `cancelled`. Backend merupakan sumber kebenaran
-untuk status yang dibaca UI. Worker menerbitkan event idempotent dengan pasangan
-`job_id + sequence`; UI melakukan polling public API, bukan membaca worker
-langsung.
+Status job yang disimpan backend adalah sumber status untuk UI. Job biasanya
+bergerak dari `queued` ke `dispatched`, lalu `running`, dan berakhir sebagai
+`succeeded`, `failed`, atau `cancelled`. UI membaca status dari backend; UI
+tidak membaca database worker.
 
-Admission berjalan pada dua lapisan: backend menyimpan execution plan dan
-resource lease lintas worker, sedangkan worker menjalankan `ResourceAwareQueue`
-untuk konflik resource di proses worker tersebut. Resource key digunakan untuk
-menserialkan akses yang berbagi sesi TDL, artifact, atau area workspace. Job
-menyimpan profile dan worker asal saat dibuat; perubahan route hanya berpengaruh
-pada job baru.
+Setiap event membawa `job_id` dan nomor `sequence`. Backend menolak nomor lama
+atau event dari worker yang tidak sesuai dengan worker pemilik job. Worker juga
+mengirim waktu kirim event agar backend dapat mengukur keterlambatan progress.
 
-## Data, sesi, dan batas keamanan
+## Antrean dan kerja bersamaan
 
-| Data | Lokasi / pemilik | Catatan |
+Backend menyimpan rencana eksekusi dan mengatur slot lintas worker. Di worker,
+`ResourceAwareQueue` menjalankan beberapa job sekaligus jika job itu tidak
+memakai resource yang sama. Resource dapat berupa sesi TDL, profile, folder,
+atau folder staging.
+
+Aturan yang berlaku:
+
+- Download untuk profile dan worker asal yang sama berjalan berurutan. Asal
+  yang berbeda dapat berjalan bersamaan.
+- Utility untuk folder yang sama berjalan berurutan. Folder yang berbeda dapat
+  berjalan bersamaan.
+- Export memakai lane profile-worker. Quick Mode punya batas job aktif per
+  worker yang dapat diatur dari Quick Mode Manager.
+- Storage upload berjalan berurutan pada worker yang sama.
+- Jangan membuka database sesi `.tdl` yang sama dari dua proses bersamaan.
+- Job tetap terikat pada profile dan worker saat dibuat. Mengubah route hanya
+  berpengaruh pada job baru.
+
+Quick Mode secara default membatasi dua job aktif per worker. Batas dapat
+diubah dari 1 sampai 32. Job profile berbeda boleh memakai slot worker yang
+tersedia. Pause menghentikan proses job dan melepas slot concurrency, tetapi
+resource eksklusif yang masih dibutuhkan job tetap ditahan. Resume memasukkan
+job kembali ke antrean dan melanjutkan dari staging yang sama.
+
+## Quick Mode dan folder staging
+
+Setiap rangkaian Quick Mode memakai foldernya sendiri di worker:
+
+```text
+/workspace/quickmode/<stage_job_id>/
+```
+
+Folder dapat berisi JSON export, media, thumbnail, archive, `quickmode.json`,
+`worker.log`, dan sesi `.tdl` khusus stage tersebut. Manifest menyimpan data
+yang dibutuhkan untuk melanjutkan job setelah gagal atau di-retry.
+
+Alur Quick Mode adalah export, download media, buat thumbnail, kompres, upload
+ke Telegram dan Google Drive, lalu verifikasi. Jika job gagal atau upload belum
+lolos verifikasi, folder staging dipertahankan untuk diagnosis dan recovery.
+Job yang berstatus terminal tidak otomatis berarti foldernya aman dihapus.
+
+Quick Mode Manager dapat memindai folder di setiap worker dan menjalankan
+recovery. Operator juga dapat menghapus folder staging yang tidak sedang dipakai
+job, antrean, atau verifikasi. Penghapusan ini menghapus semua file fisik,
+termasuk `quickmode.json`, `worker.log`, media, archive, dan sesi `.tdl`. Riwayat
+job di backend tetap ada.
+
+API utama Quick Mode:
+
+- `GET /api/v1/quick-mode/staging` memindai folder staging.
+- `POST /api/v1/quick-mode/recover` memasukkan staging kembali ke antrean.
+- `DELETE /api/v1/quick-mode/staging/{worker}/{stage_job_id}` menghapus folder
+  staging yang tidak aktif.
+- `GET /api/v1/quick-mode/limits` membaca batas job aktif; `PUT
+  /api/v1/quick-mode/limits/{worker}` mengubah batas untuk satu worker.
+- `GET /api/v1/jobs/metrics` memberi ringkasan antrean dan status worker.
+
+## Data dan keamanan
+
+| Data | Disimpan di | Catatan |
 |---|---|---|
-| Job, events, execution plan, command internal, auth, dan katalog storage/export | SQLite backend di `/data/storage.db` | Repository job dan katalog dibangun dari file database yang sama. Payload public dirahasiakan sesuai jenis job. |
-| State profile, source, dan konfigurasi operasional | File JSON di volume `/data` | Termasuk identity, registry worker (`workers.json`), route profile-worker, label, folder utility, dan settings. Credential tetap berada di konfigurasi runtime; jangan salin nilainya ke log atau dokumen. |
-| Sesi TDL | Volume `/data` milik setiap worker, per profile | `user1` dipakai jalur export/leave dan `root` untuk download. Sesi tidak disalin lintas VPS. |
-| Workspace | Host mount `/workspace` pada worker | Dipakai utility dan Quick Mode; filesystem worker yang dipilih menentukan workspace yang dikerjakan. |
-| Staging Quick Mode | `/workspace/quickmode/<stage_job_id>/` pada worker | Manifest `quickmode.json` dan `worker.log` menyertai JSON/media, thumbnail, serta archive agar retry/recovery dapat melanjutkan pekerjaan. |
+| Job, event, antrean, autentikasi, katalog export dan storage | SQLite backend, `/data/storage.db` | Menyimpan lifecycle job dan progress yang dibaca UI. |
+| Identity, profile, source, route worker, label, dan pengaturan | File JSON di `/data` | Credential dan token tidak boleh ditulis ke log atau dikirim ke Web. |
+| Sesi TDL | Volume `/data` pada masing-masing worker | `user1` untuk export/leave; `root` untuk download. Sesi tidak disalin ke worker lain. |
+| File kerja dan staging | Workspace worker, `/workspace` | Operasi berjalan pada filesystem worker yang dipilih. |
 
-Quick Mode menggunakan sesi `.tdl` terisolasi per stage. Pipeline-nya mencakup
-export JSON, download media, pembuatan thumbnail, kompresi, upload ke channel
-storage, upload archive ke Google Drive melalui rclone, verifikasi, lalu cleanup.
-Jika terjadi kegagalan atau upload belum terverifikasi, staging dipertahankan
-untuk diagnosis dan recovery. Job terminal sendiri bukan alasan untuk menghapus
-staging.
+Backend menentukan profile dari identity user dan memeriksa hak akses setiap
+permintaan. Browser menggunakan sesi Web untuk API publik. Backend dan worker
+memakai bearer token internal; token itu tidak pernah dikirim ke browser.
 
-Batas kepercayaan utama:
+Worker hanya menerima operasi folder yang divalidasi sebagai bagian dari
+`/workspace`. Backend menjadi tempat pengambilan source dan status bersama.
+Jangan membaca file sesi `.tdl`, token, password utility, atau file environment
+ke dalam log maupun dokumentasi.
 
-- Browser memakai sesi autentikasi Web untuk public API; user dan profile
-  diverifikasi di backend.
-- Frontend Telegram hanya menjadi adapter Bot API dan meneruskan operasi domain
-  ke backend melalui client internalnya.
-- Backend dan worker berkomunikasi melalui `/internal/v1` dengan bearer token
-  internal. Token worker dan internal tidak boleh dikirim ke browser.
-- Worker mengelola sesi TDL dan filesystem lokalnya sendiri. Jangan membuka
-  database Bolt sesi `.tdl` yang sama dari proses bersamaan.
-- Endpoint management memakai credential terpisah. Password utility, cookie
-  secret, token, file konfigurasi rahasia, dan isi sesi tidak boleh masuk ke
-  telemetry maupun response public.
+## Komunikasi backend dan worker
 
-## Deployment dan pengembangan
+Worker mengiklankan versi API serta daftar kemampuan di
+`GET /internal/v1/capabilities`. Backend memeriksa kemampuan itu sebelum
+mengirim operasi yang membutuhkannya. Contohnya, worker lama yang belum
+mendukung hapus staging ditolak dengan error kompatibilitas yang jelas.
+
+Command dikirim sebagai JSON melalui `/internal/v1`. Event job dikirim kembali
+ke backend melalui API internal. Contract test menjaga bentuk command, nomor
+event, dan pemeriksaan versi/kemampuan worker.
+
+## Deployment dan source map
 
 ```mermaid
 flowchart TB
   Actions[GitHub Actions]
-  GHCR[GHCR: base, gateway, worker images]
-  Gateway["VPS gateway<br/>backend + telegram + worker-local"]
-  Worker1[VPS worker remote]
-  AaPanel["aaPanel document root<br/>Web statis"]
-  Release[Web release]
+  Images["Image Docker di GHCR"]
+  Gateway["VPS gateway<br/>backend + bot Telegram + worker lokal"]
+  Remote["VPS worker tambahan"]
+  Release[Web release statis]
+  AaPanel["Document root aaPanel"]
 
-  Actions --> GHCR
-  GHCR --> Gateway
-  GHCR --> Worker1
-  Actions --> Release
-  Release --> AaPanel
-  AaPanel -->|public API| Gateway
-  Gateway <-->|internal job/event API| Worker1
+  Actions --> Images
+  Images --> Gateway
+  Images --> Remote
+  Actions --> Release --> AaPanel
+  AaPanel -->|API publik| Gateway
+  Gateway <-->|command dan event| Remote
 ```
 
-Image base, gateway, dan worker dipublish oleh workflow Docker ke GHCR.
-Gateway menjalankan backend, frontend Telegram, dan worker lokal; setiap VPS
-tambahan menjalankan worker sendiri. Web dipublish sebagai release statis dan
-dideploy terpisah. Langkah deployment serta rollback rinci ada di
+Web tidak membutuhkan Node.js atau container Web saat berjalan di production.
+Web dipasang terpisah ke aaPanel. Gateway dan worker memakai image Docker dari
+GHCR. Cara deploy dan rollback ada di
 [`DEPLOYMENT_RUNBOOK.md`](../DEPLOYMENT_RUNBOOK.md).
 
-Untuk perubahan backend/worker, batas yang paling penting dijaga adalah worker
-tidak mengimpor UI Telegram/FastAPI, dan frontend Telegram tidak mengakses
-runtime domain secara langsung. Test batas arsitektur tersedia di
-`tests/test_architecture_boundaries.py`; test domain, API, worker, dan UI
-berada di direktori `tests/` serta `web/src`.
+Untuk menelusuri source:
 
-## Rekomendasi perbaikan
+- Role dan dependency: `tme3bot/app.py`, `tme3bot/composition.py`.
+- Job, antrean, dan lifecycle: `tme3bot/application/control_plane.py`,
+  `tme3bot/application/job_scheduler.py`, `tme3bot/infrastructure/job_store.py`.
+- Public API: `tme3bot/api/backend.py`, `tme3bot/api/routes/`.
+- Worker API dan eksekusi: `tme3bot/api/worker.py`,
+  `tme3bot/worker/executor.py`, `tme3bot/worker/executor_*.py`.
+- API Web: `web/src/lib/api.ts`; UI Quick Mode:
+  `web/src/lib/components/QuickModePage.svelte`.
+- Batas arsitektur: `tests/test_architecture_boundaries.py`.
 
-Prioritas 1 dan 2 di bawah sudah diterapkan pada source. Prioritas 3 dan 4 tetap
-menjadi rekomendasi untuk pekerjaan berikutnya.
+## Yang sudah diterapkan
 
-### Prioritas 1 — Kendali concurrency Quick Mode
+1. Quick Mode punya batas kerja bersamaan per worker, antrean, Pause, dan
+   Resume.
+2. Backend API dan executor worker sudah dipisah ke route dan modul fitur.
+3. Backend dan worker memakai versi serta daftar kemampuan API internal.
+4. Monitor menampilkan antrean, waktu tunggu, status worker, latency event, dan
+   durasi fase job.
+5. Quick Mode Manager dapat menghapus staging yang tidak aktif dengan
+   konfirmasi. Penghapusan folder tidak menghapus riwayat job.
 
-Quick Mode memiliki batas aktif yang dapat diatur per worker, dengan default 2
-dan rentang 1–32. Urutan antrean mengikuti waktu submit/Resume. FIFO dijaga
-dalam profile yang sama; job profile lain boleh memakai slot worker yang masih
-kosong saat job sebelumnya tertahan oleh resource profile-nya. Dengan begitu,
-download dari profile berbeda pada worker yang sama dapat berjalan bersamaan,
-selama total job aktif tidak melewati kuota worker. Monitor menampilkan kuota
-worker dan menyediakan Pause/Resume pada setiap job.
+## Rekomendasi berikutnya
 
-Pause membekukan process group yang sedang dipakai job, mempertahankan heartbeat
-worker dan mengecualikan waktu jeda dari watchdog stall. Pause melepas slot
-concurrency, tetapi mempertahankan resource lease agar job lain tidak memakai
-sesi atau folder eksklusif yang masih ditahan. Jika worker restart, Resume
-mengirim ulang job dengan stage ID yang sama dan meminta recovery otomatis dari
-manifest Quick Mode.
+### 1. Simpan audit penghapusan staging
 
-### Prioritas 2 — Pecah modul orkestrasi besar
+Saat ini folder fisik dapat dihapus, tetapi riwayat job tidak mencatat siapa
+yang menghapus staging dan kapan. Simpan audit berisi actor, worker, stage ID,
+waktu, dan hasil penghapusan. Ini akan membantu menjawab pertanyaan “mengapa
+folder recovery sudah tidak ada?” tanpa menyimpan isi file yang dihapus.
 
-`tme3bot/api/backend.py` kini menjadi factory/middleware/auth dan composition
-root route. Route fitur berada pada `tme3bot/api/routes/` dalam modul `jobs`,
-`sources`, `downloads`, `utility`, `workers`, `storage`, dan `backups`.
+### 2. Perkuat recovery setelah worker restart
 
-`tme3bot/worker/executor.py` mengoordinasikan antrean, lifecycle job, pause,
-telemetry, dan dispatch handler. Operasi Quick Mode, download/artifact, utility,
-storage, backup, dan workspace berada pada mixin fitur masing-masing di
-`tme3bot/worker/executor_*.py`; logging dan event bersama berada di
-`executor_support.py`. `WorkerJobExecutor` tetap menjadi facade yang dipakai
-composition. Kontrak route API dan payload job worker tidak berubah. Test API,
-worker, dan batas arsitektur menjaga perilaku serta pemisahan tanggung jawab.
+Job dan payload tersimpan di SQLite backend, tetapi antrean lokal worker berada
+di memori proses. Backend membatalkan job aktif yang lama tidak mengirim progress;
+belum ada proses umum untuk mengirim ulang command yang mungkin hilang saat
+worker restart. Tambahkan lease dispatch dan rekonsiliasi: backend dapat
+membedakan job yang masih berjalan dari job yang belum diterima worker, lalu
+mengirim ulang command secara aman dengan ID job yang sama.
 
-### Prioritas 3 — Kontrak backend-worker
+### 3. Pantau kapasitas worker dan staging
 
-Job JSON, event sequence, cancellation, capability, dan response internal adalah
-kontrak lintas proses sekaligus lintas release. Tambahkan contract test untuk
-payload dan event utama, lalu formalkan pemeriksaan capability/kompatibilitas
-saat worker didaftarkan atau backend mengirim job. Ini mengurangi risiko deploy
-backend dan worker dengan kontrak yang berbeda.
-
-### Prioritas 4 — Observabilitas antrean dan progress
-
-Catat dan tampilkan waktu tunggu antrean, job aktif per worker, durasi per fase,
-latensi event, serta status worker. Kaitkan semua metrik dengan `job_id` dan
-stage ID tanpa memasukkan credential. Pemeriksaan progress perlu memastikan
-callback transfer hanya memperbarui job pemilik transfer, terutama saat beberapa
-Quick Mode berlangsung bersamaan.
-
-## Peta source untuk mulai menelusuri
-
-- Composition dan role runtime: `tme3bot/app.py`, `tme3bot/composition.py`.
-- Lifecycle, admission, dispatch, dan event job:
-  `tme3bot/application/control_plane.py`,
-  `tme3bot/application/job_scheduler.py`,
-  `tme3bot/infrastructure/job_store.py`.
-- API worker dan eksekusi job: `tme3bot/api/worker.py`,
-  `tme3bot/worker/executor.py`, serta modul fitur `tme3bot/worker/executor_*.py`.
-- Kontrak domain dan integrasi frontend: `tme3bot/domain/models.py`,
-  `tme3bot/api/routes/`, `tme3bot/frontend/client.py`, `web/src/lib/api.ts`.
+Monitor sekarang menjelaskan antrean dan ketepatan progress job. Tambahkan
+penggunaan CPU, memori, ruang disk workspace, dan ukuran staging per worker.
+Berikan peringatan untuk worker yang lama tidak merespons, antrean yang terlalu
+lama, serta workspace yang hampir penuh. Ini akan membantu mencegah beban CPU
+berlebih dan kegagalan karena disk penuh.

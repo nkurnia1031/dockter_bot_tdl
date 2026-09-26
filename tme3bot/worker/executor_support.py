@@ -343,8 +343,13 @@ class WorkerEventPublisher:
         self.backend_url = backend_url
         self.token = token
         self._sequences: dict[str, int] = {}
+        self._workers: dict[str, str] = {}
         self._audit_callbacks: dict[str, Callable[[str], None]] = {}
         self._lock = threading.RLock()
+
+    def bind_job_worker(self, job_id: str, worker: str) -> None:
+        with self._lock:
+            self._workers[str(job_id)] = str(worker)
 
     def register_audit_callback(
         self, job_id: str, callback: Callable[[str], None]
@@ -383,15 +388,19 @@ class WorkerEventPublisher:
         with self._lock:
             sequence = self._sequences.get(job_id, 1) + 1
             self._sequences[job_id] = sequence
+            worker = self._workers.get(job_id)
         payload = {
             "sequence": sequence,
             "status": status,
             "event_type": event_type,
+            "sent_at": utc_now().isoformat(),
             "transient": transient,
             "progress": json_value(progress or {}),
             "result": json_value(result) if result is not None else None,
             "error": json_value(error) if error is not None else None,
         }
+        if worker:
+            payload["worker"] = worker
         last_error: Exception | None = None
         attempts = max(1, int(max_attempts))
         timeout = max(0.5, float(timeout_seconds))
@@ -469,4 +478,5 @@ class WorkerEventPublisher:
     def forget(self, job_id: str) -> None:
         with self._lock:
             self._sequences.pop(job_id, None)
+            self._workers.pop(job_id, None)
             self._audit_callbacks.pop(job_id, None)

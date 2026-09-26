@@ -50,6 +50,28 @@ describe('JobTable', () => {
     expect(screen.queryByText('History terbaru')).toBeNull();
   });
 
+  it('shows queue latency and worker activity from monitor metrics', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs/metrics?')) {
+        return new Response(JSON.stringify({
+          active_jobs: 1,
+          queued_jobs: 2,
+          average_queue_wait_seconds: 8,
+          event_latency: { count: 12, average_ms: 34.6 },
+          workers: [{ worker: 'remote-1', status: 'busy', active_jobs: 1, queued_jobs: 2, last_seen_age_seconds: 4 }]
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [{ id: 'active-1', kind: 'export', status: 'running', profile: 'default', worker: 'remote-1', payload: {}, progress: { phase: 'downloading' } }] }), { status: 200 });
+    }));
+
+    render(JobTable, { scope: 'global', view: 'active' });
+
+    expect(await screen.findByText('8 dtk')).toBeTruthy();
+    expect(screen.getByText('35 ms · 12 event')).toBeTruthy();
+    expect(screen.getByText('remote-1 · sibuk · 1 aktif · 2 antre')).toBeTruthy();
+  });
+
   it('pauses and resumes Quick Mode jobs from the active monitor', async () => {
     const calls: { url: string; method?: string }[] = [];
     const job = {

@@ -98,6 +98,31 @@ def quick_stage_root(workspace: Path, stage_job_id: str) -> Path:
     return root
 
 
+def delete_quick_stage(workspace: Path, stage_job_id: str) -> bool:
+    """Delete one visible Quick Mode stage without following directory links."""
+    stage_id = str(stage_job_id).strip()
+    workspace_root = Path(workspace).resolve()
+    stage_root = quick_stage_root(workspace_root, stage_id)
+    quickmode_root = workspace_root / "quickmode"
+    if quickmode_root.is_symlink():
+        raise QuickModeError("Folder root staging Quick Mode tidak boleh berupa symlink.")
+    if quickmode_root.exists() and not quickmode_root.is_dir():
+        raise QuickModeError("Root staging Quick Mode bukan folder.")
+
+    raw_stage = quickmode_root / stage_id
+    if raw_stage.is_symlink():
+        raise QuickModeError("Folder staging Quick Mode tidak boleh berupa symlink.")
+
+    expected_parent = quickmode_root.resolve()
+    if stage_root.parent != expected_parent or stage_root.name != stage_id:
+        raise QuickModeError("Folder staging Quick Mode tidak sesuai dengan ID.")
+    if not stage_root.is_dir():
+        return False
+
+    shutil.rmtree(stage_root)
+    return True
+
+
 def migrate_legacy_quick_stage(workspace: Path, stage_job_id: str) -> Path:
     """Move the old hidden staging tree into the admin-visible location."""
     target = quick_stage_root(workspace, stage_job_id)

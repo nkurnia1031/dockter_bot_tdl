@@ -63,4 +63,38 @@ describe('JobProgressCard', () => {
     await fireEvent.click(toggleBtn);
     expect(screen.queryByText('Detail Progress Job')).toBeNull();
   });
+
+  it('shows queue wait, phase age, event latency and accumulated phase time', async () => {
+    render(JobProgressCard, {
+      job: {
+        id: 'quick-observe-1',
+        kind: 'export',
+        status: 'running',
+        profile: 'default',
+        worker: 'local',
+        created_at: new Date().toISOString(),
+        payload: { quick_mode: true },
+        progress: {
+          phase: 'compressing',
+          timing: { queue_wait_seconds: 4 },
+          observability: {
+            phase: 'compressing',
+            phase_started_at: new Date(Date.now() - 6000).toISOString(),
+            phase_elapsed_seconds: 6,
+            event_latency: { count: 3, average_ms: 28.4 },
+            phase_durations_seconds: { downloading: 12 }
+          }
+        }
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn()
+    });
+
+    expect(screen.getByText('Antre 4 dtk')).toBeTruthy();
+    expect(screen.getByText('Latensi event 28 ms')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: /toggle detail progress/i }));
+    expect(screen.getByText('Durasi per fase')).toBeTruthy();
+    expect(screen.getByText('Mendownload media · 12 dtk')).toBeTruthy();
+  });
 });

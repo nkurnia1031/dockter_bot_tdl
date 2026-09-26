@@ -429,6 +429,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if callable(checker):
             try:
                 capabilities = checker(selected_worker) or {}
+            except DomainError as exc:
+                if exc.code == "WORKER_INCOMPATIBLE":
+                    raise
+                raise DomainError(
+                    "WORKER_OFFLINE",
+                    f"Worker {selected_worker} tidak dapat diverifikasi: {exc}",
+                    status_code=503,
+                ) from exc
             except Exception as exc:
                 raise DomainError(
                     "WORKER_OFFLINE",

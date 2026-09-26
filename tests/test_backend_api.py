@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -43,6 +44,7 @@ class FakeDispatcher:
         self.storage_available = True
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
+        self.quick_deletions = []
 
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
@@ -83,6 +85,10 @@ class FakeDispatcher:
             "drive_found": 2,
             "staging_cleaned": True,
         }
+
+    def quickmode_delete(self, worker, stage_job_id):
+        self.quick_deletions.append((worker, stage_job_id))
+        return {"stage_job_id": stage_job_id, "deleted": True}
 
 
 class FakeWorkers:
@@ -427,6 +433,86 @@ class BackendApiTests(unittest.TestCase):
         self.assertTrue(response.json()["verified"])
         self.assertEqual(response.json()["profile"], "archive")
         self.assertEqual(response.json()["worker"], "local")
+
+    def test_job_metrics_include_worker_activity_and_queue_wait(self):
+        headers = self.login()
+        for message_id in (20, 21):
+            self.client.post(
+                "/api/v1/exports",
+                headers=headers,
+                json={"url": f"https://t.me/c/123/{message_id}"},
+            )
+
+        response = self.client.get("/api/v1/jobs/metrics", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        metrics = response.json()
+        self.assertEqual(metrics["active_jobs"], 1)
+        self.assertEqual(metrics["queued_jobs"], 1)
+        self.assertEqual(metrics["workers"][0]["worker"], "local")
+        self.assertEqual(metrics["workers"][0]["status"], "busy")
+        self.assertIsNotNone(metrics["average_queue_wait_seconds"])
+
+    def test_worker_event_latency_and_phase_timing_are_scoped_to_owner_job(self):
+        headers = self.login()
+        job = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"url": "https://t.me/c/123/22"},
+        ).json()
+        event_headers = {"Authorization": "Bearer internal"}
+        sent_at = (datetime.now(timezone.utc) - timedelta(milliseconds=250)).isoformat()
+
+        wrong_worker = self.client.post(
+            f"/internal/v1/jobs/{job['id']}/events",
+            headers=event_headers,
+            json={
+                "sequence": 2,
+                "status": "running",
+                "event_type": "started",
+                "worker": "remote-1",
+                "progress": {"phase": "downloading", "item": {"percent": 10}},
+            },
+        )
+        self.assertEqual(wrong_worker.status_code, 403)
+        self.assertEqual(wrong_worker.json()["error"]["code"], "JOB_WORKER_MISMATCH")
+        self.assertNotIn("item", self.control.jobs.get(job["id"]).progress)
+
+        started = self.client.post(
+            f"/internal/v1/jobs/{job['id']}/events",
+            headers=event_headers,
+            json={
+                "sequence": 2,
+                "status": "running",
+                "event_type": "started",
+                "worker": "local",
+                "sent_at": sent_at,
+                "progress": {"phase": "downloading"},
+            },
+        )
+        self.assertEqual(started.status_code, 200)
+        observability = started.json()["job"]["progress"]["observability"]
+        self.assertEqual(observability["event_latency"]["count"], 1)
+        self.assertGreaterEqual(observability["event_latency"]["average_ms"], 200)
+        self.assertEqual(observability["phase"], "downloading")
+        self.assertIsNotNone(observability["phase_started_at"])
+
+        changed_phase = self.client.post(
+            f"/internal/v1/jobs/{job['id']}/events",
+            headers=event_headers,
+            json={
+                "sequence": 3,
+                "status": "running",
+                "event_type": "progress.snapshot",
+                "worker": "local",
+                "transient": True,
+                "progress": {"phase": "compressing"},
+            },
+        )
+        self.assertEqual(changed_phase.status_code, 200)
+        observability = changed_phase.json()["job"]["progress"]["observability"]
+        self.assertIn("downloading", observability["phase_durations_seconds"])
+        self.assertEqual(observability["phase"], "compressing")
 
     def test_browser_cookie_login_refresh_profile_and_logout_keep_tokens_out_of_json(self):
         challenge = self.client.post("/api/v1/auth/browser/challenge")
@@ -787,6 +873,38 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(command["worker"], "local")
         self.assertEqual(command["payload"]["quick_retry"]["stage_job_id"], "orphan-1")
         self.assertNotIn("A1031@bokep@1031A", str(recovered.json()))
+
+    def test_quick_staging_delete_removes_worker_folder_and_keeps_job_history(self):
+        headers = self.login()
+
+        deleted = self.client.delete(
+            "/api/v1/quick-mode/staging/local/orphan-1",
+            headers=headers,
+        )
+
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json()["stage_job_id"], "orphan-1")
+        self.assertTrue(deleted.json()["deleted"])
+        self.assertEqual(self.dispatcher.quick_deletions, [("local", "orphan-1")])
+        self.assertEqual(self.jobs.list(kind="export", quick_mode=True), [])
+
+    def test_quick_staging_delete_rejects_stage_with_active_backend_job(self):
+        headers = self.login()
+        active = self.control.submit_job(
+            Actor(42, "default"),
+            "export",
+            {"url": "https://t.me/c/1/44", "quick_mode": True},
+            worker="local",
+        )
+
+        deleted = self.client.delete(
+            f"/api/v1/quick-mode/staging/local/{active.id}",
+            headers=headers,
+        )
+
+        self.assertEqual(deleted.status_code, 409)
+        self.assertEqual(deleted.json()["error"]["code"], "QUICKMODE_STAGE_BUSY")
+        self.assertEqual(self.dispatcher.quick_deletions, [])
 
     def test_quick_staging_scan_verifies_inactive_uploading_folder(self):
         headers = self.login()

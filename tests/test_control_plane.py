@@ -45,6 +45,14 @@ class FailingDispatcher(FakeDispatcher):
         raise RuntimeError("worker offline")
 
 
+class IncompatibleDispatcher(FakeDispatcher):
+    def dispatch(self, worker, command):
+        del worker, command
+        raise DomainError(
+            "WORKER_INCOMPATIBLE", "Worker perlu diperbarui.", status_code=409
+        )
+
+
 class ControlPlaneTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -346,6 +354,17 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].status.value, "failed")
         self.assertEqual([event.sequence for event in self.jobs.events(jobs[0].id)], [1, 2])
+
+    def test_incompatible_worker_failure_keeps_contract_error_code(self):
+        control = ControlPlane(self.jobs, IncompatibleDispatcher(), self.profiles)
+
+        with self.assertRaises(DomainError) as raised:
+            control.submit_job(self.actor, "export", {"url": "https://t.me/c/1/2"})
+
+        self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
+        job = self.jobs.list(profile="default", limit=10)[0]
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(self.jobs.events(job.id)[-1].error["code"], "WORKER_INCOMPATIBLE")
 
     def test_terminate_all_force_cancels_stale_jobs(self):
         first = self.control.submit_job(self.actor, "export", {"url": "https://t.me/c/1/2"})

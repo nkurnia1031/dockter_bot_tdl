@@ -83,5 +83,54 @@ describe('QuickModePage', () => {
     expect(screen.queryByRole('button', { name: 'Upload' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Compress' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Resume Download' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Hapus staging' })).toBeNull();
+  });
+
+  it('confirms deletion of an inactive staging folder and refreshes the scan', async () => {
+    const deletedStages: string[] = [];
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    let deleted = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/quick-mode/limits')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true')) {
+        return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      }
+      if (url.includes('/quick-mode/staging/local/stage-delete') && init?.method === 'DELETE') {
+        deletedStages.push(url);
+        deleted = true;
+        return new Response(JSON.stringify({ worker: 'local', stage_job_id: 'stage-delete', deleted: true }), { status: 200 });
+      }
+      if (url.endsWith('/quick-mode/staging')) {
+        return new Response(JSON.stringify({ items: deleted ? [] : [{
+          stage_job_id: 'stage-delete',
+          folder_name: 'batch-to-delete',
+          worker: 'local',
+          profile: 'default',
+          phase: 'failed',
+          json_present: true,
+          expected_media_count: 1,
+          actual_media_count: 0,
+          thumbnail_present: false,
+          archive_parts: 0,
+          tdl_export_present: true,
+          tdl_download_present: true,
+          worker_log_present: true,
+          staging_path: '/workspace/quickmode/stage-delete'
+        }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(QuickModePage);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Refresh scan' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Hapus staging' }));
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining('dihapus permanen'));
+    expect(deletedStages).toHaveLength(1);
+    expect(deletedStages[0]).toContain('/quick-mode/staging/local/stage-delete');
+    expect(await screen.findByText('Folder staging "batch-to-delete" berhasil dihapus.')).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText('batch-to-delete')).toBeNull());
   });
 });

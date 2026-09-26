@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from tme3bot.backup_service import BackupService, sha256_file
 from tme3bot.command_audit import bounded_output_tail, sanitize_command, sanitize_text
-from tme3bot.domain.models import utc_now
+from tme3bot.domain.models import DomainError, utc_now
 from tme3bot.export_catalog import discard_export_without_media, inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
@@ -124,6 +124,8 @@ class WorkerJobExecutor(
         self._quick_download_clients: dict[str, Any] = {}
         self._quick_active: set[str] = set()
         self._quick_verify_active: set[str] = set()
+        self._quick_delete_active: set[str] = set()
+        self._quick_stage_jobs: dict[str, str] = {}
         self._cancel_requested: set[str] = set()
         self._pause_events: dict[str, threading.Event] = {}
         self._paused_pending_ids: set[str] = set()
@@ -191,19 +193,42 @@ class WorkerJobExecutor(
 
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])
-        self.publisher.begin(job_id, command.get("event_sequence_start"))
+        worker = str(command.get("worker") or self.config.backup_node_name).strip()
+        payload = command.get("payload") or {}
+        quick_stage_id = None
+        if str(command.get("kind") or "") == "export" and bool(payload.get("quick_mode")):
+            retry = payload.get("quick_retry") or {}
+            retry = retry if isinstance(retry, dict) else {}
+            quick_stage_id = str(retry.get("stage_job_id") or job_id).strip()
         with self._lock:
+            if quick_stage_id and quick_stage_id in self._quick_delete_active:
+                raise DomainError(
+                    "QUICKMODE_STAGE_BUSY",
+                    "Folder staging Quick Mode sedang dihapus. Coba kirim job lagi sebentar.",
+                    status_code=409,
+                )
+            self.publisher.begin(job_id, command.get("event_sequence_start"))
+            if worker:
+                self.publisher.bind_job_worker(job_id, worker)
             if job_id in self._known:
                 return self._jobs.queue_size()
             self._known.add(job_id)
+            if quick_stage_id:
+                self._quick_stage_jobs[job_id] = quick_stage_id
         execution = command.get("execution") or {}
         resources = execution.get("resource_keys") or self._resource_keys_for_command(command)
-        position = self._jobs.enqueue(
-            resources,
-            command,
-            priority=0 if command.get("payload", {}).get("priority") == "next" else 100,
-            job_id=job_id,
-        )
+        try:
+            position = self._jobs.enqueue(
+                resources,
+                command,
+                priority=0 if command.get("payload", {}).get("priority") == "next" else 100,
+                job_id=job_id,
+            )
+        except Exception:
+            with self._lock:
+                self._known.discard(job_id)
+                self._quick_stage_jobs.pop(job_id, None)
+            raise
         try:
             self.publisher.emit(
                 job_id,
@@ -226,6 +251,7 @@ class WorkerJobExecutor(
         if paused_pending and self._jobs.cancel_pending(job_id):
             with self._lock:
                 self._known.discard(job_id)
+                self._quick_stage_jobs.pop(job_id, None)
             try:
                 self.publisher.emit(
                     job_id,
@@ -234,6 +260,7 @@ class WorkerJobExecutor(
                     progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
                     error={"code": "JOB_TERMINATED", "message": "Job antrean Quick Mode dibatalkan."},
                 )
+                self.publisher.forget(job_id)
                 return True
             except Exception:
                 LOGGER.warning("Could not publish cancellation for paused queued job %s", job_id, exc_info=True)
@@ -243,6 +270,8 @@ class WorkerJobExecutor(
         if self._jobs.cancel_pending(job_id):
             with self._lock:
                 self._known.discard(job_id)
+                self._quick_stage_jobs.pop(job_id, None)
+            self.publisher.forget(job_id)
             # Returning false tells the backend to persist the terminal
             # cancelled event for a command that never started.
             return False
@@ -779,6 +808,7 @@ class WorkerJobExecutor(
                 self._quick_export_clients.pop(job_id, None)
                 self._quick_download_clients.pop(job_id, None)
                 self._quick_active.discard(job_id)
+                self._quick_stage_jobs.pop(job_id, None)
                 self._cancel_requested.discard(job_id)
             self.publisher.forget(job_id)
 

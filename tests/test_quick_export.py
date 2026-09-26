@@ -10,6 +10,7 @@ from tme3bot.progress import DownloadProgressTracker
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.service import ExportJobResult, DownloadedJsonResult
 from tme3bot.utility import UtilityResult
+from tme3bot.domain.models import DomainError
 from tme3bot.worker.executor import (
     CommandMilestoneRecorder,
     JobLogSnapshot,
@@ -19,6 +20,7 @@ from tme3bot.worker.executor import (
 from tme3bot.worker.quick_export import (
     QuickModeError,
     QuickThumbnailBuilder,
+    delete_quick_stage,
     migrate_legacy_quick_stage,
     quick_folder_name,
     quick_stage_root,
@@ -43,6 +45,42 @@ class QuickThumbnailTests(unittest.TestCase):
         self.assertEqual(snapshot.value()["lines"], ["newest", "new", "middle"])
         self.assertTrue(snapshot.value()["truncated"])
         self.assertEqual(snapshot.value()["order"], "newest_first")
+
+    def test_delete_quick_stage_removes_only_selected_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            selected = workspace / "quickmode" / "stage-delete"
+            other = workspace / "quickmode" / "stage-keep"
+            selected.mkdir(parents=True)
+            other.mkdir(parents=True)
+            (selected / "quickmode.json").write_text("{}", encoding="utf-8")
+            (selected / "worker.log").write_text("diagnostic", encoding="utf-8")
+            (other / "quickmode.json").write_text("{}", encoding="utf-8")
+
+            deleted = delete_quick_stage(workspace, "stage-delete")
+
+            self.assertTrue(deleted)
+            self.assertFalse(selected.exists())
+            self.assertTrue(other.exists())
+            self.assertFalse(delete_quick_stage(workspace, "stage-delete"))
+
+    def test_quickmode_delete_rejects_stage_owned_by_queued_or_active_job(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir) / "workspace"
+            stage = workspace / "quickmode" / "stage-busy"
+            stage.mkdir(parents=True)
+            executor = object.__new__(WorkerJobExecutor)
+            executor.config = SimpleNamespace(utility_workspace_root=str(workspace))
+            executor._lock = threading.RLock()
+            executor._quick_delete_active = set()
+            executor._quick_verify_active = set()
+            executor._quick_stage_jobs = {"job-1": "stage-busy"}
+
+            with self.assertRaises(DomainError) as raised:
+                executor.quickmode_delete("stage-busy")
+
+            self.assertEqual(raised.exception.code, "QUICKMODE_STAGE_BUSY")
+            self.assertTrue(stage.exists())
 
     def test_job_log_keeps_only_the_latest_progress_bar_per_transfer(self) -> None:
         snapshot = JobLogSnapshot()

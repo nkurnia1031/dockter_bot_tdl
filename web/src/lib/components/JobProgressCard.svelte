@@ -20,6 +20,19 @@
   const speed = $derived(progress.transfer.speed_bps ? `${formatBytes(progress.transfer.speed_bps)}/dtk` : progress.transfer.speed_text || 'Menghitung...');
   const headline = $derived(progress.batch.name || progress.item.name || progress.message);
   const elapsed = $derived(formatDuration(progress.elapsedSeconds ?? ((Date.now() - new Date(job.created_at).getTime()) / 1000)));
+  const timing = $derived(job.progress?.timing || {});
+  const observability = $derived(job.progress?.observability || {});
+  const queueWaitSeconds = $derived(
+    job.status === 'queued' && timing.queued_at
+      ? Math.max(0, (Date.now() - Date.parse(timing.queued_at)) / 1000)
+      : timing.queue_wait_seconds
+  );
+  const phaseElapsedSeconds = $derived(
+    observability.phase_started_at && ['dispatched', 'running'].includes(job.status)
+      ? Math.max(0, (Date.now() - Date.parse(observability.phase_started_at)) / 1000)
+      : observability.phase_elapsed_seconds
+  );
+  const eventLatency = $derived(observability.event_latency?.average_ms);
   const stageId = $derived(job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null));
 </script>
 
@@ -75,6 +88,11 @@
               </span>
             </div>
           </div>
+        </div>
+        <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-semibold text-[var(--muted)]">
+          {#if queueWaitSeconds !== undefined}<span>Antre {formatDuration(queueWaitSeconds)}</span>{/if}
+          {#if phaseElapsedSeconds !== undefined && job.status !== 'queued'}<span>Fase ini {formatDuration(phaseElapsedSeconds)}</span>{/if}
+          {#if eventLatency !== undefined}<span>Latensi event {Math.round(eventLatency)} ms</span>{/if}
         </div>
       </div>
 
@@ -161,6 +179,22 @@
         <div class="metric failed"><span><small>Gagal</small><b>{progress.counters.failed}</b></span></div>
         <div class="metric"><span><small>Dilewati</small><b>{progress.counters.skipped}</b></span></div>
       </div>
+
+      <div class="mt-4 grid gap-2 sm:grid-cols-3">
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3"><small class="muted block">Waktu tunggu antrean</small><b class="mt-1 block text-sm">{queueWaitSeconds !== undefined ? formatDuration(queueWaitSeconds) : 'Belum tersedia'}</b></div>
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3"><small class="muted block">Durasi fase aktif</small><b class="mt-1 block text-sm">{phaseElapsedSeconds !== undefined ? formatDuration(phaseElapsedSeconds) : 'Belum tersedia'}</b></div>
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3"><small class="muted block">Rata-rata latensi event</small><b class="mt-1 block text-sm">{eventLatency !== undefined ? `${Math.round(eventLatency)} ms` : 'Belum tersedia'}</b></div>
+      </div>
+      {#if Object.keys(observability.phase_durations_seconds || {}).length}
+        <div class="mt-3 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3">
+          <b class="text-xs font-extrabold">Durasi per fase</b>
+          <div class="mt-2 flex flex-wrap gap-2">
+            {#each Object.entries(observability.phase_durations_seconds) as [phase, seconds]}
+              <span class="rounded-full bg-[var(--surface-soft)] px-2.5 py-1 text-xs">{phaseLabel(phase)} · {formatDuration(seconds)}</span>
+            {/each}
+          </div>
+        </div>
+      {/if}
 
       <!-- Staging path if present -->
       {#if job.progress?.staging_path && !job.progress?.staging_cleaned}

@@ -11,6 +11,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from tme3bot.api.schemas import WorkerJobRequest
 from tme3bot.domain.models import DomainError
+from tme3bot.domain.worker_contract import worker_contract_metadata
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -62,7 +63,7 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
 
     @app.get("/internal/v1/capabilities", dependencies=[Depends(authorize)])
     def capabilities():
-        return context.executor.capabilities()
+        return {**context.executor.capabilities(), **worker_contract_metadata()}
 
     @app.get("/internal/v1/workspace/tree", dependencies=[Depends(authorize)])
     def workspace_tree(path: str = Query("/workspace", min_length=1, max_length=4096)):
@@ -86,6 +87,13 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             str(body.get("expected_phase") or "uploading"),
         )
 
+    @app.delete(
+        "/internal/v1/quickmode/staging/{stage_job_id}",
+        dependencies=[Depends(authorize)],
+    )
+    def quickmode_delete_stage(stage_job_id: str):
+        return context.executor.quickmode_delete(stage_job_id)
+
     @app.post("/internal/v1/jobs", dependencies=[Depends(authorize)])
     def submit_job(body: WorkerJobRequest):
         payload = body.model_dump() if hasattr(body, "model_dump") else body.dict()
@@ -93,6 +101,8 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             payload.pop("execution", None)
         if payload.get("event_sequence_start") is None:
             payload.pop("event_sequence_start", None)
+        if payload.get("worker") is None:
+            payload.pop("worker", None)
         return {"position": context.executor.enqueue(payload), "job_id": body.job_id}
 
     @app.post(

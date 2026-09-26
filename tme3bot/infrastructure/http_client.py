@@ -6,6 +6,18 @@ import urllib.request
 from typing import Any
 from urllib.parse import quote
 
+from tme3bot.domain.worker_contract import (
+    CAP_JOB_CONTROL,
+    CAP_JOB_LOG_SNAPSHOT,
+    CAP_QUICKMODE_SCAN,
+    CAP_QUICKMODE_STAGING,
+    CAP_QUICKMODE_DELETE,
+    CAP_QUICKMODE_VERIFY,
+    CAP_WORKSPACE_TREE,
+    WORKER_JOB_CAPABILITIES,
+    require_worker_contract,
+)
+
 
 class JsonHttpError(RuntimeError):
     def __init__(self, status: int, message: str, payload: dict[str, Any] | None = None):
@@ -61,6 +73,11 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        required = set(WORKER_JOB_CAPABILITIES)
+        job_payload = payload.get("payload")
+        if isinstance(job_payload, dict) and bool(job_payload.get("quick_mode")):
+            required.add(CAP_QUICKMODE_STAGING)
+        self._require_capabilities(worker, required, record=record)
         return request_json(
             str(record["url"]),
             str(record["token"]),
@@ -73,6 +90,7 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             return False
+        self._require_capabilities(worker, {CAP_JOB_CONTROL}, record=record)
         result = request_json(
             str(record["url"]),
             str(record["token"]),
@@ -85,6 +103,7 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             return False
+        self._require_capabilities(worker, {CAP_JOB_CONTROL}, record=record)
         result = request_json(
             str(record["url"]),
             str(record["token"]),
@@ -97,6 +116,7 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             return False
+        self._require_capabilities(worker, {CAP_JOB_CONTROL}, record=record)
         result = request_json(
             str(record["url"]),
             str(record["token"]),
@@ -110,6 +130,7 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(worker, {CAP_WORKSPACE_TREE}, record=record)
         return request_json(
             str(record["url"]),
             str(record["token"]),
@@ -121,6 +142,7 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(worker, {CAP_QUICKMODE_SCAN}, record=record)
         return request_json(
             str(record["url"]),
             str(record["token"]),
@@ -133,6 +155,7 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(worker, {CAP_QUICKMODE_VERIFY}, record=record)
         return request_json(
             str(record["url"]),
             str(record["token"]),
@@ -140,6 +163,19 @@ class WorkerHttpDispatcher:
             "/internal/v1/quickmode/verify",
             {"stage_job_id": stage_job_id, "expected_phase": expected_phase},
             timeout=120,
+        )
+
+    def quickmode_delete(self, worker: str, stage_job_id: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(worker, {CAP_QUICKMODE_DELETE}, record=record)
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "DELETE",
+            "/internal/v1/quickmode/staging/" + quote(str(stage_job_id), safe=""),
+            timeout=180,
         )
 
     def capabilities(self, worker: str) -> dict[str, Any]:
@@ -158,13 +194,40 @@ class WorkerHttpDispatcher:
         record = self.worker_registry.get(worker)
         if not record:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
-        capabilities = self.capabilities(worker)
+        capabilities = require_worker_contract(
+            self.capabilities(worker),
+            worker,
+            required_capabilities=WORKER_JOB_CAPABILITIES,
+        )
         return {"healthy": True, **capabilities}
+
+    def _require_capabilities(
+        self,
+        worker: str,
+        required: set[str],
+        *,
+        record: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if record is None:
+            record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        response = request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            "/internal/v1/capabilities",
+            timeout=15,
+        )
+        return require_worker_contract(
+            response, worker, required_capabilities=required
+        )
 
     def job_log(self, worker: str, job_id: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:
             raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(worker, {CAP_JOB_LOG_SNAPSHOT}, record=record)
         return request_json(
             str(record["url"]),
             str(record["token"]),

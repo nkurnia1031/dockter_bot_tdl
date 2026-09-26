@@ -43,6 +43,14 @@ class JobRepository(Protocol):
 
     def set_queue_info(self, job_id: str, position: int, reason: str | None) -> None: ...
 
+    def monitor_metrics(
+        self,
+        *,
+        profile: str | None = None,
+        worker: str | None = None,
+        now=None,
+    ) -> dict[str, Any]: ...
+
     def release_execution(self, job_id: str) -> None: ...
 
     def replace_execution_resources(

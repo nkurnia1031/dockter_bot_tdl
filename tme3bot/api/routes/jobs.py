@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import Depends, Query
 from tme3bot.api.schemas import JobEventListResponse, JobListResponse, JobResponse, ObjectResponse, WorkerEventRequest
-from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus
+from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus, utc_now
 from typing import Any
 
 def register_jobs(app, context, *, _newest_first_log_response, _owned_job, current_actor, event_dict, job_dict, require_internal, require_service):
@@ -82,6 +84,96 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
             "total": total,
             "next_offset": offset + len(items) if offset + len(items) < total else None,
         }
+
+    @app.get("/api/v1/jobs/metrics", response_model=ObjectResponse)
+    def job_metrics(
+        scope: str = Query("current", pattern="^(current|global)$"),
+        profile: str | None = None,
+        worker: str | None = None,
+        actor=Depends(current_actor),
+    ):
+        selected_profile = (
+            context.control_plane.require_profile(actor, profile)
+            if profile
+            else None
+            if scope == "global"
+            else context.control_plane.require_profile(actor, None)
+        )
+        registry = context.worker_registry.list() if context.worker_registry is not None else {}
+        worker_names = sorted(registry)
+        if worker:
+            worker_names = [name for name in worker_names if name == worker]
+        snapshot = context.control_plane.jobs.monitor_metrics(
+            profile=selected_profile,
+            worker=worker,
+        )
+        by_worker = {item["worker"]: item for item in snapshot["workers"]}
+        now = datetime.now(timezone.utc)
+        for name in worker_names:
+            item = by_worker.setdefault(
+                name,
+                {
+                    "worker": name,
+                    "queued_jobs": 0,
+                    "dispatched_jobs": 0,
+                    "running_jobs": 0,
+                    "paused_jobs": 0,
+                    "quickmode_queued": 0,
+                    "quickmode_active": 0,
+                    "quickmode_paused": 0,
+                    "average_queue_wait_seconds": None,
+                    "event_latency": {"count": 0, "average_ms": None},
+                    "phase_seconds": {},
+                    "last_seen_at": None,
+                },
+            )
+            record = registry.get(name) or {}
+            item["enabled"] = bool(record.get("enabled", True))
+            active_count = int(item["dispatched_jobs"]) + int(item["running_jobs"])
+            last_seen = item.get("last_seen_at")
+            age_seconds = None
+            if last_seen:
+                try:
+                    last_seen_at = datetime.fromisoformat(str(last_seen))
+                    if last_seen_at.tzinfo is None:
+                        last_seen_at = last_seen_at.replace(tzinfo=timezone.utc)
+                    age_seconds = max(0.0, (now - last_seen_at).total_seconds())
+                except ValueError:
+                    age_seconds = None
+            if not item["enabled"]:
+                item["status"] = "disabled"
+            elif active_count:
+                item["status"] = "stale" if age_seconds is None or age_seconds > 45 else "busy"
+            elif item["paused_jobs"]:
+                item["status"] = "paused"
+            elif item["queued_jobs"]:
+                item["status"] = "queued"
+            else:
+                item["status"] = "idle"
+            item["active_jobs"] = active_count
+            item["last_seen_age_seconds"] = (
+                round(age_seconds, 1) if age_seconds is not None else None
+            )
+        limits = {
+            item["worker"]: item
+            for item in context.control_plane.jobs.quickmode_limits(worker_names)
+        }
+        workers = []
+        for name in worker_names:
+            item = dict(by_worker[name])
+            item.update(
+                {
+                    "quickmode_limit": limits.get(name, {}).get("max_concurrent", 2),
+                    "quickmode_slots": limits.get(name, {}).get("active", 0),
+                    "quickmode_queued": limits.get(name, {}).get(
+                        "queued", item["quickmode_queued"]
+                    ),
+                }
+            )
+            workers.append(item)
+        snapshot["workers"] = workers
+        snapshot["active_jobs"] = snapshot["dispatched_jobs"] + snapshot["running_jobs"]
+        return snapshot
 
     @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
     def get_job(job_id: str, actor=Depends(current_actor)):
@@ -172,6 +264,106 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
                 errors.append({"worker": worker, "error": str(exc)[:500]})
 
         return {"items": items, "errors": errors}
+
+    @app.delete(
+        "/api/v1/quick-mode/staging/{worker}/{stage_job_id}",
+        response_model=ObjectResponse,
+    )
+    def delete_quick_mode_staging(
+        worker: str,
+        stage_job_id: str,
+        actor=Depends(current_actor),
+    ):
+        """Delete one inactive physical stage while preserving job history."""
+        del actor
+        worker = str(worker or "").strip().lower()
+        stage_job_id = str(stage_job_id or "").strip()
+        if not worker or not stage_job_id:
+            raise DomainError(
+                "STAGING_TARGET_REQUIRED",
+                "Worker dan stage_job_id wajib diisi.",
+                status_code=422,
+            )
+        if context.worker_registry is None or context.worker_registry.get(worker) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker staging tidak ditemukan.", status_code=404)
+
+        # A job can be queued at the gateway before its command reaches the
+        # worker. Check every active lifecycle state here, then let the worker
+        # perform the same check against its own queue to close the dispatch race.
+        for status in ("queued", "dispatched", "running", "paused"):
+            offset = 0
+            while True:
+                candidates = context.control_plane.jobs.list(
+                    kind="export",
+                    status=status,
+                    worker=worker,
+                    quick_mode=True,
+                    archived=None,
+                    offset=offset,
+                    limit=200,
+                )
+                for candidate in candidates:
+                    retry = candidate.payload.get("quick_retry")
+                    retry = retry if isinstance(retry, dict) else {}
+                    result_value = (
+                        candidate.result.get("value", candidate.result)
+                        if isinstance(candidate.result, dict)
+                        else {}
+                    )
+                    result_value = result_value if isinstance(result_value, dict) else {}
+                    candidate_stage = str(
+                        retry.get("stage_job_id")
+                        or result_value.get("stage_job_id")
+                        or candidate.id
+                    )
+                    if candidate_stage == stage_job_id:
+                        raise DomainError(
+                            "QUICKMODE_STAGE_BUSY",
+                            f"Folder staging sedang dipakai job #{candidate.id[:8]}.",
+                            details={"job_id": candidate.id, "status": status},
+                            status_code=409,
+                        )
+                if len(candidates) < 200:
+                    break
+                offset += len(candidates)
+
+        deleter = getattr(context.worker_dispatcher, "quickmode_delete", None)
+        if not callable(deleter):
+            raise DomainError(
+                "WORKER_INCOMPATIBLE",
+                "Worker belum mendukung penghapusan staging Quick Mode. Deploy worker dengan release terbaru.",
+                details={"worker": worker},
+                status_code=409,
+            )
+        try:
+            result = deleter(worker, stage_job_id)
+        except DomainError:
+            raise
+        except Exception as exc:
+            worker_status = getattr(exc, "status", None)
+            payload = getattr(exc, "payload", {})
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if worker_status in {404, 409, 422}:
+                raise DomainError(
+                    str(error.get("code") or "QUICKMODE_STAGE_DELETE_FAILED")
+                    if isinstance(error, dict)
+                    else "QUICKMODE_STAGE_DELETE_FAILED",
+                    str(error.get("message") or exc)
+                    if isinstance(error, dict)
+                    else str(exc),
+                    status_code=int(worker_status),
+                ) from exc
+            raise DomainError(
+                "QUICKMODE_WORKER_UNAVAILABLE",
+                f"Worker {worker} tidak dapat menghapus staging: {exc}",
+                details={"worker": worker},
+                status_code=502,
+            ) from exc
+        return {
+            "worker": worker,
+            "stage_job_id": stage_job_id,
+            **(result if isinstance(result, dict) else {"deleted": bool(result)}),
+        }
 
     @app.get("/api/v1/quick-mode/limits", response_model=ObjectResponse)
     def quick_mode_limits(actor=Depends(current_actor)):
@@ -471,20 +663,44 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
         dependencies=[Depends(require_internal)],
     )
     def worker_event(job_id: str, body: WorkerEventRequest):
+        current = context.control_plane.jobs.get(job_id)
+        if current is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        if body.worker and str(body.worker).strip().lower() != current.worker.lower():
+            raise DomainError(
+                "JOB_WORKER_MISMATCH",
+                "Event progress berasal dari worker yang bukan pemilik job.",
+                status_code=403,
+                details={"job_id": job_id, "worker": current.worker},
+            )
         try:
             status = JobStatus(body.status)
         except ValueError as exc:
             raise DomainError(
                 "INVALID_JOB_STATUS", "Status job tidak valid.", status_code=422
             ) from exc
+        received_at = utc_now()
+        progress = dict(body.progress or {})
+        latency_ms = None
+        if body.sent_at is not None:
+            sent_at = body.sent_at
+            if sent_at.tzinfo is None:
+                sent_at = sent_at.replace(tzinfo=timezone.utc)
+            latency_ms = max(0.0, (received_at - sent_at).total_seconds() * 1000.0)
+        progress["backend_telemetry"] = {
+            "worker_sent_at": body.sent_at.isoformat() if body.sent_at else None,
+            "backend_received_at": received_at.isoformat(),
+            "event_latency_ms": round(latency_ms, 3) if latency_ms is not None else None,
+        }
         event = JobEvent(
             job_id=job_id,
             sequence=body.sequence,
             status=status,
             event_type=body.event_type,
-            progress=body.progress,
+            progress=progress,
             result=body.result,
             error=body.error,
+            created_at=received_at,
         )
         if body.transient:
             job, accepted = context.control_plane.update_worker_progress_result(event)

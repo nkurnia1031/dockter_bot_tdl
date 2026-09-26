@@ -16,6 +16,7 @@ from tme3bot.command_audit import (
     sanitize_text,
 )
 from tme3bot.domain.models import (
+    DomainError,
     utc_now,
 )
 from tme3bot.export_catalog import (
@@ -38,10 +39,12 @@ from tme3bot.worker.quick_export import (
     QUICK_PHASES,
     QuickModeError,
     QuickThumbnailBuilder,
+    delete_quick_stage,
     ensure_quick_stage_writable,
     ensure_quick_tdl_client,
     migrate_legacy_quick_stage,
     quick_folder_name,
+    quick_stage_root,
     quick_storage_caption,
     quick_year,
     read_quick_manifest,
@@ -1193,8 +1196,17 @@ class QuickModeExecutorMixin:
 
     def quickmode_verify(self, stage_job_id: str, expected_phase: str = "uploading") -> dict[str, Any]:
         """Verify completed Quick Mode uploads before deleting retained staging."""
+        stage_job_id = str(stage_job_id).strip()
+        with self._lock:
+            if stage_job_id in self._quick_delete_active:
+                return {
+                    "stage_job_id": stage_job_id,
+                    "status": "deferred_active",
+                    "staging_cleaned": False,
+                    "reason": "Folder staging Quick Mode sedang dihapus.",
+                }
         workspace = self._quick_workspace(self.config)
-        stage_root = migrate_legacy_quick_stage(workspace, str(stage_job_id))
+        stage_root = migrate_legacy_quick_stage(workspace, stage_job_id)
         if not stage_root.is_dir():
             return {
                 "stage_job_id": str(stage_job_id),
@@ -1212,6 +1224,20 @@ class QuickModeExecutorMixin:
                 "reason": "Staging berada di luar workspace.",
             }
         with self._lock:
+            if stage_job_id in self._quick_delete_active:
+                return {
+                    "stage_job_id": stage_job_id,
+                    "status": "deferred_active",
+                    "staging_cleaned": False,
+                    "reason": "Folder staging Quick Mode sedang dihapus.",
+                }
+            if stage_job_id in self._quick_stage_jobs.values():
+                return {
+                    "stage_job_id": stage_job_id,
+                    "status": "deferred_active",
+                    "staging_cleaned": False,
+                    "reason": "Job Quick Mode masih aktif atau berada dalam antrean.",
+                }
             if str(stage_job_id) in self._quick_active:
                 return {
                     "stage_job_id": str(stage_job_id),
@@ -1455,6 +1481,55 @@ class QuickModeExecutorMixin:
         finally:
             with self._lock:
                 self._quick_verify_active.discard(str(stage_job_id))
+
+    def quickmode_delete(self, stage_job_id: str) -> dict[str, Any]:
+        """Delete a retained stage only after confirming no worker operation owns it."""
+        stage_job_id = str(stage_job_id).strip()
+        workspace = self._quick_workspace(self.config)
+        try:
+            quick_stage_root(workspace, stage_job_id)
+        except QuickModeError as exc:
+            raise DomainError(
+                "INVALID_STAGE_JOB_ID",
+                str(exc),
+                status_code=422,
+            ) from exc
+
+        with self._lock:
+            if (
+                stage_job_id in self._quick_delete_active
+                or stage_job_id in self._quick_verify_active
+                or stage_job_id in self._quick_stage_jobs.values()
+            ):
+                raise DomainError(
+                    "QUICKMODE_STAGE_BUSY",
+                    "Folder staging Quick Mode sedang dipakai job atau verifikasi worker.",
+                    status_code=409,
+                )
+            self._quick_delete_active.add(stage_job_id)
+
+        try:
+            try:
+                deleted = delete_quick_stage(workspace, stage_job_id)
+            except QuickModeError as exc:
+                raise DomainError(
+                    "QUICKMODE_STAGE_UNSAFE",
+                    str(exc),
+                    status_code=409,
+                ) from exc
+            except OSError as exc:
+                raise DomainError(
+                    "QUICKMODE_STAGE_DELETE_FAILED",
+                    f"Folder staging Quick Mode gagal dihapus: {exc}",
+                    status_code=500,
+                ) from exc
+            return {
+                "stage_job_id": stage_job_id,
+                "deleted": bool(deleted),
+            }
+        finally:
+            with self._lock:
+                self._quick_delete_active.discard(stage_job_id)
 
     def quickmode_scan(self) -> dict[str, Any]:
         """Return derived Quick Mode staging state for the manager UI."""

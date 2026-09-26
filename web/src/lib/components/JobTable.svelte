@@ -11,6 +11,7 @@
   type JobEvent = Record<string, any>;
   let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false, view = 'all' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean; view?: 'all'|'active'|'history' } = $props();
   let jobs = $state<Job[]>([]);
+  let monitorMetrics = $state<Record<string, any> | null>(null);
   let error = $state('');
   let selected = $state<Job | null>(null);
   let events = $state<JobEvent[]>([]);
@@ -52,6 +53,10 @@
     return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
+  function workerStatusLabel(status: string): string {
+    return ({ busy: 'sibuk', stale: 'heartbeat terlambat', paused: 'dijeda', queued: 'antre', idle: 'idle', disabled: 'nonaktif' } as Record<string, string>)[status] || status;
+  }
+
   async function load() {
     const request = ++loadGeneration;
     const previousActiveIds = new Set(jobs.filter(active).map((job) => String(job.id)));
@@ -69,9 +74,19 @@
       }
       if (quickMode) params.set('quick_mode', 'true');
       const query = `/jobs?${params.toString()}`;
-      const next = (await api<{items:Job[]}>(query)).items || [];
+      const metricsParams = new URLSearchParams({ scope });
+      if (profile) metricsParams.set('profile', profile);
+      if (worker) metricsParams.set('worker', worker);
+      const [jobResponse, nextMetrics] = await Promise.all([
+        api<{items:Job[]}>(query),
+        view === 'history'
+          ? Promise.resolve(null)
+          : api<Record<string, any>>(`/jobs/metrics?${metricsParams.toString()}`).catch(() => null)
+      ]);
+      const next = jobResponse.items || [];
       if (request !== loadGeneration) return;
       jobs = next;
+      monitorMetrics = nextMetrics;
       lastRefreshed = new Date();
       if (selected) selected = next.find((job) => job.id === selected?.id) || selected;
       if (view === 'active' && hasLoaded) {
@@ -184,6 +199,7 @@
     const contextRefresh = () => {
       loadGeneration += 1;
       jobs = [];
+      monitorMetrics = null;
       selected = null;
       events = [];
       liveLog = null;
@@ -221,6 +237,26 @@
     </div>
   </div>
   {#if error}<p class="m-4 rounded-xl bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{error}</p>{/if}
+
+  {#if view !== 'history' && monitorMetrics}
+    <div class="border-b border-[var(--line)] px-4 py-3 sm:px-5">
+      <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3 py-2"><small class="muted">Aktif · dispatch / running</small><b class="mt-1 block text-sm">{monitorMetrics.active_jobs || 0} job</b></div>
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3 py-2"><small class="muted">Antrean</small><b class="mt-1 block text-sm">{monitorMetrics.queued_jobs || 0} job</b></div>
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3 py-2"><small class="muted">Rata-rata waktu tunggu · 24 jam</small><b class="mt-1 block text-sm">{monitorMetrics.average_queue_wait_seconds != null ? formatDuration(monitorMetrics.average_queue_wait_seconds) : 'Belum ada data'}</b></div>
+        <div class="rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3 py-2"><small class="muted">Latensi event worker</small><b class="mt-1 block text-sm">{monitorMetrics.event_latency?.average_ms != null ? `${Math.round(monitorMetrics.event_latency.average_ms)} ms · ${monitorMetrics.event_latency.count} event` : 'Belum ada data'}</b></div>
+      </div>
+      {#if monitorMetrics.workers?.length}
+        <div class="mt-2 flex flex-wrap gap-2" aria-label="Status worker">
+          {#each monitorMetrics.workers as item (item.worker)}
+            <span class={`rounded-full border px-2.5 py-1 text-xs font-semibold ${item.status === 'stale' ? 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200' : item.status === 'disabled' ? 'border-slate-300 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300' : 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200'}`} title={item.last_seen_at ? `Event terakhir ${item.last_seen_age_seconds ?? '?'} detik lalu` : 'Belum ada event worker'}>
+              {item.worker} · {workerStatusLabel(item.status)} · {item.active_jobs} aktif · {item.queued_jobs} antre
+            </span>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   {#if view !== 'history' && activeJobs.length}
     <div class="border-b border-[var(--line)] bg-[var(--brand-soft)]/20 p-4 sm:p-5">

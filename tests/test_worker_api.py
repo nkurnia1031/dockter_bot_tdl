@@ -8,6 +8,7 @@ from tme3bot.api.worker import WorkerContext, create_worker_app
 class FakeExecutor:
     def __init__(self):
         self.commands = []
+        self.deleted_stages = []
 
     def enqueue(self, command):
         self.commands.append(command)
@@ -35,6 +36,10 @@ class FakeExecutor:
             "expected_phase": expected_phase,
             "staging_cleaned": True,
         }
+
+    def quickmode_delete(self, stage_job_id):
+        self.deleted_stages.append(stage_job_id)
+        return {"stage_job_id": stage_job_id, "deleted": True}
 
     def job_log_snapshot(self, job_id):
         if job_id != "active":
@@ -145,6 +150,18 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["status"], "verified")
         self.assertTrue(accepted.json()["staging_cleaned"])
+
+    def test_quickmode_stage_delete_requires_token_and_forwards_stage_id(self):
+        denied = self.client.delete("/internal/v1/quickmode/staging/stage-1")
+        self.assertEqual(denied.status_code, 401)
+
+        accepted = self.client.delete(
+            "/internal/v1/quickmode/staging/stage-1",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json(), {"stage_job_id": "stage-1", "deleted": True})
+        self.assertEqual(self.executor.deleted_stages, ["stage-1"])
 
     def test_active_job_log_snapshot_requires_token_and_handles_missing(self):
         denied = self.client.get("/internal/v1/jobs/active/log-snapshot")

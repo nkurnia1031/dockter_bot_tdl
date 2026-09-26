@@ -5,7 +5,8 @@ import logging
 import threading
 import time
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
@@ -202,6 +203,7 @@ class ControlPlane:
             return self.jobs.get(job.id) or job
         except Exception as exc:
             self.jobs.release_execution(job.id)
+            failure = self._worker_dispatch_error(selected_worker, exc)
             sequence = max(
                 (event.sequence for event in self.jobs.events(job.id)), default=0
             ) + 1
@@ -210,14 +212,20 @@ class ControlPlane:
                 sequence=sequence,
                 status=JobStatus.FAILED,
                 event_type="dispatch_failed",
-                error={"code": "WORKER_UNAVAILABLE", "message": str(exc)},
+                error={"code": failure.code, "message": failure.message},
             )
             self.jobs.append_event(failed)
-            raise DomainError(
-                "WORKER_UNAVAILABLE",
-                f"Worker {selected_worker} tidak dapat menerima job: {exc}",
-                status_code=503,
-            ) from exc
+            raise failure from exc
+
+    @staticmethod
+    def _worker_dispatch_error(worker: str, exc: Exception) -> DomainError:
+        if isinstance(exc, DomainError) and exc.code == "WORKER_INCOMPATIBLE":
+            return exc
+        return DomainError(
+            "WORKER_UNAVAILABLE",
+            f"Worker {worker} tidak dapat menerima job: {exc}",
+            status_code=503,
+        )
 
     def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
         sequence = max(
@@ -442,6 +450,7 @@ class ControlPlane:
                             self._dispatch_admitted_job(queued, command)
                 except Exception as exc:
                     self.jobs.release_execution(queued.id)
+                    failure = self._worker_dispatch_error(queued.worker, exc)
                     sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1
                     self.jobs.append_event(
                         JobEvent(
@@ -449,7 +458,7 @@ class ControlPlane:
                             sequence=sequence,
                             status=JobStatus.FAILED,
                             event_type="dispatch_failed",
-                            error={"code": "WORKER_UNAVAILABLE", "message": str(exc)},
+                            error={"code": failure.code, "message": failure.message},
                         )
                     )
 
@@ -475,6 +484,7 @@ class ControlPlane:
         )
         if event.sequence <= latest_sequence:
             return current
+        event = self._with_observability(current, event)
         job, inserted = self.jobs.append_event(event)
         self._stale_cancel_requested.pop(event.job_id, None)
         # Side effects are idempotent and intentionally replayed when a worker
@@ -519,6 +529,11 @@ class ControlPlane:
 
     def update_worker_progress_result(self, event: JobEvent) -> tuple[Job, bool]:
         """Return whether a transient worker snapshot advanced the job."""
+        current = self.jobs.get(event.job_id)
+        if current is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        if not current.status.terminal:
+            event = self._with_observability(current, event)
         job, updated = self.jobs.update_progress_snapshot(event)
         if updated:
             # A valid worker heartbeat proves that the worker is alive.  Clear
@@ -526,6 +541,75 @@ class ControlPlane:
             # tick cannot force-cancel a job that has resumed reporting.
             self._stale_cancel_requested.pop(event.job_id, None)
         return job, updated
+
+    @staticmethod
+    def _with_observability(job: Job, event: JobEvent) -> JobEvent:
+        """Attach phase timing and event latency to this job's own event."""
+        progress = dict(event.progress or {})
+        current = job.progress if isinstance(job.progress, dict) else {}
+        previous_phase = str(current.get("phase") or "")
+        phase = str(progress.get("phase") or previous_phase)
+        previous_metrics = current.get("observability")
+        previous_metrics = previous_metrics if isinstance(previous_metrics, dict) else {}
+        phase_durations = previous_metrics.get("phase_durations_seconds")
+        phase_durations = (
+            dict(phase_durations) if isinstance(phase_durations, dict) else {}
+        )
+        phase_started_at = previous_metrics.get("phase_started_at")
+        now = event.created_at
+        phase_changed = bool(phase and previous_phase and phase != previous_phase)
+        should_close_phase = bool(
+            phase_started_at
+            and previous_phase
+            and (phase_changed or event.status == JobStatus.PAUSED or event.status.terminal)
+        )
+        if should_close_phase:
+            duration = _elapsed_since(str(phase_started_at), now)
+            phase_durations[previous_phase] = round(
+                float(phase_durations.get(previous_phase, 0.0)) + duration, 3
+            )
+
+        paused = event.status == JobStatus.PAUSED
+        was_paused = job.status == JobStatus.PAUSED
+        if event.status.terminal or paused:
+            phase_started_at = None
+        elif phase and (phase_changed or was_paused or not phase_started_at):
+            phase_started_at = now.isoformat()
+
+        event_latency = progress.get("backend_telemetry")
+        event_latency = event_latency if isinstance(event_latency, dict) else {}
+        latency_ms = event_latency.get("event_latency_ms")
+        previous_latency = previous_metrics.get("event_latency")
+        previous_latency = previous_latency if isinstance(previous_latency, dict) else {}
+        latency_count = int(previous_latency.get("count") or 0)
+        latency_total = float(previous_latency.get("total_ms") or 0.0)
+        if isinstance(latency_ms, (int, float)) and latency_ms >= 0:
+            latency_count += 1
+            latency_total += float(latency_ms)
+        observability = {
+            **previous_metrics,
+            "phase": phase or None,
+            "phase_started_at": phase_started_at,
+            "phase_durations_seconds": phase_durations,
+            "phase_elapsed_seconds": (
+                round(_elapsed_since(str(phase_started_at), now), 3)
+                if phase_started_at
+                else 0.0
+            ),
+            "event_latency": {
+                "count": latency_count,
+                "total_ms": round(latency_total, 3),
+                "average_ms": round(latency_total / latency_count, 3)
+                if latency_count
+                else None,
+                "last_ms": round(float(latency_ms), 3)
+                if isinstance(latency_ms, (int, float)) and latency_ms >= 0
+                else previous_latency.get("last_ms"),
+            },
+            "last_event_at": now.isoformat(),
+        }
+        progress["observability"] = observability
+        return replace(event, progress=progress)
 
     def add_event_observer(self, observer: Callable[[JobEvent], None]) -> None:
         self._event_observers.append(observer)
@@ -1082,6 +1166,17 @@ class ControlPlane:
                     "failed",
                     str((event.error or {}).get("message", "backup gagal")),
                 )
+
+
+def _elapsed_since(timestamp: str, now: datetime) -> float:
+    try:
+        started = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return 0.0
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    current = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    return max(0.0, (current - started).total_seconds())
 
 
 def serializable(value: Any) -> Any:
