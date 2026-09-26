@@ -71,7 +71,7 @@ class QuickThumbnailTests(unittest.TestCase):
         events: list[str] = []
         publisher = WorkerEventPublisher("http://backend", "internal-token")
         publisher.register_audit_callback("job-audit", events.append)
-        with patch("tme3bot.worker.executor.request_json", return_value={}):
+        with patch("tme3bot.worker.executor_support.request_json", return_value={}):
             publisher.begin("job-audit", 10)
             publisher.emit(
                 "job-audit",
@@ -234,7 +234,7 @@ class QuickThumbnailTests(unittest.TestCase):
                 rmtree(path)
 
             try:
-                with patch("tme3bot.worker.executor.shutil.rmtree", side_effect=rmtree_with_heartbeat):
+                with patch("tme3bot.worker.executor_quickmode.shutil.rmtree", side_effect=rmtree_with_heartbeat):
                     executor._cleanup_quick_stage("cleanup-job", stage)
 
                 self.assertFalse(stage.exists())
@@ -391,8 +391,8 @@ class QuickThumbnailTests(unittest.TestCase):
             )
             publisher = SimpleNamespace(emit=lambda *args, **kwargs: None)
             executor = WorkerJobExecutor(config, Profiles(), publisher)
-            with patch("tme3bot.worker.executor.RcloneRunner", VerifyRclone), patch(
-                "tme3bot.worker.executor.ensure_quick_stage_writable"
+            with patch("tme3bot.worker.executor_quickmode.RcloneRunner", VerifyRclone), patch(
+                "tme3bot.worker.executor_quickmode.ensure_quick_stage_writable"
             ) as ensure_writable:
                 result = executor.quickmode_verify("verify-stage")
 
@@ -883,8 +883,8 @@ class QuickPipelineTests(unittest.TestCase):
                     },
                 },
             }
-            with patch("tme3bot.worker.executor.QuickThumbnailBuilder", FakeThumbnailBuilder), patch(
-                "tme3bot.worker.executor.UtilityRunner",
+            with patch("tme3bot.worker.executor_quickmode.QuickThumbnailBuilder", FakeThumbnailBuilder), patch(
+                "tme3bot.worker.executor_quickmode.UtilityRunner",
                 side_effect=AssertionError("compress must not run for thumbnail-only action"),
             ):
                 result = executor._quick_export_pipeline(
@@ -1194,10 +1194,10 @@ class QuickPipelineTests(unittest.TestCase):
                 def cancel_current(self):
                     return False
 
-            with patch("tme3bot.worker.executor.QuickThumbnailBuilder", FakeThumbnailBuilder), patch(
-                "tme3bot.worker.executor.UtilityRunner", FakeUtilityRunner
-            ), patch("tme3bot.worker.executor.RcloneRunner", FakeRcloneRunner), patch(
-                "tme3bot.worker.executor.quick_year", return_value=2026
+            with patch("tme3bot.worker.executor_quickmode.QuickThumbnailBuilder", FakeThumbnailBuilder), patch(
+                "tme3bot.worker.executor_quickmode.UtilityRunner", FakeUtilityRunner
+            ), patch("tme3bot.worker.executor_storage.RcloneRunner", FakeRcloneRunner), patch(
+                "tme3bot.worker.executor_quickmode.quick_year", return_value=2026
             ):
                 result = executor._quick_export_pipeline(
                     command,

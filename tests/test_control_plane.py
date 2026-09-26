@@ -115,6 +115,38 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(second.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
 
+    def test_quick_mode_other_profile_can_fill_worker_slot_behind_blocked_profile_queue(self):
+        first = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/20", "quick_mode": True},
+            profile="default",
+        )
+        same_profile = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/21", "quick_mode": True},
+            profile="default",
+        )
+        other_profile = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/22", "quick_mode": True},
+            profile="archive",
+        )
+
+        self.assertEqual(first.status.value, "dispatched")
+        self.assertEqual(same_profile.status.value, "queued")
+        self.assertEqual(other_profile.status.value, "dispatched")
+        self.assertEqual(
+            [command["job_id"] for command in self.dispatcher.commands],
+            [first.id, other_profile.id],
+        )
+        self.assertEqual(
+            self.jobs.quickmode_limits(["local"]),
+            [{"worker": "local", "max_concurrent": 2, "active": 2, "queued": 1}],
+        )
+
     def test_export_modes_queue_on_one_worker_but_run_on_different_workers(self):
         normal = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2"}, worker="local"

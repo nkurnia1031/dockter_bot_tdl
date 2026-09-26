@@ -1,0 +1,495 @@
+from __future__ import annotations
+
+from fastapi import Depends, Query
+from tme3bot.api.schemas import JobEventListResponse, JobListResponse, JobResponse, ObjectResponse, WorkerEventRequest
+from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus
+from typing import Any
+
+def register_jobs(app, context, *, _newest_first_log_response, _owned_job, current_actor, event_dict, job_dict, require_internal, require_service):
+
+    @app.get("/api/v1/jobs", response_model=JobListResponse)
+    def list_jobs(
+        kind: str | None = None,
+        status: str | None = None,
+        worker: str | None = None,
+        profile: str | None = None,
+        quick_mode: bool | None = None,
+        scope: str = Query("current", pattern="^(current|global)$"),
+        archived: bool | None = False,
+        limit: int = Query(50, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        actor=Depends(current_actor),
+    ):
+        selected_profile = None if scope == "global" else context.control_plane.require_profile(actor, profile)
+        if profile and scope == "global":
+            selected_profile = context.control_plane.require_profile(actor, profile)
+        # The monitor needs one request for all active lifecycle states while
+        # the repository intentionally keeps its indexed status filter scalar.
+        # Accepting a comma-separated value here keeps the public API backward
+        # compatible with the existing single-status query.
+        status_values = [
+            value.strip().lower()
+            for value in str(status or "").split(",")
+            if value.strip()
+        ]
+        if len(status_values) <= 1:
+            items = context.control_plane.jobs.list(
+                profile=selected_profile,
+                kind=kind,
+                status=status_values[0] if status_values else None,
+                worker=worker,
+                quick_mode=quick_mode,
+                archived=archived,
+                offset=offset,
+                limit=limit,
+            )
+            total = context.control_plane.jobs.count(
+                profile=selected_profile,
+                kind=kind,
+                status=status_values[0] if status_values else None,
+                worker=worker,
+                quick_mode=quick_mode,
+                archived=archived,
+            )
+        else:
+            matching: list[Job] = []
+            total = 0
+            for status_value in dict.fromkeys(status_values):
+                matching.extend(
+                    context.control_plane.jobs.list(
+                        profile=selected_profile,
+                        kind=kind,
+                        status=status_value,
+                        worker=worker,
+                        quick_mode=quick_mode,
+                        archived=archived,
+                        offset=0,
+                        limit=200,
+                    )
+                )
+                total += context.control_plane.jobs.count(
+                    profile=selected_profile,
+                    kind=kind,
+                    status=status_value,
+                    worker=worker,
+                    quick_mode=quick_mode,
+                    archived=archived,
+                )
+            matching.sort(key=lambda item: item.updated_at, reverse=True)
+            items = matching[offset : offset + limit]
+        return {
+            "items": [job_dict(item) for item in items],
+            "total": total,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+        }
+
+    @app.get("/api/v1/jobs/{job_id}", response_model=JobResponse)
+    def get_job(job_id: str, actor=Depends(current_actor)):
+        job = _owned_job(context, actor, job_id)
+        return job_dict(job)
+
+    @app.get("/api/v1/quick-mode/staging", response_model=ObjectResponse)
+    def quick_mode_staging(actor=Depends(current_actor)):
+        """Merge persisted Quick Mode jobs with physical worker staging."""
+        del actor
+        jobs = context.control_plane.jobs.list(
+            kind="export",
+            quick_mode=True,
+            archived=False,
+            offset=0,
+            limit=1000,
+        )
+        by_stage: dict[tuple[str, str], dict[str, Any]] = {}
+        for job in jobs:
+            retry = job.payload.get("quick_retry")
+            retry = retry if isinstance(retry, dict) else {}
+            result_value = job.result.get("value", job.result) if isinstance(job.result, dict) else {}
+            result_value = result_value if isinstance(result_value, dict) else {}
+            stage_id = str(
+                retry.get("stage_job_id")
+                or result_value.get("stage_job_id")
+                or job.id
+            )
+            # Keep the newest attempt as the linked backend row, while the
+            # response still includes the stable stage identity.
+            key = (str(job.worker), stage_id)
+            if key not in by_stage:
+                by_stage[key] = {
+                    "id": stage_id,
+                    "job": job_dict(job),
+                    "backend_job_id": job.id,
+                }
+
+        items: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        dispatcher = context.worker_dispatcher
+        worker_names = context.worker_registry.names() if context.worker_registry is not None else []
+        scanner = getattr(dispatcher, "quickmode_scan", None) if dispatcher is not None else None
+        for worker in worker_names:
+            try:
+                response = scanner(worker) if callable(scanner) else {"worker": worker, "items": []}
+                scanned = response.get("items", []) if isinstance(response, dict) else []
+                if not isinstance(scanned, list):
+                    scanned = []
+                for raw in scanned:
+                    if not isinstance(raw, dict):
+                        continue
+                    item = dict(raw)
+                    stage_id = str(item.get("stage_job_id") or "")
+                    if not stage_id:
+                        continue
+                    linked = by_stage.get((worker, stage_id))
+                    item["worker"] = str(item.get("worker") or worker)
+                    item["backend_job"] = linked["job"] if linked else None
+                    item["backend_job_id"] = linked["backend_job_id"] if linked else None
+                    item["orphan"] = linked is None
+                    linked_status = str(linked["job"].get("status") or "") if linked else ""
+                    verifier = getattr(dispatcher, "quickmode_verify", None) if dispatcher is not None else None
+                    if (
+                        str(item.get("phase") or "") in {"uploading", "cleanup"}
+                        and linked_status not in {"queued", "dispatched", "running", "paused"}
+                        and callable(verifier)
+                    ):
+                        try:
+                            verification = verifier(
+                                worker,
+                                stage_id,
+                                str(item.get("phase") or "uploading"),
+                            )
+                            if isinstance(verification, dict):
+                                item["cleanup_verification"] = verification
+                                item["staging_cleaned"] = bool(verification.get("staging_cleaned"))
+                        except Exception as exc:
+                            item["cleanup_verification"] = {
+                                "status": "failed",
+                                "reason": str(exc)[:500],
+                                "staging_cleaned": False,
+                            }
+                    items.append(item)
+            except Exception as exc:
+                # One remote worker being offline must not hide staging from
+                # the remaining workers.
+                errors.append({"worker": worker, "error": str(exc)[:500]})
+
+        return {"items": items, "errors": errors}
+
+    @app.get("/api/v1/quick-mode/limits", response_model=ObjectResponse)
+    def quick_mode_limits(actor=Depends(current_actor)):
+        del actor
+        workers = context.worker_registry.names() if context.worker_registry is not None else []
+        return {"items": context.control_plane.jobs.quickmode_limits(workers)}
+
+    @app.put("/api/v1/quick-mode/limits/{worker}", response_model=ObjectResponse)
+    def update_quick_mode_limit(worker: str, body: dict[str, Any], actor=Depends(current_actor)):
+        del actor
+        names = context.worker_registry.names() if context.worker_registry is not None else []
+        if worker not in names:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        try:
+            limit = int(body.get("max_concurrent"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("INVALID_QUICKMODE_LIMIT", "max_concurrent harus berupa angka 1 sampai 32.", status_code=422) from exc
+        if not 1 <= limit <= 32:
+            raise DomainError("INVALID_QUICKMODE_LIMIT", "Batas Quick Mode harus antara 1 sampai 32.", status_code=422)
+        item = context.control_plane.set_quickmode_limit(worker, limit)
+        return item
+
+    @app.post("/api/v1/quick-mode/recover", response_model=ObjectResponse)
+    def recover_quick_mode(body: dict[str, Any], actor=Depends(current_actor)):
+        worker = str(body.get("worker") or "").strip().lower()
+        stage_id = str(body.get("stage_job_id") or "").strip()
+        resume_phase = str(body.get("resume_phase") or "").strip().lower() or None
+        if resume_phase not in {None, "auto", "exporting", "downloading", "thumbnailing", "compressing", "uploading", "cleanup"}:
+            raise DomainError(
+                "INVALID_QUICK_PHASE",
+                "Fase recovery Quick Mode tidak dikenal.",
+                status_code=422,
+            )
+        if not worker or not stage_id:
+            raise DomainError(
+                "RECOVERY_TARGET_REQUIRED",
+                "Worker dan stage_job_id wajib diisi.",
+                status_code=422,
+            )
+        if context.worker_registry is not None and context.worker_registry.get(worker) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker recovery tidak ditemukan.", status_code=404)
+        jobs = context.control_plane.jobs.list(
+            kind="export", quick_mode=True, archived=False, offset=0, limit=1000
+        )
+        linked = None
+        for candidate in jobs:
+            retry = candidate.payload.get("quick_retry")
+            retry = retry if isinstance(retry, dict) else {}
+            candidate_stage = str(
+                retry.get("stage_job_id")
+                or candidate.id
+            ).strip()
+            if candidate_stage == stage_id and candidate.worker == worker:
+                linked = candidate
+                break
+        if linked is not None:
+            if not linked.status.terminal:
+                raise DomainError(
+                    "JOB_NOT_TERMINAL",
+                    "Folder Quick Mode sudah memiliki job aktif.",
+                    details={"job_id": linked.id, "message": f"Folder Quick Mode sedang diproses oleh job #{linked.id[:8]}."},
+                    status_code=409,
+                )
+            return {
+                "job": job_dict(
+                    context.control_plane.retry_job(
+                        actor,
+                        linked.id,
+                        resume_phase=resume_phase,
+                        single_phase=bool(body.get("single_phase")),
+                    )
+                ),
+                "imported": False,
+            }
+
+        scanner = getattr(context.worker_dispatcher, "quickmode_scan", None)
+        try:
+            response = scanner(worker) if callable(scanner) else {"items": []}
+        except Exception as exc:
+            raise DomainError("WORKER_OFFLINE", f"Worker recovery tidak tersedia: {exc}", status_code=503) from exc
+        item = next(
+            (value for value in response.get("items", []) if isinstance(value, dict) and str(value.get("stage_job_id")) == stage_id),
+            None,
+        )
+        if item is None:
+            raise DomainError("STAGING_NOT_FOUND", "Folder staging Quick Mode tidak ditemukan.", status_code=404)
+        profile = str(body.get("profile") or item.get("profile") or "").strip()
+        if not profile:
+            raise DomainError("PROFILE_REQUIRED", "Profile wajib dipilih untuk folder recovery ini.", status_code=422)
+        context.control_plane.require_profile(actor, profile)
+        has_upload_assets = bool(item.get("archive_parts", 0)) and bool(item.get("thumbnail_present"))
+        payload: dict[str, Any] = {
+            "quick_mode": True,
+            "quick_phase": resume_phase or "auto",
+            "quick_settings": context.utility_settings.get(),
+            "quick_retry": {
+                "retry_phase": resume_phase or "auto",
+                "resume_phase": resume_phase or "auto",
+                "single_phase": bool(body.get("single_phase")) and resume_phase not in {None, "", "auto", "exporting"},
+                "stage_job_id": stage_id,
+                "quick_operation_id": str(item.get("quick_operation_id") or stage_id),
+            },
+        }
+        for key in ("url", "chat_ref", "start_id", "label", "save_source", "use_url_message_id"):
+            if body.get(key) is not None:
+                payload[key] = body[key]
+        if (
+            not item.get("json_present")
+            and not item.get("actual_media_count")
+            and not has_upload_assets
+            and not payload.get("url")
+            and not payload.get("chat_ref")
+        ):
+            raise DomainError(
+                "RECOVERY_SOURCE_REQUIRED",
+                "Folder tidak memiliki JSON atau hasil upload lengkap. Berikan URL/chat ID untuk export ulang.",
+                status_code=422,
+            )
+        job = context.control_plane.submit_job(
+            actor,
+            "export",
+            payload,
+            profile=profile,
+            worker=worker,
+        )
+        return {"job": job_dict(job), "imported": True}
+
+    @app.post(
+        "/internal/v1/jobs/{job_id}/telegram-notifications",
+        include_in_schema=False,
+        dependencies=[Depends(require_service)],
+    )
+    def create_telegram_notification(job_id: str, body: dict[str, Any]):
+        job = context.control_plane.jobs.get(job_id)
+        if job is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        user_id = int(body.get("telegram_user_id") or 0)
+        chat_id = int(body.get("telegram_chat_id") or 0)
+        if user_id <= 0 or chat_id != user_id or user_id != job.actor_user_id:
+            raise DomainError(
+                "TELEGRAM_NOTIFICATION_FORBIDDEN",
+                "Notifikasi hanya dapat didaftarkan oleh actor pembuat job pada private chat.",
+                status_code=403,
+            )
+        notification = context.control_plane.jobs.create_telegram_notification(
+            job.id, user_id, chat_id, job.profile
+        )
+        return {"notification": notification, "job": job_dict(job)}
+
+    @app.get(
+        "/internal/v1/telegram-notifications/pending",
+        include_in_schema=False,
+        dependencies=[Depends(require_service)],
+    )
+    def pending_telegram_notifications(limit: int = Query(100, ge=1, le=500)):
+        items = []
+        for notification in context.control_plane.jobs.pending_telegram_notifications(limit):
+            job = context.control_plane.jobs.get(str(notification["job_id"]))
+            if job is not None:
+                items.append({"notification": notification, "job": job_dict(job)})
+        return {"items": items}
+
+    @app.patch(
+        "/internal/v1/telegram-notifications/{notification_id}",
+        include_in_schema=False,
+        dependencies=[Depends(require_service)],
+    )
+    def update_telegram_notification(notification_id: int, body: dict[str, Any]):
+        if str(body.get("status") or "") not in {
+            "",
+            "pending",
+            "terminal",
+            "deleted",
+            "failed",
+        }:
+            raise DomainError(
+                "INVALID_NOTIFICATION_STATUS",
+                "Status notifikasi tidak valid.",
+                status_code=422,
+            )
+        notification = context.control_plane.jobs.update_telegram_notification(
+            notification_id, body
+        )
+        if notification is None:
+            raise DomainError(
+                "NOTIFICATION_NOT_FOUND",
+                "Subscription notifikasi tidak ditemukan.",
+                status_code=404,
+            )
+        return {"notification": notification}
+
+    @app.get("/api/v1/jobs/{job_id}/events", response_model=JobEventListResponse)
+    def get_job_events(
+        job_id: str,
+        after_sequence: int = Query(0, ge=0),
+        actor=Depends(current_actor),
+    ):
+        _owned_job(context, actor, job_id)
+        return {
+            "items": [
+                event_dict(item)
+                for item in context.control_plane.jobs.events(
+                    job_id, after_sequence=after_sequence
+                )
+            ]
+        }
+
+    @app.get("/api/v1/jobs/{job_id}/log-snapshot", response_model=ObjectResponse)
+    def get_job_log_snapshot(job_id: str, actor=Depends(current_actor)):
+        job = _owned_job(context, actor, job_id)
+        if context.worker_dispatcher is not None:
+            try:
+                worker_log = _newest_first_log_response(
+                    context.worker_dispatcher.job_log(job.worker, job.id)
+                )
+                return {
+                    **worker_log,
+                    "source": "worker",
+                }
+            except Exception:
+                if job.status.value in {"queued", "dispatched", "running", "paused"}:
+                    raise DomainError(
+                        "JOB_LOG_UNAVAILABLE",
+                        "Snapshot log worker belum tersedia.",
+                        status_code=503,
+                    )
+        for event in reversed(context.control_plane.jobs.events(job.id)):
+            if (
+                event.event_type == "log.snapshot"
+                and isinstance(event.result, dict)
+                and isinstance(event.result.get("log"), dict)
+            ):
+                return {
+                    **_newest_first_log_response({"log": event.result["log"]}),
+                    "source": "history",
+                }
+        return {
+            "log": {
+                "lines": [],
+                "line_count": 0,
+                "truncated": False,
+                "order": "newest_first",
+            },
+            "source": "empty",
+        }
+
+    @app.post("/api/v1/jobs/{job_id}/cancel", response_model=JobResponse)
+    def cancel_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.cancel_job(actor, job_id))
+
+    @app.post("/api/v1/jobs/{job_id}/pause", response_model=JobResponse)
+    def pause_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.pause_job(actor, job_id))
+
+    @app.post("/api/v1/jobs/{job_id}/resume", response_model=JobResponse)
+    def resume_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.resume_job(actor, job_id))
+
+    @app.post("/api/v1/jobs/terminate-active", response_model=ObjectResponse)
+    def terminate_active_jobs(
+        scope: str = Query("current", pattern="^(current|global)$"),
+        profile: str | None = None,
+        kind: str | None = None,
+        quick_mode: bool | None = None,
+        actor=Depends(current_actor),
+    ):
+        selected_profile = None if scope == "global" else profile
+        return context.control_plane.terminate_active_jobs(
+            actor,
+            profile=selected_profile,
+            kind=kind,
+            quick_mode=quick_mode,
+        )
+
+    @app.post("/api/v1/jobs/{job_id}/retry", response_model=JobResponse)
+    def retry_job(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.retry_job(actor, job_id))
+
+    @app.post("/api/v1/jobs/{job_id}/archive", response_model=JobResponse)
+    def archive_job(job_id: str, actor=Depends(current_actor)):
+        _owned_job(context, actor, job_id)
+        return job_dict(context.control_plane.jobs.set_archived(job_id, True))
+
+    @app.post("/api/v1/jobs/{job_id}/restore", response_model=JobResponse)
+    def restore_job(job_id: str, actor=Depends(current_actor)):
+        _owned_job(context, actor, job_id)
+        return job_dict(context.control_plane.jobs.set_archived(job_id, False))
+
+    @app.delete("/api/v1/jobs/{job_id}", response_model=ObjectResponse)
+    def purge_job(job_id: str, actor=Depends(current_actor)):
+        _owned_job(context, actor, job_id)
+        return {"purged": context.control_plane.jobs.purge(job_id)}
+
+    @app.post(
+        "/internal/v1/jobs/{job_id}/events",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def worker_event(job_id: str, body: WorkerEventRequest):
+        try:
+            status = JobStatus(body.status)
+        except ValueError as exc:
+            raise DomainError(
+                "INVALID_JOB_STATUS", "Status job tidak valid.", status_code=422
+            ) from exc
+        event = JobEvent(
+            job_id=job_id,
+            sequence=body.sequence,
+            status=status,
+            event_type=body.event_type,
+            progress=body.progress,
+            result=body.result,
+            error=body.error,
+        )
+        if body.transient:
+            job, accepted = context.control_plane.update_worker_progress_result(event)
+        else:
+            before = len(context.control_plane.jobs.events(job_id))
+            job = context.control_plane.append_worker_event(event)
+            accepted = len(context.control_plane.jobs.events(job_id)) > before
+        return {"ok": True, "accepted": bool(accepted), "job": job_dict(job)}

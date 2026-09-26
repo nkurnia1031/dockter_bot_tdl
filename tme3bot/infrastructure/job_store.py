@@ -492,7 +492,7 @@ class SqliteJobRepository:
             )
             plan_row = db.execute(
                 """
-                SELECT p.*, j.worker, j.status, j.payload
+                SELECT p.*, j.worker, j.profile, j.status, j.payload
                 FROM job_execution_plans p JOIN jobs j ON j.id = p.job_id
                 WHERE p.job_id = ?
                 """,
@@ -508,12 +508,13 @@ class SqliteJobRepository:
             )
             worker_name = str(plan_row["worker"])
             if is_quick_mode:
-                # Keep one FIFO for every profile assigned to this worker.
-                # queue_info updates jobs.updated_at, so ordering must use the
-                # scheduler's own timestamp instead of the visible job row.
+                # Order with scheduler timestamps because queue_info updates
+                # jobs.updated_at. Preserve worker queue positions, but enforce
+                # FIFO only among jobs from one profile. A job blocked on that
+                # profile's TDL lease must not waste a slot another profile can use.
                 earlier = db.execute(
                     """
-                    SELECT p.job_id
+                    SELECT p.job_id, j.profile
                     FROM job_execution_plans p
                     JOIN jobs j ON j.id = p.job_id
                     WHERE j.worker = ? AND j.status = 'queued'
@@ -524,15 +525,19 @@ class SqliteJobRepository:
                     """,
                     (worker_name, job_id, str(plan_row["queued_at"] or now)),
                 ).fetchall()
-                if earlier:
-                    active_slots = int(
-                        db.execute(
-                            "SELECT COUNT(*) FROM job_quickmode_slots WHERE worker = ?",
-                            (worker_name,),
-                        ).fetchone()[0]
-                    )
-                    position = active_slots + len(earlier) + 1
-                    reason = "Menunggu giliran FIFO Quick Mode"
+                same_profile_earlier = any(
+                    str(item["profile"]) == str(plan_row["profile"])
+                    for item in earlier
+                )
+                active_slots = int(
+                    db.execute(
+                        "SELECT COUNT(*) FROM job_quickmode_slots WHERE worker = ?",
+                        (worker_name,),
+                    ).fetchone()[0]
+                )
+                position = active_slots + len(earlier) + 1
+                if same_profile_earlier:
+                    reason = "Menunggu giliran FIFO profile Quick Mode"
                     db.execute(
                         "UPDATE job_execution_plans SET blocked_reason = ? WHERE job_id = ?",
                         (reason, job_id),
@@ -546,14 +551,7 @@ class SqliteJobRepository:
                 slot = db.execute(
                     "SELECT 1 FROM job_quickmode_slots WHERE job_id = ?", (job_id,)
                 ).fetchone()
-                active_slots = int(
-                    db.execute(
-                        "SELECT COUNT(*) FROM job_quickmode_slots WHERE worker = ?",
-                        (worker_name,),
-                    ).fetchone()[0]
-                )
                 if slot is None and active_slots >= max_concurrent:
-                    position = active_slots + 1
                     reason = f"Batas Quick Mode worker tercapai ({active_slots}/{max_concurrent})"
                     db.execute(
                         "UPDATE job_execution_plans SET blocked_reason = ? WHERE job_id = ?",

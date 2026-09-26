@@ -3,10 +3,10 @@
 Panduan ini menjelaskan susunan komponen, batas tanggung jawab, aliran job,
 penyimpanan, keamanan, dan deployment tme3bot untuk maintainer dan developer.
 
-Peta komponen diverifikasi terhadap source pada branch `main`, commit
-`62c491c`, tanggal 26 September 2026. Bagian rekomendasi mencatat bahwa prioritas
-kendali concurrency Quick Mode sudah diterapkan pada source kerja saat ini.
-Source code adalah acuan utama jika perilaku implementasi berubah.
+Peta komponen diverifikasi terhadap source pada branch `main` dan worktree
+tanggal 26 September 2026. Prioritas kendali concurrency Quick Mode dan pemisahan
+modul fitur sudah diterapkan pada source kerja. Source code adalah acuan utama
+jika perilaku implementasi berubah.
 
 ## Gambaran sistem
 
@@ -56,11 +56,11 @@ runtime atau container Web di VPS tersebut.
 |---|---|
 | Web (`web/src`) | Halaman SvelteKit untuk Quick Mode, export, download, storage, utility, worker, dan activity. `lib/api.ts` memanggil public API backend. |
 | Frontend Telegram (`tme3bot/frontend/telegram`) | Polling Bot API, keyboard, panel, input user, dan penyajian status. Akses domain dilakukan melalui `BackendApiClient`. |
-| Backend API (`tme3bot/api/backend.py`) | Public API, endpoint internal, otorisasi, pemilihan target, katalog, dan pemetaan model ke response API. |
+| Backend API (`tme3bot/api/backend.py`, `tme3bot/api/routes/`) | Factory, middleware, autentikasi, dan registrasi route per fitur untuk job, source, download, utility, worker, storage, dan backup. |
 | Control plane (`tme3bot/application/control_plane.py`) | Use case job, lifecycle, retry/cancel, admission resource, dispatch ke worker, serta pemrosesan event. |
 | Domain (`tme3bot/domain`) | Model actor/job/event, error domain, status, dan aturan transisi job. |
 | Infrastructure (`tme3bot/infrastructure`) | Repository SQLite, auth, dan adapter HTTP untuk komunikasi dengan worker. |
-| Worker (`tme3bot/worker`) | API internal, antrean resource lokal, executor job, progress/event publisher, dan operasi domain tanpa dependency UI Telegram. |
+| Worker (`tme3bot/worker`) | API internal, antrean resource lokal, lifecycle executor, progress/event publisher, dan mixin operasi Quick Mode, download, utility, storage, backup, serta workspace tanpa dependency UI Telegram. |
 | Runtime dan service | `profiles.py` membangun runtime sesi per profile; `service.py`, `tdl.py`, `utility.py`, `rclone.py`, dan modul terkait mengerjakan operasi spesifik. |
 | Composition (`tme3bot/app.py`, `tme3bot/composition.py`) | Memilih dan menyambungkan dependency untuk role `backend`, `telegram`, atau `worker`. |
 
@@ -167,15 +167,18 @@ berada di direktori `tests/` serta `web/src`.
 
 ## Rekomendasi perbaikan
 
-Prioritas 1 di bawah sudah diterapkan pada source. Prioritas 2–4 tetap menjadi
-rekomendasi untuk pekerjaan berikutnya.
+Prioritas 1 dan 2 di bawah sudah diterapkan pada source. Prioritas 3 dan 4 tetap
+menjadi rekomendasi untuk pekerjaan berikutnya.
 
 ### Prioritas 1 — Kendali concurrency Quick Mode
 
 Quick Mode memiliki batas aktif yang dapat diatur per worker, dengan default 2
-dan rentang 1–32. Antrean FIFO berlaku lintas profile pada worker tersebut;
-job yang di-resume mendapat urutan berdasarkan waktu klik Resume. Monitor
-menampilkan kuota worker dan menyediakan Pause/Resume pada setiap job.
+dan rentang 1–32. Urutan antrean mengikuti waktu submit/Resume. FIFO dijaga
+dalam profile yang sama; job profile lain boleh memakai slot worker yang masih
+kosong saat job sebelumnya tertahan oleh resource profile-nya. Dengan begitu,
+download dari profile berbeda pada worker yang sama dapat berjalan bersamaan,
+selama total job aktif tidak melewati kuota worker. Monitor menampilkan kuota
+worker dan menyediakan Pause/Resume pada setiap job.
 
 Pause membekukan process group yang sedang dipakai job, mempertahankan heartbeat
 worker dan mengecualikan waktu jeda dari watchdog stall. Pause melepas slot
@@ -186,11 +189,17 @@ manifest Quick Mode.
 
 ### Prioritas 2 — Pecah modul orkestrasi besar
 
-`tme3bot/api/backend.py` dan `tme3bot/worker/executor.py` memuat banyak tanggung
-jawab dalam satu file. Pindahkan route dan handler per fitur ke modul terpisah,
-pertahankan `composition.py` sebagai wiring, serta gunakan port dan test yang
-ada untuk menjaga batas domain/application/infrastructure. Kerjakan bertahap
-agar perubahan mudah direview dan regresi dapat dilokalisasi.
+`tme3bot/api/backend.py` kini menjadi factory/middleware/auth dan composition
+root route. Route fitur berada pada `tme3bot/api/routes/` dalam modul `jobs`,
+`sources`, `downloads`, `utility`, `workers`, `storage`, dan `backups`.
+
+`tme3bot/worker/executor.py` mengoordinasikan antrean, lifecycle job, pause,
+telemetry, dan dispatch handler. Operasi Quick Mode, download/artifact, utility,
+storage, backup, dan workspace berada pada mixin fitur masing-masing di
+`tme3bot/worker/executor_*.py`; logging dan event bersama berada di
+`executor_support.py`. `WorkerJobExecutor` tetap menjadi facade yang dipakai
+composition. Kontrak route API dan payload job worker tidak berubah. Test API,
+worker, dan batas arsitektur menjaga perilaku serta pemisahan tanggung jawab.
 
 ### Prioritas 3 — Kontrak backend-worker
 
@@ -216,6 +225,6 @@ Quick Mode berlangsung bersamaan.
   `tme3bot/application/job_scheduler.py`,
   `tme3bot/infrastructure/job_store.py`.
 - API worker dan eksekusi job: `tme3bot/api/worker.py`,
-  `tme3bot/worker/executor.py`.
+  `tme3bot/worker/executor.py`, serta modul fitur `tme3bot/worker/executor_*.py`.
 - Kontrak domain dan integrasi frontend: `tme3bot/domain/models.py`,
-  `tme3bot/api/backend.py`, `tme3bot/frontend/client.py`, `web/src/lib/api.ts`.
+  `tme3bot/api/routes/`, `tme3bot/frontend/client.py`, `web/src/lib/api.ts`.

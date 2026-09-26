@@ -348,23 +348,10 @@ class ControlPlane:
         self._stale_cancel_requested.pop(job.id, None)
 
     def _dispatch_pending_jobs(self, profile: str | None = None) -> None:
-        list_profiles = getattr(self.profile_manager, "list_profiles", None)
-        profiles = [profile] if profile else (
-            list(list_profiles()) if callable(list_profiles) else []
-        )
-        if profile is None and not profiles:
-            queued_lister = getattr(self.jobs, "list_queued_for_scheduler", None)
-            queued_rows = (
-                queued_lister(limit=5000)
-                if callable(queued_lister)
-                else self.jobs.list(status=JobStatus.QUEUED.value, limit=200)
-            )
-            profiles = sorted(
-                {
-                    item.profile
-                    for item in queued_rows
-                }
-            )
+        # Always inspect the global FIFO. Releasing a slot or lease for one
+        # profile may make a job from another profile eligible on that worker.
+        del profile
+        profiles: list[str | None] = [None]
         for selected in profiles:
             queued_lister = getattr(self.jobs, "list_queued_for_scheduler", None)
             queued_jobs = (
