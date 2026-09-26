@@ -40,6 +40,9 @@ tme3bot/
 └── profiles.py           runtime profile dan kompatibilitas data lama
 ```
 
+Peta komponen, alur job, batas keamanan, penyimpanan, serta rekomendasi
+pengembangan tersedia di [Panduan Arsitektur Sistem](docs/ARSITEKTUR_SISTEM.md).
+
 ## Setup VPS utama
 
 ```bash
