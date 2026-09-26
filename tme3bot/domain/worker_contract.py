@@ -18,6 +18,7 @@ CAP_QUICKMODE_STAGING = "quickmode.staging.v1"
 CAP_QUICKMODE_SCAN = "quickmode.scan.v1"
 CAP_QUICKMODE_VERIFY = "quickmode.verify.v1"
 CAP_QUICKMODE_DELETE = "quickmode.delete.v1"
+CAP_TTS = "tts"
 
 WORKER_API_CAPABILITIES = frozenset(
     {

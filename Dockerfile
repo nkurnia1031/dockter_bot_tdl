@@ -13,4 +13,9 @@ FROM runtime-base AS gateway
 CMD ["python3", "/app/bot.py"]
 
 FROM runtime-base AS worker
+COPY requirements-tts.txt /app/requirements-tts.txt
+RUN python3 -m pip install --no-cache-dir -r /app/requirements-tts.txt \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends tor \
+    && rm -rf /var/lib/apt/lists/*
 CMD ["python3", "/app/bot.py"]

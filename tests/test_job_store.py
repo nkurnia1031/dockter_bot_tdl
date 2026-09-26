@@ -90,6 +90,98 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(len(store.events("job-1")), 3)
             self.assertEqual(store.pending_telegram_notifications()[0]["job_id"], "job-1")
 
+    def test_tts_delivery_outbox_survives_restart_and_hides_artifact_ref_from_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.db"
+            store = SqliteJobRepository(path)
+            job = Job(
+                id="tts-job-1",
+                kind="tts",
+                profile="default",
+                actor_user_id=7,
+                worker="tts-ready",
+                status=JobStatus.QUEUED,
+                payload={"title": "Judul", "character_count": 16},
+            )
+            store.create(job)
+            store.append_event(JobEvent(job.id, 1, JobStatus.DISPATCHED, "dispatched"))
+            store.append_event(JobEvent(job.id, 2, JobStatus.RUNNING, "started"))
+            artifact_ref = "a" * 48
+            store.create_tts_deliveries(
+                job.id,
+                job.worker,
+                "Judul",
+                [{"artifact_ref": artifact_ref, "part_index": 1, "total_parts": 1, "byte_size": 512}],
+            )
+
+            reopened = SqliteJobRepository(path)
+            claimed = reopened.claim_tts_deliveries(limit=1)
+            self.assertEqual(len(claimed), 1)
+            self.assertEqual(claimed[0]["job_id"], job.id)
+            self.assertNotIn("artifact_ref", claimed[0])
+            self.assertEqual(reopened.get_tts_delivery(claimed[0]["id"])["artifact_ref"], artifact_ref)
+            reopened.complete_tts_delivery(claimed[0]["id"], delivered=True)
+            replacement_ref = "b" * 48
+            reopened.create_tts_deliveries(
+                job.id,
+                job.worker,
+                "Judul",
+                [{"artifact_ref": replacement_ref, "part_index": 1, "total_parts": 1, "byte_size": 512}],
+            )
+            confirmed = reopened.get_tts_delivery(claimed[0]["id"])
+            self.assertEqual(confirmed["status"], "delivered")
+            self.assertEqual(confirmed["artifact_ref"], artifact_ref)
+            self.assertEqual(
+                reopened.tts_delivery_summary(job.id),
+                {"total_parts": 1, "delivered_parts": 1, "cancelled_parts": 0},
+            )
+
+    def test_tts_telegram_readiness_expires_after_service_stops_heartbeating(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            self.assertFalse(store.tts_telegram_ready())
+            store.set_tts_telegram_ready(True)
+            self.assertTrue(store.tts_telegram_ready())
+
+    def test_tts_delivery_retry_keeps_parts_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            job = Job(
+                id="tts-order-1",
+                kind="tts",
+                profile="default",
+                actor_user_id=7,
+                worker="tts-ready",
+                status=JobStatus.QUEUED,
+                payload={"title": "Judul", "character_count": 16},
+            )
+            store.create(job)
+            store.append_event(JobEvent(job.id, 1, JobStatus.DISPATCHED, "dispatched"))
+            store.append_event(JobEvent(job.id, 2, JobStatus.RUNNING, "started"))
+            store.create_tts_deliveries(
+                job.id,
+                job.worker,
+                "Judul",
+                [
+                    {"artifact_ref": "a" * 48, "part_index": 1, "total_parts": 2, "byte_size": 512},
+                    {"artifact_ref": "b" * 48, "part_index": 2, "total_parts": 2, "byte_size": 512},
+                ],
+            )
+            first = store.claim_tts_deliveries(limit=1)[0]
+            store.complete_tts_delivery(first["id"], delivered=False)
+            self.assertEqual(store.claim_tts_deliveries(limit=1), [])
+
+            with store._db() as db:
+                db.execute(
+                    "UPDATE job_tts_deliveries SET available_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), first["id"]),
+                )
+            retried = store.claim_tts_deliveries(limit=1)
+            self.assertEqual(retried[0]["part_index"], 1)
+            store.complete_tts_delivery(retried[0]["id"], delivered=True)
+            second = store.claim_tts_deliveries(limit=1)
+            self.assertEqual(second[0]["part_index"], 2)
+
     def test_transient_progress_keeps_only_latest_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")

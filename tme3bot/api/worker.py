@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Depends, FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from tme3bot.api.schemas import WorkerJobRequest
 from tme3bot.domain.models import DomainError
-from tme3bot.domain.worker_contract import worker_contract_metadata
+from tme3bot.domain.worker_contract import CAP_TTS, worker_contract_metadata
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -63,7 +63,24 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
 
     @app.get("/internal/v1/capabilities", dependencies=[Depends(authorize)])
     def capabilities():
-        return {**context.executor.capabilities(), **worker_contract_metadata()}
+        details = context.executor.capabilities()
+        contract = worker_contract_metadata()
+        capabilities = list(contract["capabilities"])
+        if details.get("tts"):
+            capabilities.append(CAP_TTS)
+        contract["capabilities"] = sorted(set(capabilities))
+        return {**details, **contract}
+
+    @app.get(
+        "/internal/v1/tts/artifacts/{job_id}/{artifact_ref}",
+        dependencies=[Depends(authorize)],
+        include_in_schema=False,
+    )
+    def tts_artifact(job_id: str, artifact_ref: str):
+        path = context.executor.tts_artifact_path(job_id, artifact_ref)
+        if path is None:
+            raise DomainError("TTS_ARTIFACT_NOT_FOUND", "Audio artifact tidak ditemukan.", status_code=404)
+        return FileResponse(path, media_type="audio/mpeg", filename=path.name)
 
     @app.get("/internal/v1/workspace/tree", dependencies=[Depends(authorize)])
     def workspace_tree(path: str = Query("/workspace", min_length=1, max_length=4096)):

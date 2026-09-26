@@ -7,7 +7,7 @@
   import RequestIndicator from './RequestIndicator.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
-    LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, Users, Wrench, Zap
+    LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, Users, Volume2, Wrench, Zap
   } from '@lucide/svelte';
 
   let { children } = $props();
@@ -17,6 +17,7 @@
     { href: '/', label: 'Ringkasan', icon: LayoutDashboard },
     { href: '/exports/', label: 'Export', icon: FileDown },
     { href: '/quick-mode/', label: 'Quick Mode', icon: Zap },
+    { href: '/tts/', label: 'TTS Novel', icon: Volume2 },
     { href: '/downloads/', label: 'Download', icon: Download },
     { href: '/utility/', label: 'Utility', icon: Wrench },
     { href: '/storage/', label: 'Storage', icon: HardDrive },

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
+import urllib.error
+import urllib.request
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -67,6 +69,48 @@ class BackendApiClient:
             "PATCH",
             f"/internal/v1/telegram-notifications/{int(notification_id)}",
             values,
+        )
+
+    def pending_tts_deliveries(self, limit: int = 10) -> dict[str, Any]:
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "GET",
+            f"/internal/v1/tts/deliveries/pending?limit={max(1, min(int(limit), 100))}",
+        )
+
+    def set_tts_telegram_readiness(self, ready: bool) -> dict[str, Any]:
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "POST",
+            "/internal/v1/tts/telegram-readiness",
+            {"ready": bool(ready)},
+        )
+
+    def tts_delivery_audio(self, delivery_id: str) -> bytes:
+        request = urllib.request.Request(
+            self.base_url
+            + f"/internal/v1/tts/deliveries/{quote(delivery_id, safe='')}/audio",
+            headers={
+                "Authorization": f"Bearer {self.frontend_service_token}",
+                "Accept": "audio/mpeg",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.read()
+        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+            raise RuntimeError("Audio TTS belum dapat diambil.") from exc
+
+    def complete_tts_delivery(self, delivery_id: str, *, delivered: bool) -> dict[str, Any]:
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "PATCH",
+            f"/internal/v1/tts/deliveries/{quote(delivery_id, safe='')}",
+            {"delivered": bool(delivered)},
         )
 
     def me(self, telegram_user_id: int) -> dict[str, Any]:

@@ -346,6 +346,11 @@ class WorkerJobRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class TtsJobRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=100_000)
+
+
 class WorkerEventRequest(BaseModel):
     sequence: int
     status: str

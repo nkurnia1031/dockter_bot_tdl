@@ -42,6 +42,7 @@ class FakeDispatcher:
     def __init__(self):
         self.commands = []
         self.storage_available = True
+        self.tts_ready = False
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
         self.quick_deletions = []
@@ -49,6 +50,9 @@ class FakeDispatcher:
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
         return {"position": 1}
+
+    def capabilities(self, worker):
+        return {"capabilities": ["tts"] if self.tts_ready else []}
 
     def cancel(self, worker, job_id):
         return True
@@ -1177,6 +1181,110 @@ class BackendApiTests(unittest.TestCase):
             f"/api/v1/storage/items/{item.id}", headers=headers
         )
         self.assertEqual(trashed.json()["status"], "trashed")
+
+    def test_tts_submission_and_delivery_metadata_hide_text_and_artifact_refs(self):
+        self.dispatcher.tts_ready = True
+        self.jobs.set_tts_telegram_ready(True)
+        headers = self.login()
+        secret_text = "Teks rahasia untuk audio ini"
+        marker = "PRIVATE-NOVEL-TEXT-"
+        too_long = marker * 5_556
+        invalid_length = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": too_long},
+        )
+        self.assertEqual(invalid_length.status_code, 422)
+        self.assertNotIn(marker, invalid_length.text)
+        invalid_type = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": {"private": marker}},
+        )
+        self.assertEqual(invalid_type.status_code, 422)
+        self.assertNotIn(marker, invalid_type.text)
+
+        unauthorized = self.client.post(
+            "/api/v1/tts/jobs",
+            json={"title": "Bab rahasia", "text": secret_text},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+
+        created = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab rahasia", "text": secret_text},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        job = created.json()
+        self.assertEqual(job["kind"], "tts")
+        self.assertEqual(job["payload"], {"title": "Bab rahasia", "character_count": len(secret_text)})
+        self.assertNotIn(secret_text, created.text)
+        internal_command = self.dispatcher.commands[-1][1]
+        self.assertEqual(internal_command["payload"]["text"], secret_text)
+
+        artifact_ref = "a" * 48
+        registered = self.client.post(
+            "/internal/v1/tts/artifacts/ready",
+            headers={"Authorization": "Bearer internal"},
+            json={
+                "job_id": job["id"],
+                "worker": "local",
+                "parts": [{
+                    "artifact_ref": artifact_ref,
+                    "part_index": 1,
+                    "total_parts": 1,
+                    "byte_size": 512,
+                }],
+            },
+        )
+        self.assertEqual(registered.status_code, 200, registered.text)
+        self.assertNotIn(artifact_ref, registered.text)
+        self.assertEqual(
+            self.client.post(
+                "/internal/v1/tts/artifacts/ready",
+                json={"job_id": job["id"], "worker": "local", "parts": []},
+            ).status_code,
+            401,
+        )
+
+        service_headers = {"Authorization": "Bearer frontend"}
+        pending = self.client.get(
+            "/internal/v1/tts/deliveries/pending", headers=service_headers
+        )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        pending_json = pending.json()
+        self.assertEqual(len(pending_json["items"]), 1)
+        self.assertNotIn(artifact_ref, pending.text)
+        self.assertNotIn(secret_text, pending.text)
+        self.assertNotIn("chat_id", pending.text.lower())
+
+        public_job = self.client.get(
+            f"/api/v1/jobs/{job['id']}", headers=headers
+        )
+        public_events = self.client.get(
+            f"/api/v1/jobs/{job['id']}/events", headers=headers
+        )
+        self.assertNotIn(secret_text, public_job.text + public_events.text)
+        self.assertNotIn(artifact_ref, public_job.text + public_events.text)
+        self.assertNotIn("chat_id", (public_job.text + public_events.text).lower())
+
+    def test_tts_requires_telegram_readiness_and_ready_worker(self):
+        headers = self.login()
+        not_ready = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": "Teks"},
+        )
+        self.assertEqual(not_ready.status_code, 503)
+        self.jobs.set_tts_telegram_ready(True)
+        no_worker = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": "Teks"},
+        )
+        self.assertEqual(no_worker.status_code, 503)
+        self.assertEqual(no_worker.json()["error"]["code"], "TTS_WORKER_UNAVAILABLE")
 
 
 if __name__ == "__main__":

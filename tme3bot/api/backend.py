@@ -247,12 +247,20 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
+        errors = exc.errors()
+        if request.url.path == "/api/v1/tts/jobs":
+            # Pydantic versions that include the rejected input in error
+            # details must not echo the submitted novel text to the browser.
+            errors = [
+                {key: value for key, value in error.items() if key != "input"}
+                for error in errors
+            ]
         return _error(
             request,
             "VALIDATION_ERROR",
             "Payload request tidak valid.",
             status_code=422,
-            details={"errors": exc.errors()},
+            details={"errors": errors},
         )
 
     @app.exception_handler(PermissionError)
@@ -695,6 +703,17 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         current_actor=current_actor,
         job_dict=job_dict,
         verify_target=verify_target,
+    )
+
+
+    from tme3bot.api.routes.tts import register_tts
+    register_tts(
+        app,
+        context,
+        current_actor=current_actor,
+        job_dict=job_dict,
+        require_internal=require_internal,
+        require_service=require_service,
     )
 
 

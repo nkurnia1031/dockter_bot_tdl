@@ -38,6 +38,9 @@ class FakeDispatcher:
         del worker, job_id, event_sequence_start
         return self.resume_result
 
+    def capabilities(self, worker):
+        return {"tts": worker == "tts-ready", "capabilities": ["tts"] if worker == "tts-ready" else []}
+
 
 class FailingDispatcher(FakeDispatcher):
     def dispatch(self, worker, command):
@@ -110,6 +113,64 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(DomainError) as route_error:
             self.control.set_worker_route(self.actor, "local")
         self.assertEqual(route_error.exception.code, "WORKER_DISABLED")
+
+    def test_tts_routes_to_least_loaded_capable_worker_and_round_robins_ties(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "tts-workers.json",
+            {
+                "tts-ready": "http://worker-a",
+                "remote": "http://worker-b",
+                "tts-off": "http://worker-c",
+            },
+            {"tts-ready": "a", "remote": "b", "tts-off": "c"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda worker: {
+            "tts": worker in {"tts-ready", "remote"},
+            "capabilities": ["tts"] if worker in {"tts-ready", "remote"} else [],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+
+        jobs = [
+            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"}),
+            control.submit_job(self.actor, "tts", {"title": "B", "text": "private text"}),
+            control.submit_job(self.actor, "tts", {"title": "C", "text": "private text"}),
+        ]
+
+        self.assertEqual([job.worker for job in jobs], ["remote", "tts-ready", "remote"])
+        self.assertTrue(all(job.kind == "tts" for job in jobs))
+        self.assertNotIn("text", jobs[0].payload)
+        self.assertEqual(self.jobs.command_payload(jobs[0].id), {"title": "A", "text": "private text"})
+
+    def test_tts_worker_lane_admits_one_job_and_queues_another(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "single-tts-worker.json",
+            {"tts-ready": "http://worker-a"},
+            {"tts-ready": "a"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda worker: {"tts": True, "capabilities": ["tts"]}
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+
+        first = control.submit_job(self.actor, "tts", {"title": "A", "text": "one"})
+        second = control.submit_job(self.actor, "tts", {"title": "B", "text": "two"}, profile="archive")
+
+        self.assertEqual(first.status, JobStatus.DISPATCHED)
+        self.assertEqual(second.status, JobStatus.QUEUED)
+        self.assertEqual(first.worker, second.worker)
+        self.assertEqual(len(dispatcher.commands), 1)
+
+    def test_tts_rejects_workers_without_capability(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "no-tts-worker.json",
+            {"local": "http://worker"},
+            {"local": "a"},
+        )
+        control = ControlPlane(self.jobs, FakeDispatcher(), self.profiles, worker_registry=registry)
+        with self.assertRaises(DomainError) as error:
+            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+        self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
+        self.assertEqual(self.jobs.count(kind="tts"), 0)
 
     def test_same_kind_different_profiles_can_run_in_parallel(self):
         first = self.control.submit_job(

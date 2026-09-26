@@ -18,7 +18,7 @@
   const itemPercent = $derived(progress.item.percent);
   const activePercent = $derived(overallPercent ?? itemPercent);
   const speed = $derived(progress.transfer.speed_bps ? `${formatBytes(progress.transfer.speed_bps)}/dtk` : progress.transfer.speed_text || 'Menghitung...');
-  const headline = $derived(progress.batch.name || progress.item.name || progress.message);
+  const headline = $derived(job.kind === 'tts' ? job.payload?.title || progress.message : progress.batch.name || progress.item.name || progress.message);
   const elapsed = $derived(formatDuration(progress.elapsedSeconds ?? ((Date.now() - new Date(job.created_at).getTime()) / 1000)));
   const timing = $derived(job.progress?.timing || {});
   const observability = $derived(job.progress?.observability || {});
@@ -133,7 +133,7 @@
           {#if job.id}
             <span class="font-mono text-xs text-slate-500">#{job.id}</span>
           {/if}
-          <span class="badge running">{job.kind.replaceAll('_',' ')}</span>
+          <span class="badge running">{job.kind === 'tts' ? 'TTS' : job.kind.replaceAll('_',' ')}</span>
           {#if stageId}
             <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300">📁 Folder: {stageId}</span>
           {/if}

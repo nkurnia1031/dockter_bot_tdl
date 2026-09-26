@@ -104,7 +104,10 @@ export function phaseLabel(value: string): string {
     processing_json: 'Memproses JSON',
     cleanup: 'Membersihkan staging',
     completed: 'Selesai',
-    starting: 'Memulai'
+    starting: 'Memulai',
+    synthesizing: 'Membuat audio',
+    merging: 'Menggabungkan audio',
+    telegram_delivery: 'Mengirim ke Telegram'
   };
   return labels[value] || value.replaceAll('_', ' ');
 }

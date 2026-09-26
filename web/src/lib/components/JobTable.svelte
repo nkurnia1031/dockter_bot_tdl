@@ -141,17 +141,18 @@
   }
   async function retry(job: Job) {
     const quick = Boolean(job.payload?.quick_mode);
-    if (job.status === 'succeeded' && !window.confirm(quick ? 'Jalankan ulang Quick Mode dari export awal?' : 'Jalankan ulang export dari awal?')) return;
+    const tts = job.kind === 'tts';
+    if (job.status === 'succeeded' && !window.confirm(tts ? 'Kirim ulang audio TTS ke chat tujuan?' : quick ? 'Jalankan ulang Quick Mode dari export awal?' : 'Jalankan ulang export dari awal?')) return;
     retrying = { ...retrying, [job.id]: true };
     try {
-      await post(`/jobs/${encodeURIComponent(job.id)}/retry`);
+      await post(tts ? `/tts/jobs/${encodeURIComponent(job.id)}/retry` : `/jobs/${encodeURIComponent(job.id)}/retry`);
       toastMessage = job.status === 'succeeded'
-        ? (quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
-        : (quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
+        ? (tts ? 'Kirim ulang TTS masuk antrean.' : quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
+        : (tts ? 'Retry TTS masuk antrean.' : quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
       toastOpen = true;
       await load();
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Retry export gagal dibuat.';
+      error = cause instanceof Error ? cause.message : 'Retry job gagal dibuat.';
     } finally {
       const next = { ...retrying };
       delete next[job.id];
@@ -162,7 +163,7 @@
     jobActionPending = { ...jobActionPending, [job.id]: true };
     try {
       await post(`/jobs/${encodeURIComponent(job.id)}/${job.status === 'paused' ? 'resume' : 'pause'}`);
-      toastMessage = job.status === 'paused' ? 'Job masuk kembali ke antrean.' : 'Job Quick Mode dijeda.';
+      toastMessage = job.status === 'paused' ? 'Job masuk kembali ke antrean.' : job.kind === 'tts' ? 'TTS akan dijeda setelah batch aktif selesai.' : 'Job Quick Mode dijeda.';
       toastOpen = true;
       await load();
     } catch (cause) {
@@ -263,7 +264,7 @@
       <div class="mb-3 flex items-center justify-between"><h3 class="font-extrabold">Sedang berjalan</h3><span class="badge running">{activeJobs.length} aktif / antre</span></div>
       <div class="space-y-2.5">
         {#each activeJobs as job (job.id)}
-          <JobProgressCard job={job} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)} onPauseToggle={quickMode && job.payload?.quick_mode ? () => togglePause(job) : undefined} actionPending={Boolean(jobActionPending[job.id])}/>
+          <JobProgressCard job={job} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)} onPauseToggle={(job.kind === 'tts' || (quickMode && job.payload?.quick_mode)) ? () => togglePause(job) : undefined} actionPending={Boolean(jobActionPending[job.id])}/>
         {/each}
       </div>
     </div>
@@ -279,7 +280,7 @@
             {#if job.id}
               <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
             {/if}
-            <b class="capitalize">{job.kind.replaceAll('_',' ')}</b>
+            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind.replaceAll('_',' ')}</b>
             {#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}
             {#if stageId}
               <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {String(stageId).slice(0, 8)}</span>
@@ -293,7 +294,7 @@
           <small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small>
           <button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button>
           <button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>
-          {#if retryable && job.kind === 'export' && ['failed','cancelled','succeeded'].includes(job.status)}
+          {#if retryable && ['export','tts'].includes(job.kind) && ['failed','cancelled','succeeded'].includes(job.status)}
             <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>{job.status === 'succeeded' ? 'Jalankan lagi' : 'Retry'}</button>
           {/if}
         </div>

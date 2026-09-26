@@ -93,6 +93,15 @@ class AppConfig:
     web_public_origin: str = ""
     web_cookie_secret: str = ""
     web_cookie_secure: bool = True
+    tts_helper_urls: tuple[str, ...] = ()
+    tts_tor_control_hosts: tuple[str, ...] = ()
+    tts_tor_control_ports: tuple[int, ...] = ()
+    tts_tor_control_password: str = ""
+    tts_data_root: Path = Path("/data/tts")
+    tts_part_retries: int = 4
+    tts_retry_base_seconds: float = 2.0
+    tts_newnym_after_retries: int = 3
+    telegram_tts_chat_id: str = ""
 
     def validate_runtime(self) -> None:
         """Fail fast when a production role is missing its trust boundary."""
@@ -322,6 +331,32 @@ class AppConfig:
             web_cookie_secret=os.getenv("WEB_COOKIE_SECRET", "").strip(),
             web_cookie_secure=os.getenv("WEB_COOKIE_SECURE", "true").strip().lower()
             not in {"0", "false", "no", "off"},
+            tts_helper_urls=tuple(
+                value.strip().rstrip("/")
+                for value in os.getenv(
+                    "TTS_HELPER_URLS",
+                    "http://tts-1:8090,http://tts-2:8090,http://tts-3:8090",
+                ).split(",")
+                if value.strip()
+            ),
+            tts_tor_control_hosts=tuple(
+                value.strip()
+                for value in os.getenv(
+                    "TTS_TOR_CONTROL_HOSTS", "tts-1,tts-2,tts-3"
+                ).split(",")
+                if value.strip()
+            ),
+            tts_tor_control_ports=tuple(
+                int(value.strip())
+                for value in os.getenv("TTS_TOR_CONTROL_PORTS", "9051,9051,9051").split(",")
+                if value.strip()
+            ),
+            tts_tor_control_password=os.getenv("TTS_TOR_CONTROL_PASSWORD", ""),
+            tts_data_root=Path(os.getenv("TTS_DATA_ROOT", "/data/tts")),
+            tts_part_retries=max(0, int(os.getenv("TTS_PART_RETRIES", "4"))),
+            tts_retry_base_seconds=max(0.1, float(os.getenv("TTS_RETRY_BASE_SECONDS", "2"))),
+            tts_newnym_after_retries=max(1, int(os.getenv("TTS_NEWNYM_AFTER_RETRIES", "3"))),
+            telegram_tts_chat_id=os.getenv("TELEGRAM_TTS_CHAT_ID", "").strip(),
         )
 
 

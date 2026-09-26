@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -9,6 +11,16 @@ class FakeExecutor:
     def __init__(self):
         self.commands = []
         self.deleted_stages = []
+        self.tts_ready = False
+        self.artifact_file = None
+
+    def capabilities(self):
+        return {"profiles": ["default"], "tts": self.tts_ready}
+
+    def tts_artifact_path(self, job_id, artifact_ref):
+        if job_id == "job-tts" and artifact_ref == "a" * 48:
+            return self.artifact_file
+        return None
 
     def enqueue(self, command):
         self.commands.append(command)
@@ -55,9 +67,15 @@ class WorkerApiTests(unittest.TestCase):
     def setUp(self):
         config = type("Config", (), {"worker_api_token": "worker-secret"})()
         self.executor = FakeExecutor()
+        self.temp = tempfile.TemporaryDirectory()
+        self.executor.artifact_file = Path(self.temp.name) / ("artifact-" + "a" * 48 + ".mp3")
+        self.executor.artifact_file.write_bytes(b"audio")
         self.client = TestClient(
             create_worker_app(WorkerContext(config, self.executor))
         )
+
+    def tearDown(self):
+        self.temp.cleanup()
 
     def test_worker_requires_token_and_accepts_frontend_neutral_job(self):
         payload = {
@@ -83,6 +101,28 @@ class WorkerApiTests(unittest.TestCase):
     def test_worker_has_no_openapi_surface(self):
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 404)
+
+    def test_tts_capability_is_dynamic_and_audio_route_is_internal(self):
+        denied_capability = self.client.get("/internal/v1/capabilities")
+        self.assertEqual(denied_capability.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        capabilities = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertNotIn("tts", capabilities.json()["capabilities"])
+
+        self.executor.tts_ready = True
+        ready = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertIn("tts", ready.json()["capabilities"])
+
+        denied_audio = self.client.get(
+            f"/internal/v1/tts/artifacts/job-tts/{'a' * 48}"
+        )
+        self.assertEqual(denied_audio.status_code, 401)
+        audio = self.client.get(
+            f"/internal/v1/tts/artifacts/job-tts/{'a' * 48}", headers=headers
+        )
+        self.assertEqual(audio.status_code, 200)
+        self.assertEqual(audio.content, b"audio")
+        self.assertIn("artifact-", audio.headers["content-disposition"])
 
     def test_worker_preserves_event_sequence_start_for_reused_job_ids(self):
         payload = {

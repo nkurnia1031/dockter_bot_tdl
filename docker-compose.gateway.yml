@@ -47,3 +47,63 @@ services:
     volumes:
       - ${LOCAL_WORKER_DATA_ROOT:-/srv/tme3bot/worker-local}:/data
       - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}
+
+  tts-1:
+    image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
+    command: ["python3", "-m", "tme3bot.worker.tts_helper"]
+    profiles: ["tts"]
+    restart: unless-stopped
+    expose: ["8090", "9051"]
+    environment:
+      TTS_TOR_DATA_DIR: /tmp/tor-data
+      HTTP_PROXY: socks5h://127.0.0.1:9050
+      HTTPS_PROXY: socks5h://127.0.0.1:9050
+      http_proxy: socks5h://127.0.0.1:9050
+      https_proxy: socks5h://127.0.0.1:9050
+      NO_PROXY: 127.0.0.1,localhost
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/readyz', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+  tts-2:
+    image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
+    command: ["python3", "-m", "tme3bot.worker.tts_helper"]
+    profiles: ["tts"]
+    restart: unless-stopped
+    expose: ["8090", "9051"]
+    environment:
+      TTS_TOR_DATA_DIR: /tmp/tor-data
+      HTTP_PROXY: socks5h://127.0.0.1:9050
+      HTTPS_PROXY: socks5h://127.0.0.1:9050
+      http_proxy: socks5h://127.0.0.1:9050
+      https_proxy: socks5h://127.0.0.1:9050
+      NO_PROXY: 127.0.0.1,localhost
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/readyz', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 90s
+
+  tts-3:
+    image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
+    command: ["python3", "-m", "tme3bot.worker.tts_helper"]
+    profiles: ["tts"]
+    restart: unless-stopped
+    expose: ["8090", "9051"]
+    environment:
+      TTS_TOR_DATA_DIR: /tmp/tor-data
+      HTTP_PROXY: socks5h://127.0.0.1:9050
+      HTTPS_PROXY: socks5h://127.0.0.1:9050
+      http_proxy: socks5h://127.0.0.1:9050
+      https_proxy: socks5h://127.0.0.1:9050
+      NO_PROXY: 127.0.0.1,localhost
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/readyz', timeout=2).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 90s

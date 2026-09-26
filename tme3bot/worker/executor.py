@@ -98,6 +98,7 @@ from .executor_backup import BackupExecutorMixin
 from .executor_downloads import DownloadExecutorMixin
 from .executor_quickmode import QuickModeExecutorMixin
 from .executor_storage import StorageExecutorMixin
+from .executor_tts import TtsExecutorMixin
 from .executor_utility import UtilityExecutorMixin
 from .executor_workspace import WorkspaceExecutorMixin
 
@@ -106,6 +107,7 @@ class WorkerJobExecutor(
     DownloadExecutorMixin,
     UtilityExecutorMixin,
     StorageExecutorMixin,
+    TtsExecutorMixin,
     BackupExecutorMixin,
     WorkspaceExecutorMixin,
 ):
@@ -402,7 +404,7 @@ class WorkerJobExecutor(
             interrupt("utility", utility_runner.cancel_current)
         # An active Quick Mode job is cancellable even when its current phase
         # has no subprocess (for example while resolving a Telegram result).
-        return bool(cancelled or quick_active or kind in {"export", "backup_node"})
+        return bool(cancelled or quick_active or kind in {"export", "backup_node", "tts"})
 
     def pause(self, job_id: str) -> bool:
         target = str(job_id)
@@ -437,6 +439,10 @@ class WorkerJobExecutor(
             if pause_event.is_set():
                 return True
             pause_event.set()
+            tts_active = active[1] == "tts"
+        if tts_active:
+            # TTS acknowledges pause after its current three-request batch.
+            return True
         self._set_job_process_paused(target, True)
         phase = self._quick_terminal_phase(command, "running")
         try:
@@ -544,11 +550,17 @@ class WorkerJobExecutor(
                 storage_available = Path(runtime_config.tdl_export_storage).exists()
             except Exception:
                 storage_available = False
+        tts_ready = False
+        try:
+            tts_ready = self._tts_pipeline().ready()
+        except Exception:
+            tts_ready = False
         return {
             "profiles": profiles,
             "storage_profile": storage_profile,
             "storage_profile_available": storage_available,
             "workspace": Path(getattr(self.config, "utility_workspace_root", "/workspace")).is_dir(),
+            "tts": tts_ready,
         }
 
     def _unhandled_resource(self, command: dict[str, Any], exc: Exception) -> None:
@@ -925,7 +937,7 @@ class WorkerJobExecutor(
             if not is_paused:
                 return
             self._set_job_process_paused(job_id, True)
-            pause_event.wait(timeout=1.0)
+            time.sleep(0.25)
 
     def _command_callback(self):
         return getattr(self._job_log, "audit", None)
@@ -1013,6 +1025,7 @@ class WorkerJobExecutor(
             "utility": self._utility,
             "storage_upload": self._storage_upload,
             "backup_node": self._backup,
+            "tts": self._tts,
         }
         handler = handlers.get(kind)
         if handler is None:

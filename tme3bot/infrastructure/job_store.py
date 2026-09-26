@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -162,6 +163,32 @@ class SqliteJobRepository:
                 );
                 CREATE INDEX IF NOT EXISTS job_telegram_notifications_pending
                     ON job_telegram_notifications(status, terminal_notified_at);
+                CREATE TABLE IF NOT EXISTS job_tts_deliveries (
+                    id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    artifact_ref TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    part_index INTEGER NOT NULL,
+                    total_parts INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    available_at TEXT NOT NULL,
+                    lease_until TEXT,
+                    delivered_at TEXT,
+                    last_error_code TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(job_id, part_index),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS job_tts_deliveries_pending
+                    ON job_tts_deliveries(status, available_at, lease_until);
+                CREATE TABLE IF NOT EXISTS tts_service_health (
+                    service TEXT PRIMARY KEY,
+                    ready INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             columns = {
@@ -489,6 +516,169 @@ class SqliteJobRepository:
                 (*updates.values(), int(notification_id)),
             )
         return self.telegram_notification(notification_id)
+
+    def create_tts_deliveries(
+        self, job_id: str, worker: str, title: str, parts: list[dict[str, Any]]
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for item in parts:
+                part_index = int(item["part_index"])
+                db.execute(
+                    """
+                    INSERT INTO job_tts_deliveries(
+                        id, job_id, worker, title, artifact_ref, byte_size,
+                        part_index, total_parts, status, attempts, available_at,
+                        lease_until, delivered_at, last_error_code, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, NULL, ?)
+                    ON CONFLICT(job_id, part_index) DO UPDATE SET
+                        worker = excluded.worker,
+                        title = excluded.title,
+                        artifact_ref = CASE WHEN job_tts_deliveries.status = 'delivered' THEN job_tts_deliveries.artifact_ref ELSE excluded.artifact_ref END,
+                        byte_size = CASE WHEN job_tts_deliveries.status = 'delivered' THEN job_tts_deliveries.byte_size ELSE excluded.byte_size END,
+                        total_parts = excluded.total_parts,
+                        status = CASE WHEN job_tts_deliveries.status = 'delivered' THEN 'delivered' ELSE 'pending' END,
+                        available_at = excluded.available_at,
+                        lease_until = NULL,
+                        last_error_code = NULL
+                    """,
+                    (
+                        secrets.token_hex(16),
+                        job_id,
+                        str(worker),
+                        str(title)[:200],
+                        str(item["artifact_ref"]),
+                        max(1, int(item["byte_size"])),
+                        part_index,
+                        int(item["total_parts"]),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+            row = db.execute(
+                "SELECT COUNT(*) FROM job_tts_deliveries WHERE job_id = ? AND status != 'cancelled'",
+                (job_id,),
+            ).fetchone()
+        return int(row[0])
+
+    def claim_tts_deliveries(
+        self, limit: int = 10, lease_seconds: int = 180
+    ) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        lease_until = (now + timedelta(seconds=max(30, int(lease_seconds)))).isoformat()
+        claimed: list[dict[str, Any]] = []
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                """
+                SELECT d.id FROM job_tts_deliveries d
+                JOIN jobs j ON j.id = d.job_id
+                  WHERE j.status IN ('dispatched', 'running')
+                    AND d.status IN ('pending', 'claimed')
+                    AND d.available_at <= ?
+                    AND (d.lease_until IS NULL OR d.lease_until <= ?)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM job_tts_deliveries earlier
+                        WHERE earlier.job_id = d.job_id
+                          AND earlier.part_index < d.part_index
+                          AND earlier.status != 'delivered'
+                    )
+                  ORDER BY d.created_at, d.part_index LIMIT ?
+                """,
+                (now.isoformat(), now.isoformat(), max(1, min(int(limit), 100))),
+            ).fetchall()
+            for item in rows:
+                delivery_id = str(item["id"])
+                db.execute(
+                    "UPDATE job_tts_deliveries SET status = 'claimed', lease_until = ?, attempts = attempts + 1 WHERE id = ?",
+                    (lease_until, delivery_id),
+                )
+                row = db.execute(
+                    "SELECT id, job_id, title, part_index, total_parts, byte_size, attempts FROM job_tts_deliveries WHERE id = ?",
+                    (delivery_id,),
+                ).fetchone()
+                if row is not None:
+                    claimed.append(dict(row))
+        return claimed
+
+    def get_tts_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM job_tts_deliveries WHERE id = ?", (str(delivery_id),)
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def complete_tts_delivery(
+        self, delivery_id: str, *, delivered: bool
+    ) -> dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        with self._db() as db:
+            row = db.execute(
+                "SELECT attempts, status FROM job_tts_deliveries WHERE id = ?", (str(delivery_id),)
+            ).fetchone()
+            if row is None:
+                return None
+            if str(row["status"]) != "claimed":
+                pass
+            elif delivered:
+                db.execute(
+                    "UPDATE job_tts_deliveries SET status = 'delivered', lease_until = NULL, delivered_at = ?, last_error_code = NULL WHERE id = ?",
+                    (now.isoformat(), str(delivery_id)),
+                )
+            else:
+                delay = min(300, 2 ** min(int(row["attempts"]), 8))
+                db.execute(
+                    "UPDATE job_tts_deliveries SET status = 'pending', lease_until = NULL, available_at = ?, last_error_code = 'TELEGRAM_SEND_FAILED' WHERE id = ?",
+                    ((now + timedelta(seconds=delay)).isoformat(), str(delivery_id)),
+                )
+        return self.get_tts_delivery(delivery_id)
+
+    def tts_delivery_summary(self, job_id: str) -> dict[str, Any]:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered, SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled FROM job_tts_deliveries WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+        return {
+            "total_parts": int(row["total"] or 0),
+            "delivered_parts": int(row["delivered"] or 0),
+            "cancelled_parts": int(row["cancelled"] or 0),
+        }
+
+    def cancel_tts_deliveries(self, job_id: str) -> None:
+        with self._db() as db:
+            db.execute(
+                "UPDATE job_tts_deliveries SET status = 'cancelled', lease_until = NULL WHERE job_id = ? AND status != 'delivered'",
+                (str(job_id),),
+            )
+
+    def reset_tts_deliveries(self, job_id: str) -> None:
+        with self._db() as db:
+            db.execute("DELETE FROM job_tts_deliveries WHERE job_id = ?", (str(job_id),))
+
+    def set_tts_telegram_ready(self, ready: bool) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            db.execute(
+                "INSERT INTO tts_service_health(service, ready, updated_at) VALUES('telegram', ?, ?) ON CONFLICT(service) DO UPDATE SET ready = excluded.ready, updated_at = excluded.updated_at",
+                (1 if ready else 0, now),
+            )
+
+    def tts_telegram_ready(self, max_age_seconds: int = 90) -> bool:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT ready, updated_at FROM tts_service_health WHERE service = 'telegram'"
+            ).fetchone()
+        if row is None or not bool(row["ready"]):
+            return False
+        try:
+            updated = datetime.fromisoformat(str(row["updated_at"]))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return False
+        return (datetime.now(timezone.utc) - updated).total_seconds() <= max_age_seconds
 
     def try_acquire_execution(self, job_id: str) -> dict[str, Any]:
         """Acquire all keys or return a deterministic queue position."""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import io
 import threading
 import time
 from dataclasses import dataclass, field
@@ -92,6 +93,11 @@ class TelegramFrontendApp:
             target=self._resume_job_notifications,
             daemon=True,
             name="telegram-job-notification-resume",
+        ).start()
+        threading.Thread(
+            target=self._run_tts_delivery_loop,
+            daemon=True,
+            name="telegram-tts-delivery",
         ).start()
         LOGGER.info("Telegram frontend polling started")
         self.updater.idle()
@@ -1743,6 +1749,63 @@ class TelegramFrontendApp:
                     notification=notification,
                     update_panel=False,
                 )
+
+    def _run_tts_delivery_loop(self) -> None:
+        """Deliver durable TTS outbox entries using the Telegram process token."""
+        target_chat = str(self.config.telegram_tts_chat_id).strip()
+        readiness_updated = 0.0
+        while True:
+            try:
+                if time.monotonic() - readiness_updated >= 30:
+                    self.client.set_tts_telegram_readiness(bool(target_chat))
+                    readiness_updated = time.monotonic()
+                if not target_chat:
+                    time.sleep(5.0)
+                    continue
+                items = self.client.pending_tts_deliveries(limit=1).get("items", [])
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    delivery_id = str(item.get("id") or "")
+                    job_id = str(item.get("job_id") or "")
+                    delivered = False
+                    try:
+                        audio_bytes = self.client.tts_delivery_audio(delivery_id)
+                        if not audio_bytes or len(audio_bytes) > 48_000_000:
+                            raise ValueError("invalid_audio_size")
+                        part_index = int(item.get("part_index") or 1)
+                        total_parts = int(item.get("total_parts") or 1)
+                        title = str(item.get("title") or "Audio TTS")[:200]
+                        audio_file = io.BytesIO(audio_bytes)
+                        audio_file.name = f"audio-{job_id[:8]}-{part_index}.mp3"
+                        caption = title if total_parts == 1 else f"{title} ({part_index}/{total_parts})"
+                        self.updater.bot.send_audio(
+                            chat_id=target_chat,
+                            audio=audio_file,
+                            title=title,
+                            caption=caption[:1024],
+                            timeout=120,
+                        )
+                        delivered = True
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "TTS Telegram delivery failed job=%s part=%s error_type=%s",
+                            job_id[:8],
+                            item.get("part_index"),
+                            type(exc).__name__,
+                        )
+                    try:
+                        self.client.complete_tts_delivery(delivery_id, delivered=delivered)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "TTS delivery result could not be persisted job=%s part=%s error_type=%s",
+                            job_id[:8],
+                            item.get("part_index"),
+                            type(exc).__name__,
+                        )
+            except Exception as exc:
+                LOGGER.warning("TTS delivery queue poll failed error_type=%s", type(exc).__name__)
+            time.sleep(2.0)
 
     def _show_job(
         self, message, user_id: int, job: dict[str, Any], markup=None

@@ -29,6 +29,8 @@ flowchart LR
   JSON[("File konfigurasi<br/>JSON di /data")]
   Local["Worker lokal"]
   Remote["Worker remote"]
+  TTS["Tiga helper gTTS + Tor per worker TTS"]
+  Outbox["Outbox delivery SQLite"]
   TDL["Telegram dan sesi TDL"]
   Drive["Google Drive<br/>melalui rclone"]
 
@@ -40,6 +42,13 @@ flowchart LR
   Backend --> JSON
   Backend -->|command /internal/v1| Local
   Backend -->|command /internal/v1| Remote
+  Local -->|TTS melalui tiga jalur| TTS
+  Remote -->|TTS melalui tiga jalur| TTS
+  Local -->|artifact audio internal| Backend
+  Remote -->|artifact audio internal| Backend
+  Backend --> Outbox
+  Outbox -->|ambil audio dan status| TGApp
+  TGApp -->|sendAudio| Telegram
   Local --> TDL
   Remote --> TDL
   Local --> Drive
@@ -57,6 +66,7 @@ flowchart LR
 | Domain | Menyimpan model job, actor, event, status, dan aturan perubahan status. | `tme3bot/domain/` |
 | Infrastructure | Menghubungkan aplikasi ke SQLite, autentikasi, dan API worker. | `tme3bot/infrastructure/` |
 | Worker | Menjalankan export, download, Quick Mode, utility, storage, backup, dan workspace. | `tme3bot/worker/` |
+| TTS | Worker membuat MP3 dengan tiga helper/Tor; backend menyimpan outbox; proses bot mengirim audio ke satu chat privat. | `worker/tts_pipeline.py`, `api/routes/tts.py`, `frontend/telegram/app.py` |
 | Runtime | Membuka sesi per profile dan menjalankan TDL, rclone, serta utility. | `profiles.py`, `service.py`, `tdl.py`, `rclone.py`, `utility.py` |
 
 `app.py` dan `composition.py` menyusun dependency sesuai role aplikasi:
@@ -150,6 +160,22 @@ API utama Quick Mode:
 - `GET /api/v1/quick-mode/limits` membaca batas job aktif; `PUT
   /api/v1/quick-mode/limits/{worker}` mengubah batas untuk satu worker.
 - `GET /api/v1/jobs/metrics` memberi ringkasan antrean dan status worker.
+
+## TTS Novel
+
+TTS memakai lifecycle job dan monitor yang sama. Teks dibagi menjadi bagian
+maksimal 90 karakter; tiap job menjalankan paling banyak tiga request gTTS
+bersamaan. Worker menyimpan checkpoint dan MP3 sementara di `/data/tts`. Backend
+menyimpan outbox delivery di SQLite, lalu proses Telegram mengambil audio dan
+mengirimkannya ke chat tujuan tetap. Job baru sukses setelah semua bagian
+dikonfirmasi Telegram.
+
+Worker mengiklankan capability `tts` hanya jika tiga helper dan tiga jalur
+kontrol Tor siap. Job dipilih berdasarkan jumlah antrean TTS pada worker yang
+siap, lalu melekat pada worker tersebut. Satu worker menjalankan satu job TTS
+pada satu waktu; worker berbeda dapat memproses job bersamaan. Teks lengkap,
+referensi artifact, dan chat tujuan tidak ditampilkan pada API publik atau log.
+Detail konfigurasi dan rollout ada di [runbook TTS Novel](TTS_NOVEL_RUNBOOK.md).
 
 ## Data dan keamanan
 

@@ -53,6 +53,8 @@ class ControlPlane:
         self._scheduler_stop = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._stale_cancel_requested: dict[str, Any] = {}
+        self._tts_route_lock = threading.Lock()
+        self._tts_round_robin = 0
 
     def actor(self, telegram_user_id: int) -> Actor:
         profile = self.profile_manager.profile_for_user(telegram_user_id)
@@ -107,9 +109,13 @@ class ControlPlane:
         worker: str | None = None,
         job_id: str | None = None,
     ) -> Job:
-        selected_profile, selected_worker = self.resolve_target(
-            actor, profile=profile, worker=worker
-        )
+        if kind == "tts":
+            selected_profile = self.require_profile(actor, profile)
+            selected_worker = self._select_tts_worker(worker)
+        else:
+            selected_profile, selected_worker = self.resolve_target(
+                actor, profile=profile, worker=worker
+            )
         available_profiles = ()
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
         if callable(list_profiles):
@@ -226,6 +232,54 @@ class ControlPlane:
             f"Worker {worker} tidak dapat menerima job: {exc}",
             status_code=503,
         )
+
+    def _select_tts_worker(self, requested: str | None = None) -> str:
+        registry = self.worker_registry
+        checker = getattr(self.dispatcher, "capabilities", None)
+        if registry is None or not callable(checker):
+            raise DomainError("TTS_WORKER_UNAVAILABLE", "Worker TTS belum tersedia.", status_code=503)
+        if requested:
+            candidates = [str(requested).strip().lower()]
+        else:
+            enabled = getattr(registry, "enabled_names", None)
+            candidates = list(enabled()) if callable(enabled) else registry.names()
+        ready: list[str] = []
+        for name in candidates:
+            record = registry.get(name)
+            if record is None or not bool(record.get("enabled", True)):
+                continue
+            try:
+                response = checker(name)
+            except Exception:
+                continue
+            capabilities = response.get("capabilities", []) if isinstance(response, dict) else []
+            if isinstance(response, dict) and (
+                response.get("tts") is True
+                or (isinstance(capabilities, list) and "tts" in capabilities)
+            ):
+                ready.append(name)
+        if not ready:
+            raise DomainError(
+                "TTS_WORKER_UNAVAILABLE",
+                "Tidak ada worker dengan tiga helper TTS dan jalur Tor yang siap.",
+                status_code=503,
+            )
+        if requested:
+            return ready[0]
+        statuses = ("queued", "dispatched", "running", "paused")
+        counts = {
+            name: sum(
+                self.jobs.count(kind="tts", worker=name, status=status, archived=False)
+                for status in statuses
+            )
+            for name in ready
+        }
+        minimum = min(counts.values())
+        tied = sorted(name for name, count in counts.items() if count == minimum)
+        with self._tts_route_lock:
+            selected = tied[self._tts_round_robin % len(tied)]
+            self._tts_round_robin += 1
+        return selected
 
     def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
         sequence = max(
@@ -807,6 +861,25 @@ class ControlPlane:
             job_id=original.id,
         )
 
+    def retry_tts_job(self, actor: Actor, job_id: str) -> Job:
+        original = self.jobs.get(job_id)
+        if original is None or original.kind != "tts":
+            raise DomainError("TTS_JOB_NOT_FOUND", "Job TTS tidak ditemukan.", status_code=404)
+        self.require_profile(actor, original.profile)
+        if not original.status.terminal:
+            raise DomainError("JOB_NOT_TERMINAL", "Job TTS masih aktif.", status_code=409)
+        command_payload = self.jobs.command_payload(job_id)
+        if not isinstance(command_payload, dict) or not str(command_payload.get("text") or ""):
+            raise DomainError("RETRY_PAYLOAD_UNAVAILABLE", "Teks internal job TTS tidak tersedia untuk retry.", status_code=409)
+        return self.submit_job(
+            actor,
+            "tts",
+            deepcopy(command_payload),
+            profile=original.profile,
+            worker=original.worker,
+            job_id=original.id,
+        )
+
     @staticmethod
     def _quick_retry_phase(job: Job) -> str:
         if job.status == JobStatus.SUCCEEDED:
@@ -936,6 +1009,8 @@ class ControlPlane:
                 )
             )
             self.jobs.release_execution(job.id)
+            if job.kind == "tts":
+                self._cancel_tts_deliveries(job.id)
             self._dispatch_pending_jobs()
             return self.jobs.get(job.id) or job
         if job.status == JobStatus.QUEUED:
@@ -954,6 +1029,8 @@ class ControlPlane:
                 )
             )
             self.jobs.release_execution(job.id)
+            if job.kind == "tts":
+                self._cancel_tts_deliveries(job.id)
             self._dispatch_pending_jobs(job.profile)
             return self.jobs.get(job.id) or job
         try:
@@ -976,6 +1053,8 @@ class ControlPlane:
                 "Worker tidak memiliki proses aktif yang dapat dihentikan.",
                 status_code=409,
             )
+        if job.kind == "tts":
+            self._cancel_tts_deliveries(job.id)
         # The worker emits the terminal ``cancelled`` event only after the
         # interrupted process has actually stopped. Marking it terminal here
         # would reject late log/final events and make the UI lie about a still
@@ -987,8 +1066,8 @@ class ControlPlane:
         if job is None:
             raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
         self.require_profile(actor, job.profile)
-        if not bool(job.payload.get("quick_mode")):
-            raise DomainError("JOB_NOT_PAUSABLE", "Pause saat ini tersedia untuk Quick Mode.", status_code=409)
+        if not bool(job.payload.get("quick_mode")) and job.kind != "tts":
+            raise DomainError("JOB_NOT_PAUSABLE", "Pause saat ini tersedia untuk Quick Mode dan TTS.", status_code=409)
         if job.status == JobStatus.PAUSED:
             return job
         if job.status.terminal:
@@ -1055,11 +1134,22 @@ class ControlPlane:
 
     @staticmethod
     def _redacted_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if kind == "tts":
+            text = str(payload.get("text") or "")
+            return {
+                "title": str(payload.get("title") or "")[:200],
+                "character_count": len(text),
+            }
         if kind not in {"backup_node", "utility", "export"}:
             return dict(payload)
         if kind == "export" and not bool(payload.get("quick_mode")):
             return dict(payload)
         return _redact_secrets(payload)
+
+    def _cancel_tts_deliveries(self, job_id: str) -> None:
+        cancel = getattr(self.jobs, "cancel_tts_deliveries", None)
+        if callable(cancel):
+            cancel(job_id)
 
     def _apply_event_side_effects(self, job: Job, event: JobEvent) -> None:
         result = event.result or {}

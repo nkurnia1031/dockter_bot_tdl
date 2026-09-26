@@ -5,6 +5,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from tme3bot.domain.worker_contract import (
     CAP_JOB_CONTROL,
@@ -13,6 +14,7 @@ from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_STAGING,
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_VERIFY,
+    CAP_TTS,
     CAP_WORKSPACE_TREE,
     WORKER_JOB_CAPABILITIES,
     require_worker_contract,
@@ -77,6 +79,8 @@ class WorkerHttpDispatcher:
         job_payload = payload.get("payload")
         if isinstance(job_payload, dict) and bool(job_payload.get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
+        if str(payload.get("kind") or "") == "tts":
+            required.add(CAP_TTS)
         self._require_capabilities(worker, required, record=record)
         return request_json(
             str(record["url"]),
@@ -189,6 +193,24 @@ class WorkerHttpDispatcher:
             "/internal/v1/capabilities",
             timeout=15,
         )
+
+    def open_tts_artifact(self, worker: str, job_id: str, artifact_ref: str):
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(worker, {CAP_TTS}, record=record)
+        request = Request(
+            str(record["url"]).rstrip("/")
+            + f"/internal/v1/tts/artifacts/{quote(job_id, safe='')}/{quote(artifact_ref, safe='')}",
+            headers={"Authorization": f"Bearer {record['token']}", "Accept": "audio/mpeg"},
+            method="GET",
+        )
+        try:
+            return urlopen(request, timeout=90)
+        except urllib.error.HTTPError as exc:
+            raise JsonHttpError(exc.code, "Worker tidak dapat menyediakan audio TTS.") from exc
+        except urllib.error.URLError as exc:
+            raise JsonHttpError(503, "Worker audio TTS tidak dapat dihubungi.") from exc
 
     def check_worker(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
