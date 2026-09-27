@@ -31,11 +31,25 @@ from tme3bot.worker.quick_export import (
 )
 
 
-class QuickThumbnailTests(unittest.TestCase):
+class WorkerExecutorTestCase(unittest.TestCase):
+    def setUp(self):
+        self.worker_settings_tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.worker_settings_tmp.cleanup()
+
+    def make_executor(self, config, profile_manager, publisher):
+        if not getattr(config, "state_file", None):
+            config.state_file = Path(self.worker_settings_tmp.name) / "state.json"
+        return WorkerJobExecutor(config, profile_manager, publisher)
+
     def make_media(self, root: Path, names: list[str]) -> None:
         root.mkdir(parents=True, exist_ok=True)
         for name in names:
             (root / name).write_bytes(b"media")
+
+
+class QuickThumbnailTests(WorkerExecutorTestCase):
 
     def test_job_log_keeps_newest_tail_and_returns_newest_first(self) -> None:
         snapshot = JobLogSnapshot()
@@ -207,7 +221,7 @@ class QuickThumbnailTests(unittest.TestCase):
                 def emit(self, *args, **kwargs):
                     events.append((args, kwargs))
 
-            executor = WorkerJobExecutor(
+            executor = self.make_executor(
                 SimpleNamespace(utility_workspace_root=workspace),
                 SimpleNamespace(),
                 Publisher(),
@@ -253,7 +267,7 @@ class QuickThumbnailTests(unittest.TestCase):
                     self.audit_callbacks.pop(job_id, None)
 
             publisher = Publisher()
-            executor = WorkerJobExecutor(
+            executor = self.make_executor(
                 SimpleNamespace(utility_workspace_root=workspace),
                 SimpleNamespace(),
                 publisher,
@@ -288,7 +302,7 @@ class QuickThumbnailTests(unittest.TestCase):
             download_progress=tracker,
             download_operation_lock=threading.Lock(),
         )
-        executor = WorkerJobExecutor(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
+        executor = self.make_executor(SimpleNamespace(), SimpleNamespace(), SimpleNamespace())
         events: list[tuple[str, str]] = []
         first_entered = threading.Event()
         second_attempting = threading.Event()
@@ -428,7 +442,7 @@ class QuickThumbnailTests(unittest.TestCase):
                 job_stall_timeout_seconds=30,
             )
             publisher = SimpleNamespace(emit=lambda *args, **kwargs: None)
-            executor = WorkerJobExecutor(config, Profiles(), publisher)
+            executor = self.make_executor(config, Profiles(), publisher)
             with patch("tme3bot.worker.executor_quickmode.RcloneRunner", VerifyRclone), patch(
                 "tme3bot.worker.executor_quickmode.ensure_quick_stage_writable"
             ) as ensure_writable:
@@ -693,7 +707,7 @@ class QuickThumbnailTests(unittest.TestCase):
                 '"tme3bot":{"chat_ref":"@source","label":"label"}}',
                 encoding="utf-8",
             )
-            executor = WorkerJobExecutor(
+            executor = self.make_executor(
                 SimpleNamespace(), SimpleNamespace(), SimpleNamespace()
             )
 
@@ -706,7 +720,7 @@ class QuickThumbnailTests(unittest.TestCase):
             self.assertEqual(manifest["stats"]["media_count"], 1)
 
 
-class ExportMilestoneTests(unittest.TestCase):
+class ExportMilestoneTests(WorkerExecutorTestCase):
     def test_export_publishes_json_ready_milestone_before_post_export_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -745,7 +759,7 @@ class ExportMilestoneTests(unittest.TestCase):
             )
             profiles = SimpleNamespace(runtime=lambda profile: runtime)
             publisher = Publisher()
-            executor = WorkerJobExecutor(SimpleNamespace(), profiles, publisher)
+            executor = self.make_executor(SimpleNamespace(), profiles, publisher)
 
             executor._export(
                 {
@@ -796,7 +810,7 @@ class ExportMilestoneTests(unittest.TestCase):
                 export_tdl_client=SimpleNamespace(output_callback=None, progress_callback=None),
             )
             profiles = SimpleNamespace(runtime=lambda profile: runtime)
-            executor = WorkerJobExecutor(SimpleNamespace(), profiles, Publisher())
+            executor = self.make_executor(SimpleNamespace(), profiles, Publisher())
 
             executor._export(
                 {
@@ -813,7 +827,7 @@ class ExportMilestoneTests(unittest.TestCase):
         self.assertEqual(export_service.calls[0][1]["export_end_id"], 500)
 
 
-class QuickPipelineTests(unittest.TestCase):
+class QuickPipelineTests(WorkerExecutorTestCase):
     def test_export_entrypoint_honors_thumbnail_phase_without_calling_export(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir) / "workspace"
@@ -841,7 +855,7 @@ class QuickPipelineTests(unittest.TestCase):
                 export_service=ExportService(),
             )
             profiles = SimpleNamespace(runtime=lambda profile: runtime)
-            executor = WorkerJobExecutor(
+            executor = self.make_executor(
                 SimpleNamespace(
                     utility_workspace_root=workspace,
                     backup_node_name="local",
@@ -903,7 +917,7 @@ class QuickPipelineTests(unittest.TestCase):
                     output_path.write_bytes(b"thumbnail")
                     return {"photos_used": 1, "video_contact_sheet": False, "thumbnail_name": output_path.name}
 
-            executor = WorkerJobExecutor(
+            executor = self.make_executor(
                 SimpleNamespace(utility_workspace_root=workspace, backup_node_name="local"),
                 SimpleNamespace(),
                 Publisher(),
@@ -959,7 +973,7 @@ class QuickPipelineTests(unittest.TestCase):
                 def emit(self, *args, **kwargs):
                     del args, kwargs
 
-            executor = WorkerJobExecutor(
+            executor = self.make_executor(
                 SimpleNamespace(utility_workspace_root=workspace, backup_node_name="local"),
                 SimpleNamespace(),
                 Publisher(),
@@ -1034,7 +1048,7 @@ class QuickPipelineTests(unittest.TestCase):
         )
         storage_runtime = SimpleNamespace(export_tdl_client=Client("storage", error=True))
         config = SimpleNamespace(worker_storage_profile="storage", backup_node_name="local")
-        executor = WorkerJobExecutor(config, Profiles(), SimpleNamespace())
+        executor = self.make_executor(config, Profiles(), SimpleNamespace())
         executor._active["quick-cancel"] = ("default", "export")
         executor._quick_active.add("quick-cancel")
         executor._quick_thumbnail_builders["quick-cancel"] = Runner()
@@ -1152,7 +1166,7 @@ class QuickPipelineTests(unittest.TestCase):
                 backup_node_name="local",
                 worker_storage_profile="storage",
             )
-            executor = WorkerJobExecutor(config, Profiles(), publisher)
+            executor = self.make_executor(config, Profiles(), publisher)
             export_result = ExportJobResult(
                 status="exported",
                 chat_ref="@source",

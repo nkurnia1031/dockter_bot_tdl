@@ -19,6 +19,22 @@ class StateStoreTests(unittest.TestCase):
             self.assertEqual(updated.last_id, 11)
             self.assertEqual([key for key, _ in store.list_sources()], ["filetuyenchonbot"])
 
+    def test_tdl_reference_aliases_share_one_source_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = StateStore(root / "state.json", root / "max.json")
+
+            store.upsert_source("https://t.me/IYear", None, 10)
+            store.upsert_source("@iyear", None, 11)
+            store.upsert_source("+1 123456789", None, 12)
+            store.upsert_source("+1123456789", None, 13)
+
+            self.assertEqual(store.get_source("iyear").last_id, 11)
+            self.assertEqual(store.get_source("+1 123456789").last_id, 13)
+            self.assertEqual(
+                [key for key, _ in store.list_sources()], ["+1123456789", "iyear"]
+            )
+
     def test_last_id_never_moves_backwards_when_worker_finishes_late(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

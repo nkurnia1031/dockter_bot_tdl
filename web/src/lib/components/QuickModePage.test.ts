@@ -32,7 +32,7 @@ describe('QuickModePage', () => {
     await screen.findByRole('button', { name: 'Tambah Quick Mode' });
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     await screen.findByText('Target backend terverifikasi');
-    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), { target: { value: 'example' } });
+    await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Tambah Quick Mode' }));
 
     expect(requests.find((item) => item.url.includes('/context/verify'))?.body).toMatchObject({ purpose: 'export', quick_mode: true });

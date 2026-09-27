@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends, Query
 from tme3bot.api.schemas import JobEventListResponse, JobListResponse, JobResponse, ObjectResponse, WorkerEventRequest
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus, utc_now
 from typing import Any
 
@@ -470,6 +471,11 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
         for key in ("url", "chat_ref", "start_id", "label", "save_source", "use_url_message_id"):
             if body.get(key) is not None:
                 payload[key] = body[key]
+        if payload.get("chat_ref"):
+            try:
+                payload["chat_ref"] = normalize_tdl_chat_ref(payload["chat_ref"])
+            except ValueError as exc:
+                raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
         if (
             not item.get("json_present")
             and not item.get("actual_media_count")

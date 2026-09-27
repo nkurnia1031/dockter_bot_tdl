@@ -9,22 +9,38 @@
   let meta = $state<Meta[]>([]);
   let drafts = $state<Record<string,string>>({});
   let storage = $state<any>(null);
+  let runtimeSecrets = $state<any>({ telegram_bot_token_configured: false, telegram_tts_chat_configured: false });
+  let secretDraft = $state({ bot_token: '' });
   let message = $state('');
   let saving = $state('');
 
   async function load() {
     try {
-      const [valueResult, metaResult, storageResult] = await Promise.all([
-        api<Settings>('/utility/settings'), api<{items:Meta[]}>('/utility/settings/meta'), api<any>('/storage/settings').catch(() => null)
+      const [valueResult, metaResult, storageResult, secretResult] = await Promise.all([
+        api<Settings>('/utility/settings'), api<{items:Meta[]}>('/utility/settings/meta'), api<any>('/storage/settings').catch(() => null), api<any>('/runtime/secrets')
       ]);
-      settings = valueResult; meta = metaResult.items || []; storage = storageResult;
+      settings = valueResult; meta = metaResult.items || []; storage = storageResult; runtimeSecrets = secretResult;
       drafts = { move_size: settings.move_size, compress_size: settings.compress_size, rclone_destination: settings.rclone_destination, compress_password: '' };
+      secretDraft = { bot_token: '' };
     } catch (cause) { message = cause instanceof Error ? cause.message : 'Pengaturan gagal dimuat.'; }
   }
   async function save(item: Meta) {
     saving = item.key;
     try { await put(`/utility/settings/${item.key}`, { value: drafts[item.key] }); message = `${item.label} berhasil disimpan.`; await load(); }
     catch (cause) { message = cause instanceof Error ? cause.message : 'Pengaturan gagal disimpan.'; }
+    finally { saving = ''; }
+  }
+  async function saveRuntimeSecrets() {
+    const payload: Record<string, string> = {};
+    if (secretDraft.bot_token) payload.bot_token = secretDraft.bot_token;
+    if (!Object.keys(payload).length) return;
+    saving = 'runtime-secrets';
+    try {
+      const result = await put<any>('/runtime/secrets', payload);
+      const services = (result.restart_required_services || []).join(' dan ');
+      message = services ? `Credential tersimpan. Restart container ${services} agar perubahan aktif.` : 'Credential tersimpan.';
+      await load();
+    } catch (cause) { message = cause instanceof Error ? cause.message : 'Credential gagal disimpan.'; }
     finally { saving = ''; }
   }
   const active = (item: Meta) => item.secret ? (settings.compress_password_configured ? 'Sudah diatur' : 'Belum diatur') : (settings as any)[item.key] || '-';
@@ -48,6 +64,11 @@
   </div></section>
   <div class="space-y-5">
     <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><HardDrive class="text-violet-600" size={21}/><h2 class="font-extrabold">Channel storage</h2></div><dl class="mt-4 space-y-3 text-sm"><div><dt class="muted">Nama</dt><dd class="font-bold">{storage?.title || 'Belum dikonfigurasi'}</dd></div><div><dt class="muted">Channel ID</dt><dd class="font-mono">{storage?.channel_id || storage?.channel || '-'}</dd></div></dl></section>
-    <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><ShieldCheck class="text-emerald-600" size={21}/><h2 class="font-extrabold">Keamanan</h2></div><p class="muted mt-3 text-sm">Password hanya dapat diganti. Nilai yang tersimpan tidak pernah dikirim kembali ke browser atau ditampilkan di log.</p></section>
+    <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><ShieldCheck class="text-emerald-600" size={21}/><h2 class="font-extrabold">Kredensial Telegram</h2></div>
+      <p class="muted mt-2 text-sm">Token bot: {runtimeSecrets.telegram_bot_token_configured ? 'Sudah diatur' : 'Belum diatur'}. ID chat tujuan audio dikelola dari halaman TTS Novel.</p>
+      <div class="mt-4 space-y-3"><label class="block text-sm font-bold">Token bot baru<input class="field mt-2" type="password" bind:value={secretDraft.bot_token} autocomplete="new-password" placeholder="Kosongkan agar tidak berubah"/></label><button class="button w-full" onclick={saveRuntimeSecrets} disabled={saving === 'runtime-secrets' || !secretDraft.bot_token}><Save size={16}/>{saving === 'runtime-secrets' ? 'Menyimpan...' : 'Simpan token bot'}</button></div>
+      <p class="muted mt-3 text-xs">Nilai rahasia hanya dikirim saat disimpan dan tidak dibaca kembali ke halaman. Perubahan token bot memerlukan restart backend dan Telegram.</p>
+    </section>
+    <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><ShieldCheck class="text-emerald-600" size={21}/><h2 class="font-extrabold">Keamanan</h2></div><p class="muted mt-3 text-sm">Login Web melindungi pengaturan. Password dan token tersimpan di volume data dengan akses file terbatas; API tidak mengembalikan nilainya.</p></section>
   </div>
 </div>

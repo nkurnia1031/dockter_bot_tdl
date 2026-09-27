@@ -267,6 +267,23 @@ class SettingRequest(BaseModel):
     value: str
 
 
+class BackupRuntimeSettingsRequest(BaseModel):
+    enabled: bool
+    schedule: str = Field(min_length=5, max_length=5)
+    timezone: str = Field(min_length=1, max_length=80)
+    retention: int = Field(ge=1, le=3650)
+    volume_size: str = Field(min_length=2, max_length=32)
+    channel: str = Field(default="", max_length=200)
+    storage_trash_retention_days: int = Field(ge=1, le=3650)
+    job_stall_timeout_seconds: int = Field(ge=0, le=86400)
+    job_cancel_grace_seconds: int = Field(ge=0, le=3600)
+
+
+class RuntimeSecretsRequest(BaseModel):
+    bot_token: str | None = Field(default=None, min_length=20, max_length=256)
+    telegram_tts_chat_id: str | None = Field(default=None, max_length=128)
+
+
 class LabelRequest(BaseModel):
     label: str
 
@@ -286,6 +303,22 @@ class WorkerUpdateRequest(BaseModel):
 
 class WorkerEnabledRequest(BaseModel):
     enabled: bool
+
+
+class WorkerRuntimeSettingsRequest(BaseModel):
+    worker_api_token: str | None = Field(default=None, min_length=16, max_length=512)
+    job_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
+    tdl_export_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
+    tdl_download_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
+    storage_profile: str | None = Field(default=None, min_length=1, max_length=48)
+    tts_helper_urls: list[str] | None = Field(default=None, min_length=3, max_length=3)
+    tts_tor_control_hosts: list[str] | None = Field(default=None, min_length=3, max_length=3)
+    tts_tor_control_ports: list[int] | None = Field(default=None, min_length=3, max_length=3)
+    tts_tor_control_password: str | None = Field(default=None, max_length=512)
+    clear_tts_tor_control_password: bool = False
+    tts_part_retries: int | None = Field(default=None, ge=0, le=10)
+    tts_retry_base_seconds: float | None = Field(default=None, ge=0.1, le=60)
+    tts_newnym_after_retries: int | None = Field(default=None, ge=1, le=20)
 
 
 class WorkerRouteRequest(BaseModel):
@@ -349,6 +382,7 @@ class WorkerJobRequest(BaseModel):
 class TtsJobRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     text: str = Field(min_length=1, max_length=100_000)
+    worker: str | None = Field(default=None, min_length=1, max_length=48)
 
 
 class WorkerEventRequest(BaseModel):

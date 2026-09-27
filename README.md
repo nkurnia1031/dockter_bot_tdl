@@ -42,6 +42,8 @@ tme3bot/
 
 Peta komponen, alur job, batas keamanan, penyimpanan, serta rekomendasi
 pengembangan tersedia di [Panduan Arsitektur Sistem](docs/ARSITEKTUR_SISTEM.md).
+Pemisahan environment dan pengaturan yang dapat diubah saat aplikasi berjalan
+dijelaskan di [Pengaturan runtime lewat Web](docs/PENGATURAN_RUNTIME.md).
 
 ## Setup VPS utama
 

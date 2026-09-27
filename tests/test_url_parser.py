@@ -22,6 +22,11 @@ class ParseTme3UrlTests(unittest.TestCase):
         self.assertEqual(parsed.bootstrap_message_id, 12)
         self.assertIsNone(parsed.requested_label)
 
+    def test_tme3_link_accepts_tdl_phone_reference(self) -> None:
+        parsed = parse_tme3_url("https://t.me3/c/%2B1%20123456789/12", "t.me3")
+        self.assertEqual(parsed.chat_ref, "+1 123456789")
+        self.assertEqual(parsed.bootstrap_message_id, 12)
+
     def test_rejects_other_host(self) -> None:
         with self.assertRaises(URLParseError):
             parse_tme3_url("https://example.com/c/@KFCMNB_bot/3", "t.me3")

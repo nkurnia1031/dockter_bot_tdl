@@ -88,6 +88,8 @@ class BackendContext:
     bot: Any = None
     worker_dispatcher: Any = None
     storage_maintenance: Any = None
+    runtime_settings: Any = None
+    backup_scheduler: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -248,9 +250,15 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, exc: RequestValidationError):
         errors = exc.errors()
-        if request.url.path == "/api/v1/tts/jobs":
-            # Pydantic versions that include the rejected input in error
-            # details must not echo the submitted novel text to the browser.
+        sensitive_request = (
+            request.url.path == "/api/v1/tts/jobs"
+            or request.url.path == "/api/v1/runtime/secrets"
+            or request.url.path.startswith("/api/v1/workers/")
+            and request.url.path.endswith("/settings")
+        )
+        if sensitive_request:
+            # Pydantic versions that include rejected input in error details
+            # must not echo novel text, tokens, or passwords to the caller.
             errors = [
                 {key: value for key, value in error.items() if key != "input"}
                 for error in errors
@@ -417,6 +425,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     def require_management(token: str = Depends(raw_token)) -> None:
         if not context.config.management_api_token or token != context.config.management_api_token:
             raise DomainError("MANAGEMENT_UNAUTHORIZED", "Management token tidak valid.", status_code=401)
+
+    from tme3bot.api.routes.runtime_settings import register_runtime_settings
+    register_runtime_settings(
+        app,
+        context,
+        current_actor=current_actor,
+        require_service=require_service,
+    )
 
     def verify_target(
         actor: Actor,

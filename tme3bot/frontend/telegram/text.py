@@ -19,6 +19,7 @@ def help_text(host: str) -> str:
         "- ID pada URL yang dikirim langsung selalu dipakai sebagai Mulai ID, termasuk untuk mengulang atau mengambil ulang ID lama.\n"
         f"- Kirim URL tanpa label seperti https://{host}/c/@KFCMNB_bot/3 untuk export tanpa prefix label.\n"
         "- Menu source tersimpan selalu melanjutkan dari Last ID + 1. Source bisa dipilih satu, beberapa, atau semua lalu dihapus secara batch.\n"
+        "- Referensi source mengikuti format TDL: @username, username, ID numeric, link publik t.me, atau nomor telepon internasional.\n"
         "- Menu source bisa export tanpa copy-paste URL, dengan label terakhir, label global tersimpan, label custom, atau tanpa label.\n"
         "- Tombol Pengaturan download mengatur apakah profile aktif memakai download utama atau folder profile sendiri.\n"
         "- Output download dipisah ke download/berlabel/<nama-json>/ dan download/biasa/<nama-json>/.\n"

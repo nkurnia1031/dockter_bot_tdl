@@ -88,6 +88,16 @@ class BackendApiClient:
             {"ready": bool(ready)},
         )
 
+    def telegram_bootstrap_settings(self) -> dict[str, Any]:
+        """Fetch Web-managed Telegram credentials during Telegram role startup."""
+        return request_json(
+            self.base_url,
+            self.frontend_service_token,
+            "GET",
+            "/internal/v1/telegram/bootstrap",
+            timeout=15,
+        )
+
     def tts_delivery_audio(self, delivery_id: str) -> bytes:
         request = urllib.request.Request(
             self.base_url

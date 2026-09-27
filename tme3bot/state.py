@@ -9,21 +9,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from tme3bot.chat_refs import canonical_chat_key
 from tme3bot.persistence import utc_now_iso, write_json_atomic
 
 
 def normalize_chat_ref(chat_ref: str) -> str:
-    """Canonical source key: usernames ignore @ and letter case.
-
-    Numeric Telegram references are preserved unchanged.  This keeps legacy
-    channel IDs distinct while making ``@Channel`` and ``channel`` one source.
-    """
-    value = str(chat_ref or "").strip()
-    if not value:
-        return ""
-    if value.lstrip("-").isdigit():
-        return value
-    return value.lstrip("@").casefold()
+    """Canonical source key for usernames, links, phones, and numeric IDs."""
+    return canonical_chat_key(chat_ref)
 
 
 @dataclass

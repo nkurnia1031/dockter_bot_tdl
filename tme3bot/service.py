@@ -182,6 +182,10 @@ class ExportService:
     def _select_warmup_url(
         self, parsed: ParsedTme3Url, export_result: ExportResult
     ) -> str | None:
+        # Telegram phone references are valid TDL peers but do not have a
+        # public t.me/<phone>/<message> URL for the warm-up fallback.
+        if parsed.chat_ref.strip().startswith("+"):
+            return None
         message = self._select_warmup_message(export_result.messages)
         if message is None:
             return None
@@ -577,6 +581,8 @@ def unique_path(path: Path) -> Path:
 
 def build_telegram_message_url(chat_ref: str, message_id: int) -> str:
     cleaned = chat_ref.strip()
+    if cleaned.startswith("+"):
+        return ""
     if cleaned.startswith("@"):
         return f"https://t.me/{cleaned.lstrip('@')}/{message_id}"
 

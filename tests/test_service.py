@@ -147,6 +147,7 @@ class ServiceTests(unittest.TestCase):
             "https://t.me/c/3954783687/10315",
         )
         self.assertEqual(build_telegram_message_url("@tdl", 1), "https://t.me/tdl/1")
+        self.assertEqual(build_telegram_message_url("+1 123456789", 1), "")
 
     def test_input_without_label_uses_timestamp_chat_filename_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

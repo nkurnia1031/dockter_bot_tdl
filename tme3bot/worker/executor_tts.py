@@ -5,6 +5,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from tme3bot.domain.models import utc_now
@@ -18,7 +19,8 @@ _SAFE_ARTIFACT = re.compile(r"^[a-f0-9]{48}$")
 
 class TtsExecutorMixin:
     def _tts_pipeline(self) -> TtsPipeline:
-        return TtsPipeline.from_config(self.config)
+        settings = self.runtime_settings.tts_settings()
+        return TtsPipeline.from_config(SimpleNamespace(**settings))
 
     def _tts_artifact_directory(self, job_id: str) -> Path:
         if not _SAFE_JOB.fullmatch(job_id):

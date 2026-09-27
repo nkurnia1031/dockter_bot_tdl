@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, post, put, remove } from '$lib/api';
+  import { normalizeTdlChatRef } from '$lib/chatRef';
   import { session } from '$lib/session.svelte';
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
@@ -193,8 +194,9 @@
   }
 
   function stageSourcePayload(): Record<string, unknown> {
+    const normalizedChatRef = url.trim() ? null : normalizeTdlChatRef(chatRef);
     return {
-      ...(url.trim() ? { url: url.trim() } : chatRef.trim() ? { chat_ref: chatRef.trim() } : {}),
+      ...(url.trim() ? { url: url.trim() } : normalizedChatRef ? { chat_ref: normalizedChatRef } : {}),
       ...(label.trim() ? { label: label.trim() } : {}),
       ...(overwriteStartId ? { start_id: Number(startId), use_url_message_id: true } : {})
     };
@@ -295,7 +297,7 @@
   function updateChatRef(value: string) {
     chatRef = value;
     url = '';
-    if (selected && selected.replace(/^@/, '').toLowerCase() !== value.replace(/^@/, '').toLowerCase()) {
+    if (selected && normalizeTdlChatRef(selected) !== normalizeTdlChatRef(value)) {
       selected = '';
       overwriteStartId = false;
       startId = '1';
@@ -338,8 +340,9 @@
       message = 'Verifikasi profile dan worker Quick Mode terlebih dahulu.';
       return;
     }
-    if (!chatRef.trim() && !url.trim()) {
-      message = 'Masukkan username/chat ID atau URL Telegram.';
+    const normalizedChatRef = url.trim() ? null : normalizeTdlChatRef(chatRef);
+    if (!url.trim() && !normalizedChatRef) {
+      message = 'Masukkan @username, username, ID numeric, link t.me publik, nomor telepon internasional, atau URL export.';
       return;
     }
     const manualStartId = Number(startId);
@@ -351,14 +354,14 @@
     message = '';
     try {
       const payload: Record<string, unknown> = {
-        ...(url.trim() ? { url: url.trim() } : { chat_ref: chatRef.trim() }),
+        ...(url.trim() ? { url: url.trim() } : { chat_ref: normalizedChatRef }),
         label: label || undefined,
         use_url_message_id: overwriteStartId,
         profile: targetProfile,
         worker: targetWorker,
         quick_mode: true
       };
-      if (isNumeric(chatRef)) payload.save_source = saveNumericSource;
+      if (normalizedChatRef && isNumeric(normalizedChatRef)) payload.save_source = saveNumericSource;
       if (overwriteStartId) payload.start_id = manualStartId;
       await post('/exports', payload);
       beginCooldown();
@@ -437,8 +440,8 @@
   <div class="mt-5"><TargetPicker purpose="export" quickMode={true} bind:profile={targetProfile} bind:worker={targetWorker} bind:verified={targetVerified}/></div>
   <div class="mt-5 grid gap-4 lg:grid-cols-2">
     <label class="block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)} disabled={sourceLoading}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
-    <label class="block text-sm font-bold">Username atau chat ID<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="username atau numeric ID" /></label>
-    <label class="block text-sm font-bold lg:col-span-2">URL Telegram manual <span class="muted font-normal">(opsional, mengesampingkan chat ID)</span><input class="field mt-2" value={url} oninput={(event) => updateUrl((event.currentTarget as HTMLInputElement).value)} placeholder="https://t.me/c/..." /></label>
+    <label class="block text-sm font-bold">Referensi chat<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="@iyear · 123456789 · https://t.me/iyear · +1 123456789" /></label>
+    <label class="block text-sm font-bold lg:col-span-2">URL Telegram manual <span class="muted font-normal">(opsional, mengesampingkan referensi chat)</span><input class="field mt-2" value={url} oninput={(event) => updateUrl((event.currentTarget as HTMLInputElement).value)} placeholder="https://t.me/c/..." /></label>
     <label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId}/></label>
     <label class="block text-sm font-bold">Label<input class="field mt-2" list="quick-mode-labels" bind:value={label} placeholder="Opsional"/><datalist id="quick-mode-labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label>
   </div>

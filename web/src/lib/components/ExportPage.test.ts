@@ -53,7 +53,7 @@ describe('ExportPage labels', () => {
     await screen.findByText('Export baru');
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     await screen.findByText('Target backend terverifikasi');
-    const input=screen.getByLabelText('Username atau chat ID');
+    const input=screen.getByLabelText('Referensi chat');
     await fireEvent.input(input, {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
     expect(await screen.findByText('Export masuk antrean')).toBeTruthy();
@@ -114,7 +114,7 @@ describe('ExportPage labels', () => {
     render(ExportPage);
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     await screen.findByText('Target backend terverifikasi');
-    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
+    await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
 
     const lockedButton=await screen.findByRole('button', {name:'Tunggu sebentar...'});
@@ -155,7 +155,7 @@ describe('ExportPage labels', () => {
     render(ExportPage);
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     await screen.findByText('Target backend terverifikasi');
-    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
+    await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
     expect(screen.queryByText('Target backend terverifikasi')).toBeNull();
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
@@ -184,7 +184,7 @@ describe('ExportPage labels', () => {
     await screen.findByText('Export baru');
     await fireEvent.click(screen.getByRole('button', {name:'Verifikasi target'}));
     await screen.findByText('Target backend terverifikasi');
-    await fireEvent.input(screen.getByLabelText('Username atau chat ID'), {target:{value:'example'}});
+    await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
     await fireEvent.click(screen.getByRole('button', {name:'Verifikasi target'}));
     await screen.findByText('Target backend terverifikasi');

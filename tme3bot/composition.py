@@ -10,6 +10,7 @@ from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
+from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
@@ -44,6 +45,25 @@ class ControlPlaneBackupRouter:
 
 def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupScheduler]:
     from telegram import Bot
+
+    runtime_settings = BackendRuntimeSettings(
+        config.state_file.parent / "app_runtime_settings.json",
+        {
+            "backup_enabled": config.backup_enabled,
+            "backup_schedule": config.backup_schedule,
+            "backup_timezone": config.backup_timezone,
+            "backup_retention": config.backup_retention,
+            "backup_volume_size": config.backup_volume_size,
+            "backup_channel": config.backup_channel,
+            "backup_channel_id": config.backup_channel_id,
+            "storage_trash_retention_days": config.storage_trash_retention_days,
+            "job_stall_timeout_seconds": config.job_stall_timeout_seconds,
+            "job_cancel_grace_seconds": config.job_cancel_grace_seconds,
+            "bot_token": config.bot_token,
+            "telegram_tts_chat_id": config.telegram_tts_chat_id,
+        },
+    )
+    BackendRuntimeSettings.apply_to(config, runtime_settings.get())
 
     bootstrap_endpoints = config.worker_endpoints or {
         "local": "http://worker-local:8080"
@@ -97,6 +117,22 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         challenge_minutes=config.auth_challenge_minutes,
     )
     bot = Bot(token=config.bot_token)
+    if config.backup_channel_ref and not config.backup_channel_id:
+        try:
+            from tme3bot.chat_refs import normalize_bot_api_chat_ref
+
+            resolved = bot.get_chat(
+                normalize_bot_api_chat_ref(config.backup_channel_ref)
+            )
+            object.__setattr__(config, "backup_channel_id", int(resolved.id))
+            values = runtime_settings.get()
+            if not values.get("backup_channel_id"):
+                runtime_settings.update({"backup_channel_id": config.backup_channel_id})
+                BackendRuntimeSettings.apply_to(config, runtime_settings.get())
+        except Exception:
+            LOGGER.warning(
+                "Backup channel username belum bisa di-resolve ke numeric chat ID."
+            )
     storage_maintenance = StorageMaintenanceService(
         catalog, bot, config.storage_trash_retention_days
     )
@@ -139,6 +175,8 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         bot=bot,
         worker_dispatcher=dispatcher,
         storage_maintenance=storage_maintenance,
+        runtime_settings=runtime_settings,
+        backup_scheduler=scheduler,
     )
     return context, scheduler
 

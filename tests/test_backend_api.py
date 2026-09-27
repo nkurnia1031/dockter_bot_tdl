@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from tme3bot.api.backend import BackendContext, create_backend_app
+from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.domain.models import Actor, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
@@ -46,6 +47,19 @@ class FakeDispatcher:
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
         self.quick_deletions = []
+        self.runtime_settings = {
+            "storage_profile": "storage",
+            "storage_profile_available": True,
+            "available_storage_profiles": ["storage", "archive"],
+            "worker_api_token_configured": True,
+            "tts_helper_urls": ["http://tts-1:5000", "http://tts-2:5000", "http://tts-3:5000"],
+            "tts_tor_control_hosts": ["tor-1", "tor-2", "tor-3"],
+            "tts_tor_control_ports": [9051, 9051, 9051],
+            "tts_tor_control_password_configured": False,
+            "tts_part_retries": 4,
+            "tts_retry_base_seconds": 2.0,
+            "tts_newnym_after_retries": 3,
+        }
 
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
@@ -53,6 +67,27 @@ class FakeDispatcher:
 
     def capabilities(self, worker):
         return {"capabilities": ["tts"] if self.tts_ready else []}
+
+    def worker_settings(self, worker):
+        return dict(self.runtime_settings)
+
+    def update_worker_settings(self, worker, payload):
+        selected = payload.get("storage_profile")
+        if selected and selected not in self.runtime_settings["available_storage_profiles"]:
+            from tme3bot.infrastructure.http_client import JsonHttpError
+
+            raise JsonHttpError(
+                409,
+                "Profil Storage belum tersedia.",
+                {"error": {"code": "STORAGE_PROFILE_UNAVAILABLE", "message": "Profil Storage belum tersedia."}},
+            )
+        if selected:
+            self.runtime_settings["storage_profile"] = selected
+        if payload.get("tts_tor_control_password"):
+            self.runtime_settings["tts_tor_control_password_configured"] = True
+        if payload.get("worker_api_token"):
+            self.runtime_settings["worker_api_token_configured"] = True
+        return dict(self.runtime_settings)
 
     def cancel(self, worker, job_id):
         return True
@@ -130,6 +165,11 @@ class FakeWorkers:
 class FakeTelegramBot:
     def __init__(self):
         self.copy_calls = []
+        self.chat_lookups = []
+
+    def get_chat(self, chat_id):
+        self.chat_lookups.append(chat_id)
+        return type("Chat", (), {"id": -100987654321, "username": "backupchannel", "title": "Backup"})()
 
     def copy_message(self, **values):
         self.copy_calls.append(values)
@@ -183,6 +223,12 @@ class BackendApiTests(unittest.TestCase):
                 "backup_channel": "456",
                 "backup_channel_ref": "-100456",
                 "backup_channel_id": -100456,
+                "backup_channel_username": "456",
+                "storage_trash_retention_days": 30,
+                "job_stall_timeout_seconds": 600,
+                "job_cancel_grace_seconds": 30,
+                "bot_token": "123456:abcdefghijklmnopqrstuvwxyzABCDE12345",
+                "telegram_tts_chat_id": "",
                 "web_cookie_secret": "w" * 48,
                 "web_cookie_secure": False,
                 "web_public_origin": "",
@@ -202,7 +248,24 @@ class BackendApiTests(unittest.TestCase):
             utility_settings=UtilitySettingsStore(root / "settings.json"),
             worker_dispatcher=self.dispatcher,
             bot=self.bot,
+            runtime_settings=BackendRuntimeSettings(
+                root / "runtime-settings.json",
+                {
+                    "backup_enabled": True,
+                    "backup_schedule": "03:00",
+                    "backup_timezone": "Asia/Jakarta",
+                    "backup_retention": 7,
+                    "backup_volume_size": "45m",
+                    "backup_channel": "456",
+                    "storage_trash_retention_days": 30,
+                    "job_stall_timeout_seconds": 600,
+                    "job_cancel_grace_seconds": 30,
+                    "bot_token": "123456:abcdefghijklmnopqrstuvwxyzABCDE12345",
+                    "telegram_tts_chat_id": "",
+                },
+            ),
         )
+        self.context = context
         self.client = TestClient(create_backend_app(context))
 
     def tearDown(self):
@@ -265,6 +328,197 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(enabled.json()["enabled"])
+
+    def test_worker_storage_profile_can_be_read_and_updated_from_web(self):
+        headers = self.login()
+
+        current = self.client.get("/api/v1/workers/local/settings", headers=headers)
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(current.json()["storage_profile"], "storage")
+        self.assertNotIn("token", current.json())
+
+        updated = self.client.put(
+            "/api/v1/workers/local/settings",
+            headers=headers,
+            json={"storage_profile": "archive"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["storage_profile"], "archive")
+
+        rejected = self.client.put(
+            "/api/v1/workers/local/settings",
+            headers=headers,
+            json={"storage_profile": "missing"},
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.json()["error"]["code"], "STORAGE_PROFILE_UNAVAILABLE")
+
+    def test_backup_runtime_settings_are_persisted_and_applied_immediately(self):
+        headers = self.login()
+        response = self.client.put(
+            "/api/v1/backups/settings",
+            headers=headers,
+            json={
+                "enabled": False,
+                "schedule": "04:15",
+                "timezone": "Asia/Jakarta",
+                "retention": 12,
+                "volume_size": "2g",
+                "channel": "789",
+                "storage_trash_retention_days": 45,
+                "job_stall_timeout_seconds": 900,
+                "job_cancel_grace_seconds": 60,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["enabled"])
+        self.assertEqual(response.json()["channel"], "789")
+        self.assertEqual(self.client.get("/api/v1/backups/status", headers=headers).json()["schedule"], "04:15")
+        self.assertEqual(self.context.config.backup_channel_id, -100789)
+        self.assertEqual(self.context.control_plane.job_stall_timeout_seconds, 900)
+
+    def test_backup_runtime_settings_reject_invalid_timezone_without_applying(self):
+        headers = self.login()
+        response = self.client.put(
+            "/api/v1/backups/settings",
+            headers=headers,
+            json={
+                "enabled": True,
+                "schedule": "04:15",
+                "timezone": "Not/A_Timezone",
+                "retention": 12,
+                "volume_size": "2g",
+                "channel": "789",
+                "storage_trash_retention_days": 45,
+                "job_stall_timeout_seconds": 900,
+                "job_cancel_grace_seconds": 60,
+            },
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.context.config.backup_schedule, "03:00")
+
+    def test_backup_settings_accept_public_tme_link_and_resolve_bot_api_id(self):
+        headers = self.login()
+        response = self.client.put(
+            "/api/v1/backups/settings",
+            headers=headers,
+            json={
+                "enabled": False,
+                "schedule": "04:15",
+                "timezone": "Asia/Jakarta",
+                "retention": 12,
+                "volume_size": "2g",
+                "channel": "https://t.me/BackupChannel",
+                "storage_trash_retention_days": 45,
+                "job_stall_timeout_seconds": 900,
+                "job_cancel_grace_seconds": 60,
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["channel"], "backupchannel")
+        self.assertEqual(self.bot.chat_lookups, ["@backupchannel"])
+        self.assertEqual(self.context.config.backup_channel_id, -100987654321)
+        self.assertEqual(self.context.config.backup_channel_ref, "backupchannel")
+
+    def test_web_managed_telegram_credentials_are_write_only_and_bootstrap_is_service_only(self):
+        headers = self.login()
+        secret = "987654:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"
+        status = self.client.get("/api/v1/runtime/secrets", headers=headers)
+        self.assertEqual(status.status_code, 200)
+        self.assertTrue(status.json()["telegram_bot_token_configured"])
+
+        updated = self.client.put(
+            "/api/v1/runtime/secrets",
+            headers=headers,
+            json={"bot_token": secret, "telegram_tts_chat_id": "-100123456789"},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertNotIn(secret, updated.text)
+        self.assertEqual(updated.json()["restart_required_services"], ["backend", "telegram"])
+
+        denied = self.client.get("/internal/v1/telegram/bootstrap")
+        self.assertEqual(denied.status_code, 401)
+        bootstrap = self.client.get(
+            "/internal/v1/telegram/bootstrap",
+            headers={"Authorization": "Bearer frontend"},
+        )
+        self.assertEqual(bootstrap.status_code, 200)
+        self.assertEqual(bootstrap.json()["bot_token"], secret)
+        self.assertEqual(bootstrap.json()["telegram_tts_chat_id"], "-100123456789")
+        public_status = self.client.get("/api/v1/runtime/secrets", headers=headers)
+        self.assertTrue(public_status.json()["telegram_tts_chat_configured"])
+        self.assertNotIn("-100123456789", public_status.text)
+        chat_update = self.client.put(
+            "/api/v1/runtime/secrets",
+            headers=headers,
+            json={"telegram_tts_chat_id": "-100987654321"},
+        )
+        self.assertEqual(chat_update.status_code, 200)
+        self.assertEqual(chat_update.json()["restart_required_services"], ["telegram"])
+
+        rejected_secret = "short-secret"
+        rejected = self.client.put(
+            "/api/v1/runtime/secrets",
+            headers=headers,
+            json={"bot_token": rejected_secret},
+        )
+        self.assertEqual(rejected.status_code, 422)
+        self.assertNotIn(rejected_secret, rejected.text)
+
+        invalid_chat = self.client.put(
+            "/api/v1/runtime/secrets",
+            headers=headers,
+            json={"telegram_tts_chat_id": "@not-a-numeric-id"},
+        )
+        self.assertEqual(invalid_chat.status_code, 422)
+        self.assertNotIn("@not-a-numeric-id", invalid_chat.text)
+
+        public_username = self.client.put(
+            "/api/v1/runtime/secrets",
+            headers=headers,
+            json={"telegram_tts_chat_id": "https://t.me/IYear"},
+        )
+        self.assertEqual(public_username.status_code, 200)
+        self.assertEqual(
+            self.context.runtime_settings.get()["telegram_tts_chat_id"], "@iyear"
+        )
+        self.assertEqual(public_username.json()["restart_required_services"], ["telegram"])
+
+        phone_target = self.client.put(
+            "/api/v1/runtime/secrets",
+            headers=headers,
+            json={"telegram_tts_chat_id": "+1 123456789"},
+        )
+        self.assertEqual(phone_target.status_code, 422)
+        self.assertNotIn("+1 123456789", phone_target.text)
+
+    def test_tts_tor_secret_can_be_updated_from_web_without_returning_value(self):
+        headers = self.login()
+        secret = "tor-password-is-write-only"
+        updated = self.client.put(
+            "/api/v1/workers/local/settings",
+            headers=headers,
+            json={
+                "tts_tor_control_password": secret,
+                "tts_part_retries": 6,
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertNotIn(secret, updated.text)
+        self.assertTrue(updated.json()["tts_tor_control_password_configured"])
+
+    def test_worker_api_token_rotation_updates_worker_then_gateway_registry(self):
+        headers = self.login()
+        secret = "new-worker-token-long-enough-123"
+        response = self.client.put(
+            "/api/v1/workers/local",
+            headers=headers,
+            json={"url": "http://worker", "token": secret},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(secret, response.text)
+        self.assertEqual(self.workers.get("local")["token"], secret)
+        self.assertTrue(self.dispatcher.runtime_settings["worker_api_token_configured"])
 
     def insert_storage_item(self):
         return self.catalog.insert_item(
@@ -646,6 +900,32 @@ class BackendApiTests(unittest.TestCase):
             f"/api/v1/jobs/{job['id']}/events", headers=headers
         ).json()["items"]
         self.assertNotIn("progress.snapshot", [event["event_type"] for event in events])
+
+    def test_export_chat_ref_is_normalized_to_tdl_peer_selector(self):
+        headers = self.login()
+        for raw, expected in (
+            ("@IYear", "iyear"),
+            ("iyear", "iyear"),
+            ("123456789", "123456789"),
+            ("https://t.me/IYear", "iyear"),
+            ("+1 123456789", "+1123456789"),
+        ):
+            with self.subTest(raw=raw):
+                response = self.client.post(
+                    "/api/v1/exports",
+                    headers=headers,
+                    json={"chat_ref": raw},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.json()["payload"]["chat_ref"], expected)
+
+        invalid = self.client.post(
+            "/api/v1/exports",
+            headers=headers,
+            json={"chat_ref": "https://example.com/IYear"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["error"]["code"], "INVALID_CHAT_REF")
 
     def test_telegram_job_notification_is_service_authenticated_and_idempotent(self):
         headers = self.login()
@@ -1285,6 +1565,29 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(no_worker.status_code, 503)
         self.assertEqual(no_worker.json()["error"]["code"], "TTS_WORKER_UNAVAILABLE")
+
+    def test_tts_worker_options_and_explicit_worker_selection(self):
+        self.dispatcher.tts_ready = True
+        self.jobs.set_tts_telegram_ready(True)
+        self.workers.upsert("remote-tts", "http://remote-tts", "remote-token")
+        headers = self.login()
+
+        options = self.client.get("/api/v1/tts/workers", headers=headers)
+        self.assertEqual(options.status_code, 200, options.text)
+        self.assertEqual(
+            {item["name"] for item in options.json()["items"]},
+            {"local", "remote-tts"},
+        )
+        self.assertTrue(all(item["queued_jobs"] == 0 for item in options.json()["items"]))
+
+        created = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": "Isi", "worker": "remote-tts"},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["worker"], "remote-tts")
+        self.assertEqual(self.dispatcher.commands[-1][0], "remote-tts")
 
 
 if __name__ == "__main__":

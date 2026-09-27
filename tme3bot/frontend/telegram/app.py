@@ -44,6 +44,7 @@ from tme3bot.frontend.telegram.panel import (
     edit_menu_message,
 )
 from tme3bot.frontend.telegram.text import help_text, source_digest
+from tme3bot.chat_refs import canonical_chat_key
 from tme3bot.frontend.telegram.export_workspace import (
     ExportWorkspaceStore,
     format_export_job,
@@ -529,7 +530,7 @@ class TelegramFrontendApp:
             )
             edit_menu_message(
                 message,
-                "Ketik nama, label, username, atau numeric ID source.",
+                "Ketik nama, label, @username, ID numeric, link t.me, atau nomor telepon source.",
                 export_input_cancel_markup(),
             )
             return
@@ -539,7 +540,7 @@ class TelegramFrontendApp:
             )
             edit_menu_message(
                 message,
-                "Ketik username tanpa link atau numeric chat ID untuk source baru.",
+                "Kirim @username, username, ID numeric, https://t.me/username, atau nomor telepon internasional untuk source baru.",
                 export_input_cancel_markup(),
             )
             return
@@ -583,7 +584,7 @@ class TelegramFrontendApp:
                     f"?profile={quote(str(actor['profile']), safe='')}",
                 )
                 state = self.export_workspaces.get(message.chat_id, user_id)
-                if state.chat_ref and state.chat_ref.lstrip("@").casefold() == chat_ref.lstrip("@").casefold():
+                if state.chat_ref and canonical_chat_key(state.chat_ref) == canonical_chat_key(chat_ref):
                     state.source = None
                     state.chat_ref = None
                     state.start_id = None
@@ -762,19 +763,21 @@ class TelegramFrontendApp:
         sources = self.client.get(user_id, "/api/v1/sources").get("items", [])
         if getattr(state, "source_query", ""):
             query = state.source_query
+            normalized_query = canonical_chat_key(query)
             sources = [
                 item
                 for item in sources
-                if query in str(item.get("chat_ref", "")).lstrip("@").casefold()
+                if normalized_query in canonical_chat_key(str(item.get("chat_ref", "")))
+                or query in str(item.get("chat_ref", "")).lstrip("@").casefold()
                 or query in str(item.get("label", "")).casefold()
             ]
         labels = self.client.get(user_id, "/api/v1/labels").get("items", [])
         source_map = {
-            str(item.get("chat_ref", "")).lstrip("@").casefold(): item
+            canonical_chat_key(str(item.get("chat_ref", ""))): item
             for item in sources
         }
         if state.chat_ref and state.source is None:
-            state.source = source_map.get(state.chat_ref.lstrip("@").casefold())
+            state.source = source_map.get(canonical_chat_key(state.chat_ref))
         selected = state.chat_ref or "Belum dipilih"
         if state.source and state.source.get("label"):
             selected = f"{state.source['label']} — {selected}"
@@ -863,8 +866,8 @@ class TelegramFrontendApp:
                 (
                     item
                     for item in sources
-                    if str(item.get("chat_ref", "")).lstrip("@").casefold()
-                    == ref.lstrip("@").casefold()
+                    if canonical_chat_key(str(item.get("chat_ref", "")))
+                    == canonical_chat_key(ref)
                 ),
                 None,
             )

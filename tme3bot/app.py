@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 
 from tme3bot.config import AppConfig
 
@@ -33,6 +34,23 @@ def main() -> None:
         client = BackendApiClient(
             config.backend_api_url, config.frontend_service_token
         )
+        try:
+            managed = client.telegram_bootstrap_settings()
+            bot_token = str(managed.get("bot_token") or "").strip()
+            if bot_token:
+                config = replace(
+                    config,
+                    bot_token=bot_token,
+                    telegram_tts_chat_id=str(
+                        managed.get("telegram_tts_chat_id") or ""
+                    ),
+                )
+        except Exception:
+            # Preserve environment bootstrap for upgrades where the backend
+            # has not yet received the internal bootstrap endpoint.
+            logging.getLogger(__name__).warning(
+                "Telegram runtime settings unavailable; using environment bootstrap"
+            )
         TelegramFrontendApp(config, client).start()
         return
     raise RuntimeError(f"APP_ROLE tidak didukung: {config.app_role}")

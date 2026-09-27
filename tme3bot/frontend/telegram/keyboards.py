@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from tme3bot.chat_refs import canonical_chat_key
 from tme3bot.frontend.telegram.text import source_digest
 
 
@@ -30,12 +31,12 @@ def _export_source_compact_markup(
     source = getattr(state, "source", None) or {}
     selected_ref = str(getattr(state, "chat_ref", "") or "")
     if not source.get("label") and selected_ref:
-        selected_key = selected_ref.lstrip("@").casefold()
+        selected_key = canonical_chat_key(selected_ref)
         source = next(
             (
                 item
                 for item in sources
-                if str(item.get("chat_ref", "")).lstrip("@").casefold() == selected_key
+                if canonical_chat_key(str(item.get("chat_ref", ""))) == selected_key
             ),
             source,
         )
@@ -254,7 +255,7 @@ def _export_source_picker_markup(state, sources: list[dict]) -> InlineKeyboardMa
     page = max(0, int(getattr(state, "source_page", 0)))
     page_size = 6
     start = page * page_size
-    selected = str(getattr(state, "chat_ref", "") or "").lstrip("@").casefold()
+    selected = canonical_chat_key(str(getattr(state, "chat_ref", "") or ""))
     rows = [
         [InlineKeyboardButton("Pilih source", callback_data="ew:source:close")],
         [
@@ -264,7 +265,7 @@ def _export_source_picker_markup(state, sources: list[dict]) -> InlineKeyboardMa
     ]
     for item in sources[start : start + page_size]:
         ref = str(item.get("chat_ref", ""))
-        marker = "✓ " if ref.lstrip("@").casefold() == selected else ""
+        marker = "✓ " if canonical_chat_key(ref) == selected else ""
         label = f"{marker}{item.get('label') + ' — ' if item.get('label') else ''}{ref}"
         rows.append(
             [

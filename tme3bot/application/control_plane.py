@@ -234,16 +234,40 @@ class ControlPlane:
         )
 
     def _select_tts_worker(self, requested: str | None = None) -> str:
+        options = self.tts_worker_options()
+        if not options:
+            raise DomainError(
+                "TTS_WORKER_UNAVAILABLE",
+                "Tidak ada worker dengan tiga helper TTS dan jalur Tor yang siap.",
+                status_code=503,
+            )
+        if requested:
+            selected = str(requested).strip().lower()
+            for option in options:
+                if option["name"].lower() == selected:
+                    return option["name"]
+            raise DomainError(
+                "TTS_WORKER_UNAVAILABLE",
+                "Worker yang dipilih tidak siap untuk job TTS.",
+                status_code=503,
+            )
+        counts = {option["name"]: option["queued_jobs"] for option in options}
+        minimum = min(counts.values())
+        tied = sorted(name for name, count in counts.items() if count == minimum)
+        with self._tts_route_lock:
+            selected = tied[self._tts_round_robin % len(tied)]
+            self._tts_round_robin += 1
+        return selected
+
+    def tts_worker_options(self) -> list[dict[str, Any]]:
         registry = self.worker_registry
         checker = getattr(self.dispatcher, "capabilities", None)
         if registry is None or not callable(checker):
-            raise DomainError("TTS_WORKER_UNAVAILABLE", "Worker TTS belum tersedia.", status_code=503)
-        if requested:
-            candidates = [str(requested).strip().lower()]
-        else:
-            enabled = getattr(registry, "enabled_names", None)
-            candidates = list(enabled()) if callable(enabled) else registry.names()
-        ready: list[str] = []
+            return []
+        enabled = getattr(registry, "enabled_names", None)
+        candidates = list(enabled()) if callable(enabled) else registry.names()
+        statuses = ("queued", "dispatched", "running", "paused")
+        result: list[dict[str, Any]] = []
         for name in candidates:
             record = registry.get(name)
             if record is None or not bool(record.get("enabled", True)):
@@ -253,33 +277,17 @@ class ControlPlane:
             except Exception:
                 continue
             capabilities = response.get("capabilities", []) if isinstance(response, dict) else []
-            if isinstance(response, dict) and (
+            if not isinstance(response, dict) or not (
                 response.get("tts") is True
                 or (isinstance(capabilities, list) and "tts" in capabilities)
             ):
-                ready.append(name)
-        if not ready:
-            raise DomainError(
-                "TTS_WORKER_UNAVAILABLE",
-                "Tidak ada worker dengan tiga helper TTS dan jalur Tor yang siap.",
-                status_code=503,
-            )
-        if requested:
-            return ready[0]
-        statuses = ("queued", "dispatched", "running", "paused")
-        counts = {
-            name: sum(
+                continue
+            queued_jobs = sum(
                 self.jobs.count(kind="tts", worker=name, status=status, archived=False)
                 for status in statuses
             )
-            for name in ready
-        }
-        minimum = min(counts.values())
-        tied = sorted(name for name, count in counts.items() if count == minimum)
-        with self._tts_route_lock:
-            selected = tied[self._tts_round_robin % len(tied)]
-            self._tts_round_robin += 1
-        return selected
+            result.append({"name": str(name), "queued_jobs": queued_jobs})
+        return sorted(result, key=lambda option: option["name"].lower())
 
     def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
         sequence = max(

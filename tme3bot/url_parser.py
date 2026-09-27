@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
+
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 
 
 class URLParseError(ValueError):
@@ -45,9 +47,13 @@ def parse_tme3_url(raw_url: str, expected_host: str) -> ParsedTme3Url:
             "Format wajib /c/<chat_ref>/<message_id> dengan label opsional untuk host t.me3."
         )
 
-    chat_ref = parts[1].strip()
+    chat_ref = unquote(parts[1]).strip()
     if not chat_ref:
         raise URLParseError("chat_ref tidak boleh kosong.")
+    try:
+        normalize_tdl_chat_ref(chat_ref)
+    except ValueError as exc:
+        raise URLParseError(str(exc)) from exc
 
     try:
         message_id = int(parts[2])

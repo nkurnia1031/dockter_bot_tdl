@@ -194,6 +194,33 @@ class WorkerHttpDispatcher:
             timeout=15,
         )
 
+    def worker_settings(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            "/internal/v1/runtime-settings",
+            timeout=15,
+        )
+
+    def update_worker_settings(
+        self, worker: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "PUT",
+            "/internal/v1/runtime-settings",
+            payload,
+            timeout=15,
+        )
+
     def open_tts_artifact(self, worker: str, job_id: str, artifact_ref: str):
         record = self.worker_registry.get(worker)
         if not record:

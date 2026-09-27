@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, post, remove } from '$lib/api';
+  import { normalizeTdlChatRef } from '$lib/chatRef';
   import type { LabelItem } from '$lib/presentation';
   import JobTable from './JobTable.svelte';
   import TargetPicker from './TargetPicker.svelte';
@@ -161,7 +162,7 @@
   }
   function updateChatRef(value: string) {
     chatRef = value;
-    if (selected && selected.replace(/^@/, '').toLowerCase() !== value.replace(/^@/, '').toLowerCase()) {
+    if (selected && normalizeTdlChatRef(selected) !== normalizeTdlChatRef(value)) {
       selected = '';
       overwriteStartId = false;
       startId = '1';
@@ -188,6 +189,11 @@
   async function submit() {
     if (submitting || exportCooldown) return;
     try {
+      const normalizedChatRef = normalizeTdlChatRef(chatRef);
+      if (!normalizedChatRef) {
+        message='Masukkan @username, username, ID numeric, link t.me publik, atau nomor telepon internasional.';
+        return;
+      }
       if (!targetVerified || targetVerified.profile !== targetProfile || targetVerified.worker !== targetWorker || (quickMode && targetVerified.quick_mode !== true)) {
         message='Verifikasi profile dan worker terlebih dahulu.';
         return;
@@ -198,13 +204,13 @@
         return;
       }
       const payload:Record<string,unknown>={
-        chat_ref:chatRef,
+        chat_ref:normalizedChatRef,
         label:label || undefined,
         use_url_message_id:overwriteStartId,
         profile: targetProfile,
         worker: targetWorker
       };
-      if (isNumericChatRef(chatRef)) payload.save_source=saveNumericSource;
+      if (isNumericChatRef(normalizedChatRef)) payload.save_source=saveNumericSource;
       if (overwriteStartId) payload.start_id=manualStartId;
       if (quickMode) payload.quick_mode=true;
       submitting = true;
@@ -277,14 +283,14 @@
   {/each}
 </div>
 
-<header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">EXPORT</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Source & pembuatan export</h1><p class="muted mt-2">Pilih source tersimpan atau masukkan username/numeric chat ID.</p></div><div class="hidden rounded-2xl bg-violet-50 p-3 text-violet-700 sm:block dark:bg-violet-950 dark:text-violet-200"><FileDown size={24}/></div></header>
+<header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">EXPORT</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Source & pembuatan export</h1><p class="muted mt-2">Pilih source tersimpan atau masukkan @username, ID, link publik t.me, atau nomor telepon.</p></div><div class="hidden rounded-2xl bg-violet-50 p-3 text-violet-700 sm:block dark:bg-violet-950 dark:text-violet-200"><FileDown size={24}/></div></header>
 
 <div class="mt-6"><TargetPicker purpose="export" quickMode={quickMode} bind:profile={targetProfile} bind:worker={targetWorker} bind:verified={targetVerified} /></div>
 
 <div class="mt-7 grid gap-5 xl:grid-cols-[.84fr_1.16fr]">
   <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Export baru</h2><p class="muted text-sm">Start ID dapat dioverride saat diperlukan.</p></div></div>
     <label class="mt-6 block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
-    <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Username atau chat ID<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="username atau numeric ID" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
+    <div class="mt-4 grid gap-4 sm:grid-cols-2"><label class="block text-sm font-bold sm:col-span-2">Referensi chat<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="@iyear · 123456789 · https://t.me/iyear · +1 123456789" /></label><label class="block text-sm font-bold">Start message ID<input class="field mt-2 disabled:cursor-not-allowed disabled:opacity-60" type="number" min="1" bind:value={startId} disabled={!overwriteStartId} /></label><label class="block text-sm font-bold">Label<input class="field mt-2" list="labels" bind:value={label} placeholder="Opsional" /><datalist id="labels">{#each labels as item}<option value={item.label}></option>{/each}</datalist></label></div>
     <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId} /><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Aktifkan hanya untuk export ini. Last ID backend tidak akan diturunkan.</span></span></label>
     <label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-4 text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" checked={quickMode} onchange={(event) => updateQuickMode((event.currentTarget as HTMLInputElement).checked)} /><span><span class="block text-sm font-extrabold">Quick Mode Export</span><span class="muted mt-1 block text-xs">Download, thumbnail, compress, dan upload otomatis ke ModeCepat/tahun.</span></span></label>
     {#if isNumericChatRef(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource} /><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Default mati agar ID sekali pakai tidak memenuhi daftar source. Aktifkan jika Last ID ingin disimpan.</span></span></label>{/if}

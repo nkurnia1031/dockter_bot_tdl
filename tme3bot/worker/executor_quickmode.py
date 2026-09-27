@@ -1309,7 +1309,7 @@ class QuickModeExecutorMixin:
                     fallback_path=worker_log,
                 )
 
-            storage_profile = str(getattr(self.config, "worker_storage_profile", "storage"))
+            storage_profile = self.storage_profile()
             verify_root: Path | None = None
             try:
                 if storage_profile not in self.profile_manager.list_profiles():

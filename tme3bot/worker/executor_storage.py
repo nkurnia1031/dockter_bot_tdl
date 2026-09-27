@@ -109,7 +109,7 @@ class StorageExecutorMixin:
         upload_item_callback=None,
     ) -> dict[str, Any]:
         payload = command["payload"]
-        storage_profile = getattr(self.config, "worker_storage_profile", "storage")
+        storage_profile = self.storage_profile()
         if storage_profile not in self.profile_manager.list_profiles():
             raise ValueError(
                 f"STORAGE_PROFILE_UNAVAILABLE: profile worker {storage_profile} belum memiliki sesi TDL."

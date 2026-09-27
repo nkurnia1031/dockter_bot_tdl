@@ -76,7 +76,10 @@ Base Go/TDL tidak perlu dibangun ulang.
 awal. Panel ini menggabungkan pemilihan source, label opsional, Start ID, dan
 pengiriman export dalam satu pesan Telegram. Source tersimpan dipilih melalui
 tombol inline; source baru dapat dimasukkan sebagai username tanpa `@` atau
-numeric chat ID. Username dengan dan tanpa `@` dianggap source yang sama.
+numeric chat ID. Referensi source juga menerima `@username`, link publik
+`https://t.me/<username>`, dan nomor telepon internasional seperti
+`+1 123456789`. Bentuk username dengan/ tanpa `@` dan link publik dinormalisasi
+ke source yang sama.
 
 `Overwrite Start ID` default OFF dan memakai `Last ID backend + 1`. Saat switch
 ON, user wajib mengisi Start ID angka minimal 1 dan frontend mengirim
@@ -634,8 +637,8 @@ cache immutable.
    `Mulai semua`. Pastikan artifact campuran dikelompokkan menjadi satu job
    untuk setiap profile-worker asal dan kelompok berbeda dapat paralel.
 8. Buka Utility dan Storage, pilih worker serta verifikasi target sebelum
-   memilih folder. Pastikan Storage menolak worker tanpa profile
-   `WORKER_STORAGE_PROFILE`.
+   memilih folder. Pada halaman Workers → Runtime, pilih profil Storage yang
+   memiliki sesi `.tdl` pada worker tersebut.
 9. Pastikan job terminal berpindah ke History dan snapshot log terakhir tetap
    dapat dibuka.
 
@@ -850,18 +853,23 @@ memiliki pilihan terpisah untuk menyalin file ke remote yang sama. Sumber dan
 arsip rclone selalu divalidasi berada di bawah `/workspace`; staging Quick Mode
 yang gagal tetap berada di `/workspace/quickmode` untuk diagnosis/retry.
 
-Setiap worker yang melayani Storage wajib memiliki profile sesi dedicated sesuai
-`WORKER_STORAGE_PROFILE` (default `storage`), misalnya:
+Setiap worker yang melayani Storage wajib memiliki profil dengan sesi `.tdl`
+Storage yang sudah login dan dapat mengakses channel Storage. Siapkan sesi pada
+worker terlebih dahulu. Contoh membuat identity dari sesi `storage` yang sudah
+login:
 
 ```bash
 python3 run.py identity storage
 ```
 
-Pastikan sesi tersebut sudah login dan memiliki akses channel Storage sebelum
-menjalankan upload. Jika sesi belum ada, checker mengembalikan
-`STORAGE_PROFILE_UNAVAILABLE`; jangan melewati checker dengan mengubah payload
-manual. Jangan menghapus lock untuk memaksa paralel karena database Bolt `.tdl`
-tidak boleh dibuka bersamaan. Backup tetap mengikuti lane backup yang ada.
+Lalu buka halaman Workers → Runtime dan pilih profil itu untuk worker terkait.
+Pengaturan tersimpan di data worker dan berlaku untuk job berikutnya;
+`WORKER_STORAGE_PROFILE` hanya menjadi nilai awal bila belum ada pilihan Web.
+Jika belum ada sesi, halaman Runtime tidak akan menawarkan profil tersebut dan
+checker mengembalikan `STORAGE_PROFILE_UNAVAILABLE`. Jangan melewati checker
+dengan mengubah payload manual. Jangan menghapus lock untuk memaksa paralel
+karena database Bolt `.tdl` tidak boleh dibuka bersamaan. Backup tetap mengikuti
+lane backup yang ada.
 
 Setiap job asynchronous yang dibuat dari Telegram membuat satu pesan status
 tanpa keyboard. Pesan yang sama diperbarui saat queued/running, menampilkan
@@ -909,9 +917,9 @@ status worker terakhir. Target dipilih pada fitur yang memakainya:
   response checker valid.
 - Utility: pilih `worker`, verifikasi workspace, lalu pilih folder pada worker
   tersebut. Profile actor hanya dicatat untuk audit.
-- Storage: pilih `worker`, verifikasi `WORKER_STORAGE_PROFILE`, lalu gunakan
-  Workspace Explorer. Profile Storage dedicated adalah profile TDL worker,
-  bukan profile actor.
+- Storage: pilih `worker`, pastikan profil runtime Storage worker sudah
+  dipilih pada halaman Workers → Runtime, lalu gunakan Workspace Explorer.
+  Profile Storage dedicated adalah profile TDL worker, bukan profile actor.
 - Download: default `scope=global`, sehingga artifact dari seluruh profile dan
   worker tampil. Filter profile/worker hanya untuk penyaringan tampilan.
 
@@ -953,7 +961,7 @@ Deploy selalu dalam urutan berikut:
 1. Gateway/backend: migration SQLite, checker, source profile, download global
    dan endpoint batch.
 2. Worker-local dan seluruh worker remote: scheduler origin, inventory,
-   capability endpoint, serta `WORKER_STORAGE_PROFILE` dan sesi `.tdl`-nya.
+   capability/runtime-settings endpoint, serta sesi `.tdl` Storage-nya.
 3. Static web: TargetPicker, filter/download global, dan bulk actions.
 
 Setelah setiap tahap, lakukan health check dan pastikan worker yang relevan

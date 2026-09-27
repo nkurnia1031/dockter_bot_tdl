@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from tme3bot.persistence import write_json_atomic
+from tme3bot.persistence import write_json_atomic, write_json_atomic_private
 from tme3bot.tdl import (
     CommandCallback,
     ProcessStalledError,
@@ -95,11 +95,9 @@ class UtilitySettingsStore:
             self._load()
             assert self._settings is not None
             self._settings[key] = value
-            write_json_atomic(self.path, self._settings)
-            try:
-                self.path.chmod(0o600)
-            except OSError:
-                pass
+            # This file contains the archive password as well as non-secret
+            # utility values, so create it atomically with owner-only access.
+            write_json_atomic_private(self.path, self._settings)
 
     def _load(self) -> None:
         if self._settings is not None:
@@ -123,11 +121,7 @@ class UtilitySettingsStore:
                     LOGGER.warning("Tujuan rclone pada settings tidak valid; memakai default.")
                     continue
             self._settings[key] = candidate
-        write_json_atomic(self.path, self._settings)
-        try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
+        write_json_atomic_private(self.path, self._settings)
 
 
 def _validate_size(value: str) -> None:

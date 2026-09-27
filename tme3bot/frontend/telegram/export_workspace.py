@@ -5,17 +5,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from tme3bot.chat_refs import canonical_chat_key
+
 EXPORT_WORKSPACE_TTL_SECONDS = 30 * 60
 
 
 def normalize_chat_ref(chat_ref: str) -> str:
-    """Match backend source canonicalization without importing its state store."""
-    value = str(chat_ref or "").strip()
-    if not value:
-        return ""
-    if value.lstrip("-").isdigit():
-        return value
-    return value.lstrip("@").casefold()
+    """Match backend canonicalization for IDs, usernames, links, and phones."""
+    return canonical_chat_key(chat_ref)
 
 
 def is_numeric_chat_ref(chat_ref: str | None) -> bool:
@@ -236,7 +233,7 @@ class ExportWorkspaceState:
     def select_chat_ref(self, chat_ref: str, source: dict[str, Any] | None = None) -> None:
         ref = normalize_chat_ref(chat_ref)
         if not ref:
-            raise ValueError("Username atau numeric chat ID wajib diisi.")
+            raise ValueError("Isi @username, ID numeric, link t.me publik, atau nomor telepon internasional.")
         self.chat_ref = ref
         self.source = dict(source) if source is not None else None
         if self.source is not None:

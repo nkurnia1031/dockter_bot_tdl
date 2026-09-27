@@ -46,6 +46,7 @@ from tme3bot.worker.quick_export import (
     visual_media,
     write_quick_manifest,
 )
+from tme3bot.worker.runtime_settings import WorkerRuntimeSettings
 
 LOGGER = logging.getLogger(__name__)
 from .executor_support import (
@@ -117,6 +118,25 @@ class WorkerJobExecutor(
         self.config = config
         self.profile_manager = profile_manager
         self.publisher = publisher
+        self.runtime_settings = WorkerRuntimeSettings(
+            config.state_file.parent / "worker_settings.json",
+            default_storage_profile=getattr(config, "worker_storage_profile", "storage"),
+            default_worker_api_token=str(getattr(config, "worker_api_token", "")),
+            default_operational_settings={
+                "job_stall_timeout_seconds": int(getattr(config, "job_stall_timeout_seconds", 600)),
+                "tdl_export_stall_timeout_seconds": int(getattr(config, "tdl_export_stall_timeout_seconds", 300)),
+                "tdl_download_stall_timeout_seconds": int(getattr(config, "tdl_download_stall_timeout_seconds", 300)),
+            },
+            default_tts_settings={
+                "tts_helper_urls": tuple(getattr(config, "tts_helper_urls", ())),
+                "tts_tor_control_hosts": tuple(getattr(config, "tts_tor_control_hosts", ())),
+                "tts_tor_control_ports": tuple(getattr(config, "tts_tor_control_ports", ())),
+                "tts_tor_control_password": str(getattr(config, "tts_tor_control_password", "")),
+                "tts_part_retries": int(getattr(config, "tts_part_retries", 4)),
+                "tts_retry_base_seconds": float(getattr(config, "tts_retry_base_seconds", 2.0)),
+                "tts_newnym_after_retries": int(getattr(config, "tts_newnym_after_retries", 3)),
+            },
+        )
         self._active: dict[str, tuple[str, str]] = {}
         self._active_commands: dict[str, dict[str, Any]] = {}
         self._utility_runners: dict[str, UtilityRunner] = {}
@@ -359,7 +379,7 @@ class WorkerJobExecutor(
                 )
                 try:
                     storage_runtime = self.profile_manager.runtime(
-                        getattr(self.config, "worker_storage_profile", "storage")
+                        self.storage_profile()
                     )
                 except Exception:
                     storage_runtime = None
@@ -381,7 +401,7 @@ class WorkerJobExecutor(
         elif kind == "storage_upload":
             try:
                 storage_runtime = self.profile_manager.runtime(
-                    getattr(self.config, "worker_storage_profile", "storage")
+                    self.storage_profile()
                 )
             except Exception:
                 storage_runtime = None
@@ -512,7 +532,7 @@ class WorkerJobExecutor(
             except Exception:
                 runtime = None
             try:
-                storage_profile = getattr(self.config, "worker_storage_profile", "storage")
+                storage_profile = self.storage_profile()
                 storage_runtime = self.profile_manager.runtime(storage_profile)
                 clients.append(getattr(storage_runtime, "export_tdl_client", None))
             except Exception:
@@ -540,16 +560,9 @@ class WorkerJobExecutor(
     def capabilities(self) -> dict[str, Any]:
         """Return non-secret worker capabilities for backend target checks."""
         profiles = [str(item) for item in self.profile_manager.list_profiles()]
-        storage_profile = getattr(self.config, "worker_storage_profile", "storage")
-        storage_available = False
-        if storage_profile in profiles:
-            try:
-                runtime_config = build_profile_config(
-                    self.profile_manager.base_config, storage_profile
-                )
-                storage_available = Path(runtime_config.tdl_export_storage).exists()
-            except Exception:
-                storage_available = False
+        storage_profiles_available = self.available_storage_profiles()
+        storage_profile = self.storage_profile()
+        storage_available = storage_profile in storage_profiles_available
         tts_ready = False
         try:
             tts_ready = self._tts_pipeline().ready()
@@ -559,9 +572,196 @@ class WorkerJobExecutor(
             "profiles": profiles,
             "storage_profile": storage_profile,
             "storage_profile_available": storage_available,
+            "available_storage_profiles": storage_profiles_available,
             "workspace": Path(getattr(self.config, "utility_workspace_root", "/workspace")).is_dir(),
             "tts": tts_ready,
         }
+
+    def storage_profile(self) -> str:
+        return self.runtime_settings.storage_profile()
+
+    def available_storage_profiles(self) -> list[str]:
+        available: list[str] = []
+        for profile in self.profile_manager.list_profiles():
+            try:
+                runtime_config = build_profile_config(self.profile_manager.base_config, str(profile))
+                if Path(runtime_config.tdl_export_storage).is_dir():
+                    available.append(str(profile))
+            except Exception:
+                continue
+        return available
+
+    def worker_settings(self) -> dict[str, Any]:
+        selected = self.storage_profile()
+        available = self.available_storage_profiles()
+        tts = self.runtime_settings.tts_settings()
+        operational = self.runtime_settings.operational_settings()
+        return {
+            "storage_profile": selected,
+            "storage_profile_available": selected in available,
+            "available_storage_profiles": available,
+            "worker_api_token_configured": bool(self.runtime_settings.worker_api_token()),
+            **operational,
+            "tts_helper_urls": list(tts.get("tts_helper_urls", ())),
+            "tts_tor_control_hosts": list(tts.get("tts_tor_control_hosts", ())),
+            "tts_tor_control_ports": list(tts.get("tts_tor_control_ports", ())),
+            "tts_tor_control_password_configured": self.runtime_settings.has_tts_password(),
+            "tts_part_retries": int(tts.get("tts_part_retries", 4)),
+            "tts_retry_base_seconds": float(tts.get("tts_retry_base_seconds", 2.0)),
+            "tts_newnym_after_retries": int(tts.get("tts_newnym_after_retries", 3)),
+        }
+
+    def update_storage_profile(self, profile: str) -> dict[str, Any]:
+        return self.update_worker_settings({"storage_profile": profile})
+
+    def update_worker_settings(self, values: dict[str, Any]) -> dict[str, Any]:
+        updates = dict(values)
+        selected = str(updates.get("storage_profile") or "").strip()
+        if "storage_profile" in updates:
+            available = self.available_storage_profiles()
+            if selected not in available:
+                raise DomainError(
+                    "STORAGE_PROFILE_UNAVAILABLE",
+                    "Profil Storage yang dipilih belum memiliki sesi TDL pada worker ini.",
+                    status_code=409,
+                    details={"available_storage_profiles": available},
+                )
+
+        clear_password = bool(updates.pop("clear_tts_tor_control_password", False))
+        worker_api_token = updates.pop("worker_api_token", None)
+        operational_updates = {
+            key: value
+            for key, value in updates.items()
+            if key in self.runtime_settings.default_operational_settings
+        }
+        if any(
+            isinstance(value, bool) or not 0 <= int(value) <= 86400
+            for value in operational_updates.values()
+        ):
+            raise DomainError(
+                "INVALID_WORKER_SETTINGS",
+                "Timeout worker harus berada antara 0 dan 86400 detik.",
+                status_code=422,
+            )
+        if clear_password and updates.get("tts_tor_control_password"):
+            raise DomainError(
+                "INVALID_TTS_SETTINGS",
+                "Pilih ganti atau hapus password Tor, bukan keduanya.",
+                status_code=422,
+            )
+        if clear_password:
+            updates["tts_tor_control_password"] = ""
+        tts_updates = {key: value for key, value in updates.items() if key.startswith("tts_")}
+        if tts_updates:
+            self._validate_tts_settings(tts_updates)
+
+        with self._lock:
+            if "storage_profile" in updates and self._storage_settings_busy():
+                raise DomainError(
+                    "WORKER_SETTINGS_BUSY",
+                    "Profil Storage tidak dapat diubah saat job Storage atau Quick Mode sedang berjalan.",
+                    status_code=409,
+                )
+            if tts_updates and any(kind == "tts" for _, kind in self._active.values()):
+                raise DomainError(
+                    "WORKER_SETTINGS_BUSY",
+                    "Pengaturan TTS tidak dapat diubah saat job TTS sedang berjalan.",
+                    status_code=409,
+                )
+            if operational_updates and self._active:
+                raise DomainError(
+                    "WORKER_SETTINGS_BUSY",
+                    "Timeout worker tidak dapat diubah saat ada job aktif.",
+                    status_code=409,
+                )
+            if "storage_profile" in updates:
+                self.runtime_settings.set_storage_profile(selected)
+                updates.pop("storage_profile", None)
+            if tts_updates:
+                self.runtime_settings.set_tts_settings(tts_updates)
+            if worker_api_token is not None:
+                try:
+                    self.runtime_settings.set_worker_api_token(str(worker_api_token))
+                except ValueError as exc:
+                    raise DomainError(
+                        "INVALID_WORKER_SETTINGS", str(exc), status_code=422
+                    ) from exc
+            if operational_updates:
+                self.runtime_settings.set_operational_settings(operational_updates)
+                for key, value in operational_updates.items():
+                    object.__setattr__(self.config, key, int(value))
+        return self.worker_settings()
+
+    def worker_token_matches(self, token: str) -> bool:
+        return self.runtime_settings.worker_token_matches(token)
+
+    def _storage_settings_busy(self) -> bool:
+        storage_job_active = any(
+            kind == "storage_upload" for _, kind in self._active.values()
+        )
+        quick_job_active = any(
+            str(command.get("kind") or "") == "export"
+            and bool((command.get("payload") or {}).get("quick_mode"))
+            for command in self._active_commands.values()
+        )
+        return bool(
+            storage_job_active
+            or quick_job_active
+            or self._quick_active
+            or self._quick_verify_active
+        )
+
+    def _validate_tts_settings(self, updates: dict[str, Any]) -> None:
+        from urllib.parse import urlsplit
+
+        current = self.runtime_settings.tts_settings()
+        candidate = {**current, **updates}
+        urls = tuple(str(item).strip().rstrip("/") for item in candidate.get("tts_helper_urls", ()))
+        hosts = tuple(str(item).strip() for item in candidate.get("tts_tor_control_hosts", ()))
+        ports = tuple(int(item) for item in candidate.get("tts_tor_control_ports", ()))
+        valid_urls = True
+        try:
+            for url in urls:
+                parsed = urlsplit(url)
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.fragment
+                ):
+                    valid_urls = False
+                    break
+                _ = parsed.port
+        except ValueError:
+            valid_urls = False
+        if len(urls) != 3 or not valid_urls:
+            raise DomainError(
+                "INVALID_TTS_SETTINGS",
+                "TTS harus memiliki tepat tiga URL helper HTTP/HTTPS.",
+                status_code=422,
+            )
+        if len(hosts) != 3 or any(not host or len(host) > 253 or any(ch.isspace() for ch in host) for host in hosts):
+            raise DomainError(
+                "INVALID_TTS_SETTINGS",
+                "TTS harus memiliki tepat tiga host Tor yang valid.",
+                status_code=422,
+            )
+        if len(ports) != 3 or any(port < 1 or port > 65535 for port in ports):
+            raise DomainError(
+                "INVALID_TTS_SETTINGS",
+                "TTS harus memiliki tepat tiga port Tor antara 1 dan 65535.",
+                status_code=422,
+            )
+        if int(candidate.get("tts_part_retries", 4)) not in range(0, 11):
+            raise DomainError("INVALID_TTS_SETTINGS", "Retry TTS harus antara 0 dan 10.", status_code=422)
+        if not 0.1 <= float(candidate.get("tts_retry_base_seconds", 2.0)) <= 60:
+            raise DomainError("INVALID_TTS_SETTINGS", "Backoff TTS harus antara 0,1 dan 60 detik.", status_code=422)
+        if int(candidate.get("tts_newnym_after_retries", 3)) not in range(1, 21):
+            raise DomainError("INVALID_TTS_SETTINGS", "Batas rotasi circuit TTS harus antara 1 dan 20.", status_code=422)
+        password = str(candidate.get("tts_tor_control_password", "") or "")
+        if len(password) > 512 or "\n" in password or "\r" in password:
+            raise DomainError("INVALID_TTS_SETTINGS", "Password Tor tidak valid.", status_code=422)
 
     def _unhandled_resource(self, command: dict[str, Any], exc: Exception) -> None:
         LOGGER.exception("Worker queue failed for job %s", command.get("job_id"))

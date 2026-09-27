@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import Depends, Query
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.api.schemas import DownloadBatchRequest, DownloadRequest, JobResponse, ObjectResponse
 from tme3bot.domain.models import DomainError
 from typing import Any
@@ -131,6 +132,11 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
         selected_profile = None if scope == "global" else context.control_plane.require_profile(actor, profile)
         if profile:
             selected_profile = context.control_plane.require_profile(actor, profile)
+        if chat_ref:
+            try:
+                chat_ref = normalize_tdl_chat_ref(chat_ref)
+            except ValueError:
+                pass
         items, total = context.export_catalog.list(
             profile=selected_profile,
             status=status,

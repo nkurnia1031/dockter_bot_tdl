@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import re
 
+from tme3bot.chat_refs import normalize_tdl_chat_ref
+
 
 def compact_channel_ref(raw: str) -> str:
     value = str(raw or "").strip()
-    match = re.search(r"t\.me/c/(\d+)", value, re.IGNORECASE)
+    match = re.search(r"(?:https?://)?(?:www\.)?t\.me/c/(\d+)", value, re.IGNORECASE)
     if match:
         return match.group(1)
     if value.startswith("-100") and value[4:].isdigit():
         return value[4:]
-    return value
+    try:
+        return normalize_tdl_chat_ref(value)
+    except ValueError:
+        return value
 
 
 def channel_chat_id(raw: str) -> int:

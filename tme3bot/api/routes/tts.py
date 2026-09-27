@@ -14,6 +14,11 @@ _ACTIVE = {"queued", "dispatched", "running", "paused"}
 
 
 def register_tts(app, context, *, current_actor, job_dict, require_internal, require_service):
+    @app.get("/api/v1/tts/workers")
+    def list_tts_workers(actor=Depends(current_actor)):
+        del actor
+        return {"items": context.control_plane.tts_worker_options()}
+
     @app.post("/api/v1/tts/jobs", response_model=JobResponse)
     def submit_tts(body: TtsJobRequest, actor=Depends(current_actor)):
         title = body.title.strip()
@@ -34,6 +39,7 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             "tts",
             {"title": title, "text": text},
             profile=actor.profile,
+            worker=body.worker,
         )
         return job_dict(job)
 

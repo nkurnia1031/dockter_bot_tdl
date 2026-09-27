@@ -6,10 +6,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Depends, FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from tme3bot.api.schemas import WorkerJobRequest
+from tme3bot.api.schemas import WorkerJobRequest, WorkerRuntimeSettingsRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.domain.worker_contract import CAP_TTS, worker_contract_metadata
 
@@ -43,6 +44,16 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     async def domain_error(request: Request, exc: DomainError):
         return _error(request, exc.code, exc.message, exc.status_code)
 
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(request: Request, exc: RequestValidationError):
+        del exc
+        return _error(
+            request,
+            "VALIDATION_ERROR",
+            "Payload runtime worker tidak valid.",
+            422,
+        )
+
     @app.exception_handler(Exception)
     async def unhandled_error(request: Request, exc: Exception):
         LOGGER.exception("Worker API failed")
@@ -52,7 +63,14 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> None:
         token = credentials.credentials if credentials is not None else ""
-        if not context.config.worker_api_token or token != context.config.worker_api_token:
+        matcher = getattr(context.executor, "worker_token_matches", None)
+        valid = (
+            matcher(token)
+            if callable(matcher)
+            else bool(context.config.worker_api_token)
+            and token == context.config.worker_api_token
+        )
+        if not valid:
             raise DomainError(
                 "WORKER_UNAUTHORIZED", "Worker token tidak valid.", status_code=401
             )
@@ -70,6 +88,15 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             capabilities.append(CAP_TTS)
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
+
+    @app.get("/internal/v1/runtime-settings", dependencies=[Depends(authorize)])
+    def runtime_settings():
+        return context.executor.worker_settings()
+
+    @app.put("/internal/v1/runtime-settings", dependencies=[Depends(authorize)])
+    def update_runtime_settings(body: WorkerRuntimeSettingsRequest):
+        values = body.model_dump(exclude_unset=True) if hasattr(body, "model_dump") else body.dict(exclude_unset=True)
+        return context.executor.update_worker_settings(values)
 
     @app.get(
         "/internal/v1/tts/artifacts/{job_id}/{artifact_ref}",

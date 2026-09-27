@@ -183,30 +183,56 @@ class BackupScheduler:
         self.config = config
         self.coordinator = coordinator
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if not self.config.backup_enabled or self._thread is not None:
+        if self._thread is not None:
             return
         self._thread = threading.Thread(target=self._loop, daemon=True, name="tme3-backup-scheduler")
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Recheck enabled state or the schedule after a Web update."""
+        self._wake.set()
 
     def _loop(self) -> None:
-        try:
-            next_run = self.coordinator.next_run()
-        except Exception:
-            LOGGER.exception("Backup scheduler configuration invalid")
-            return
+        next_run = None
+        schedule_key = None
         while not self._stop.is_set():
+            if not self.config.backup_enabled:
+                next_run = None
+                schedule_key = None
+                self._wake.wait(5.0)
+                self._wake.clear()
+                continue
+            current_key = (self.config.backup_schedule, self.config.backup_timezone)
+            if next_run is None or current_key != schedule_key:
+                try:
+                    next_run = self.coordinator.next_run()
+                    schedule_key = current_key
+                except Exception:
+                    LOGGER.exception("Backup scheduler configuration invalid")
+                    self._wake.wait(30.0)
+                    self._wake.clear()
+                    continue
             delay = max(1.0, (next_run - datetime.now(next_run.tzinfo)).total_seconds())
-            if self._stop.wait(min(delay, 60.0)):
+            awakened = self._wake.wait(min(delay, 60.0))
+            self._wake.clear()
+            if self._stop.is_set():
                 return
-            if datetime.now(next_run.tzinfo) >= next_run:
+            if awakened:
+                continue
+            if self.config.backup_enabled and current_key == (
+                self.config.backup_schedule,
+                self.config.backup_timezone,
+            ) and datetime.now(next_run.tzinfo) >= next_run:
                 try:
                     self.coordinator.start_now()
                 except Exception:
                     LOGGER.exception("Scheduled backup could not start")
-                next_run = self.coordinator.next_run()
+                next_run = None

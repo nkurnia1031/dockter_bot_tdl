@@ -213,7 +213,7 @@ class AppConfig:
         storage_channel_username = os.getenv("STORAGE_CHANNEL_USERNAME", "").strip().lstrip("@")
         raw_storage_channel_id = os.getenv("STORAGE_CHANNEL_ID", "").strip()
         try:
-            storage_channel_id = channel_chat_id(storage_channel) if storage_channel else (int(raw_storage_channel_id) if raw_storage_channel_id else 0)
+            storage_channel_id = channel_chat_id(storage_channel) or (int(raw_storage_channel_id) if raw_storage_channel_id else 0)
         except ValueError as exc:
             raise ValueError("STORAGE_CHANNEL_ID harus berupa angka Telegram chat ID.") from exc
         storage_db_file = Path(os.getenv("STORAGE_DB_FILE", "/data/storage.db"))
@@ -226,7 +226,7 @@ class AppConfig:
         backup_channel_username = os.getenv("BACKUP_CHANNEL_USERNAME", "").strip().lstrip("@")
         raw_backup_channel_id = os.getenv("BACKUP_CHANNEL_ID", "").strip()
         try:
-            backup_channel_id = channel_chat_id(backup_channel) if backup_channel else (int(raw_backup_channel_id) if raw_backup_channel_id else 0)
+            backup_channel_id = channel_chat_id(backup_channel) or (int(raw_backup_channel_id) if raw_backup_channel_id else 0)
         except ValueError as exc:
             raise ValueError("BACKUP_CHANNEL_ID harus berupa angka Telegram chat ID.") from exc
         try:

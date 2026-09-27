@@ -5,7 +5,7 @@ import re
 import threading
 from pathlib import Path
 
-from tme3bot.persistence import write_json_atomic
+from tme3bot.persistence import write_json_atomic_private
 
 
 WORKER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -144,8 +144,4 @@ class WorkerRegistry:
         return workers
 
     def _write_locked(self, workers: dict[str, dict[str, object]]) -> None:
-        write_json_atomic(self.path, {"workers": workers})
-        try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
+        write_json_atomic_private(self.path, {"workers": workers})

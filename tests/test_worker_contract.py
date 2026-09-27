@@ -56,6 +56,31 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(set(body["capabilities"]), WORKER_API_CAPABILITIES)
         self.assertEqual(body["profiles"], ["default"])
 
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_worker_runtime_settings_use_authenticated_internal_endpoints(self, request):
+        request.side_effect = [
+            {"storage_profile": "default", "available_storage_profiles": ["default"]},
+            {"storage_profile": "archive", "available_storage_profiles": ["archive"]},
+        ]
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        current = dispatcher.worker_settings("remote")
+        updated = dispatcher.update_worker_settings(
+            "remote", {"storage_profile": "archive"}
+        )
+
+        self.assertEqual(current["storage_profile"], "default")
+        self.assertEqual(updated["storage_profile"], "archive")
+        self.assertEqual(request.call_args_list[0].args[2:4], (
+            "GET",
+            "/internal/v1/runtime-settings",
+        ))
+        self.assertEqual(request.call_args_list[1].args[2:5], (
+            "PUT",
+            "/internal/v1/runtime-settings",
+            {"storage_profile": "archive"},
+        ))
+
     def test_worker_job_endpoint_accepts_dispatch_contract_payload(self):
         executor = ContractWorkerExecutor()
         app = create_worker_app(

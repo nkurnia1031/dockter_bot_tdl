@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from tme3bot.api.worker import WorkerContext, create_worker_app
+from tme3bot.domain.models import DomainError
 
 
 class FakeExecutor:
@@ -13,9 +14,50 @@ class FakeExecutor:
         self.deleted_stages = []
         self.tts_ready = False
         self.artifact_file = None
+        self.runtime_updates = []
+        self.worker_api_token = "worker-secret"
+        self.previous_worker_api_token = ""
+        self.worker_settings_values = {
+            "storage_profile": "default",
+            "storage_profile_available": True,
+            "available_storage_profiles": ["default"],
+            "worker_api_token_configured": True,
+            "tts_helper_urls": ["http://tts-1:5000", "http://tts-2:5000", "http://tts-3:5000"],
+            "tts_tor_control_hosts": ["tor-1", "tor-2", "tor-3"],
+            "tts_tor_control_ports": [9051, 9051, 9051],
+            "tts_tor_control_password_configured": False,
+            "tts_part_retries": 4,
+            "tts_retry_base_seconds": 2.0,
+            "tts_newnym_after_retries": 3,
+        }
 
     def capabilities(self):
         return {"profiles": ["default"], "tts": self.tts_ready}
+
+    def worker_settings(self):
+        return dict(self.worker_settings_values)
+
+    def update_worker_settings(self, values):
+        self.runtime_updates.append(values)
+        if values.get("worker_api_token"):
+            self.previous_worker_api_token = self.worker_api_token
+            self.worker_api_token = values["worker_api_token"]
+        profile = values.get("storage_profile")
+        if profile and profile != "default":
+            raise DomainError(
+                "STORAGE_PROFILE_UNAVAILABLE",
+                "Profil Storage belum tersedia.",
+                status_code=409,
+            )
+        if values.get("tts_tor_control_password"):
+            self.worker_settings_values["tts_tor_control_password_configured"] = True
+        return self.worker_settings()
+
+    def worker_token_matches(self, token):
+        if token == self.worker_api_token:
+            self.previous_worker_api_token = ""
+            return True
+        return token == self.previous_worker_api_token and bool(token)
 
     def tts_artifact_path(self, job_id, artifact_ref):
         if job_id == "job-tts" and artifact_ref == "a" * 48:
@@ -123,6 +165,81 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.content, b"audio")
         self.assertIn("artifact-", audio.headers["content-disposition"])
+
+    def test_worker_runtime_settings_are_internal_and_validate_storage_profile(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        denied = self.client.get("/internal/v1/runtime-settings")
+        self.assertEqual(denied.status_code, 401)
+
+        current = self.client.get("/internal/v1/runtime-settings", headers=headers)
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(current.json()["available_storage_profiles"], ["default"])
+
+        rejected = self.client.put(
+            "/internal/v1/runtime-settings",
+            headers=headers,
+            json={"storage_profile": "missing"},
+        )
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.json()["error"]["code"], "STORAGE_PROFILE_UNAVAILABLE")
+
+        accepted = self.client.put(
+            "/internal/v1/runtime-settings",
+            headers=headers,
+            json={"storage_profile": "default"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["storage_profile"], "default")
+
+    def test_worker_runtime_settings_accept_tts_secret_without_returning_it(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        secret = "tor-control-password-never-return-this"
+        updated = self.client.put(
+            "/internal/v1/runtime-settings",
+            headers=headers,
+            json={
+                "tts_helper_urls": ["http://tts-1:5000", "http://tts-2:5000", "http://tts-3:5000"],
+                "tts_tor_control_hosts": ["tor-1", "tor-2", "tor-3"],
+                "tts_tor_control_ports": [9051, 9051, 9051],
+                "tts_tor_control_password": secret,
+                "tts_part_retries": 5,
+            },
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertNotIn(secret, updated.text)
+        self.assertTrue(updated.json()["tts_tor_control_password_configured"])
+        self.assertEqual(self.executor.runtime_updates[0]["tts_tor_control_password"], secret)
+
+    def test_worker_runtime_validation_does_not_echo_rejected_secret(self):
+        secret = "tor-secret-must-not-echo"
+        response = self.client.put(
+            "/internal/v1/runtime-settings",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"tts_tor_control_password": secret * 30},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn(secret, response.text)
+
+    def test_worker_api_token_can_rotate_with_short_overlap_for_inflight_update(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        new_token = "rotated-worker-token-123456"
+        updated = self.client.put(
+            "/internal/v1/runtime-settings",
+            headers=headers,
+            json={"worker_api_token": new_token},
+        )
+        self.assertEqual(updated.status_code, 200)
+        self.assertNotIn(new_token, updated.text)
+
+        accepted_new = self.client.get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": f"Bearer {new_token}"},
+        )
+        self.assertEqual(accepted_new.status_code, 200)
+        rejected_old = self.client.get(
+            "/internal/v1/capabilities", headers=headers
+        )
+        self.assertEqual(rejected_old.status_code, 401)
 
     def test_worker_preserves_event_sequence_start_for_reused_job_ids(self):
         payload = {

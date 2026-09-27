@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fastapi import Depends
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.api.schemas import BatchSourcesRequest, ExportRequest, ItemListResponse, JobResponse, LabelRequest, ObjectResponse, SourceListResponse, SourceResponse, SourceUpdateRequest
 from tme3bot.domain.models import DomainError
 
@@ -66,6 +67,11 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
                 "Isi URL lama atau chat_ref username/numeric ID.",
                 status_code=422,
             )
+        if values.get("chat_ref"):
+            try:
+                values["chat_ref"] = normalize_tdl_chat_ref(values["chat_ref"])
+            except ValueError as exc:
+                raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
         verify_target(
             actor,
             "export",
@@ -111,8 +117,12 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
 
     @app.post("/api/v1/sources/leave", response_model=JobResponse)
     def submit_leave(body: BatchSourcesRequest, actor=Depends(current_actor)):
+        try:
+            chat_refs = sorted({normalize_tdl_chat_ref(item) for item in body.chat_refs})
+        except ValueError as exc:
+            raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
         return job_dict(
             context.control_plane.submit_job(
-                actor, "leave", {"chat_refs": body.chat_refs}, profile=actor.profile
+                actor, "leave", {"chat_refs": chat_refs}, profile=actor.profile
             )
         )
