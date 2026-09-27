@@ -42,7 +42,7 @@ describe('TTS page target controls', () => {
       if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (path.endsWith('/runtime/secrets') && method === 'PUT') {
         updates.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
-        return new Response(JSON.stringify({ telegram_tts_chat_configured: true, restart_required_services: ['telegram'] }), { status: 200 });
+        return new Response(JSON.stringify({ telegram_tts_chat_configured: true, restart_required_services: [] }), { status: 200 });
       }
       if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: false }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -53,11 +53,11 @@ describe('TTS page target controls', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Simpan ID chat' }));
 
     await waitFor(() => expect(updates).toEqual([{ telegram_tts_chat_id: '-100123456789' }]));
-    expect(await screen.findByText(/Restart container Telegram agar perubahan aktif/)).toBeTruthy();
+    expect(await screen.findByText(/Job TTS berikutnya akan dikirim lewat profil TDL aktif/)).toBeTruthy();
     expect(screen.queryByDisplayValue('-100123456789')).toBeNull();
   });
 
-  it('normalizes a public Telegram username link for Bot API delivery', async () => {
+  it('normalizes a public Telegram username link for TDL delivery', async () => {
     const updates: Record<string, unknown>[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const path = String(input);
@@ -65,7 +65,7 @@ describe('TTS page target controls', () => {
       if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (path.endsWith('/runtime/secrets') && method === 'PUT') {
         updates.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
-        return new Response(JSON.stringify({ telegram_tts_chat_configured: true, restart_required_services: ['telegram'] }), { status: 200 });
+        return new Response(JSON.stringify({ telegram_tts_chat_configured: true, restart_required_services: [] }), { status: 200 });
       }
       if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: false }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -75,6 +75,27 @@ describe('TTS page target controls', () => {
     await fireEvent.input(await screen.findByLabelText('ID chat Telegram'), { target: { value: 'https://t.me/IYear' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Simpan ID chat' }));
 
-    await waitFor(() => expect(updates).toEqual([{ telegram_tts_chat_id: '@iyear' }]));
+    await waitFor(() => expect(updates).toEqual([{ telegram_tts_chat_id: 'iyear' }]));
+  });
+
+  it('accepts an international phone reference for TDL delivery', async () => {
+    const updates: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const path = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (path.endsWith('/runtime/secrets') && method === 'PUT') {
+        updates.push(JSON.parse(String(init?.body || '{}')) as Record<string, unknown>);
+        return new Response(JSON.stringify({ telegram_tts_chat_configured: true, restart_required_services: [] }), { status: 200 });
+      }
+      if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: false }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(TtsPage);
+    await fireEvent.input(await screen.findByLabelText('ID chat Telegram'), { target: { value: '+1 123456789' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Simpan ID chat' }));
+
+    await waitFor(() => expect(updates).toEqual([{ telegram_tts_chat_id: '+1123456789' }]));
   });
 });

@@ -563,30 +563,49 @@ class SqliteJobRepository:
         return int(row[0])
 
     def claim_tts_deliveries(
-        self, limit: int = 10, lease_seconds: int = 180
+        self,
+        limit: int = 10,
+        lease_seconds: int = 180,
+        *,
+        worker: str | None = None,
+        job_id: str | None = None,
+        include_artifact_ref: bool = False,
     ) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
         lease_until = (now + timedelta(seconds=max(30, int(lease_seconds)))).isoformat()
         claimed: list[dict[str, Any]] = []
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
+            filters = [
+                "j.status IN ('dispatched', 'running')",
+                "d.status IN ('pending', 'claimed')",
+                "d.available_at <= ?",
+                "(d.lease_until IS NULL OR d.lease_until <= ?)",
+            ]
+            params: list[Any] = [now.isoformat(), now.isoformat()]
+            if worker is not None:
+                filters.append("d.worker = ?")
+                params.append(str(worker))
+            if job_id is not None:
+                filters.append("d.job_id = ?")
+                params.append(str(job_id))
+            columns = "d.id"
+            if include_artifact_ref:
+                columns += ", d.artifact_ref"
             rows = db.execute(
-                """
-                SELECT d.id FROM job_tts_deliveries d
+                f"""
+                SELECT {columns} FROM job_tts_deliveries d
                 JOIN jobs j ON j.id = d.job_id
-                  WHERE j.status IN ('dispatched', 'running')
-                    AND d.status IN ('pending', 'claimed')
-                    AND d.available_at <= ?
-                    AND (d.lease_until IS NULL OR d.lease_until <= ?)
+                  WHERE {' AND '.join(filters)}
                     AND NOT EXISTS (
                         SELECT 1 FROM job_tts_deliveries earlier
                         WHERE earlier.job_id = d.job_id
                           AND earlier.part_index < d.part_index
                           AND earlier.status != 'delivered'
                     )
-                  ORDER BY d.created_at, d.part_index LIMIT ?
+                ORDER BY d.created_at, d.part_index LIMIT ?
                 """,
-                (now.isoformat(), now.isoformat(), max(1, min(int(limit), 100))),
+                (*params, max(1, min(int(limit), 100))),
             ).fetchall()
             for item in rows:
                 delivery_id = str(item["id"])
@@ -594,8 +613,11 @@ class SqliteJobRepository:
                     "UPDATE job_tts_deliveries SET status = 'claimed', lease_until = ?, attempts = attempts + 1 WHERE id = ?",
                     (lease_until, delivery_id),
                 )
+                fields = "id, job_id, title, part_index, total_parts, byte_size, attempts"
+                if include_artifact_ref:
+                    fields += ", artifact_ref"
                 row = db.execute(
-                    "SELECT id, job_id, title, part_index, total_parts, byte_size, attempts FROM job_tts_deliveries WHERE id = ?",
+                    f"SELECT {fields} FROM job_tts_deliveries WHERE id = ?",
                     (delivery_id,),
                 ).fetchone()
                 if row is not None:

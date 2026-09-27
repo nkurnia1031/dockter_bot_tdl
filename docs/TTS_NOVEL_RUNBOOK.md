@@ -4,13 +4,14 @@ Fitur TTS menerima judul dan teks dari Web, membagi teks menjadi bagian
 maksimal 90 karakter, lalu membuat audio memakai tiga helper gTTS. Setiap
 helper menjalankan proses Tor sendiri. Secara default backend memilih worker
 TTS dengan antrean paling sedikit. Halaman TTS juga bisa memilih worker TTS
-tertentu yang siap. Bot Telegram mengambil audio dari outbox SQLite dan
-mengirimkannya ke satu chat tujuan yang ID-nya diatur dari halaman TTS.
+tertentu yang siap. Setelah sintesis selesai, worker memakai sesi TDL `user1`
+pada profile job untuk mengirim setiap bagian ke satu chat tujuan yang diatur
+dari halaman TTS.
 
 Teks lengkap hanya ada pada command internal yang disimpan backend dan dikirim
 ke worker. Monitor, event, hasil job, dan log hanya menyimpan judul, jumlah
-karakter/bagian, fase, progress, serta status. Bot token hanya berada di
-layanan Telegram. Worker tidak menerima token bot atau chat tujuan.
+karakter/bagian, fase, progress, serta status. Worker memakai sesi `.tdl`
+profile aktif; bot token tidak dipakai untuk delivery TTS.
 
 ## Persiapan
 
@@ -22,11 +23,10 @@ layanan Telegram. Worker tidak menerima token bot atau chat tujuan.
    mulai; service Telegram membacanya melalui endpoint internal ketika
    dimulai. Perubahan token dari Web meminta restart backend dan Telegram.
 3. Tujuan audio dapat diatur dari kartu **Chat tujuan MP3** di halaman
-   **TTS Novel**. Masukkan ID numeric, username, atau link publik
-   `https://t.me/<username>`, lalu restart container Telegram agar perubahan
-   aktif. Tujuan harus dapat dijangkau bot. Bot API tidak mengirim berdasarkan
-   nomor telepon. Nilai awal dapat tetap diisi pada `TELEGRAM_TTS_CHAT_ID` di
-   `.env.telegram`.
+   **TTS Novel**. Masukkan ID numeric, username, link publik
+   `https://t.me/<username>`, atau nomor telepon internasional. Nilai baru
+   dipakai job berikutnya tanpa restart container Telegram. Nilai awal dapat
+   tetap diisi pada `TELEGRAM_TTS_CHAT_ID` di konfigurasi backend.
 4. URL tiga helper dapat diubah dari **Workers → Runtime → Mesin TTS** untuk
    masing-masing worker. Setiap helper menjalankan Tor pada loopback container;
    worker memeriksa `/readyz` dan meminta rotasi lewat `/newnym`. Tidak ada
@@ -57,10 +57,9 @@ container lain atau port publik host. Jalur Tor memakai circuit terpisah
 sebagai upaya terbaik; alamat IP keluarnya tidak diperiksa atau dijamin berbeda.
 
 Worker baru melaporkan capability `tts` setelah ketiga helper merespons
-`/readyz`. Gateway mengirim job
-hanya ke worker dengan capability itu. Proses Telegram mengirim heartbeat
-kesiapan hanya jika chat tujuan audio terisi; endpoint pembuatan job
-menolak permintaan bila layanan Telegram belum siap.
+`/readyz`. Gateway mengirim job hanya ke worker dengan capability itu. Job
+ditolak bila chat tujuan belum diatur; tidak ada readiness TTS yang bergantung
+pada container Telegram.
 
 ## Pemeriksaan uji coba
 
@@ -70,7 +69,7 @@ menolak permintaan bila layanan Telegram belum siap.
    tentukan satu worker TTS tertentu. Buat job kecil, lalu pantau fase antre, sintesis,
    penggabungan, dan pengiriman di monitor.
 3. Pastikan jumlah bagian bertambah selama sintesis dan job baru sukses setelah
-   Telegram mengonfirmasi semua audio.
+   TDL profile aktif mengonfirmasi semua upload.
 4. Coba Pause ketika sintesis berjalan. Pause berlaku setelah batch maksimal
    tiga request selesai; Resume meneruskan checkpoint yang sudah tersimpan.
 5. Pastikan audio masuk ke chat tujuan, lalu pastikan folder artifact job sudah

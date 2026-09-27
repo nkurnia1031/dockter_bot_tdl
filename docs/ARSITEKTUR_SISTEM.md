@@ -22,7 +22,7 @@ berjalan di VPS terpisah.
 flowchart LR
   Browser[Browser]
   Web["Web statis<br/>SvelteKit"]
-  Telegram[Telegram Bot API]
+  Telegram[Telegram UI / Bot API]
   TGApp["Aplikasi bot Telegram"]
   Backend["Backend API<br/>FastAPI"]
   DB[("SQLite<br/>/data/storage.db")]
@@ -42,13 +42,13 @@ flowchart LR
   Backend --> JSON
   Backend -->|command /internal/v1| Local
   Backend -->|command /internal/v1| Remote
-  Local -->|TTS melalui tiga jalur| TTS
-  Remote -->|TTS melalui tiga jalur| TTS
-  Local -->|artifact audio internal| Backend
-  Remote -->|artifact audio internal| Backend
+  Local -->|TTS melalui tiga jalur + TDL profile| TTS
+  Remote -->|TTS melalui tiga jalur + TDL profile| TTS
+  Local -->|metadata artifact internal| Backend
+  Remote -->|metadata artifact internal| Backend
   Backend --> Outbox
-  Outbox -->|ambil audio dan status| TGApp
-  TGApp -->|sendAudio| Telegram
+  Local -->|claim/report delivery| Backend
+  Remote -->|claim/report delivery| Backend
   Local --> TDL
   Remote --> TDL
   Local --> Drive
@@ -66,7 +66,7 @@ flowchart LR
 | Domain | Menyimpan model job, actor, event, status, dan aturan perubahan status. | `tme3bot/domain/` |
 | Infrastructure | Menghubungkan aplikasi ke SQLite, autentikasi, dan API worker. | `tme3bot/infrastructure/` |
 | Worker | Menjalankan export, download, Quick Mode, utility, storage, backup, dan workspace. | `tme3bot/worker/` |
-| TTS | Worker membuat MP3 dengan tiga helper/Tor; backend menyimpan outbox; proses bot mengirim audio ke satu chat privat. | `worker/tts_pipeline.py`, `api/routes/tts.py`, `frontend/telegram/app.py` |
+| TTS | Worker membuat MP3 dengan tiga helper/Tor, lalu mengirim setiap bagian melalui sesi TDL `user1` pada profile job. Backend menyimpan outbox delivery agar progress dan retry tetap tahan restart. | `worker/tts_pipeline.py`, `worker/executor_tts.py`, `api/routes/tts.py` |
 | Runtime | Membuka sesi per profile dan menjalankan TDL, rclone, serta utility. | `profiles.py`, `service.py`, `tdl.py`, `rclone.py`, `utility.py` |
 
 `app.py` dan `composition.py` menyusun dependency sesuai role aplikasi:
@@ -166,9 +166,9 @@ API utama Quick Mode:
 TTS memakai lifecycle job dan monitor yang sama. Teks dibagi menjadi bagian
 maksimal 90 karakter; tiap job menjalankan paling banyak tiga request gTTS
 bersamaan. Worker menyimpan checkpoint dan MP3 sementara di `/data/tts`. Backend
-menyimpan outbox delivery di SQLite, lalu proses Telegram mengambil audio dan
-mengirimkannya ke chat tujuan tetap. Job baru sukses setelah semua bagian
-dikonfirmasi Telegram.
+menyimpan outbox delivery di SQLite, lalu worker pemilik job mengambil bagian
+berikutnya dan mengunggahnya melalui sesi TDL profile aktif. Job baru sukses
+setelah semua upload TDL dikonfirmasi.
 
 Worker mengiklankan capability `tts` hanya jika tiga helper dan tiga jalur
 kontrol Tor siap. Job dipilih berdasarkan jumlah antrean TTS pada worker yang

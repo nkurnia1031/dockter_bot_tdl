@@ -563,8 +563,11 @@ class WorkerJobExecutor(
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
         tts_ready = False
+        tts_profiles: list[str] = []
         try:
             tts_ready = self._tts_pipeline().ready()
+            if tts_ready:
+                tts_profiles = self.available_storage_profiles()
         except Exception:
             tts_ready = False
         return {
@@ -574,6 +577,7 @@ class WorkerJobExecutor(
             "available_storage_profiles": storage_profiles_available,
             "workspace": Path(getattr(self.config, "utility_workspace_root", "/workspace")).is_dir(),
             "tts": tts_ready,
+            "tts_profiles": tts_profiles,
         }
 
     def storage_profile(self) -> str:
@@ -783,6 +787,11 @@ class WorkerJobExecutor(
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         elif kind == "storage_upload":
             keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
+        elif kind == "tts":
+            # TTS delivery uses the active profile's export TDL session.
+            # Keep it serial with export/leave jobs for that same profile,
+            # while different profiles may still run on the worker together.
+            keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         elif kind in {"download", "download_clear_failed"}:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         elif kind == "backup_node":

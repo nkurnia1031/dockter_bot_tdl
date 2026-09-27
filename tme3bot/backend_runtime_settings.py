@@ -6,7 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tme3bot.channel_ref import channel_chat_id, channel_tdl_ref, compact_channel_ref
-from tme3bot.chat_refs import normalize_bot_api_chat_ref
+from tme3bot.chat_refs import normalize_bot_api_chat_ref, normalize_tdl_chat_ref
 from tme3bot.persistence import write_json_atomic_private
 
 
@@ -75,7 +75,10 @@ class BackendRuntimeSettings:
             result["backup_channel"] = compact_channel_ref(bot_ref)
         chat_id = str(result.get("telegram_tts_chat_id", "")).strip()
         if chat_id:
-            result["telegram_tts_chat_id"] = normalize_bot_api_chat_ref(chat_id)
+            # TTS delivery is performed by the active TDL profile.  Keep the
+            # canonical TDL peer spelling so numeric IDs, usernames, public
+            # links, and phone references all remain valid.
+            result["telegram_tts_chat_id"] = normalize_tdl_chat_ref(chat_id)
         if "backup_channel_id" not in result:
             result["backup_channel_id"] = channel_chat_id(
                 str(result.get("backup_channel", ""))
@@ -118,7 +121,7 @@ class BackendRuntimeSettings:
             raise ValueError("Token bot Telegram tidak valid.")
         chat_id = str(values.get("telegram_tts_chat_id", "")).strip()
         if chat_id:
-            normalize_bot_api_chat_ref(chat_id)
+            normalize_tdl_chat_ref(chat_id)
 
     @staticmethod
     def apply_to(config, values: dict[str, Any]) -> None:

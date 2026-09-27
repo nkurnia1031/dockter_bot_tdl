@@ -172,6 +172,29 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
         self.assertEqual(self.jobs.count(kind="tts"), 0)
 
+    def test_tts_routes_only_to_worker_with_active_profile_tdl_session(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "tts-profile-workers.json",
+            {"tts-default": "http://worker-a", "tts-archive": "http://worker-b"},
+            {"tts-default": "a", "tts-archive": "b"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda worker: {
+            "tts": True,
+            "capabilities": ["tts"],
+            "tts_profiles": ["default"] if worker == "tts-default" else ["archive"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+
+        job = control.submit_job(
+            self.actor,
+            "tts",
+            {"title": "Bab", "text": "Isi"},
+            profile="archive",
+        )
+
+        self.assertEqual(job.worker, "tts-archive")
+
     def test_same_kind_different_profiles_can_run_in_parallel(self):
         first = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2"}, profile="default"

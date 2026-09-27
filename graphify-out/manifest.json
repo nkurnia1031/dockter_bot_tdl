@@ -354,15 +354,15 @@
     "semantic_hash": ""
   },
   "tests/test_backend_api.py": {
-    "mtime": 1790509752.4683857,
-    "seen": 1790510298.2681992,
-    "ast_hash": "f7483f2703f7134c545a2ffd67559a88",
+    "mtime": 1790513998.164098,
+    "seen": 1790515788.5604346,
+    "ast_hash": "202a3655aff7333b981984261197e634",
     "semantic_hash": ""
   },
   "tests/test_control_plane.py": {
-    "mtime": 1790453595.909021,
-    "seen": 1790454920.8437028,
-    "ast_hash": "754c77c6f90c92b078a7919806b3076b",
+    "mtime": 1790514922.7929482,
+    "seen": 1790515788.5604346,
+    "ast_hash": "44767696d42660dea08b91f4c41c6753",
     "semantic_hash": ""
   },
   "tests/test_job_store.py": {
@@ -408,9 +408,9 @@
     "semantic_hash": ""
   },
   "tme3bot/application/control_plane.py": {
-    "mtime": 1790492640.6296334,
-    "seen": 1790493310.9174068,
-    "ast_hash": "df59d268a3891b976c791494a9ce985c",
+    "mtime": 1790514395.749799,
+    "seen": 1790515788.5614338,
+    "ast_hash": "f67ff72797ed9398320561f0a27ad13d",
     "semantic_hash": ""
   },
   "tme3bot/application/ports.py": {
@@ -468,9 +468,9 @@
     "semantic_hash": ""
   },
   "tme3bot/infrastructure/job_store.py": {
-    "mtime": 1790454514.4016898,
-    "seen": 1790454920.8437028,
-    "ast_hash": "73e9e6a317238ffb17783ee45656d6da",
+    "mtime": 1790513246.168218,
+    "seen": 1790515788.5614338,
+    "ast_hash": "d59e29f7d313367902597fa1dd42e5d7",
     "semantic_hash": ""
   },
   "tme3bot/worker/__init__.py": {
@@ -480,9 +480,9 @@
     "semantic_hash": ""
   },
   "tme3bot/worker/executor.py": {
-    "mtime": 1790509540.8796775,
-    "seen": 1790510298.269199,
-    "ast_hash": "b7d0b1306283cbcabc37e9ac93860a18",
+    "mtime": 1790514368.8125317,
+    "seen": 1790515788.5624352,
+    "ast_hash": "df9be3d80bee155584417f701779491d",
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
@@ -498,9 +498,9 @@
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/app.py": {
-    "mtime": 1790494933.3174403,
-    "seen": 1790499995.8747458,
-    "ast_hash": "4df62f579c7d2fa5153c36cab1dbdfdc",
+    "mtime": 1790513443.7868366,
+    "seen": 1790515788.5614338,
+    "ast_hash": "96134c2b31576559882a0a8b2023f0c6",
     "semantic_hash": ""
   },
   "tme3bot/frontend/telegram/keyboards.py": {
@@ -996,9 +996,9 @@
     "semantic_hash": ""
   },
   "docs/ARSITEKTUR_SISTEM.md": {
-    "mtime": 1790453851.355457,
-    "seen": 1790454920.8449714,
-    "ast_hash": "82dc074c9716064089168af2fba1dc4d",
+    "mtime": 1790514790.3283846,
+    "seen": 1790515788.5624352,
+    "ast_hash": "455ec1a1d850c05ee73c7b7477544ca5",
     "semantic_hash": ""
   },
   "tme3bot/api/routes/__init__.py": {
@@ -1110,15 +1110,15 @@
     "semantic_hash": ""
   },
   "tme3bot/api/routes/tts.py": {
-    "mtime": 1790492640.630639,
-    "seen": 1790493310.9174068,
-    "ast_hash": "41585080dd46ed9027fa76c57222be6e",
+    "mtime": 1790514368.810017,
+    "seen": 1790515788.5614338,
+    "ast_hash": "f13dcf30b0c849297a0db5f86cd14f3a",
     "semantic_hash": ""
   },
   "tme3bot/worker/executor_tts.py": {
-    "mtime": 1790487737.874393,
-    "seen": 1790488774.2337215,
-    "ast_hash": "8532e19f735cd03ca9832e4c9b930b47",
+    "mtime": 1790514631.672326,
+    "seen": 1790515788.5624352,
+    "ast_hash": "797879052fb8eeb009baf8a89119be69",
     "semantic_hash": ""
   },
   "tme3bot/worker/tts_helper.py": {
@@ -1134,15 +1134,15 @@
     "semantic_hash": ""
   },
   "web/src/routes/tts/+page.svelte": {
-    "mtime": 1790494311.881914,
-    "seen": 1790499995.8747458,
-    "ast_hash": "03d6827baaddad5e88b62efbb5e248e3",
+    "mtime": 1790514881.7021985,
+    "seen": 1790515788.5624352,
+    "ast_hash": "7cc03cdfb34079e6050137a8db88315d",
     "semantic_hash": ""
   },
   "docs/TTS_NOVEL_RUNBOOK.md": {
-    "mtime": 1790509478.1010027,
-    "seen": 1790510298.269199,
-    "ast_hash": "86f38cae65c763ea9321e9342979d384",
+    "mtime": 1790513753.2210908,
+    "seen": 1790515788.5624352,
+    "ast_hash": "70694a2e08083b354e8728c70939d79b",
     "semantic_hash": ""
   },
   "requirements-tts.txt": {
@@ -1164,9 +1164,9 @@
     "semantic_hash": ""
   },
   "docs/PENGATURAN_RUNTIME.md": {
-    "mtime": 1790509590.36317,
-    "seen": 1790510298.269199,
-    "ast_hash": "f00eb3f48280137b0255b8c48a4966a4",
+    "mtime": 1790513767.2828114,
+    "seen": 1790515788.5624352,
+    "ast_hash": "0425a77584b29ec818ddbbf6f7a0447e",
     "semantic_hash": ""
   },
   "tests/test_backend_runtime_settings.py": {
@@ -1176,21 +1176,21 @@
     "semantic_hash": ""
   },
   "tme3bot/api/routes/runtime_settings.py": {
-    "mtime": 1790490922.8861263,
-    "seen": 1790491777.07759,
-    "ast_hash": "7669969552629012ee05fc3b02742b84",
+    "mtime": 1790513306.7510228,
+    "seen": 1790515788.5614338,
+    "ast_hash": "b68cc4fe3b7feaa3a2fd3b715d11ad79",
     "semantic_hash": ""
   },
   "tme3bot/backend_runtime_settings.py": {
-    "mtime": 1790499896.1636708,
-    "seen": 1790499995.8747458,
-    "ast_hash": "f9f7bcc8d50b369f77f0c38e886a8727",
+    "mtime": 1790513181.7629564,
+    "seen": 1790515788.5614338,
+    "ast_hash": "b99346121b2dc8d9d94ad4cddd58f48f",
     "semantic_hash": ""
   },
   "web/src/lib/components/TtsPage.test.ts": {
-    "mtime": 1790494652.5583565,
-    "seen": 1790499995.8747458,
-    "ast_hash": "8ec55299656f0d77f806038c1d594af7",
+    "mtime": 1790513681.6015892,
+    "seen": 1790515788.5624352,
+    "ast_hash": "8407c64c4e2b9c23fba0110d94cc2e40",
     "semantic_hash": ""
   },
   "tests/test_chat_refs.py": {
@@ -1215,6 +1215,12 @@
     "mtime": 1790500225.6285894,
     "seen": 1790500382.6941788,
     "ast_hash": "f46ec9b60a5e9ff1f17baa71392abfce",
+    "semantic_hash": ""
+  },
+  "tests/test_tts_executor.py": {
+    "mtime": 1790514725.2568104,
+    "seen": 1790515788.5614338,
+    "ast_hash": "92ed01961be4605d8ed931407ed5c6ca",
     "semantic_hash": ""
   }
 }

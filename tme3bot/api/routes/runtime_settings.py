@@ -37,12 +37,6 @@ def register_runtime_settings(app, context, *, current_actor, require_service):
         restart_services = []
         if "bot_token" in values:
             restart_services.extend(["backend", "telegram"])
-        if "telegram_tts_chat_id" in values:
-            restart_services.append("telegram")
-        if restart_services:
-            set_ready = getattr(context.control_plane.jobs, "set_tts_telegram_ready", None)
-            if callable(set_ready):
-                set_ready(False)
         return {
             "telegram_bot_token_configured": bool(saved.get("bot_token")),
             "telegram_tts_chat_configured": bool(saved.get("telegram_tts_chat_id")),

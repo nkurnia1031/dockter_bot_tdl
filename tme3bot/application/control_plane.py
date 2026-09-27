@@ -111,7 +111,7 @@ class ControlPlane:
     ) -> Job:
         if kind == "tts":
             selected_profile = self.require_profile(actor, profile)
-            selected_worker = self._select_tts_worker(worker)
+            selected_worker = self._select_tts_worker(worker, profile=selected_profile)
         else:
             selected_profile, selected_worker = self.resolve_target(
                 actor, profile=profile, worker=worker
@@ -233,12 +233,12 @@ class ControlPlane:
             status_code=503,
         )
 
-    def _select_tts_worker(self, requested: str | None = None) -> str:
-        options = self.tts_worker_options()
+    def _select_tts_worker(self, requested: str | None = None, *, profile: str | None = None) -> str:
+        options = self.tts_worker_options(profile=profile)
         if not options:
             raise DomainError(
                 "TTS_WORKER_UNAVAILABLE",
-                "Tidak ada worker dengan tiga helper TTS dan jalur Tor yang siap.",
+                "Tidak ada worker dengan helper TTS, jalur Tor, dan sesi TDL profile aktif yang siap.",
                 status_code=503,
             )
         if requested:
@@ -259,7 +259,7 @@ class ControlPlane:
             self._tts_round_robin += 1
         return selected
 
-    def tts_worker_options(self) -> list[dict[str, Any]]:
+    def tts_worker_options(self, *, profile: str | None = None) -> list[dict[str, Any]]:
         registry = self.worker_registry
         checker = getattr(self.dispatcher, "capabilities", None)
         if registry is None or not callable(checker):
@@ -282,6 +282,12 @@ class ControlPlane:
                 or (isinstance(capabilities, list) and "tts" in capabilities)
             ):
                 continue
+            if profile:
+                tts_profiles = response.get("tts_profiles")
+                if isinstance(tts_profiles, list) and str(profile) not in {
+                    str(item) for item in tts_profiles
+                }:
+                    continue
             queued_jobs = sum(
                 self.jobs.count(kind="tts", worker=name, status=status, archived=False)
                 for status in statuses

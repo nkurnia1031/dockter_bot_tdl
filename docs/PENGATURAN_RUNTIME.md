@@ -18,13 +18,12 @@ bisa mengganti port, mount, atau binary host sendiri.
 | Watchdog job, timeout stall export TDL, dan timeout stall download TDL per worker | Workers / Runtime / Timeout job worker | `worker_settings.json` pada volume worker; berlaku untuk job berikutnya dan tidak bisa diubah saat ada job aktif |
 | Jadwal, tujuan channel, retensi, dan ukuran arsip backup; retensi Trash Storage; watchdog/cancel job | Backup | `app_runtime_settings.json` pada volume gateway; langsung berlaku |
 | Token bot Telegram | Pengaturan / Kredensial Telegram | `app_runtime_settings.json` pada volume gateway; tulis-saja, restart backend/Telegram |
-| ID chat atau username tujuan audio TTS | TTS Novel / Chat tujuan MP3 | `app_runtime_settings.json` pada volume gateway; tulis-saja, restart Telegram |
+| ID chat, username, link, atau nomor telepon tujuan audio TTS | TTS Novel / Chat tujuan MP3 | `app_runtime_settings.json` pada volume gateway; dipakai job TDL berikutnya |
 
 Form yang meneruskan referensi ke TDL menerima `@username`, `username`, ID
 numeric, link publik `https://t.me/<username>`, dan nomor telepon internasional
-seperti `+1 123456789`. Tujuan TTS dan backup dikirim lewat Bot API, sehingga
-menerima ID numeric atau username/link publik; nomor telepon tidak dapat
-dipakai sebagai tujuan Bot API.
+seperti `+1 123456789`. TTS dikirim memakai sesi TDL profile aktif; backup tetap
+menggunakan Bot API.
 
 Pengaturan Storage dan TTS dipisah per worker karena sesi `.tdl` dan helper
 tersedia pada mesin worker tertentu. Setiap helper menjalankan Tor lokal dan
@@ -40,10 +39,9 @@ Browser tidak menerima nilai yang sudah tersimpan: API hanya mengembalikan
 status seperti `sudah diatur`. Worker TTS tidak memerlukan password Tor; control
 port hanya listen pada loopback masing-masing helper.
 
-Token bot dan tujuan audio TTS disimpan pada file runtime gateway. Telegram
-membaca keduanya melalui endpoint internal ketika proses Telegram dimulai.
-Mengganti token bot memerlukan restart backend dan Telegram; mengganti tujuan
-TTS memerlukan restart Telegram. API Web hanya menampilkan status configured.
+Token bot dan tujuan audio TTS disimpan pada file runtime gateway. Mengganti
+token bot memerlukan restart backend dan Telegram; mengganti tujuan TTS dipakai
+oleh job berikutnya tanpa restart. API Web hanya menampilkan status configured.
 Token API worker bisa dirotasi dari form Edit Worker saat alamat worker tidak
 berubah. Gateway mengirim token baru melalui koneksi lama yang terautentikasi,
 worker memberi overlap token lama maksimal lima menit, lalu registry gateway

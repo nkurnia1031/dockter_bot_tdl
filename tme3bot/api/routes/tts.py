@@ -13,11 +13,19 @@ _ARTIFACT_REF = re.compile(r"^[a-f0-9]{48}$")
 _ACTIVE = {"queued", "dispatched", "running", "paused"}
 
 
+def _tts_chat_ref(context) -> str:
+    values = context.runtime_settings.get() if context.runtime_settings is not None else {}
+    return str(
+        values.get("telegram_tts_chat_id")
+        if "telegram_tts_chat_id" in values
+        else getattr(context.config, "telegram_tts_chat_id", "")
+    ).strip()
+
+
 def register_tts(app, context, *, current_actor, job_dict, require_internal, require_service):
     @app.get("/api/v1/tts/workers")
     def list_tts_workers(actor=Depends(current_actor)):
-        del actor
-        return {"items": context.control_plane.tts_worker_options()}
+        return {"items": context.control_plane.tts_worker_options(profile=actor.profile)}
 
     @app.post("/api/v1/tts/jobs", response_model=JobResponse)
     def submit_tts(body: TtsJobRequest, actor=Depends(current_actor)):
@@ -27,11 +35,10 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             raise DomainError("TTS_TITLE_REQUIRED", "Judul wajib diisi.", status_code=422)
         if not text:
             raise DomainError("TTS_TEXT_REQUIRED", "Teks wajib diisi.", status_code=422)
-        readiness = getattr(context.control_plane.jobs, "tts_telegram_ready", None)
-        if not callable(readiness) or not readiness():
+        if not _tts_chat_ref(context):
             raise DomainError(
-                "TTS_TELEGRAM_UNAVAILABLE",
-                "Layanan Telegram TTS belum siap atau chat tujuan belum dikonfigurasi.",
+                "TTS_CHAT_UNAVAILABLE",
+                "Chat tujuan TTS belum dikonfigurasi.",
                 status_code=503,
             )
         job = context.control_plane.submit_job(
@@ -88,7 +95,7 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             str(job.payload.get("title") or "Audio TTS"),
             normalized,
         )
-        return {"registered_parts": count}
+        return {"registered_parts": count, "chat_ref": _tts_chat_ref(context)}
 
     @app.get(
         "/internal/v1/tts/jobs/{job_id}/delivery",
@@ -132,6 +139,47 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
     )
     def pending_tts_deliveries(limit: int = Query(10, ge=1, le=100)):
         return {"items": context.control_plane.jobs.claim_tts_deliveries(limit)}
+
+    @app.get(
+        "/internal/v1/tts/deliveries/worker-pending",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def worker_pending_tts_deliveries(
+        worker: str = Query(..., min_length=1, max_length=48),
+        job_id: str = Query(..., min_length=1, max_length=120),
+        limit: int = Query(1, ge=1, le=10),
+    ):
+        job = context.control_plane.jobs.get(job_id)
+        if job is None or job.kind != "tts":
+            raise DomainError("TTS_JOB_NOT_FOUND", "Job TTS tidak ditemukan.", status_code=404)
+        if worker.strip().lower() != job.worker.lower():
+            raise DomainError("JOB_WORKER_MISMATCH", "Worker bukan pemilik job TTS.", status_code=403)
+        return {
+            "items": context.control_plane.jobs.claim_tts_deliveries(
+                limit,
+                worker=job.worker,
+                job_id=job.id,
+                include_artifact_ref=True,
+            )
+        }
+
+    @app.patch(
+        "/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def complete_worker_tts_delivery(delivery_id: str, body: dict[str, Any]):
+        delivered = body.get("delivered")
+        if type(delivered) is not bool:
+            raise DomainError("TTS_DELIVERY_RESULT_INVALID", "Hasil delivery harus boolean.", status_code=422)
+        item = context.control_plane.jobs.get_tts_delivery(delivery_id)
+        if item is None:
+            raise DomainError("TTS_DELIVERY_NOT_FOUND", "Delivery TTS tidak ditemukan.", status_code=404)
+        if str(body.get("worker") or "").strip().lower() != str(item.get("worker") or "").lower():
+            raise DomainError("JOB_WORKER_MISMATCH", "Worker bukan pemilik delivery TTS.", status_code=403)
+        updated = context.control_plane.jobs.complete_tts_delivery(delivery_id, delivered=delivered)
+        return {"status": str(updated.get("status") if updated else "missing")}
 
     @app.post(
         "/internal/v1/tts/telegram-readiness",

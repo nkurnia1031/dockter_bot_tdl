@@ -225,7 +225,7 @@ class BackendApiTests(unittest.TestCase):
                 "job_stall_timeout_seconds": 600,
                 "job_cancel_grace_seconds": 30,
                 "bot_token": "123456:abcdefghijklmnopqrstuvwxyzABCDE12345",
-                "telegram_tts_chat_id": "",
+                "telegram_tts_chat_id": "123456789",
                 "web_cookie_secret": "w" * 48,
                 "web_cookie_secure": False,
                 "web_public_origin": "",
@@ -258,7 +258,7 @@ class BackendApiTests(unittest.TestCase):
                     "job_stall_timeout_seconds": 600,
                     "job_cancel_grace_seconds": 30,
                     "bot_token": "123456:abcdefghijklmnopqrstuvwxyzABCDE12345",
-                    "telegram_tts_chat_id": "",
+                    "telegram_tts_chat_id": "123456789",
                 },
             ),
         )
@@ -451,7 +451,7 @@ class BackendApiTests(unittest.TestCase):
             json={"telegram_tts_chat_id": "-100987654321"},
         )
         self.assertEqual(chat_update.status_code, 200)
-        self.assertEqual(chat_update.json()["restart_required_services"], ["telegram"])
+        self.assertEqual(chat_update.json()["restart_required_services"], [])
 
         rejected_secret = "short-secret"
         rejected = self.client.put(
@@ -477,17 +477,16 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(public_username.status_code, 200)
         self.assertEqual(
-            self.context.runtime_settings.get()["telegram_tts_chat_id"], "@iyear"
+            self.context.runtime_settings.get()["telegram_tts_chat_id"], "iyear"
         )
-        self.assertEqual(public_username.json()["restart_required_services"], ["telegram"])
+        self.assertEqual(public_username.json()["restart_required_services"], [])
 
         phone_target = self.client.put(
             "/api/v1/runtime/secrets",
             headers=headers,
             json={"telegram_tts_chat_id": "+1 123456789"},
         )
-        self.assertEqual(phone_target.status_code, 422)
-        self.assertNotIn("+1 123456789", phone_target.text)
+        self.assertEqual(phone_target.status_code, 200)
 
     def test_tts_tor_secret_is_not_required_or_stored(self):
         headers = self.login()
@@ -1546,15 +1545,16 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn(artifact_ref, public_job.text + public_events.text)
         self.assertNotIn("chat_id", (public_job.text + public_events.text).lower())
 
-    def test_tts_requires_telegram_readiness_and_ready_worker(self):
+    def test_tts_requires_chat_and_ready_worker(self):
         headers = self.login()
+        self.context.runtime_settings.update({"telegram_tts_chat_id": ""})
         not_ready = self.client.post(
             "/api/v1/tts/jobs",
             headers=headers,
             json={"title": "Bab", "text": "Teks"},
         )
         self.assertEqual(not_ready.status_code, 503)
-        self.jobs.set_tts_telegram_ready(True)
+        self.context.runtime_settings.update({"telegram_tts_chat_id": "123456789"})
         no_worker = self.client.post(
             "/api/v1/tts/jobs",
             headers=headers,
@@ -1562,6 +1562,62 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(no_worker.status_code, 503)
         self.assertEqual(no_worker.json()["error"]["code"], "TTS_WORKER_UNAVAILABLE")
+
+    def test_tts_worker_delivery_claim_is_scoped_and_exposes_ref_only_internal(self):
+        self.dispatcher.tts_ready = True
+        headers = self.login()
+        created = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": "Isi"},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        job_id = created.json()["id"]
+        artifact_ref = "b" * 48
+        registered = self.client.post(
+            "/internal/v1/tts/artifacts/ready",
+            headers={"Authorization": "Bearer internal"},
+            json={
+                "job_id": job_id,
+                "worker": "local",
+                "parts": [{
+                    "artifact_ref": artifact_ref,
+                    "part_index": 1,
+                    "total_parts": 1,
+                    "byte_size": 512,
+                }],
+            },
+        )
+        self.assertEqual(registered.status_code, 200, registered.text)
+        self.assertEqual(registered.json()["chat_ref"], "123456789")
+
+        pending_path = f"/internal/v1/tts/deliveries/worker-pending?worker=local&job_id={job_id}"
+        self.assertEqual(self.client.get(pending_path).status_code, 401)
+        wrong_worker = self.client.get(
+            pending_path.replace("worker=local", "worker=remote"),
+            headers={"Authorization": "Bearer internal"},
+        )
+        self.assertEqual(wrong_worker.status_code, 403)
+        pending = self.client.get(
+            pending_path,
+            headers={"Authorization": "Bearer internal"},
+        )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        item = pending.json()["items"][0]
+        self.assertEqual(item["artifact_ref"], artifact_ref)
+        delivery_id = item["id"]
+        denied = self.client.patch(
+            f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+            headers={"Authorization": "Bearer internal"},
+            json={"worker": "remote", "delivered": True},
+        )
+        self.assertEqual(denied.status_code, 403)
+        completed = self.client.patch(
+            f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+            headers={"Authorization": "Bearer internal"},
+            json={"worker": "local", "delivered": True},
+        )
+        self.assertEqual(completed.status_code, 200, completed.text)
 
     def test_tts_worker_options_and_explicit_worker_selection(self):
         self.dispatcher.tts_ready = True

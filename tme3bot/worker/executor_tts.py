@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,7 +67,7 @@ class TtsExecutorMixin:
                 "message": {
                     "synthesizing": "Membuat audio",
                     "merging": "Menggabungkan audio",
-                    "telegram_delivery": "Mengirim audio ke Telegram",
+                    "telegram_delivery": "Mengirim audio lewat TDL",
                 }.get(phase, "Memproses TTS"),
                 "character_count": len(text),
                 "part_count": total,
@@ -127,7 +128,7 @@ class TtsExecutorMixin:
             self._append_job_log(
                 f"[TTS] sintesis selesai bagian={result['part_count']} karakter={result['character_count']}"
             )
-            request_json(
+            registration = request_json(
                 self.config.backend_api_url,
                 self.config.backend_internal_token,
                 "POST",
@@ -148,7 +149,20 @@ class TtsExecutorMixin:
                 },
                 timeout=30,
             )
-            self._append_job_log(f"[TTS] menunggu konfirmasi delivery parts={len(result['artifacts'])}")
+            target_chat = str(registration.get("chat_ref") or "").strip()
+            if not target_chat:
+                raise TtsError("Chat tujuan TDL TTS belum dikonfigurasi")
+            # The destination is an internal setting. Keep it available to
+            # command-audit redaction without publishing it in progress/log
+            # payloads.
+            secrets = getattr(self._job_log, "secrets", None)
+            if isinstance(secrets, list) and target_chat not in secrets:
+                secrets.append(target_chat)
+            runtime = self.profile_manager.runtime(str(command["profile"]))
+            tdl_client = runtime.export_tdl_client
+            self._append_job_log(
+                f"[TTS] mengirim lewat TDL profile={runtime.name} parts={len(result['artifacts'])}"
+            )
             while True:
                 if job_id in self._cancel_requested:
                     request_json(
@@ -163,6 +177,98 @@ class TtsExecutorMixin:
                 if pause_event.is_set():
                     publish_paused()
                     self._wait_if_paused(job_id)
+                pending = request_json(
+                    self.config.backend_api_url,
+                    self.config.backend_internal_token,
+                    "GET",
+                    f"/internal/v1/tts/deliveries/worker-pending?worker={worker_name}&job_id={job_id}&limit=1",
+                    timeout=10,
+                )
+                items = pending.get("items") if isinstance(pending, dict) else []
+                if isinstance(items, list) and items:
+                    item = items[0] if isinstance(items[0], dict) else {}
+                    delivery_id = str(item.get("id") or "")
+                    artifact_ref = str(item.get("artifact_ref") or "")
+                    artifact_path = self.tts_artifact_path(job_id, artifact_ref)
+                    part_index = int(item.get("part_index") or 1)
+                    total_parts = int(item.get("total_parts") or len(result["artifacts"]))
+                    if not delivery_id or artifact_path is None:
+                        if delivery_id:
+                            request_json(
+                                self.config.backend_api_url,
+                                self.config.backend_internal_token,
+                                "PATCH",
+                                f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+                                {"worker": worker_name, "delivered": False},
+                                timeout=10,
+                            )
+                        raise TtsError("Artifact TTS tidak tersedia untuk pengiriman")
+                    if job_id in self._cancel_requested:
+                        request_json(
+                            self.config.backend_api_url,
+                            self.config.backend_internal_token,
+                            "POST",
+                            f"/internal/v1/tts/jobs/{job_id}/cancel-delivery",
+                            {"worker": worker_name},
+                            timeout=10,
+                        )
+                        raise TtsCancelled("Job TTS dibatalkan")
+                    caption = title if total_parts == 1 else f"{title} ({part_index}/{total_parts})"
+                    try:
+                        self._append_job_log(
+                            f"[TTS] upload TDL bagian={part_index}/{total_parts}"
+                        )
+                        with runtime.export_operation_lock:
+                            tdl_client.upload(
+                                artifact_path,
+                                target_chat,
+                                caption,
+                            )
+                    except Exception as exc:
+                        try:
+                            request_json(
+                                self.config.backend_api_url,
+                                self.config.backend_internal_token,
+                                "PATCH",
+                                f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+                                {"worker": worker_name, "delivered": False},
+                                timeout=10,
+                            )
+                        except Exception:
+                            LOGGER.warning(
+                                "Could not persist failed TDL delivery job=%s part=%s",
+                                job_id[:8],
+                                part_index,
+                            )
+                        raise TtsError(f"Pengiriman TDL gagal ({type(exc).__name__})") from None
+                    request_json(
+                        self.config.backend_api_url,
+                        self.config.backend_internal_token,
+                        "PATCH",
+                        f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+                        {"worker": worker_name, "delivered": True},
+                        timeout=10,
+                    )
+                    state = request_json(
+                        self.config.backend_api_url,
+                        self.config.backend_internal_token,
+                        "GET",
+                        f"/internal/v1/tts/jobs/{job_id}/delivery?worker={worker_name}",
+                        timeout=10,
+                    )
+                    delivered = int(state.get("delivered_parts") or 0)
+                    total = int(state.get("total_parts") or len(result["artifacts"]))
+                    emit({"phase": "telegram_delivery", "current": delivered, "total": total})
+                    if state.get("status") == "delivered":
+                        self._append_job_log("[TTS] seluruh bagian terkirim lewat TDL")
+                        self.delete_tts_artifacts(job_id)
+                        return {
+                            "title": title,
+                            "character_count": result["character_count"],
+                            "part_count": result["part_count"],
+                            "delivered_parts": delivered,
+                        }
+                    continue
                 state = request_json(
                     self.config.backend_api_url,
                     self.config.backend_internal_token,
@@ -171,7 +277,7 @@ class TtsExecutorMixin:
                     timeout=10,
                 )
                 if state.get("status") == "delivered":
-                    self._append_job_log("[TTS] seluruh bagian diterima Telegram")
+                    self._append_job_log("[TTS] seluruh bagian terkirim lewat TDL")
                     self.delete_tts_artifacts(job_id)
                     return {
                         "title": title,

@@ -3,7 +3,7 @@
   import { Volume2 } from '@lucide/svelte';
   import JobTable from '$lib/components/JobTable.svelte';
   import { api, post, put } from '$lib/api';
-  import { normalizeBotApiChatRef } from '$lib/chatRef';
+  import { normalizeTdlChatRef } from '$lib/chatRef';
 
   type TtsWorker = { name: string; queued_jobs: number };
 
@@ -46,9 +46,9 @@
   async function saveChatId(clear = false) {
     chatMessage = '';
     chatError = '';
-    const chatId = normalizeBotApiChatRef(chatDraft);
+    const chatId = normalizeTdlChatRef(chatDraft);
     if (!clear && !chatId) {
-      chatError = 'Masukkan ID numeric, @username, username, atau link publik t.me. Pengiriman Bot API tidak mendukung nomor telepon.';
+      chatError = 'Masukkan ID numeric, @username, username, link publik t.me, atau nomor telepon internasional.';
       return;
     }
     chatSaving = true;
@@ -60,8 +60,8 @@
       chatConfigured = result.telegram_tts_chat_configured;
       chatDraft = '';
       chatMessage = clear
-        ? 'ID chat dihapus. Restart container Telegram agar perubahan aktif.'
-        : 'ID chat tersimpan. Restart container Telegram agar perubahan aktif.';
+        ? 'ID chat dihapus. Job TTS berikutnya tidak akan dikirim sampai tujuan baru diatur.'
+        : 'ID chat tersimpan. Job TTS berikutnya akan dikirim lewat profil TDL aktif.';
     } catch (cause) {
       chatError = cause instanceof Error ? cause.message : 'ID chat gagal disimpan.';
     } finally {
@@ -128,7 +128,7 @@
     </div>
     {#if chatError}<p role="alert" class="mt-2 text-sm text-rose-600">{chatError}</p>{/if}
     {#if chatMessage}<p role="status" class="mt-2 text-sm text-emerald-700 dark:text-emerald-300">{chatMessage}</p>{/if}
-    <p class="muted mt-2 text-xs">Terima ID numeric, username, dan link publik t.me. Tujuan harus bisa dijangkau bot. Setelah mengubah atau menghapus tujuan, restart container Telegram.</p>
+    <p class="muted mt-2 text-xs">Terima ID numeric, username, link publik t.me, dan nomor telepon internasional. Tujuan harus bisa dijangkau sesi TDL pada profile aktif.</p>
   </div>
   <div>
     <h2 class="text-lg font-extrabold">Worker TTS</h2>
@@ -136,7 +136,7 @@
     {#if workersLoading}
       <p class="muted mt-3 text-sm">Memeriksa worker...</p>
     {:else if workers.length === 0}
-      <p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker TTS yang siap. Periksa helper dan Tor dari halaman Workers.</p>
+      <p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker TTS yang siap untuk profile aktif. Periksa helper, Tor, dan sesi TDL profile dari halaman Workers.</p>
     {:else}
       <div class="mt-3 flex flex-wrap gap-2">{#each workers as option}<span class="badge">{option.name} · {option.queued_jobs} job</span>{/each}</div>
     {/if}
