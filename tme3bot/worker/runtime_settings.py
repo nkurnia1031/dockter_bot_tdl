@@ -26,7 +26,11 @@ class WorkerRuntimeSettings:
     ) -> None:
         self.path = Path(path)
         self.default_storage_profile = str(default_storage_profile or "storage")
-        self.default_tts_settings = dict(default_tts_settings or {})
+        self.default_tts_settings = {
+            key: value
+            for key, value in dict(default_tts_settings or {}).items()
+            if key not in {"tts_tor_control_password", "clear_tts_tor_control_password"}
+        }
         self.default_worker_api_token = str(default_worker_api_token or "")
         self.default_operational_settings = dict(default_operational_settings or {})
         self._lock = threading.RLock()
@@ -77,14 +81,6 @@ class WorkerRuntimeSettings:
         with self._lock:
             self._values.update(values)
             self._save_locked()
-
-    def has_tts_password(self) -> bool:
-        with self._lock:
-            stored = self._values.get("tts_tor_control_password")
-            effective = stored if stored is not None else self.default_tts_settings.get(
-                "tts_tor_control_password", ""
-            )
-            return bool(str(effective or ""))
 
     def worker_api_token(self) -> str:
         with self._lock:
@@ -142,3 +138,13 @@ class WorkerRuntimeSettings:
             return
         if isinstance(payload, dict):
             self._values = payload
+            # Older worker volumes may contain the removed Tor control
+            # password.  Do not retain it after upgrading to helper-local
+            # control and HTTP /newnym rotation.
+            removed = False
+            for key in ("tts_tor_control_password", "clear_tts_tor_control_password"):
+                if key in self._values:
+                    self._values.pop(key, None)
+                    removed = True
+            if removed:
+                self._save_locked()

@@ -100,6 +100,26 @@ class TtsPipelineTests(unittest.TestCase):
         self.assertEqual(sleeps.count(0.2), (result["part_count"] - 1) // 3)
         self.assertLessEqual(maximum, 3)
 
+    def test_route_rotation_uses_helper_http_endpoint(self):
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b'{"renewed": true}'
+
+        pipeline = make_pipeline()
+        with patch("tme3bot.worker.tts_pipeline.urllib.request.urlopen", return_value=Response()) as opened:
+            self.assertTrue(pipeline._renew_tor_route(1))
+        request = opened.call_args.args[0]
+        self.assertEqual(request.full_url, "http://helper-2/newnym")
+        self.assertEqual(request.method, "POST")
+
     def test_merge_keeps_part_order_and_large_output_splits_at_part_boundaries(self):
         def request_part(text, job_id, index, total, route, attempt, directory):
             path = directory / f"part-{index:05d}.mp3"

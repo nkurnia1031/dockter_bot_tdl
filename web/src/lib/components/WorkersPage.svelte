@@ -16,22 +16,15 @@
     storage_profile_available: boolean;
     available_storage_profiles: string[];
     tts_helper_urls: string[];
-    tts_tor_control_hosts: string[];
-    tts_tor_control_ports: number[];
-    tts_tor_control_password_configured: boolean;
     tts_part_retries: number;
     tts_retry_base_seconds: number;
     tts_newnym_after_retries: number;
   };
   type TtsDraft = {
     helper_urls: string;
-    tor_hosts: string;
-    tor_ports: string;
     part_retries: string;
     retry_base_seconds: string;
     newnym_after_retries: string;
-    tor_password: string;
-    clear_tor_password: boolean;
   };
   type WorkerOpsDraft = { job_stall: string; export_stall: string; download_stall: string };
   let workers = $state<Worker[]>([]);
@@ -79,13 +72,9 @@
         ...ttsDrafts,
         [worker.name]: {
           helper_urls: (result.tts_helper_urls || []).join(', '),
-          tor_hosts: (result.tts_tor_control_hosts || []).join(', '),
-          tor_ports: (result.tts_tor_control_ports || []).join(', '),
           part_retries: String(result.tts_part_retries ?? 4),
           retry_base_seconds: String(result.tts_retry_base_seconds ?? 2),
           newnym_after_retries: String(result.tts_newnym_after_retries ?? 3),
-          tor_password: '',
-          clear_tor_password: false,
         },
       };
     } catch (cause) {
@@ -150,19 +139,14 @@
     if (!draft) return;
     const payload: Record<string, unknown> = {
       tts_helper_urls: parseList(draft.helper_urls),
-      tts_tor_control_hosts: parseList(draft.tor_hosts),
-      tts_tor_control_ports: parseList(draft.tor_ports).map(Number),
       tts_part_retries: Number(draft.part_retries),
       tts_retry_base_seconds: Number(draft.retry_base_seconds),
       tts_newnym_after_retries: Number(draft.newnym_after_retries),
     };
-    if (draft.tor_password) payload.tts_tor_control_password = draft.tor_password;
-    if (draft.clear_tor_password) payload.clear_tts_tor_control_password = true;
     settingsSaving = { ...settingsSaving, [worker.name]: true };
     try {
       const result = await put<WorkerSettings>(`/workers/${encodeURIComponent(worker.name)}/settings`, payload);
       workerSettings = { ...workerSettings, [worker.name]: result };
-      updateTtsDraft(worker, { tor_password: '', clear_tor_password: false });
       message = `Pengaturan TTS worker ${worker.name} disimpan untuk job berikutnya.`;
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Pengaturan TTS gagal disimpan.';
@@ -213,18 +197,14 @@
               {@const tts = ttsDrafts[worker.name]}
               {#if tts}
                 <div class="mt-6 border-t border-[var(--line)] pt-5">
-                  <div class="flex flex-wrap items-center justify-between gap-2"><div><h4 class="text-sm font-extrabold">Mesin TTS</h4><p class="muted mt-1 text-xs">Perubahan berlaku untuk job TTS baru. Password Tor hanya bisa diganti atau dihapus; nilainya tidak dikirim kembali.</p></div><span class="badge">Password Tor: {settings.tts_tor_control_password_configured ? 'Sudah diatur' : 'Belum diatur'}</span></div>
+                  <div><h4 class="text-sm font-extrabold">Mesin TTS</h4><p class="muted mt-1 text-xs">Setiap helper menjalankan Tor lokal. Worker memakai endpoint internal helper untuk pemeriksaan kesiapan dan rotasi circuit.</p></div>
                   <div class="mt-4 grid gap-3 lg:grid-cols-2">
                     <label class="text-sm font-bold">URL tiga helper gTTS<textarea class="field mt-2 min-h-20" value={tts.helper_urls} oninput={(event) => updateTtsDraft(worker, { helper_urls: event.currentTarget.value })} placeholder="http://tts-1:5000, http://tts-2:5000, http://tts-3:5000"></textarea></label>
-                    <label class="text-sm font-bold">Host tiga control port Tor<textarea class="field mt-2 min-h-20" value={tts.tor_hosts} oninput={(event) => updateTtsDraft(worker, { tor_hosts: event.currentTarget.value })} placeholder="tor-1, tor-2, tor-3"></textarea></label>
-                    <label class="text-sm font-bold">Port control Tor<input class="field mt-2" value={tts.tor_ports} oninput={(event) => updateTtsDraft(worker, { tor_ports: event.currentTarget.value })} placeholder="9051, 9051, 9051"/></label>
-                    <label class="text-sm font-bold">Password control Tor baru<input class="field mt-2" type="password" value={tts.tor_password} oninput={(event) => updateTtsDraft(worker, { tor_password: event.currentTarget.value, clear_tor_password: false })} autocomplete="new-password" placeholder="Kosongkan agar tidak berubah"/></label>
                     <label class="text-sm font-bold">Retry per bagian<input class="field mt-2" type="number" min="0" max="10" value={tts.part_retries} oninput={(event) => updateTtsDraft(worker, { part_retries: event.currentTarget.value })}/></label>
                     <label class="text-sm font-bold">Backoff awal (detik)<input class="field mt-2" type="number" min="0.1" max="60" step="0.1" value={tts.retry_base_seconds} oninput={(event) => updateTtsDraft(worker, { retry_base_seconds: event.currentTarget.value })}/></label>
                     <label class="text-sm font-bold">Rotasi circuit setelah retry<input class="field mt-2" type="number" min="1" max="20" value={tts.newnym_after_retries} oninput={(event) => updateTtsDraft(worker, { newnym_after_retries: event.currentTarget.value })}/></label>
-                    <label class="flex items-center gap-2 self-end pb-3 text-sm"><input type="checkbox" checked={tts.clear_tor_password} onchange={(event) => updateTtsDraft(worker, { clear_tor_password: event.currentTarget.checked, tor_password: '' })}/>Hapus password Tor tersimpan</label>
                   </div>
-                  <button class="button mt-4" onclick={() => saveTtsSettings(worker)} disabled={settingsSaving[worker.name] || Boolean(tts.clear_tor_password && tts.tor_password)}>{settingsSaving[worker.name] ? 'Menyimpan...' : 'Simpan pengaturan TTS'}</button>
+                  <button class="button mt-4" onclick={() => saveTtsSettings(worker)} disabled={settingsSaving[worker.name]}>{settingsSaving[worker.name] ? 'Menyimpan...' : 'Simpan pengaturan TTS'}</button>
                 </div>
               {/if}
               {@const ops = opsDrafts[worker.name]}

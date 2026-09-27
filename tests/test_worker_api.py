@@ -25,7 +25,6 @@ class FakeExecutor:
             "tts_helper_urls": ["http://tts-1:5000", "http://tts-2:5000", "http://tts-3:5000"],
             "tts_tor_control_hosts": ["tor-1", "tor-2", "tor-3"],
             "tts_tor_control_ports": [9051, 9051, 9051],
-            "tts_tor_control_password_configured": False,
             "tts_part_retries": 4,
             "tts_retry_base_seconds": 2.0,
             "tts_newnym_after_retries": 3,
@@ -49,8 +48,6 @@ class FakeExecutor:
                 "Profil Storage belum tersedia.",
                 status_code=409,
             )
-        if values.get("tts_tor_control_password"):
-            self.worker_settings_values["tts_tor_control_password_configured"] = True
         return self.worker_settings()
 
     def worker_token_matches(self, token):
@@ -191,7 +188,7 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["storage_profile"], "default")
 
-    def test_worker_runtime_settings_accept_tts_secret_without_returning_it(self):
+    def test_worker_runtime_settings_do_not_store_tor_secret(self):
         headers = {"Authorization": "Bearer worker-secret"}
         secret = "tor-control-password-never-return-this"
         updated = self.client.put(
@@ -207,17 +204,17 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(updated.status_code, 200)
         self.assertNotIn(secret, updated.text)
-        self.assertTrue(updated.json()["tts_tor_control_password_configured"])
-        self.assertEqual(self.executor.runtime_updates[0]["tts_tor_control_password"], secret)
+        self.assertNotIn("tts_tor_control_password_configured", updated.json())
+        self.assertNotIn("tts_tor_control_password", self.executor.runtime_updates[0])
 
-    def test_worker_runtime_validation_does_not_echo_rejected_secret(self):
+    def test_worker_runtime_ignores_removed_tor_secret(self):
         secret = "tor-secret-must-not-echo"
         response = self.client.put(
             "/internal/v1/runtime-settings",
             headers={"Authorization": "Bearer worker-secret"},
             json={"tts_tor_control_password": secret * 30},
         )
-        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.status_code, 200)
         self.assertNotIn(secret, response.text)
 
     def test_worker_api_token_can_rotate_with_short_overlap_for_inflight_update(self):

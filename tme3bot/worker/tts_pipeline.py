@@ -99,7 +99,6 @@ class TtsPipeline:
         helper_urls: tuple[str, ...] | list[str],
         tor_control_host: str | tuple[str, ...] | list[str],
         tor_control_ports: tuple[int, ...] | list[int],
-        tor_control_password: str = "",
         *,
         retries: int = 4,
         retry_base_seconds: float = 2.0,
@@ -121,7 +120,6 @@ class TtsPipeline:
         else:
             self.tor_control_hosts = tuple(str(item).strip() for item in tor_control_host if str(item).strip())
         self.tor_control_ports = tuple(int(port) for port in tor_control_ports)
-        self.tor_control_password = str(tor_control_password)
         self.retries = max(0, int(retries))
         self.retry_base_seconds = max(0.1, float(retry_base_seconds))
         self.newnym_after_retries = max(1, int(newnym_after_retries))
@@ -140,21 +138,18 @@ class TtsPipeline:
             getattr(config, "tts_helper_urls", ()),
             getattr(config, "tts_tor_control_hosts", ()),
             getattr(config, "tts_tor_control_ports", ()),
-            getattr(config, "tts_tor_control_password", ""),
             retries=getattr(config, "tts_part_retries", 4),
             retry_base_seconds=getattr(config, "tts_retry_base_seconds", 2.0),
             newnym_after_retries=getattr(config, "tts_newnym_after_retries", 3),
         )
 
     def ready(self) -> bool:
-        if len(self.helper_urls) != TTS_PARALLELISM or len(self.tor_control_ports) != TTS_PARALLELISM:
+        if len(self.helper_urls) != TTS_PARALLELISM:
             return False
-        if len(self.tor_control_hosts) != TTS_PARALLELISM:
-            return False
-        return all(self._health_probe(url) for url in self.helper_urls) and all(
-            self._tor_probe(host, port)
-            for host, port in zip(self.tor_control_hosts, self.tor_control_ports)
-        )
+        # Each helper owns its Tor process and checks its local control port.
+        # The worker talks to the helper HTTP API instead of exposing an
+        # unauthenticated Tor control port on the Compose network.
+        return all(self._health_probe(url) for url in self.helper_urls)
 
     @staticmethod
     def _probe_helper(url: str) -> bool:
@@ -173,10 +168,20 @@ class TtsPipeline:
             return False
 
     def _renew_tor_route(self, route_index: int) -> bool:
-        index = route_index % len(self.tor_control_ports)
-        port = self.tor_control_ports[index]
+        index = route_index % len(self.helper_urls)
+        request = urllib.request.Request(
+            self.helper_urls[index] + "/newnym",
+            method="POST",
+        )
         with _TOR_LOCK:
-            return _tor_command(self.tor_control_hosts[index], port, self.tor_control_password)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    if response.status != 200:
+                        return False
+                    payload = json.loads(response.read().decode("utf-8"))
+                    return bool(payload.get("renewed"))
+            except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+                return False
 
     def _http_request_part(
         self,
@@ -254,8 +259,8 @@ class TtsPipeline:
     ) -> dict[str, Any]:
         if len(text) > MAX_TTS_TEXT_CHARS:
             raise TtsError("Teks melewati batas 100.000 karakter")
-        if len(self.helper_urls) != TTS_PARALLELISM or len(self.tor_control_ports) != TTS_PARALLELISM or len(self.tor_control_hosts) != TTS_PARALLELISM:
-            raise TtsError("Konfigurasi TTS memerlukan tiga helper dan tiga jalur Tor")
+        if len(self.helper_urls) != TTS_PARALLELISM:
+            raise TtsError("Konfigurasi TTS memerlukan tiga helper")
         root.mkdir(parents=True, exist_ok=True)
         for old in root.glob("artifact-*.mp3"):
             try:

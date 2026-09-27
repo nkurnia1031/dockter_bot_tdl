@@ -34,21 +34,20 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
 
             self.assertEqual(restarted.storage_profile(), "archive")
 
-    def test_tts_overrides_and_password_persist_but_public_status_is_boolean(self):
+    def test_tts_overrides_drop_removed_tor_password(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "worker_settings.json"
             defaults = {
                 "tts_helper_urls": ["http://one:5000", "http://two:5000", "http://three:5000"],
                 "tts_tor_control_hosts": ["tor-one", "tor-two", "tor-three"],
                 "tts_tor_control_ports": [9051, 9051, 9051],
-                "tts_tor_control_password": "bootstrap-secret",
                 "tts_part_retries": 4,
             }
             settings = WorkerRuntimeSettings(
                 path, default_storage_profile="default", default_tts_settings=defaults
             )
             settings.set_tts_settings(
-                {"tts_tor_control_password": "new-secret", "tts_part_retries": 6}
+                {"tts_tor_control_password": "legacy-secret", "tts_part_retries": 6}
             )
             restarted = WorkerRuntimeSettings(
                 path,
@@ -57,11 +56,7 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
             )
 
             self.assertEqual(restarted.tts_settings()["tts_part_retries"], 6)
-            self.assertEqual(restarted.tts_settings()["tts_tor_control_password"], "new-secret")
-            self.assertTrue(restarted.has_tts_password())
-
-            restarted.set_tts_settings({"tts_tor_control_password": ""})
-            self.assertFalse(restarted.has_tts_password())
+            self.assertNotIn("tts_tor_control_password", restarted.tts_settings())
 
     def test_worker_token_rotation_accepts_old_until_gateway_uses_new_token(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -136,7 +131,6 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
                 "tts_helper_urls": ["http://one:5000", "http://two:5000", "http://three:5000"],
                 "tts_tor_control_hosts": ["tor-one", "tor-two", "tor-three"],
                 "tts_tor_control_ports": [9051, 9051, 9051],
-                "tts_tor_control_password": "bootstrap-secret",
                 "tts_part_retries": 4,
                 "tts_retry_base_seconds": 2.0,
                 "tts_newnym_after_retries": 3,

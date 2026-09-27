@@ -96,7 +96,6 @@ class AppConfig:
     tts_helper_urls: tuple[str, ...] = ()
     tts_tor_control_hosts: tuple[str, ...] = ()
     tts_tor_control_ports: tuple[int, ...] = ()
-    tts_tor_control_password: str = ""
     tts_data_root: Path = Path("/data/tts")
     tts_part_retries: int = 4
     tts_retry_base_seconds: float = 2.0
@@ -351,7 +350,6 @@ class AppConfig:
                 for value in os.getenv("TTS_TOR_CONTROL_PORTS", "9051,9051,9051").split(",")
                 if value.strip()
             ),
-            tts_tor_control_password=os.getenv("TTS_TOR_CONTROL_PASSWORD", ""),
             tts_data_root=Path(os.getenv("TTS_DATA_ROOT", "/data/tts")),
             tts_part_retries=max(0, int(os.getenv("TTS_PART_RETRIES", "4"))),
             tts_retry_base_seconds=max(0.1, float(os.getenv("TTS_RETRY_BASE_SECONDS", "2"))),

@@ -9643,7 +9643,7 @@
       "file_type": "code",
       "norm_label": "canonical_chat_key()",
       "source_file": "tme3bot/chat_refs.py",
-      "source_location": "L69"
+      "source_location": "L76"
     },
     {
       "id": "tme3bot_frontend_telegram_app_telegramfrontendapp_handle_export_input",
@@ -29128,7 +29128,7 @@
       "source_location": "L1"
     },
     {
-      "id": "tme3bot_chat_refs_rationale_70",
+      "id": "tme3bot_chat_refs_rationale_77",
       "label": "Canonicalize aliases for source state while preserving legacy keys.",
       "_origin": "ast",
       "community": 20,
@@ -29136,7 +29136,7 @@
       "file_type": "rationale",
       "norm_label": "canonicalize aliases for source state while preserving legacy keys.",
       "source_file": "tme3bot/chat_refs.py",
-      "source_location": "L70"
+      "source_location": "L77"
     },
     {
       "id": "tme3bot_frontend_telegram_init_rationale_1",
@@ -47426,7 +47426,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/chat_refs.py",
-      "source_location": "L75",
+      "source_location": "L82",
       "weight": 1.0
     },
     {
@@ -47438,7 +47438,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/chat_refs.py",
-      "source_location": "L60",
+      "source_location": "L61",
       "weight": 1.0
     },
     {
@@ -91131,7 +91131,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/chat_refs.py",
-      "source_location": "L69",
+      "source_location": "L76",
       "weight": 1.0
     },
     {
@@ -111718,14 +111718,14 @@
       "weight": 1.0
     },
     {
-      "source": "tme3bot_chat_refs_rationale_70",
+      "source": "tme3bot_chat_refs_rationale_77",
       "target": "tme3bot_chat_refs_canonical_chat_key",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/chat_refs.py",
-      "source_location": "L70",
+      "source_location": "L77",
       "weight": 1.0
     },
     {

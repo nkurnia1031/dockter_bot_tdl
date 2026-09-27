@@ -55,7 +55,6 @@ class FakeDispatcher:
             "tts_helper_urls": ["http://tts-1:5000", "http://tts-2:5000", "http://tts-3:5000"],
             "tts_tor_control_hosts": ["tor-1", "tor-2", "tor-3"],
             "tts_tor_control_ports": [9051, 9051, 9051],
-            "tts_tor_control_password_configured": False,
             "tts_part_retries": 4,
             "tts_retry_base_seconds": 2.0,
             "tts_newnym_after_retries": 3,
@@ -83,8 +82,6 @@ class FakeDispatcher:
             )
         if selected:
             self.runtime_settings["storage_profile"] = selected
-        if payload.get("tts_tor_control_password"):
-            self.runtime_settings["tts_tor_control_password_configured"] = True
         if payload.get("worker_api_token"):
             self.runtime_settings["worker_api_token_configured"] = True
         return dict(self.runtime_settings)
@@ -492,7 +489,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(phone_target.status_code, 422)
         self.assertNotIn("+1 123456789", phone_target.text)
 
-    def test_tts_tor_secret_can_be_updated_from_web_without_returning_value(self):
+    def test_tts_tor_secret_is_not_required_or_stored(self):
         headers = self.login()
         secret = "tor-password-is-write-only"
         updated = self.client.put(
@@ -505,7 +502,7 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(updated.status_code, 200)
         self.assertNotIn(secret, updated.text)
-        self.assertTrue(updated.json()["tts_tor_control_password_configured"])
+        self.assertNotIn("tts_tor_control_password_configured", updated.json())
 
     def test_worker_api_token_rotation_updates_worker_then_gateway_registry(self):
         headers = self.login()

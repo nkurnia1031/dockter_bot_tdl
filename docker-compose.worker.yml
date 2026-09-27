@@ -22,7 +22,7 @@ services:
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     profiles: ["tts"]
     restart: unless-stopped
-    expose: ["8090", "9051"]
+    expose: ["8090"]
     environment:
       TTS_TOR_DATA_DIR: /tmp/tor-data
       HTTP_PROXY: socks5h://127.0.0.1:9050
@@ -42,7 +42,7 @@ services:
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     profiles: ["tts"]
     restart: unless-stopped
-    expose: ["8090", "9051"]
+    expose: ["8090"]
     environment:
       TTS_TOR_DATA_DIR: /tmp/tor-data
       HTTP_PROXY: socks5h://127.0.0.1:9050
@@ -62,7 +62,7 @@ services:
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     profiles: ["tts"]
     restart: unless-stopped
-    expose: ["8090", "9051"]
+    expose: ["8090"]
     environment:
       TTS_TOR_DATA_DIR: /tmp/tor-data
       HTTP_PROXY: socks5h://127.0.0.1:9050

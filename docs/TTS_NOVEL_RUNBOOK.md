@@ -27,10 +27,10 @@ layanan Telegram. Worker tidak menerima token bot atau chat tujuan.
    aktif. Tujuan harus dapat dijangkau bot. Bot API tidak mengirim berdasarkan
    nomor telepon. Nilai awal dapat tetap diisi pada `TELEGRAM_TTS_CHAT_ID` di
    `.env.telegram`.
-4. URL helper dan host/port control Tor dapat diubah dari **Workers → Runtime
-   → Mesin TTS** untuk masing-masing worker. Nilai `.env.worker.local` atau
-   `.env.worker` tetap menjadi bootstrap/fallback; perubahan Web berlaku pada
-   job TTS berikutnya.
+4. URL tiga helper dapat diubah dari **Workers → Runtime → Mesin TTS** untuk
+   masing-masing worker. Setiap helper menjalankan Tor pada loopback container;
+   worker memeriksa `/readyz` dan meminta rotasi lewat `/newnym`. Tidak ada
+   password atau control port Tor yang perlu disimpan di Web atau `.env`.
 5. Pastikan direktori `/data/tts` termasuk dalam volume data worker agar
    artifact dan checkpoint tetap ada setelah container worker restart.
 
@@ -51,12 +51,13 @@ COMPOSE_PROFILES=tts python3 run.py deploy worker --pull
 
 Gunakan perintah worker hanya pada host yang env worker-nya memiliki konfigurasi
 helper dan volume data TTS. Profile tersebut menjalankan tiga container helper
-beserta Tor; port helper hanya diekspos ke jaringan internal Compose, bukan ke
-port publik host. Jalur Tor memakai circuit terpisah sebagai upaya terbaik;
-alamat IP keluarnya tidak diperiksa atau dijamin berbeda.
+beserta Tor. Hanya HTTP helper yang tersedia di jaringan internal Compose;
+control port Tor tetap loopback di dalam setiap helper dan tidak diekspos ke
+container lain atau port publik host. Jalur Tor memakai circuit terpisah
+sebagai upaya terbaik; alamat IP keluarnya tidak diperiksa atau dijamin berbeda.
 
 Worker baru melaporkan capability `tts` setelah ketiga helper merespons
-`/readyz` dan ketiga port kontrol Tor dapat dijangkau. Gateway mengirim job
+`/readyz`. Gateway mengirim job
 hanya ke worker dengan capability itu. Proses Telegram mengirim heartbeat
 kesiapan hanya jika chat tujuan audio terisi; endpoint pembuatan job
 menolak permintaan bila layanan Telegram belum siap.

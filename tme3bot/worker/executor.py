@@ -131,7 +131,6 @@ class WorkerJobExecutor(
                 "tts_helper_urls": tuple(getattr(config, "tts_helper_urls", ())),
                 "tts_tor_control_hosts": tuple(getattr(config, "tts_tor_control_hosts", ())),
                 "tts_tor_control_ports": tuple(getattr(config, "tts_tor_control_ports", ())),
-                "tts_tor_control_password": str(getattr(config, "tts_tor_control_password", "")),
                 "tts_part_retries": int(getattr(config, "tts_part_retries", 4)),
                 "tts_retry_base_seconds": float(getattr(config, "tts_retry_base_seconds", 2.0)),
                 "tts_newnym_after_retries": int(getattr(config, "tts_newnym_after_retries", 3)),
@@ -605,7 +604,6 @@ class WorkerJobExecutor(
             "tts_helper_urls": list(tts.get("tts_helper_urls", ())),
             "tts_tor_control_hosts": list(tts.get("tts_tor_control_hosts", ())),
             "tts_tor_control_ports": list(tts.get("tts_tor_control_ports", ())),
-            "tts_tor_control_password_configured": self.runtime_settings.has_tts_password(),
             "tts_part_retries": int(tts.get("tts_part_retries", 4)),
             "tts_retry_base_seconds": float(tts.get("tts_retry_base_seconds", 2.0)),
             "tts_newnym_after_retries": int(tts.get("tts_newnym_after_retries", 3)),
@@ -627,7 +625,6 @@ class WorkerJobExecutor(
                     details={"available_storage_profiles": available},
                 )
 
-        clear_password = bool(updates.pop("clear_tts_tor_control_password", False))
         worker_api_token = updates.pop("worker_api_token", None)
         operational_updates = {
             key: value
@@ -643,14 +640,10 @@ class WorkerJobExecutor(
                 "Timeout worker harus berada antara 0 dan 86400 detik.",
                 status_code=422,
             )
-        if clear_password and updates.get("tts_tor_control_password"):
-            raise DomainError(
-                "INVALID_TTS_SETTINGS",
-                "Pilih ganti atau hapus password Tor, bukan keduanya.",
-                status_code=422,
-            )
-        if clear_password:
-            updates["tts_tor_control_password"] = ""
+        # Tor control stays loopback-only inside each helper.  Circuit
+        # rotation uses the helper HTTP endpoint, so no password is needed.
+        updates.pop("tts_tor_control_password", None)
+        updates.pop("clear_tts_tor_control_password", None)
         tts_updates = {key: value for key, value in updates.items() if key.startswith("tts_")}
         if tts_updates:
             self._validate_tts_settings(tts_updates)
@@ -759,9 +752,6 @@ class WorkerJobExecutor(
             raise DomainError("INVALID_TTS_SETTINGS", "Backoff TTS harus antara 0,1 dan 60 detik.", status_code=422)
         if int(candidate.get("tts_newnym_after_retries", 3)) not in range(1, 21):
             raise DomainError("INVALID_TTS_SETTINGS", "Batas rotasi circuit TTS harus antara 1 dan 20.", status_code=422)
-        password = str(candidate.get("tts_tor_control_password", "") or "")
-        if len(password) > 512 or "\n" in password or "\r" in password:
-            raise DomainError("INVALID_TTS_SETTINGS", "Password Tor tidak valid.", status_code=422)
 
     def _unhandled_resource(self, command: dict[str, Any], exc: Exception) -> None:
         LOGGER.exception("Worker queue failed for job %s", command.get("job_id"))

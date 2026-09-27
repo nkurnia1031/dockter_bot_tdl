@@ -1,7 +1,7 @@
 # Graph Report - dockter_bot_tdl  (2026-09-27)
 
 ## Corpus Check
-- 194 files · ~150,131 words
+- 194 files · ~150,206 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 9 file(s) not represented in the graph (top: (none) 6, .base 1, .conf 1)
 

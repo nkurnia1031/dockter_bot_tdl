@@ -314,8 +314,6 @@ class WorkerRuntimeSettingsRequest(BaseModel):
     tts_helper_urls: list[str] | None = Field(default=None, min_length=3, max_length=3)
     tts_tor_control_hosts: list[str] | None = Field(default=None, min_length=3, max_length=3)
     tts_tor_control_ports: list[int] | None = Field(default=None, min_length=3, max_length=3)
-    tts_tor_control_password: str | None = Field(default=None, max_length=512)
-    clear_tts_tor_control_password: bool = False
     tts_part_retries: int | None = Field(default=None, ge=0, le=10)
     tts_retry_base_seconds: float | None = Field(default=None, ge=0.1, le=60)
     tts_newnym_after_retries: int | None = Field(default=None, ge=1, le=20)

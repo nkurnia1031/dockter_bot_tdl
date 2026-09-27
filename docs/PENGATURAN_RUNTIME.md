@@ -14,7 +14,7 @@ bisa mengganti port, mount, atau binary host sendiri.
 | Folder Utility, ukuran pindah/arsip, tujuan rclone, dan password arsip | Utility / Pengaturan | File pengaturan Utility pada volume data; dipakai job berikutnya |
 | Folder, metadata, dan operasi Storage | Storage | Database Storage gateway |
 | Profil sesi TDL Storage per worker | Workers / Runtime | `worker_settings.json` pada volume worker; dipakai job Storage dan Quick Mode berikutnya |
-| URL helper gTTS, tiga host dan port Tor, retry/backoff, serta password Tor | Workers / Runtime / Mesin TTS | `worker_settings.json` pada volume worker; dipakai job TTS baru |
+| URL tiga helper gTTS dan retry/backoff TTS | Workers / Runtime / Mesin TTS | `worker_settings.json` pada volume worker; dipakai job TTS baru |
 | Watchdog job, timeout stall export TDL, dan timeout stall download TDL per worker | Workers / Runtime / Timeout job worker | `worker_settings.json` pada volume worker; berlaku untuk job berikutnya dan tidak bisa diubah saat ada job aktif |
 | Jadwal, tujuan channel, retensi, dan ukuran arsip backup; retensi Trash Storage; watchdog/cancel job | Backup | `app_runtime_settings.json` pada volume gateway; langsung berlaku |
 | Token bot Telegram | Pengaturan / Kredensial Telegram | `app_runtime_settings.json` pada volume gateway; tulis-saja, restart backend/Telegram |
@@ -26,8 +26,9 @@ seperti `+1 123456789`. Tujuan TTS dan backup dikirim lewat Bot API, sehingga
 menerima ID numeric atau username/link publik; nomor telepon tidak dapat
 dipakai sebagai tujuan Bot API.
 
-Pengaturan Storage dan TTS dipisah per worker karena sesi `.tdl`, helper, dan
-jalur Tor tersedia pada mesin worker tertentu. Mengganti konfigurasi tidak
+Pengaturan Storage dan TTS dipisah per worker karena sesi `.tdl` dan helper
+tersedia pada mesin worker tertentu. Setiap helper menjalankan Tor lokal dan
+menyediakan pemeriksaan serta rotasi circuit melalui HTTP internal. Mengganti konfigurasi tidak
 memindahkan job yang sudah ditempatkan. Pengubahan profil Storage ditolak
 selama job Storage atau Quick Mode berjalan; pengubahan TTS ditolak selama job
 TTS berjalan.
@@ -36,13 +37,8 @@ TTS berjalan.
 
 Rahasia yang sudah memiliki form Web dapat ditulis atau diganti setelah login.
 Browser tidak menerima nilai yang sudah tersimpan: API hanya mengembalikan
-status seperti `sudah diatur`. Kolom password kosong berarti nilainya tidak
-diubah; tersedia aksi hapus untuk password Tor.
-
-Rahasia worker TTS disimpan di `worker_settings.json` pada volume data worker
-dengan permission file owner-only di sistem Linux. Nilai password tidak
-dimasukkan ke status worker, event job, atau log. Token API worker juga dikelola
-melalui form Worker, bukan ditampilkan kembali.
+status seperti `sudah diatur`. Worker TTS tidak memerlukan password Tor; control
+port hanya listen pada loopback masing-masing helper.
 
 Token bot dan tujuan audio TTS disimpan pada file runtime gateway. Telegram
 membaca keduanya melalui endpoint internal ketika proses Telegram dimulai.

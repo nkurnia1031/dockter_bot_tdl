@@ -56,16 +56,20 @@ def _start_tor() -> None:
         [
             "tor",
             "--SocksPort",
-            "0.0.0.0:9050",
+            "127.0.0.1:9050",
             "--ControlPort",
-            "0.0.0.0:9051",
+            "127.0.0.1:9051",
             "--CookieAuthentication",
             "0",
             "--DataDirectory",
             str(data_dir),
+            "--Log",
+            "notice stdout",
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        # Keep Tor diagnostics in the helper container log.  The control
+        # listener is loopback-only, so no Tor credential is exposed here.
+        stdout=None,
+        stderr=None,
         user=tor_user.pw_uid,
         group=tor_user.pw_gid,
     )
