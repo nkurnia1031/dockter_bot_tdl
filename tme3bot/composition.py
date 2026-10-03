@@ -18,6 +18,7 @@ from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
+from tme3bot.profile_provisioning import ProfileProvisioningService, ProfileProvisioningStore
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_maintenance import StorageMaintenanceService
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
@@ -87,6 +88,15 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
     dispatcher = WorkerHttpDispatcher(registry)
+    profile_provisioner = ProfileProvisioningService(
+        ProfileProvisioningStore(
+            config.storage_db_file,
+            config.state_file.parent / "profile-vault",
+        ),
+        profiles,
+        registry,
+        dispatcher,
+    )
     folders = UtilityFolderStore(
         config.utility_folders_file, config.utility_workspace_root
     )
@@ -99,6 +109,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         storage_catalog=catalog,
         export_catalog=export_catalog,
         worker_registry=registry,
+        profile_readiness=profile_provisioner.worker_ready,
         utility_folders=folders,
         utility_settings=settings,
         label_store=labels,
@@ -177,6 +188,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         storage_maintenance=storage_maintenance,
         runtime_settings=runtime_settings,
         backup_scheduler=scheduler,
+        profile_provisioner=profile_provisioner,
     )
     return context, scheduler
 
@@ -185,12 +197,18 @@ def run_backend(config: AppConfig) -> None:
     context, scheduler = build_backend_context(config)
     scheduler.start()
     context.storage_maintenance.start()
-    uvicorn.run(
-        create_backend_app(context),
-        host=config.backend_bind_host,
-        port=config.backend_port,
-        log_level=config.log_level.lower(),
-    )
+    if context.profile_provisioner is not None:
+        context.profile_provisioner.start()
+    try:
+        uvicorn.run(
+            create_backend_app(context),
+            host=config.backend_bind_host,
+            port=config.backend_port,
+            log_level=config.log_level.lower(),
+        )
+    finally:
+        if context.profile_provisioner is not None:
+            context.profile_provisioner.stop()
 
 
 def run_worker(config: AppConfig) -> None:

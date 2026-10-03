@@ -25,6 +25,8 @@ env.*
 akultan/
 data/
 profiles/
+!web/src/routes/profiles/
+!web/src/routes/profiles/+page.svelte
 workspace/
 exports/
 download/

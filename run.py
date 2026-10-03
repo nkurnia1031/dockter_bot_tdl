@@ -1476,8 +1476,14 @@ def add_profile(env: dict[str, str], profile_name: str | None) -> None:
         )
 
     ensure_container_profile_dirs(env, profile)
+    default_profile = normalize_profile_name(env.get("DEFAULT_PROFILE", "default")) or "default"
+    profile_path = (
+        "/data"
+        if profile == default_profile
+        else f"/data/profiles/{profile}"
+    )
     profile_root = map_data_path(
-        Path(data_root_value(env) or ".").expanduser(), f"/data/profiles/{profile}"
+        Path(data_root_value(env) or ".").expanduser(), profile_path
     )
     print(f"Profile siap: {profile}")
     if profile_root is not None:

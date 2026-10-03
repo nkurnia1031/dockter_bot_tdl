@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import Depends, FastAPI, Query, Request
+from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,6 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from tme3bot.api.schemas import WorkerJobRequest, WorkerRuntimeSettingsRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.domain.worker_contract import CAP_TTS, worker_contract_metadata
+from tme3bot.profile_provisioning import MAX_PROFILE_BUNDLE_BYTES, MAX_SESSION_ARCHIVE_BYTES
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -75,6 +76,21 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 "WORKER_UNAUTHORIZED", "Worker token tidak valid.", status_code=401
             )
 
+    def profile_operation(callback, code: str, message: str):
+        try:
+            return callback()
+        except DomainError:
+            raise
+        except ValueError as exc:
+            raise DomainError("PROFILE_SESSION_INVALID", str(exc), status_code=422) from exc
+        except KeyError as exc:
+            raise DomainError("PROFILE_LOGIN_NOT_FOUND", "Sesi login worker tidak ditemukan.", status_code=404) from exc
+        except Exception:
+            # Do not log the exception text or traceback: filesystem errors can
+            # include local paths, while login errors may include private TDL output.
+            LOGGER.warning("Worker profile operation failed (%s)", code)
+            raise DomainError(code, message, status_code=503) from None
+
     @app.get("/healthz")
     def healthz():
         return {"ok": True, "role": "worker"}
@@ -88,6 +104,121 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             capabilities.append(CAP_TTS)
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
+
+    @app.post("/internal/v1/profiles/validate", dependencies=[Depends(authorize)])
+    async def validate_profile_session(request: Request):
+        data = await request.body()
+        if len(data) > MAX_SESSION_ARCHIVE_BYTES:
+            raise DomainError("PROFILE_ARCHIVE_TOO_LARGE", "ZIP sesi melebihi batas 128 MiB.", status_code=413)
+        return profile_operation(
+            lambda: context.executor.validate_profile_session(data),
+            "PROFILE_VALIDATION_FAILED",
+            "Worker tidak dapat memvalidasi sesi TDL.",
+        )
+
+    @app.post("/internal/v1/profiles/login/{operation_id}", dependencies=[Depends(authorize)])
+    def start_profile_login(operation_id: str, body: dict[str, Any]):
+        method = str(body.get("method") or "")
+        phone = str(body.get("phone") or "")
+        return profile_operation(
+            lambda: context.executor.start_profile_login(operation_id, method, phone),
+            "PROFILE_LOGIN_FAILED",
+            "Worker tidak dapat memulai login TDL.",
+        )
+
+    @app.post("/internal/v1/profiles/login/{operation_id}/input", dependencies=[Depends(authorize)])
+    def profile_login_input(operation_id: str, body: dict[str, Any]):
+        return profile_operation(
+            lambda: context.executor.profile_login_input(
+                operation_id, str(body.get("field") or ""), str(body.get("value") or "")
+            ),
+            "PROFILE_LOGIN_INPUT_FAILED",
+            "Worker tidak dapat menerima input login.",
+        )
+
+    @app.get("/internal/v1/profiles/login/{operation_id}", dependencies=[Depends(authorize)])
+    def profile_login_state(operation_id: str):
+        state = dict(profile_operation(
+            lambda: context.executor.profile_login_state(operation_id),
+            "PROFILE_LOGIN_STATUS_FAILED",
+            "Worker tidak dapat membaca status login.",
+        ))
+        # The account identifier is returned separately by the validation
+        # endpoint after the web flow completes, never in the login poll.
+        state.pop("telegram_user_id", None)
+        return state
+
+    @app.get("/internal/v1/profiles/login/{operation_id}/bundle", dependencies=[Depends(authorize)])
+    def profile_login_bundle(operation_id: str):
+        state = profile_operation(
+            lambda: context.executor.profile_login_state(operation_id),
+            "PROFILE_LOGIN_STATUS_FAILED",
+            "Worker tidak dapat membaca status login.",
+        )
+        path = profile_operation(
+            lambda: context.executor.profile_login_bundle_path(operation_id),
+            "PROFILE_LOGIN_BUNDLE_FAILED",
+            "Worker tidak dapat mengambil sesi login.",
+        )
+        if path is None or not path.is_file():
+            raise DomainError("PROFILE_LOGIN_NOT_READY", "Sesi login belum siap.", status_code=409)
+        headers = {}
+        if state.get("telegram_user_id") is not None:
+            headers["X-Telegram-User-ID"] = str(int(state["telegram_user_id"]))
+        data = profile_operation(
+            path.read_bytes,
+            "PROFILE_LOGIN_BUNDLE_FAILED",
+            "Worker tidak dapat mengambil sesi login.",
+        )
+        return Response(data, media_type="application/zip", headers=headers)
+
+    @app.delete("/internal/v1/profiles/login/{operation_id}", dependencies=[Depends(authorize)])
+    def cancel_profile_login(operation_id: str):
+        return {"cancelled": context.executor.cancel_profile_login(operation_id)}
+
+    @app.put("/internal/v1/profiles/{profile}/session", dependencies=[Depends(authorize)])
+    async def install_profile_bundle(
+        profile: str,
+        request: Request,
+        telegram_user_id: int = Header(alias="X-Telegram-User-ID"),
+        provisioning_id: str = Header(default="", alias="X-Provisioning-ID"),
+    ):
+        data = await request.body()
+        if len(data) > MAX_PROFILE_BUNDLE_BYTES:
+            raise DomainError("PROFILE_ARCHIVE_TOO_LARGE", "Bundle profil melebihi batas.", status_code=413)
+        return profile_operation(
+            lambda: context.executor.install_profile_bundle(
+                profile, telegram_user_id, data, provisioning_id
+            ),
+            "PROFILE_INSTALL_FAILED",
+            "Worker tidak dapat memasang sesi profil.",
+        )
+
+    @app.get("/internal/v1/profiles/{profile}/session", dependencies=[Depends(authorize)])
+    def export_profile_bundle(profile: str):
+        try:
+            user_id, data = profile_operation(
+                lambda: context.executor.export_profile_bundle(profile),
+                "PROFILE_EXPORT_FAILED",
+                "Worker tidak dapat mengekspor sesi profil.",
+            )
+        except DomainError as exc:
+            if exc.code == "PROFILE_SESSION_INVALID":
+                raise DomainError("PROFILE_SESSION_UNAVAILABLE", exc.message, status_code=409) from exc
+            raise
+        return Response(
+            data,
+            media_type="application/zip",
+            headers={"X-Telegram-User-ID": str(user_id)},
+        )
+
+    @app.post("/internal/v1/profiles/{profile}/session/commit", dependencies=[Depends(authorize)])
+    def commit_profile_bundle(profile: str, body: dict[str, Any]):
+        return {"committed": context.executor.commit_profile_bundle(profile, str(body.get("operation_id") or ""))}
+
+    @app.delete("/internal/v1/profiles/{profile}/session", dependencies=[Depends(authorize)])
+    def rollback_profile_bundle(profile: str, operation_id: str = Query(..., min_length=1, max_length=64)):
+        return {"rolled_back": context.executor.rollback_profile_bundle(profile, operation_id)}
 
     @app.get("/internal/v1/runtime-settings", dependencies=[Depends(authorize)])
     def runtime_settings():

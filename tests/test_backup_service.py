@@ -36,6 +36,9 @@ class BackupServiceTests(unittest.TestCase):
             config.download_root.mkdir(parents=True)
             config.download_root.joinpath("large.bin").write_bytes(b"media")
             config.state_file.write_text("{}", encoding="utf-8")
+            vault_key = root / "profile-vault" / "vault.key"
+            vault_key.parent.mkdir(parents=True)
+            vault_key.write_bytes(b"encrypted-session-vault-test-key")
             (root / "utility_settings.json").write_text(json.dumps({"compress_password": "secret"}), encoding="utf-8")
             catalog = StorageCatalog(root / "storage.db")
             service = BackupService(config, catalog)
@@ -45,6 +48,10 @@ class BackupServiceTests(unittest.TestCase):
                 service._write_runtime_env(staging)
                 service._write_manifest(staging, "run", "gateway", "now")
             self.assertTrue((staging / "data/storage.db").exists())
+            self.assertEqual(
+                (staging / "data/profile-vault/vault.key").read_bytes(),
+                b"encrypted-session-vault-test-key",
+            )
             self.assertTrue((staging / "data/exports/pending/one.json").exists())
             self.assertFalse((staging / "data/download/large.bin").exists())
             self.assertIn("BOT_TOKEN=bot-secret", (staging / "runtime.env").read_text(encoding="utf-8"))

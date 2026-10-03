@@ -246,14 +246,49 @@ class ProfileManager:
     def runtime(self, profile_name: str) -> ProfileRuntime:
         normalized = normalize_profile_name(profile_name) or self.default_profile
         with self._lock:
-            runtime = self._runtimes.get(normalized)
-            if runtime is not None:
-                return runtime
             profile_config = build_profile_config(self.base_config, normalized)
+            export_storage = self.export_tdl_storage_path(normalized)
+            if Path(profile_config.tdl_export_storage).resolve() != export_storage.resolve():
+                # Older add-profile output could place a default profile under
+                # PROFILES_ROOT. Point the TDL client at that initialized
+                # session instead of creating an empty canonical directory.
+                profile_config = replace(
+                    profile_config,
+                    tdl_export_storage=export_storage,
+                    tdl_export_home=export_storage.parent,
+                )
+            runtime = self._runtimes.get(normalized)
+            if (
+                runtime is not None
+                and Path(runtime.config.tdl_export_storage).resolve()
+                == export_storage.resolve()
+            ):
+                return runtime
             ensure_profile_runtime_dirs(profile_config)
             runtime = build_profile_runtime(normalized, profile_config)
             self._runtimes[normalized] = runtime
             return runtime
+
+    def export_tdl_storage_path(self, profile_name: str) -> Path:
+        """Resolve the session path, including a legacy default-profile location."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        configured = Path(build_profile_config(self.base_config, normalized).tdl_export_storage)
+        if normalized != self.default_profile:
+            return configured
+
+        legacy = (
+            Path(self.base_config.profiles_root)
+            / normalized
+            / "user1"
+            / ".tdl"
+        )
+        if (
+            legacy.resolve() != configured.resolve()
+            and _tdl_session_database_ready(legacy)
+            and not _tdl_session_database_ready(configured)
+        ):
+            return legacy
+        return configured
 
 
 def profile_settings_path(base_config: AppConfig, profile_name: str) -> Path:
@@ -323,6 +358,15 @@ def describe_download_mode(mode: str) -> str:
         if mode == DOWNLOAD_MODE_ISOLATED
         else "download utama/default"
     )
+
+
+def _tdl_session_database_ready(storage_root: Path) -> bool:
+    """Return whether TDL initialized its Bolt database in this session root."""
+    database = Path(storage_root) / "data"
+    try:
+        return database.is_file() and database.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def build_profile_runtime(profile_name: str, config: AppConfig) -> ProfileRuntime:

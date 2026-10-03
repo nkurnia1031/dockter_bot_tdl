@@ -139,6 +139,14 @@ class BackupService:
             "labels.json", "utility_folders.json", "utility_settings.json",
         ):
             self._copy_file(data_root / name, data_target / name)
+        vault_key = data_root / "profile-vault" / "vault.key"
+        if vault_key.is_file():
+            vault_key_target = data_target / "profile-vault" / "vault.key"
+            self._copy_file(vault_key, vault_key_target)
+            try:
+                vault_key_target.chmod(0o600)
+            except OSError:
+                pass
         self._copy_profile_metadata(Path(self.config.profiles_root), data_target / "profiles")
         self._copy_json_tree(Path(self.config.export_pending_dir), data_target / "exports" / "pending")
         self._copy_json_tree(Path(self.config.export_processing_dir), data_target / "exports" / "processing")

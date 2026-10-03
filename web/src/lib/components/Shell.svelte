@@ -7,7 +7,7 @@
   import RequestIndicator from './RequestIndicator.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
-    LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, Users, Volume2, Wrench, Zap
+    LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, Zap
   } from '@lucide/svelte';
 
   let { children } = $props();
@@ -18,6 +18,7 @@
     { href: '/exports/', label: 'Export', icon: FileDown },
     { href: '/quick-mode/', label: 'Quick Mode', icon: Zap },
     { href: '/tts/', label: 'TTS Novel', icon: Volume2 },
+    { href: '/profiles/', label: 'Profil', icon: UserRoundPlus },
     { href: '/downloads/', label: 'Download', icon: Download },
     { href: '/utility/', label: 'Utility', icon: Wrench },
     { href: '/storage/', label: 'Storage', icon: HardDrive },
@@ -132,9 +133,19 @@
         <div class="flex min-w-0 items-center justify-between gap-2 sm:gap-3">
           <div class="topbar-left flex min-w-0 flex-1 items-center gap-2">
             <button class="button secondary menu-trigger size-10 shrink-0 !rounded-xl !p-0 lg:hidden" onclick={() => mobileOpen = true} aria-label="Buka navigasi"><Menu size={19}/></button>
-            <div class="flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2">
-              <Users class="shrink-0 text-violet-500" size={15}/><div class="min-w-0"><p class="muted truncate text-[.65rem] font-bold uppercase tracking-[.12em]">Actor profile</p><b class="block max-w-28 truncate text-sm">{session.current.actor?.profile || '-'}</b></div>
-            </div>
+            <label class="flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-1.5">
+              <Users class="shrink-0 text-violet-500" size={15}/>
+              <span class="sr-only">Profil aktif</span>
+              <select
+                class="max-w-28 cursor-pointer truncate bg-transparent text-sm font-bold outline-none sm:max-w-36"
+                value={session.current.actor?.profile || ''}
+                onchange={(event) => chooseProfile(event.currentTarget.value)}
+                disabled={session.switching || session.current.profiles.length < 2}
+                aria-label="Profil aktif"
+              >
+                {#each session.current.profiles as profile}<option value={profile}>{profile}</option>{/each}
+              </select>
+            </label>
             <div class="hidden min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 md:flex"><Server class="shrink-0 text-sky-500" size={15}/><div><p class="muted text-[.65rem] font-bold uppercase tracking-[.12em]">Target</p><span class="text-xs font-semibold text-[var(--muted)]">Dipilih per fitur</span></div></div>
             <span class="hidden items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-700 md:inline-flex dark:bg-emerald-950 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Backend online</span>
           </div>

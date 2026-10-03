@@ -32,6 +32,7 @@ class ControlPlane:
         utility_settings=None,
         backup_coordinator=None,
         storage_delivery=None,
+        profile_readiness=None,
         label_store=None,
         job_stall_timeout_seconds: int = 600,
         job_cancel_grace_seconds: int = 30,
@@ -46,6 +47,7 @@ class ControlPlane:
         self.utility_settings = utility_settings
         self.backup_coordinator = backup_coordinator
         self.storage_delivery = storage_delivery
+        self.profile_readiness = profile_readiness
         self.label_store = label_store
         self.job_stall_timeout_seconds = max(0, int(job_stall_timeout_seconds))
         self.job_cancel_grace_seconds = max(0, int(job_cancel_grace_seconds))
@@ -97,6 +99,14 @@ class ControlPlane:
                     "Worker sedang dinonaktifkan dan tidak menerima job baru.",
                     status_code=409,
                 )
+        if callable(self.profile_readiness) and not self.profile_readiness(
+            selected_profile, selected_worker
+        ):
+            raise DomainError(
+                "PROFILE_WORKER_PENDING",
+                f"Profil {selected_profile} belum selesai disinkronkan ke worker {selected_worker}.",
+                status_code=409,
+            )
         return selected_profile, selected_worker
 
     def submit_job(
@@ -287,6 +297,8 @@ class ControlPlane:
                 if isinstance(tts_profiles, list) and str(profile) not in {
                     str(item) for item in tts_profiles
                 }:
+                    continue
+                if callable(self.profile_readiness) and not self.profile_readiness(profile, name):
                     continue
             queued_jobs = sum(
                 self.jobs.count(kind="tts", worker=name, status=status, archived=False)

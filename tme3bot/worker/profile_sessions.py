@@ -1,0 +1,523 @@
+from __future__ import annotations
+
+import io
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import stat
+import subprocess
+import tempfile
+import threading
+import time
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+try:
+    import pty
+except ImportError:  # pragma: no cover - TDL workers run on Linux.
+    pty = None  # type: ignore[assignment]
+
+from tme3bot.names import normalize_profile_name
+from tme3bot.profile_provisioning import (
+    MAX_PROFILE_BUNDLE_BYTES,
+    MAX_SESSION_ARCHIVE_BYTES,
+    extract_single_session,
+    validate_profile_bundle,
+)
+from tme3bot.profiles import build_profile_config
+
+
+_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+_LOGIN_TTL_SECONDS = 15 * 60
+_PHONE_RE = re.compile(r"^[+0-9(). -]{4,32}$")
+
+
+@dataclass
+class _LoginProcess:
+    operation_id: str
+    method: str
+    directory: Path
+    pid: int
+    master_fd: int
+    transcript: str = ""
+    status: str = "running"
+    error: str = ""
+    telegram_user_id: int | None = None
+    bundle_path: Path | None = None
+    exit_code: int | None = None
+    created_at: float = field(default_factory=time.monotonic)
+
+
+class ProfileSessionManager:
+    """Narrow TDL login bridge and safe profile session installer for workers."""
+
+    def __init__(self, config: Any) -> None:
+        self.config = config
+        temp_root = getattr(config, "temp_root", None) or tempfile.gettempdir()
+        self.root = Path(temp_root) / "profile-provisioning"
+        self.root.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            self._set_private_tree(self.root)
+        self.login_root = self.root / "logins"
+        self.login_root.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            self._set_private_tree(self.login_root)
+        # Login processes cannot survive a worker restart. Remove only their
+        # abandoned temporary sessions; installation rollback backups live in
+        # a separate directory and must remain available to the backend.
+        for child in self.login_root.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+        self._lock = threading.RLock()
+        self._logins: dict[str, _LoginProcess] = {}
+
+    def start(self, operation_id: str, method: str, phone: str = "") -> dict[str, Any]:
+        if pty is None:
+            raise RuntimeError("Login interaktif TDL memerlukan worker Linux.")
+        method = str(method).strip().lower()
+        if method not in {"qr", "code"}:
+            raise ValueError("Metode login TDL tidak didukung.")
+        phone = str(phone or "").strip()
+        if method == "code" and not _PHONE_RE.fullmatch(phone):
+            raise ValueError("Nomor telepon tidak valid untuk login kode.")
+        operation_id = self._valid_operation_id(operation_id)
+        with self._lock:
+            for old_id, old in list(self._logins.items()):
+                if old.status != "running" and time.monotonic() - old.created_at > _LOGIN_TTL_SECONDS:
+                    self._logins.pop(old_id, None)
+            existing = self._logins.get(operation_id)
+            if existing is not None and existing.status in {"running", "ready"}:
+                return self.state(operation_id)
+            directory = self.login_root / operation_id
+            if directory.exists():
+                shutil.rmtree(directory)
+            storage_root = directory / "session" / ".tdl"
+            storage_root.mkdir(parents=True, exist_ok=True)
+            self._set_private_tree(directory)
+            self._chown_user1(directory)
+            command = [
+                "runuser", "-u", str(self.config.tdl_export_user), "--",
+                "tdl", "--storage", f"type=bolt,path={storage_root / 'data'}",
+                "-n", str(self.config.tdl_export_namespace), "login", "-T", method,
+            ]
+            env = dict(os.environ)
+            env.update({
+                "HOME": str(self.config.tdl_export_home),
+                "TERM": "xterm-256color",
+                "COLUMNS": "160",
+                "LINES": "42",
+                "NO_COLOR": "1",
+            })
+            pid, master = pty.fork()
+            if pid == 0:
+                try:
+                    os.execvpe(command[0], command, env)
+                except BaseException:
+                    os._exit(127)
+            try:
+                import termios
+
+                attrs = termios.tcgetattr(master)
+                attrs[3] &= ~(termios.ECHO | termios.ECHONL)
+                termios.tcsetattr(master, termios.TCSANOW, attrs)
+            except Exception:
+                pass
+            session = _LoginProcess(operation_id, method, directory, pid, master)
+            self._logins[operation_id] = session
+            if method == "code" and phone.strip():
+                # Survey reads a complete line after showing its phone prompt.
+                # The PTY has echo disabled so the private input is never echoed.
+                time.sleep(0.1)
+                os.write(master, phone.strip().encode("utf-8") + b"\n")
+            return self.state(operation_id)
+
+    def input(self, operation_id: str, field_name: str, value: str) -> dict[str, Any]:
+        operation_id = self._valid_operation_id(operation_id)
+        with self._lock:
+            session = self._require(operation_id)
+            if session.status != "running":
+                raise ValueError("Proses login TDL tidak sedang menunggu input.")
+            self._drain(session)
+            step = self._step(session)
+            field_name = str(field_name).strip().lower()
+            expected = {"code": "code", "password": "password"}.get(step)
+            if field_name != expected:
+                raise ValueError("Langkah login sudah berubah; muat ulang status login.")
+            value = str(value)
+            if not value or len(value) > 256 or "\n" in value or "\r" in value:
+                raise ValueError("Input login tidak valid.")
+            os.write(session.master_fd, value.encode("utf-8") + b"\n")
+            return self.state(operation_id)
+
+    def state(self, operation_id: str) -> dict[str, Any]:
+        operation_id = self._valid_operation_id(operation_id)
+        with self._lock:
+            session = self._require(operation_id)
+            self._drain(session)
+            self._finish_if_exited(session)
+            now = time.monotonic()
+            if session.status == "running" and now - session.created_at > _LOGIN_TTL_SECONDS:
+                self._terminate(session)
+                session.status = "expired"
+                session.error = "Sesi login kedaluwarsa. Mulai proses login baru."
+                shutil.rmtree(session.directory, ignore_errors=True)
+            elif session.status == "ready" and now - session.created_at > _LOGIN_TTL_SECONDS:
+                session.status = "expired"
+                session.error = "Sesi login kedaluwarsa. Mulai proses login baru."
+                shutil.rmtree(session.directory, ignore_errors=True)
+            if session.status == "running":
+                step = self._step(session)
+                result: dict[str, Any] = {"status": "waiting_input", "step": step}
+                if step == "qr":
+                    result["qr_text"] = self._qr_text(session.transcript)
+                return result
+            result = {"status": session.status, "step": "", "error": session.error}
+            if session.status == "ready" and session.telegram_user_id is not None:
+                result["telegram_user_id"] = session.telegram_user_id
+            return result
+
+    def bundle_path(self, operation_id: str) -> Path | None:
+        state = self.state(operation_id)
+        if state.get("status") != "ready":
+            return None
+        with self._lock:
+            return self._require(operation_id).bundle_path
+
+    def cancel(self, operation_id: str) -> bool:
+        operation_id = self._valid_operation_id(operation_id)
+        with self._lock:
+            session = self._logins.pop(operation_id, None)
+            if session is None:
+                return False
+            if session.status == "running":
+                self._terminate(session)
+            else:
+                try:
+                    os.close(session.master_fd)
+                except OSError:
+                    pass
+            shutil.rmtree(session.directory, ignore_errors=True)
+            return True
+
+    def validate_upload(self, archive_data: bytes) -> int:
+        files = extract_single_session(archive_data)
+        with tempfile.TemporaryDirectory(prefix="tdl-profile-validate-", dir=self.root) as temporary:
+            directory = Path(temporary)
+            session_root = directory / ".tdl"
+            self._write_files(session_root, files)
+            self._chown_user1(directory)
+            return self._whoami(session_root)
+
+    def install_bundle(self, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str) -> dict[str, Any]:
+        normalized = normalize_profile_name(profile)
+        if not normalized or normalized == normalize_profile_name(self.config.default_profile):
+            raise ValueError("Nama profil tidak valid atau merupakan profil default.")
+        if len(bundle) > MAX_PROFILE_BUNDLE_BYTES:
+            raise ValueError("Bundle profil melebihi batas.")
+        entries = validate_profile_bundle(bundle)
+        profile_config = build_profile_config(self.config, normalized)
+        profile_root = Path(profile_config.profile_root)
+        if profile_root.resolve() == Path(self.config.state_file).parent.resolve():
+            raise ValueError("Profil default tidak dapat diganti melalui provisioning.")
+        expected_identity = int(telegram_user_id)
+        with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+            try:
+                identity = json.loads(archive.read("identity.json").decode("utf-8"))
+                stored_id = int(identity.get("telegram_user_id", identity.get("tdl_user_id")))
+            except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Identity bundle profil tidak valid.") from exc
+            if stored_id != expected_identity:
+                raise ValueError("Identity bundle tidak cocok dengan profil.")
+
+        operation_id = self._valid_operation_id(operation_id or "sync-" + normalized)
+        stage_root = profile_root.parent / f".{normalized}.provision-{operation_id}"
+        backup_root = self.root / "backups" / operation_id / normalized
+        marker = profile_root / ".profile-provisioning.json"
+        if marker.exists():
+            try:
+                previous = json.loads(marker.read_text(encoding="utf-8"))
+                if previous.get("operation_id") != operation_id:
+                    raise RuntimeError("Profil sedang menerima provisioning lain.")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Marker provisioning profil rusak.") from exc
+        else:
+            backup_root.mkdir(parents=True, exist_ok=True)
+            for relative in ("root/.tdl", "user1/.tdl"):
+                current = profile_root / relative
+                if current.exists():
+                    saved = backup_root / relative
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(current, saved)
+            if (profile_root / "identity.json").exists():
+                backup_root.mkdir(parents=True, exist_ok=True)
+                os.replace(profile_root / "identity.json", backup_root / "identity.json")
+            profile_root.mkdir(parents=True, exist_ok=True)
+            marker.write_text(json.dumps({"operation_id": operation_id, "new_profile": not backup_root.joinpath("identity.json").exists()}), encoding="utf-8")
+        shutil.rmtree(stage_root, ignore_errors=True)
+        stage_root.mkdir(parents=True, exist_ok=True)
+        if os.name == "posix":
+            stage_root.chmod(0o700)
+        try:
+            with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
+                for info, parts in entries:
+                    path = "/".join(parts)
+                    if info.is_dir() or path in {"identity.json", "root", "user1", "root/.tdl", "user1/.tdl"}:
+                        continue
+                    target = stage_root.joinpath(*parts)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(archive.read(info))
+            self._set_private_tree(stage_root)
+            for relative in ("root/.tdl", "user1/.tdl"):
+                source = stage_root / relative
+                database_files = list((source / "data").glob("*")) if source.exists() else []
+                if not any(item.is_file() and item.stat().st_size for item in database_files):
+                    raise ValueError(f"Bundle tidak memiliki database {relative} yang siap.")
+                destination = profile_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.rmtree(destination, ignore_errors=True)
+                os.replace(source, destination)
+            identity_path = profile_root / "identity.json"
+            identity_path.write_text(json.dumps({"telegram_user_id": expected_identity, "tdl_user_id": expected_identity}), encoding="utf-8")
+            self._set_private_tree(profile_root / "root" / ".tdl")
+            self._set_private_tree(profile_root / "user1" / ".tdl")
+            try:
+                identity_path.chmod(0o600)
+            except OSError:
+                pass
+            self._chown_user1(profile_root / "user1")
+            return {"profile": normalized, "ready": True}
+        except Exception:
+            shutil.rmtree(stage_root, ignore_errors=True)
+            self.rollback_bundle(normalized, operation_id)
+            raise
+        finally:
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+    def commit_bundle(self, profile: str, operation_id: str) -> bool:
+        profile_root = Path(build_profile_config(self.config, profile).profile_root)
+        marker = profile_root / ".profile-provisioning.json"
+        try:
+            state = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if state.get("operation_id") != operation_id:
+            return False
+        backup = self.root / "backups" / operation_id / normalize_profile_name(profile)
+        shutil.rmtree(backup.parent, ignore_errors=True)
+        marker.unlink(missing_ok=True)
+        return True
+
+    def rollback_bundle(self, profile: str, operation_id: str) -> bool:
+        profile_root = Path(build_profile_config(self.config, profile).profile_root)
+        marker = profile_root / ".profile-provisioning.json"
+        try:
+            state = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if state.get("operation_id") != operation_id:
+            return False
+        backup = self.root / "backups" / operation_id / normalize_profile_name(profile)
+        for relative in ("root/.tdl", "user1/.tdl"):
+            current = profile_root / relative
+            shutil.rmtree(current, ignore_errors=True)
+            saved = backup / relative
+            if saved.exists():
+                current.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(saved, current)
+        identity = profile_root / "identity.json"
+        identity.unlink(missing_ok=True)
+        saved_identity = backup / "identity.json"
+        if saved_identity.exists():
+            os.replace(saved_identity, identity)
+        marker.unlink(missing_ok=True)
+        shutil.rmtree(backup.parent, ignore_errors=True)
+        try:
+            profile_root.rmdir()
+        except OSError:
+            pass
+        return True
+
+    def export_bundle(self, profile: str) -> tuple[int, bytes]:
+        normalized = normalize_profile_name(profile)
+        config = build_profile_config(self.config, normalized)
+        root = Path(config.profile_root)
+        try:
+            identity = json.loads((root / "identity.json").read_text(encoding="utf-8"))
+            user_id = int(identity.get("telegram_user_id", identity.get("tdl_user_id")))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ValueError("Identity profil belum tersedia pada worker.") from exc
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for relative in ("root/.tdl", "user1/.tdl"):
+                source = root / relative
+                if not source.is_dir():
+                    raise ValueError(f"Sesi {relative} belum tersedia pada worker.")
+                for path in source.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, path.relative_to(root).as_posix())
+            archive.writestr("identity.json", json.dumps({"telegram_user_id": user_id, "tdl_user_id": user_id}))
+        data = output.getvalue()
+        validate_profile_bundle(data)
+        return user_id, data
+
+    def remove_bundle(self, profile: str, operation_id: str) -> bool:
+        return self.rollback_bundle(profile, operation_id)
+
+    def _whoami(self, storage_root: Path) -> int:
+        identity_file = storage_root.parent / "identity.json"
+        helper = str(getattr(self.config, "leave_helper_binary", "/usr/local/bin/tdl-leave"))
+        command = [
+            "runuser", "-u", str(self.config.tdl_export_user), "--", helper,
+            "--storage", str(storage_root / "data"),
+            "--namespace", str(self.config.tdl_export_namespace),
+            "--whoami", "--identity-file", str(identity_file),
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(self.config.tdl_export_home),
+                env={**os.environ, "HOME": str(self.config.tdl_export_home)},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=60,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise ValueError("Sesi TDL tidak terautentikasi.")
+            payload = json.loads(identity_file.read_text(encoding="utf-8"))
+            return int(payload.get("telegram_user_id", payload.get("tdl_user_id")))
+        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Sesi TDL tidak valid atau belum login.") from exc
+
+    def _finish_if_exited(self, session: _LoginProcess) -> None:
+        try:
+            pid, status = os.waitpid(session.pid, os.WNOHANG)
+        except ChildProcessError:
+            pid, status = session.pid, 0
+        if pid == 0:
+            return
+        session.exit_code = os.waitstatus_to_exitcode(status)
+        try:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+        if session.exit_code != 0:
+            session.status = "failed"
+            session.error = "TDL login gagal. Mulai ulang login atau periksa sesi worker."
+            shutil.rmtree(session.directory, ignore_errors=True)
+            return
+        try:
+            session_root = session.directory / "session" / ".tdl"
+            session.telegram_user_id = self._whoami(session_root)
+            output = session.directory / "session.zip"
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                for path in session_root.rglob("*"):
+                    if path.is_file():
+                        archive.write(path, ".tdl/" + path.relative_to(session_root).as_posix())
+            if os.name == "posix":
+                os.chmod(output, 0o600)
+            session.bundle_path = output
+            session.status = "ready"
+        except Exception:
+            session.status = "failed"
+            session.error = "Login selesai, tetapi identitas sesi TDL tidak dapat dibaca."
+            shutil.rmtree(session.directory, ignore_errors=True)
+
+    def _step(self, session: _LoginProcess) -> str:
+        text = _ANSI_RE.sub("", session.transcript)
+        lower = text.lower()
+        if "enter 2fa password" in lower or "password:" in lower and "2fa" in lower:
+            return "password"
+        if "enter code" in lower or "code:" in lower:
+            return "code"
+        if session.method == "qr":
+            return "qr"
+        return "waiting"
+
+    def _qr_text(self, transcript: str) -> str:
+        text = _ANSI_RE.sub("", transcript).replace("\r", "\n")
+        lines = [line for line in text.splitlines() if any(char in line for char in "█▀▄▌▐")]
+        return "\n".join(lines[-34:])[-5000:]
+
+    def _drain(self, session: _LoginProcess) -> None:
+        while True:
+            try:
+                ready, _, _ = select.select([session.master_fd], [], [], 0)
+                if not ready:
+                    return
+                raw = os.read(session.master_fd, 65536)
+                if not raw:
+                    return
+                session.transcript = (session.transcript + raw.decode("utf-8", errors="replace"))[-24000:]
+            except OSError:
+                return
+
+    def _terminate(self, session: _LoginProcess) -> None:
+        try:
+            os.killpg(session.pid, signal.SIGTERM)
+            time.sleep(0.05)
+            os.killpg(session.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                os.kill(session.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.waitpid(session.pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+        try:
+            os.close(session.master_fd)
+        except OSError:
+            pass
+
+    def _require(self, operation_id: str) -> _LoginProcess:
+        session = self._logins.get(operation_id)
+        if session is None:
+            raise KeyError(operation_id)
+        return session
+
+    @staticmethod
+    def _valid_operation_id(value: str) -> str:
+        value = str(value)
+        if len(value) > 64 or not re.fullmatch(r"[a-zA-Z0-9_-]+", value):
+            raise ValueError("ID provisioning tidak valid.")
+        return value
+
+    @staticmethod
+    def _write_files(root: Path, files: dict[str, bytes]) -> None:
+        for relative, data in files.items():
+            path = PurePosixPath(relative)
+            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError("ZIP sesi berisi path yang tidak aman.")
+            destination = root.joinpath(*path.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(data)
+
+    @staticmethod
+    def _chown_user1(path: Path) -> None:
+        if os.name != "posix" or os.geteuid() != 0:
+            return
+        try:
+            import pwd
+
+            account = pwd.getpwnam("user1")
+            for item in [path, *path.rglob("*")]:
+                os.chown(item, account.pw_uid, account.pw_gid)
+        except (KeyError, OSError):
+            pass
+
+    @staticmethod
+    def _set_private_tree(path: Path) -> None:
+        if os.name != "posix" or not path.exists():
+            return
+        try:
+            for item in [path, *path.rglob("*")]:
+                item.chmod(0o700 if item.is_dir() else 0o600)
+        except OSError:
+            pass

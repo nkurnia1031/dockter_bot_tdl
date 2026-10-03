@@ -47,6 +47,7 @@ from tme3bot.worker.quick_export import (
     write_quick_manifest,
 )
 from tme3bot.worker.runtime_settings import WorkerRuntimeSettings
+from tme3bot.worker.profile_sessions import ProfileSessionManager
 
 LOGGER = logging.getLogger(__name__)
 from .executor_support import (
@@ -118,6 +119,7 @@ class WorkerJobExecutor(
         self.config = config
         self.profile_manager = profile_manager
         self.publisher = publisher
+        self._profile_sessions = ProfileSessionManager(config)
         self.runtime_settings = WorkerRuntimeSettings(
             config.state_file.parent / "worker_settings.json",
             default_storage_profile=getattr(config, "worker_storage_profile", "storage"),
@@ -211,6 +213,38 @@ class WorkerJobExecutor(
             # The worker can still expose its API while the backend restarts;
             # the next worker restart will retry registration.
             LOGGER.warning("Could not sync worker profile metadata to backend: %s", exc)
+
+    def validate_profile_session(self, archive_data: bytes) -> dict[str, int]:
+        return {"telegram_user_id": self._profile_sessions.validate_upload(archive_data)}
+
+    def start_profile_login(self, operation_id: str, method: str, phone: str = "") -> dict[str, Any]:
+        return self._profile_sessions.start(operation_id, method, phone)
+
+    def profile_login_input(self, operation_id: str, field_name: str, value: str) -> dict[str, Any]:
+        return self._profile_sessions.input(operation_id, field_name, value)
+
+    def profile_login_state(self, operation_id: str) -> dict[str, Any]:
+        return self._profile_sessions.state(operation_id)
+
+    def profile_login_bundle_path(self, operation_id: str) -> Path | None:
+        return self._profile_sessions.bundle_path(operation_id)
+
+    def cancel_profile_login(self, operation_id: str) -> bool:
+        return self._profile_sessions.cancel(operation_id)
+
+    def install_profile_bundle(
+        self, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str
+    ) -> dict[str, Any]:
+        return self._profile_sessions.install_bundle(profile, telegram_user_id, bundle, operation_id)
+
+    def commit_profile_bundle(self, profile: str, operation_id: str) -> bool:
+        return self._profile_sessions.commit_bundle(profile, operation_id)
+
+    def rollback_profile_bundle(self, profile: str, operation_id: str) -> bool:
+        return self._profile_sessions.rollback_bundle(profile, operation_id)
+
+    def export_profile_bundle(self, profile: str) -> tuple[int, bytes]:
+        return self._profile_sessions.export_bundle(profile)
 
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])
@@ -587,8 +621,17 @@ class WorkerJobExecutor(
         available: list[str] = []
         for profile in self.profile_manager.list_profiles():
             try:
-                runtime_config = build_profile_config(self.profile_manager.base_config, str(profile))
-                if Path(runtime_config.tdl_export_storage).is_dir():
+                resolve_storage = getattr(
+                    self.profile_manager, "export_tdl_storage_path", None
+                )
+                if callable(resolve_storage):
+                    storage_path = resolve_storage(str(profile))
+                else:
+                    runtime_config = build_profile_config(
+                        self.profile_manager.base_config, str(profile)
+                    )
+                    storage_path = runtime_config.tdl_export_storage
+                if Path(storage_path).is_dir():
                     available.append(str(profile))
             except Exception:
                 continue

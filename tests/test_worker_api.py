@@ -17,6 +17,8 @@ class FakeExecutor:
         self.runtime_updates = []
         self.worker_api_token = "worker-secret"
         self.previous_worker_api_token = ""
+        self.profile_inputs = []
+        self.profile_installs = []
         self.worker_settings_values = {
             "storage_profile": "default",
             "storage_profile_available": True,
@@ -100,6 +102,38 @@ class FakeExecutor:
             "line_count": 2,
             "truncated": False,
         }
+
+    def validate_profile_session(self, archive_data):
+        return {"telegram_user_id": 123}
+
+    def start_profile_login(self, operation_id, method, phone=""):
+        return {"status": "waiting_input", "step": "qr", "qr_text": "QR"}
+
+    def profile_login_input(self, operation_id, field_name, value):
+        self.profile_inputs.append((operation_id, field_name, value))
+        return {"status": "waiting_input", "step": "password"}
+
+    def profile_login_state(self, operation_id):
+        return {"status": "ready", "telegram_user_id": 123}
+
+    def profile_login_bundle_path(self, operation_id):
+        return self.artifact_file
+
+    def cancel_profile_login(self, operation_id):
+        return True
+
+    def install_profile_bundle(self, profile, telegram_user_id, bundle, operation_id):
+        self.profile_installs.append((profile, telegram_user_id, bundle, operation_id))
+        return {"profile": profile, "ready": True}
+
+    def export_profile_bundle(self, profile):
+        return 123, b"profile-bundle"
+
+    def commit_profile_bundle(self, profile, operation_id):
+        return True
+
+    def rollback_profile_bundle(self, profile, operation_id):
+        return True
 
 
 class WorkerApiTests(unittest.TestCase):
@@ -332,6 +366,37 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["error"]["code"], "JOB_LOG_NOT_ACTIVE")
+
+    def test_profile_login_and_bundle_routes_are_internal_and_typed(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        denied = self.client.post("/internal/v1/profiles/login/op-1", json={"method": "qr"})
+        self.assertEqual(denied.status_code, 401)
+
+        started = self.client.post(
+            "/internal/v1/profiles/login/op-1",
+            headers=headers,
+            json={"method": "qr", "phone": ""},
+        )
+        self.assertEqual(started.json()["step"], "qr")
+        state = self.client.get("/internal/v1/profiles/login/op-1", headers=headers)
+        self.assertEqual(state.json()["status"], "ready")
+        self.assertNotIn("telegram_user_id", state.json())
+
+        supplied = self.client.post(
+            "/internal/v1/profiles/login/op-1/input",
+            headers=headers,
+            json={"field": "password", "value": "private-password"},
+        )
+        self.assertEqual(supplied.json()["step"], "password")
+        self.assertEqual(self.executor.profile_inputs[-1][2], "private-password")
+
+        installed = self.client.put(
+            "/internal/v1/profiles/novel/session",
+            headers={**headers, "X-Telegram-User-ID": "123", "X-Provisioning-ID": "op-1"},
+            content=b"profile-bundle",
+        )
+        self.assertEqual(installed.status_code, 200)
+        self.assertEqual(self.executor.profile_installs[-1][0:2], ("novel", 123))
 
 
 if __name__ == "__main__":

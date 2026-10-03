@@ -173,6 +173,41 @@ class FakeTelegramBot:
         return type("CopiedMessage", (), {"message_id": 777})()
 
 
+class FakeProfileProvisioner:
+    def __init__(self):
+        self.uploaded = None
+        self.login = None
+
+    def profiles(self):
+        return [{"name": "default", "active": True, "status": "legacy", "vault": False, "workers": []}]
+
+    def upload(self, name, worker, data, actor_user_id):
+        self.uploaded = (name, worker, data, actor_user_id)
+        return "operation-upload"
+
+    def start_login(self, name, worker, method, phone, actor_user_id):
+        self.login = (name, worker, method, phone, actor_user_id)
+        return "operation-login"
+
+    def operation(self, operation_id, actor_user_id):
+        if operation_id != "operation-login" or actor_user_id != 42:
+            raise KeyError(operation_id)
+        return {"id": operation_id, "profile": "novel", "status": "authenticating", "login": {"step": "qr", "qr_text": "qr-payload"}, "workers": []}
+
+    def login_input(self, operation_id, actor_user_id, field, value):
+        self.login_input_call = (operation_id, actor_user_id, field, value)
+        return {"status": "waiting_input", "step": "password"}
+
+    def retry(self, operation_id, actor_user_id):
+        return None
+
+    def cancel(self, operation_id, actor_user_id):
+        return {"cancelled": True}
+
+    def adopt(self, profile, worker, actor_user_id):
+        return "operation-adopt"
+
+
 class BackendApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -295,6 +330,43 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["profiles"], ["remote-1"])
         self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
+
+    def test_web_profile_upload_and_stepwise_login_keep_private_input_out_of_response(self):
+        headers = self.login()
+        provisioner = FakeProfileProvisioner()
+        self.context.profile_provisioner = provisioner
+
+        denied = self.client.post(
+            "/api/v1/profiles/provisionings/upload?name=novel&worker=local",
+            content=b"zip",
+            headers={"content-type": "application/zip"},
+        )
+        self.assertEqual(denied.status_code, 401)
+
+        uploaded = self.client.post(
+            "/api/v1/profiles/provisionings/upload?name=novel&worker=local",
+            content=b"session-zip",
+            headers={**headers, "content-type": "application/zip"},
+        )
+        self.assertEqual(uploaded.status_code, 200)
+        self.assertEqual(uploaded.json(), {"id": "operation-upload", "status": "distributing"})
+        self.assertEqual(provisioner.uploaded[:3], ("novel", "local", b"session-zip"))
+
+        secret_phone = "+62 812 0000 9999"
+        started = self.client.post(
+            "/api/v1/profiles/provisionings/login",
+            headers=headers,
+            json={"name": "novel", "worker": "local", "method": "code", "phone": secret_phone},
+        )
+        self.assertEqual(started.status_code, 200)
+        self.assertNotIn(secret_phone, started.text)
+        self.assertEqual(provisioner.login[3], secret_phone)
+
+        state = self.client.get(
+            "/api/v1/profiles/provisionings/operation-login", headers=headers
+        )
+        self.assertEqual(state.json()["login"]["step"], "qr")
+        self.assertNotIn("actor_user_id", state.text)
 
     def test_worker_can_be_enabled_or_disabled_from_web_api(self):
         headers = self.login()

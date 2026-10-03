@@ -3910,7 +3910,7 @@
       "file_type": "code",
       "norm_label": ".bundle_path()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L184"
+      "source_location": "L183"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_cancel",
@@ -3922,7 +3922,7 @@
       "file_type": "code",
       "norm_label": ".cancel()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L191"
+      "source_location": "L190"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_chown_user1",
@@ -3934,7 +3934,7 @@
       "file_type": "code",
       "norm_label": "._chown_user1()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L503"
+      "source_location": "L502"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_drain",
@@ -3946,7 +3946,7 @@
       "file_type": "code",
       "norm_label": "._drain()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L447"
+      "source_location": "L446"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_finish_if_exited",
@@ -3958,7 +3958,7 @@
       "file_type": "code",
       "norm_label": "._finish_if_exited()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L397"
+      "source_location": "L396"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_init",
@@ -3982,7 +3982,7 @@
       "file_type": "code",
       "norm_label": ".input()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L139"
+      "source_location": "L138"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_install_bundle",
@@ -3994,7 +3994,7 @@
       "file_type": "code",
       "norm_label": ".install_bundle()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L216"
+      "source_location": "L215"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_qr_text",
@@ -4006,7 +4006,7 @@
       "file_type": "code",
       "norm_label": "._qr_text()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L442"
+      "source_location": "L441"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_remove_bundle",
@@ -4018,7 +4018,7 @@
       "file_type": "code",
       "norm_label": ".remove_bundle()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L368"
+      "source_location": "L367"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_require",
@@ -4030,7 +4030,7 @@
       "file_type": "code",
       "norm_label": "._require()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L479"
+      "source_location": "L478"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_rollback_bundle",
@@ -4042,7 +4042,7 @@
       "file_type": "code",
       "norm_label": ".rollback_bundle()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L315"
+      "source_location": "L314"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_set_private_tree",
@@ -4054,7 +4054,7 @@
       "file_type": "code",
       "norm_label": "._set_private_tree()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L516"
+      "source_location": "L515"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_start",
@@ -4066,7 +4066,7 @@
       "file_type": "code",
       "norm_label": ".start()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L79"
+      "source_location": "L78"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_state",
@@ -4078,7 +4078,7 @@
       "file_type": "code",
       "norm_label": ".state()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L157"
+      "source_location": "L156"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_step",
@@ -4090,7 +4090,7 @@
       "file_type": "code",
       "norm_label": "._step()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L431"
+      "source_location": "L430"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_terminate",
@@ -4102,7 +4102,7 @@
       "file_type": "code",
       "norm_label": "._terminate()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L460"
+      "source_location": "L459"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_valid_operation_id",
@@ -4114,7 +4114,7 @@
       "file_type": "code",
       "norm_label": "._valid_operation_id()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L486"
+      "source_location": "L485"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_validate_upload",
@@ -4126,7 +4126,7 @@
       "file_type": "code",
       "norm_label": ".validate_upload()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L207"
+      "source_location": "L206"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_whoami",
@@ -4138,7 +4138,7 @@
       "file_type": "code",
       "norm_label": "._whoami()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L371"
+      "source_location": "L370"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_write_files",
@@ -4150,7 +4150,7 @@
       "file_type": "code",
       "norm_label": "._write_files()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L493"
+      "source_location": "L492"
     },
     {
       "id": "tme3bot_profile_registry_profileregistry_bootstrap_from_identities",
@@ -10570,7 +10570,7 @@
       "file_type": "code",
       "norm_label": ".commit_bundle()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L301"
+      "source_location": "L300"
     },
     {
       "id": "tme3bot_worker_profile_sessions_profilesessionmanager_export_bundle",
@@ -10582,7 +10582,7 @@
       "file_type": "code",
       "norm_label": ".export_bundle()",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L345"
+      "source_location": "L344"
     },
     {
       "id": "tests_test_quick_export_quickpipelinetests_test_pipeline_passes_compress_settings_uploads_both_files_and_cleans_stage_run",
@@ -66618,7 +66618,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L185",
+      "source_location": "L184",
       "weight": 1.0
     },
     {
@@ -66630,7 +66630,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L189",
+      "source_location": "L188",
       "weight": 1.0
     },
     {
@@ -66642,7 +66642,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L192",
+      "source_location": "L191",
       "weight": 1.0
     },
     {
@@ -66654,7 +66654,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L198",
+      "source_location": "L197",
       "weight": 1.0
     },
     {
@@ -66666,7 +66666,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L302",
+      "source_location": "L301",
       "weight": 1.0
     },
     {
@@ -66678,7 +66678,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L302",
+      "source_location": "L301",
       "weight": 1.0
     },
     {
@@ -66690,12 +66690,24 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L310",
+      "source_location": "L309",
       "weight": 1.0
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_export_bundle",
       "target": "tme3bot_names_normalize_profile_name",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "tme3bot/worker/profile_sessions.py",
+      "source_location": "L345",
+      "weight": 1.0
+    },
+    {
+      "source": "tme3bot_worker_profile_sessions_profilesessionmanager_export_bundle",
+      "target": "tme3bot_profiles_build_profile_config",
       "relation": "calls",
       "_origin": "ast",
       "confidence": "EXTRACTED",
@@ -66707,7 +66719,7 @@
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_export_bundle",
-      "target": "tme3bot_profiles_build_profile_config",
+      "target": "tme3bot_worker_profile_sessions_py_path",
       "relation": "calls",
       "_origin": "ast",
       "confidence": "EXTRACTED",
@@ -66719,18 +66731,6 @@
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_export_bundle",
-      "target": "tme3bot_worker_profile_sessions_py_path",
-      "relation": "calls",
-      "_origin": "ast",
-      "confidence": "EXTRACTED",
-      "confidence_score": 1.0,
-      "context": "call",
-      "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L348",
-      "weight": 1.0
-    },
-    {
-      "source": "tme3bot_worker_profile_sessions_profilesessionmanager_export_bundle",
       "target": "tme3bot_profile_provisioning_validate_profile_bundle",
       "relation": "calls",
       "_origin": "ast",
@@ -66738,7 +66738,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L365",
+      "source_location": "L364",
       "weight": 1.0
     },
     {
@@ -66750,7 +66750,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L416",
+      "source_location": "L415",
       "weight": 1.0
     },
     {
@@ -66762,7 +66762,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L62",
+      "source_location": "L61",
       "weight": 1.0
     },
     {
@@ -66774,7 +66774,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L65",
+      "source_location": "L64",
       "weight": 1.0
     },
     {
@@ -66786,7 +66786,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L140",
+      "source_location": "L139",
       "weight": 1.0
     },
     {
@@ -66798,12 +66798,24 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L142",
+      "source_location": "L141",
       "weight": 1.0
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_input",
       "target": "tme3bot_worker_profile_sessions_profilesessionmanager_drain",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "tme3bot/worker/profile_sessions.py",
+      "source_location": "L144",
+      "weight": 1.0
+    },
+    {
+      "source": "tme3bot_worker_profile_sessions_profilesessionmanager_input",
+      "target": "tme3bot_worker_profile_sessions_profilesessionmanager_step",
       "relation": "calls",
       "_origin": "ast",
       "confidence": "EXTRACTED",
@@ -66815,18 +66827,6 @@
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_input",
-      "target": "tme3bot_worker_profile_sessions_profilesessionmanager_step",
-      "relation": "calls",
-      "_origin": "ast",
-      "confidence": "EXTRACTED",
-      "confidence_score": 1.0,
-      "context": "call",
-      "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L146",
-      "weight": 1.0
-    },
-    {
-      "source": "tme3bot_worker_profile_sessions_profilesessionmanager_input",
       "target": "tme3bot_worker_profile_sessions_profilesessionmanager_state",
       "relation": "calls",
       "_origin": "ast",
@@ -66834,7 +66834,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L155",
+      "source_location": "L154",
       "weight": 1.0
     },
     {
@@ -66846,7 +66846,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L217",
+      "source_location": "L216",
       "weight": 1.0
     },
     {
@@ -66858,12 +66858,24 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L222",
+      "source_location": "L221",
       "weight": 1.0
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_install_bundle",
       "target": "tme3bot_profiles_build_profile_config",
+      "relation": "calls",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "context": "call",
+      "source_file": "tme3bot/worker/profile_sessions.py",
+      "source_location": "L222",
+      "weight": 1.0
+    },
+    {
+      "source": "tme3bot_worker_profile_sessions_profilesessionmanager_install_bundle",
+      "target": "tme3bot_worker_profile_sessions_py_path",
       "relation": "calls",
       "_origin": "ast",
       "confidence": "EXTRACTED",
@@ -66875,18 +66887,6 @@
     },
     {
       "source": "tme3bot_worker_profile_sessions_profilesessionmanager_install_bundle",
-      "target": "tme3bot_worker_profile_sessions_py_path",
-      "relation": "calls",
-      "_origin": "ast",
-      "confidence": "EXTRACTED",
-      "confidence_score": 1.0,
-      "context": "call",
-      "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L224",
-      "weight": 1.0
-    },
-    {
-      "source": "tme3bot_worker_profile_sessions_profilesessionmanager_install_bundle",
       "target": "tme3bot_worker_profile_sessions_profilesessionmanager_valid_operation_id",
       "relation": "calls",
       "_origin": "ast",
@@ -66894,7 +66894,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L237",
+      "source_location": "L236",
       "weight": 1.0
     },
     {
@@ -66906,7 +66906,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L274",
+      "source_location": "L273",
       "weight": 1.0
     },
     {
@@ -66918,7 +66918,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L292",
+      "source_location": "L291",
       "weight": 1.0
     },
     {
@@ -66930,7 +66930,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L296",
+      "source_location": "L295",
       "weight": 1.0
     },
     {
@@ -66942,7 +66942,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L369",
+      "source_location": "L368",
       "weight": 1.0
     },
     {
@@ -66954,7 +66954,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L316",
+      "source_location": "L315",
       "weight": 1.0
     },
     {
@@ -66966,7 +66966,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L316",
+      "source_location": "L315",
       "weight": 1.0
     },
     {
@@ -66978,7 +66978,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L324",
+      "source_location": "L323",
       "weight": 1.0
     },
     {
@@ -66990,7 +66990,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L101",
+      "source_location": "L100",
       "weight": 1.0
     },
     {
@@ -67002,7 +67002,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L102",
+      "source_location": "L101",
       "weight": 1.0
     },
     {
@@ -67014,7 +67014,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L130",
+      "source_location": "L129",
       "weight": 1.0
     },
     {
@@ -67026,7 +67026,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L88",
+      "source_location": "L87",
       "weight": 1.0
     },
     {
@@ -67038,7 +67038,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L95",
+      "source_location": "L94",
       "weight": 1.0
     },
     {
@@ -67050,7 +67050,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L158",
+      "source_location": "L157",
       "weight": 1.0
     },
     {
@@ -67062,7 +67062,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L160",
+      "source_location": "L159",
       "weight": 1.0
     },
     {
@@ -67074,7 +67074,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L161",
+      "source_location": "L160",
       "weight": 1.0
     },
     {
@@ -67086,7 +67086,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L162",
+      "source_location": "L161",
       "weight": 1.0
     },
     {
@@ -67098,7 +67098,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L165",
+      "source_location": "L164",
       "weight": 1.0
     },
     {
@@ -67110,7 +67110,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L174",
+      "source_location": "L173",
       "weight": 1.0
     },
     {
@@ -67122,7 +67122,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L177",
+      "source_location": "L176",
       "weight": 1.0
     },
     {
@@ -67134,7 +67134,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L208",
+      "source_location": "L207",
       "weight": 1.0
     },
     {
@@ -67146,7 +67146,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L210",
+      "source_location": "L209",
       "weight": 1.0
     },
     {
@@ -67158,7 +67158,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L212",
+      "source_location": "L211",
       "weight": 1.0
     },
     {
@@ -67170,7 +67170,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L213",
+      "source_location": "L212",
       "weight": 1.0
     },
     {
@@ -67182,7 +67182,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L214",
+      "source_location": "L213",
       "weight": 1.0
     },
     {
@@ -73842,7 +73842,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L139",
+      "source_location": "L138",
       "weight": 1.0
     },
     {
@@ -73854,7 +73854,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L216",
+      "source_location": "L215",
       "weight": 1.0
     },
     {
@@ -73866,7 +73866,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L79",
+      "source_location": "L78",
       "weight": 1.0
     },
     {
@@ -73878,7 +73878,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L157",
+      "source_location": "L156",
       "weight": 1.0
     },
     {
@@ -89190,7 +89190,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L503",
+      "source_location": "L502",
       "weight": 1.0
     },
     {
@@ -89202,7 +89202,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L447",
+      "source_location": "L446",
       "weight": 1.0
     },
     {
@@ -89214,7 +89214,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L397",
+      "source_location": "L396",
       "weight": 1.0
     },
     {
@@ -89238,7 +89238,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L516",
+      "source_location": "L515",
       "weight": 1.0
     },
     {
@@ -89250,7 +89250,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L431",
+      "source_location": "L430",
       "weight": 1.0
     },
     {
@@ -89262,7 +89262,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L460",
+      "source_location": "L459",
       "weight": 1.0
     },
     {
@@ -89274,7 +89274,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L371",
+      "source_location": "L370",
       "weight": 1.0
     },
     {
@@ -89286,7 +89286,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L493",
+      "source_location": "L492",
       "weight": 1.0
     },
     {
@@ -90546,7 +90546,7 @@
       "confidence_score": 1.0,
       "context": "return_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L184",
+      "source_location": "L183",
       "weight": 1.0
     },
     {
@@ -90558,7 +90558,7 @@
       "confidence_score": 1.0,
       "context": "return_type",
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L479",
+      "source_location": "L478",
       "weight": 1.0
     },
     {
@@ -119037,7 +119037,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L139",
+      "source_location": "L138",
       "weight": 1.0
     },
     {
@@ -119048,7 +119048,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L157",
+      "source_location": "L156",
       "weight": 1.0
     },
     {
@@ -119059,7 +119059,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L184",
+      "source_location": "L183",
       "weight": 1.0
     },
     {
@@ -119070,7 +119070,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L191",
+      "source_location": "L190",
       "weight": 1.0
     },
     {
@@ -119081,7 +119081,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L207",
+      "source_location": "L206",
       "weight": 1.0
     },
     {
@@ -119092,7 +119092,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L216",
+      "source_location": "L215",
       "weight": 1.0
     },
     {
@@ -119103,7 +119103,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L301",
+      "source_location": "L300",
       "weight": 1.0
     },
     {
@@ -119114,7 +119114,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L315",
+      "source_location": "L314",
       "weight": 1.0
     },
     {
@@ -119125,7 +119125,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L345",
+      "source_location": "L344",
       "weight": 1.0
     },
     {
@@ -119136,7 +119136,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L368",
+      "source_location": "L367",
       "weight": 1.0
     },
     {
@@ -119147,7 +119147,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L371",
+      "source_location": "L370",
       "weight": 1.0
     },
     {
@@ -119158,7 +119158,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L397",
+      "source_location": "L396",
       "weight": 1.0
     },
     {
@@ -119169,7 +119169,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L431",
+      "source_location": "L430",
       "weight": 1.0
     },
     {
@@ -119180,7 +119180,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L442",
+      "source_location": "L441",
       "weight": 1.0
     },
     {
@@ -119191,7 +119191,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L447",
+      "source_location": "L446",
       "weight": 1.0
     },
     {
@@ -119202,7 +119202,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L460",
+      "source_location": "L459",
       "weight": 1.0
     },
     {
@@ -119213,7 +119213,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L479",
+      "source_location": "L478",
       "weight": 1.0
     },
     {
@@ -119224,7 +119224,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L486",
+      "source_location": "L485",
       "weight": 1.0
     },
     {
@@ -119235,7 +119235,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L493",
+      "source_location": "L492",
       "weight": 1.0
     },
     {
@@ -119246,7 +119246,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L503",
+      "source_location": "L502",
       "weight": 1.0
     },
     {
@@ -119257,7 +119257,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L516",
+      "source_location": "L515",
       "weight": 1.0
     },
     {
@@ -119279,7 +119279,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/profile_sessions.py",
-      "source_location": "L79",
+      "source_location": "L78",
       "weight": 1.0
     },
     {

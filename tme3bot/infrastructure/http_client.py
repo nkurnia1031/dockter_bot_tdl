@@ -5,7 +5,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 from tme3bot.domain.worker_contract import (
     CAP_JOB_CONTROL,
@@ -19,6 +19,7 @@ from tme3bot.domain.worker_contract import (
     WORKER_JOB_CAPABILITIES,
     require_worker_contract,
 )
+from tme3bot.profile_provisioning import profile_transfer_is_secure
 
 
 class JsonHttpError(RuntimeError):
@@ -26,6 +27,14 @@ class JsonHttpError(RuntimeError):
         super().__init__(message)
         self.status = status
         self.payload = payload or {}
+
+
+class _RejectRedirects(HTTPRedirectHandler):
+    """Keep authenticated profile bundle transfers on the configured URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        del req, fp, code, msg, headers, newurl
+        return None
 
 
 def request_json(
@@ -70,6 +79,122 @@ def request_json(
 class WorkerHttpDispatcher:
     def __init__(self, worker_registry) -> None:
         self.worker_registry = worker_registry
+
+    def _profile_request(
+        self,
+        worker: str,
+        method: str,
+        path: str,
+        data: bytes = b"",
+        *,
+        content_type: str = "application/json",
+        timeout: float = 90,
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[bytes, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        if not profile_transfer_is_secure(str(record["url"])):
+            raise RuntimeError("Provisioning sesi hanya diizinkan melalui HTTPS untuk worker remote.")
+        headers = {
+            "Authorization": f"Bearer {record['token']}",
+            "Accept": "application/json, application/zip",
+            "Content-Type": content_type,
+        }
+        headers.update(extra_headers or {})
+        request = Request(
+            str(record["url"]).rstrip("/") + path,
+            data=data if method.upper() not in {"GET", "HEAD"} else None,
+            headers=headers,
+            method=method.upper(),
+        )
+        try:
+            # Session archives and worker bearer tokens must not follow an
+            # unexpected redirect, especially an HTTPS-to-HTTP downgrade.
+            opener = build_opener(ProxyHandler({}), _RejectRedirects())
+            with opener.open(request, timeout=timeout) as response:
+                return response.read(), response.headers
+        except urllib.error.HTTPError as exc:
+            # Do not return worker response bodies; they may contain TDL or
+            # filesystem details that must remain private.
+            raise JsonHttpError(exc.code, "Worker menolak operasi provisioning profil.") from exc
+        except urllib.error.URLError as exc:
+            raise JsonHttpError(503, "Worker provisioning tidak dapat dihubungi.") from exc
+
+    def _profile_json(self, worker: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        data, _ = self._profile_request(
+            worker, method, path,
+            json.dumps(payload or {}).encode("utf-8") if method.upper() != "GET" else b"",
+        )
+        return json.loads(data.decode("utf-8")) if data else {}
+
+    def validate_profile_session(self, worker: str, archive_data: bytes) -> int:
+        data, _ = self._profile_request(
+            worker, "POST", "/internal/v1/profiles/validate", archive_data,
+            content_type="application/zip", timeout=180,
+        )
+        result = json.loads(data.decode("utf-8")) if data else {}
+        return int(result["telegram_user_id"])
+
+    def start_profile_login(self, worker: str, operation_id: str, method: str, phone: str) -> dict[str, Any]:
+        return self._profile_json(
+            worker, "POST", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}",
+            {"method": method, "phone": phone},
+        )
+
+    def profile_login_input(self, worker: str, operation_id: str, field: str, value: str) -> dict[str, Any]:
+        return self._profile_json(
+            worker, "POST", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}/input",
+            {"field": field, "value": value},
+        )
+
+    def profile_login_state(self, worker: str, operation_id: str) -> dict[str, Any]:
+        return self._profile_json(worker, "GET", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}")
+
+    def profile_login_bundle(self, worker: str, operation_id: str) -> bytes:
+        data, _ = self._profile_request(
+            worker, "GET", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}/bundle", timeout=180
+        )
+        return data
+
+    def cancel_profile_login(self, worker: str, operation_id: str) -> None:
+        self._profile_json(worker, "DELETE", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}")
+
+    def install_profile_bundle(
+        self, worker: str, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str
+    ) -> dict[str, Any]:
+        data, _ = self._profile_request(
+            worker,
+            "PUT",
+            f"/internal/v1/profiles/{quote(profile, safe='')}/session",
+            bundle,
+            content_type="application/zip",
+            timeout=180,
+            extra_headers={
+                "X-Telegram-User-ID": str(int(telegram_user_id)),
+                "X-Provisioning-ID": operation_id,
+            },
+        )
+        return json.loads(data.decode("utf-8")) if data else {"ready": True}
+
+    def commit_profile_bundle(self, worker: str, profile: str, operation_id: str) -> None:
+        self._profile_json(
+            worker, "POST",
+            f"/internal/v1/profiles/{quote(profile, safe='')}/session/commit",
+            {"operation_id": operation_id},
+        )
+
+    def remove_profile_bundle(self, worker: str, profile: str, operation_id: str) -> None:
+        self._profile_json(
+            worker, "DELETE",
+            f"/internal/v1/profiles/{quote(profile, safe='')}/session?operation_id={quote(operation_id, safe='')}",
+        )
+
+    def export_profile_bundle(self, worker: str, profile: str) -> tuple[int, bytes]:
+        data, headers = self._profile_request(
+            worker, "GET", f"/internal/v1/profiles/{quote(profile, safe='')}/session", timeout=180
+        )
+        return int(headers.get("X-Telegram-User-ID") or 0), data
 
     def dispatch(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]:
         record = self.worker_registry.get(worker)

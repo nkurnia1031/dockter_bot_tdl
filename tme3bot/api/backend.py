@@ -64,6 +64,7 @@ from tme3bot.api.schemas import (
     WorkerUpdateRequest,
 )
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
+from tme3bot.profile_provisioning import profile_transfer_is_secure
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
 from tme3bot.utility import utility_setting_specs
@@ -90,6 +91,7 @@ class BackendContext:
     storage_maintenance: Any = None
     runtime_settings: Any = None
     backup_scheduler: Any = None
+    profile_provisioner: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -255,6 +257,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             or request.url.path == "/api/v1/runtime/secrets"
             or request.url.path.startswith("/api/v1/workers/")
             and request.url.path.endswith("/settings")
+            or request.url.path.startswith("/api/v1/profiles/provisionings")
         )
         if sensitive_request:
             # Pydantic versions that include rejected input in error details
@@ -674,6 +677,152 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 for name in context.profile_manager.list_profiles()
             ]
         }
+
+    @app.get("/api/v1/profiles/management")
+    def profile_management(actor=Depends(current_actor)):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        workers = []
+        checker = getattr(context.worker_dispatcher, "check_worker", None)
+        for name, item in context.worker_registry.list().items():
+            try:
+                online = bool(checker(name).get("healthy", True)) if callable(checker) else False
+            except Exception:
+                online = False
+            secure = profile_transfer_is_secure(str(item.get("url") or ""))
+            workers.append({"name": name, "enabled": bool(item.get("enabled", True)), "online": online, "secure": secure})
+        return {
+            "items": provisioner.profiles(actor.telegram_user_id),
+            "workers": workers,
+        }
+
+    @app.post("/api/v1/profiles/provisionings/upload")
+    async def upload_profile_session(
+        request: Request,
+        name: str = Query(..., min_length=1, max_length=48),
+        worker: str = Query(..., min_length=1, max_length=48),
+        actor=Depends(current_actor),
+    ):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in request.stream():
+            total += len(chunk)
+            if total > 128 * 1024 * 1024:
+                raise DomainError("PROFILE_ARCHIVE_TOO_LARGE", "ZIP sesi melebihi batas 128 MiB.", status_code=413)
+            chunks.append(chunk)
+        try:
+            operation_id = provisioner.upload(name, worker, b"".join(chunks), actor.telegram_user_id)
+        except FileExistsError as exc:
+            raise DomainError("PROFILE_EXISTS", str(exc), status_code=409) from exc
+        except KeyError as exc:
+            raise DomainError("WORKER_NOT_FOUND", "Worker bootstrap tidak ditemukan.", status_code=404) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_SESSION_INVALID", str(exc), status_code=422) from exc
+        except Exception as exc:
+            raise DomainError("PROFILE_PROVISIONING_FAILED", "Worker tidak dapat memvalidasi sesi profil.", status_code=503) from exc
+        return {"id": operation_id, "status": "distributing"}
+
+    @app.post("/api/v1/profiles/provisionings/login")
+    def start_profile_login(request: Request, body: dict[str, Any], actor=Depends(current_actor)):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            operation_id = provisioner.start_login(
+                str(body.get("name") or ""),
+                str(body.get("worker") or ""),
+                str(body.get("method") or ""),
+                str(body.get("phone") or ""),
+                actor.telegram_user_id,
+            )
+        except FileExistsError as exc:
+            raise DomainError("PROFILE_EXISTS", str(exc), status_code=409) from exc
+        except KeyError as exc:
+            raise DomainError("WORKER_NOT_FOUND", "Worker bootstrap tidak ditemukan.", status_code=404) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_LOGIN_INVALID", str(exc), status_code=422) from exc
+        except Exception as exc:
+            raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker login TDL tidak dapat dihubungi.", status_code=503) from exc
+        return {"id": operation_id, "status": "authenticating"}
+
+    @app.get("/api/v1/profiles/provisionings/{operation_id}")
+    def profile_provisioning_state(operation_id: str, actor=Depends(current_actor)):
+        if context.profile_provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            return context.profile_provisioner.operation(operation_id, actor.telegram_user_id)
+        except KeyError as exc:
+            raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404) from exc
+        except PermissionError as exc:
+            raise DomainError("PROFILE_PROVISIONING_FORBIDDEN", "Provisioning dimiliki actor lain.", status_code=403) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_PROVISIONING_FAILED", str(exc), status_code=409) from exc
+        except Exception as exc:
+            raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker login belum dapat dihubungi.", status_code=503) from exc
+
+    @app.post("/api/v1/profiles/provisionings/{operation_id}/input")
+    def profile_login_input(operation_id: str, body: dict[str, Any], actor=Depends(current_actor)):
+        if context.profile_provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            return context.profile_provisioner.login_input(
+                operation_id, actor.telegram_user_id,
+                str(body.get("field") or ""), str(body.get("value") or ""),
+            )
+        except KeyError as exc:
+            raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404) from exc
+        except PermissionError as exc:
+            raise DomainError("PROFILE_PROVISIONING_FORBIDDEN", "Provisioning dimiliki actor lain.", status_code=403) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_LOGIN_INPUT_INVALID", str(exc), status_code=422) from exc
+        except Exception as exc:
+            raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker login TDL tidak dapat dihubungi.", status_code=503) from exc
+
+    @app.post("/api/v1/profiles/provisionings/{operation_id}/retry")
+    def retry_profile_provisioning(operation_id: str, actor=Depends(current_actor)):
+        if context.profile_provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            context.profile_provisioner.retry(operation_id, actor.telegram_user_id)
+        except KeyError as exc:
+            raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404) from exc
+        except PermissionError as exc:
+            raise DomainError("PROFILE_PROVISIONING_FORBIDDEN", "Provisioning dimiliki actor lain.", status_code=403) from exc
+        return {"retried": True}
+
+    @app.delete("/api/v1/profiles/provisionings/{operation_id}")
+    def cancel_profile_provisioning(operation_id: str, actor=Depends(current_actor)):
+        if context.profile_provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            return context.profile_provisioner.cancel(operation_id, actor.telegram_user_id)
+        except KeyError as exc:
+            raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404) from exc
+        except PermissionError as exc:
+            raise DomainError("PROFILE_PROVISIONING_FORBIDDEN", "Provisioning dimiliki actor lain.", status_code=403) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_CANNOT_CANCEL", str(exc), status_code=409) from exc
+
+    @app.post("/api/v1/profiles/{profile}/adopt")
+    def adopt_profile(profile: str, body: dict[str, Any], actor=Depends(current_actor)):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            operation_id = provisioner.adopt(profile, str(body.get("worker") or ""), actor.telegram_user_id)
+        except FileExistsError as exc:
+            raise DomainError("PROFILE_ALREADY_VAULTED", str(exc), status_code=409) from exc
+        except KeyError as exc:
+            raise DomainError("PROFILE_OR_WORKER_NOT_FOUND", "Profil atau worker sumber tidak ditemukan.", status_code=404) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_ADOPTION_INVALID", str(exc), status_code=409) from exc
+        except Exception as exc:
+            raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker sumber tidak dapat mengekspor sesi profil.", status_code=503) from exc
+        return {"id": operation_id, "status": "distributing"}
 
     from tme3bot.api.routes.jobs import register_jobs
     register_jobs(
