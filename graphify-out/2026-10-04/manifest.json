@@ -246,9 +246,9 @@
     "semantic_hash": ""
   },
   "AGENTS.md": {
-    "mtime": 1791105181.4078267,
-    "seen": 1791105475.0821812,
-    "ast_hash": "7655913b6bd3fce0452c1b36ef1cbf04",
+    "mtime": 1791102265.9025757,
+    "seen": 1791103166.4372237,
+    "ast_hash": "e076de4e41e06668f97fc42a631089c1",
     "semantic_hash": ""
   },
   "README.md": {
@@ -1266,9 +1266,9 @@
     "semantic_hash": ""
   },
   "tests/test_trusted_device_helper.py": {
-    "mtime": 1791104958.003986,
-    "seen": 1791105475.081182,
-    "ast_hash": "4ea546322f5066ee809bfaee643ab2d4",
+    "mtime": 1791102372.5738158,
+    "seen": 1791103166.4361799,
+    "ast_hash": "4fff97886a0454019b04e04420f961a3",
     "semantic_hash": ""
   },
   "tme3bot/api/routes/devices.py": {
@@ -1290,9 +1290,9 @@
     "semantic_hash": ""
   },
   "tools/trusted_device_store.py": {
-    "mtime": 1791104964.4151976,
-    "seen": 1791105475.081182,
-    "ast_hash": "b3096441df1c4e3cb5de32add54e1dc2",
+    "mtime": 1791102006.4947276,
+    "seen": 1791103166.4372237,
+    "ast_hash": "eb29ecfe5ff06842581f17a1e9829496",
     "semantic_hash": ""
   },
   "web/src/lib/components/TrustedDevices.svelte": {
@@ -1314,9 +1314,9 @@
     "semantic_hash": ""
   },
   "plan/00-PRIORITY-trusted-device-access.md": {
-    "mtime": 1791105408.7700744,
-    "seen": 1791105475.0821812,
-    "ast_hash": "810c0dfabfcc621bc783d5f0c418c5ca",
+    "mtime": 1791097271.749171,
+    "seen": 1791103166.4372237,
+    "ast_hash": "d8a3d8397441dd3795d47eb3face27b2",
     "semantic_hash": ""
   },
   "plan/01-backend-source-state.md": {
@@ -1458,27 +1458,15 @@
     "semantic_hash": ""
   },
   "plan/PROGRESS.md": {
-    "mtime": 1791105408.7712016,
-    "seen": 1791105475.0821812,
-    "ast_hash": "b63eb4ddf5587e5766e95a9fe9b9cb03",
+    "mtime": 1791097323.5495565,
+    "seen": 1791103166.4372237,
+    "ast_hash": "b24c2a7fa3a75c114e7b190a07b3629a",
     "semantic_hash": ""
   },
   "plan/RECOMMENDATIONS.md": {
     "mtime": 1791097323.551625,
     "seen": 1791103166.4372237,
     "ast_hash": "44c235ba16ef25cb1969727c5ee1a4fa",
-    "semantic_hash": ""
-  },
-  "tests/test_trusted_device_browser_e2e.py": {
-    "mtime": 1791105173.9922574,
-    "seen": 1791105475.081182,
-    "ast_hash": "dc4cd3504e0eeacc2c356c23e35d1e3a",
-    "semantic_hash": ""
-  },
-  "tools/trusted_device_browser.py": {
-    "mtime": 1791105492.3957286,
-    "seen": 1791105575.943882,
-    "ast_hash": "bc5c514fea842a1f81298132ccc6103d",
     "semantic_hash": ""
   }
 }

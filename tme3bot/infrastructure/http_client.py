@@ -121,10 +121,19 @@ class WorkerHttpDispatcher:
         except urllib.error.URLError as exc:
             raise JsonHttpError(503, "Worker provisioning tidak dapat dihubungi.") from exc
 
-    def _profile_json(self, worker: str, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _profile_json(
+        self,
+        worker: str,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        timeout: float = 8,
+    ) -> dict[str, Any]:
         data, _ = self._profile_request(
             worker, method, path,
             json.dumps(payload or {}).encode("utf-8") if method.upper() != "GET" else b"",
+            timeout=timeout,
         )
         return json.loads(data.decode("utf-8")) if data else {}
 
@@ -159,6 +168,24 @@ class WorkerHttpDispatcher:
 
     def cancel_profile_login(self, worker: str, operation_id: str) -> None:
         self._profile_json(worker, "DELETE", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}")
+
+    def check_worker_fast(self, worker: str, *, timeout: float = 2.5) -> dict[str, Any]:
+        """Check worker availability without loading its full capabilities."""
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        request = Request(
+            str(record["url"]).rstrip("/") + "/healthz",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        try:
+            opener = build_opener(ProxyHandler({}), _RejectRedirects())
+            with opener.open(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            raise JsonHttpError(503, "Worker tidak dapat dihubungi.") from exc
+        return {"healthy": isinstance(result, dict) and result.get("ok") is True and result.get("role") == "worker"}
 
     def install_profile_bundle(
         self, worker: str, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str

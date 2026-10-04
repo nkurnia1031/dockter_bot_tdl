@@ -6,6 +6,7 @@ import hmac
 import logging
 import secrets
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -63,6 +64,7 @@ from tme3bot.api.schemas import (
     WorkerRouteRequest,
     WorkerUpdateRequest,
 )
+from tme3bot.api.routes.devices import register_device_routes
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.profile_provisioning import profile_transfer_is_secure
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
@@ -92,6 +94,7 @@ class BackendContext:
     runtime_settings: Any = None
     backup_scheduler: Any = None
     profile_provisioner: Any = None
+    device_auth: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -258,6 +261,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             or request.url.path.startswith("/api/v1/workers/")
             and request.url.path.endswith("/settings")
             or request.url.path.startswith("/api/v1/profiles/provisionings")
+            or request.url.path.startswith("/api/v1/auth/devices")
+            or request.url.path.startswith("/api/v1/auth/device/")
         )
         if sensitive_request:
             # Pydantic versions that include rejected input in error details
@@ -683,15 +688,33 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         provisioner = context.profile_provisioner
         if provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
-        workers = []
-        checker = getattr(context.worker_dispatcher, "check_worker", None)
-        for name, item in context.worker_registry.list().items():
+        registered_workers = context.worker_registry.list()
+        checker = getattr(context.worker_dispatcher, "check_worker_fast", None)
+        if not callable(checker):
+            checker = getattr(context.worker_dispatcher, "check_worker", None)
+
+        def online_status(name: str) -> tuple[str, bool]:
             try:
                 online = bool(checker(name).get("healthy", True)) if callable(checker) else False
             except Exception:
                 online = False
+            return name, online
+
+        names = list(registered_workers)
+        online_by_name: dict[str, bool] = {}
+        if names:
+            with ThreadPoolExecutor(max_workers=min(8, len(names))) as executor:
+                online_by_name.update(executor.map(online_status, names))
+
+        workers = []
+        for name, item in registered_workers.items():
             secure = profile_transfer_is_secure(str(item.get("url") or ""))
-            workers.append({"name": name, "enabled": bool(item.get("enabled", True)), "online": online, "secure": secure})
+            workers.append({
+                "name": name,
+                "enabled": bool(item.get("enabled", True)),
+                "online": online_by_name.get(name, False),
+                "secure": secure,
+            })
         return {
             "items": provisioner.profiles(actor.telegram_user_id),
             "workers": workers,
@@ -918,6 +941,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     _add_internal_state_routes(app, context, require_internal)
     _add_management_routes(app, context, require_management)
+    register_device_routes(
+        app,
+        context,
+        current_actor=current_actor,
+        set_session=_set_session,
+        browser_actor_dict=browser_actor_dict,
+    )
     return app
 
 

@@ -1,9 +1,12 @@
 import tempfile
 import unittest
+import base64
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
@@ -11,6 +14,7 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.domain.models import Actor, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
+from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
@@ -47,6 +51,7 @@ class FakeDispatcher:
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
         self.quick_deletions = []
+        self.fast_worker_checks = []
         self.runtime_settings = {
             "storage_profile": "storage",
             "storage_profile_available": True,
@@ -106,6 +111,10 @@ class FakeDispatcher:
             "storage_profile_available": self.storage_available,
             "workspace": True,
         }
+
+    def check_worker_fast(self, worker):
+        self.fast_worker_checks.append(worker)
+        return {"healthy": True}
 
     def quickmode_scan(self, worker):
         return self.quick_scan.get(worker, {"worker": worker, "items": []})
@@ -178,7 +187,8 @@ class FakeProfileProvisioner:
         self.uploaded = None
         self.login = None
 
-    def profiles(self):
+    def profiles(self, actor_user_id=None):
+        del actor_user_id
         return [{"name": "default", "active": True, "status": "legacy", "vault": False, "workers": []}]
 
     def upload(self, name, worker, data, actor_user_id):
@@ -236,6 +246,7 @@ class BackendApiTests(unittest.TestCase):
             "a" * 48,
             "my_bot",
         )
+        self.auth_repository = self.auth.repository
         config = type(
             "Config",
             (),
@@ -296,6 +307,9 @@ class BackendApiTests(unittest.TestCase):
                     "telegram_tts_chat_id": "123456789",
                 },
             ),
+            device_auth=DeviceAuthService(
+                self.auth_repository, self.auth, "https://ui.example.test"
+            ),
         )
         self.context = context
         self.client = TestClient(create_backend_app(context))
@@ -319,6 +333,112 @@ class BackendApiTests(unittest.TestCase):
             json={"poll_token": challenge["poll_token"]},
         ).json()["access_token"]
         return {"Authorization": f"Bearer {token}"}
+
+    def browser_login(self, user_id=42, csrf="csrf-device-test"):
+        pair = self.auth._new_web_session(user_id)
+        self.client.cookies.set("tme3_access", pair.access_token)
+        self.client.cookies.set("tme3_refresh", pair.refresh_token)
+        self.client.cookies.set("tme3_csrf", csrf)
+        return {"Origin": "http://testserver", "X-CSRF-Token": csrf}
+
+    def test_trusted_device_routes_require_browser_csrf_and_hide_keys(self):
+        private = Ed25519PrivateKey.generate()
+        public = private.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        device_id = "fd9f67f1-bba8-4011-9ed3-0f819ac8df10"
+        document = {
+            "device_id": device_id,
+            "name": "Agent laptop",
+            "algorithm": "Ed25519",
+            "public_key": base64.urlsafe_b64encode(public).decode().rstrip("="),
+            "origin": "https://ui.example.test",
+        }
+        headers = self.browser_login()
+
+        rejected = self.client.post("/api/v1/auth/devices", json=document)
+        self.assertEqual(rejected.status_code, 403)
+        registered = self.client.post("/api/v1/auth/devices", headers=headers, json=document)
+        self.assertEqual(registered.status_code, 201)
+        self.assertTrue(registered.json()["created"])
+        self.assertNotIn("public_key", registered.text)
+        self.assertNotIn("private_key", registered.text)
+
+        listing = self.client.get("/api/v1/auth/devices")
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.json()["items"][0]["fingerprint"], registered.json()["device"]["fingerprint"])
+        self.assertNotIn("public_key", listing.text)
+
+        denied = self.client.post(
+            "/api/v1/auth/device/challenge",
+            headers={"Origin": "https://attacker.example"},
+            json={"device_id": device_id},
+        )
+        self.assertEqual(denied.status_code, 403)
+        challenge_response = self.client.post(
+            "/api/v1/auth/device/challenge",
+            headers={"Origin": "https://ui.example.test"},
+            json={"device_id": device_id},
+        )
+        self.assertEqual(challenge_response.status_code, 200)
+        challenge = challenge_response.json()
+        signature = base64.urlsafe_b64encode(
+            private.sign(
+                challenge_payload(
+                    origin=challenge["origin"],
+                    device_id=device_id,
+                    challenge_id=challenge["challenge_id"],
+                    nonce=challenge["nonce"],
+                    expires_unix=challenge["expires_unix"],
+                )
+            )
+        ).decode().rstrip("=")
+        self.client.cookies.clear()
+        exchanged = self.client.post(
+            "/api/v1/auth/device/exchange",
+            headers={"Origin": "https://ui.example.test"},
+            json={"device_id": device_id, "challenge_id": challenge["challenge_id"], "signature": signature},
+        )
+        self.assertEqual(exchanged.status_code, 200, exchanged.text)
+        self.assertNotIn("access_token", exchanged.text)
+        self.assertNotIn("refresh_token", exchanged.text)
+        set_cookie = "\n".join(exchanged.headers.get_list("set-cookie"))
+        self.assertIn("tme3_access=", set_cookie)
+        self.assertIn("tme3_refresh=", set_cookie)
+        self.assertEqual(self.client.get("/api/v1/auth/browser/session").status_code, 200)
+        headers["X-CSRF-Token"] = exchanged.cookies.get("tme3_csrf")
+
+        # A new Telegram login retains the separate device session.
+        self.auth._new_web_session(42)
+        self.assertEqual(self.client.get("/api/v1/auth/browser/session").status_code, 200)
+        revoked = self.client.delete(
+            f"/api/v1/auth/devices/{device_id}", headers=headers
+        )
+        self.assertEqual(revoked.status_code, 200)
+        self.assertEqual(self.client.get("/api/v1/auth/browser/session").status_code, 401)
+
+    def test_trusted_device_list_and_mutations_are_actor_scoped(self):
+        headers = self.browser_login(42)
+        private = Ed25519PrivateKey.generate()
+        public = private.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        device_id = "fd9f67f1-bba8-4011-9ed3-0f819ac8df10"
+        body = {
+            "device_id": device_id,
+            "name": "Owner laptop",
+            "algorithm": "Ed25519",
+            "public_key": base64.urlsafe_b64encode(public).decode().rstrip("="),
+            "origin": "https://ui.example.test",
+        }
+        self.assertEqual(self.client.post("/api/v1/auth/devices", headers=headers, json=body).status_code, 201)
+
+        actor_headers = self.browser_login(43, "csrf-other-actor")
+        self.assertEqual(self.client.get("/api/v1/auth/devices").json()["items"], [])
+        renamed = self.client.patch(
+            f"/api/v1/auth/devices/{device_id}", headers=actor_headers, json={"name": "stolen"}
+        )
+        self.assertEqual(renamed.status_code, 404)
 
     def test_worker_profile_sync_persists_gateway_registry(self):
         response = self.client.post(
@@ -367,6 +487,17 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(state.json()["login"]["step"], "qr")
         self.assertNotIn("actor_user_id", state.text)
+
+    def test_profile_management_uses_fast_worker_health_check(self):
+        headers = self.login()
+        self.context.profile_provisioner = FakeProfileProvisioner()
+
+        response = self.client.get("/api/v1/profiles/management", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.dispatcher.fast_worker_checks, ["local"])
+        self.assertTrue(response.json()["workers"][0]["online"])
+        self.assertNotIn("secret", response.text)
 
     def test_worker_can_be_enabled_or_disabled_from_web_api(self):
         headers = self.login()

@@ -270,9 +270,10 @@ class ProfileProvisioningStore:
                     ON profile_provisionings(status, updated_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sessions_user_id
                     ON profile_sessions(telegram_user_id);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_provisionings_pending
+                DROP INDEX IF EXISTS idx_profile_provisionings_pending;
+                CREATE UNIQUE INDEX idx_profile_provisionings_pending
                     ON profile_provisionings(profile)
-                    WHERE status IN ('authenticating','distributing');
+                    WHERE status IN ('authenticating','validating','distributing');
                 """
             )
 
@@ -321,7 +322,7 @@ class ProfileProvisioningStore:
             ).fetchone()
             if row is None:
                 raise KeyError(operation_id)
-            if str(row["status"]) != "authenticating":
+            if str(row["status"]) not in {"authenticating", "validating"}:
                 raise ValueError("Provisioning profil sudah tidak menerima sesi.")
             profile = str(row["profile"])
             try:
@@ -463,7 +464,7 @@ class ProfileProvisioningStore:
     def pending_operations(self) -> list[dict[str, Any]]:
         with self._db() as db:
             rows = db.execute(
-                "SELECT id,profile,bootstrap_worker,source,method,status,updated_at FROM profile_provisionings WHERE status IN ('authenticating','distributing')"
+                "SELECT id,profile,bootstrap_worker,source,method,status,updated_at FROM profile_provisionings WHERE status IN ('validating','distributing')"
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -477,7 +478,22 @@ class ProfileProvisioningStore:
     def fail(self, operation_id: str, error: str) -> None:
         with self._lock, self._db() as db:
             db.execute(
-                "UPDATE profile_provisionings SET status='failed',error=?,updated_at=? WHERE id=?",
+                "UPDATE profile_provisionings SET status='failed',error=?,updated_at=? WHERE id=? AND status!='cancelled'",
+                (str(error)[:240], _now(), operation_id),
+            )
+
+    def mark_validating(self, operation_id: str) -> bool:
+        with self._lock, self._db() as db:
+            cursor = db.execute(
+                "UPDATE profile_provisionings SET status='validating',error=NULL,updated_at=? WHERE id=? AND status='authenticating'",
+                (_now(), operation_id),
+            )
+            return cursor.rowcount == 1
+
+    def set_error(self, operation_id: str, error: str) -> None:
+        with self._lock, self._db() as db:
+            db.execute(
+                "UPDATE profile_provisionings SET error=?,updated_at=? WHERE id=? AND status='validating'",
                 (str(error)[:240], _now(), operation_id),
             )
 
@@ -534,20 +550,28 @@ class ProfileProvisioningService:
         self.worker_registry = worker_registry
         self.dispatcher = dispatcher
         self._stop = threading.Event()
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
+        self._processing_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._wake.set()
         self._thread = threading.Thread(target=self._loop, name="profile-provisioning", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        self._wake.set()
 
     def _loop(self) -> None:
-        while not self._stop.wait(10):
+        while not self._stop.is_set():
+            self._wake.wait(10)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             try:
                 self.process_once()
             except Exception:
@@ -555,16 +579,65 @@ class ProfileProvisioningService:
                 pass
 
     def process_once(self) -> None:
-        with self._lock:
+        if not self._processing_lock.acquire(blocking=False):
+            return
+        try:
             self._process_once()
+        finally:
+            self._processing_lock.release()
+
+    def _complete_login(self, operation_id: str) -> None:
+        info = self.store.provisioning(operation_id)
+        if info is None or info["status"] != "validating":
+            return
+        worker = str(info["bootstrap_worker"])
+        try:
+            bundle = self.dispatcher.profile_login_bundle(worker, operation_id)
+            session = extract_single_session(bundle)
+            user_id = int(self.dispatcher.validate_profile_session(worker, bundle))
+            if self.profile_manager.profile_registry.profile_for_user(user_id) is not None:
+                raise FileExistsError("Akun Telegram tersebut sudah terdaftar pada profil lain.")
+            self.store.store_bundle(operation_id, user_id, build_profile_bundle(session, user_id))
+        except FileExistsError:
+            self.store.fail(operation_id, "Akun Telegram tersebut sudah terdaftar pada profil lain.")
+            try:
+                self.dispatcher.cancel_profile_login(worker, operation_id)
+            except Exception:
+                pass
+            return
+        except ValueError as exc:
+            self.store.fail(operation_id, str(exc) or "Sesi TDL tidak valid.")
+            try:
+                self.dispatcher.cancel_profile_login(worker, operation_id)
+            except Exception:
+                pass
+            return
+        except Exception as exc:
+            if getattr(exc, "status", None) in {404, 422}:
+                self.store.fail(operation_id, "Worker tidak dapat memvalidasi sesi TDL. Mulai login baru.")
+                try:
+                    self.dispatcher.cancel_profile_login(worker, operation_id)
+                except Exception:
+                    pass
+                return
+            # Network and worker timeouts are retried by the background loop.
+            self.store.set_error(
+                operation_id,
+                "Worker belum dapat memvalidasi sesi; sinkronisasi akan dicoba ulang.",
+            )
+            return
+        try:
+            self.dispatcher.cancel_profile_login(worker, operation_id)
+        except Exception:
+            pass
 
     def _process_once(self) -> None:
         for operation in self.store.pending_operations():
-            if operation["status"] == "authenticating":
+            if operation["status"] == "validating":
                 try:
-                    self.login_state(str(operation["id"]))
+                    self._complete_login(str(operation["id"]))
                 except Exception:
-                    # Remote worker outages are retried on the next pass.
+                    # A later background pass retries worker and TDL outages.
                     pass
         for name in self.worker_registry.names():
             self.store.add_worker_for_active_profiles(name)
@@ -615,7 +688,8 @@ class ProfileProvisioningService:
                     item["status"] == "ready" for item in info["workers"]
                 ):
                     profile_name, user_id = self.store.mark_active(operation_id)
-                    self.profile_manager.profile_registry.register(profile_name, user_id)
+                    with self._lock:
+                        self.profile_manager.profile_registry.register(profile_name, user_id)
                     for item in info["workers"]:
                         try:
                             self.dispatcher.commit_profile_bundle(
@@ -648,7 +722,7 @@ class ProfileProvisioningService:
                     "active": True,
                     "status": "legacy",
                     "vault": False,
-                    "adoptable": name != self.profile_manager.default_profile,
+                    "adoptable": True,
                     "workers": [],
                 })
             else:
@@ -715,6 +789,7 @@ class ProfileProvisioningService:
             except Exception:
                 self.store.cancel(operation_id)
                 raise
+        self._wake.set()
         return operation_id
 
     def start_login(self, name: str, worker: str, method: str, phone: str | None, actor_user_id: int) -> str:
@@ -734,104 +809,66 @@ class ProfileProvisioningService:
             if not targets:
                 raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
             operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source="login", method=selected_method, target_workers=targets)
-            try:
-                self.dispatcher.start_profile_login(worker, operation_id, selected_method, phone_value)
-            except Exception:
-                self.store.cancel(operation_id)
-                raise
+        try:
+            self.dispatcher.start_profile_login(worker, operation_id, selected_method, phone_value)
+        except Exception:
+            self.store.cancel(operation_id)
+            raise
         return operation_id
 
     def login_state(self, operation_id: str) -> dict[str, Any]:
-        with self._lock:
-            return self._login_state_locked(operation_id)
-
-    def _login_state_locked(self, operation_id: str) -> dict[str, Any]:
         info = self.store.provisioning(operation_id)
         if info is None:
             raise KeyError(operation_id)
-        if info["status"] == "cancelled":
-            info.pop("actor_user_id", None)
-            return info
         if info["status"] == "authenticating":
+            worker = str(info["bootstrap_worker"])
             try:
-                state = self.dispatcher.profile_login_state(info["bootstrap_worker"], operation_id)
+                state = self.dispatcher.profile_login_state(worker, operation_id)
             except Exception as exc:
                 if getattr(exc, "status", None) != 404:
                     raise
                 message = "Proses login pada worker sudah berakhir. Mulai login baru."
                 self.store.fail(operation_id, message)
                 try:
-                    self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
+                    self.dispatcher.cancel_profile_login(worker, operation_id)
                 except Exception:
                     pass
-                refreshed = self.store.provisioning(operation_id) or info
-                refreshed.pop("actor_user_id", None)
-                return {**refreshed, "login": {"status": "failed", "error": message}}
+                state = {"status": "failed", "error": message}
             if state.get("status") in {"failed", "expired"}:
-                self.store.fail(operation_id, str(state.get("error") or "Login TDL gagal."))
+                message = str(state.get("error") or "Login TDL gagal.")
+                self.store.fail(operation_id, message)
                 info = self.store.provisioning(operation_id) or info
+                info.pop("actor_user_id", None)
+                return {**info, "login": {"status": "failed", "error": message}}
             if state.get("status") == "ready":
-                bundle = self.dispatcher.profile_login_bundle(info["bootstrap_worker"], operation_id)
-                session = extract_single_session(bundle)
-                user_id = int(self.dispatcher.validate_profile_session(info["bootstrap_worker"], bundle))
-                if self.profile_manager.profile_registry.profile_for_user(user_id) is not None:
-                    message = "Akun Telegram tersebut sudah terdaftar pada profil lain."
-                    self.store.fail(operation_id, message)
-                    try:
-                        self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
-                    except Exception:
-                        pass
-                    state = {"status": "failed", "error": message}
-                    refreshed = self.store.provisioning(operation_id) or info
-                    refreshed.pop("actor_user_id", None)
-                    return {**refreshed, "login": state}
-                try:
-                    self.store.store_bundle(operation_id, user_id, build_profile_bundle(session, user_id))
-                except FileExistsError:
-                    message = "Akun Telegram tersebut sudah terdaftar pada profil lain."
-                    self.store.fail(operation_id, message)
-                    try:
-                        self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
-                    except Exception:
-                        pass
-                    state = {"status": "failed", "error": message}
-                    refreshed = self.store.provisioning(operation_id) or info
-                    refreshed.pop("actor_user_id", None)
-                    return {**refreshed, "login": state}
-                except Exception:
-                    self.store.fail(operation_id, "Bundle sesi TDL tidak dapat disimpan.")
-                    try:
-                        self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
-                    except Exception:
-                        pass
-                    raise
-                try:
-                    self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
-                except Exception:
-                    pass
-            refreshed = self.store.provisioning(operation_id) or info
-            refreshed.pop("actor_user_id", None)
-            return {**refreshed, "login": state}
+                self.store.mark_validating(operation_id)
+                self._wake.set()
+                info = self.store.provisioning(operation_id) or info
+                info.pop("actor_user_id", None)
+                return {**info, "login": {"status": "validating"}}
+            info.pop("actor_user_id", None)
+            return {**info, "login": state}
+        if info["status"] == "validating":
+            info["login"] = {"status": "validating"}
         info.pop("actor_user_id", None)
         return info
 
     def login_input(self, operation_id: str, actor_user_id: int, field_name: str, value: str) -> dict[str, Any]:
-        with self._lock:
-            info = self.store.provisioning(operation_id)
-            if info is None:
-                raise KeyError(operation_id)
-            if int(info["actor_user_id"]) != int(actor_user_id):
-                raise PermissionError("Provisioning ini dimiliki actor lain.")
-            if info["status"] != "authenticating":
-                raise ValueError("Provisioning tidak sedang menunggu input login.")
-            return self.dispatcher.profile_login_input(
-                info["bootstrap_worker"], operation_id, field_name, value
-            )
+        info = self.store.provisioning(operation_id)
+        if info is None:
+            raise KeyError(operation_id)
+        if int(info["actor_user_id"]) != int(actor_user_id):
+            raise PermissionError("Provisioning ini dimiliki actor lain.")
+        if info["status"] != "authenticating":
+            raise ValueError("Provisioning tidak sedang menunggu input login.")
+        return self.dispatcher.profile_login_input(
+            info["bootstrap_worker"], operation_id, field_name, value
+        )
 
     def adopt(self, profile: str, worker: str, actor_user_id: int) -> str:
         profile = normalize_profile_name(profile)
-        if not profile or profile == self.profile_manager.default_profile:
-            raise ValueError("Profil default tidak dapat diadopsi melalui vault.")
+        if not profile:
+            raise ValueError("Nama profil tidak valid.")
         if profile not in self.profile_manager.list_profiles():
             raise KeyError(profile)
         if self.store.bundle(profile) is not None:
@@ -855,6 +892,7 @@ class ProfileProvisioningService:
             except Exception:
                 self.store.cancel(operation_id)
                 raise
+        self._wake.set()
         return operation_id
 
     def _require_owner(self, operation_id: str, actor_user_id: int) -> dict[str, Any]:
@@ -875,25 +913,26 @@ class ProfileProvisioningService:
     def cancel(self, operation_id: str, actor_user_id: int) -> dict[str, Any]:
         with self._lock:
             info = self._require_owner(operation_id, actor_user_id)
-            if info["source"] == "adoption" and info["status"] == "distributing":
+            if info["source"] == "adoption" and info["status"] in {"validating", "distributing"}:
                 raise ValueError("Adopsi tidak dapat dibatalkan setelah distribusi dimulai.")
             result = self.store.cancel(operation_id)
-            try:
-                self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
-            except Exception:
-                pass
-            if info["source"] != "adoption":
-                for worker, _status in result["workers"]:
-                    try:
-                        self.dispatcher.remove_profile_bundle(worker, info["profile"], operation_id)
-                    except Exception:
-                        pass
+        try:
+            self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
+        except Exception:
+            pass
+        if info["source"] != "adoption":
+            for worker, _status in result["workers"]:
+                try:
+                    self.dispatcher.remove_profile_bundle(worker, info["profile"], operation_id)
+                except Exception:
+                    pass
         return {"cancelled": True, "profile": info["profile"]}
 
     def retry(self, operation_id: str, actor_user_id: int) -> None:
         with self._lock:
             self._require_owner(operation_id, actor_user_id)
             self.store.retry(operation_id)
+        self._wake.set()
 
     def worker_ready(self, profile: str, worker: str) -> bool:
         return self.ready(profile, worker)

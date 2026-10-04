@@ -50,6 +50,28 @@ class BrowserProfileRequest(BaseModel):
     profile: str
 
 
+class DeviceRegistrationRequest(BaseModel):
+    device_id: str = Field(min_length=36, max_length=36)
+    name: str = Field(min_length=1, max_length=80)
+    algorithm: str = Field(min_length=1, max_length=16)
+    public_key: str = Field(min_length=40, max_length=64)
+    origin: str = Field(min_length=8, max_length=300)
+
+
+class DeviceRenameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class DeviceChallengeRequest(BaseModel):
+    device_id: str = Field(min_length=36, max_length=36)
+
+
+class DeviceExchangeRequest(BaseModel):
+    device_id: str = Field(min_length=36, max_length=36)
+    challenge_id: str = Field(min_length=36, max_length=36)
+    signature: str = Field(min_length=80, max_length=100)
+
+
 class ChallengeExchangeResponse(ApiResponse):
     status: str | None = None
     access_token: str | None = None

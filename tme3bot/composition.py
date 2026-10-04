@@ -13,6 +13,7 @@ from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
+from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.export_catalog import ExportArtifactCatalog
@@ -127,6 +128,11 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         refresh_days=config.auth_refresh_days,
         challenge_minutes=config.auth_challenge_minutes,
     )
+    device_auth = DeviceAuthService(
+        auth_repository,
+        auth,
+        config.web_public_origin,
+    )
     bot = Bot(token=config.bot_token)
     if config.backup_channel_ref and not config.backup_channel_id:
         try:
@@ -189,6 +195,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         runtime_settings=runtime_settings,
         backup_scheduler=scheduler,
         profile_provisioner=profile_provisioner,
+        device_auth=device_auth,
     )
     return context, scheduler
 

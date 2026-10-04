@@ -1,9 +1,11 @@
 import io
 import sqlite3
+import threading
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from tme3bot.config import AppConfig
 from tme3bot.profile_provisioning import (
@@ -12,9 +14,11 @@ from tme3bot.profile_provisioning import (
     build_profile_bundle,
     extract_single_session,
     profile_transfer_is_secure,
+    validate_profile_bundle,
 )
 from tme3bot.worker.profile_sessions import ProfileSessionManager
 from tme3bot.profile_registry import ProfileRegistry
+from tme3bot.worker.executor import WorkerJobExecutor
 
 
 def make_config(root: Path) -> AppConfig:
@@ -83,9 +87,24 @@ class FakeProfileDispatcher:
         self.online = {"local"}
         self.installed = {}
         self.committed = []
+        self.login_state_value = {"status": "waiting_input", "step": "qr", "qr_text": "qr-test"}
+        self.login_bundle_downloads = []
 
     def validate_profile_session(self, worker, data):
         return 987654
+
+    def start_profile_login(self, worker, operation_id, method, phone):
+        return {"status": "running"}
+
+    def profile_login_state(self, worker, operation_id):
+        return dict(self.login_state_value)
+
+    def profile_login_bundle(self, worker, operation_id):
+        self.login_bundle_downloads.append((worker, operation_id))
+        return single_session_zip()
+
+    def export_profile_bundle(self, worker, profile):
+        return 987654, build_profile_bundle({"data/default": b"vault-session"}, 987654)
 
     def install_profile_bundle(self, worker, profile, user_id, bundle, operation_id):
         if worker not in self.online:
@@ -109,6 +128,64 @@ class MutableWorkerRegistry(FakeWorkerRegistry):
 
 
 class ProfileProvisioningTests(unittest.TestCase):
+    def test_profile_adoption_export_waits_until_both_tdl_lanes_are_locked(self):
+        runtime = SimpleNamespace(
+            export_operation_lock=threading.Lock(),
+            download_operation_lock=threading.Lock(),
+        )
+
+        class FakeProfileManager:
+            def runtime(self, _profile):
+                return runtime
+
+        class FakeSessionExporter:
+            def export_bundle(self, _profile):
+                return (
+                    123,
+                    (runtime.export_operation_lock.locked(), runtime.download_operation_lock.locked()),
+                )
+
+            def install_bundle(self, _profile, _user_id, _bundle, _operation_id):
+                return {
+                    "locked": (
+                        runtime.export_operation_lock.locked(),
+                        runtime.download_operation_lock.locked(),
+                    )
+                }
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = FakeProfileManager()
+        executor._profile_sessions = FakeSessionExporter()
+
+        self.assertEqual(executor.export_profile_bundle("default"), (123, (True, True)))
+        self.assertEqual(
+            executor.install_profile_bundle("default", 123, b"bundle", "sync-1"),
+            {"locked": (True, True)},
+        )
+
+    def test_tdl_login_validation_runs_in_background_after_manual_status_refresh(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dispatcher = FakeProfileDispatcher()
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            workers = MutableWorkerRegistry()
+            service = ProfileProvisioningService(
+                store, FakeProfileManager(root), workers, dispatcher
+            )
+
+            operation = service.start_login("novel", "local", "qr", None, 42)
+            dispatcher.login_state_value = {"status": "ready", "step": ""}
+            refreshed = service.operation(operation, 42)
+
+            self.assertEqual(refreshed["status"], "validating")
+            self.assertEqual(refreshed["login"]["status"], "validating")
+            self.assertEqual(dispatcher.login_bundle_downloads, [])
+
+            service.process_once()
+
+            self.assertEqual(dispatcher.login_bundle_downloads, [("local", operation)])
+            self.assertEqual(store.provisioning(operation)["status"], "distributing")
+
     def test_single_session_zip_is_duplicated_into_independent_profile_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -168,6 +245,40 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertEqual(old_export.read_bytes(), b"old-export-session")
             identity = (profile_root / "identity.json").read_text()
             self.assertIn("77", identity)
+
+    def test_default_bundle_install_rolls_back_or_commits_without_touching_backend_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(root)
+            old_root = root / "root" / ".tdl" / "data" / "default"
+            old_export = root / "user1" / ".tdl" / "data" / "default"
+            old_root.parent.mkdir(parents=True)
+            old_export.parent.mkdir(parents=True)
+            old_root.write_bytes(b"old-root-session")
+            old_export.write_bytes(b"old-export-session")
+            (root / "identity.json").write_text('{"telegram_user_id":77}')
+            config.state_file.write_text("backend-state")
+            manager = ProfileSessionManager(config)
+            bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
+
+            manager.install_bundle("default", 88, bundle, "default-replace-1")
+
+            self.assertEqual(old_root.read_bytes(), b"new-session")
+            self.assertEqual(old_export.read_bytes(), b"new-session")
+            self.assertEqual((root / "identity.json").read_text(), '{"telegram_user_id": 88, "tdl_user_id": 88}')
+            self.assertEqual(config.state_file.read_text(), "backend-state")
+            self.assertTrue(manager.rollback_bundle("default", "default-replace-1"))
+            self.assertEqual(old_root.read_bytes(), b"old-root-session")
+            self.assertEqual(old_export.read_bytes(), b"old-export-session")
+            self.assertIn("77", (root / "identity.json").read_text())
+            self.assertEqual(config.state_file.read_text(), "backend-state")
+
+            manager.install_bundle("default", 88, bundle, "default-replace-2")
+            self.assertTrue(manager.commit_bundle("default", "default-replace-2"))
+            self.assertEqual(old_root.read_bytes(), b"new-session")
+            self.assertEqual(old_export.read_bytes(), b"new-session")
+            self.assertEqual(config.state_file.read_text(), "backend-state")
+            self.assertFalse((root / ".profile-provisioning-backups").exists())
 
     def test_zip_path_traversal_and_missing_tdl_directory_are_rejected(self):
         output = io.BytesIO()
@@ -231,17 +342,37 @@ class ProfileProvisioningTests(unittest.TestCase):
                 store.store_bundle(operation, 456, bundle)
             self.assertIsNone(store.bundle("novel"))
 
-    def test_adoption_cannot_replace_the_default_profile(self):
+    def test_default_profile_can_be_adopted_and_distributed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
             service = ProfileProvisioningService(
-                ProfileProvisioningStore(root / "storage.db", root / "vault"),
+                store,
                 FakeProfileManager(root),
                 FakeWorkerRegistry(),
                 FakeProfileDispatcher(),
             )
-            with self.assertRaisesRegex(ValueError, "default"):
-                service.adopt("default", "local", 42)
+
+            default_profile = next(
+                item for item in service.profiles() if item["name"] == "default"
+            )
+            self.assertEqual(default_profile["status"], "legacy")
+            self.assertTrue(default_profile["adoptable"])
+
+            operation = service.adopt("default", "local", 42)
+
+            stored_user_id, stored_bundle = store.bundle("default")
+            self.assertEqual(stored_user_id, 987654)
+            validate_profile_bundle(stored_bundle)
+            with zipfile.ZipFile(io.BytesIO(stored_bundle)) as archive:
+                self.assertEqual(archive.read("root/.tdl/data/default"), b"vault-session")
+                self.assertEqual(archive.read("user1/.tdl/data/default"), b"vault-session")
+            info = store.provisioning(operation)
+            self.assertEqual(info["status"], "distributing")
+            self.assertEqual(
+                {item["worker"] for item in info["workers"]},
+                {"local", "remote-offline"},
+            )
 
     def test_profile_names_must_not_be_silently_rewritten(self):
         with tempfile.TemporaryDirectory() as temporary:

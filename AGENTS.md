@@ -171,6 +171,52 @@ memiliki field `enabled` dianggap aktif. Error admission yang diharapkan adalah
 - Utility hanya boleh memakai path di dalam `/workspace` setelah `resolve()` dan `relative_to()`.
 - Jangan log password utility.
 
+### Trusted device untuk browser agent
+
+- Gunakan jalur ini hanya jika tugas yang sedang dikerjakan memang mengizinkan
+  akses ke production. Credential perangkat hanya menyelesaikan autentikasi;
+  credential ini tidak memberi izin untuk deploy, mengubah data, atau melakukan
+  aksi production lain yang belum diminta.
+- Pendaftaran perangkat dilakukan terpisah dari pekerjaan agent dan harus
+  disetujui pengguna dari sesi Web yang sudah login. Jangan mendaftarkan key,
+  membuka production, atau memulai login Telegram secara otomatis.
+- Helper Windows berada di `tools/trusted_device.py`. Buat key dan berkas
+  public-key enrollment dengan:
+
+  ```powershell
+  python -m tools.trusted_device init --origin https://ui.utama.naufix.space --name "Laptop agent"
+  ```
+
+  Backend harus dikonfigurasi dengan `WEB_PUBLIC_ORIGIN` persis ke origin
+  HTTPS situs sebelum fitur ini dapat dipakai.
+  Pengguna mengunggah dan menyetujui berkas enrollment tersebut pada
+  Pengaturan → Perangkat tepercaya setelah memeriksa fingerprint.
+- Untuk tugas production yang sudah diotorisasi, periksa metadata lalu minta
+  helper membuat sesi browser sementara:
+
+  ```powershell
+  python -m tools.trusted_device status --origin https://ui.utama.naufix.space
+  python -m tools.trusted_device prepare-browser --origin https://ui.utama.naufix.space
+  ```
+
+  Helper menghasilkan Playwright storage state di direktori privat Windows.
+  Jangan membuka atau mencetak isi file, menyalin cookie ke log/chat, atau
+  memasukkannya ke URL. Impor hanya bila tool browser yang tersedia secara
+  eksplisit menerima Playwright `storage_state`; setelah tool memuat state,
+  hapus file sementara. Bila import tidak didukung, laporkan keterbatasan dan
+  jangan melemahkan login atau mencoba melewati autentikasi.
+
+  Repository menyediakan `tools.trusted_device_browser.open_trusted_context()`
+  untuk agent berbasis Playwright serta `python -m tools.trusted_device_browser`
+  untuk memeriksa sesi browser. Runner memvalidasi origin, memblokir request ke
+  origin lain, dan menghapus state setelah diimpor. Agent yang memakai API
+  Python tetap harus membatasi navigasi ke origin tersebut dan menutup context
+  setelah selesai.
+- Setelah autentikasi, verifikasi sesi melalui UI/API yang diizinkan sebelum
+  melakukan tindakan. Cabut perangkat dari Pengaturan bila laptop tidak lagi
+  dipercaya; `forget-local` hanya menghapus credential pada laptop dan tidak
+  mencabut perangkat di server.
+
 ## Profile Layout
 
 Profile default memakai `/data`; profile tambahan memakai `/data/profiles/<name>`.

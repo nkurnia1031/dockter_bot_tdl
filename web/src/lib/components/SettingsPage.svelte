@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, put } from '$lib/api';
+  import TrustedDevices from '$lib/components/TrustedDevices.svelte';
   import { HardDrive, Save, Settings2, ShieldCheck } from '@lucide/svelte';
 
   type Settings = { move_size: string; compress_size: string; rclone_destination: string; compress_password_configured: boolean };
@@ -70,5 +71,6 @@
       <p class="muted mt-3 text-xs">Nilai rahasia hanya dikirim saat disimpan dan tidak dibaca kembali ke halaman. Perubahan token bot memerlukan restart backend dan Telegram.</p>
     </section>
     <section class="card p-5 sm:p-6"><div class="flex items-center gap-3"><ShieldCheck class="text-emerald-600" size={21}/><h2 class="font-extrabold">Keamanan</h2></div><p class="muted mt-3 text-sm">Login Web melindungi pengaturan. Password dan token tersimpan di volume data dengan akses file terbatas; API tidak mengembalikan nilainya.</p></section>
+    <TrustedDevices />
   </div>
 </div>

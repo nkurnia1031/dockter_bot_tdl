@@ -5,10 +5,12 @@ import ProfilesPage from './ProfilesPage.svelte';
 describe('ProfilesPage', () => {
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
   it('uploads a TDL session ZIP to the selected secure worker', async () => {
+    const interval = vi.spyOn(window, 'setInterval');
     const requests: { url: string; method: string; body?: BodyInit | null }[] = [];
     let managementCalls = 0;
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
@@ -49,6 +51,7 @@ describe('ProfilesPage', () => {
     await fireEvent.click(submit);
 
     expect(await screen.findByText('Sinkronisasi')).toBeTruthy();
+    expect(interval.mock.calls.some(([, delay]) => delay === 4000)).toBe(false);
     const upload = requests.find((item) => item.url.includes('/profiles/provisionings/upload'));
     expect(upload?.method).toBe('POST');
     expect(upload?.url).toContain('name=novel');

@@ -215,15 +215,13 @@ class ProfileSessionManager:
 
     def install_bundle(self, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str) -> dict[str, Any]:
         normalized = normalize_profile_name(profile)
-        if not normalized or normalized == normalize_profile_name(self.config.default_profile):
-            raise ValueError("Nama profil tidak valid atau merupakan profil default.")
+        if not normalized:
+            raise ValueError("Nama profil tidak valid.")
         if len(bundle) > MAX_PROFILE_BUNDLE_BYTES:
             raise ValueError("Bundle profil melebihi batas.")
         entries = validate_profile_bundle(bundle)
         profile_config = build_profile_config(self.config, normalized)
         profile_root = Path(profile_config.profile_root)
-        if profile_root.resolve() == Path(self.config.state_file).parent.resolve():
-            raise ValueError("Profil default tidak dapat diganti melalui provisioning.")
         expected_identity = int(telegram_user_id)
         with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
             try:
@@ -235,34 +233,66 @@ class ProfileSessionManager:
                 raise ValueError("Identity bundle tidak cocok dengan profil.")
 
         operation_id = self._valid_operation_id(operation_id or "sync-" + normalized)
-        stage_root = profile_root.parent / f".{normalized}.provision-{operation_id}"
-        backup_root = self.root / "backups" / operation_id / normalized
+        # Keep staging and rollback data beside profile files on the same
+        # filesystem. For default, this avoids creating directories under /.
+        stage_root = profile_root / f".{normalized}.provision-{operation_id}"
+        backup_root = self._backup_directory(normalized, operation_id)
         marker = profile_root / ".profile-provisioning.json"
         if marker.exists():
             try:
-                previous = json.loads(marker.read_text(encoding="utf-8"))
-                if previous.get("operation_id") != operation_id:
+                state = json.loads(marker.read_text(encoding="utf-8"))
+                if state.get("operation_id") != operation_id:
                     raise RuntimeError("Profil sedang menerima provisioning lain.")
             except json.JSONDecodeError as exc:
                 raise RuntimeError("Marker provisioning profil rusak.") from exc
+            original = state.get("original")
+            if not isinstance(original, dict):
+                # Markers created before the original-path manifest were
+                # written only after all old files had been moved to backup.
+                original = {
+                    relative: (backup_root / relative).exists()
+                    for relative in ("root/.tdl", "user1/.tdl")
+                }
+                original["identity.json"] = (backup_root / "identity.json").exists()
+                state["original"] = original
+                marker.write_text(json.dumps(state), encoding="utf-8")
         else:
-            backup_root.mkdir(parents=True, exist_ok=True)
-            for relative in ("root/.tdl", "user1/.tdl"):
-                current = profile_root / relative
-                if current.exists():
-                    saved = backup_root / relative
-                    saved.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(current, saved)
-            if (profile_root / "identity.json").exists():
-                backup_root.mkdir(parents=True, exist_ok=True)
-                os.replace(profile_root / "identity.json", backup_root / "identity.json")
             profile_root.mkdir(parents=True, exist_ok=True)
-            marker.write_text(json.dumps({"operation_id": operation_id, "new_profile": not backup_root.joinpath("identity.json").exists()}), encoding="utf-8")
+            backup_root.mkdir(parents=True, exist_ok=True)
+            if os.name == "posix":
+                backup_root.parent.mkdir(parents=True, exist_ok=True)
+                backup_root.parent.chmod(0o700)
+                backup_root.chmod(0o700)
+            original = {
+                relative: (profile_root / relative).exists()
+                for relative in ("root/.tdl", "user1/.tdl")
+            }
+            original["identity.json"] = (profile_root / "identity.json").exists()
+            state = {
+                "operation_id": operation_id,
+                "new_profile": not original["identity.json"],
+                "original": original,
+            }
+            marker.write_text(json.dumps(state), encoding="utf-8")
         shutil.rmtree(stage_root, ignore_errors=True)
         stage_root.mkdir(parents=True, exist_ok=True)
         if os.name == "posix":
             stage_root.chmod(0o700)
         try:
+            # Complete any interrupted backup before replacing sessions. The
+            # manifest lets rollback distinguish untouched originals from new
+            # files installed by this operation.
+            backup_root.mkdir(parents=True, exist_ok=True)
+            for relative in ("root/.tdl", "user1/.tdl"):
+                current = profile_root / relative
+                saved = backup_root / relative
+                if original.get(relative) and current.exists() and not saved.exists():
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(current, saved)
+            identity = profile_root / "identity.json"
+            saved_identity = backup_root / "identity.json"
+            if original.get("identity.json") and identity.exists() and not saved_identity.exists():
+                os.replace(identity, saved_identity)
             with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
                 for info, parts in entries:
                     path = "/".join(parts)
@@ -307,8 +337,10 @@ class ProfileSessionManager:
             return False
         if state.get("operation_id") != operation_id:
             return False
-        backup = self.root / "backups" / operation_id / normalize_profile_name(profile)
+        normalized = normalize_profile_name(profile)
+        backup = self._backup_directory(normalized, operation_id)
         shutil.rmtree(backup.parent, ignore_errors=True)
+        self._remove_empty_backup_root(profile_root)
         marker.unlink(missing_ok=True)
         return True
 
@@ -321,26 +353,58 @@ class ProfileSessionManager:
             return False
         if state.get("operation_id") != operation_id:
             return False
-        backup = self.root / "backups" / operation_id / normalize_profile_name(profile)
+        normalized = normalize_profile_name(profile)
+        backup = self._backup_directory(normalized, operation_id)
+        original = state.get("original")
+        if not isinstance(original, dict):
+            original = {
+                relative: (backup / relative).exists()
+                for relative in ("root/.tdl", "user1/.tdl")
+            }
+            original["identity.json"] = (backup / "identity.json").exists()
+        shutil.rmtree(profile_root / f".{normalized}.provision-{operation_id}", ignore_errors=True)
         for relative in ("root/.tdl", "user1/.tdl"):
             current = profile_root / relative
-            shutil.rmtree(current, ignore_errors=True)
             saved = backup / relative
             if saved.exists():
+                shutil.rmtree(current, ignore_errors=True)
                 current.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(saved, current)
+            elif not original.get(relative, state.get("new_profile", False)):
+                shutil.rmtree(current, ignore_errors=True)
         identity = profile_root / "identity.json"
-        identity.unlink(missing_ok=True)
         saved_identity = backup / "identity.json"
         if saved_identity.exists():
+            identity.unlink(missing_ok=True)
             os.replace(saved_identity, identity)
+        elif not original.get("identity.json", state.get("new_profile", False)):
+            identity.unlink(missing_ok=True)
         marker.unlink(missing_ok=True)
         shutil.rmtree(backup.parent, ignore_errors=True)
+        self._remove_empty_backup_root(profile_root)
+        if normalized != normalize_profile_name(self.config.default_profile):
+            try:
+                profile_root.rmdir()
+            except OSError:
+                pass
+        return True
+
+    def _backup_directory(self, profile: str, operation_id: str) -> Path:
+        profile_root = Path(build_profile_config(self.config, profile).profile_root)
+        current = profile_root / ".profile-provisioning-backups" / operation_id / profile
+        legacy = self.root / "backups" / operation_id / profile
+        # Let a worker upgraded during provisioning still commit or roll back
+        # backups created by the prior layout.
+        if legacy.exists() and not current.exists():
+            return legacy
+        return current
+
+    @staticmethod
+    def _remove_empty_backup_root(profile_root: Path) -> None:
         try:
-            profile_root.rmdir()
+            (profile_root / ".profile-provisioning-backups").rmdir()
         except OSError:
             pass
-        return True
 
     def export_bundle(self, profile: str) -> tuple[int, bytes]:
         normalized = normalize_profile_name(profile)

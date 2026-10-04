@@ -28,7 +28,7 @@
 
   const availableWorkers = $derived(workers.filter((item) => item.online && item.secure));
   const workerStatus = (value: string) => ({ ready: 'Siap', waiting: 'Menunggu', failed: 'Perlu dicoba ulang' } as Record<string, string>)[value] || value;
-  const profileStatus = (value: string) => ({ active: 'Aktif', legacy: 'Belum diadopsi', distributing: 'Sinkronisasi', authenticating: 'Login TDL', failed: 'Gagal' } as Record<string, string>)[value] || value;
+  const profileStatus = (value: string) => ({ active: 'Aktif', legacy: 'Belum diadopsi', authenticating: 'Login TDL', validating: 'Memvalidasi sesi', distributing: 'Sinkronisasi', failed: 'Gagal' } as Record<string, string>)[value] || value;
 
   async function load() {
     loading = true;
@@ -151,8 +151,6 @@
 
   onMount(() => {
     void load();
-    const timer = window.setInterval(() => { void load(); }, 4000);
-    return () => window.clearInterval(timer);
   });
 </script>
 
@@ -191,7 +189,7 @@
 
     {#if operation}
       <article class="mt-5 rounded-2xl border border-violet-300/50 bg-violet-50/50 p-4 dark:bg-violet-950/20">
-        <div class="flex flex-wrap items-center justify-between gap-2"><div><p class="text-xs font-bold uppercase tracking-wider text-violet-600">Provisioning {operation.profile}</p><p class="mt-1 font-bold">{profileStatus(operation.status)}</p></div>{#if operation.source !== 'adoption'}<button class="button secondary !px-3 !py-2" onclick={cancelOperation} disabled={saving || operation.status === 'active'}><X size={15}/>Batalkan</button>{/if}</div>
+        <div class="flex flex-wrap items-center justify-between gap-2"><div><p class="text-xs font-bold uppercase tracking-wider text-violet-600">Provisioning {operation.profile}</p><p class="mt-1 font-bold">{profileStatus(operation.status)}</p></div><div class="flex gap-2"><button class="button secondary !px-3 !py-2" onclick={() => refreshOperation(operation!.id)} disabled={loading || saving} aria-label="Perbarui status provisioning"><RefreshCw size={15}/>Perbarui status</button>{#if operation.source !== 'adoption'}<button class="button secondary !px-3 !py-2" onclick={cancelOperation} disabled={saving || operation.status === 'active'}><X size={15}/>Batalkan</button>{/if}</div></div>
         {#if operation.login && operation.status === 'authenticating'}
           <div class="mt-4 space-y-3">
             {#if operation.login.step === 'qr'}
@@ -204,6 +202,7 @@
             {#if operation.login.error}<p class="text-sm text-rose-600">{operation.login.error}</p>{/if}
           </div>
         {/if}
+        {#if operation.status === 'validating'}<p class="muted mt-3 text-sm">Worker memvalidasi sesi TDL di background. Perbarui status untuk melihat hasilnya.</p>{/if}
         {#if operation.error}<p class="mt-3 text-sm text-rose-600">{operation.error}</p>{/if}
         {#if operation.workers?.length}<div class="mt-4 grid gap-2 sm:grid-cols-2">{#each operation.workers as item}<div class="rounded-lg border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm"><div class="flex items-center justify-between gap-2"><span class="font-semibold">{item.worker}</span><span class="badge">{workerStatus(item.status)}</span></div>{#if item.error}<p class="muted mt-1 text-xs">{item.error}</p>{/if}</div>{/each}</div>{/if}
       </article>

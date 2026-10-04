@@ -235,7 +235,14 @@ class WorkerJobExecutor(
     def install_profile_bundle(
         self, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str
     ) -> dict[str, Any]:
-        return self._profile_sessions.install_bundle(profile, telegram_user_id, bundle, operation_id)
+        runtime = self.profile_manager.runtime(profile)
+        # Wait for current TDL commands to release their session locks and keep
+        # new commands out until the replacement has completed.
+        with runtime.export_operation_lock:
+            with runtime.download_operation_lock:
+                return self._profile_sessions.install_bundle(
+                    profile, telegram_user_id, bundle, operation_id
+                )
 
     def commit_profile_bundle(self, profile: str, operation_id: str) -> bool:
         return self._profile_sessions.commit_bundle(profile, operation_id)
@@ -244,7 +251,12 @@ class WorkerJobExecutor(
         return self._profile_sessions.rollback_bundle(profile, operation_id)
 
     def export_profile_bundle(self, profile: str) -> tuple[int, bytes]:
-        return self._profile_sessions.export_bundle(profile)
+        runtime = self.profile_manager.runtime(profile)
+        # Take a consistent snapshot while TDL commands are not changing its
+        # Bolt databases. Keep the same lock order as profile installation.
+        with runtime.export_operation_lock:
+            with runtime.download_operation_lock:
+                return self._profile_sessions.export_bundle(profile)
 
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])

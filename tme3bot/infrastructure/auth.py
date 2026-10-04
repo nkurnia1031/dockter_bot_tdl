@@ -81,10 +81,258 @@ class SqliteAuthRepository:
                     last_used_at TEXT NOT NULL,
                     revoked_at TEXT
                 );
-                CREATE INDEX IF NOT EXISTS auth_sessions_user
-                    ON auth_sessions(telegram_user_id, created_at DESC);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(auth_sessions)").fetchall()
+            }
+            if "session_kind" not in columns:
+                db.execute(
+                    "ALTER TABLE auth_sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT 'telegram'"
+                )
+            if "device_id" not in columns:
+                db.execute("ALTER TABLE auth_sessions ADD COLUMN device_id TEXT")
+            db.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS auth_sessions_user
+                    ON auth_sessions(telegram_user_id, created_at DESC);
+                CREATE INDEX IF NOT EXISTS auth_sessions_device
+                    ON auth_sessions(device_id, revoked_at);
+                CREATE TABLE IF NOT EXISTS auth_devices (
+                    id TEXT PRIMARY KEY,
+                    telegram_user_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    algorithm TEXT NOT NULL,
+                    public_key BLOB NOT NULL,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    origin TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    revoked_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS auth_devices_actor
+                    ON auth_devices(telegram_user_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS auth_device_challenges (
+                    id TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL,
+                    origin TEXT NOT NULL,
+                    nonce TEXT NOT NULL,
+                    signed_payload BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    consumed_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS auth_device_challenges_device
+                    ON auth_device_challenges(device_id, consumed_at, expires_at);
+                CREATE TABLE IF NOT EXISTS auth_device_rate_limits (
+                    rate_key TEXT PRIMARY KEY,
+                    window_started_at INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL
+                );
+                """
+            )
+
+    @contextmanager
+    def _immediate(self):
+        """Run security-sensitive read/modify/write work under a SQLite write lock."""
+        with self._lock:
+            db = self._connect()
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                yield db
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            finally:
+                db.close()
+
+    @staticmethod
+    def _rate_limit(db, key: str, now: int, limit: int, window: int) -> bool:
+        row = db.execute(
+            "SELECT window_started_at, request_count FROM auth_device_rate_limits WHERE rate_key = ?",
+            (key,),
+        ).fetchone()
+        if row is None or int(row["window_started_at"]) + window <= now:
+            db.execute(
+                "INSERT INTO auth_device_rate_limits(rate_key, window_started_at, request_count) VALUES(?, ?, 1) "
+                "ON CONFLICT(rate_key) DO UPDATE SET window_started_at=excluded.window_started_at, request_count=1",
+                (key, now),
+            )
+            return True
+        count = int(row["request_count"])
+        if count >= limit:
+            return False
+        db.execute(
+            "UPDATE auth_device_rate_limits SET request_count = ? WHERE rate_key = ?",
+            (count + 1, key),
+        )
+        return True
+
+    def register_device(
+        self, device_id: str, telegram_user_id: int, name: str, public_key: bytes,
+        fingerprint: str, origin: str, now: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        with self._immediate() as db:
+            existing = db.execute(
+                "SELECT * FROM auth_devices WHERE id = ? OR fingerprint = ?",
+                (device_id, fingerprint),
+            ).fetchone()
+            if existing is not None:
+                item = dict(existing)
+                if (
+                    item["id"] == device_id
+                    and int(item["telegram_user_id"]) == int(telegram_user_id)
+                    and bytes(item["public_key"]) == public_key
+                    and item["origin"] == origin
+                    and item["revoked_at"] is None
+                ):
+                    return item, "existing"
+                return None, "conflict"
+            db.execute(
+                "INSERT INTO auth_devices(id, telegram_user_id, name, algorithm, public_key, fingerprint, origin, created_at) "
+                "VALUES(?, ?, ?, 'Ed25519', ?, ?, ?, ?)",
+                (device_id, int(telegram_user_id), name, public_key, fingerprint, origin, now),
+            )
+            row = db.execute("SELECT * FROM auth_devices WHERE id = ?", (device_id,)).fetchone()
+            return dict(row), "created"
+
+    def list_devices(self, telegram_user_id: int) -> list[dict[str, Any]]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT id, telegram_user_id, name, algorithm, fingerprint, origin, created_at, last_used_at, revoked_at "
+                "FROM auth_devices WHERE telegram_user_id = ? ORDER BY created_at DESC, id",
+                (int(telegram_user_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def rename_device(self, device_id: str, telegram_user_id: int, name: str, now: str) -> bool:
+        with self._immediate() as db:
+            cursor = db.execute(
+                "UPDATE auth_devices SET name = ? WHERE id = ? AND telegram_user_id = ? AND revoked_at IS NULL",
+                (name, device_id, int(telegram_user_id)),
+            )
+            return cursor.rowcount == 1
+
+    def revoke_device(self, device_id: str, telegram_user_id: int, now: str) -> bool:
+        with self._immediate() as db:
+            cursor = db.execute(
+                "UPDATE auth_devices SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ? AND telegram_user_id = ?",
+                (now, device_id, int(telegram_user_id)),
+            )
+            if cursor.rowcount != 1:
+                return False
+            db.execute(
+                "UPDATE auth_sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE device_id = ?",
+                (now, device_id),
+            )
+            return True
+
+    def get_device(self, device_id: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.execute("SELECT * FROM auth_devices WHERE id = ?", (device_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def create_device_challenge(
+        self, *, device_id: str, challenge_id: str, origin: str, nonce: str,
+        signed_payload: bytes, created_at: str, expires_at: str, now_epoch: int,
+        remote_key: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        with self._immediate() as db:
+            db.execute(
+                "DELETE FROM auth_device_rate_limits WHERE window_started_at + 3600 <= ?",
+                (now_epoch,),
+            )
+            expired_before = (
+                datetime.fromtimestamp(now_epoch, timezone.utc) - timedelta(days=1)
+            ).isoformat()
+            db.execute(
+                "DELETE FROM auth_device_challenges WHERE expires_at <= ?",
+                (expired_before,),
+            )
+            if not self._rate_limit(db, f"ip:{remote_key}", now_epoch, 60, 60):
+                return None, "rate_limited"
+            device = db.execute(
+                "SELECT * FROM auth_devices WHERE id = ? AND revoked_at IS NULL", (device_id,)
+            ).fetchone()
+            if device is None or device["origin"] != origin:
+                return None, "invalid"
+            if not self._rate_limit(db, f"device:{device_id}", now_epoch, 10, 60):
+                return None, "rate_limited"
+            outstanding = db.execute(
+                "SELECT COUNT(*) AS total FROM auth_device_challenges WHERE device_id = ? AND consumed_at IS NULL AND expires_at > ?",
+                (device_id, created_at),
+            ).fetchone()
+            if int(outstanding["total"]) >= 3:
+                return None, "rate_limited"
+            db.execute(
+                "INSERT INTO auth_device_challenges(id, device_id, origin, nonce, signed_payload, created_at, expires_at) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?)",
+                (challenge_id, device_id, origin, nonce, signed_payload, created_at, expires_at),
+            )
+            return dict(device), "created"
+
+    def begin_device_exchange(
+        self, *, device_id: str, challenge_id: str, now_epoch: int, remote_key: str,
+    ) -> tuple[dict[str, Any] | None, str]:
+        with self._immediate() as db:
+            if not self._rate_limit(db, f"ip:{remote_key}", now_epoch, 60, 60):
+                return None, "rate_limited"
+            row = db.execute(
+                "SELECT c.*, d.telegram_user_id, d.public_key, d.fingerprint, d.revoked_at AS device_revoked_at, d.origin AS device_origin "
+                "FROM auth_device_challenges c JOIN auth_devices d ON d.id = c.device_id "
+                "WHERE c.id = ? AND c.device_id = ?",
+                (challenge_id, device_id),
+            ).fetchone()
+            if row is None or row["device_revoked_at"] is not None:
+                return None, "invalid"
+            attempts = int(row["attempts"])
+            if attempts >= 5:
+                return None, "rate_limited"
+            db.execute(
+                "UPDATE auth_device_challenges SET attempts = attempts + 1 WHERE id = ?",
+                (challenge_id,),
+            )
+            return dict(row), "attempt"
+
+    def complete_device_exchange(
+        self, *, device_id: str, challenge_id: str, origin: str, signed_payload: bytes,
+        now: str, refresh_token_hash: str, session_expires_at: str,
+    ) -> tuple[str | None, int | None, str]:
+        with self._immediate() as db:
+            device = db.execute(
+                "SELECT telegram_user_id FROM auth_devices WHERE id = ? AND revoked_at IS NULL AND origin = ?",
+                (device_id, origin),
+            ).fetchone()
+            challenge = db.execute(
+                "SELECT * FROM auth_device_challenges WHERE id = ? AND device_id = ?",
+                (challenge_id, device_id),
+            ).fetchone()
+            if device is None or challenge is None:
+                return None, None, "invalid"
+            if challenge["consumed_at"] is not None:
+                return None, None, "consumed"
+            if challenge["expires_at"] <= now or challenge["origin"] != origin:
+                return None, None, "expired"
+            if bytes(challenge["signed_payload"]) != signed_payload:
+                return None, None, "invalid"
+            changed = db.execute(
+                "UPDATE auth_device_challenges SET consumed_at = ? WHERE id = ? AND consumed_at IS NULL",
+                (now, challenge_id),
+            )
+            if changed.rowcount != 1:
+                return None, None, "consumed"
+            session_id = str(uuid.uuid4())
+            user_id = int(device["telegram_user_id"])
+            db.execute(
+                "INSERT INTO auth_sessions(id, telegram_user_id, refresh_token_hash, created_at, expires_at, last_used_at, session_kind, device_id) "
+                "VALUES(?, ?, ?, ?, ?, ?, 'device', ?)",
+                (session_id, user_id, refresh_token_hash, now, session_expires_at, now, device_id),
+            )
+            db.execute("UPDATE auth_devices SET last_used_at = ? WHERE id = ?", (now, device_id))
+            return session_id, user_id, "created"
 
     def create_challenge(
         self, challenge_id: str, code: str, poll_token_hash: str, expires_at: datetime
@@ -186,7 +434,7 @@ class SqliteAuthRepository:
             db.execute(
                 """
                 UPDATE auth_sessions SET revoked_at = ?
-                WHERE telegram_user_id = ? AND revoked_at IS NULL
+                WHERE telegram_user_id = ? AND session_kind = 'telegram' AND revoked_at IS NULL
                 """,
                 (now, int(telegram_user_id)),
             )
@@ -194,8 +442,8 @@ class SqliteAuthRepository:
                 """
                 INSERT INTO auth_sessions(
                     id, telegram_user_id, refresh_token_hash, created_at,
-                    expires_at, last_used_at
-                ) VALUES(?, ?, ?, ?, ?, ?)
+                    expires_at, last_used_at, session_kind, device_id
+                ) VALUES(?, ?, ?, ?, ?, ?, 'telegram', NULL)
                 """,
                 (
                     session_id,
@@ -214,8 +462,9 @@ class SqliteAuthRepository:
         with self._db() as db:
             row = db.execute(
                 """
-                SELECT * FROM auth_sessions
-                WHERE refresh_token_hash = ? AND revoked_at IS NULL AND expires_at > ?
+                SELECT s.* FROM auth_sessions s LEFT JOIN auth_devices d ON d.id = s.device_id
+                WHERE s.refresh_token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+                  AND (s.session_kind != 'device' OR (d.id IS NOT NULL AND d.revoked_at IS NULL))
                 """,
                 (refresh_token_hash, _now().isoformat()),
             ).fetchone()
@@ -225,8 +474,9 @@ class SqliteAuthRepository:
         with self._db() as db:
             row = db.execute(
                 """
-                SELECT * FROM auth_sessions
-                WHERE id = ? AND revoked_at IS NULL AND expires_at > ?
+                SELECT s.* FROM auth_sessions s LEFT JOIN auth_devices d ON d.id = s.device_id
+                WHERE s.id = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+                  AND (s.session_kind != 'device' OR (d.id IS NOT NULL AND d.revoked_at IS NULL))
                 """,
                 (session_id, _now().isoformat()),
             ).fetchone()
@@ -365,6 +615,11 @@ class BotAuthService:
             )
         user_id = int(session["telegram_user_id"])
         actor = self.actor_resolver(user_id)
+        if str(session.get("session_kind") or "telegram") == "device":
+            if not getattr(actor, "authorized", True):
+                raise DomainError("UNAUTHORIZED_ACTOR", "Actor tidak lagi diizinkan.", status_code=403)
+            if not session.get("device_id"):
+                raise DomainError("SESSION_REVOKED", "Sesi perangkat sudah dicabut.", status_code=401)
         new_refresh = secrets.token_urlsafe(48)
         if not self.repository.rotate_refresh(
             str(session["id"]), old_hash, _hash_secret(new_refresh)
@@ -376,7 +631,11 @@ class BotAuthService:
             )
         return TokenPair(
             access_token=self._access_token(
-                user_id, getattr(actor, "profile", ""), str(session["id"])
+                user_id,
+                getattr(actor, "profile", ""),
+                str(session["id"]),
+                session_kind=str(session.get("session_kind") or "telegram"),
+                device_id=str(session["device_id"]) if session.get("device_id") else None,
             ),
             refresh_token=new_refresh,
             token_type="bearer",
@@ -398,12 +657,22 @@ class BotAuthService:
                 "TOKEN_INVALID", "Jenis token tidak valid.", status_code=401
             )
         session_id = str(payload.get("sid", ""))
-        if session_id != "bot" and self.repository.active_session_by_id(session_id) is None:
-            raise DomainError(
-                "SESSION_REVOKED",
-                "Sesi web sudah dicabut atau kedaluwarsa.",
-                status_code=401,
-            )
+        if session_id != "bot":
+            session = self.repository.active_session_by_id(session_id)
+            if session is None:
+                raise DomainError(
+                    "SESSION_REVOKED",
+                    "Sesi web sudah dicabut atau kedaluwarsa.",
+                    status_code=401,
+                )
+            if str(session.get("session_kind") or "telegram") == "device":
+                if payload.get("session_kind") != "device" or payload.get("device_id") != session.get("device_id"):
+                    raise DomainError("SESSION_REVOKED", "Sesi perangkat sudah dicabut.", status_code=401)
+                actor = self.actor_resolver(int(session["telegram_user_id"]))
+                if not getattr(actor, "authorized", True):
+                    raise DomainError("UNAUTHORIZED_ACTOR", "Actor tidak lagi diizinkan.", status_code=403)
+            elif payload.get("session_kind") not in (None, "telegram"):
+                raise DomainError("SESSION_REVOKED", "Jenis sesi tidak valid.", status_code=401)
         return payload
 
     def _new_web_session(self, telegram_user_id: int) -> TokenPair:
@@ -423,8 +692,29 @@ class BotAuthService:
             expires_in=self.access_seconds,
         )
 
+    def new_device_web_session(
+        self, telegram_user_id: int, device_id: str, session_id: str,
+        refresh_token: str,
+    ) -> TokenPair:
+        actor = self.actor_resolver(int(telegram_user_id))
+        if not getattr(actor, "authorized", True):
+            raise DomainError("UNAUTHORIZED_ACTOR", "Actor tidak lagi diizinkan.", status_code=403)
+        return TokenPair(
+            access_token=self._access_token(
+                telegram_user_id,
+                getattr(actor, "profile", ""),
+                session_id,
+                session_kind="device",
+                device_id=device_id,
+            ),
+            refresh_token=refresh_token,
+            token_type="bearer",
+            expires_in=self.access_seconds,
+        )
+
     def _access_token(
-        self, telegram_user_id: int, profile: str, session_id: str
+        self, telegram_user_id: int, profile: str, session_id: str,
+        *, session_kind: str = "telegram", device_id: str | None = None,
     ) -> str:
         now = _now()
         return jwt.encode(
@@ -433,6 +723,8 @@ class BotAuthService:
                 "telegram_user_id": int(telegram_user_id),
                 "profile": profile,
                 "sid": session_id,
+                "session_kind": session_kind,
+                **({"device_id": device_id} if device_id else {}),
                 "typ": "access",
                 "jti": str(uuid.uuid4()),
                 "iat": int(now.timestamp()),
