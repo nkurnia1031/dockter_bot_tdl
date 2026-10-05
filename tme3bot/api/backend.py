@@ -97,6 +97,8 @@ class BackendContext:
     device_auth: Any = None
     source_repository: Any = None
     operation_service: Any = None
+    queue_command_service: Any = None
+    queue_publisher: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -957,6 +959,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         context.operation_service,
         current_actor=current_actor,
     )
+    from tme3bot.api.routes.queue import register_queue
+    register_queue(app, context, require_internal=require_internal)
     return app
 
 

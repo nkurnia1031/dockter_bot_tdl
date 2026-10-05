@@ -43,6 +43,21 @@ class OperationsService:
     def __init__(self, store: OperationRepository, handlers: Mapping[str, OperationHandler] | None = None) -> None:
         self.store = store
         self._handlers = dict(handlers or {})
+        self._command_handlers: dict[str, Any] = {}
+
+    def register_command_handler(self, topic: str, handler) -> None:
+        normalized = str(topic or "").strip().lower()
+        if not re.fullmatch(r"operation\.[a-z][a-z0-9_.-]{0,62}", normalized):
+            raise ValueError("Nama operation command tidak valid.")
+        if not callable(handler):
+            raise ValueError("Command handler harus callable.")
+        self._command_handlers[normalized] = handler
+
+    def command_handler(self, topic: str):
+        return self._command_handlers.get(str(topic or "").strip().lower())
+
+    def supports_command(self, topic: str) -> bool:
+        return self.command_handler(topic) is not None
 
     def register_handler(self, kind: str, handler: OperationHandler) -> None:
         normalized = str(kind or "").strip().lower()

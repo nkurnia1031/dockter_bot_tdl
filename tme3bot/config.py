@@ -80,6 +80,8 @@ class AppConfig:
     worker_api_tokens: dict[str, str] | None = None
     worker_storage_profile: str = "storage"
     backend_api_url: str = ""
+    redis_url: str = ""
+    durable_dispatch_enabled: bool = False
     backend_bind_host: str = "0.0.0.0"
     backend_port: int = 8080
     frontend_service_token: str = ""
@@ -118,6 +120,8 @@ class AppConfig:
                 raise ValueError(
                     "AUTH_JWT_SECRET minimal 32 karakter untuk APP_ROLE=backend."
                 )
+            if self.durable_dispatch_enabled and not self.redis_url:
+                required["REDIS_URL"] = self.redis_url
         elif self.app_role == "telegram":
             required = {
                 "BACKEND_API_URL": self.backend_api_url,
@@ -128,6 +132,12 @@ class AppConfig:
                 "BACKEND_API_URL": self.backend_api_url,
                 "BACKEND_INTERNAL_TOKEN": self.backend_internal_token,
                 "WORKER_API_TOKEN": self.worker_api_token,
+            }
+        elif self.app_role == "backend-queue":
+            required = {
+                "BACKEND_API_URL": self.backend_api_url,
+                "BACKEND_INTERNAL_TOKEN": self.backend_internal_token,
+                "REDIS_URL": self.redis_url,
             }
         missing = [name for name, value in required.items() if not str(value).strip()]
         if missing:
@@ -141,8 +151,10 @@ class AppConfig:
         load_dotenv(override=False)
 
         app_role = os.getenv("APP_ROLE", "backend").strip().lower() or "backend"
-        if app_role not in {"backend", "telegram", "worker"}:
-            raise ValueError("APP_ROLE harus backend, telegram, atau worker.")
+        if app_role not in {"backend", "backend-queue", "telegram", "worker"}:
+            raise ValueError(
+                "APP_ROLE harus backend, backend-queue, telegram, atau worker."
+            )
         bot_token = os.getenv("BOT_TOKEN", "").strip()
         if app_role in {"backend", "telegram"} and not bot_token:
             raise ValueError("BOT_TOKEN is required.")
@@ -316,6 +328,11 @@ class AppConfig:
             worker_api_tokens=api_tokens,
             worker_storage_profile=os.getenv("WORKER_STORAGE_PROFILE", "storage").strip() or "storage",
             backend_api_url=os.getenv("BACKEND_API_URL", "").strip().rstrip("/"),
+            redis_url=os.getenv("REDIS_URL", "").strip(),
+            durable_dispatch_enabled=(
+                os.getenv("DURABLE_DISPATCH_ENABLED", "false").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
             backend_bind_host=os.getenv("BACKEND_BIND_HOST", "0.0.0.0").strip() or "0.0.0.0",
             backend_port=int(os.getenv("BACKEND_PORT", os.getenv("GATEWAY_PORT", "8080"))),
             frontend_service_token=os.getenv("FRONTEND_SERVICE_TOKEN", "").strip(),

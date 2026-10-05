@@ -22,6 +22,11 @@ def main() -> None:
 
         run_backend(config)
         return
+    if config.app_role == "backend-queue":
+        from tme3bot.composition import run_queue
+
+        run_queue(config)
+        return
     if config.app_role == "worker":
         from tme3bot.composition import run_worker
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import build
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -61,6 +62,48 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("FROM runtime-base AS worker", dockerfile)
         self.assertFalse((PROJECT_ROOT / "Dockerfile.web").exists())
         self.assertTrue((PROJECT_ROOT / "deploy" / "nginx" / "tme3bot-ui.conf").is_file())
+
+    def test_gateway_queue_uses_private_persistent_redis_without_worker_mounts(self) -> None:
+        for filename in ("docker-compose.gateway.yml", "docker-compose.yml"):
+            payload = yaml.safe_load((PROJECT_ROOT / filename).read_text(encoding="utf-8"))
+            services = payload["services"]
+            redis = services["redis"]
+            runner = services["backend-queue"]
+            self.assertNotIn("ports", redis)
+            self.assertNotIn("ports", runner)
+            self.assertNotIn("volumes", runner)
+            self.assertEqual(redis["volumes"], ["queue-redis-data:/data"])
+            self.assertIn("--appendonly", redis["command"])
+            self.assertIn("--appendfsync", redis["command"])
+            self.assertIn("everysec", redis["command"])
+            self.assertIn("--maxmemory-policy", redis["command"])
+            self.assertIn("noeviction", redis["command"])
+            self.assertTrue(payload["networks"]["queue-private"]["internal"])
+            self.assertIn("queue-private", redis["networks"])
+            self.assertIn("queue-private", runner["networks"])
+            self.assertEqual(runner["environment"]["APP_ROLE"], "backend-queue")
+            self.assertEqual(runner["environment"]["REDIS_URL"], "redis://redis:6379/0")
+            self.assertEqual(runner["environment"]["BOT_TOKEN"], "")
+            self.assertNotIn("BACKEND_INTERNAL_TOKEN", runner["environment"])
+            self.assertEqual(runner["env_file"], ["${BACKEND_ENV_FILE:-.env.backend}"])
+
+            backend = services["backend"]
+            self.assertIn("queue-private", backend["networks"])
+            self.assertEqual(backend["environment"]["REDIS_URL"], "redis://redis:6379/0")
+
+        remote = yaml.safe_load((PROJECT_ROOT / "docker-compose.worker.yml").read_text(encoding="utf-8"))
+        self.assertNotIn("redis", remote["services"])
+        self.assertNotIn("backend-queue", remote["services"])
+
+    def test_application_image_installs_pinned_queue_dependencies(self) -> None:
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        basefile = (PROJECT_ROOT / "Dockerfile.base").read_text(encoding="utf-8")
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertIn("COPY requirements.txt /tmp/tme3bot-requirements.txt", dockerfile)
+        self.assertIn("pip install --no-cache-dir -r /tmp/tme3bot-requirements.txt", dockerfile)
+        self.assertIn("COPY requirements.txt /tmp/tme3bot-requirements.txt", basefile)
+        self.assertIn("redis==8.1.0", requirements)
+        self.assertIn("rq==2.12.0", requirements)
 
     def test_deployment_archive_includes_split_configs(self) -> None:
         names = {path.name for path in build.iter_files()}

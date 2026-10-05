@@ -3,6 +3,12 @@ FROM ${TME3BOT_BASE_IMAGE} AS runtime-base
 
 WORKDIR /app
 
+# Install application dependencies in the application image as well as the
+# optional immutable base so an existing base image cannot omit new packages.
+COPY requirements.txt /tmp/tme3bot-requirements.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/tme3bot-requirements.txt \
+    && rm -f /tmp/tme3bot-requirements.txt
+
 COPY bot.py /app/bot.py
 COPY pkg_resources.py /app/pkg_resources.py
 COPY tme3bot /app/tme3bot

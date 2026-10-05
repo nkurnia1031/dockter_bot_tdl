@@ -398,7 +398,7 @@ class ProfileProvisioningStore:
     def distribution_ready(self, profile: str, worker: str) -> bool:
         with self._db() as db:
             row = db.execute(
-                "SELECT active FROM profile_sessions WHERE profile=?", (profile,)
+                "SELECT 1 FROM profile_sessions WHERE profile=?", (profile,)
             ).fetchone()
             item = db.execute(
                 "SELECT status FROM profile_distributions WHERE profile=? AND worker=?",
@@ -407,7 +407,11 @@ class ProfileProvisioningStore:
         # Legacy profiles without a vault retain their pre-existing behavior.
         if row is None:
             return True
-        return bool(int(row["active"])) and item is not None and str(item["status"]) == "ready"
+        # A worker can use its installed session as soon as it acknowledges
+        # its own distribution. Global activation remains gated on every
+        # worker in the provisioning snapshot, but an offline worker must not
+        # block targets that are already ready.
+        return item is not None and str(item["status"]) == "ready"
 
     def provisioning(self, operation_id: str) -> dict[str, Any] | None:
         with self._db() as db:

@@ -293,7 +293,7 @@ class ProfileProvisioningTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract_single_session(output.getvalue())
 
-    def test_vault_encrypts_session_and_gates_worker_until_distribution_ready(self):
+    def test_vault_encrypts_session_and_gates_each_worker_independently(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = ProfileProvisioningStore(root / "storage.db", root / "vault")
@@ -320,6 +320,15 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertTrue(store.distribution_ready("legacy", "remote"))
 
             store.update_distribution("novel", "local", "ready", provisioning_id=operation)
+            self.assertTrue(store.distribution_ready("novel", "local"))
+            self.assertFalse(store.distribution_ready("novel", "remote"))
+            # One unavailable worker keeps the provisioning operation pending,
+            # but does not prevent using a worker that has installed the bundle.
+            store.mark_active(operation)
+            self.assertTrue(store.distribution_ready("novel", "local"))
+            self.assertFalse(store.list_profiles()[0]["active"])
+            self.assertEqual(store.provisioning(operation)["status"], "distributing")
+
             store.update_distribution("novel", "remote", "ready", provisioning_id=operation)
             store.mark_active(operation)
             self.assertTrue(store.distribution_ready("novel", "local"))
@@ -478,7 +487,8 @@ class ProfileProvisioningTests(unittest.TestCase):
                 {"local": "ready", "remote-offline": "waiting"},
             )
             self.assertNotIn("novel", manager.list_profiles())
-            self.assertFalse(service.worker_ready("novel", "local"))
+            self.assertTrue(service.worker_ready("novel", "local"))
+            self.assertFalse(service.worker_ready("novel", "remote-offline"))
 
             dispatcher.online.add("remote-offline")
             service.process_once()

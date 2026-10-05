@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import asdict
 
 import uvicorn
@@ -18,6 +19,10 @@ from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.queue_transport import (
+    QueueCommandService,
+    QueueOutboxPublisher,
+)
 from tme3bot.infrastructure.source_store import (
     SqliteProfileStateStore,
     SqliteSourceRepository,
@@ -100,7 +105,18 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
-    operation_service = OperationsService(SqliteOperationStore(jobs))
+    operation_store = SqliteOperationStore(jobs)
+    operation_service = OperationsService(operation_store)
+    queue_command_service = QueueCommandService(operation_store)
+    queue_publisher = (
+        QueueOutboxPublisher(
+            operation_store,
+            config.redis_url,
+            operations=operation_service,
+        )
+        if config.durable_dispatch_enabled
+        else None
+    )
     dispatcher = WorkerHttpDispatcher(registry)
     profile_provisioner = ProfileProvisioningService(
         ProfileProvisioningStore(
@@ -212,6 +228,8 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         device_auth=device_auth,
         source_repository=source_repository,
         operation_service=operation_service,
+        queue_command_service=queue_command_service,
+        queue_publisher=queue_publisher,
     )
     return context, scheduler
 
@@ -222,6 +240,8 @@ def run_backend(config: AppConfig) -> None:
     context.storage_maintenance.start()
     if context.profile_provisioner is not None:
         context.profile_provisioner.start()
+    if context.queue_publisher is not None:
+        context.queue_publisher.start()
     try:
         uvicorn.run(
             create_backend_app(context),
@@ -232,6 +252,33 @@ def run_backend(config: AppConfig) -> None:
     finally:
         if context.profile_provisioner is not None:
             context.profile_provisioner.stop()
+        if context.queue_publisher is not None:
+            context.queue_publisher.stop()
+
+
+def run_queue(config: AppConfig) -> None:
+    from redis import Redis
+    from rq import Queue, Worker
+    from rq.serializers import JSONSerializer
+
+    from tme3bot.infrastructure.queue_transport import QUEUE_NAME
+
+    connection = Redis.from_url(
+        config.redis_url,
+        socket_connect_timeout=5,
+        socket_timeout=10,
+        health_check_interval=30,
+    )
+    connection.ping()
+    queue = Queue(QUEUE_NAME, connection=connection, serializer=JSONSerializer)
+    worker = Worker(
+        [queue],
+        connection=connection,
+        serializer=JSONSerializer,
+        name=f"backend-queue-{os.getpid()}",
+    )
+    LOGGER.info("Backend queue runner started.")
+    worker.work(with_scheduler=True, logging_level=config.log_level.upper())
 
 
 def run_worker(config: AppConfig) -> None:

@@ -6,3 +6,5 @@ uvicorn==0.34.3
 PyJWT==2.10.1
 httpx==0.28.1
 cryptography>=42,<50
+redis==8.1.0
+rq==2.12.0
