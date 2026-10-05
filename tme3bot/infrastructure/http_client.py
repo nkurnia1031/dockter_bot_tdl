@@ -8,6 +8,7 @@ from urllib.parse import quote
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener, urlopen
 
 from tme3bot.domain.worker_contract import (
+    CAP_DURABLE_COMMANDS_V1,
     CAP_JOB_CONTROL,
     CAP_JOB_LOG_SNAPSHOT,
     CAP_QUICKMODE_SCAN,
@@ -241,6 +242,69 @@ class WorkerHttpDispatcher:
             "/internal/v1/jobs",
             payload,
         )
+
+    def dispatch_command(self, worker: str, envelope: dict[str, Any]) -> dict[str, Any]:
+        """Send a durable command using a stable ID and reconcile lost ACKs."""
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        command_id = str(envelope.get("command_id") or "").strip()
+        if not command_id or len(command_id) > 160:
+            raise ValueError("Command ID tidak valid.")
+        required = set(WORKER_JOB_CAPABILITIES) | {CAP_DURABLE_COMMANDS_V1}
+        job = envelope.get("job") if isinstance(envelope.get("job"), dict) else {}
+        job_payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+        if str(job.get("kind") or "") == "tts":
+            required.add(CAP_TTS)
+        if bool(job_payload.get("quick_mode")):
+            required.add(CAP_QUICKMODE_STAGING)
+        self._require_capabilities(worker, required, record=record)
+
+        status_path = f"/internal/v1/commands/{quote(command_id, safe='')}"
+        base_url = str(record["url"]).rstrip("/")
+        token = str(record["token"])
+
+        def current_receipt() -> dict[str, Any] | None:
+            try:
+                return request_json(base_url, token, "GET", status_path, timeout=8)
+            except JsonHttpError as exc:
+                if exc.status == 404:
+                    return None
+                raise
+
+        def accepted(receipt: dict[str, Any] | None) -> bool:
+            if not isinstance(receipt, dict):
+                return False
+            status = str(receipt.get("status") or "").strip().lower()
+            return receipt.get("accepted") is True or status in {
+                "accepted", "queued", "running", "succeeded", "failed",
+                "cancelled", "completed", "terminal",
+            }
+
+        receipt = current_receipt()
+        if accepted(receipt):
+            return {**(receipt or {}), "accepted": True, "replayed": True}
+        try:
+            receipt = request_json(
+                base_url, token, "POST", "/internal/v1/commands", envelope,
+                timeout=10,
+            )
+        except Exception:
+            # The POST may have reached the worker even if its response was
+            # lost. Resolve that ambiguity by querying the same stable ID;
+            # callers retry this envelope unchanged if the status is unknown.
+            try:
+                receipt = current_receipt()
+            except Exception:
+                receipt = None
+            if accepted(receipt):
+                return {**(receipt or {}), "accepted": True, "replayed": True}
+            raise
+        if not accepted(receipt):
+            raise JsonHttpError(
+                503, "Worker belum mengonfirmasi penerimaan command."
+            )
+        return {**receipt, "accepted": True}
 
     def cancel(self, worker: str, job_id: str) -> bool:
         record = self.worker_registry.get(worker)

@@ -954,13 +954,65 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         browser_actor_dict=browser_actor_dict,
     )
     from tme3bot.api.routes.operations import register_operations
+    operations = context.operation_service
+    if (
+        operations is not None
+        and context.queue_publisher is not None
+        and context.queue_command_service is not None
+    ):
+        def prepare_background_job(actor, target, input_data):
+            job_kind = str(input_data.get("job_kind") or "").strip().lower()
+            if job_kind == "tts":
+                settings = (
+                    context.runtime_settings.get()
+                    if context.runtime_settings is not None
+                    else {}
+                )
+                chat_ref = str(
+                    settings.get("telegram_tts_chat_id")
+                    if "telegram_tts_chat_id" in settings
+                    else getattr(context.config, "telegram_tts_chat_id", "")
+                ).strip()
+                if not chat_ref:
+                    raise DomainError(
+                        "TTS_CHAT_UNAVAILABLE",
+                        "Chat tujuan TTS belum dikonfigurasi.",
+                        status_code=503,
+                    )
+            return context.control_plane.prepare_durable_job(
+                actor, target, input_data
+            )
+
+        def advance_background_job(command):
+            result = context.control_plane.advance_durable_job(command)
+            if result.get("status") in {"wait", "retry"}:
+                private = command.get("private_payload")
+                if isinstance(private, dict) and private.get("job_id"):
+                    operations.mark_waiting_worker_for_job(str(private["job_id"]))
+            return result
+
+        operations.register_handler("job.submit", prepare_background_job)
+        operations.register_command_handler(
+            "operation.accepted", advance_background_job
+        )
+        operations.register_command_handler(
+            "operation.retry", advance_background_job
+        )
+        operations.register_command_handler(
+            "operation.cancel", context.control_plane.advance_durable_cancel
+        )
     register_operations(
         app,
-        context.operation_service,
+        operations,
         current_actor=current_actor,
     )
     from tme3bot.api.routes.queue import register_queue
     register_queue(app, context, require_internal=require_internal)
+    # Queue advancement is an authenticated control-plane endpoint, not part
+    # of the public API contract. Keep it out of the generated client schema.
+    for route in app.routes:
+        if getattr(route, "path", "") == "/internal/v1/queue/commands/{command_id}/advance":
+            route.include_in_schema = False
     return app
 
 

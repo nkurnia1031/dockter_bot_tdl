@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import uuid
 import logging
 import threading
@@ -7,13 +8,25 @@ import time
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any, Callable
 from urllib.parse import unquote, urlparse
 
 from tme3bot.application.ports import JobRepository, WorkerDispatcher
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
+from tme3bot.domain.worker_contract import (
+    CAP_QUICKMODE_STAGING,
+    CAP_TTS,
+    DURABLE_COMMAND_CAPABILITIES,
+    require_worker_contract,
+)
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS
+
+_DURABLE_JOB_KINDS = frozenset({
+    "export", "leave", "download", "utility", "storage_upload", "tts",
+})
 
 
 class ControlPlane:
@@ -81,7 +94,8 @@ class ControlPlane:
         return selected
 
     def resolve_target(
-        self, actor: Actor, *, profile: str | None = None, worker: str | None = None
+        self, actor: Actor, *, profile: str | None = None, worker: str | None = None,
+        check_readiness: bool = True,
     ) -> tuple[str, str]:
         selected_profile = self.require_profile(actor, profile)
         selected_worker = str(worker or self.profile_manager.worker_route(selected_profile)).strip().lower()
@@ -99,7 +113,7 @@ class ControlPlane:
                     "Worker sedang dinonaktifkan dan tidak menerima job baru.",
                     status_code=409,
                 )
-        if callable(self.profile_readiness) and not self.profile_readiness(
+        if check_readiness and callable(self.profile_readiness) and not self.profile_readiness(
             selected_profile, selected_worker
         ):
             raise DomainError(
@@ -242,6 +256,409 @@ class ControlPlane:
             f"Worker {worker} tidak dapat menerima job: {exc}",
             status_code=503,
         )
+
+    def prepare_durable_job(self, actor: Actor, target: dict[str, Any], input_data: dict[str, Any]):
+        """Validate and persist a job plan without performing worker I/O."""
+        from tme3bot.application.operations import PreparedOperation
+
+        if set(input_data) - {"job_kind", "payload"}:
+            raise DomainError("OPERATION_INPUT_INVALID", "Input job operation tidak dikenal.", status_code=422)
+        kind = str(input_data.get("job_kind") or "").strip().lower()
+        payload = input_data.get("payload")
+        if kind not in _DURABLE_JOB_KINDS:
+            raise DomainError("JOB_KIND_INVALID", "Jenis job belum didukung oleh dispatch background.", status_code=422)
+        if not isinstance(payload, dict):
+            raise DomainError("JOB_PAYLOAD_INVALID", "Payload job harus berupa object.", status_code=422)
+        if set(target) - {"profile", "worker"}:
+            raise DomainError("OPERATION_TARGET_INVALID", "Target hanya boleh berisi profile dan worker.", status_code=422)
+        if not str(target.get("worker") or "").strip():
+            raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk job background.", status_code=422)
+
+        selected_profile, selected_worker = self.resolve_target(
+            actor,
+            profile=str(target.get("profile") or actor.profile),
+            worker=str(target.get("worker")),
+            check_readiness=False,
+        )
+        payload = self._prepare_durable_payload(
+            actor, kind, payload, selected_profile, selected_worker
+        )
+
+        job_id = str(uuid.uuid4())
+        if kind == "export" and bool(payload.get("quick_mode")):
+            retry = payload.get("quick_retry")
+            retry = dict(retry) if isinstance(retry, dict) else {}
+            retry.setdefault("stage_job_id", job_id)
+            payload = {**payload, "quick_retry": retry}
+        profiles = getattr(self.profile_manager, "list_profiles", None)
+        execution = build_execution_plan(
+            kind,
+            selected_profile,
+            selected_worker,
+            payload,
+            profiles() if callable(profiles) else (),
+            stage_job_id=job_id if kind == "export" and bool(payload.get("quick_mode")) else None,
+        )
+        command_payload = {
+            "dispatch_mode": "durable",
+            "command_id": str(uuid.uuid4()),
+            "dispatch_token": secrets.token_urlsafe(32),
+            "attempt": 1,
+            "dispatch_started": False,
+            "profile_revision": 0,
+            "settings_version": 0,
+            "job_id": job_id,
+            "kind": kind,
+            "profile": selected_profile,
+            "actor_user_id": int(actor.telegram_user_id),
+            "worker": selected_worker,
+            "execution": execution.as_dict(),
+            "payload": payload,
+        }
+        job = Job(
+            id=job_id,
+            kind=kind,
+            profile=selected_profile,
+            actor_user_id=int(actor.telegram_user_id),
+            worker=selected_worker,
+            status=JobStatus.QUEUED,
+            payload=self._redacted_payload(kind, payload),
+        )
+        return PreparedOperation(
+            profile=selected_profile,
+            target={"profile": selected_profile, "worker": selected_worker, "job_kind": kind},
+            private_payload={"job_id": job_id},
+            job=job,
+            execution_plan=execution.as_dict(),
+            command_payload=command_payload,
+        )
+
+    def _prepare_durable_payload(
+        self,
+        actor: Actor,
+        kind: str,
+        payload: dict[str, Any],
+        profile: str,
+        worker: str,
+    ) -> dict[str, Any]:
+        allowed: dict[str, set[str]] = {
+            "export": {
+                "url", "chat_ref", "start_id", "label", "use_url_message_id",
+                "save_source", "quick_mode",
+            },
+            "leave": {"chat_refs"},
+            "download": {"artifact_ids", "priority"},
+            "utility": {"utility", "folders", "password"},
+            "storage_upload": {
+                "folder_path", "folder", "destination_folder_id",
+                "preserve_structure", "keywords", "rclone_upload",
+            },
+            "tts": {"title", "text"},
+        }
+        if set(payload) - allowed[kind]:
+            raise DomainError(
+                "JOB_PAYLOAD_INVALID",
+                "Payload job memuat field yang tidak diizinkan.",
+                status_code=422,
+            )
+
+        if kind == "export":
+            values = dict(payload)
+            for flag in ("use_url_message_id", "save_source", "quick_mode"):
+                if flag in values and values[flag] is not None and type(values[flag]) is not bool:
+                    raise DomainError("JOB_PAYLOAD_INVALID", "Flag export harus berupa boolean.", status_code=422)
+            url = str(values.get("url") or "").strip()
+            chat_ref = str(values.get("chat_ref") or "").strip()
+            if not url and not chat_ref:
+                raise DomainError("EXPORT_REFERENCE_REQUIRED", "Isi URL atau chat_ref untuk export.", status_code=422)
+            if len(url) > 2048:
+                raise DomainError("JOB_PAYLOAD_INVALID", "URL export terlalu panjang.", status_code=422)
+            if chat_ref:
+                try:
+                    values["chat_ref"] = normalize_tdl_chat_ref(chat_ref)
+                except ValueError as exc:
+                    raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
+            start_id = values.get("start_id")
+            if start_id is not None and (type(start_id) is not int or start_id < 1):
+                raise DomainError("JOB_PAYLOAD_INVALID", "Start ID harus bilangan positif.", status_code=422)
+            label = values.get("label")
+            if label is not None and (not isinstance(label, str) or len(label) > 120):
+                raise DomainError("JOB_PAYLOAD_INVALID", "Label export tidak valid.", status_code=422)
+            if bool(values.get("quick_mode")):
+                values["quick_settings"] = self._utility_settings_snapshot()
+            return values
+
+        if kind == "leave":
+            chat_refs = payload.get("chat_refs")
+            if not isinstance(chat_refs, list) or not chat_refs or len(chat_refs) > 1000:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Daftar chat leave tidak valid.", status_code=422)
+            try:
+                return {"chat_refs": sorted({normalize_tdl_chat_ref(str(item)) for item in chat_refs})}
+            except ValueError as exc:
+                raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
+
+        if kind == "download":
+            artifact_ids = payload.get("artifact_ids")
+            priority = str(payload.get("priority") or "normal").strip().lower()
+            if not isinstance(artifact_ids, list) or not artifact_ids or len(artifact_ids) > 500:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Daftar artifact download tidak valid.", status_code=422)
+            if priority not in {"normal", "next"}:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Prioritas download tidak valid.", status_code=422)
+            if self.export_catalog is None:
+                raise DomainError("ARTIFACT_CATALOG_UNAVAILABLE", "Katalog artifact belum tersedia.", status_code=503)
+            artifact_keys: list[str] = []
+            artifact_refs: list[dict[str, str]] = []
+            retry_failed = False
+            for artifact_id in artifact_ids:
+                artifact = self.export_catalog.get(str(artifact_id))
+                if artifact is None:
+                    raise DomainError("ARTIFACT_NOT_FOUND", "Artifact tidak ditemukan.", status_code=404)
+                artifact_profile = str(artifact["profile"])
+                artifact_worker = str(artifact["worker"])
+                self.require_profile(actor, artifact_profile)
+                if (artifact_profile, artifact_worker) != (profile, worker):
+                    raise DomainError("ARTIFACT_ORIGIN_MIXED", "Pilih artifact dari satu origin profile-worker.", status_code=409)
+                if artifact["status"] not in {"pending", "failed"}:
+                    raise DomainError("ARTIFACT_NOT_PENDING", "Artifact tidak berada pada antrean yang dapat dijalankan.", status_code=409)
+                if not bool(artifact.get("available", 1)):
+                    raise DomainError("ARTIFACT_UNAVAILABLE", "File artifact sudah tidak tersedia pada worker.", status_code=409)
+                retry_failed = retry_failed or artifact["status"] == "failed"
+                artifact_keys.append(str(artifact["artifact_key"]))
+                artifact_refs.append({"key": str(artifact["artifact_key"]), "status": str(artifact["status"])})
+            return {
+                "retry_failed": retry_failed,
+                "artifact_keys": artifact_keys,
+                "artifacts": artifact_refs,
+                "priority": priority,
+            }
+
+        if kind == "utility":
+            utility = str(payload.get("utility") or "").strip().lower()
+            folders = payload.get("folders")
+            if utility not in {"extract", "compress", "export", "pindah"}:
+                raise DomainError("UTILITY_INVALID", "Jenis utility tidak dikenal.", status_code=422)
+            if not isinstance(folders, list) or not folders or len(folders) > 500:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Daftar folder utility tidak valid.", status_code=422)
+            normalized_folders = []
+            for value in folders:
+                path = PurePosixPath(str(value or ""))
+                if not path.is_absolute() or not path.parts or path.parts[0] != "/" or len(path.parts) < 2 or path.parts[1] != "workspace" or ".." in path.parts:
+                    raise DomainError("UTILITY_PATH_INVALID", "Folder utility harus berada di dalam /workspace.", status_code=422)
+                normalized_folders.append(str(path))
+            password = payload.get("password")
+            if password is not None and (not isinstance(password, str) or len(password) > 512):
+                raise DomainError("JOB_PAYLOAD_INVALID", "Password utility tidak valid.", status_code=422)
+            return {
+                "utility": utility,
+                "folders": normalized_folders,
+                "password": password,
+                "settings": self._utility_settings_snapshot(),
+            }
+
+        if kind == "storage_upload":
+            if profile != actor.profile:
+                raise DomainError("PROFILE_NOT_ALLOWED", "Storage upload harus memakai profile actor aktif.", status_code=403)
+            folder_path = str(payload.get("folder_path") or "").strip()
+            source_path = PurePosixPath(folder_path)
+            if not source_path.is_absolute() or len(source_path.parts) < 2 or source_path.parts[1] != "workspace" or ".." in source_path.parts:
+                raise DomainError("STORAGE_SOURCE_INVALID", "Folder sumber harus berada di dalam /workspace.", status_code=422)
+            destination_id = payload.get("destination_folder_id")
+            if destination_id is not None and (type(destination_id) is not int or destination_id < 1):
+                raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak valid.", status_code=422)
+            if self.storage_catalog is None:
+                raise DomainError("STORAGE_UNAVAILABLE", "Katalog Storage belum tersedia.", status_code=503)
+            if destination_id is None and str(payload.get("folder") or "").strip():
+                folder = self.storage_catalog.ensure_path(
+                    str(payload["folder"]).strip(), actor.telegram_user_id
+                )
+                destination_id = folder.id if folder else None
+            if destination_id is not None:
+                selected = self.storage_catalog.get_folder(destination_id)
+                if selected is None or selected.status != "active":
+                    raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak aktif.", status_code=409)
+            rclone_upload = payload.get("rclone_upload", False)
+            preserve_structure = payload.get("preserve_structure", True)
+            if type(rclone_upload) is not bool or type(preserve_structure) is not bool:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Opsi upload Storage harus berupa boolean.", status_code=422)
+            keywords = str(payload.get("keywords") or "")
+            if len(keywords) > 600:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Keywords Storage terlalu panjang.", status_code=422)
+            values = {
+                "folder_path": str(source_path),
+                "folder": str(payload.get("folder") or ""),
+                "destination_folder_id": destination_id,
+                "destination_folder_path": self.storage_catalog.folder_path(destination_id),
+                "preserve_structure": preserve_structure,
+                "keywords": keywords,
+                "rclone_upload": rclone_upload,
+                "batch_id": str(uuid.uuid4()),
+                "owner_user_id": actor.telegram_user_id,
+                "owner_profile": actor.profile,
+            }
+            if rclone_upload:
+                values["rclone_destination"] = self._utility_settings_snapshot().get(
+                    "rclone_destination", "googledrive:backup"
+                )
+            return values
+
+        if kind == "tts":
+            title = str(payload.get("title") or "").strip()
+            text = str(payload.get("text") or "").strip()
+            if not title or len(title) > 200:
+                raise DomainError("TTS_TITLE_INVALID", "Judul TTS wajib diisi dan maksimal 200 karakter.", status_code=422)
+            if not text or len(text) > 100_000:
+                raise DomainError("TTS_TEXT_INVALID", "Teks TTS wajib diisi dan maksimal 100.000 karakter.", status_code=422)
+            return {"title": title, "text": text}
+
+        raise DomainError("JOB_KIND_INVALID", "Jenis job belum didukung oleh dispatch background.", status_code=422)
+
+    def _utility_settings_snapshot(self) -> dict[str, Any]:
+        getter = getattr(self.utility_settings, "get", None)
+        values = getter() if callable(getter) else DEFAULT_UTILITY_SETTINGS
+        return deepcopy(values if isinstance(values, dict) else DEFAULT_UTILITY_SETTINGS)
+
+    def advance_durable_job(self, command: dict[str, Any]) -> dict[str, str]:
+        private = command.get("private_payload") if isinstance(command.get("private_payload"), dict) else {}
+        job_id = str(private.get("job_id") or "")
+        job = self.jobs.get(job_id) if job_id else None
+        if job is None:
+            return {"status": "terminal", "reason": "job_missing"}
+        stored = self.jobs.command_payload(job.id)
+        if not isinstance(stored, dict) or stored.get("dispatch_mode") != "durable":
+            return {"status": "terminal", "reason": "dispatch_mode_changed"}
+        attempt = max(1, int(command.get("attempt") or 1))
+        if job.status.terminal:
+            if attempt <= 1:
+                return {"status": "terminal", "reason": "job_terminal"}
+            job = self.jobs.reset_for_retry(job.id, self._redacted_payload(job.kind, stored.get("payload") or {}))
+            job = self.jobs.get(job.id) or job
+        stored_attempt = max(1, int(stored.get("attempt") or 1))
+        if attempt > stored_attempt:
+            # A retry keeps the public job ID but gets a new idempotency token.
+            # Persisting the attempt in job_commands makes this safe if the
+            # queue command is replayed after the row was reset to queued.
+            stored = {
+                **stored,
+                "attempt": attempt,
+                "command_id": str(uuid.uuid4()),
+                "dispatch_token": secrets.token_urlsafe(32),
+                "dispatch_started": False,
+            }
+            self.jobs.update_command_payload(job.id, stored)
+            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+            self.jobs.append_event(JobEvent(
+                job_id=job.id,
+                sequence=sequence,
+                status=JobStatus.QUEUED,
+                event_type="retry_started",
+                progress={"phase": "queued", "retry_attempt": attempt},
+            ))
+            job = self.jobs.get(job.id) or job
+        if job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING, JobStatus.PAUSED}:
+            return {"status": "accepted", "reason": "already_dispatched"}
+        if job.status != JobStatus.QUEUED:
+            return {"status": "terminal", "reason": "job_not_queued"}
+
+        if self.worker_registry is not None:
+            record = self.worker_registry.get(job.worker)
+            if record is None or not bool(record.get("enabled", True)):
+                return {"status": "wait", "reason": "not_ready"}
+        if callable(self.profile_readiness) and not self.profile_readiness(
+            job.profile, job.worker
+        ):
+            return {"status": "wait", "reason": "not_ready"}
+
+        capabilities = getattr(self.dispatcher, "capabilities", None)
+        dispatch_command = getattr(self.dispatcher, "dispatch_command", None)
+        if not callable(capabilities) or not callable(dispatch_command):
+            return {"status": "wait", "reason": "not_ready"}
+        required = set(DURABLE_COMMAND_CAPABILITIES)
+        if job.kind == "tts":
+            required.add(CAP_TTS)
+        if bool((stored.get("payload") or {}).get("quick_mode")):
+            required.add(CAP_QUICKMODE_STAGING)
+        try:
+            require_worker_contract(
+                capabilities(job.worker), job.worker, required_capabilities=required
+            )
+        except Exception:
+            return {"status": "wait", "reason": "not_ready"}
+
+        admission = self.jobs.try_acquire_execution(job.id)
+        self.jobs.set_queue_info(
+            job.id, int(admission.get("position", 1)), admission.get("blocked_reason")
+        )
+        if not admission.get("admitted"):
+            return {"status": "wait", "reason": "not_ready"}
+        latest = max((item.sequence for item in self.jobs.events(job.id)), default=0)
+        envelope = {
+            "command_id": str(stored["command_id"]),
+            "operation_id": str(command.get("operation_id") or ""),
+            "job_id": job.id,
+            "attempt": attempt,
+            "dispatch_token": str(stored["dispatch_token"]),
+            "profile_revision": int(stored.get("profile_revision") or 0),
+            "settings_version": int(stored.get("settings_version") or 0),
+            "event_sequence_start": latest + 1,
+            "execution_plan": self.jobs.execution_plan(job.id) or stored.get("execution") or {},
+            "job": {
+                "kind": job.kind,
+                "profile": job.profile,
+                "actor_user_id": job.actor_user_id,
+                "worker": job.worker,
+                "payload": stored.get("payload") or {},
+            },
+        }
+        # Atomically persist this before the network call and only if the
+        # operation has not begun cancellation. After this point an ACK may be
+        # ambiguous, so cancellation must go through the worker.
+        begin_dispatch = getattr(self.jobs, "begin_durable_dispatch", None)
+        if not callable(begin_dispatch) or not begin_dispatch(job.id):
+            self.jobs.release_execution(job.id)
+            return {"status": "terminal", "reason": "dispatch_aborted"}
+        try:
+            receipt = dispatch_command(job.worker, envelope)
+        except Exception:
+            # The stable command ID lets the next queue attempt query the
+            # worker journal before resending an acceptance that may be lost.
+            return {"status": "wait", "reason": "not_ready"}
+        if not isinstance(receipt, dict) or receipt.get("accepted") is not True:
+            return {"status": "wait", "reason": "not_ready"}
+        self.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=latest + 1,
+            status=JobStatus.DISPATCHED,
+            event_type="durable_dispatch_accepted",
+            progress={"worker": job.worker, "position": int(admission.get("position", 1))},
+        ))
+        return {"status": "accepted"}
+
+    def advance_durable_cancel(self, command: dict[str, Any]) -> dict[str, str]:
+        private = command.get("private_payload") if isinstance(command.get("private_payload"), dict) else {}
+        job = self.jobs.get(str(private.get("job_id") or ""))
+        if job is None or job.status.terminal:
+            return {"status": "accepted", "reason": "job_terminal"}
+        if job.status == JobStatus.QUEUED:
+            stored = self.jobs.command_payload(job.id)
+            if not isinstance(stored, dict) or not stored.get("dispatch_started"):
+                sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+                self.append_worker_event(JobEvent(
+                    job_id=job.id,
+                    sequence=sequence,
+                    status=JobStatus.CANCELLED,
+                    event_type="operation_cancelled_queued",
+                    progress={"phase": "cancelled"},
+                ))
+                self._dispatch_pending_jobs()
+                return {"status": "accepted"}
+        try:
+            # A true return only means the worker accepted the cancel request.
+            # Keep the durable operation command retryable until a terminal
+            # worker event confirms the actual job outcome.
+            self.dispatcher.cancel(job.worker, job.id)
+            return {"status": "wait", "reason": "not_ready"}
+        except Exception:
+            return {"status": "wait", "reason": "not_ready"}
 
     def _select_tts_worker(self, requested: str | None = None, *, profile: str | None = None) -> str:
         options = self.tts_worker_options(profile=profile)
@@ -454,6 +871,15 @@ class ControlPlane:
                 )
             )
             for queued in queued_jobs:
+                command_payload = self.jobs.command_payload(queued.id)
+                if (
+                    isinstance(command_payload, dict)
+                    and command_payload.get("dispatch_mode") == "durable"
+                ):
+                    # Durable operation jobs are admitted only by their RQ
+                    # advance command. The legacy scheduler must not claim
+                    # the same queued row or send a v1 dispatch in parallel.
+                    continue
                 admission = self.jobs.try_acquire_execution(queued.id)
                 self.jobs.set_queue_info(
                     queued.id,
@@ -462,7 +888,6 @@ class ControlPlane:
                 )
                 if not admission.get("admitted"):
                     continue
-                command_payload = self.jobs.command_payload(queued.id)
                 if not isinstance(command_payload, dict):
                     self.jobs.release_execution(queued.id)
                     sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1

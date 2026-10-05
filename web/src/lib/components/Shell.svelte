@@ -7,7 +7,7 @@
   import RequestIndicator from './RequestIndicator.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
-    LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, Zap
+    KeyRound, LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, Zap
   } from '@lucide/svelte';
 
   let { children } = $props();
@@ -150,6 +150,7 @@
             <span class="hidden items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-700 md:inline-flex dark:bg-emerald-950 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Backend online</span>
           </div>
           <div class="topbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
+            <a class="button secondary h-10 !rounded-xl !px-2.5 sm:!px-3" href="/decrypt/" aria-label="Buka dekripsi teks" title="Dekripsi teks"><KeyRound size={16}/><span class="hidden sm:inline">Dekripsi</span></a>
             <button id="theme-trigger" class="button secondary theme-trigger hidden size-10 !rounded-xl !p-0 sm:inline-flex" aria-label="Pilih tema"><span class="sr-only">Tema {labelForTheme(theme)}</span>{#if theme === 'dark'}<Moon size={17}/>{:else}<Sun size={17}/>{/if}</button>
             <Dropdown bind:isOpen={themeMenuOpen} triggeredBy="#theme-trigger" placement="bottom-end" class="!z-50 !w-40 !rounded-xl !border-[var(--line)] !bg-[var(--panel-strong)] !p-1 !shadow-xl" simple>
               {#each ['light', 'dark', 'system'] as option}<DropdownItem onclick={() => setTheme(option as Theme)} class="!rounded-lg !px-3 !py-2 !text-sm !text-[var(--ink)] hover:!bg-[var(--brand-soft)]">{labelForTheme(option as Theme)}{#if theme === option}<span class="float-right text-violet-600">&#10003;</span>{/if}</DropdownItem>{/each}

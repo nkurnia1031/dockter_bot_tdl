@@ -7,13 +7,14 @@ from tme3bot.api.schemas import WorkerEventRequest
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.domain.models import DomainError
 from tme3bot.domain.worker_contract import (
+    CAP_DURABLE_COMMANDS_V1,
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_STAGING,
     WORKER_API_CAPABILITIES,
     WORKER_API_CONTRACT_VERSION,
     worker_contract_metadata,
 )
-from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
+from tme3bot.infrastructure.http_client import JsonHttpError, WorkerHttpDispatcher
 from tme3bot.worker.executor_support import WorkerEventPublisher
 
 
@@ -156,6 +157,87 @@ class WorkerContractTests(unittest.TestCase):
             dispatcher.dispatch("remote", {"job_id": "job-2", "payload": {}})
 
         self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
+        self.assertEqual(request.call_count, 1)
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_durable_dispatch_queries_status_before_posting_stable_command(self, request):
+        capabilities = worker_contract_metadata()
+        capabilities["capabilities"].append(CAP_DURABLE_COMMANDS_V1)
+        request.side_effect = [
+            capabilities,
+            JsonHttpError(404, "missing"),
+            {"status": "accepted"},
+        ]
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+        envelope = {
+            "command_id": "command-1",
+            "dispatch_token": "stable-token",
+            "job": {"kind": "export", "payload": {}},
+        }
+
+        result = dispatcher.dispatch_command("remote", envelope)
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual(request.call_args_list[1].args[2:4], (
+            "GET", "/internal/v1/commands/command-1",
+        ))
+        self.assertEqual(request.call_args_list[2].args[2:5], (
+            "POST", "/internal/v1/commands", envelope,
+        ))
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_durable_dispatch_resolves_timeout_by_requerying_same_command(self, request):
+        capabilities = worker_contract_metadata()
+        capabilities["capabilities"].append(CAP_DURABLE_COMMANDS_V1)
+        request.side_effect = [
+            capabilities,
+            JsonHttpError(404, "missing"),
+            TimeoutError("response lost"),
+            {"status": "running"},
+        ]
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+        envelope = {
+            "command_id": "command-timeout",
+            "dispatch_token": "same-token",
+            "job": {"kind": "export", "payload": {}},
+        }
+
+        result = dispatcher.dispatch_command("remote", envelope)
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["replayed"])
+        self.assertEqual(request.call_args_list[2].args[4], envelope)
+        self.assertEqual(request.call_args_list[3].args[3], "/internal/v1/commands/command-timeout")
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_durable_dispatch_does_not_resend_a_known_terminal_command(self, request):
+        capabilities = worker_contract_metadata()
+        capabilities["capabilities"].append(CAP_DURABLE_COMMANDS_V1)
+        request.side_effect = [capabilities, {"status": "failed"}]
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        result = dispatcher.dispatch_command(
+            "remote",
+            {"command_id": "known-failed", "job": {"kind": "export", "payload": {}}},
+        )
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["replayed"])
+        self.assertEqual(request.call_count, 2)
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_durable_dispatch_rejects_worker_without_durable_capability(self, request):
+        request.return_value = worker_contract_metadata()
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        with self.assertRaises(DomainError) as raised:
+            dispatcher.dispatch_command(
+                "remote",
+                {"command_id": "legacy-worker", "job": {"kind": "export", "payload": {}}},
+            )
+
+        self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
+        self.assertIn(CAP_DURABLE_COMMANDS_V1, raised.exception.details["missing_capabilities"])
         self.assertEqual(request.call_count, 1)
 
     @patch("tme3bot.infrastructure.http_client.request_json")

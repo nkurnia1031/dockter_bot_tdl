@@ -34,7 +34,19 @@
 
   const activeStates = ['queued', 'dispatched', 'running', 'paused'];
   const active = (job: Job) => activeStates.includes(job.status);
-  const activeJobs = $derived(jobs.filter(active));
+  const activeJobs = $derived(jobs.filter(active).sort((left, right) => {
+    // Progress updates change updated_at, which must not move cards on each
+    // poll. Keep active jobs in FIFO creation order with a deterministic tie-break.
+    const leftCreatedAt = Date.parse(String(left.created_at || ''));
+    const rightCreatedAt = Date.parse(String(right.created_at || ''));
+    if (Number.isFinite(leftCreatedAt) && Number.isFinite(rightCreatedAt) && leftCreatedAt !== rightCreatedAt) {
+      return leftCreatedAt - rightCreatedAt;
+    }
+    if (Number.isFinite(leftCreatedAt) !== Number.isFinite(rightCreatedAt)) {
+      return Number.isFinite(leftCreatedAt) ? -1 : 1;
+    }
+    return String(left.id || '').localeCompare(String(right.id || ''));
+  }));
   const historyJobs = $derived(jobs.filter((job) => !active(job)));
   const newestFirst = (items: JobEvent[]) => [...items].sort((left, right) => Number(right.sequence || 0) - Number(left.sequence || 0));
   const milestones = $derived(newestFirst(events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type))));

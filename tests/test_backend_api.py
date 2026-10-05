@@ -423,6 +423,39 @@ class BackendApiTests(unittest.TestCase):
         capability = self.client.get("/api/v1/capabilities")
         self.assertIn("operations_v1", capability.json()["capabilities"])
 
+    def test_background_job_submit_is_accepted_without_worker_dispatch(self):
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        client = TestClient(create_backend_app(self.context))
+        auth = self.login(42)
+
+        response = client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "background-job-1"},
+            json={
+                "kind": "job.submit",
+                "target": {"profile": "default", "worker": "local"},
+                "input": {
+                    "job_kind": "export",
+                    "payload": {"url": "https://t.me/c/100/42"},
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertIn("job.submit", client.get("/api/v1/capabilities").json()["operations"]["supported_kinds"])
+        self.assertEqual(self.dispatcher.commands, [])
+        operation = self.operation_service.get(self.control.actor(42), response.json()["operation_id"])
+        job = self.jobs.get(operation.job_id)
+        self.assertEqual(operation.status.value, "queued")
+        self.assertEqual(job.status.value, "queued")
+        self.assertEqual(job.worker, "local")
+        self.assertEqual(self.jobs.command_payload(job.id)["dispatch_mode"], "durable")
+
+    def test_background_job_submit_is_not_advertised_without_queue(self):
+        capabilities = self.client.get("/api/v1/capabilities").json()
+        self.assertNotIn("job.submit", capabilities["operations"]["supported_kinds"])
+
     def test_trusted_device_routes_require_browser_csrf_and_hide_keys(self):
         private = Ed25519PrivateKey.generate()
         public = private.public_key().public_bytes(

@@ -238,3 +238,22 @@ class OperationsService:
         except DomainError:
             # A late or out-of-order job event cannot move a cancelling or terminal operation backwards.
             return
+
+    def mark_waiting_worker_for_job(self, job_id: str) -> None:
+        operation = self.store.get_by_job_id(str(job_id))
+        if operation is None or operation.status.terminal or operation.status in {
+            OperationStatus.CANCELLING, OperationStatus.NEEDS_RECONCILIATION,
+        }:
+            return
+        if operation.status == OperationStatus.WAITING_WORKER:
+            return
+        try:
+            self.store.transition_from_job(
+                operation.id,
+                expected_revision=operation.revision,
+                status=OperationStatus.WAITING_WORKER,
+                phase="waiting_worker",
+                safe_progress={"phase": "waiting_worker"},
+            )
+        except DomainError:
+            return

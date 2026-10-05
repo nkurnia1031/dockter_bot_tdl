@@ -425,6 +425,44 @@ class SqliteJobRepository:
                 (_dump(payload), job_id),
             )
 
+    def begin_durable_dispatch(self, job_id: str) -> bool:
+        """Atomically reserve the one-way boundary before a v2 worker request.
+
+        A cancellation can safely cancel a queued job before this boundary.
+        Once it is crossed, cancellation must be confirmed by the worker since
+        the command may already have been accepted.
+        """
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT j.status, c.payload AS command_payload, o.status AS operation_status
+                   FROM jobs AS j
+                   JOIN job_commands AS c ON c.job_id=j.id
+                   LEFT JOIN operations AS o ON o.job_id=j.id
+                   WHERE j.id=?""",
+                (str(job_id),),
+            ).fetchone()
+            if row is None or str(row["status"]) != JobStatus.QUEUED.value:
+                db.commit()
+                return False
+            if str(row["operation_status"] or "") in {
+                "cancelling", "cancelled", "succeeded", "failed", "needs_reconciliation"
+            }:
+                db.commit()
+                return False
+            payload = _load(row["command_payload"], None)
+            if not isinstance(payload, dict) or payload.get("dispatch_mode") != "durable":
+                db.commit()
+                return False
+            if not payload.get("dispatch_started"):
+                payload["dispatch_started"] = True
+                db.execute(
+                    "UPDATE job_commands SET payload=? WHERE job_id=?",
+                    (_dump(payload), str(job_id)),
+                )
+            db.commit()
+            return True
+
     def quickmode_limits(self, workers: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
         names = sorted({str(item).strip().lower() for item in workers if str(item).strip()})
         with self._db() as db:

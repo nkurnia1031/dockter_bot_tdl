@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import JobTable from './JobTable.svelte';
 
 describe('JobTable', () => {
@@ -48,6 +48,38 @@ describe('JobTable', () => {
     expect(await screen.findByText('Sedang berjalan')).toBeTruthy();
     expect(urls.some((url) => decodeURIComponent(url).includes('status=queued,dispatched,running,paused'))).toBe(true);
     expect(screen.queryByText('History terbaru')).toBeNull();
+  });
+
+  it('keeps active job order stable when polling returns a different update order', async () => {
+    const older = {
+      id: 'job-older', kind: 'utility', status: 'running', created_at: '2026-10-05T09:00:00Z',
+      updated_at: '2026-10-05T09:05:00Z', progress: { phase: 'compressing', message: 'Job lama' }
+    };
+    const newer = {
+      id: 'job-newer', kind: 'utility', status: 'running', created_at: '2026-10-05T09:01:00Z',
+      updated_at: '2026-10-05T09:04:00Z', progress: { phase: 'compressing', message: 'Job baru' }
+    };
+    let jobRequest = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs/metrics?')) return new Response(JSON.stringify({}), { status: 200 });
+      if (url.includes('/jobs?')) {
+        jobRequest += 1;
+        const items = jobRequest === 1 ? [newer, older] : [older, newer];
+        return new Response(JSON.stringify({ items }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    const { container } = render(JobTable, { scope: 'global', view: 'active' });
+    const order = () => Array.from(container.querySelectorAll('.idm-row b.truncate')).map((item) => item.textContent);
+
+    await screen.findByText('Job lama');
+    expect(order()).toEqual(['Job lama', 'Job baru']);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh monitor' }));
+    await waitFor(() => expect(jobRequest).toBe(2));
+    expect(order()).toEqual(['Job lama', 'Job baru']);
   });
 
   it('shows queue latency and worker activity from monitor metrics', async () => {

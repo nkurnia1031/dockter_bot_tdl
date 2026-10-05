@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
   import JobTable from './JobTable.svelte';
-  import { Activity, Archive, Boxes, Clock3, Database, HardDrive } from '@lucide/svelte';
+  import { Activity, Archive, ArrowUpRight, Boxes, Clock3, Database, HardDrive, KeyRound } from '@lucide/svelte';
 
   let data = $state<Record<string, any> | null>(null);
   let error = $state('');
@@ -28,6 +28,11 @@
 </header>
 
 {#if error}<div class="mt-6 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200">{error}</div>{/if}
+
+<a href="/decrypt/" class="record-card mt-6 flex flex-wrap items-center justify-between gap-4 border-violet-200 bg-violet-50/80 p-4 no-underline dark:border-violet-900 dark:bg-violet-950/40 sm:p-5">
+  <span class="flex min-w-0 items-center gap-3"><span class="grid size-11 shrink-0 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-900 dark:text-violet-200"><KeyRound size={20}/></span><span><b class="block text-sm font-extrabold text-[var(--ink)]">Dekripsi teks</b><span class="muted mt-1 block text-xs sm:text-sm">Buka alat dekripsi Safelink yang bekerja langsung di browser.</span></span></span>
+  <span class="inline-flex items-center gap-1 text-sm font-bold text-violet-700 dark:text-violet-200">Buka alat <ArrowUpRight size={16}/></span>
+</a>
 
 <div class="mt-7 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
   {#each Object.entries(data || {}) as [key, item], index}

@@ -11,6 +11,7 @@ WORKER_API_CONTRACT_VERSION = 1
 
 CAP_JOB_DISPATCH = "jobs.dispatch.v1"
 CAP_JOB_EVENTS = "jobs.events.v1"
+CAP_DURABLE_COMMANDS_V1 = "durable_commands_v1"
 CAP_JOB_CONTROL = "jobs.control.v1"
 CAP_JOB_LOG_SNAPSHOT = "jobs.log_snapshot.v1"
 CAP_WORKSPACE_TREE = "workspace.tree.v1"
@@ -34,6 +35,9 @@ WORKER_API_CAPABILITIES = frozenset(
     }
 )
 WORKER_JOB_CAPABILITIES = frozenset({CAP_JOB_DISPATCH, CAP_JOB_EVENTS})
+DURABLE_COMMAND_CAPABILITIES = frozenset(
+    {CAP_JOB_DISPATCH, CAP_JOB_EVENTS, CAP_DURABLE_COMMANDS_V1}
+)
 
 
 def worker_contract_metadata() -> dict[str, Any]:
