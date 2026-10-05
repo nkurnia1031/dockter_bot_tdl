@@ -27,19 +27,54 @@
   let notice = $state('');
   let copied = $state(false);
 
+  function readEncryptedValue(input: string): { value: string; fromParameter: boolean } {
+    const raw = input.trim();
+    const links = raw.match(/https?:\/\/[^\s)\]]+/gi) || [];
+
+    for (const link of links) {
+      try {
+        const url = new URL(link);
+        const fragment = url.hash.replace(/^#/, '');
+        const fragmentQuery = fragment.includes('?') ? fragment.slice(fragment.indexOf('?') + 1) : fragment;
+        const value = url.searchParams.get('o') || new URLSearchParams(fragmentQuery).get('o');
+        if (value !== null && value !== undefined) return { value, fromParameter: true };
+      } catch {
+        // A pasted Markdown link may contain punctuation around the URL; try the next match.
+      }
+    }
+
+    const parameter = raw.match(/(?:[?&#]|^)o=([^&#\s\])]+)/i);
+    if (parameter) {
+      let value = parameter[1];
+      try { value = decodeURIComponent(value.replace(/\+/g, ' ')); } catch { /* keep the copied value */ }
+      return { value, fromParameter: true };
+    }
+    if (links.length) throw new Error('URL tidak memiliki parameter o.');
+    return { value: raw.replace(/\s+/g, ''), fromParameter: false };
+  }
+
   function decrypt() {
     error = '';
     notice = '';
     plaintext = '';
     copied = false;
 
-    const value = encrypted.trim().replace(/\s+/g, '');
+    let input: { value: string; fromParameter: boolean };
+    try {
+      input = readEncryptedValue(encrypted);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Tidak dapat membaca input.';
+      return;
+    }
+    const value = input.value.replace(/\s+/g, '');
     if (!value) {
-      error = 'Masukkan teks terenkripsi terlebih dahulu.';
+      error = input.fromParameter ? 'Parameter o pada URL kosong.' : 'Masukkan teks terenkripsi atau URL Safelink terlebih dahulu.';
       return;
     }
     if (!/^[\da-f]+$/i.test(value) || value.length < 48 || (value.length - 16) % 32 !== 0) {
-      error = 'Format tidak valid. Masukkan hex: 16 karakter salt, diikuti ciphertext AES dalam blok 32 karakter.';
+      error = input.fromParameter
+        ? 'Nilai parameter o bukan hex Safelink yang valid.'
+        : 'Format tidak valid. Masukkan hex: 16 karakter salt, diikuti ciphertext AES dalam blok 32 karakter.';
       return;
     }
 
@@ -51,7 +86,7 @@
         return;
       }
       plaintext = decoded;
-      notice = 'Dekripsi selesai di browser ini.';
+      notice = input.fromParameter ? 'Parameter o ditemukan dan berhasil didekripsi di browser ini.' : 'Dekripsi selesai di browser ini.';
     } catch {
       error = 'Dekripsi gagal. Periksa teks terenkripsi dan kecocokan kunci.';
     }
@@ -103,7 +138,7 @@
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div>
       <h2 id="decrypt-title" class="font-extrabold">Teks terenkripsi</h2>
-      <p class="muted mt-1 text-sm">Tempel nilai hex yang berisi salt dan ciphertext.</p>
+      <p class="muted mt-1 text-sm">Tempel nilai hex langsung atau URL Safelink; jika berupa URL, yang diproses hanya parameter <code>o</code>.</p>
     </div>
     <button class="button secondary" type="button" onclick={fillExample}><RotateCcw size={15}/>Isi contoh</button>
   </div>
