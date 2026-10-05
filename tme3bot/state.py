@@ -26,6 +26,9 @@ class SourceState:
     warmup_url: str | None = None
     warmup_done: bool = False
     warmup_done_at: str | None = None
+    # Internal compare-and-swap revision. Kept out of to_dict() so the
+    # existing public and worker state payloads remain unchanged.
+    revision: int = 0
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "SourceState":

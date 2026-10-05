@@ -10,7 +10,7 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
     @app.get("/api/v1/sources", response_model=SourceListResponse)
     def list_sources(profile: str | None = None, actor=Depends(current_actor)):
         selected_profile = context.control_plane.require_profile(actor, profile)
-        store = context.profile_manager.runtime(selected_profile).state_store
+        store = context.profile_manager.state_store(selected_profile)
         return {
             "items": [
                 {"chat_ref": chat_ref, **source.to_dict()}
@@ -21,7 +21,7 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
     @app.get("/api/v1/sources/{chat_ref:path}", response_model=SourceResponse)
     def get_source(chat_ref: str, profile: str | None = None, actor=Depends(current_actor)):
         selected_profile = context.control_plane.require_profile(actor, profile)
-        source = context.profile_manager.runtime(selected_profile).state_store.get_source(chat_ref)
+        source = context.profile_manager.state_store(selected_profile).get_source(chat_ref)
         if source is None:
             raise DomainError("SOURCE_NOT_FOUND", "Source tidak ditemukan.", status_code=404)
         return {"chat_ref": chat_ref, **source.to_dict()}
@@ -29,7 +29,7 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
     @app.delete("/api/v1/sources/{chat_ref:path}", response_model=ObjectResponse)
     def delete_source(chat_ref: str, profile: str | None = None, actor=Depends(current_actor)):
         selected_profile = context.control_plane.require_profile(actor, profile)
-        deleted = context.profile_manager.runtime(selected_profile).state_store.delete_source(chat_ref)
+        deleted = context.profile_manager.state_store(selected_profile).delete_source(chat_ref)
         return {"deleted": deleted}
 
     @app.patch("/api/v1/sources/{chat_ref:path}", response_model=SourceResponse)
@@ -37,7 +37,7 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
         chat_ref: str, body: SourceUpdateRequest, profile: str | None = None, actor=Depends(current_actor)
     ):
         selected_profile = context.control_plane.require_profile(actor, profile)
-        store = context.profile_manager.runtime(selected_profile).state_store
+        store = context.profile_manager.state_store(selected_profile)
         source = store.get_source(chat_ref)
         if source is None:
             raise DomainError(
@@ -55,7 +55,7 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
     @app.post("/api/v1/sources/batch-delete", response_model=ObjectResponse)
     def batch_delete_sources(body: BatchSourcesRequest, profile: str | None = None, actor=Depends(current_actor)):
         selected_profile = context.control_plane.require_profile(actor, profile)
-        deleted = context.profile_manager.runtime(selected_profile).state_store.delete_sources(body.chat_refs)
+        deleted = context.profile_manager.state_store(selected_profile).delete_sources(body.chat_refs)
         return {"deleted": deleted}
 
     @app.post("/api/v1/exports", response_model=JobResponse)

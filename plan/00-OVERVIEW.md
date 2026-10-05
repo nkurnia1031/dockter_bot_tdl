@@ -2,10 +2,10 @@
 
 ## Cara memakai paket
 
-Paket ini berisi 27 dokumen dengan 23 task implementasi (P0 dan 01–22); **belum ada task aplikasi yang dikerjakan**.
+Paket ini berisi 28 dokumen dengan 24 task implementasi (P0, P1, dan 01–22). Status dan hasil task aplikasi tercatat di [PROGRESS](PROGRESS.md).
 Agent pelaksana cukup membaca overview ini dan satu file task yang ditugaskan.
-Kerjakan [P0 — akses laptop tepercaya](00-PRIORITY-trusted-device-access.md) terlebih dahulu, sebelum 01; P0 mandiri tanpa Redis.
-Status dan hasil verifikasi berada di [PROGRESS](PROGRESS.md). Rekomendasi tambahan di [RECOMMENDATIONS](RECOMMENDATIONS.md), keputusan bersyarat di [OPEN-QUESTIONS](OPEN-QUESTIONS.md).
+Kerjakan [P0 — akses laptop tepercaya](00-PRIORITY-trusted-device-access.md) sebelum 01. Kerjakan [P1 — diagnosis dan pemulihan kesiapan TTS](03A-PRIORITY-tts-health-recovery.md) sesudah 03 dan sebelum 04; P1 tidak memerlukan Redis.
+Rekomendasi tambahan di [RECOMMENDATIONS](RECOMMENDATIONS.md), keputusan bersyarat di [OPEN-QUESTIONS](OPEN-QUESTIONS.md).
 Semua path source dalam task relatif terhadap root repository. Bahasa dokumentasi Indonesia.
 
 ## Baseline audit — 2026-10-04, Asia/Jakarta
@@ -74,6 +74,7 @@ root/.tdl dan user1/.tdl tetap terpisah; backend tidak menjalankan TDL. Web tida
 - Desired settings disimpan walau worker offline/busy; apply saat aman, ACK per versi. Job memakai snapshot config.
 - ENV runtime diimpor sekali, persisted wins, clear memakai tombstone. Rahasia encrypted/redacted; trust bootstrap tetap persisten.
 - TTS tetap dikirim melalui akun TDL profil aktif. Nama legacy TELEGRAM_TTS_CHAT_ID tidak mengembalikan pengiriman Bot API.
+- P1 menyediakan diagnosis per helper dan recovery Tor yang dipicu operator dari Workers Web tanpa Docker socket. Task berikutnya boleh mengubah implementasinya, tetapi wajib mempertahankan diagnosis, aksi recovery terbatas, auth, dan refresh manual; helper container yang tidak merespons tetap membutuhkan supervisor/operator host.
 - Static Web, auth actor/worker, batas /workspace dan aturan artifact missing tetap dipertahankan.
 
 ## Gerbang kompatibilitas dan migrasi
@@ -97,6 +98,7 @@ Task worker hanya mengiklankan capability setelah readiness nyata. Jangan menera
 - Baca git status/log/diff; pertahankan perubahan lokal. Tidak ada reset/clean massal atau commit/deploy otomatis.
 - Allowlist file dalam task bersifat lengkap. Modul baru ditentukan namanya; backend.py hanya wiring logika baru.
 - Jangan memperluas allowlist diam-diam. Jika prasyarat/kontrak tidak sesuai, catat task terblokir beserta bukti.
+- Jangan menghapus atau melemahkan kontrak P1 saat refactor worker, settings, queue, atau Web. Bila implementasi perlu dipindahkan ke operation background, pertahankan API/UX setara, batas helper yang sama, dan test kontraknya.
 - Pakai apply_patch, Python 3.10/Ubuntu 22.04, dataclass/type hints, domain/application/infrastructure dan test unittest yang ada.
 - Web memakai Svelte 5/TypeScript, Vitest, adapter static. Jangan menambah Next.js atau container web.
 - Data default /data; root untuk download, user1 untuk export/leave; jangan berbagi database Bolt aktif.
@@ -115,22 +117,23 @@ Task worker hanya mengiklankan capability setelah readiness nyata. Jangan menera
 | 01 | [Repository state backend dan pemisahan runtime profil](01-backend-source-state.md) | — |
 | 02 | [Inventarisasi dan migrasi state lama tanpa kehilangan progress](02-legacy-state-migration.md) | 01 |
 | 03 | [Operation persisten dan transactional outbox](03-durable-operations-outbox.md) | 01 |
-| 04 | [Redis privat dan proses RQ untuk orkestrasi](04-redis-rq-runtime.md) | 03 |
+| P1 | [Diagnosis dan pemulihan kesiapan helper TTS](03A-PRIORITY-tts-health-recovery.md) | 03; dikerjakan sebelum 04 |
+| 04 | [Redis privat dan proses RQ untuk orkestrasi](04-redis-rq-runtime.md) | 03, P1 |
 | 05 | [Penerimaan cepat dan kontrak dispatch berversi](05-background-dispatch-contract.md) | 03, 04 |
 | 06 | [Alias peer dan serialisasi export lintas worker](06-shared-export-cursor.md) | 01, 05 |
 | 07 | [Vault profil berversi dan kontrak tarik/ACK](07-versioned-profile-vault.md) | 03 |
-| 08 | [Konfigurasi terpusat, versi penerapan, dan rahasia](08-desired-runtime-settings.md) | 03 |
-| 09 | [Jurnal command worker dan outbox event persisten](09-worker-command-journal.md) | 05 |
+| 08 | [Konfigurasi terpusat, versi penerapan, dan rahasia](08-desired-runtime-settings.md) | 03, P1 |
+| 09 | [Jurnal command worker dan outbox event persisten](09-worker-command-journal.md) | P1, 05 |
 | 10 | [Tarik profil saat startup dan sinkronisasi manual](10-worker-profile-pull.md) | 07, 09 |
 | 11 | [Executor export memakai cursor bersama dan mengarsip state lokal](11-worker-export-state-cutover.md) | 02, 06, 09, 10 |
-| 12 | [Supervisor login TDL yang tidak bergantung pada browser](12-worker-login-supervisor.md) | 09, 10 |
+| 12 | [Supervisor login TDL yang tidak bergantung pada browser](12-worker-login-supervisor.md) | P1, 09, 10 |
 | 13 | [Workflow profil upload, login, adopsi, dan distribusi](13-background-profile-provisioning.md) | 07, 12 |
-| 14 | [Penerapan konfigurasi worker saat aman](14-worker-settings-apply.md) | 08, 09 |
+| 14 | [Penerapan konfigurasi worker saat aman](14-worker-settings-apply.md) | P1, 08, 09 |
 | 15 | [Bootstrap persisten dan reload client layanan](15-service-settings-reload.md) | P0, 08 |
 | 16 | [Aksi Quick Mode sebagai operation background](16-quickmode-background-actions.md) | 05, 09 |
 | 17 | [Pemeriksaan Storage, Utility, dan target melalui antrean](17-storage-utility-background-actions.md) | 05, 09 |
 | 18 | [Halaman Profil pulih setelah ditutup](18-web-profile-recovery.md) | 10, 13 |
-| 19 | [Monitor progress terpusat dan refresh berdasarkan aksi](19-web-operation-monitor.md) | P0, 16, 17, 18 |
-| 20 | [Pengaturan Web dengan desired/applied status](20-web-runtime-settings.md) | P0, 14, 15 |
+| 19 | [Monitor progress terpusat dan refresh berdasarkan aksi](19-web-operation-monitor.md) | P0, P1, 16, 17, 18 |
+| 20 | [Pengaturan Web dengan desired/applied status](20-web-runtime-settings.md) | P0, P1, 14, 15 |
 | 21 | [Penyederhanaan ENV dan inventaris pemakaian](21-env-cleanup-and-inventory.md) | 14, 15, 20 |
-| 22 | [Uji kegagalan lintas komponen dan panduan cutover](22-integration-and-rollout.md) | P0, 01–21 |
+| 22 | [Uji kegagalan lintas komponen dan panduan cutover](22-integration-and-rollout.md) | P0, P1, 01–21 |

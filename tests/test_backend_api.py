@@ -11,11 +11,13 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
+from tme3bot.application.operations import OperationsService, PreparedOperation
 from tme3bot.domain.models import Actor, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_links import sign_storage_item
@@ -48,6 +50,15 @@ class FakeDispatcher:
         self.commands = []
         self.storage_available = True
         self.tts_ready = False
+        self.tts_health_result = {
+            "helpers_ready": False,
+            "available_profiles": ["default"],
+            "helpers": [
+                {"slot": slot, "status": "tor_unreachable", "bootstrap_percent": None, "checked_at": "now"}
+                for slot in range(1, 4)
+            ],
+        }
+        self.tts_recoveries = []
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
         self.quick_deletions = []
@@ -71,6 +82,14 @@ class FakeDispatcher:
 
     def capabilities(self, worker):
         return {"capabilities": ["tts"] if self.tts_ready else []}
+
+    def tts_health(self, worker):
+        del worker
+        return dict(self.tts_health_result)
+
+    def recover_tts_helper(self, worker, slot):
+        self.tts_recoveries.append((worker, slot))
+        return {"accepted": True, "status": "restarting"}
 
     def worker_settings(self, worker):
         return dict(self.runtime_settings)
@@ -228,6 +247,7 @@ class BackendApiTests(unittest.TestCase):
         self.profiles.profile_registry = ProfileRegistry(root / "profiles.json", "default")
         self.dispatcher = FakeDispatcher()
         self.jobs = SqliteJobRepository(db)
+        self.operation_service = OperationsService(SqliteOperationStore(self.jobs))
         self.catalog = StorageCatalog(db)
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
@@ -310,6 +330,7 @@ class BackendApiTests(unittest.TestCase):
             device_auth=DeviceAuthService(
                 self.auth_repository, self.auth, "https://ui.example.test"
             ),
+            operation_service=self.operation_service,
         )
         self.context = context
         self.client = TestClient(create_backend_app(context))
@@ -340,6 +361,67 @@ class BackendApiTests(unittest.TestCase):
         self.client.cookies.set("tme3_refresh", pair.refresh_token)
         self.client.cookies.set("tme3_csrf", csrf)
         return {"Origin": "http://testserver", "X-CSRF-Token": csrf}
+
+    def test_operations_api_is_idempotent_private_and_actor_scoped(self):
+        def prepare(actor, target, input_data):
+            return PreparedOperation(
+                profile=actor.profile,
+                target={"worker": "local"},
+                private_payload={"text": input_data["text"]},
+            )
+
+        self.operation_service.register_handler("test.echo", prepare)
+        auth = self.login(42)
+        submitted = self.client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "operation-submit-1"},
+            json={"kind": "test.echo", "target": {"worker": "ignored"}, "input": {"text": "private-operation-text"}},
+        )
+        self.assertEqual(submitted.status_code, 202)
+        operation_id = submitted.json()["operation_id"]
+        self.assertEqual(submitted.headers["location"], f"/api/v1/operations/{operation_id}")
+        self.assertNotIn("private-operation-text", submitted.text)
+        self.assertNotIn("input", submitted.json())
+        self.assertEqual(submitted.json()["status"], "queued")
+        self.assertEqual(submitted.json()["revision"], 1)
+        repeated = self.client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "operation-submit-1"},
+            json={"kind": "test.echo", "target": {"worker": "ignored"}, "input": {"text": "private-operation-text"}},
+        )
+        self.assertEqual(repeated.status_code, 202)
+        self.assertEqual(repeated.json()["operation_id"], operation_id)
+        collision = self.client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "operation-submit-1"},
+            json={"kind": "test.echo", "target": {"worker": "ignored"}, "input": {"text": "different-private-text"}},
+        )
+        self.assertEqual(collision.status_code, 409)
+        self.assertNotIn("different-private-text", collision.text)
+        self.assertEqual(self.client.get(f"/api/v1/operations/{operation_id}", headers=self.login(43)).status_code, 404)
+        listed = self.client.get("/api/v1/operations", headers=auth)
+        self.assertEqual([item["operation_id"] for item in listed.json()["items"]], [operation_id])
+        private = self.operation_service.store.get_private_payload(operation_id)
+        self.assertEqual(private, {"text": "private-operation-text"})
+
+    def test_operations_validation_redacts_rejected_input_and_kind_is_allowlisted(self):
+        auth = self.login(42)
+        malformed = self.client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "operation-invalid-1"},
+            json={"kind": "test.echo", "target": {}, "input": "do-not-echo-this-value"},
+        )
+        self.assertEqual(malformed.status_code, 422)
+        self.assertNotIn("do-not-echo-this-value", malformed.text)
+        unavailable = self.client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "operation-unavailable-1"},
+            json={"kind": "arbitrary.command", "target": {}, "input": {}},
+        )
+        self.assertEqual(unavailable.status_code, 422)
+        self.assertEqual(unavailable.json()["error"]["code"], "OPERATION_KIND_UNAVAILABLE")
+        capability = self.client.get("/api/v1/capabilities")
+        self.assertIn("operations_v1", capability.json()["capabilities"])
 
     def test_trusted_device_routes_require_browser_csrf_and_hide_keys(self):
         private = Ed25519PrivateKey.generate()
@@ -528,6 +610,68 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(enabled.status_code, 200)
         self.assertTrue(enabled.json()["enabled"])
+
+    def test_worker_tts_health_is_manual_authenticated_and_profile_scoped(self):
+        denied = self.client.get("/api/v1/workers/local/tts/health")
+        self.assertEqual(denied.status_code, 401)
+        headers = self.login()
+        self.dispatcher.tts_health_result = {
+            "helpers_ready": True,
+            "available_profiles": ["default"],
+            "helpers": [
+                {"slot": slot, "status": "ready", "bootstrap_percent": 100, "checked_at": "now", "url": "http://private-helper"}
+                for slot in range(1, 4)
+            ],
+        }
+        ready = self.client.get("/api/v1/workers/local/tts/health", headers=headers)
+        self.assertEqual(ready.status_code, 200, ready.text)
+        self.assertTrue(ready.json()["ready"])
+        self.assertTrue(ready.json()["profile_session_ready"])
+        self.assertNotIn("available_profiles", ready.json())
+        self.assertNotIn("private-helper", ready.text)
+
+        self.profiles.set_worker_route("default", "local")
+        self.dispatcher.tts_health_result["available_profiles"] = []
+        no_session = self.client.get("/api/v1/workers/local/tts/health", headers=headers)
+        self.assertFalse(no_session.json()["ready"])
+        self.assertTrue(no_session.json()["helpers_ready"])
+        self.assertFalse(no_session.json()["profile_session_ready"])
+
+    def test_worker_tts_helper_recovery_is_explicit_and_slot_limited(self):
+        headers = self.login()
+        denied = self.client.post("/api/v1/workers/local/tts/helpers/1/recover")
+        self.assertEqual(denied.status_code, 401)
+        accepted = self.client.post(
+            "/api/v1/workers/local/tts/helpers/2/recover", headers=headers
+        )
+        self.assertEqual(accepted.status_code, 202)
+        self.assertEqual(accepted.json(), {
+            "worker": "local", "slot": 2, "accepted": True, "status": "restarting",
+        })
+        self.assertEqual(self.dispatcher.tts_recoveries, [("local", 2)])
+        invalid = self.client.post(
+            "/api/v1/workers/local/tts/helpers/4/recover", headers=headers
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(self.dispatcher.tts_recoveries, [("local", 2)])
+
+    def test_worker_tts_recovery_forwards_helper_busy_without_internal_details(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        headers = self.login()
+        self.dispatcher.recover_tts_helper = lambda worker, slot: (_ for _ in ()).throw(
+            JsonHttpError(409, "Helper busy", {"error": {
+                "code": "TTS_HELPER_BUSY", "message": "Helper sedang memproses sintesis.",
+                "details": {"active_requests": 3, "worker_path": "/private/path"},
+            }})
+        )
+        response = self.client.post(
+            "/api/v1/workers/local/tts/helpers/1/recover", headers=headers
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "TTS_HELPER_BUSY")
+        self.assertNotIn("private/path", response.text)
+        self.assertNotIn("active_requests", response.text)
 
     def test_worker_storage_profile_can_be_read_and_updated_from_web(self):
         headers = self.login()

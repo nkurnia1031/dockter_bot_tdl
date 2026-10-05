@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, Path as ApiPath, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -104,6 +104,43 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             capabilities.append(CAP_TTS)
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
+
+    @app.get("/internal/v1/tts/health", dependencies=[Depends(authorize)])
+    def tts_health():
+        return context.executor.tts_health()
+
+    @app.post("/internal/v1/tts/helpers/{slot}/recover", dependencies=[Depends(authorize)])
+    def recover_tts_helper(slot: int = ApiPath(ge=1, le=3)):
+        try:
+            result = context.executor.recover_tts_helper(slot)
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            code = str(getattr(exc, "code", "TTS_HELPER_UNAVAILABLE"))
+            allowed = {
+                "TTS_HELPER_BUSY", "TTS_HELPER_ALREADY_READY", "TTS_RECOVERY_COOLDOWN",
+                "TTS_HELPER_RECOVERING", "TTS_HELPER_UNAVAILABLE", "TTS_HELPER_SLOT_INVALID",
+                "TTS_RECOVERY_REJECTED",
+            }
+            if code not in allowed:
+                code = "TTS_HELPER_UNAVAILABLE"
+            details = {}
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            if code == "TTS_RECOVERY_COOLDOWN" and isinstance(retry_after, int):
+                details["retry_after_seconds"] = retry_after
+            raise DomainError(
+                code,
+                {
+                    "TTS_HELPER_BUSY": "Helper sedang memproses sintesis.",
+                    "TTS_HELPER_ALREADY_READY": "Helper sudah siap.",
+                    "TTS_RECOVERY_COOLDOWN": "Tunggu sebelum meminta pemulihan lagi.",
+                    "TTS_HELPER_RECOVERING": "Pemulihan helper sedang berlangsung.",
+                    "TTS_HELPER_SLOT_INVALID": "Slot helper tidak valid.",
+                    "TTS_RECOVERY_REJECTED": "Helper menolak permintaan pemulihan.",
+                }.get(code, "Helper TTS tidak dapat dihubungi."),
+                status_code=int(status) if isinstance(status, int) and 400 <= status <= 599 else 503,
+                details=details,
+            ) from None
+        return {"accepted": True, "status": str(result.get("status") or "restarting")}
 
     @app.post("/internal/v1/profiles/validate", dependencies=[Depends(authorize)])
     async def validate_profile_session(request: Request):

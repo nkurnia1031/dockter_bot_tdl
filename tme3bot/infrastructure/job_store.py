@@ -73,6 +73,13 @@ class SqliteJobRepository:
             finally:
                 db.close()
 
+    @contextmanager
+    def unit_of_work(self):
+        """Expose one write transaction for multi-repository SQLite units."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            yield db
+
     def _initialize(self) -> None:
         with self._db() as db:
             db.executescript(
@@ -256,6 +263,47 @@ class SqliteJobRepository:
                 ),
             )
         return job
+
+    @staticmethod
+    def insert_prepared_job(
+        db: sqlite3.Connection,
+        job: Job,
+        execution_plan: dict[str, Any],
+        command_payload: dict[str, Any],
+    ) -> None:
+        """Insert a job, scheduler plan, and private command on a caller's transaction."""
+        db.execute(
+            """INSERT INTO jobs(
+                   id, kind, profile, actor_user_id, worker, status, payload,
+                   progress, result, error, archived_at, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                job.id, job.kind, job.profile, job.actor_user_id, job.worker,
+                job.status.value, _dump(job.payload), _dump(job.progress),
+                _dump(job.result) if job.result is not None else None,
+                _dump(job.error) if job.error is not None else None,
+                job.archived_at.isoformat() if job.archived_at else None,
+                job.created_at.isoformat(), job.updated_at.isoformat(),
+            ),
+        )
+        db.execute(
+            """INSERT INTO job_execution_plans(
+                   job_id, concurrency_keys, queue_group, priority, lane,
+                   queued_at, admitted_at, released_at, blocked_reason
+               ) VALUES(?, ?, ?, ?, ?, ?, NULL, NULL, NULL)""",
+            (
+                job.id,
+                _dump(execution_plan.get("resource_keys", [])),
+                str(execution_plan.get("queue_group", "")),
+                int(execution_plan.get("priority", 100)),
+                str(execution_plan.get("lane", "unknown")),
+                str(execution_plan.get("queued_at") or datetime.now(timezone.utc).isoformat()),
+            ),
+        )
+        db.execute(
+            "INSERT INTO job_commands(job_id, payload) VALUES(?, ?)",
+            (job.id, _dump(command_payload)),
+        )
 
     def get(self, job_id: str) -> Job | None:
         with self._db() as db:

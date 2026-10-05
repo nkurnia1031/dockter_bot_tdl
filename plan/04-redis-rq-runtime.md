@@ -8,13 +8,13 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task 03 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task 03 dan P1 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah. Task 04 tidak boleh dimulai sebelum P1 selesai.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
 ## Konteks khusus task
 
-Belum ada Redis/RQ pada requirements. Dockerfile memakai runtime-base dengan dependency dari Dockerfile.base. Gateway menjalankan backend, telegram dan worker-local; remote worker harus tetap HTTP dan tidak memperoleh koneksi Redis.
+Belum ada Redis/RQ pada requirements. Dockerfile memakai runtime-base dengan dependency dari Dockerfile.base. Gateway menjalankan backend, telegram dan worker-local; remote worker harus tetap HTTP dan tidak memperoleh koneksi Redis. P1 menambahkan diagnosis/recovery helper TTS melalui Worker API; queue tidak boleh menghapus atau melemahkan kontrol Workers Web, auth, atau refresh manual tersebut.
 
 ## File yang disentuh
 
@@ -59,7 +59,7 @@ Internal POST /internal/v1/queue/commands/{id}/advance memerlukan service auth d
 Kerjakan HANYA task 04: Redis privat dan proses RQ untuk orkestrasi.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 03.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 03 dan P1.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.

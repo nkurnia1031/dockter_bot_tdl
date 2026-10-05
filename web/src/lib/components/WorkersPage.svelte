@@ -27,6 +27,9 @@
     newnym_after_retries: string;
   };
   type WorkerOpsDraft = { job_stall: string; export_stall: string; download_stall: string };
+  type TtsHelperStatus = 'ready' | 'bootstrapping' | 'tor_unreachable' | 'helper_unreachable';
+  type TtsHelper = { slot: number; status: TtsHelperStatus; bootstrap_percent: number | null; checked_at: string | null };
+  type TtsHealth = { worker: string; ready: boolean; helpers_ready: boolean; profile_session_ready: boolean; helpers: TtsHelper[] };
   let workers = $state<Worker[]>([]);
   let name = $state(''); let url = $state(''); let token = $state(''); let message = $state('');
   let editing = $state<Worker|null>(null); let deleting = $state<Worker|null>(null); let editOpen = $state(false); let deleteOpen = $state(false); let editUrl = $state(''); let editToken = $state('');
@@ -37,6 +40,9 @@
   let opsDrafts = $state<Record<string, WorkerOpsDraft>>({});
   let settingsLoading = $state<Record<string, boolean>>({});
   let settingsSaving = $state<Record<string, boolean>>({});
+  let ttsHealth = $state<Record<string, TtsHealth>>({});
+  let ttsHealthLoading = $state<Record<string, boolean>>({});
+  let ttsRecoveryLoading = $state<Record<string, number | null>>({});
   async function load() { try { workers = (await api<{items:Worker[]}>('/workers')).items || []; } catch (cause) { message = cause instanceof Error ? cause.message : 'Worker gagal dimuat.'; } }
   async function add() { await post('/workers', { name, url, token }); name = url = token = ''; message = 'Worker ditambahkan.'; await load(); }
   async function select(worker: Worker) {
@@ -154,6 +160,52 @@
       settingsSaving = { ...settingsSaving, [worker.name]: false };
     }
   }
+  async function refreshTtsHealth(worker: Worker) {
+    ttsHealthLoading = { ...ttsHealthLoading, [worker.name]: true };
+    try {
+      ttsHealth = {
+        ...ttsHealth,
+        [worker.name]: await api<TtsHealth>(`/workers/${encodeURIComponent(worker.name)}/tts/health`),
+      };
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : `Diagnosis TTS ${worker.name} gagal dimuat.`;
+    } finally {
+      ttsHealthLoading = { ...ttsHealthLoading, [worker.name]: false };
+    }
+  }
+  async function recoverTtsHelper(worker: Worker, slot: number) {
+    ttsRecoveryLoading = { ...ttsRecoveryLoading, [worker.name]: slot };
+    try {
+      await post(`/workers/${encodeURIComponent(worker.name)}/tts/helpers/${slot}/recover`, {});
+      message = `Pemulihan Tor helper ${slot} pada ${worker.name} dimulai. Periksa ulang status secara manual.`;
+      const current = ttsHealth[worker.name];
+      if (current) {
+        ttsHealth = {
+          ...ttsHealth,
+          [worker.name]: {
+            ...current,
+            ready: false,
+            helpers_ready: false,
+            helpers: current.helpers.map((helper) => helper.slot === slot
+              ? { ...helper, status: 'bootstrapping', bootstrap_percent: 0 }
+              : helper),
+          },
+        };
+      }
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : `Pemulihan helper ${slot} gagal dimulai.`;
+    } finally {
+      ttsRecoveryLoading = { ...ttsRecoveryLoading, [worker.name]: null };
+    }
+  }
+  function ttsStatusLabel(status: TtsHelperStatus): string {
+    return {
+      ready: 'Siap',
+      bootstrapping: 'Tor sedang memulai',
+      tor_unreachable: 'Tor tidak terjangkau',
+      helper_unreachable: 'Helper tidak terjangkau',
+    }[status];
+  }
   async function update() { if (!editing) return; await put(`/workers/${encodeURIComponent(editing.name)}`, { url: editUrl, token: editToken }); editing = null; editOpen = false; await load(); }
   async function destroy() { if (!deleting) return; await remove(`/workers/${encodeURIComponent(deleting.name)}`); deleting = null; deleteOpen = false; await load(); }
   onMount(() => {
@@ -172,7 +224,7 @@
     {#each workers as worker}
       <div class="border-b border-[var(--line)] last:border-0">
         <article class="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
-          <div class="min-w-0"><div class="flex items-center gap-2"><b>{worker.name}</b>{#if worker.selected}<span class="badge succeeded">Route aktif</span>{/if}{#if worker.enabled === false}<span class="badge failed">Nonaktif</span>{:else}<span class="badge">Siap</span>{/if}</div><p class="muted mt-1 truncate text-sm">{worker.url}</p><p class="muted mt-1 text-xs">{worker.enabled === false ? 'Tidak menerima job baru; job lama tidak dihentikan.' : 'Dapat menerima job baru.'}</p></div>
+          <div class="min-w-0"><div class="flex items-center gap-2"><b>{worker.name}</b>{#if worker.selected}<span class="badge succeeded">Route aktif</span>{/if}{#if worker.enabled === false}<span class="badge failed">Nonaktif</span>{:else}<span class="badge">Aktif</span>{/if}</div><p class="muted mt-1 truncate text-sm">{worker.url}</p><p class="muted mt-1 text-xs">{worker.enabled === false ? 'Tidak menerima job baru; job lama tidak dihentikan.' : 'Admission job aktif; kesiapan TTS diperiksa terpisah.'}</p></div>
           <div class="flex flex-wrap gap-2"><button class="button secondary" onclick={() => select(worker)} disabled={worker.selected || worker.enabled === false}><CheckCircle2 size={15}/>Pilih</button><button class={`button ${worker.enabled === false ? '' : 'danger'}`} onclick={() => toggle(worker)}>{worker.enabled === false ? 'Aktifkan' : 'Nonaktifkan'}</button><button class="button secondary" onclick={() => toggleSettings(worker)}><Settings2 size={15}/>{settingsOpen === worker.name ? 'Tutup' : 'Runtime'}</button><button class="button secondary" onclick={() => { editing = worker; editUrl = worker.url; editToken = ''; editOpen = true; }}><Pencil size={15}/>Edit</button><button class="button ghost text-rose-600" onclick={() => { deleting = worker; deleteOpen = true; }}><Trash2 size={15}/></button></div>
         </article>
         {#if settingsOpen === worker.name}
@@ -198,6 +250,30 @@
               {#if tts}
                 <div class="mt-6 border-t border-[var(--line)] pt-5">
                   <div><h4 class="text-sm font-extrabold">Mesin TTS</h4><p class="muted mt-1 text-xs">Setiap helper menjalankan Tor lokal. Worker memakai endpoint internal helper untuk pemeriksaan kesiapan dan rotasi circuit.</p></div>
+                  <div class="mt-4 rounded-xl border border-[var(--line)] p-4">
+                    <div class="flex flex-wrap items-center justify-between gap-3">
+                      <div><h5 class="text-sm font-bold">Diagnosis kesiapan</h5><p class="muted mt-1 text-xs">Pemeriksaan hanya berjalan saat diminta. Status sesi profil terpisah dari status helper.</p></div>
+                      <button class="button secondary" onclick={() => refreshTtsHealth(worker)} disabled={ttsHealthLoading[worker.name]} aria-label={`Periksa ulang TTS ${worker.name}`}><RefreshCw size={15}/>{ttsHealthLoading[worker.name] ? 'Memeriksa...' : 'Periksa ulang'}</button>
+                    </div>
+                    {#if ttsHealth[worker.name]}
+                      {@const health = ttsHealth[worker.name]}
+                      <p class="muted mt-3 text-xs">Sesi profil aktif: {health.profile_session_ready ? 'tersedia' : 'belum tersedia pada worker ini'} · Kesiapan helper: {health.helpers_ready ? 'siap' : 'belum siap'}</p>
+                      <div class="mt-3 grid gap-2 sm:grid-cols-3">
+                        {#each health.helpers as helper (helper.slot)}
+                          <div class="rounded-lg bg-[var(--panel)] p-3" data-testid={`tts-helper-${worker.name}-${helper.slot}`}>
+                            <div class="flex items-center justify-between gap-2"><b class="text-sm">Helper {helper.slot}</b><span class="text-xs font-semibold">{ttsStatusLabel(helper.status)}</span></div>
+                            {#if helper.status === 'bootstrapping'}<p class="muted mt-1 text-xs">{helper.bootstrap_percent === null ? 'Menunggu Tor aktif' : `Bootstrap ${helper.bootstrap_percent}%`}</p>{/if}
+                            {#if helper.status === 'helper_unreachable'}<p class="muted mt-1 text-xs">Helper tidak merespons. Restart container perlu dilakukan operator pada host.</p>{/if}
+                            {#if helper.status === 'tor_unreachable' || helper.status === 'bootstrapping'}
+                              <button class="button secondary mt-2 !px-3 !py-2 text-xs" onclick={() => recoverTtsHelper(worker, helper.slot)} disabled={ttsRecoveryLoading[worker.name] !== undefined && ttsRecoveryLoading[worker.name] !== null} aria-label={`Pulihkan helper ${helper.slot} ${worker.name}`}>{ttsRecoveryLoading[worker.name] === helper.slot ? 'Meminta pemulihan...' : 'Pulihkan Tor'}</button>
+                            {/if}
+                          </div>
+                        {/each}
+                      </div>
+                    {:else}
+                      <p class="muted mt-3 text-sm">Belum diperiksa.</p>
+                    {/if}
+                  </div>
                   <div class="mt-4 grid gap-3 lg:grid-cols-2">
                     <label class="text-sm font-bold">URL tiga helper gTTS<textarea class="field mt-2 min-h-20" value={tts.helper_urls} oninput={(event) => updateTtsDraft(worker, { helper_urls: event.currentTarget.value })} placeholder="http://tts-1:5000, http://tts-2:5000, http://tts-3:5000"></textarea></label>
                     <label class="text-sm font-bold">Retry per bagian<input class="field mt-2" type="number" min="0" max="10" value={tts.part_retries} oninput={(event) => updateTtsDraft(worker, { part_retries: event.currentTarget.value })}/></label>

@@ -9,6 +9,7 @@ import uvicorn
 from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.application.control_plane import ControlPlane
+from tme3bot.application.operations import OperationsService
 from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
@@ -16,6 +17,11 @@ from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.source_store import (
+    SqliteProfileStateStore,
+    SqliteSourceRepository,
+)
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
@@ -78,7 +84,13 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         bootstrap_endpoints,
         bootstrap_tokens,
     )
-    profiles = ProfileManager(config, registry)
+    source_repository = SqliteSourceRepository(config.storage_db_file)
+    profiles = ProfileManager(
+        config,
+        registry,
+        source_repository=source_repository,
+        source_state_store_factory=SqliteProfileStateStore,
+    )
     profiles.profile_registry.bootstrap_from_identities(
         {
             item["name"]: item.get("telegram_user_id")
@@ -88,6 +100,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
+    operation_service = OperationsService(SqliteOperationStore(jobs))
     dispatcher = WorkerHttpDispatcher(registry)
     profile_provisioner = ProfileProvisioningService(
         ProfileProvisioningStore(
@@ -117,6 +130,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         job_stall_timeout_seconds=config.job_stall_timeout_seconds,
         job_cancel_grace_seconds=config.job_cancel_grace_seconds,
     )
+    control_plane.add_event_observer(operation_service.on_job_event)
     control_plane.start_scheduler()
     auth_repository = SqliteAuthRepository(config.storage_db_file)
     auth = BotAuthService(
@@ -196,6 +210,8 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         backup_scheduler=scheduler,
         profile_provisioner=profile_provisioner,
         device_auth=device_auth,
+        source_repository=source_repository,
+        operation_service=operation_service,
     )
     return context, scheduler
 

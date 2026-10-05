@@ -1,6 +1,6 @@
 # Progres implementasi
 
-Status awal: seluruh 23 task (P0 dan 01–22) **belum**. Dokumen rencana telah disusun, tetapi aplikasi belum diubah oleh paket ini.
+Paket memuat 24 task (P0, P1, dan 01–22). Status pada tabel mencerminkan pekerjaan yang sudah diverifikasi; P1 ditambahkan sebagai prioritas sesudah 03 dan sebelum 04.
 Tanggal memakai Asia/Jakarta. Agent hanya memperbarui baris task yang ditugaskan setelah verifikasi.
 
 Status yang diizinkan: `belum`, `sedang`, `selesai`, `terblokir`.
@@ -9,10 +9,11 @@ Catatan berisi ringkasan perubahan, perintah/hasil test, tool tidak tersedia, ba
 | ID | Dokumen | Status | Catatan | Tanggal |
 |---|---|---|---|---|
 | P0 | [00-PRIORITY-trusted-device-access.md](00-PRIORITY-trusted-device-access.md) | selesai | Ditambahkan runner Playwright yang mengimpor storage state, menghapusnya setelah import, membatasi trafik ke origin terdaftar, serta test HTTPS lokal Chrome: sesi berhasil lalu ditolak setelah revoke. E2E 1/1 lulus dengan TLS verification dan Secure cookie aktif. Perbaikan ACL memastikan credential DPAPI tetap terbaca setelah pembuatan folder state. Regresi P0 69 test: 68 lulus, 1 E2E dilewati pada run default; compileall dan diff-check lulus. Verifikasi UI pnpm check/test/build sudah lulus pada sesi implementasi P0 sebelumnya. Suite penuh sebelumnya memiliki 5 error fixture URL `@bot` lama di `test_service`, 1 skip. Tidak ada akses/registrasi/deploy production; task 01 belum dimulai. | 2026-10-04 |
-| 01 | [01-backend-source-state.md](01-backend-source-state.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |
-| 02 | [02-legacy-state-migration.md](02-legacy-state-migration.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |
-| 03 | [03-durable-operations-outbox.md](03-durable-operations-outbox.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |
-| 04 | [04-redis-rq-runtime.md](04-redis-rq-runtime.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |
+| 01 | [01-backend-source-state.md](01-backend-source-state.md) | selesai | Ditambahkan `SourceRepository` dan SQLite adapter transaksional dengan revision/CAS, peer columns, serta gate metadata yang default-nya nonaktif; state JSON tetap fallback sampai task 02 migrasi sukses. Profile state kini dapat diakses tanpa membangun runtime TDL; kontrak `SourceState`/HTTP payload tetap sama. 32 test task dan 48 test backend API lulus; compileall serta diff-check lulus. Belum deploy atau migrasi data. | 2026-10-05 |
+| 02 | [02-legacy-state-migration.md](02-legacy-state-migration.md) | selesai | Ditambahkan CLI snapshot offline untuk inventory, plan, dry-run/commit, dan export-legacy; conflict tanpa bukti export sukses serta artifact terkait ditahan, checksum/revision diperiksa, ledger dan perubahan source atomik, replay identik no-op. Backup gateway kini memuat snapshot SQL source dan migration ledger. 16 test migrasi/source-store/backup lulus; compileall, diff-check, dan graphify update lulus. Hanya fixture sementara; tidak dijalankan migrasi produksi. | 2026-10-05 |
+| 03 | [03-durable-operations-outbox.md](03-durable-operations-outbox.md) | selesai | Ditambahkan lifecycle operation SQLite, payload privat terpisah, attempt/idempotency, transactional outbox, API actor-scoped, adapter event job, serta insert job+execution plan+operation+outbox atomik. Test terarah 70/70 lulus; compileall dan diff-check lulus; `graphify update .` selesai (dengan warning parser pada file Svelte yang tidak terkait). Belum ada handler operation yang didaftarkan (`supported_kinds` kosong), sehingga submit kind baru tetap ditolak terstruktur sampai task lanjutan memasang handler. Tidak ada deployment atau perubahan data production. | 2026-10-05 |
+| P1 | [03A-PRIORITY-tts-health-recovery.md](03A-PRIORITY-tts-health-recovery.md) | selesai | Diagnosis empat status helper, refresh manual, pemulihan Tor terbatas dengan busy guard/coalescing/cooldown. Seluruh test API/worker dan TTS lulus, termasuk tambahan test diagnosis/capability; 39 test Web, check/build, compileall, dan graphify lulus. Docker image belum dibangun karena Docker CLI tidak tersedia. | 2026-10-05 |
+| 04 | [04-redis-rq-runtime.md](04-redis-rq-runtime.md) | belum | Menunggu implementasi dan verifikasi P1. | 2026-10-04 |
 | 05 | [05-background-dispatch-contract.md](05-background-dispatch-contract.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |
 | 06 | [06-shared-export-cursor.md](06-shared-export-cursor.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |
 | 07 | [07-versioned-profile-vault.md](07-versioned-profile-vault.md) | belum | Menunggu implementasi dan verifikasi. | 2026-10-04 |

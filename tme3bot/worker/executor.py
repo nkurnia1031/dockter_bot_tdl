@@ -609,11 +609,17 @@ class WorkerJobExecutor(
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
         tts_ready = False
-        tts_profiles: list[str] = []
+        tts_health: dict[str, Any] = {
+            "helpers_ready": False,
+            "helpers": [
+                {"slot": slot, "status": "helper_unreachable", "bootstrap_percent": None, "checked_at": None}
+                for slot in range(1, 4)
+            ],
+        }
+        tts_profiles = self.available_storage_profiles()
         try:
-            tts_ready = self._tts_pipeline().ready()
-            if tts_ready:
-                tts_profiles = self.available_storage_profiles()
+            tts_health = self.tts_health()
+            tts_ready = bool(tts_health.get("helpers_ready")) and bool(tts_profiles)
         except Exception:
             tts_ready = False
         return {
@@ -624,6 +630,7 @@ class WorkerJobExecutor(
             "workspace": Path(getattr(self.config, "utility_workspace_root", "/workspace")).is_dir(),
             "tts": tts_ready,
             "tts_profiles": tts_profiles,
+            "tts_health": tts_health,
         }
 
     def storage_profile(self) -> str:

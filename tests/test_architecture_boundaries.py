@@ -67,6 +67,14 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         ):
             self.assertNotIn(field, fields)
 
+    def test_source_metadata_routes_do_not_construct_profile_tdl_runtime(self):
+        routes = ROOT / "api" / "routes" / "sources.py"
+        backend = ROOT / "api" / "backend.py"
+        self.assertNotIn("profile_manager.runtime(", routes.read_text(encoding="utf-8"))
+        self.assertNotIn("profile_manager.runtime(", backend.read_text(encoding="utf-8"))
+        self.assertIn("profile_manager.state_store(", routes.read_text(encoding="utf-8"))
+        self.assertIn("profile_manager.state_store(", backend.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

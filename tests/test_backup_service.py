@@ -8,6 +8,7 @@ from unittest.mock import patch
 from tme3bot.backup_service import BackupService
 from tme3bot.config import AppConfig
 from tme3bot.storage_catalog import StorageCatalog
+from tme3bot.infrastructure.source_store import SqliteSourceRepository
 
 
 def make_config(root: Path) -> AppConfig:
@@ -41,6 +42,18 @@ class BackupServiceTests(unittest.TestCase):
             vault_key.write_bytes(b"encrypted-session-vault-test-key")
             (root / "utility_settings.json").write_text(json.dumps({"compress_password": "secret"}), encoding="utf-8")
             catalog = StorageCatalog(root / "storage.db")
+            source_repository = SqliteSourceRepository(root / "storage.db")
+            source_repository.apply_migration_plan(
+                migration_id="backup-test-migration", plan_sha256="a" * 64,
+                backup_sha256="b" * 64,
+                rows=[{
+                    "profile": "default", "chat_ref": "channel", "decision": "cursor=keep_backend",
+                    "status": "approved", "cursor_before": None, "cursor_after": 42,
+                    "expected_revision": 0, "input_sha256": "c" * 64,
+                    "label": "channel", "updated_at": "2026-10-05T00:00:00+00:00",
+                    "warmup_url": None, "warmup_done": True, "warmup_done_at": None,
+                }],
+            )
             service = BackupService(config, catalog)
             staging = root / "staging"
             with patch.dict("os.environ", {"BOT_TOKEN": "bot-secret"}, clear=False):
@@ -48,6 +61,9 @@ class BackupServiceTests(unittest.TestCase):
                 service._write_runtime_env(staging)
                 service._write_manifest(staging, "run", "gateway", "now")
             self.assertTrue((staging / "data/storage.db").exists())
+            source_state_backup = json.loads((staging / "data/source-state-backup.json").read_text(encoding="utf-8"))
+            self.assertEqual(source_state_backup["sources"][0]["last_id"], 42)
+            self.assertEqual(source_state_backup["ledger"][0]["migration_id"], "backup-test-migration")
             self.assertEqual(
                 (staging / "data/profile-vault/vault.key").read_bytes(),
                 b"encrypted-session-vault-test-key",

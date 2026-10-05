@@ -14,6 +14,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 
 ## Konteks khusus task
 
+Task ini memakai WorkerHttpDispatcher yang juga membawa API diagnosis/recovery TTS P1. Pertahankan metode dispatcher tersebut dan jangan menggabungkan recovery Tor ke lifecycle upload/login/adopsi profil.
+
 upload()/start_login()/adopt pada profile_provisioning.py melakukan I/O worker di request. pending_operations hanya memasukkan validating/distributing; login_state() GET dapat memicu validating. Perubahan lokal sudah mengurangi polling tetapi belum memindahkan semua lifecycle.
 
 ## File yang disentuh

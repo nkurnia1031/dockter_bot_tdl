@@ -25,10 +25,12 @@ _TOR_LOCK = threading.Lock()
 
 
 class TtsError(RuntimeError):
-    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False):
+    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False, code: str = "TTS_ERROR", retry_after_seconds: int | None = None):
         super().__init__(message)
         self.status = status
         self.retryable = bool(retryable)
+        self.code = str(code)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class TtsCancelled(TtsError):
@@ -107,6 +109,7 @@ class TtsPipeline:
         request_timeout_seconds: float = 130,
         telegram_audio_safe_bytes: int = TELEGRAM_AUDIO_SAFE_BYTES,
         health_probe: Callable[[str], bool] | None = None,
+        diagnostic_probe: Callable[[str], dict[str, Any]] | None = None,
         tor_probe: Callable[[str, int], bool] | None = None,
         request_part: Callable[..., bytes] | None = None,
         renew_route: Callable[[int], bool] | None = None,
@@ -127,6 +130,18 @@ class TtsPipeline:
         self.request_timeout_seconds = max(1.0, float(request_timeout_seconds))
         self.telegram_audio_safe_bytes = max(1, int(telegram_audio_safe_bytes))
         self._health_probe = health_probe or self._probe_helper
+        if diagnostic_probe is not None:
+            self._diagnostic_probe = diagnostic_probe
+        elif health_probe is not None:
+            def legacy_probe(url: str) -> dict[str, Any]:
+                is_ready = bool(health_probe(url))
+                return {
+                    "status": "ready" if is_ready else "tor_unreachable",
+                    "bootstrap_percent": 100 if is_ready else None,
+                }
+            self._diagnostic_probe = legacy_probe
+        else:
+            self._diagnostic_probe = self._probe_helper_diagnostics
         self._tor_probe = tor_probe or self._probe_tor
         self._request_part = request_part or self._http_request_part
         self._renew_route = renew_route or self._renew_tor_route
@@ -144,12 +159,74 @@ class TtsPipeline:
         )
 
     def ready(self) -> bool:
+        health = self.diagnostics()
+        return bool(health["helpers_ready"])
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return fixed-slot helper health without exposing configured URLs."""
+        checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        helpers_by_slot: dict[int, dict[str, Any]] = {}
+        probes = {}
+        with ThreadPoolExecutor(max_workers=TTS_PARALLELISM, thread_name_prefix="tts-health") as pool:
+            for slot in range(1, min(len(self.helper_urls), TTS_PARALLELISM) + 1):
+                probes[pool.submit(self._diagnostic_probe, self.helper_urls[slot - 1])] = slot
+            for future in as_completed(probes):
+                slot = probes[future]
+                try:
+                    result = future.result()
+                except Exception:
+                    result = {"status": "helper_unreachable", "bootstrap_percent": None}
+                helpers_by_slot[slot] = result if isinstance(result, dict) else {"status": "helper_unreachable"}
+        helpers: list[dict[str, Any]] = []
+        for slot in range(1, TTS_PARALLELISM + 1):
+            result = helpers_by_slot.get(slot, {"status": "helper_unreachable", "bootstrap_percent": None})
+            status = str(result.get("status") or "helper_unreachable")
+            if status not in {"ready", "bootstrapping", "tor_unreachable", "helper_unreachable"}:
+                status = "helper_unreachable"
+            percent = result.get("bootstrap_percent")
+            if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
+                percent = None
+            if status in {"tor_unreachable", "helper_unreachable"}:
+                percent = None
+            helpers.append({"slot": slot, "status": status, "bootstrap_percent": percent, "checked_at": checked_at})
+        return {
+            "helpers_ready": len(self.helper_urls) == TTS_PARALLELISM
+            and all(item["status"] == "ready" for item in helpers),
+            "helpers": helpers,
+        }
+
+    def recover_helper(self, slot: int) -> dict[str, Any]:
+        if isinstance(slot, bool) or int(slot) < 1 or int(slot) > TTS_PARALLELISM:
+            raise TtsError("Slot helper TTS tidak valid", status=422, code="TTS_HELPER_SLOT_INVALID")
         if len(self.helper_urls) != TTS_PARALLELISM:
-            return False
-        # Each helper owns its Tor process and checks its local control port.
-        # The worker talks to the helper HTTP API instead of exposing an
-        # unauthenticated Tor control port on the Compose network.
-        return all(self._health_probe(url) for url in self.helper_urls)
+            raise TtsError("Konfigurasi tiga helper TTS belum tersedia", status=503, code="TTS_HELPER_UNAVAILABLE")
+        request = urllib.request.Request(self.helper_urls[int(slot) - 1] + "/recover-tor", method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                raw = response.read()
+                payload = json.loads(raw.decode("utf-8")) if raw else {}
+                if response.status != 202 or not payload.get("accepted"):
+                    raise TtsError("Helper TTS menolak pemulihan", status=response.status, code="TTS_RECOVERY_REJECTED")
+                return {"accepted": True, "status": "restarting"}
+        except urllib.error.HTTPError as exc:
+            try:
+                payload = json.loads(exc.read().decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = {}
+            error = str(payload.get("error") or "TTS_RECOVERY_REJECTED")
+            retry_after = payload.get("retry_after_seconds")
+            code = error if error in {
+                "TTS_HELPER_BUSY", "TTS_HELPER_ALREADY_READY", "TTS_RECOVERY_COOLDOWN",
+                "TTS_HELPER_RECOVERING", "TTS_HELPER_UNAVAILABLE",
+            } else "TTS_RECOVERY_REJECTED"
+            raise TtsError(
+                "Helper TTS menolak pemulihan",
+                status=int(exc.code),
+                code=code,
+                retry_after_seconds=int(retry_after) if isinstance(retry_after, int) and retry_after > 0 else None,
+            ) from None
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+            raise TtsError("Helper TTS tidak dapat dihubungi", status=503, code="TTS_HELPER_UNAVAILABLE") from None
 
     @staticmethod
     def _probe_helper(url: str) -> bool:
@@ -158,6 +235,17 @@ class TtsPipeline:
                 return response.status == 200
         except Exception:
             return False
+
+    @staticmethod
+    def _probe_helper_diagnostics(url: str) -> dict[str, Any]:
+        try:
+            with urllib.request.urlopen(url + "/diagnostics", timeout=2) as response:
+                if response.status != 200:
+                    return {"status": "helper_unreachable", "bootstrap_percent": None}
+                payload = json.loads(response.read().decode("utf-8"))
+                return payload if isinstance(payload, dict) else {"status": "helper_unreachable"}
+        except Exception:
+            return {"status": "helper_unreachable", "bootstrap_percent": None}
 
     @staticmethod
     def _probe_tor(host: str, port: int) -> bool:

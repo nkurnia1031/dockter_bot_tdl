@@ -13,6 +13,10 @@ from tme3bot.profiles import (
     ProfileManager,
     build_profile_runtime,
 )
+from tme3bot.infrastructure.source_store import (
+    SqliteProfileStateStore,
+    SqliteSourceRepository,
+)
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.state import HttpStateStore, StateStore
 
@@ -145,6 +149,35 @@ class ProfileTests(unittest.TestCase):
             config = replace(self.make_config(root), backend_api_url="http://backend:8080")
             runtime = build_profile_runtime("default", config)
             self.assertIsInstance(runtime.state_store, StateStore)
+
+    def test_metadata_state_access_does_not_construct_tdl_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(self.make_config(root), app_role="backend")
+            repository = SqliteSourceRepository(root / "backend.db")
+            manager = ProfileManager(
+                config,
+                source_repository=repository,
+                source_state_store_factory=SqliteProfileStateStore,
+            )
+
+            with patch(
+                "tme3bot.profiles.build_profile_runtime",
+                side_effect=AssertionError("metadata access built a TDL runtime"),
+            ):
+                legacy_store = manager.state_store("default")
+                legacy_store.upsert_source("@archive", "label", 10)
+                self.assertIsInstance(legacy_store, StateStore)
+                self.assertEqual(legacy_store.get_source("archive").last_id, 10)
+
+                repository.set_enabled(True)
+                backend_store = manager.state_store("default")
+                self.assertIsInstance(backend_store, SqliteProfileStateStore)
+                backend_store.upsert_source("@archive", None, 11)
+                self.assertEqual(backend_store.get_source("archive").last_id, 11)
+
+            self.assertIsNot(legacy_store, backend_store)
+            self.assertEqual(legacy_store.get_source("archive").last_id, 10)
 
     def test_export_and_download_use_distinct_tdl_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -13,6 +13,7 @@ class FakeExecutor:
         self.commands = []
         self.deleted_stages = []
         self.tts_ready = False
+        self.tts_helper_recoveries = []
         self.artifact_file = None
         self.runtime_updates = []
         self.worker_api_token = "worker-secret"
@@ -34,6 +35,20 @@ class FakeExecutor:
 
     def capabilities(self):
         return {"profiles": ["default"], "tts": self.tts_ready}
+
+    def tts_health(self):
+        return {
+            "helpers_ready": self.tts_ready,
+            "available_profiles": ["default"],
+            "helpers": [
+                {"slot": slot, "status": "ready" if self.tts_ready else "tor_unreachable", "bootstrap_percent": 100 if self.tts_ready else None, "checked_at": "now"}
+                for slot in range(1, 4)
+            ],
+        }
+
+    def recover_tts_helper(self, slot):
+        self.tts_helper_recoveries.append(slot)
+        return {"accepted": True, "status": "restarting"}
 
     def worker_settings(self):
         return dict(self.worker_settings_values)
@@ -196,6 +211,24 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.content, b"audio")
         self.assertIn("artifact-", audio.headers["content-disposition"])
+
+    def test_tts_health_and_helper_recovery_require_worker_auth(self):
+        denied = self.client.get("/internal/v1/tts/health")
+        self.assertEqual(denied.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        health = self.client.get("/internal/v1/tts/health", headers=headers)
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json()["helpers"][0]["status"], "tor_unreachable")
+        self.assertEqual(health.json()["available_profiles"], ["default"])
+        denied_recovery = self.client.post("/internal/v1/tts/helpers/1/recover")
+        self.assertEqual(denied_recovery.status_code, 401)
+        accepted = self.client.post("/internal/v1/tts/helpers/2/recover", headers=headers)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json(), {"accepted": True, "status": "restarting"})
+        self.assertEqual(self.executor.tts_helper_recoveries, [2])
+        invalid = self.client.post("/internal/v1/tts/helpers/4/recover", headers=headers)
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(self.executor.tts_helper_recoveries, [2])
 
     def test_worker_runtime_settings_are_internal_and_validate_storage_profile(self):
         headers = {"Authorization": "Bearer worker-secret"}

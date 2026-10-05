@@ -8,13 +8,15 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task 05 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task P1 dan 05 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
 ## Konteks khusus task
 
 WorkerJobExecutor dan ResourceAwareQueue memegang state eksekusi dalam memori. WorkerEventPublisher di executor_support.py menyimpan sequence dalam dict dan melakukan HTTP langsung; restart dapat kehilangan event yang belum terkirim.
+
+Task ini menyentuh Worker API yang juga memiliki endpoint internal P1 untuk diagnosis dan recovery helper TTS. Pertahankan endpoint dan batasnya; bila kelak dijadikan command persisten, tetap gunakan slot helper terkonfigurasi, auth worker, penolakan saat sintesis aktif, dan refresh manual Web.
 
 ## File yang disentuh
 
@@ -54,7 +56,7 @@ POST/GET internal commands memakai envelope task 05; operation command tanpa job
 Kerjakan HANYA task 09: Jurnal command worker dan outbox event persisten.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 05.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P1, 05.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.

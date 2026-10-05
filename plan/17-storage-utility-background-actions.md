@@ -14,6 +14,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 
 ## Konteks khusus task
 
+Task ini mengubah route worker dan dispatcher yang juga melayani diagnosis/recovery TTS P1. Pertahankan endpoint tersebut terpisah dari operasi Storage/Utility, dengan worker auth, slot helper terkonfigurasi, dan refresh manual.
+
 Storage/Utility route meneruskan filesystem/TDL request ke worker; storage settings GET juga dapat resolve chat. context/verify memeriksa target aktual. Download Manager sengaja tidak reconcile saat dibuka; artifact missing dicatat deleted/available=false saat preflight.
 
 ## File yang disentuh

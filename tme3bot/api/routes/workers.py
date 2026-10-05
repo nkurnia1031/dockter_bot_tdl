@@ -8,6 +8,8 @@ from tme3bot.api.schemas import (
     WorkerRequest,
     WorkerRouteRequest,
     WorkerRuntimeSettingsRequest,
+    WorkerTtsHealthResponse,
+    WorkerTtsRecoveryResponse,
     WorkerUpdateRequest,
 )
 from tme3bot.domain.models import DomainError
@@ -96,6 +98,124 @@ def register_workers(app, context, *, current_actor):
             )
         context.worker_registry.set_enabled(name, body.enabled)
         return {"name": name, "enabled": bool(body.enabled)}
+
+    def tts_worker_error(name: str, exc: Exception) -> DomainError:
+        if isinstance(exc, JsonHttpError):
+            if exc.status == 404:
+                return DomainError(
+                    "WORKER_UPDATE_REQUIRED",
+                    "Perbarui worker agar diagnosis dan pemulihan TTS tersedia.",
+                    status_code=409,
+                    details={"worker": name},
+                )
+            error_payload = exc.payload.get("error")
+            error = error_payload if isinstance(error_payload, dict) else {}
+            code = str(error.get("code") or "")
+            safe_codes = {
+                "TTS_HELPER_BUSY", "TTS_HELPER_ALREADY_READY", "TTS_RECOVERY_COOLDOWN",
+                "TTS_HELPER_RECOVERING", "TTS_HELPER_UNAVAILABLE", "TTS_HELPER_SLOT_INVALID",
+                "TTS_RECOVERY_REJECTED",
+            }
+            if code in safe_codes and 400 <= exc.status < 500:
+                messages = {
+                    "TTS_HELPER_BUSY": "Helper sedang memproses sintesis; coba lagi setelah selesai.",
+                    "TTS_HELPER_ALREADY_READY": "Helper TTS sudah siap.",
+                    "TTS_RECOVERY_COOLDOWN": "Tunggu sebentar sebelum meminta pemulihan lagi.",
+                    "TTS_HELPER_RECOVERING": "Pemulihan helper TTS sedang berlangsung.",
+                    "TTS_HELPER_UNAVAILABLE": "Helper TTS tidak dapat dihubungi.",
+                    "TTS_HELPER_SLOT_INVALID": "Slot helper TTS tidak valid.",
+                    "TTS_RECOVERY_REJECTED": "Helper TTS menolak permintaan pemulihan.",
+                }
+                return DomainError(
+                    code,
+                    messages.get(code, "Permintaan pemulihan TTS ditolak."),
+                    status_code=exc.status,
+                    details={
+                        key: value for key, value in dict(error.get("details") or {}).items()
+                        if key == "retry_after_seconds" and isinstance(value, int)
+                    },
+                )
+            return DomainError(
+                "WORKER_UNAVAILABLE",
+                f"Worker {name} tidak dapat dihubungi untuk diagnosis TTS.",
+                status_code=503 if exc.status >= 500 else 502,
+                details={"worker": name},
+            )
+        return DomainError(
+            "WORKER_UNAVAILABLE",
+            f"Worker {name} tidak dapat dihubungi untuk diagnosis TTS.",
+            status_code=503,
+            details={"worker": name},
+        )
+
+    @app.get("/api/v1/workers/{name}/tts/health", response_model=WorkerTtsHealthResponse)
+    def worker_tts_health(name: str, actor=Depends(current_actor)):
+        if context.worker_registry.get(name) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        get_health = getattr(context.worker_dispatcher, "tts_health", None)
+        if not callable(get_health):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Backend belum mendukung diagnosis TTS worker.", status_code=409)
+        try:
+            result = get_health(name)
+        except Exception as exc:
+            raise tts_worker_error(name, exc) from None
+        helpers = result.get("helpers") if isinstance(result, dict) else []
+        helpers_ready = bool(result.get("helpers_ready")) if isinstance(result, dict) else False
+        available_profiles = result.get("available_profiles") if isinstance(result, dict) else []
+        if not isinstance(available_profiles, list):
+            available_profiles = []
+        safe_helpers = []
+        allowed_statuses = {"ready", "bootstrapping", "tor_unreachable", "helper_unreachable"}
+        for helper in helpers if isinstance(helpers, list) else []:
+            if not isinstance(helper, dict):
+                continue
+            status = str(helper.get("status") or "helper_unreachable")
+            if status not in allowed_statuses:
+                status = "helper_unreachable"
+            slot = helper.get("slot")
+            if isinstance(slot, bool) or not isinstance(slot, int) or slot < 1 or slot > 3:
+                continue
+            percent = helper.get("bootstrap_percent")
+            if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
+                percent = None
+            if status in {"tor_unreachable", "helper_unreachable"}:
+                percent = None
+            safe_helpers.append({
+                "slot": slot,
+                "status": status,
+                "bootstrap_percent": percent,
+                "checked_at": str(helper.get("checked_at") or "") or None,
+            })
+        safe_helpers.sort(key=lambda item: item["slot"])
+        profile_session_ready = str(actor.profile) in {str(item) for item in available_profiles}
+        helpers_ready = helpers_ready and len(safe_helpers) == 3 and all(item["status"] == "ready" for item in safe_helpers)
+        return {
+            "worker": name,
+            "ready": helpers_ready and profile_session_ready,
+            "helpers_ready": helpers_ready,
+            "profile_session_ready": profile_session_ready,
+            "helpers": safe_helpers,
+        }
+
+    @app.post(
+        "/api/v1/workers/{name}/tts/helpers/{slot}/recover",
+        response_model=WorkerTtsRecoveryResponse,
+        status_code=202,
+    )
+    def recover_worker_tts_helper(name: str, slot: int, actor=Depends(current_actor)):
+        del actor
+        if slot < 1 or slot > 3:
+            raise DomainError("TTS_HELPER_SLOT_INVALID", "Slot helper TTS harus 1, 2, atau 3.", status_code=422)
+        if context.worker_registry.get(name) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        recover = getattr(context.worker_dispatcher, "recover_tts_helper", None)
+        if not callable(recover):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Backend belum mendukung pemulihan helper TTS.", status_code=409)
+        try:
+            result = recover(name, slot)
+        except Exception as exc:
+            raise tts_worker_error(name, exc) from None
+        return {"worker": name, "slot": slot, "accepted": bool(result.get("accepted", True)), "status": str(result.get("status") or "restarting")}
 
     @app.get("/api/v1/workers/{name}/settings", response_model=ObjectResponse)
     def worker_settings(name: str, actor=Depends(current_actor)):

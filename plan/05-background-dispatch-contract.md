@@ -14,6 +14,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 
 ## Konteks khusus task
 
+P1 menambahkan operasi diagnosis/recovery TTS ke `WorkerHttpDispatcher`. Perluas kontrak dispatch tanpa menghapus operasi status/recovery; command TTS hanya boleh menyasar slot helper worker yang sudah terdaftar.
+
 ControlPlane.submit_job melakukan dispatch sebelum response. build_execution_plan menyimpan resource lane. WorkerHttpDispatcher dan domain/worker_contract.py adalah batas integrasi yang sudah tersedia.
 
 ## File yang disentuh

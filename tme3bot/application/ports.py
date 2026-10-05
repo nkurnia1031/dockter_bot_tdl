@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, Protocol
 
 from tme3bot.domain.models import Job, JobEvent
+from tme3bot.domain.operations import Operation, OperationStatus
 
 
 class JobRepository(Protocol):
@@ -80,6 +82,24 @@ class JobRepository(Protocol):
     ) -> dict[str, Any] | None: ...
 
 
+class OperationRepository(Protocol):
+    def find_idempotent(self, actor_user_id: int, action: str, key_sha256: str, payload_sha256: str) -> Operation | None: ...
+
+    def create_submission(self, operation: Operation, **values) -> tuple[Operation, bool]: ...
+
+    def get_for_actor(self, operation_id: str, actor_user_id: int) -> Operation | None: ...
+
+    def list_for_actor(self, actor_user_id: int, *, status: str | None, offset: int, limit: int) -> tuple[list[Operation], bool]: ...
+
+    def apply_action(self, **values) -> tuple[Operation, bool]: ...
+
+    def set_visibility(self, **values) -> tuple[Operation, bool]: ...
+
+    def get_by_job_id(self, job_id: str) -> Operation | None: ...
+
+    def transition_from_job(self, operation_id: str, *, expected_revision: int, status: OperationStatus, phase: str, safe_progress: dict[str, Any]) -> Operation | None: ...
+
+
 class WorkerDispatcher(Protocol):
     def dispatch(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
@@ -96,6 +116,68 @@ class WorkerDispatcher(Protocol):
 
 class ActorResolver(Protocol):
     def resolve(self, telegram_user_id: int): ...
+
+
+class ProfileStateStore(Protocol):
+    """Profile-scoped source state used by export and metadata endpoints."""
+
+    def load(self) -> Any: ...
+
+    def get_source(self, chat_ref: str) -> Any | None: ...
+
+    def list_sources(self) -> list[tuple[str, Any]]: ...
+
+    def upsert_source(
+        self,
+        chat_ref: str,
+        label: str | None,
+        last_id: int,
+        warmup_url: str | None = None,
+        warmup_done: bool | None = None,
+    ) -> Any: ...
+
+    def mark_warmup_done(self, chat_ref: str) -> None: ...
+
+    def delete_source(self, chat_ref: str) -> bool: ...
+
+    def delete_sources(self, chat_refs: Iterable[str]) -> list[str]: ...
+
+
+class SourceRepository(Protocol):
+    """Backend-owned source records with atomic revision-checked commits."""
+
+    def is_enabled(self) -> bool: ...
+
+    def set_enabled(self, enabled: bool) -> None: ...
+
+    def get_source(self, profile: str, chat_ref: str) -> Any | None: ...
+
+    def list_sources(self, profile: str) -> list[tuple[str, Any]]: ...
+
+    def upsert_source(
+        self,
+        profile: str,
+        chat_ref: str,
+        label: str | None,
+        last_id: int,
+        warmup_url: str | None = None,
+        warmup_done: bool | None = None,
+    ) -> Any: ...
+
+    def commit_source(
+        self,
+        profile: str,
+        chat_ref: str,
+        source: Any,
+        *,
+        expected_revision: int,
+        peer_type: str | None = None,
+        peer_id: str | None = None,
+    ) -> Any: ...
+
+    def mark_warmup_done(self, profile: str, chat_ref: str) -> None: ...
+
+    def delete_sources(self, profile: str, chat_refs: Iterable[str]) -> list[str]: ...
 
 
 class StorageDelivery(Protocol):

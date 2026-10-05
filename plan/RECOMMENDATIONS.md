@@ -1,6 +1,6 @@
 # Rekomendasi lanjutan
 
-Dokumen ini dipisahkan dari 23 task wajib (P0 dan 01–22). Perluasan di bawah tidak otomatis menjadi scope agent pelaksana. Beberapa fondasi minimum (misalnya audit metadata dan capability) sudah wajib; rekomendasi menyangkut penguatan sesudah fondasi itu tersedia.
+Dokumen ini dipisahkan dari 24 task wajib (P0, P1, dan 01–22). Perluasan di bawah tidak otomatis menjadi scope agent pelaksana. Beberapa fondasi minimum (misalnya audit metadata dan capability) sudah wajib; rekomendasi menyangkut penguatan sesudah fondasi itu tersedia.
 
 Perkiraan usaha adalah hari kerja engineer dengan konteks repo, bukan janji durasi. Audit pada 2026-10-04; deployment/kapasitas produksi saat ini belum diperiksa.
 
@@ -10,7 +10,7 @@ Perkiraan usaha adalah hari kerja engineer dengan konteks repo, bukan janji dura
 | Tinggi | Drill restore otomatis DB + vault + key + desired settings | Vault AES-GCM tidak dapat dipulihkan hanya dari database tanpa kunci. Ledger/outbox harus konsisten dengan snapshot. | 1–3 hari | Sesudah task 22 dan berkala |
 | Tinggi | Audit UI yang dapat ditelusuri untuk perubahan profil, cursor, target dan rahasia | Task 08 mencatat audit minimum; operator perlu pencarian actor/operation/revision dan retensi. Tidak menyimpan nilai rahasia. | 2–4 hari | Sesudah settings stabil |
 | Sedang | Dashboard antrean dan SLO internal | Bedakan queue age, resource wait, worker latency, outbox lag dan ACK lag; UI lambat tidak selalu berarti CPU worker penuh. | 2–4 hari | Sesudah queue canary |
-| Sedang | Tampilan kompatibilitas per worker | Capability/gates sudah wajib; tampilkan alasan worker belum siap, versi kontrak dan tindakan operator pada Workers. | 1–2 hari | Setelah task 20 |
+| Sedang | Tampilan versi kontrak dan gate per worker | Capability/gates sudah wajib; tampilkan versi kontrak serta kompatibilitas deployment lintas worker. Diagnosis dan pemulihan kesiapan helper TTS sudah menjadi task P1. | 1–2 hari | Setelah task 20 |
 | Sedang | Retensi terukur untuk event/operation/artifact sementara | SQLite/outbox/log dapat tumbuh terus. Cleanup harus mempertahankan unresolved delivery, audit dan checkpoint recovery. | 1–3 hari | Setelah pola penggunaan diketahui |
 | Sedang | Resource budget dan admission menurut kapasitas nyata | Redis/RQ menambah proses pada gateway kecil. Ukur RSS, CPU, disk fsync dan antrean; batasi pengiriman tanpa merusak fairness profil. | 2–4 hari | Sebelum memperbanyak worker |
 | Sedang | Role operator/admin dan reauthentication untuk perubahan rahasia | Lapisan login yang ada memberi identitas, tetapi perubahan token/vault mempunyai dampak lebih luas daripada menjalankan job. | 3–5 hari | Bila pengguna bertambah |

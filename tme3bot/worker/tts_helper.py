@@ -6,6 +6,7 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -18,6 +19,18 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 LOGGER = logging.getLogger("tme3bot.tts_helper")
 _TOR_PROCESS: subprocess.Popen | None = None
+_HELPER_LOCK = threading.RLock()
+_ACTIVE_SYNTHESIS = 0
+_RECOVERY_RUNNING = False
+_RECOVERY_COOLDOWN_SECONDS = 60
+_RECOVERY_LAST_STARTED = 0.0
+
+
+def _bootstrap_percent(status: bytes) -> int | None:
+    match = re.search(rb"(?:^|\s)PROGRESS=(\d{1,3})(?:\s|$)", status)
+    if not match:
+        return None
+    return max(0, min(100, int(match.group(1))))
 
 
 def _tor_status(command: bytes) -> bytes:
@@ -41,6 +54,17 @@ def _tor_ready() -> bool:
         return b"PROGRESS=100" in _tor_status(b"GETINFO status/bootstrap-phase")
     except OSError:
         return False
+
+
+def _tor_diagnostics() -> tuple[str, int | None]:
+    try:
+        status = _tor_status(b"GETINFO status/bootstrap-phase")
+    except OSError:
+        return "tor_unreachable", None
+    percent = _bootstrap_percent(status)
+    if percent is None:
+        return "tor_unreachable", None
+    return ("ready" if percent >= 100 else "bootstrapping"), percent
 
 
 def _start_tor() -> None:
@@ -75,6 +99,42 @@ def _start_tor() -> None:
     )
 
 
+def _restart_tor() -> None:
+    global _TOR_PROCESS
+    process = _TOR_PROCESS
+    if process is not None and process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except ChildProcessError:
+                pass
+        except ChildProcessError:
+            pass
+    _TOR_PROCESS = None
+    _start_tor()
+
+
+def _run_tor_recovery() -> None:
+    global _RECOVERY_RUNNING
+    try:
+        _restart_tor()
+    except Exception as exc:
+        LOGGER.warning("Tor helper recovery failed error_type=%s", type(exc).__name__)
+    finally:
+        with _HELPER_LOCK:
+            _RECOVERY_RUNNING = False
+
+
 @app.get("/healthz")
 def ready():
     return jsonify({"ok": True})
@@ -83,6 +143,51 @@ def ready():
 @app.get("/readyz")
 def readyz():
     return (jsonify({"ok": True}), 200) if _tor_ready() else (jsonify({"ok": False}), 503)
+
+
+@app.get("/diagnostics")
+def diagnostics():
+    with _HELPER_LOCK:
+        recovering = _RECOVERY_RUNNING
+    if recovering:
+        return jsonify({"status": "bootstrapping", "bootstrap_percent": 0})
+    status, percent = _tor_diagnostics()
+    if _TOR_PROCESS is not None and _TOR_PROCESS.poll() is not None:
+        status, percent = "tor_unreachable", None
+    return jsonify({"status": status, "bootstrap_percent": percent})
+
+
+@app.post("/recover-tor")
+def recover_tor():
+    global _RECOVERY_RUNNING, _RECOVERY_LAST_STARTED
+    with _HELPER_LOCK:
+        if _RECOVERY_RUNNING:
+            return jsonify({"accepted": True, "status": "restarting"}), 202
+        if _ACTIVE_SYNTHESIS:
+            return jsonify({"error": "TTS_HELPER_BUSY", "active_requests": _ACTIVE_SYNTHESIS}), 409
+        status, _ = _tor_diagnostics()
+        if _TOR_PROCESS is not None and _TOR_PROCESS.poll() is not None:
+            status = "tor_unreachable"
+        if status == "ready":
+            return jsonify({"error": "TTS_HELPER_ALREADY_READY"}), 409
+        elapsed = time.monotonic() - _RECOVERY_LAST_STARTED
+        if _RECOVERY_LAST_STARTED and elapsed < _RECOVERY_COOLDOWN_SECONDS:
+            remaining = max(1, int(_RECOVERY_COOLDOWN_SECONDS - elapsed + 0.999))
+            return (
+                jsonify({"error": "TTS_RECOVERY_COOLDOWN", "retry_after_seconds": remaining}),
+                429,
+                {"Retry-After": str(remaining)},
+            )
+        _RECOVERY_RUNNING = True
+        _RECOVERY_LAST_STARTED = time.monotonic()
+        try:
+            threading.Thread(target=_run_tor_recovery, name="tts-tor-recovery", daemon=True).start()
+        except Exception as exc:
+            _RECOVERY_RUNNING = False
+            _RECOVERY_LAST_STARTED = 0.0
+            LOGGER.warning("Could not start Tor recovery error_type=%s", type(exc).__name__)
+            return jsonify({"error": "TTS_HELPER_UNAVAILABLE"}), 503
+    return jsonify({"accepted": True, "status": "restarting"}), 202
 
 
 @app.post("/newnym")
@@ -96,10 +201,15 @@ def renew_tor_circuit():
 
 @app.post("/synthesize-part")
 def synthesize_part():
+    global _ACTIVE_SYNTHESIS
     payload = request.get_json(silent=True) or {}
     text = " ".join(str(payload.get("text") or "").split())
     if not text or len(text) > TTS_PART_CHARS:
         return jsonify({"error": "invalid_part"}), 422
+    with _HELPER_LOCK:
+        if _RECOVERY_RUNNING:
+            return jsonify({"error": "TTS_HELPER_RECOVERING"}), 503
+        _ACTIVE_SYNTHESIS += 1
     try:
         output = io.BytesIO()
         gTTS(text=text, lang="id", tld="com", slow=False).write_to_fp(output)
@@ -122,6 +232,9 @@ def synthesize_part():
             status,
         )
         return jsonify({"error": "upstream_tts_failed"}), status
+    finally:
+        with _HELPER_LOCK:
+            _ACTIVE_SYNTHESIS = max(0, _ACTIVE_SYNTHESIS - 1)
     return Response(audio, status=200, mimetype="audio/mpeg")
 
 

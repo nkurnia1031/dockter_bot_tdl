@@ -14,6 +14,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 
 ## Konteks khusus task
 
+Perubahan executor pada task ini harus mempertahankan diagnosis dan recovery TTS P1. Cutover state export tidak boleh mengubah readiness helper, target slot, guard sintesis aktif, atau auth API recovery.
+
 service.py membaca last_id dari state_store sebelum export; QuickMode memiliki export.json_ready dan resource release terpisah. Worker runtime sudah memakai HttpStateStore, tetapi jalur fallback/backup masih perlu dipastikan tidak menghidupkan state lama.
 
 ## File yang disentuh

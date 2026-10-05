@@ -8,13 +8,15 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task 03 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task 03 dan P1 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
 ## Konteks khusus task
 
 BackendRuntimeSettings memakai app_runtime_settings.json; worker runtime memakai worker_settings.json. PUT settings worker saat ini diteruskan sinkron dan dapat gagal ketika worker offline/sibuk. Sebagian secret berada di JSON privat; profile vault sudah memiliki kunci persisten.
+
+Pertahankan kontrak P1: status kesiapan tiap helper TTS dan aksi recovery Tor yang dipicu operator di Workers Web bukan field settings biasa. Perubahan desired/applied `tts_helper_urls` harus tetap menjadi sumber target recovery; jangan menghapus diagnosis atau mengganti recovery terbatas dengan restart Docker.
 
 ## File yang disentuh
 
@@ -58,7 +60,7 @@ GET/PUT /api/v1/runtime/settings?scope=&worker=; PUT {expected_version,values}; 
 Kerjakan HANYA task 08: Konfigurasi terpusat, versi penerapan, dan rahasia.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 03.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 03, P1.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.

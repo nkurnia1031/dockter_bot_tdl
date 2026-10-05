@@ -8,13 +8,15 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task 08, 09 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task P1, 08, 09 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
 ## Konteks khusus task
 
 worker/runtime_settings.py menolak beberapa perubahan ketika job aktif. Executor membaca settings lokal, sedangkan tdl.py masih membaca langsung TDL_UPLOAD_RESOLVE_* dari ENV. Desired settings task 08 memungkinkan perubahan disimpan meski worker offline.
+
+Pertahankan kontrak P1 saat settings TTS berubah: diagnosis dan recovery memakai URL helper yang sudah diterapkan pada worker, bukan URL dari request Web. Apply settings tidak boleh me-restart Tor/helper secara tersembunyi atau memutus sintesis aktif.
 
 ## File yang disentuh
 
@@ -55,7 +57,7 @@ Command runtime.apply hanya menunjuk desired_version. GET internal settings mema
 Kerjakan HANYA task 14: Penerapan konfigurasi worker saat aman.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 08, 09.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P1, 08, 09.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.

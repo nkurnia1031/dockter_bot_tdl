@@ -14,6 +14,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 
 ## Konteks khusus task
 
+Task ini memperluas WorkerHttpDispatcher; pertahankan kontrak diagnosis dan recovery TTS P1. Operasi Quick Mode tidak boleh mengubah target helper, auth worker, atau refresh manual status TTS.
+
 QuickMode mempunyai staging/recovery, manifest quickmode.json dan worker.log. Endpoint scan/crosscheck/cleanup masih berada di api/backend.py dan executor_quickmode.py. Job terminal tidak cukup menjadi alasan menghapus staging; verifikasi Telegram dan rclone tetap diperlukan.
 
 ## File yang disentuh

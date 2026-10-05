@@ -69,6 +69,22 @@ class JobStoreTests(unittest.TestCase):
                     JobEvent("job-1", 2, JobStatus.RUNNING, "started")
                 )
 
+    def test_unit_of_work_rolls_back_all_writes_on_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            with self.assertRaises(RuntimeError):
+                with store.unit_of_work() as db:
+                    SqliteJobRepository.insert_prepared_job(
+                        db,
+                        self.make_job(),
+                        {"resource_keys": ["export:default"], "queue_group": "export", "lane": "export"},
+                        {"private": "command"},
+                    )
+                    raise RuntimeError("simulate failure before transaction commit")
+            self.assertIsNone(store.get("job-1"))
+            self.assertIsNone(store.execution_plan("job-1"))
+            self.assertIsNone(store.command_payload("job-1"))
+
     def test_reset_for_retry_reuses_id_and_preserves_event_history(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")

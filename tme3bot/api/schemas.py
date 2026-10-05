@@ -169,6 +169,28 @@ class WorkerListResponse(ApiResponse):
     items: list[WorkerResponse]
 
 
+class TtsHelperHealthItem(ApiResponse):
+    slot: int = Field(ge=1, le=3)
+    status: str
+    bootstrap_percent: int | None = Field(default=None, ge=0, le=100)
+    checked_at: str | None = None
+
+
+class WorkerTtsHealthResponse(ApiResponse):
+    worker: str
+    ready: bool
+    helpers_ready: bool
+    profile_session_ready: bool
+    helpers: list[TtsHelperHealthItem]
+
+
+class WorkerTtsRecoveryResponse(ApiResponse):
+    worker: str
+    slot: int = Field(ge=1, le=3)
+    accepted: bool
+    status: str
+
+
 class StorageItemResponse(ApiResponse):
     id: int
     upload_id: str
@@ -236,6 +258,43 @@ class ServiceExchangeRequest(BaseModel):
 class SubmitJobRequest(BaseModel):
     profile: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class OperationSubmitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: str = Field(min_length=1, max_length=64)
+    target: dict[str, Any]
+    input: dict[str, Any]
+
+
+class OperationVisibilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    dismissed: bool
+
+
+class OperationResponse(ApiResponse):
+    operation_id: str
+    kind: str
+    profile: str
+    target: dict[str, Any]
+    status: str
+    phase: str
+    revision: int
+    attempt: int
+    progress: dict[str, Any]
+    job_id: str | None = None
+    error: dict[str, str] | None = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    dismissed: bool = False
+    status_url: str | None = None
+
+
+class OperationListResponse(ApiResponse):
+    items: list[OperationResponse]
+    next_cursor: str | None = None
 
 
 class ExportRequest(BaseModel):

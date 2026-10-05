@@ -6,6 +6,7 @@ import os
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 try:
     import pwd
@@ -13,6 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - Windows local test environment
     pwd = None
 
 from tme3bot.config import AppConfig
+from tme3bot.application.ports import ProfileStateStore, SourceRepository
 from tme3bot.names import normalize_profile_name
 from tme3bot.persistence import write_json_atomic
 from tme3bot.profile_registry import ProfileRegistry
@@ -33,7 +35,7 @@ VALID_DOWNLOAD_MODES = {DOWNLOAD_MODE_SHARED, DOWNLOAD_MODE_ISOLATED}
 class ProfileRuntime:
     name: str
     config: AppConfig
-    state_store: StateStore
+    state_store: ProfileStateStore
     download_progress: DownloadProgressTracker
     export_tdl_client: TDLClient
     download_tdl_client: TDLClient
@@ -90,7 +92,14 @@ class ProfileSelectionStore:
 
 
 class ProfileManager:
-    def __init__(self, base_config: AppConfig, worker_registry: WorkerRegistry | None = None) -> None:
+    def __init__(
+        self,
+        base_config: AppConfig,
+        worker_registry: WorkerRegistry | None = None,
+        *,
+        source_repository: SourceRepository | None = None,
+        source_state_store_factory: Callable[[SourceRepository, str], ProfileStateStore] | None = None,
+    ) -> None:
         self.base_config = base_config
         self.worker_registry = worker_registry
         self.default_profile = (
@@ -108,6 +117,10 @@ class ProfileManager:
         self._worker_routes: dict[str, str] | None = None
         self._lock = threading.RLock()
         self._runtimes: dict[str, ProfileRuntime] = {}
+        self.source_repository = source_repository
+        self.source_state_store_factory = source_state_store_factory
+        self._state_stores: dict[str, ProfileStateStore] = {}
+        self._state_store_modes: dict[str, str] = {}
 
     def active_profile_for_chat(self, chat_id: int) -> str:
         profile = self.profile_for_user(chat_id)
@@ -243,6 +256,41 @@ class ProfileManager:
         self.runtime(normalized)
         return selected_mode
 
+    def state_store(self, profile_name: str) -> ProfileStateStore:
+        """Return source state without constructing profile TDL clients."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        if self.base_config.app_role == "worker":
+            mode = "http"
+        elif self.source_repository is not None and self.source_repository.is_enabled():
+            mode = "sqlite"
+        else:
+            mode = "legacy"
+
+        with self._lock:
+            existing = self._state_stores.get(normalized)
+            if existing is not None and self._state_store_modes.get(normalized) == mode:
+                return existing
+
+            profile_config = build_profile_config(self.base_config, normalized)
+            if mode == "sqlite":
+                if self.source_repository is None or self.source_state_store_factory is None:
+                    raise RuntimeError("Backend source repository aktif tanpa adapter profile state.")
+                store = self.source_state_store_factory(self.source_repository, normalized)
+            elif mode == "http":
+                store = HttpStateStore(
+                    profile_config.backend_api_url,
+                    profile_config.backend_internal_token,
+                    normalized,
+                )
+            else:
+                store = StateStore(profile_config.state_file, profile_config.legacy_max_json)
+
+            self._state_stores[normalized] = store
+            self._state_store_modes[normalized] = mode
+            if existing is not None:
+                self._runtimes.pop(normalized, None)
+            return store
+
     def runtime(self, profile_name: str) -> ProfileRuntime:
         normalized = normalize_profile_name(profile_name) or self.default_profile
         with self._lock:
@@ -257,15 +305,19 @@ class ProfileManager:
                     tdl_export_storage=export_storage,
                     tdl_export_home=export_storage.parent,
                 )
+            profile_state_store = self.state_store(normalized)
             runtime = self._runtimes.get(normalized)
             if (
                 runtime is not None
                 and Path(runtime.config.tdl_export_storage).resolve()
                 == export_storage.resolve()
+                and runtime.state_store is profile_state_store
             ):
                 return runtime
             ensure_profile_runtime_dirs(profile_config)
-            runtime = build_profile_runtime(normalized, profile_config)
+            runtime = build_profile_runtime(
+                normalized, profile_config, state_store=profile_state_store
+            )
             self._runtimes[normalized] = runtime
             return runtime
 
@@ -369,14 +421,19 @@ def _tdl_session_database_ready(storage_root: Path) -> bool:
         return False
 
 
-def build_profile_runtime(profile_name: str, config: AppConfig) -> ProfileRuntime:
-    if config.app_role == "worker":
+def build_profile_runtime(
+    profile_name: str,
+    config: AppConfig,
+    *,
+    state_store: ProfileStateStore | None = None,
+) -> ProfileRuntime:
+    if state_store is None and config.app_role == "worker":
         # Workers must use the gateway API.  A local state.json here would
         # silently diverge as soon as a profile changes worker.
         state_store = HttpStateStore(
             config.backend_api_url, config.backend_internal_token, profile_name
         )
-    else:
+    elif state_store is None:
         # Backend owns state.json and must not accidentally call itself through
         # BACKEND_API_URL.
         state_store = StateStore(config.state_file, config.legacy_max_json)

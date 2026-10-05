@@ -346,6 +346,32 @@ class WorkerHttpDispatcher:
             timeout=15,
         )
 
+    def tts_health(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            "/internal/v1/tts/health",
+            timeout=12,
+        )
+
+    def recover_tts_helper(self, worker: str, slot: int) -> dict[str, Any]:
+        if isinstance(slot, bool) or int(slot) < 1 or int(slot) > 3:
+            raise ValueError("Slot helper TTS tidak valid.")
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            f"/internal/v1/tts/helpers/{int(slot)}/recover",
+            timeout=8,
+        )
+
     def worker_settings(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

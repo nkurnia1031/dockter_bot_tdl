@@ -8,7 +8,7 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task P0, 14, 15 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task P0, P1, 14, 15 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
@@ -17,6 +17,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 P0 menambahkan komponen TrustedDevices pada Settings dengan register/list/rename/revoke menggunakan API auth langsung. Pertahankan komponen, fingerprint confirmation, CSRF dan refresh manual saat menyusun kelompok runtime settings. Device public key/registry bukan field secret runtime dan tidak dipindahkan ke desired/applied settings. Private key tetap lokal; actor hanya mengelola perangkat sendiri.
 
 SettingsPage dan WorkersPage sudah menampilkan beberapa runtime settings. Endpoint sebelumnya dapat menolak perubahan ketika worker sibuk dan mengembalikan restart_required_services. Target baru adalah persist desired terlebih dahulu lalu menampilkan penerapan.
+
+WorkersPage juga memiliki kontrol P1 untuk diagnosis per helper TTS dan recovery Tor yang eksplisit. Pertahankan kontrol itu terpisah dari form settings; jangan menyebutnya sebagai restart container dan jangan menghilangkannya saat WorkersPage direfaktor.
 
 ## File yang disentuh
 
@@ -35,7 +37,7 @@ Path relatif terhadap root repo. “Baru” berarti dibuat oleh task ini; “Diu
 | Diubah | `web/src/routes/tts/+page.svelte` |
 | Diubah | `web/src/lib/components/TtsPage.test.ts` |
 | Baru | `web/src/lib/components/SettingsPage.test.ts` |
-| Baru | `web/src/lib/components/WorkersPage.test.ts` |
+| Diubah | `web/src/lib/components/WorkersPage.test.ts` (dibuat oleh P1) |
 | Diubah | `plan/PROGRESS.md` |
 | Dihasilkan tool | `graphify-out/` (hanya output `graphify update .`) |
 
@@ -58,7 +60,7 @@ GET/PUT runtime/settings dengan expected_version dan secret clear semantics task
 Kerjakan HANYA task 20: Pengaturan Web dengan desired/applied status.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P0, 14, 15.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P0, P1, 14, 15.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.
@@ -80,6 +82,7 @@ Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lai
 ## Kriteria selesai
 
 - Komponen Perangkat tepercaya tetap tersedia, memakai auth/CSRF dan refresh manual; save settings tidak mengubah key, owner atau status revoke.
+- Kontrol diagnosis dan recovery TTS P1 tetap tersedia di WorkersPage, menggunakan aksi/refresh manual dan tanpa Docker socket.
 
 - Save offline terlihat pending dan tidak hilang setelah reload.
 - Secret tidak muncul kembali atau tersimpan browser.

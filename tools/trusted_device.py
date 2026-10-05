@@ -8,6 +8,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
 from urllib.parse import urlsplit
 
@@ -31,7 +32,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def canonical_payload(challenge: dict, expected_origin: str, device_id: str) -> bytes:
+def canonical_payload(
+    challenge: dict,
+    expected_origin: str,
+    device_id: str,
+    *,
+    reference_time: int | None = None,
+) -> bytes:
     if (
         challenge.get("protocol_version") != PROTOCOL
         or challenge.get("origin") != expected_origin
@@ -44,7 +51,10 @@ def canonical_payload(challenge: dict, expected_origin: str, device_id: str) -> 
         challenge_id = str(challenge["challenge_id"])
         if not challenge_id or any("\r" in value or "\n" in value for value in (nonce, challenge_id)):
             raise ValueError("Invalid field")
-        if expires < int(time.time()) or expires > int(time.time()) + 125:
+        # Use the HTTPS server's Date header when available. Local clocks can drift,
+        # while the backend remains authoritative when the challenge is exchanged.
+        now = int(time.time()) if reference_time is None else int(reference_time)
+        if expires < now - 2 or expires > now + 125:
             raise ValueError("Expired or implausible challenge")
         raw_nonce = base64.urlsafe_b64decode(nonce + "=" * (-len(nonce) % 4))
         if len(raw_nonce) != 32:
@@ -56,7 +66,7 @@ def canonical_payload(challenge: dict, expected_origin: str, device_id: str) -> 
         raise TrustedDeviceError("Challenge perangkat rusak atau telah kedaluwarsa.") from exc
 
 
-def _open_json(origin: str, path: str, body: dict) -> tuple[dict, list[str]]:
+def _open_json(origin: str, path: str, body: dict) -> tuple[dict, list[str], int | None]:
     url = canonical_origin(origin) + "/api/v1" + path
     payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
@@ -75,6 +85,16 @@ def _open_json(origin: str, path: str, body: dict) -> tuple[dict, list[str]]:
             raw = response.read(1024 * 1024)
             result = json.loads(raw.decode("utf-8"))
             cookies = list(response.headers.get_all("Set-Cookie", []))
+            server_time = None
+            date_header = response.headers.get("Date")
+            if date_header:
+                try:
+                    parsed_date = parsedate_to_datetime(date_header)
+                    if parsed_date.tzinfo is None:
+                        parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+                    server_time = int(parsed_date.timestamp())
+                except (TypeError, ValueError, OverflowError):
+                    server_time = None
     except urllib.error.HTTPError as exc:
         # Error response is deliberately not printed; it may contain deployment-specific text.
         raise TrustedDeviceError(f"Backend autentikasi menolak request (HTTP {exc.code}).") from None
@@ -82,7 +102,7 @@ def _open_json(origin: str, path: str, body: dict) -> tuple[dict, list[str]]:
         raise TrustedDeviceError("Backend autentikasi tidak dapat dijangkau atau memberi respons tidak valid.") from None
     if not isinstance(result, dict):
         raise TrustedDeviceError("Respons autentikasi tidak valid.")
-    return result, cookies
+    return result, cookies, server_time
 
 
 def browser_state(origin: str, set_cookie_headers: list[str]) -> dict:
@@ -158,11 +178,20 @@ def command_prepare(args) -> dict:
     store = TrustedDeviceStore(origin)
     store.clean_stale_states()
     document, private_bytes = store.credentials()
-    challenge, _ = _open_json(origin, "/auth/device/challenge", {"device_id": document["device_id"]})
-    signed = canonical_payload(challenge, origin, str(document["device_id"]))
+    challenge, _, server_time = _open_json(
+        origin, "/auth/device/challenge", {"device_id": document["device_id"]}
+    )
+    if server_time is None:
+        raise TrustedDeviceError("Backend tidak mengirim waktu server untuk memvalidasi challenge.")
+    signed = canonical_payload(
+        challenge,
+        origin,
+        str(document["device_id"]),
+        reference_time=server_time,
+    )
     private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
     signature = _b64(private_key.sign(signed))
-    session_data, set_cookie = _open_json(
+    session_data, set_cookie, _ = _open_json(
         origin,
         "/auth/device/exchange",
         {

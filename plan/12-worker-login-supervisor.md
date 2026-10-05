@@ -8,13 +8,15 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task 09, 10 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task P1, 09, 10 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
 ## Konteks khusus task
 
 ProfileSessionManager menggunakan _LoginProcess, PTY dan dict _logins; state() menguras PTY dan memeriksa exit. _finish_if_exited dapat memanggil whoami dengan timeout panjang. Startup membersihkan direktori login tertinggal, sehingga hasil login bisa hilang sebelum backend mengambilnya.
+
+Task ini juga mengubah Worker API. Jangan menghapus atau menggabungkan endpoint diagnosis/recovery helper TTS P1 ke alur login; auth worker, target slot tetap, dan lifecycle Tor harus tetap terpisah.
 
 ## File yang disentuh
 
@@ -51,7 +53,7 @@ Command profile.login.start/input/renew/cancel memuat operation_id+attempt; inpu
 Kerjakan HANYA task 12: Supervisor login TDL yang tidak bergantung pada browser.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: 09, 10.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P1, 09, 10.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.

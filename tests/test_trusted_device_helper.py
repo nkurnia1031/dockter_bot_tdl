@@ -144,6 +144,33 @@ class TrustedDeviceHelperTests(unittest.TestCase):
         with self.assertRaises(TrustedDeviceError):
             canonical_payload({**challenge, "origin": "https://attacker.example"}, "https://ui.example.test", challenge["device_id"])
 
+    def test_challenge_expiry_uses_server_time_when_local_clock_is_behind(self):
+        server_now = int(time.time())
+        challenge = {
+            "protocol_version": "tme3-device-auth-v1",
+            "origin": "https://ui.example.test",
+            "device_id": "fd9f67f1-bba8-4011-9ed3-0f819ac8df10",
+            "challenge_id": "3fc16ed4-f991-4faa-b80a-5c21c40d9a6e",
+            "nonce": base64.urlsafe_b64encode(bytes(32)).decode().rstrip("="),
+            "expires_unix": server_now + 120,
+        }
+        # A local clock 42 seconds behind sees the server's 120-second expiry
+        # as 162 seconds in the future. The trusted HTTPS Date remains correct.
+        payload = canonical_payload(
+            challenge,
+            challenge["origin"],
+            challenge["device_id"],
+            reference_time=server_now,
+        )
+        self.assertEqual(payload.decode().splitlines()[-1], str(server_now + 120))
+        with self.assertRaises(TrustedDeviceError):
+            canonical_payload(
+                challenge,
+                challenge["origin"],
+                challenge["device_id"],
+                reference_time=server_now + 123,
+            )
+
     def test_browser_state_keeps_secure_cookie_attributes_and_never_returns_token(self):
         state = browser_state("https://ui.example.test", [
             "tme3_access=access-value; Max-Age=900; Path=/; HttpOnly; Secure; SameSite=lax",

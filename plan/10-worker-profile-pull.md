@@ -14,6 +14,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 
 ## Konteks khusus task
 
+Task ini mengubah executor dan Worker API yang juga menyediakan diagnosis/recovery TTS P1. Pertahankan capability per helper dan endpoint recovery Tor; sinkronisasi profil tidak boleh menyamarkan status helper atau menjadikan recovery bagian dari alur profile pull.
+
 WorkerJobExecutor.start() memanggil sync_profiles() untuk melaporkan metadata lokal. ProfileSessionManager sudah memiliki export/install bundle; perubahan lokal menambah lock sesi dan dukungan default. Gunakan mekanisme aman tersebut, jangan kembali memasang zip langsung di data root.
 
 ## File yang disentuh

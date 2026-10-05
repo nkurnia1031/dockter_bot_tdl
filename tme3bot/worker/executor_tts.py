@@ -5,6 +5,7 @@ import re
 import shutil
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -16,12 +17,56 @@ from tme3bot.worker.tts_pipeline import TtsCancelled, TtsError, TtsPipeline
 LOGGER = logging.getLogger(__name__)
 _SAFE_JOB = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
 _SAFE_ARTIFACT = re.compile(r"^[a-f0-9]{48}$")
+_UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+
+
+def _truncate_utf8(value: str, max_bytes: int) -> str:
+    output: list[str] = []
+    used = 0
+    for char in value:
+        size = len(char.encode("utf-8"))
+        if used + size > max_bytes:
+            break
+        output.append(char)
+        used += size
+    return "".join(output)
+
+
+def tts_delivery_filename(title: str, part_index: int, total_parts: int) -> str:
+    """Build a portable audio filename from the user-visible TTS title."""
+    stem = unicodedata.normalize("NFC", str(title or "")).strip()
+    stem = _UNSAFE_FILENAME.sub("_", stem)
+    stem = re.sub(r"\s+", " ", stem).strip(" .")
+    if stem.lower().endswith(".mp3"):
+        stem = stem[:-4].rstrip(" .")
+    part = f" ({int(part_index)} of {int(total_parts)})" if int(total_parts) > 1 else ""
+    suffix = f"{part}.mp3"
+    stem = _truncate_utf8(stem, 220 - len(suffix.encode("utf-8"))).rstrip(" .")
+    if not stem:
+        stem = "Audio TTS"
+    if stem.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
+        stem = f"_{stem}"
+    return f"{stem}{suffix}"
 
 
 class TtsExecutorMixin:
     def _tts_pipeline(self) -> TtsPipeline:
         settings = self.runtime_settings.tts_settings()
         return TtsPipeline.from_config(SimpleNamespace(**settings))
+
+    def tts_health(self) -> dict[str, Any]:
+        pipeline = self._tts_pipeline()
+        health = pipeline.diagnostics()
+        health["available_profiles"] = self.available_storage_profiles()
+        return health
+
+    def recover_tts_helper(self, slot: int) -> dict[str, Any]:
+        return self._tts_pipeline().recover_helper(slot)
 
     def _tts_artifact_directory(self, job_id: str) -> Path:
         if not _SAFE_JOB.fullmatch(job_id):
@@ -44,6 +89,21 @@ class TtsExecutorMixin:
         if root.exists():
             shutil.rmtree(root, ignore_errors=True)
         return not root.exists()
+
+    @staticmethod
+    def _prepare_tts_upload_file(
+        artifact_path: Path, title: str, part_index: int, total_parts: int
+    ) -> Path:
+        """Keep the opaque artifact for retries, and upload a title-named copy."""
+        outgoing = artifact_path.parent / "outgoing"
+        outgoing.mkdir(parents=True, exist_ok=True)
+        target = outgoing / tts_delivery_filename(title, part_index, total_parts)
+        try:
+            shutil.copyfile(artifact_path, target)
+        except Exception:
+            target.unlink(missing_ok=True)
+            raise
+        return target
 
     def _tts(self, command: dict[str, Any]) -> dict[str, Any]:
         job_id = str(command["job_id"])
@@ -218,12 +278,18 @@ class TtsExecutorMixin:
                         self._append_job_log(
                             f"[TTS] upload TDL bagian={part_index}/{total_parts}"
                         )
-                        with runtime.export_operation_lock:
-                            tdl_client.upload(
-                                artifact_path,
-                                target_chat,
-                                caption,
-                            )
+                        upload_path = self._prepare_tts_upload_file(
+                            artifact_path, title, part_index, total_parts
+                        )
+                        try:
+                            with runtime.export_operation_lock:
+                                tdl_client.upload(
+                                    upload_path,
+                                    target_chat,
+                                    caption,
+                                )
+                        finally:
+                            upload_path.unlink(missing_ok=True)
                     except Exception as exc:
                         try:
                             request_json(

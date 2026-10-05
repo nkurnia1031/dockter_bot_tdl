@@ -95,6 +95,8 @@ class BackendContext:
     backup_scheduler: Any = None
     profile_provisioner: Any = None
     device_auth: Any = None
+    source_repository: Any = None
+    operation_service: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -257,6 +259,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         errors = exc.errors()
         sensitive_request = (
             request.url.path == "/api/v1/tts/jobs"
+            or request.url.path.startswith("/api/v1/operations")
             or request.url.path == "/api/v1/runtime/secrets"
             or request.url.path.startswith("/api/v1/workers/")
             and request.url.path.endswith("/settings")
@@ -948,6 +951,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         set_session=_set_session,
         browser_actor_dict=browser_actor_dict,
     )
+    from tme3bot.api.routes.operations import register_operations
+    register_operations(
+        app,
+        context.operation_service,
+        current_actor=current_actor,
+    )
     return app
 
 
@@ -1075,7 +1084,7 @@ def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_in
         dependencies=[Depends(require_internal)],
     )
     def state_sources(profile: str):
-        store = context.profile_manager.runtime(profile).state_store
+        store = context.profile_manager.state_store(profile)
         return {
             "sources": {
                 key: value.to_dict() for key, value in store.list_sources()
@@ -1088,7 +1097,7 @@ def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_in
         dependencies=[Depends(require_internal)],
     )
     def state_source(profile: str, chat_ref: str):
-        source = context.profile_manager.runtime(profile).state_store.get_source(chat_ref)
+        source = context.profile_manager.state_store(profile).get_source(chat_ref)
         return {"source": source.to_dict() if source else None}
 
     @app.post(
@@ -1098,7 +1107,7 @@ def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_in
     )
     async def state_upsert(profile: str, request: Request):
         body = await request.json()
-        source = context.profile_manager.runtime(profile).state_store.upsert_source(
+        source = context.profile_manager.state_store(profile).upsert_source(
             body["chat_ref"],
             body.get("label"),
             int(body["last_id"]),
@@ -1114,7 +1123,7 @@ def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_in
     )
     async def state_warmup(profile: str, request: Request):
         body = await request.json()
-        context.profile_manager.runtime(profile).state_store.mark_warmup_done(
+        context.profile_manager.state_store(profile).mark_warmup_done(
             body["chat_ref"]
         )
         return {"ok": True}
@@ -1126,7 +1135,7 @@ def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_in
     )
     async def state_delete(profile: str, request: Request):
         body = await request.json()
-        deleted = context.profile_manager.runtime(profile).state_store.delete_sources(
+        deleted = context.profile_manager.state_store(profile).delete_sources(
             body.get("chat_refs", [])
         )
         return {"deleted": deleted}

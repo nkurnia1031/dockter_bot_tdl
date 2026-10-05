@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tme3bot.storage_catalog import StorageCatalog
+from tme3bot.infrastructure.source_store import SqliteSourceRepository
 from tme3bot.utility import UtilitySettingsStore
 from tme3bot.tdl_output import clean_tdl_output_line, parse_percent
 
@@ -134,6 +135,16 @@ class BackupService:
         data_target.mkdir(parents=True, exist_ok=True)
         if self.catalog is not None and Path(self.config.storage_db_file).exists():
             self.catalog.backup_database_to(data_target / "storage.db")
+            source_snapshot = SqliteSourceRepository.export_database_snapshot(data_target / "storage.db")
+            state_backup = data_target / "source-state-backup.json"
+            state_backup.write_text(
+                json.dumps(source_snapshot, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                state_backup.chmod(0o600)
+            except OSError:
+                pass
         for name in (
             "state.json", "max.json", "workers.json", "worker_routes.json", "profile_state.json", "profiles.json",
             "labels.json", "utility_folders.json", "utility_settings.json",

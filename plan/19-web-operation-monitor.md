@@ -8,7 +8,7 @@ Dokumen ini adalah instruksi untuk implementasi berikutnya; belum menyatakan fit
 
 ## Prasyarat
 
-Task P0, 16, 17, 18 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
+Task P0, P1, 16, 17, 18 sudah selesai dan verifikasinya tercatat di PROGRESS. Modul baru dari prasyarat sudah tersedia; file itu ditandai Diubah di bawah.
 
 Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa hasil prasyarat. Semua perubahan diterapkan lokal dahulu, tanpa deployment otomatis.
 
@@ -17,6 +17,8 @@ Baca [overview](00-OVERVIEW.md); gunakan [progres](PROGRESS.md) untuk memeriksa 
 P0 sudah menyediakan helper laptop untuk memasang cookie pada browser agent baru. session.restore tetap menerima sesi device melalui API browser yang sama. Refactor Login/monitor tidak boleh otomatis memanggil helper atau membuka challenge Telegram saat sesi device valid. Logout tetap eksplisit dan tidak diikuti auto re-auth; browser tanpa credential tetap menampilkan login normal.
 
 JobTable interval 2500ms; QuickMode memuat statistik dan limits dalam interval yang sama; ExportPage memeriksa notices dan Login melakukan polling auth. Workers/Profiles sudah lebih manual. SvelteKit static harus tetap tanpa server runtime.
+
+Pertahankan kontrol P1 pada WorkersPage: diagnosis dan recovery TTS tetap berbasis aksi/refresh manual, tanpa polling settings. Bila recovery dipindahkan ke operation monitor, status dan kontrol operator harus tetap tersedia dengan pembatasan worker/helper yang sama.
 
 ## File yang disentuh
 
@@ -74,7 +76,7 @@ Coordinator memakai GET job/operation snapshot; mutation response 202 diikuti re
 Kerjakan HANYA task 19: Monitor progress terpusat dan refresh berdasarkan aksi.
 Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lain.
 1. Periksa git status --short, git log -5 --oneline, dan diff file dalam allowlist.
-   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P0, 16, 17, 18.
+   Pertahankan perubahan lokal yang sudah ada. Verifikasi prasyarat: P0, P1, 16, 17, 18.
 2. Periksa fungsi dan kontrak pada bagian Konteks. Gunakan graphify query terlebih
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.

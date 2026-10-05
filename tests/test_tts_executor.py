@@ -5,12 +5,25 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tme3bot.worker.executor_tts import TtsExecutorMixin
+from tme3bot.worker.executor_tts import TtsExecutorMixin, tts_delivery_filename
+from tme3bot.worker.executor import WorkerJobExecutor
 
 
 class _FakePipeline:
     def ready(self):
         return True
+
+    def diagnostics(self):
+        return {
+            "helpers_ready": True,
+            "helpers": [
+                {"slot": slot, "status": "ready", "bootstrap_percent": 100, "checked_at": "now"}
+                for slot in range(1, 4)
+            ],
+        }
+
+    def recover_helper(self, slot):
+        return {"accepted": True, "status": f"restarting-{slot}"}
 
     def synthesize(self, job_id, text, root, **kwargs):
         del job_id, text, kwargs
@@ -65,8 +78,42 @@ class _Executor(TtsExecutorMixin):
     def _append_job_log(self, line):
         self.logs.append(line)
 
+    def available_storage_profiles(self):
+        return ["default"]
+
+    def storage_profile(self):
+        return "default"
+
 
 class TtsExecutorTests(unittest.TestCase):
+    def test_health_and_recovery_use_current_runtime_helper_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = _Executor(directory)
+            pipeline = _FakePipeline()
+            with patch.object(executor, "_tts_pipeline", return_value=pipeline):
+                result = executor.tts_health()
+                recovered = executor.recover_tts_helper(2)
+        self.assertTrue(result["helpers_ready"])
+        self.assertEqual(result["available_profiles"], ["default"])
+        self.assertNotIn("helper_urls", result)
+        self.assertEqual(recovered, {"accepted": True, "status": "restarting-2"})
+
+    def test_tts_capability_uses_helper_diagnosis_and_available_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = _Executor(directory)
+            executor.profile_manager.list_profiles = lambda: ["default"]
+            executor.config.utility_workspace_root = directory
+            with patch.object(executor, "tts_health", return_value={"helpers_ready": True}):
+                ready = WorkerJobExecutor.capabilities(executor)
+            self.assertTrue(ready["tts"])
+            self.assertEqual(ready["tts_profiles"], ["default"])
+
+            executor.available_storage_profiles = lambda: []
+            with patch.object(executor, "tts_health", return_value={"helpers_ready": True}):
+                no_profile = WorkerJobExecutor.capabilities(executor)
+            self.assertFalse(no_profile["tts"])
+            self.assertEqual(no_profile["tts_profiles"], [])
+
     def test_tts_uploads_each_part_with_active_profile_tdl_session(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = _Executor(directory)
@@ -108,7 +155,23 @@ class TtsExecutorTests(unittest.TestCase):
             path, chat_ref, caption = executor.tdl.uploads[0]
             self.assertEqual(chat_ref, "+1123456789")
             self.assertEqual(caption, "Bab 1")
-            self.assertTrue(path.name.startswith("artifact-"))
+            self.assertEqual(path.name, "Bab 1.mp3")
+
+    def test_tts_delivery_filename_uses_title_and_numbers_multiple_parts(self):
+        self.assertEqual(tts_delivery_filename("Bab 1", 1, 1), "Bab 1.mp3")
+        self.assertEqual(tts_delivery_filename("Bab 1.mp3", 1, 1), "Bab 1.mp3")
+        self.assertEqual(
+            tts_delivery_filename("Bab 1", 2, 3), "Bab 1 (2 of 3).mp3"
+        )
+        self.assertEqual(tts_delivery_filename("CON", 1, 1), "_CON.mp3")
+
+        unsafe = tts_delivery_filename(r"../Bab: 1?", 1, 1)
+        self.assertEqual(Path(unsafe).name, unsafe)
+        self.assertFalse(any(char in unsafe for char in '<>:"/\\|?*'))
+        self.assertLessEqual(
+            len(tts_delivery_filename("😀" * 200, 100, 100).encode("utf-8")),
+            220,
+        )
 
 
 if __name__ == "__main__":
