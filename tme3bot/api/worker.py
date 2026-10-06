@@ -12,7 +12,12 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from tme3bot.api.schemas import WorkerJobRequest, WorkerRuntimeSettingsRequest
 from tme3bot.domain.models import DomainError
-from tme3bot.domain.worker_contract import CAP_TTS, worker_contract_metadata
+from tme3bot.domain.worker_contract import (
+    CAP_DURABLE_COMMANDS_V1,
+    CAP_SAFELINK_RESOLVE,
+    CAP_TTS,
+    worker_contract_metadata,
+)
 from tme3bot.profile_provisioning import MAX_PROFILE_BUNDLE_BYTES, MAX_SESSION_ARCHIVE_BYTES
 
 LOGGER = logging.getLogger(__name__)
@@ -100,8 +105,11 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         details = context.executor.capabilities()
         contract = worker_contract_metadata()
         capabilities = list(contract["capabilities"])
+        capabilities.append(CAP_DURABLE_COMMANDS_V1)
         if details.get("tts"):
             capabilities.append(CAP_TTS)
+        if details.get("safelink_resolver"):
+            capabilities.append(CAP_SAFELINK_RESOLVE)
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
 

@@ -1,4 +1,6 @@
 import unittest
+import sys
+from types import ModuleType
 from unittest.mock import call, patch
 
 from fastapi.testclient import TestClient
@@ -10,11 +12,13 @@ from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_STAGING,
+    CAP_SAFELINK_RESOLVE,
     WORKER_API_CAPABILITIES,
     WORKER_API_CONTRACT_VERSION,
     worker_contract_metadata,
 )
 from tme3bot.infrastructure.http_client import JsonHttpError, WorkerHttpDispatcher
+from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.executor_support import WorkerEventPublisher
 
 
@@ -38,6 +42,95 @@ class ContractWorkerRegistry:
 
 
 class WorkerContractTests(unittest.TestCase):
+    def test_resolver_browser_readiness_launches_chromium_once_and_caches_result(self):
+        class Browser:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        class Chromium:
+            def __init__(self, browser):
+                self.browser = browser
+                self.launch_calls = 0
+
+            def launch(self, *, headless):
+                self.launch_calls += 1
+                if not headless:
+                    raise AssertionError("readiness check must use headless Chromium")
+                return self.browser
+
+        class PlaywrightContext:
+            def __init__(self, chromium):
+                self.chromium = chromium
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                del exc
+                return False
+
+        browser = Browser()
+        chromium = Chromium(browser)
+        package = ModuleType("playwright")
+        sync_api = ModuleType("playwright.sync_api")
+        sync_api.sync_playwright = lambda: PlaywrightContext(chromium)
+        executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
+
+        with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": sync_api}):
+            self.assertTrue(executor._safelink_browser_ready())
+            self.assertTrue(executor._safelink_browser_ready())
+
+        self.assertEqual(chromium.launch_calls, 1)
+        self.assertEqual(browser.close_calls, 1)
+
+    def test_resolver_browser_readiness_retries_after_chromium_startup_failure(self):
+        class Browser:
+            def __init__(self):
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        class Chromium:
+            def __init__(self):
+                self.launch_calls = 0
+                self.browser = Browser()
+
+            def launch(self, **kwargs):
+                del kwargs
+                self.launch_calls += 1
+                if self.launch_calls == 1:
+                    raise RuntimeError("browser still starting")
+                return self.browser
+
+        class PlaywrightContext:
+            def __init__(self, chromium):
+                self.chromium = chromium
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                del exc
+                return False
+
+        package = ModuleType("playwright")
+        sync_api = ModuleType("playwright.sync_api")
+        chromium = Chromium()
+        sync_api.sync_playwright = lambda: PlaywrightContext(chromium)
+        executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
+
+        with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": sync_api}):
+            self.assertFalse(executor._safelink_browser_ready())
+            self.assertTrue(executor._safelink_browser_ready())
+            self.assertTrue(executor._safelink_browser_ready())
+
+        self.assertEqual(chromium.launch_calls, 2)
+        self.assertEqual(chromium.browser.close_calls, 1)
+
     def test_worker_capability_endpoint_advertises_versioned_wire_features(self):
         executor = ContractWorkerExecutor()
         app = create_worker_app(
@@ -54,8 +147,47 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()
         self.assertEqual(body["contract_version"], WORKER_API_CONTRACT_VERSION)
-        self.assertEqual(set(body["capabilities"]), WORKER_API_CAPABILITIES)
+        self.assertEqual(
+            set(body["capabilities"]),
+            WORKER_API_CAPABILITIES | {CAP_DURABLE_COMMANDS_V1},
+        )
         self.assertEqual(body["profiles"], ["default"])
+
+    def test_worker_resolver_capability_is_advertised_only_when_browser_ready(self):
+        executor = ContractWorkerExecutor()
+        executor.capabilities = lambda: {
+            "profiles": ["default"],
+            "workspace": True,
+            "safelink_resolver": True,
+        }
+        app = create_worker_app(
+            WorkerContext(
+                type("Config", (), {"worker_api_token": "worker-token"})(),
+                executor,
+            )
+        )
+        response = TestClient(app).get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": "Bearer worker-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(CAP_SAFELINK_RESOLVE, response.json()["capabilities"])
+
+        executor.capabilities = lambda: {
+            "profiles": ["default"],
+            "workspace": True,
+            "safelink_resolver": False,
+        }
+        response = TestClient(create_worker_app(
+            WorkerContext(
+                type("Config", (), {"worker_api_token": "worker-token"})(),
+                executor,
+            )
+        )).get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": "Bearer worker-token"},
+        )
+        self.assertNotIn(CAP_SAFELINK_RESOLVE, response.json()["capabilities"])
 
     @patch("tme3bot.infrastructure.http_client.request_json")
     def test_worker_runtime_settings_use_authenticated_internal_endpoints(self, request):

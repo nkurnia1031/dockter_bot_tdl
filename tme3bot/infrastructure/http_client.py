@@ -13,6 +13,7 @@ from tme3bot.domain.worker_contract import (
     CAP_JOB_LOG_SNAPSHOT,
     CAP_QUICKMODE_SCAN,
     CAP_QUICKMODE_STAGING,
+    CAP_SAFELINK_RESOLVE,
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_VERIFY,
     CAP_TTS,
@@ -256,6 +257,8 @@ class WorkerHttpDispatcher:
         job_payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
         if str(job.get("kind") or "") == "tts":
             required.add(CAP_TTS)
+        if str(job.get("kind") or "") == "safelink_resolve":
+            required.add(CAP_SAFELINK_RESOLVE)
         if bool(job_payload.get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
         self._require_capabilities(worker, required, record=record)

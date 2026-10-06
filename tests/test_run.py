@@ -36,7 +36,8 @@ class RunScriptTests(unittest.TestCase):
 
     def test_preflight_image_names_have_safe_defaults_and_check_git_tag(self) -> None:
         self.assertEqual(
-            run.image_names_for_release({}), ["tme3bot-gateway", "tme3bot-worker"]
+            run.image_names_for_release({}),
+            ["tme3bot-gateway", "tme3bot-worker", "tme3bot-resolver"],
         )
         with patch.object(run, "docker_image_exists", return_value=True) as inspect:
             self.assertEqual(
@@ -190,7 +191,27 @@ class RunScriptTests(unittest.TestCase):
         deploy_env = run_compose.call_args.args[1]
         self.assertEqual(deploy_env["PROFILE_ROOT"], "/srv/remote-worker")
 
-    def test_migrate_builds_both_compose_files_and_saves_images(self) -> None:
+    def test_deploy_resolver_uses_its_compose_and_env_file(self) -> None:
+        env = {"RESOLVER_ENV_FILE": ".env.resolver.test"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            resolver_env = project / ".env.resolver.test"
+            resolver_env.write_text("PROFILE_ROOT=/srv/resolver\n", encoding="utf-8")
+            with (
+                patch.object(run, "PROJECT_DIR", project),
+                patch.object(run, "require_env_file"),
+                patch.object(run, "validate_local_base_image"),
+                patch.object(run, "ensure_profile_root"),
+                patch.object(run, "prepare_tdl_build_asset"),
+                patch.object(run, "run_compose") as run_compose,
+            ):
+                run.deploy_application(env, ["resolver", "--pull"], start_services=False)
+
+        deploy_env = run_compose.call_args.args[1]
+        self.assertEqual(deploy_env["COMPOSE_FILE"], "docker-compose.resolver.yml")
+        self.assertEqual(deploy_env["PROFILE_ROOT"], "/srv/resolver")
+
+    def test_migrate_builds_all_split_compose_files_and_saves_images(self) -> None:
         env = {}
 
         def fake_docker(args, _env):
@@ -206,18 +227,23 @@ class RunScriptTests(unittest.TestCase):
             patch.object(run, "ensure_base_image_available"),
             patch.object(run, "prepare_tdl_build_asset"),
             patch.object(run, "run_compose") as run_compose,
-            patch.object(run, "capture_compose", side_effect=["gateway-image\nworker-image\n", "worker-image\n"]),
+            patch.object(run, "capture_compose", side_effect=[
+                "gateway-image\nworker-image\n", "worker-image\n", "resolver-image\n"
+            ]),
             patch.object(run, "run_docker", side_effect=fake_docker) as run_docker,
             patch.object(run, "build_migration_archive", side_effect=fake_archive),
         ):
             output = run.migrate_images(env)
 
         self.assertEqual(output, run.PROJECT_DIR / "migrate.zip")
-        self.assertEqual(run_compose.call_count, 2)
+        self.assertEqual(run_compose.call_count, 3)
         worker_build_env = run_compose.call_args_list[1].args[1]
         self.assertEqual(
             worker_build_env["PROFILE_ROOT"], "/tmp/tme3bot-worker-build"
         )
+        resolver_build_env = run_compose.call_args_list[2].args[1]
+        self.assertEqual(resolver_build_env["PROFILE_ROOT"], "/tmp/tme3bot-resolver-build")
+        self.assertEqual(resolver_build_env["COMPOSE_FILE"], "docker-compose.resolver.yml")
         run_docker.assert_called_once()
         self.assertEqual(run_docker.call_args.args[0][:2], ["save", "-o"])
 

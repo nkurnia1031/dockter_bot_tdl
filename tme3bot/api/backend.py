@@ -910,6 +910,15 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     )
 
 
+    from tme3bot.api.routes.safelink import register_safelink
+    register_safelink(
+        app,
+        context,
+        current_actor=current_actor,
+        job_dict=job_dict,
+    )
+
+
     from tme3bot.api.routes.workers import register_workers
     register_workers(
         app,

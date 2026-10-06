@@ -25,3 +25,12 @@ RUN python3 -m pip install --no-cache-dir -r /app/requirements-tts.txt \
     && apt-get install -y --no-install-recommends tor \
     && rm -rf /var/lib/apt/lists/*
 CMD ["python3", "/app/bot.py"]
+
+FROM runtime-base AS browser-resolver
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+COPY requirements-browser.txt /app/requirements-browser.txt
+RUN mkdir -p /ms-playwright \
+    && python3 -m pip install --no-cache-dir -r /app/requirements-browser.txt \
+    && python3 -m playwright install --with-deps chromium \
+    && rm -f /app/requirements-browser.txt
+CMD ["python3", "/app/bot.py"]

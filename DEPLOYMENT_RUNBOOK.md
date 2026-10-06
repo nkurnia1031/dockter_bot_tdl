@@ -520,7 +520,39 @@ Output akan menampilkan nama, URL, dan token dalam bentuk tersamarkan.
 Perintah `worker add` langsung menulis registry gateway; tidak diperlukan
 rebuild image atau restart worker untuk menambah worker berikutnya.
 
-### D.3 Verifikasi worker dan route legacy
+### D.3 Worker resolver shortlink
+
+Resolver memakai image tersendiri dengan Playwright dan Chromium. Siapkan host
+khusus seperti worker remote, tetapi gunakan file `.env.resolver`:
+
+```bash
+cp .env.resolver.example .env.resolver
+cp .env.example .env
+```
+
+Isi `PROFILE_ROOT`, `BACKEND_API_URL`, `BACKEND_INTERNAL_TOKEN`, port, dan
+`WORKER_API_TOKEN` unik. Proxy domain worker ke port localhost yang dipilih,
+daftarkan worker dari gateway dengan token yang sama, lalu deploy image yang
+sudah dipublish oleh workflow:
+
+```bash
+python3 run.py deploy resolver --pull
+docker compose -f docker-compose.resolver.yml ps
+curl -fsS https://resolver1.example.com/healthz
+```
+
+Worker harus muncul dengan capability `safelink_resolve.v1` sebelum menerima
+job. Worker ini hanya mengikuti halaman dan mengembalikan URL tujuan; ia tidak
+mengunduh file dari tujuan tersebut. Jangan gunakan resolver sebagai worker
+umum TDL atau TTS. Daftarkan worker dari gateway:
+
+```bash
+python3 run.py worker add resolver-1 https://resolver1.example.com
+```
+
+Saat diminta token, masukkan `WORKER_API_TOKEN` dari `.env.resolver`.
+
+### D.4 Verifikasi worker dan route legacy
 
 Registrasi worker belum otomatis memindahkan route profile. Untuk alur baru,
 pilih target profile-worker langsung di halaman Export, atau pilih worker di
@@ -530,11 +562,11 @@ berlaku untuk job baru, sedangkan job yang sudah berjalan tetap pada origin
 asalnya.
 
 Pastikan worker terlihat sehat dan buat satu job percobaan sebelum dipakai
-untuk batch besar. Untuk menambah worker kedua, ulangi langkah D.1–D.3 dengan
-nama berbeda, misalnya `remote-2`, URL berbeda, `PROFILE_ROOT` berbeda, dan
-token berbeda.
+untuk batch besar. Untuk menambah worker kedua, ulangi konfigurasi worker pada
+bagian D.1 dan registrasi gateway pada D.2 dengan nama berbeda, misalnya
+`remote-2`, URL berbeda, `PROFILE_ROOT` berbeda, dan token berbeda.
 
-### D.4 Mengaktifkan atau menonaktifkan worker dari Web UI
+### D.5 Mengaktifkan atau menonaktifkan worker dari Web UI
 
 Buka menu **Workers** pada Web UI. Setiap worker memiliki status `Siap` atau
 `Nonaktif` dan tombol **Aktifkan/Nonaktifkan**. Status ini adalah kontrol

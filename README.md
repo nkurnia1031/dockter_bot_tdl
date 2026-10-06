@@ -93,9 +93,9 @@ image yang sama tanpa build kedua.
 
 Release Docker dibangun oleh workflow
 `.github/workflows/docker-images.yml`. Workflow tersebut membuat image dasar
-Go/TDL/Python terlebih dahulu, kemudian membangun image gateway dan worker dari
-base image immutable, lalu mem-publish semuanya ke GHCR. VPS tidak perlu lagi
-menjalankan `docker build` atau mengompilasi Go.
+Go/TDL/Python terlebih dahulu, kemudian membangun image gateway, worker, dan
+resolver browser dari base image immutable, lalu mem-publish semuanya ke GHCR.
+VPS tidak perlu lagi menjalankan `docker build` atau mengompilasi Go.
 
 Push ke `main` akan menghasilkan tag image berdasarkan 12 karakter SHA commit:
 
@@ -103,6 +103,7 @@ Push ke `main` akan menghasilkan tag image berdasarkan 12 karakter SHA commit:
 ghcr.io/<owner>/tme3bot-base:py310-tdl0203-<sha12>
 ghcr.io/<owner>/tme3bot-gateway:<sha12>
 ghcr.io/<owner>/tme3bot-worker:<sha12>
+ghcr.io/<owner>/tme3bot-resolver:<sha12>
 ```
 
 Workflow juga memperbarui tag `latest` untuk penggunaan sederhana. Untuk
@@ -113,6 +114,7 @@ Pada VPS, isi `.env` dengan nama package GHCR dan tag commit yang sama:
 ```env
 GATEWAY_IMAGE_NAME=ghcr.io/<owner>/tme3bot-gateway
 WORKER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-worker
+RESOLVER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-resolver
 IMAGE_TAG=<sha12>
 ```
 
@@ -127,6 +129,11 @@ docker compose -f docker-compose.gateway.yml up -d --remove-orphans
 `python3 run.py deploy gateway --pull` dan `python3 run.py deploy worker --pull`
 tetap dapat dipakai sebagai wrapper. Build lokal dan `base-migrate.zip` masih
 tersedia sebagai fallback untuk recovery atau deployment offline.
+
+Worker shortlink memakai image terpisah yang menyertakan Playwright dan
+Chromium. Salin `.env.resolver.example` menjadi `.env.resolver` di host khusus,
+isi backend URL dan token worker unik, daftarkan worker itu pada gateway, lalu
+jalankan `python3 run.py deploy resolver --pull`.
 
 Jika arsitektur target bukan AMD64, workflow perlu ditambah target platform
 tersebut dan image multi-arsitektur harus dibangun sebelum VPS ARM melakukan

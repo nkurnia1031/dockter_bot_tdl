@@ -9,6 +9,8 @@ on:
       - '.dockerignore'
       - '.docker/**'
       - 'requirements.txt'
+      - 'requirements-browser.txt'
+      - 'docker-compose.resolver.yml'
       - 'leave-helper/**'
       - 'bot.py'
       - 'tme3bot/**'
@@ -77,7 +79,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [gateway, worker]
+        target: [gateway, worker, resolver]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

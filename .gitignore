@@ -11,6 +11,7 @@ __pycache__/
 !.env.web.example
 !.env.worker.example
 !.env.worker.local.example
+!.env.resolver.example
 env
 env.*
 .venv/

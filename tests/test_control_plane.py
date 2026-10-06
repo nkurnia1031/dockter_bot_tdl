@@ -7,6 +7,7 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.domain.worker_contract import CAP_DURABLE_COMMANDS_V1, CAP_SAFELINK_RESOLVE
 from tme3bot.worker_registry import WorkerRegistry
 
 
@@ -171,6 +172,117 @@ class ControlPlaneTests(unittest.TestCase):
             control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
         self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
         self.assertEqual(self.jobs.count(kind="tts"), 0)
+
+    def test_safelink_durable_job_auto_routes_and_keeps_input_private(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "resolver-workers.json",
+            {
+                "resolver-a": "http://worker-a",
+                "resolver-b": "http://worker-b",
+                "ordinary": "http://worker-c",
+            },
+            {"resolver-a": "a", "resolver-b": "b", "ordinary": "c"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda worker: {
+            "safelink_resolver": worker.startswith("resolver-"),
+            "capabilities": (
+                [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1]
+                if worker.startswith("resolver-")
+                else []
+            ),
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+
+        prepared = control.prepare_durable_job(
+            self.actor,
+            {},
+            {
+                "job_kind": "safelink_resolve",
+                "payload": {"url": "https://pndk.to/private-token"},
+            },
+        )
+
+        self.assertEqual(prepared.job.worker, "resolver-a")
+        self.assertEqual(prepared.job.payload, {"submitted": True})
+        self.assertEqual(
+            prepared.command_payload["payload"],
+            {"url": "https://pndk.to/private-token"},
+        )
+        self.assertIn(
+            "worker:resolver-a:kind:safelink_resolve",
+            prepared.execution_plan["resource_keys"],
+        )
+
+        with self.assertRaises(DomainError) as forced_target:
+            control.prepare_durable_job(
+                self.actor,
+                {"worker": "resolver-b"},
+                {
+                    "job_kind": "safelink_resolve",
+                    "payload": {"url": "https://pndk.to/another"},
+                },
+            )
+        self.assertEqual(forced_target.exception.code, "SAFELINK_WORKER_AUTO_SELECTED")
+
+    def test_safelink_router_uses_queue_depth_and_round_robin_ties(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "resolver-load-workers.json",
+            {"resolver-a": "http://worker-a", "resolver-b": "http://worker-b", "offline": "http://worker-c"},
+            {"resolver-a": "a", "resolver-b": "b", "offline": "c"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda worker: {
+            "safelink_resolver": worker != "offline",
+            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1]
+            if worker != "offline"
+            else [],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+
+        self.assertEqual(control._select_safelink_worker(), "resolver-a")
+        self.assertEqual(control._select_safelink_worker(), "resolver-b")
+        self.jobs.create(
+            Job(
+                id="resolver-a-queued",
+                kind="safelink_resolve",
+                profile="default",
+                actor_user_id=42,
+                worker="resolver-a",
+                status=JobStatus.QUEUED,
+                payload={"submitted": True},
+            )
+        )
+        self.assertEqual(control._select_safelink_worker(), "resolver-b")
+
+    def test_safelink_submit_rejects_untrusted_domains_and_missing_workers(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "no-resolver-workers.json",
+            {"ordinary": "http://worker"},
+            {"ordinary": "token"},
+        )
+        control = ControlPlane(self.jobs, FakeDispatcher(), self.profiles, worker_registry=registry)
+        with self.assertRaises(DomainError) as unavailable:
+            control.prepare_durable_job(
+                self.actor,
+                {},
+                {"job_kind": "safelink_resolve", "payload": {"url": "https://pndk.to/code"}},
+            )
+        self.assertEqual(unavailable.exception.code, "SAFELINK_WORKER_UNAVAILABLE")
+
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "safelink_resolver": True,
+            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        with self.assertRaises(DomainError) as invalid:
+            control.prepare_durable_job(
+                self.actor,
+                {},
+                {"job_kind": "safelink_resolve", "payload": {"url": "https://example.com/code"}},
+            )
+        self.assertEqual(invalid.exception.code, "SAFELINK_URL_INVALID")
 
     def test_tts_routes_only_to_worker_with_active_profile_tdl_session(self):
         registry = WorkerRegistry(

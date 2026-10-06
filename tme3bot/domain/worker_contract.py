@@ -20,6 +20,7 @@ CAP_QUICKMODE_SCAN = "quickmode.scan.v1"
 CAP_QUICKMODE_VERIFY = "quickmode.verify.v1"
 CAP_QUICKMODE_DELETE = "quickmode.delete.v1"
 CAP_TTS = "tts"
+CAP_SAFELINK_RESOLVE = "safelink_resolve.v1"
 
 WORKER_API_CAPABILITIES = frozenset(
     {

@@ -91,6 +91,10 @@ def build_execution_plan(
         # Different workers remain independent and can each use three routes.
         keys = {f"worker:{worker}:kind:tts"}
         lane = "tts"
+    elif kind == "safelink_resolve":
+        # Resolver browser contexts share one Chromium-capable worker slot.
+        keys = {f"worker:{worker}:kind:safelink_resolve"}
+        lane = "safelink-resolver"
     elif kind in {"download", "download_clear_failed"}:
         keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         lane = "tdl-download"
@@ -133,7 +137,11 @@ def build_execution_plan(
 
     return JobExecutionPlan(
         resource_keys=frozenset(key for key in keys if key),
-        queue_group=f"worker:{worker}:kind:{kind}" if kind == "tts" else f"profile:{profile}:worker:{worker}:kind:{kind}",
+        queue_group=(
+            f"worker:{worker}:kind:{kind}"
+            if kind in {"tts", "safelink_resolve"}
+            else f"profile:{profile}:worker:{worker}:kind:{kind}"
+        ),
         lane=lane,
         priority=0 if payload.get("priority") == "next" else 100,
     )

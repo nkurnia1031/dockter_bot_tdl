@@ -464,6 +464,12 @@ class TtsJobRequest(BaseModel):
     worker: str | None = Field(default=None, min_length=1, max_length=48)
 
 
+class SafelinkJobRequest(BaseModel):
+    # Validate length in the domain layer so FastAPI's validation response
+    # never echoes a caller-supplied shortlink in its error details.
+    url: str
+
+
 class WorkerEventRequest(BaseModel):
     sequence: int
     status: str

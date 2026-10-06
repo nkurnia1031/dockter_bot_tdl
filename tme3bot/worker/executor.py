@@ -100,6 +100,7 @@ from .executor_backup import BackupExecutorMixin
 from .executor_downloads import DownloadExecutorMixin
 from .executor_quickmode import QuickModeExecutorMixin
 from .executor_storage import StorageExecutorMixin
+from .executor_safelink import SafelinkExecutorMixin
 from .executor_tts import TtsExecutorMixin
 from .executor_utility import UtilityExecutorMixin
 from .executor_workspace import WorkspaceExecutorMixin
@@ -109,6 +110,7 @@ class WorkerJobExecutor(
     DownloadExecutorMixin,
     UtilityExecutorMixin,
     StorageExecutorMixin,
+    SafelinkExecutorMixin,
     TtsExecutorMixin,
     BackupExecutorMixin,
     WorkspaceExecutorMixin,
@@ -622,6 +624,8 @@ class WorkerJobExecutor(
             tts_ready = bool(tts_health.get("helpers_ready")) and bool(tts_profiles)
         except Exception:
             tts_ready = False
+        resolver_probe = getattr(self, "_safelink_browser_ready", None)
+        resolver_ready = bool(resolver_probe()) if callable(resolver_probe) else False
         return {
             "profiles": profiles,
             "storage_profile": storage_profile,
@@ -631,7 +635,33 @@ class WorkerJobExecutor(
             "tts": tts_ready,
             "tts_profiles": tts_profiles,
             "tts_health": tts_health,
+            "safelink_resolver": resolver_ready,
         }
+
+    def _safelink_browser_ready(self) -> bool:
+        cached = getattr(self, "_safelink_browser_ready_cached", None)
+        if cached:
+            return True
+        browser = None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                ready = True
+        except Exception:
+            ready = False
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    ready = False
+        # Cache only a successful probe. A transient startup failure must not
+        # permanently hide resolver capability until the worker is restarted.
+        if ready:
+            self._safelink_browser_ready_cached = True
+        return ready
 
     def storage_profile(self) -> str:
         return self.runtime_settings.storage_profile()
@@ -854,6 +884,8 @@ class WorkerJobExecutor(
             # Keep it serial with export/leave jobs for that same profile,
             # while different profiles may still run on the worker together.
             keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
+        elif kind == "safelink_resolve":
+            keys = {f"worker:{worker}:kind:safelink_resolve"}
         elif kind in {"download", "download_clear_failed"}:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         elif kind == "backup_node":
@@ -1287,6 +1319,7 @@ class WorkerJobExecutor(
             "storage_upload": self._storage_upload,
             "backup_node": self._backup,
             "tts": self._tts,
+            "safelink_resolve": self._safelink_resolve,
         }
         handler = handlers.get(kind)
         if handler is None:

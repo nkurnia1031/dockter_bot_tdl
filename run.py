@@ -42,9 +42,9 @@ Commands:
   backup list                       List recorded backup runs
   backup status                     Show backup status
   update        Rebuild with cache, reuse host tdl, recreate running container
-  deploy [gateway|worker] [--pull]  Deploy; use --pull on low-memory targets
+  deploy [gateway|worker|resolver] [--pull]  Deploy; use --pull on low-memory targets
   deploy web [--rollback]           Install static UI release; no Node/Docker build
-  publish [gateway|worker|--all] [--build-base]  Build locally and push images
+  publish [gateway|worker|resolver|--all] [--build-base]  Build locally and push images
   cleanup       Remove dangling local Docker images left by rebuilds
   clean         Alias for cleanup
   restart       Restart the bot container
@@ -62,7 +62,7 @@ Commands:
 
 Notes:
   - Data lives in PROFILE_ROOT mounted to /data.
-  - Set COMPOSE_FILE to docker-compose.gateway.yml or docker-compose.worker.yml for split deployments.
+  - Resolver worker uses docker-compose.resolver.yml and .env.resolver.
   - update/down will not remove .tdl, download, exports, or state.json.
   - Builds prefer the host tdl binary and use a fixed fallback when unavailable.
   - cleanup keeps tagged images and images used by containers.
@@ -488,6 +488,7 @@ def image_names_for_release(env: dict[str, str]) -> list[str]:
     for key, default in (
         ("GATEWAY_IMAGE_NAME", "tme3bot-gateway"),
         ("WORKER_IMAGE_NAME", "tme3bot-worker"),
+        ("RESOLVER_IMAGE_NAME", "tme3bot-resolver"),
     ):
         value = (env.get(key) or default).strip()
         if value and value not in names:
@@ -535,18 +536,21 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
     target_env = dict(env)
     if target == "worker":
         merge_env_file(target_env, target_env.get("WORKER_ENV_FILE", ".env.worker"))
+    elif target == "resolver":
+        merge_env_file(target_env, target_env.get("RESOLVER_ENV_FILE", ".env.resolver"))
     report = preflight_report(target_env, install=True)
     print_preflight_report(report)
     if int(report.get("exit_code", 0)) != 0:
         raise RuntimeError("Preflight gagal; selesaikan masalah di atas sebelum deploy.")
-    if target not in {"gateway", "worker"}:
-        raise RuntimeError("DEPLOY_TARGET harus gateway atau worker.")
+    if target not in {"gateway", "worker", "resolver"}:
+        raise RuntimeError("DEPLOY_TARGET harus gateway, worker, atau resolver.")
     image_status = report.get("images") or {}
-    required_names = (
-        list(image_status)
-        if target == "gateway"
-        else [str(target_env.get("WORKER_IMAGE_NAME") or "tme3bot-worker")]
-    )
+    if target == "gateway":
+        required_names = list(image_status)
+    elif target == "resolver":
+        required_names = [str(target_env.get("RESOLVER_IMAGE_NAME") or "tme3bot-resolver")]
+    else:
+        required_names = [str(target_env.get("WORKER_IMAGE_NAME") or "tme3bot-worker")]
     required_statuses = [image_status.get(name, "MISSING") for name in required_names]
     if any(value == "MISSING" for value in required_statuses):
         revision = str(report.get("git_sha") or "unknown")
@@ -563,7 +567,11 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
         ensure_profile_root(target_env)
         compose_env_values = dict(target_env)
         compose_env_values["COMPOSE_FILE"] = (
-            "docker-compose.gateway.yml" if target == "gateway" else "docker-compose.worker.yml"
+            {
+                "gateway": "docker-compose.gateway.yml",
+                "worker": "docker-compose.worker.yml",
+                "resolver": "docker-compose.resolver.yml",
+            }[target]
         )
         run_compose(["up", "-d", "--remove-orphans"], compose_env_values)
         run_compose(["ps"], compose_env_values)
@@ -850,14 +858,14 @@ def worker_service(env: dict[str, str]) -> str:
     if service := configured_service(env):
         return service
     compose_file = (env.get("COMPOSE_FILE") or "").replace("\\", "/").lower()
-    return "worker" if compose_file.endswith("docker-compose.worker.yml") else "worker-local"
+    return "worker" if compose_file.endswith(("docker-compose.worker.yml", "docker-compose.resolver.yml")) else "worker-local"
 
 
 def shell_service(env: dict[str, str]) -> str:
     if service := configured_service(env):
         return service
     compose_file = (env.get("COMPOSE_FILE") or "").replace("\\", "/").lower()
-    return "worker" if compose_file.endswith("docker-compose.worker.yml") else "backend"
+    return "worker" if compose_file.endswith(("docker-compose.worker.yml", "docker-compose.resolver.yml")) else "backend"
 
 
 def data_root_value(env: dict[str, str]) -> str:
@@ -966,8 +974,8 @@ def deploy_application(
     pull_only = "--pull" in arguments
     target_args = [item for item in arguments if item != "--pull"]
     target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
-    if target not in {"", "gateway", "worker"}:
-        raise RuntimeError("Target deploy harus gateway atau worker.")
+    if target not in {"", "gateway", "worker", "resolver"}:
+        raise RuntimeError("Target deploy harus gateway, worker, atau resolver.")
 
     deploy_env = dict(env)
     # Never rely on a mutable `latest` manifest for production deployment.
@@ -983,6 +991,9 @@ def deploy_application(
         # PROFILE_ROOT (and other useful defaults) so ${PROFILE_ROOT} in the
         # worker volume is valid for both build and pull deployments.
         merge_env_file(deploy_env, deploy_env.get("WORKER_ENV_FILE", ".env.worker"))
+    elif target == "resolver":
+        deploy_env["COMPOSE_FILE"] = "docker-compose.resolver.yml"
+        merge_env_file(deploy_env, deploy_env.get("RESOLVER_ENV_FILE", ".env.resolver"))
 
     ensure_profile_root(deploy_env)
     if pull_only:
@@ -1176,9 +1187,9 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
         if item not in {"--pull", "--build-base", "--no-login", "--all"}
     ]
     target = (target_args[0].strip().lower() if target_args else "").replace("_", "-")
-    targets = ["gateway", "worker"] if publish_all else [target or "gateway"]
-    if any(item not in {"gateway", "worker"} for item in targets):
-        raise RuntimeError("Target publish harus gateway, worker, atau --all.")
+    targets = ["gateway", "worker", "resolver"] if publish_all else [target or "gateway"]
+    if any(item not in {"gateway", "worker", "resolver"} for item in targets):
+        raise RuntimeError("Target publish harus gateway, worker, resolver, atau --all.")
     publish_env = dict(env)
     publish_env["IMAGE_TAG"] = release_image_tag(publish_env)
     if build_base:
@@ -1187,9 +1198,18 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
         login_registry(publish_env)
     for item in targets:
         target_env = dict(publish_env)
-        target_env["COMPOSE_FILE"] = (
-            "docker-compose.gateway.yml" if item == "gateway" else "docker-compose.worker.yml"
-        )
+        target_env["COMPOSE_FILE"] = {
+            "gateway": "docker-compose.gateway.yml",
+            "worker": "docker-compose.worker.yml",
+            "resolver": "docker-compose.resolver.yml",
+        }[item]
+        if item == "resolver":
+            resolver_env_name = target_env.get("RESOLVER_ENV_FILE", ".env.resolver")
+            resolver_env_path = Path(resolver_env_name)
+            if not resolver_env_path.is_absolute():
+                resolver_env_path = PROJECT_DIR / resolver_env_path
+            if not resolver_env_path.is_file():
+                target_env["RESOLVER_ENV_FILE"] = ".env.resolver.example"
         deploy_application(target_env, [item], start_services=False)
         run_compose(["push"], target_env)
         print(f"Image {item} berhasil dipublish dengan tag {target_env['IMAGE_TAG']}.")
@@ -1198,7 +1218,12 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
 
 def login_registry(env: dict[str, str]) -> None:
     """Login to the image registry without exposing the PAT in process output."""
-    image = (env.get("GATEWAY_IMAGE_NAME") or env.get("WORKER_IMAGE_NAME") or "").strip()
+    image = (
+        env.get("GATEWAY_IMAGE_NAME")
+        or env.get("WORKER_IMAGE_NAME")
+        or env.get("RESOLVER_IMAGE_NAME")
+        or ""
+    ).strip()
     registry = image.split("/", 1)[0] if "/" in image else ""
     if not registry or "." not in registry:
         print("Registry login dilewati: image memakai registry lokal/Docker Hub.")
@@ -1281,6 +1306,13 @@ def migrate_images(env: dict[str, str]) -> Path:
                 # command. The builder does not mount this path; it only keeps
                 # PROFILE_ROOT mandatory for real worker deployments.
                 "PROFILE_ROOT": "/tmp/tme3bot-worker-build",
+            },
+        ),
+        (
+            "docker-compose.resolver.yml",
+            {
+                "RESOLVER_ENV_FILE": ".env.resolver.example",
+                "PROFILE_ROOT": "/tmp/tme3bot-resolver-build",
             },
         ),
     ):

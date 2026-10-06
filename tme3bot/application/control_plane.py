@@ -17,15 +17,19 @@ from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_STAGING,
+    CAP_DURABLE_COMMANDS_V1,
+    CAP_SAFELINK_RESOLVE,
     CAP_TTS,
     DURABLE_COMMAND_CAPABILITIES,
     require_worker_contract,
 )
 from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS
+from tme3bot.safelink import normalize_shortlink_url
 
 _DURABLE_JOB_KINDS = frozenset({
     "export", "leave", "download", "utility", "storage_upload", "tts",
+    "safelink_resolve",
 })
 
 
@@ -70,6 +74,8 @@ class ControlPlane:
         self._stale_cancel_requested: dict[str, Any] = {}
         self._tts_route_lock = threading.Lock()
         self._tts_round_robin = 0
+        self._safelink_route_lock = threading.Lock()
+        self._safelink_round_robin = 0
 
     def actor(self, telegram_user_id: int) -> Actor:
         profile = self.profile_manager.profile_for_user(telegram_user_id)
@@ -271,15 +277,24 @@ class ControlPlane:
             raise DomainError("JOB_PAYLOAD_INVALID", "Payload job harus berupa object.", status_code=422)
         if set(target) - {"profile", "worker"}:
             raise DomainError("OPERATION_TARGET_INVALID", "Target hanya boleh berisi profile dan worker.", status_code=422)
-        if not str(target.get("worker") or "").strip():
-            raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk job background.", status_code=422)
-
-        selected_profile, selected_worker = self.resolve_target(
-            actor,
-            profile=str(target.get("profile") or actor.profile),
-            worker=str(target.get("worker")),
-            check_readiness=False,
-        )
+        if kind == "safelink_resolve":
+            if str(target.get("worker") or "").strip():
+                raise DomainError(
+                    "SAFELINK_WORKER_AUTO_SELECTED",
+                    "Worker resolver dipilih otomatis berdasarkan kesiapan dan panjang antrean.",
+                    status_code=422,
+                )
+            selected_profile = self.require_profile(actor, str(target.get("profile") or actor.profile))
+            selected_worker = self._select_safelink_worker()
+        else:
+            if not str(target.get("worker") or "").strip():
+                raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk job background.", status_code=422)
+            selected_profile, selected_worker = self.resolve_target(
+                actor,
+                profile=str(target.get("profile") or actor.profile),
+                worker=str(target.get("worker")),
+                check_readiness=False,
+            )
         payload = self._prepare_durable_payload(
             actor, kind, payload, selected_profile, selected_worker
         )
@@ -354,6 +369,7 @@ class ControlPlane:
                 "preserve_structure", "keywords", "rclone_upload",
             },
             "tts": {"title", "text"},
+            "safelink_resolve": {"url"},
         }
         if set(payload) - allowed[kind]:
             raise DomainError(
@@ -510,6 +526,12 @@ class ControlPlane:
                 raise DomainError("TTS_TEXT_INVALID", "Teks TTS wajib diisi dan maksimal 100.000 karakter.", status_code=422)
             return {"title": title, "text": text}
 
+        if kind == "safelink_resolve":
+            try:
+                return {"url": normalize_shortlink_url(payload.get("url"))}
+            except ValueError as exc:
+                raise DomainError("SAFELINK_URL_INVALID", str(exc), status_code=422) from None
+
         raise DomainError("JOB_KIND_INVALID", "Jenis job belum didukung oleh dispatch background.", status_code=422)
 
     def _utility_settings_snapshot(self) -> dict[str, Any]:
@@ -563,7 +585,7 @@ class ControlPlane:
             record = self.worker_registry.get(job.worker)
             if record is None or not bool(record.get("enabled", True)):
                 return {"status": "wait", "reason": "not_ready"}
-        if callable(self.profile_readiness) and not self.profile_readiness(
+        if job.kind != "safelink_resolve" and callable(self.profile_readiness) and not self.profile_readiness(
             job.profile, job.worker
         ):
             return {"status": "wait", "reason": "not_ready"}
@@ -575,6 +597,8 @@ class ControlPlane:
         required = set(DURABLE_COMMAND_CAPABILITIES)
         if job.kind == "tts":
             required.add(CAP_TTS)
+        if job.kind == "safelink_resolve":
+            required.add(CAP_SAFELINK_RESOLVE)
         if bool((stored.get("payload") or {}).get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
         try:
@@ -719,6 +743,67 @@ class ControlPlane:
                     continue
             queued_jobs = sum(
                 self.jobs.count(kind="tts", worker=name, status=status, archived=False)
+                for status in statuses
+            )
+            result.append({"name": str(name), "queued_jobs": queued_jobs})
+        return sorted(result, key=lambda option: option["name"].lower())
+
+    def _select_safelink_worker(self, requested: str | None = None) -> str:
+        options = self.safelink_worker_options()
+        if not options:
+            raise DomainError(
+                "SAFELINK_WORKER_UNAVAILABLE",
+                "Belum ada worker resolver yang siap. Deploy worker resolver dengan Playwright dan Chromium, lalu periksa status worker.",
+                status_code=503,
+            )
+        if requested:
+            selected = str(requested).strip().lower()
+            for option in options:
+                if option["name"].lower() == selected:
+                    return option["name"]
+            raise DomainError(
+                "SAFELINK_WORKER_UNAVAILABLE",
+                "Worker yang dipilih belum siap untuk resolver shortlink.",
+                status_code=503,
+            )
+        counts = {option["name"]: int(option["queued_jobs"]) for option in options}
+        minimum = min(counts.values())
+        tied = sorted(name for name, count in counts.items() if count == minimum)
+        with self._safelink_route_lock:
+            selected = tied[self._safelink_round_robin % len(tied)]
+            self._safelink_round_robin += 1
+        return selected
+
+    def safelink_worker_options(self) -> list[dict[str, Any]]:
+        registry = self.worker_registry
+        checker = getattr(self.dispatcher, "capabilities", None)
+        if registry is None or not callable(checker):
+            return []
+        enabled = getattr(registry, "enabled_names", None)
+        candidates = list(enabled()) if callable(enabled) else registry.names()
+        statuses = ("queued", "dispatched", "running", "paused")
+        result: list[dict[str, Any]] = []
+        for name in candidates:
+            record = registry.get(name)
+            if record is None or not bool(record.get("enabled", True)):
+                continue
+            try:
+                response = checker(name)
+            except Exception:
+                continue
+            capabilities = response.get("capabilities", []) if isinstance(response, dict) else []
+            if (
+                not isinstance(response, dict)
+                or response.get("safelink_resolver") is not True
+                or not isinstance(capabilities, list)
+                or CAP_SAFELINK_RESOLVE not in capabilities
+                or CAP_DURABLE_COMMANDS_V1 not in capabilities
+            ):
+                continue
+            queued_jobs = sum(
+                self.jobs.count(
+                    kind="safelink_resolve", worker=name, status=status, archived=False
+                )
                 for status in statuses
             )
             result.append({"name": str(name), "queued_jobs": queued_jobs})
@@ -1585,6 +1670,8 @@ class ControlPlane:
 
     @staticmethod
     def _redacted_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if kind == "safelink_resolve":
+            return {"submitted": True}
         if kind == "tts":
             text = str(payload.get("text") or "")
             return {

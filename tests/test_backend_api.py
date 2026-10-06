@@ -13,6 +13,7 @@ from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService, PreparedOperation
 from tme3bot.domain.models import Actor, JobEvent, JobStatus
+from tme3bot.domain.worker_contract import CAP_DURABLE_COMMANDS_V1, CAP_SAFELINK_RESOLVE
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
@@ -455,6 +456,122 @@ class BackendApiTests(unittest.TestCase):
     def test_background_job_submit_is_not_advertised_without_queue(self):
         capabilities = self.client.get("/api/v1/capabilities").json()
         self.assertNotIn("job.submit", capabilities["operations"]["supported_kinds"])
+
+    def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        self.dispatcher.capabilities = lambda _worker: {
+            "safelink_resolver": True,
+            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
+        }
+        client = TestClient(create_backend_app(self.context))
+        auth = self.login(42)
+        private_url = "https://pndk.to/private-short-token"
+
+        response = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-submit-1"},
+            json={"url": private_url},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.json()["kind"], "safelink_resolve")
+        self.assertEqual(response.json()["status"], "queued")
+        self.assertEqual(response.json()["payload"], {"submitted": True})
+        self.assertNotIn(private_url, response.text)
+        job = self.jobs.get(response.json()["id"])
+        self.assertEqual(
+            self.jobs.command_payload(job.id)["payload"],
+            {"url": private_url},
+        )
+        self.assertEqual(job.worker, "local")
+
+    def test_safelink_submit_errors_are_clear_without_echoing_shortlink(self):
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        auth = self.login(42)
+        client = TestClient(create_backend_app(self.context))
+        private_url = "https://pndk.to/do-not-echo-this"
+
+        unavailable = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-no-worker"},
+            json={"url": private_url},
+        )
+        self.assertEqual(unavailable.status_code, 503, unavailable.text)
+        self.assertEqual(unavailable.json()["error"]["code"], "SAFELINK_WORKER_UNAVAILABLE")
+        self.assertNotIn(private_url, unavailable.text)
+
+        self.dispatcher.capabilities = lambda _worker: {
+            "safelink_resolver": True,
+            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
+        }
+        invalid = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-invalid-host"},
+            json={"url": "https://example.com/do-not-echo-this"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["error"]["code"], "SAFELINK_URL_INVALID")
+        self.assertNotIn("do-not-echo-this", invalid.text)
+
+        oversized_url = "https://pndk.to/" + ("x" * 2050)
+        oversized = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-oversized"},
+            json={"url": oversized_url},
+        )
+        self.assertEqual(oversized.status_code, 422)
+        self.assertEqual(oversized.json()["error"]["code"], "SAFELINK_URL_INVALID")
+        self.assertNotIn(oversized_url, oversized.text)
+
+    def test_safelink_jobs_use_persisted_cancel_and_retry_operations(self):
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        self.dispatcher.capabilities = lambda _worker: {
+            "safelink_resolver": True,
+            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
+        }
+        client = TestClient(create_backend_app(self.context))
+        auth = self.login(42)
+        self.control.add_event_observer(self.operation_service.on_job_event)
+
+        submitted = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-cancel-submit"},
+            json={"url": "https://pndk.to/cancel-me"},
+        )
+        cancel = client.post(
+            f"/api/v1/safelink/jobs/{submitted.json()['id']}/cancel",
+            headers={**auth, "Idempotency-Key": "safelink-cancel-1"},
+        )
+        self.assertEqual(cancel.status_code, 202)
+        cancel_operation = self.operation_service.store.get_by_job_id(submitted.json()["id"])
+        self.assertEqual(cancel_operation.status.value, "cancelling")
+
+        retriable = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-retry-submit"},
+            json={"url": "https://go.fakta.id/retry-me"},
+        )
+        job_id = retriable.json()["id"]
+        failed = JobEvent(
+            job_id=job_id,
+            sequence=1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={"code": "RESOLVER_FAILED", "message": "Resolver gagal."},
+        )
+        self.jobs.append_event(failed)
+        self.operation_service.on_job_event(failed)
+        retry = client.post(
+            f"/api/v1/safelink/jobs/{job_id}/retry",
+            headers={**auth, "Idempotency-Key": "safelink-retry-1"},
+        )
+        self.assertEqual(retry.status_code, 202)
+        self.assertEqual(retry.json()["status"], "queued")
+        self.assertEqual(self.operation_service.store.get_by_job_id(job_id).status.value, "queued")
+        self.assertEqual(self.jobs.command_payload(job_id)["payload"], {"url": "https://go.fakta.id/retry-me"})
 
     def test_trusted_device_routes_require_browser_csrf_and_hide_keys(self):
         private = Ed25519PrivateKey.generate()
