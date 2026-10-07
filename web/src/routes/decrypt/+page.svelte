@@ -47,6 +47,20 @@
     const result = selectedResolverJob?.result?.value ?? selectedResolverJob?.result;
     return typeof result?.destination_url === 'string' ? result.destination_url : '';
   });
+  const plaintextLink = $derived(httpLink(plaintext));
+  const resolverLink = $derived(httpLink(resolverResult));
+
+  function httpLink(value: string): string {
+    const candidate = value.trim();
+    if (!candidate) return '';
+    try {
+      const url = new URL(candidate);
+      if (!['http:', 'https:'].includes(url.protocol) || !url.hostname || url.username || url.password) return '';
+      return url.href;
+    } catch {
+      return '';
+    }
+  }
 
   function readEncryptedValue(input: string): { value: string; fromParameter: boolean } {
     const raw = input.trim();
@@ -298,15 +312,24 @@
     <button class="button secondary" type="button" onclick={copyOutput} disabled={!plaintext}><Clipboard size={15}/>{copied ? 'Tersalin' : 'Salin hasil'}</button>
   </div>
 
-  <label class="sr-only" for="decrypted-text">Hasil dekripsi</label>
-  <textarea
-    id="decrypted-text"
-    class="field mt-4 min-h-48 resize-y font-mono text-sm leading-6"
-    bind:value={plaintext}
-    placeholder="Hasil dekripsi akan muncul di sini…"
-    readonly
-    spellcheck="false"
-  ></textarea>
+  {#if plaintextLink}
+    <a
+      class="mt-4 block break-all rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-4 font-mono text-sm leading-6 text-sky-700 underline decoration-sky-500/50 underline-offset-4 hover:text-sky-900 dark:text-sky-300 dark:hover:text-sky-100"
+      href={plaintextLink}
+      target="_blank"
+      rel="noopener noreferrer"
+    >{plaintext.trim()}</a>
+  {:else}
+    <label class="sr-only" for="decrypted-text">Hasil dekripsi</label>
+    <textarea
+      id="decrypted-text"
+      class="field mt-4 min-h-48 resize-y font-mono text-sm leading-6"
+      bind:value={plaintext}
+      placeholder="Hasil dekripsi akan muncul di sini…"
+      readonly
+      spellcheck="false"
+    ></textarea>
+  {/if}
 </section>
 
 <p class="muted mt-4 flex items-start gap-2 text-xs leading-5"><ShieldCheck size={15} class="mt-0.5 shrink-0"/>Pemrosesan dilakukan sepenuhnya di browser. Teks tidak dikirim ke backend atau worker. Kunci mengikuti script contoh.</p>
@@ -342,11 +365,21 @@
 
   <div class="mt-6 border-t border-[var(--line)] pt-5">
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <div><h3 class="font-extrabold">Hasil URL tujuan</h3><p class="muted mt-1 text-xs">Hasil hanya ditampilkan sebagai teks. Buka sendiri setelah memeriksanya.</p></div>
+      <div><h3 class="font-extrabold">Hasil URL tujuan</h3><p class="muted mt-1 text-xs">Klik tautan untuk membukanya di tab baru.</p></div>
       <button class="button secondary" type="button" onclick={copyResolverOutput} disabled={!resolverResult}><Clipboard size={15}/>{resolverCopied ? 'Tersalin' : 'Salin URL'}</button>
     </div>
-    <label class="sr-only" for="resolver-output">URL tujuan</label>
-    <textarea id="resolver-output" class="field mt-3 min-h-24 resize-y font-mono text-sm leading-6" value={resolverResult} readonly placeholder="URL tujuan muncul setelah job selesai." spellcheck="false"></textarea>
+    {#if resolverLink}
+      <a
+        class="mt-3 block break-all rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-4 font-mono text-sm leading-6 text-sky-700 underline decoration-sky-500/50 underline-offset-4 hover:text-sky-900 dark:text-sky-300 dark:hover:text-sky-100"
+        href={resolverLink}
+        target="_blank"
+        rel="noopener noreferrer"
+      >{resolverResult}</a>
+    {:else if resolverResult}
+      <p class="muted mt-3 break-all rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-4 font-mono text-sm leading-6">{resolverResult}</p>
+    {:else}
+      <p class="muted mt-3 rounded-xl border border-dashed border-[var(--line)] p-4 text-sm">URL tujuan muncul setelah job selesai.</p>
+    {/if}
   </div>
 
   <div class="mt-6 border-t border-[var(--line)] pt-5">

@@ -9,6 +9,22 @@ describe('Decrypt page shortlink resolver', () => {
     vi.restoreAllMocks();
   });
 
+  it('renders decrypted HTTP URLs as clickable links', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ items: [] }), { status: 200 })));
+    render(DecryptPage);
+
+    await fireEvent.input(screen.getByRole('textbox', { name: 'Teks terenkripsi' }), {
+      target: { value: 'a77894319ebfd94509a5db3c280d9aee30d8f20e48773993e3a07eda5632fcf4050a8da670fb4831a28b1f68f6cef20af063b32024485302' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Dekripsi' }));
+
+    const link = await screen.findByRole('link', { name: 'https://qiwi.gg/file/aHda4057-HDHTIND884' });
+    expect(link.getAttribute('href')).toBe('https://qiwi.gg/file/aHda4057-HDHTIND884');
+    expect(link.getAttribute('target')).toBe('_blank');
+    expect(link.getAttribute('rel')).toBe('noopener noreferrer');
+    expect(screen.queryByRole('textbox', { name: 'Hasil dekripsi' })).toBeNull();
+  });
+
   it('submits a shortlink job, restores its result from job history, and does not open it', async () => {
     const shortlink = 'https://pndk.to/opaque-code';
     const destination = 'https://files.example.test/book.zip';
@@ -39,7 +55,10 @@ describe('Decrypt page shortlink resolver', () => {
     await fireEvent.input(await screen.findByLabelText('URL shortlink'), { target: { value: shortlink } });
     await fireEvent.click(screen.getByRole('button', { name: 'Resolve' }));
 
-    expect(await screen.findByDisplayValue(destination)).toBeTruthy();
+    const outputLink = await screen.findByRole('link', { name: destination });
+    expect(outputLink.getAttribute('href')).toBe(destination);
+    expect(outputLink.getAttribute('target')).toBe('_blank');
+    expect(screen.queryByRole('textbox', { name: 'URL tujuan' })).toBeNull();
     expect(requests.find((request) => request.path.endsWith('/safelink/jobs') && request.method === 'POST')?.body)
       .toEqual({ url: shortlink });
     expect(await screen.findByText('Job resolver masuk antrean. Kamu dapat menutup halaman; hasilnya tersimpan di riwayat.')).toBeTruthy();
