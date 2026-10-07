@@ -275,6 +275,17 @@ class ExportArtifactCatalog:
             ).fetchone()
         return dict(row)
 
+    def upsert_for_export_cursor(self, **values: Any) -> dict[str, Any]:
+        """Idempotently record an export artifact before its shared cursor commits."""
+        required = {
+            "profile", "worker", "export_job_id", "filename", "artifact_key"
+        }
+        if not required.issubset(values) or any(
+            not str(values.get(key) or "").strip() for key in required
+        ):
+            raise ValueError("Identitas artifact untuk commit cursor belum lengkap.")
+        return self.upsert(**values)
+
     def upsert_many(self, values: list[dict[str, Any]]) -> int:
         """Upsert an inventory batch in one SQLite transaction.
 

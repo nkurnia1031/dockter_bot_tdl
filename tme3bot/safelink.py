@@ -1,4 +1,4 @@
-"""Input validation shared by the Safelink API and resolver worker."""
+"""Input validation shared by the Safelink API and resolver addon."""
 
 from __future__ import annotations
 

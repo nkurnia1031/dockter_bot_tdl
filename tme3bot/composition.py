@@ -27,6 +27,7 @@ from tme3bot.infrastructure.source_store import (
     SqliteProfileStateStore,
     SqliteSourceRepository,
 )
+from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
@@ -76,6 +77,24 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
             "telegram_tts_chat_id": config.telegram_tts_chat_id,
         },
     )
+    legacy_runtime_values = runtime_settings.get()
+    legacy_utility_settings = UtilitySettingsStore(config.utility_settings_file)
+    legacy_utility_values = legacy_utility_settings.get()
+    runtime_settings_store = SqliteSettingsStore(
+        config.storage_db_file,
+        config.state_file.parent / "runtime-settings" / "settings.key",
+    )
+    runtime_settings_store.seed_once(
+        "backend-runtime-json-env-v1",
+        legacy_runtime_values,
+        source="legacy-runtime-json-env",
+    )
+    runtime_settings_store.seed_once(
+        "utility-settings-json-v1",
+        legacy_utility_values,
+        source="legacy-utility-json",
+    )
+    runtime_settings.attach_settings_store(runtime_settings_store)
     BackendRuntimeSettings.apply_to(config, runtime_settings.get())
 
     bootstrap_endpoints = config.worker_endpoints or {
@@ -90,18 +109,38 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         bootstrap_tokens,
     )
     source_repository = SqliteSourceRepository(config.storage_db_file)
+    profile_vault = ProfileProvisioningStore(
+        config.storage_db_file,
+        config.state_file.parent / "profile-vault",
+    )
     profiles = ProfileManager(
         config,
         registry,
         source_repository=source_repository,
         source_state_store_factory=SqliteProfileStateStore,
     )
-    profiles.profile_registry.bootstrap_from_identities(
-        {
-            item["name"]: item.get("telegram_user_id")
-            for item in profiles.local_profile_identities()
-        }
-    )
+    for vaulted_name, telegram_user_id in profile_vault.vaulted_identities().items():
+        try:
+            profiles.profile_registry.register_vaulted(vaulted_name, telegram_user_id)
+        except ValueError:
+            LOGGER.warning("Vault identity registry conflict for profile %s.", vaulted_name)
+    vaulted_profiles = set(profile_vault.vaulted_identities())
+    for item in profiles.local_profile_identities():
+        profile_name = str(item.get("name") or "")
+        telegram_user_id = item.get("telegram_user_id")
+        if not profile_name or profile_name in vaulted_profiles:
+            continue
+        try:
+            if telegram_user_id is not None:
+                profile_vault.record_legacy_discovery(
+                    profile_name, int(telegram_user_id), "local"
+                )
+            profiles.profile_registry.register_discovered(
+                profile_name,
+                int(telegram_user_id) if telegram_user_id is not None else None,
+            )
+        except (TypeError, ValueError):
+            LOGGER.warning("Local worker profile metadata is invalid for %s.", profile_name)
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
@@ -119,18 +158,18 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     )
     dispatcher = WorkerHttpDispatcher(registry)
     profile_provisioner = ProfileProvisioningService(
-        ProfileProvisioningStore(
-            config.storage_db_file,
-            config.state_file.parent / "profile-vault",
-        ),
+        profile_vault,
         profiles,
         registry,
         dispatcher,
+        operation_service,
     )
     folders = UtilityFolderStore(
         config.utility_folders_file, config.utility_workspace_root
     )
-    settings = UtilitySettingsStore(config.utility_settings_file)
+    settings = UtilitySettingsStore(
+        config.utility_settings_file, desired_store=runtime_settings_store
+    )
     labels = LabelStore(config.state_file.parent / "labels.json")
     control_plane = ControlPlane(
         jobs,
@@ -142,6 +181,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         profile_readiness=profile_provisioner.worker_ready,
         utility_folders=folders,
         utility_settings=settings,
+        runtime_settings_store=runtime_settings_store,
         label_store=labels,
         job_stall_timeout_seconds=config.job_stall_timeout_seconds,
         job_cancel_grace_seconds=config.job_cancel_grace_seconds,
@@ -223,6 +263,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         worker_dispatcher=dispatcher,
         storage_maintenance=storage_maintenance,
         runtime_settings=runtime_settings,
+        runtime_settings_store=runtime_settings_store,
         backup_scheduler=scheduler,
         profile_provisioner=profile_provisioner,
         device_auth=device_auth,

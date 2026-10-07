@@ -207,6 +207,21 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertTrue(manager.commit_bundle("novel", "operation-1"))
             self.assertFalse((profile_root / ".profile-provisioning.json").exists())
 
+    def test_installed_profile_integrity_requires_both_independent_sessions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = ProfileSessionManager(make_config(root))
+            bundle = build_profile_bundle(
+                extract_single_session(single_session_zip()), 123456
+            )
+
+            manager.install_bundle("novel", 123456, bundle, "integrity-check")
+
+            self.assertEqual(manager.verify_installed("novel"), 123456)
+            self.assertFalse(manager.verify_installed("novel", 123457))
+            (root / "profiles" / "novel" / "root" / ".tdl" / "data" / "default").unlink()
+            self.assertFalse(manager.verify_installed("novel"))
+
     def test_worker_restart_cleans_abandoned_login_data_but_keeps_install_backups(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -334,6 +349,67 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertTrue(store.distribution_ready("novel", "local"))
             self.assertFalse(store.distribution_ready("novel", "new-worker"))
 
+    def test_worker_added_after_snapshot_gets_desired_revision_without_blocking_activation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            operation = store.begin(
+                profile="novel", actor_user_id=7, bootstrap_worker="local",
+                source="upload", target_workers=["local", "offline-disabled"],
+            )
+            bundle = build_profile_bundle({"data/default": b"revision-one"}, 123)
+            store.store_bundle(operation, 123, bundle)
+            desired = store.desired_revision("novel")
+            self.assertEqual(desired["revision"], 1)
+
+            store.update_distribution("novel", "local", "ready", provisioning_id=operation)
+            store.add_worker_for_active_profiles("worker-added-later")
+            self.assertEqual(
+                store.profile_manifest("worker-added-later")[0]["revision"], 1
+            )
+            self.assertFalse(store.distribution_ready("novel", "worker-added-later"))
+
+            store.mark_active(operation)
+            self.assertFalse(store.list_profiles()[0]["active"])
+            store.update_distribution(
+                "novel", "offline-disabled", "ready", provisioning_id=operation
+            )
+            store.mark_active(operation)
+            self.assertTrue(store.list_profiles()[0]["active"])
+            self.assertFalse(store.distribution_ready("novel", "worker-added-later"))
+
+    def test_new_bundle_creates_revision_without_mutating_previous_revision(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            first_operation = store.begin(
+                profile="novel", actor_user_id=7, bootstrap_worker="local",
+                source="upload", target_workers=["local"],
+            )
+            first_bundle = build_profile_bundle({"data/default": b"first-session"}, 123)
+            store.store_bundle(first_operation, 123, first_bundle)
+            first = store.desired_revision("novel")
+            store.update_distribution("novel", "local", "ready", provisioning_id=first_operation)
+            store.mark_active(first_operation)
+
+            second_operation = store.begin(
+                profile="novel", actor_user_id=7, bootstrap_worker="local",
+                source="adoption", target_workers=["local"],
+            )
+            second_bundle = build_profile_bundle({"data/default": b"second-session"}, 123)
+            store.store_bundle(second_operation, 123, second_bundle)
+            second = store.desired_revision("novel")
+
+            self.assertEqual((first["revision"], second["revision"]), (1, 2))
+            self.assertNotEqual(first["bundle_sha256"], second["bundle_sha256"])
+            self.assertEqual(store.bundle("novel"), (123, second_bundle))
+            with store._db() as db:
+                revisions = db.execute(
+                    "SELECT revision,bundle_sha256 FROM profile_session_revisions WHERE profile='novel' ORDER BY revision"
+                ).fetchall()
+            self.assertEqual([int(row["revision"]) for row in revisions], [1, 2])
+            self.assertEqual(str(revisions[0]["bundle_sha256"]), first["bundle_sha256"])
+
     def test_store_bundle_rejects_identity_that_does_not_match_session_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -410,6 +486,7 @@ class ProfileProvisioningTests(unittest.TestCase):
     def test_profile_transfers_require_https_except_internal_worker_hosts(self):
         self.assertTrue(profile_transfer_is_secure("https://worker.example:8090"))
         self.assertTrue(profile_transfer_is_secure("http://worker-local:8080"))
+        self.assertTrue(profile_transfer_is_secure("http://resolver:8080"))
         self.assertFalse(profile_transfer_is_secure("http://remote.example:8080"))
         self.assertFalse(profile_transfer_is_secure("https://user:secret@worker.example"))
 

@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 _USERNAME = re.compile(r"@?([A-Za-z0-9_]{5,32})\Z")
 _NUMBER = re.compile(r"-?\d+\Z")
 _PHONE = re.compile(r"\+\s*[0-9][0-9\s().-]*[0-9]\Z")
+_PEER_TYPE = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_PEER_ID = re.compile(r"-?[0-9]+\Z")
 
 
 def normalize_tdl_chat_ref(raw: str) -> str:
@@ -82,3 +84,21 @@ def canonical_chat_key(raw: str) -> str:
         return normalize_tdl_chat_ref(value)
     except ValueError:
         return value.lstrip("@").casefold()
+
+
+def normalize_peer_identity(peer_type: str, peer_id: str | int) -> tuple[str, str]:
+    """Normalize a TDL-resolved peer identity before it enters the alias map.
+
+    A numeric chat reference alone is not enough to identify a Telegram peer:
+    the authenticated TDL session must report both its peer type and ID.
+    """
+    selected_type = str(peer_type or "").strip().casefold()
+    selected_id = str(peer_id if peer_id is not None else "").strip()
+    if not _PEER_TYPE.fullmatch(selected_type):
+        raise ValueError("Jenis peer Telegram tidak valid.")
+    if not _PEER_ID.fullmatch(selected_id):
+        raise ValueError("ID peer Telegram harus berupa angka.")
+    numeric_id = int(selected_id)
+    if numeric_id == 0:
+        raise ValueError("ID peer Telegram tidak boleh nol.")
+    return selected_type, str(numeric_id)

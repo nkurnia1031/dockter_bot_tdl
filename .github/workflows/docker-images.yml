@@ -73,13 +73,19 @@ jobs:
           cache-to: type=gha,mode=max,scope=tme3bot-base
 
   application:
-    name: Build ${{ matrix.target }} image
+    name: Build ${{ matrix.image }} image
     needs: base
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [gateway, worker, resolver]
+        include:
+          - image: gateway
+            target: gateway
+          - image: worker
+            target: worker
+          - image: resolver
+            target: browser-resolver
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -105,7 +111,7 @@ jobs:
           build-args: |
             TME3BOT_BASE_IMAGE=${{ needs.base.outputs.base_ref }}
           tags: |
-            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.target }}:${{ needs.base.outputs.tag }}
-            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.target }}:latest
-          cache-from: type=gha,scope=tme3bot-${{ matrix.target }}
-          cache-to: type=gha,mode=max,scope=tme3bot-${{ matrix.target }}
+            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}:${{ needs.base.outputs.tag }}
+            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}:latest
+          cache-from: type=gha,scope=tme3bot-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=tme3bot-${{ matrix.image }}

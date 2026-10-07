@@ -3,11 +3,8 @@ from __future__ import annotations
 from typing import Any
 
 from tme3bot.progress_reporter import ProgressReporter
-from tme3bot.worker.safelink_resolver import (
-    SafelinkCancelled,
-    SafelinkResolveError,
-    resolve_shortlink,
-)
+from tme3bot.worker.safelink_resolver import SafelinkCancelled, SafelinkResolveError
+from tme3bot.worker.resolver_client import resolve_with_addon
 
 
 class SafelinkExecutorMixin:
@@ -28,7 +25,7 @@ class SafelinkExecutorMixin:
             )
 
         try:
-            return resolve_shortlink(
+            return resolve_with_addon(
                 str(payload.get("url") or ""),
                 on_progress=progress,
                 is_cancelled=cancelled,

@@ -48,6 +48,9 @@ from tme3bot.worker.quick_export import (
 )
 from tme3bot.worker.runtime_settings import WorkerRuntimeSettings
 from tme3bot.worker.profile_sessions import ProfileSessionManager
+from tme3bot.worker.profile_sync import ProfileSyncClient, ProfileSyncError
+from tme3bot.worker.command_runner import WorkerCommandRunner
+from tme3bot.worker.command_store import WorkerCommandStore
 
 LOGGER = logging.getLogger(__name__)
 from .executor_support import (
@@ -162,6 +165,22 @@ class WorkerJobExecutor(
         self._quick_log_locks: dict[str, threading.RLock] = {}
         self._quick_log_named_progress: dict[str, bool] = {}
         self._quick_log_state_lock = threading.RLock()
+        self.command_store = WorkerCommandStore(
+            config.state_file.parent / "worker-command-journal.sqlite3"
+        )
+        self.command_runner = WorkerCommandRunner(self.command_store, self)
+        self.profile_sync = ProfileSyncClient(
+            config,
+            profile_manager,
+            self._profile_sessions,
+            install_bundle=self.install_profile_bundle,
+            commit_bundle=self.commit_profile_bundle,
+            rollback_bundle=self.rollback_profile_bundle,
+        )
+        self.command_runner.register_operation_handler(
+            "profile.sync", self._run_profile_sync_operation
+        )
+        self._durable_admission_lock = threading.RLock()
         # Inventory statistics are derived from the JSON file.  Keep a small
         # process-local fingerprint cache so repeated reconciles do not parse
         # unchanged exports again.  The cache is intentionally disposable;
@@ -176,9 +195,34 @@ class WorkerJobExecutor(
         )
 
     def start(self) -> None:
-        self.sync_profiles()
+        if self.profile_sync.enabled:
+            self.sync_profiles()
         self._recover_legacy_quick_stages()
+        self.publisher.attach_outbox(self.command_store)
         self._jobs.start()
+        self.publisher.start_sender()
+        self.command_runner.start()
+
+    def durable_commands_ready(self) -> bool:
+        return bool(
+            getattr(self, "command_store", None) is not None
+            and getattr(self, "publisher", None) is not None
+            and self.publisher.sender_ready
+            and getattr(self, "command_runner", None) is not None
+            and self.command_runner.ready
+        )
+
+    def accept_durable_command(self, envelope: dict[str, Any]) -> dict[str, Any]:
+        if not self.durable_commands_ready():
+            raise DomainError(
+                "DURABLE_COMMANDS_NOT_READY",
+                "Jurnal command worker belum siap.",
+                status_code=503,
+            )
+        return self.command_runner.accept(envelope)
+
+    def durable_command_status(self, command_id: str) -> dict[str, Any] | None:
+        return self.command_runner.status(command_id)
 
     def _recover_legacy_quick_stages(self) -> None:
         """Make pre-manager Quick Mode staging visible after worker restart."""
@@ -201,20 +245,26 @@ class WorkerJobExecutor(
             pass
 
     def sync_profiles(self) -> None:
-        """Publish only profile metadata; .tdl files remain on this worker."""
-        try:
-            request_json(
-                self.config.backend_api_url,
-                self.config.backend_internal_token,
-                "POST",
-                "/internal/v1/profiles/sync",
-                {"profiles": self.profile_manager.local_profile_identities()},
-                timeout=15,
-            )
-        except Exception as exc:
-            # The worker can still expose its API while the backend restarts;
-            # the next worker restart will retry registration.
-            LOGGER.warning("Could not sync worker profile metadata to backend: %s", exc)
+        """Pull backend-owned revisions; never publish local identity as authority."""
+        self.profile_sync.start()
+
+    def profile_sync_status(self) -> dict[str, Any]:
+        return self.profile_sync.snapshot()
+
+    def request_profile_sync(self, profile: str | None = None, mode: str = "check") -> dict[str, Any]:
+        return self.profile_sync.request_sync(profile=profile, mode=mode)
+
+    def _run_profile_sync_operation(self, envelope: dict[str, Any]) -> None:
+        operation = envelope.get("operation")
+        operation = operation if isinstance(operation, dict) else {}
+        profile = operation.get("profile") or envelope.get("profile")
+        mode = str(operation.get("mode") or "check")
+        result = self.profile_sync.sync_now(profile=str(profile) if profile else None, mode=mode)
+        if result.get("status") != "ready":
+            code = "PROFILE_SYNC_PENDING"
+            if result.get("status") == "not_assigned":
+                code = "PROFILE_NOT_ASSIGNED"
+            raise ProfileSyncError(code)
 
     def validate_profile_session(self, archive_data: bytes) -> dict[str, int]:
         return {"telegram_user_id": self._profile_sessions.validate_upload(archive_data)}
@@ -242,15 +292,26 @@ class WorkerJobExecutor(
         # new commands out until the replacement has completed.
         with runtime.export_operation_lock:
             with runtime.download_operation_lock:
-                return self._profile_sessions.install_bundle(
+                result = self._profile_sessions.install_bundle(
                     profile, telegram_user_id, bundle, operation_id
                 )
+                refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
+                if callable(refresh):
+                    refresh(profile)
+                return result
 
     def commit_profile_bundle(self, profile: str, operation_id: str) -> bool:
         return self._profile_sessions.commit_bundle(profile, operation_id)
 
     def rollback_profile_bundle(self, profile: str, operation_id: str) -> bool:
-        return self._profile_sessions.rollback_bundle(profile, operation_id)
+        runtime = self.profile_manager.runtime(profile)
+        with runtime.export_operation_lock:
+            with runtime.download_operation_lock:
+                restored = self._profile_sessions.rollback_bundle(profile, operation_id)
+                refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
+                if restored and callable(refresh):
+                    refresh(profile)
+                return restored
 
     def export_profile_bundle(self, profile: str) -> tuple[int, bytes]:
         runtime = self.profile_manager.runtime(profile)
@@ -279,6 +340,13 @@ class WorkerJobExecutor(
             self.publisher.begin(job_id, command.get("event_sequence_start"))
             if worker:
                 self.publisher.bind_job_worker(job_id, worker)
+            if command.get("command_id"):
+                self.publisher.bind_command(
+                    job_id,
+                    str(command.get("command_id")),
+                    int(command.get("attempt") or 1),
+                    str(command.get("dispatch_token") or ""),
+                )
             if job_id in self._known:
                 return self._jobs.queue_size()
             self._known.add(job_id)
@@ -310,6 +378,13 @@ class WorkerJobExecutor(
         return position
 
     def cancel(self, job_id: str) -> bool:
+        command_store = getattr(self, "command_store", None)
+        with getattr(self, "_durable_admission_lock", threading.RLock()):
+            durable_cancel = (
+                command_store.request_cancel_by_job(job_id)
+                if command_store is not None
+                else None
+            )
         with self._lock:
             was_paused = job_id in self._pause_events and self._pause_events[job_id].is_set()
             if was_paused:
@@ -329,6 +404,8 @@ class WorkerJobExecutor(
                     progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
                     error={"code": "JOB_TERMINATED", "message": "Job antrean Quick Mode dibatalkan."},
                 )
+                if durable_cancel is not None:
+                    command_store.finish(str(durable_cancel["command_id"]), "cancelled")
                 self.publisher.forget(job_id)
                 return True
             except Exception:
@@ -340,6 +417,17 @@ class WorkerJobExecutor(
             with self._lock:
                 self._known.discard(job_id)
                 self._quick_stage_jobs.pop(job_id, None)
+            if durable_cancel is not None:
+                self.publisher.emit(
+                    job_id,
+                    "cancelled",
+                    "cancelled",
+                    progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
+                    error={"code": "JOB_TERMINATED", "message": "Job antrean dibatalkan."},
+                )
+                command_store.finish(str(durable_cancel["command_id"]), "cancelled")
+                self.publisher.forget(job_id)
+                return True
             self.publisher.forget(job_id)
             # Returning false tells the backend to persist the terminal
             # cancelled event for a command that never started.
@@ -608,6 +696,16 @@ class WorkerJobExecutor(
         """Return non-secret worker capabilities for backend target checks."""
         profiles = [str(item) for item in self.profile_manager.list_profiles()]
         storage_profiles_available = self.available_storage_profiles()
+        profile_sync = self.profile_sync.snapshot()
+        if self.profile_sync.enabled:
+            profiles = [
+                name for name in profiles if self.profile_sync.profile_ready(name)
+            ]
+            storage_profiles_available = [
+                name
+                for name in storage_profiles_available
+                if self.profile_sync.profile_ready(name)
+            ]
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
         tts_ready = False
@@ -626,8 +724,15 @@ class WorkerJobExecutor(
             tts_ready = False
         resolver_probe = getattr(self, "_safelink_browser_ready", None)
         resolver_ready = bool(resolver_probe()) if callable(resolver_probe) else False
+        tts_profiles = self.available_storage_profiles()
+        if self.profile_sync.enabled:
+            tts_profiles = [
+                name for name in tts_profiles if self.profile_sync.profile_ready(name)
+            ]
+            tts_ready = tts_ready and bool(tts_profiles)
         return {
             "profiles": profiles,
+            "profile_sync": profile_sync,
             "storage_profile": storage_profile,
             "storage_profile_available": storage_available,
             "available_storage_profiles": storage_profiles_available,
@@ -639,29 +744,9 @@ class WorkerJobExecutor(
         }
 
     def _safelink_browser_ready(self) -> bool:
-        cached = getattr(self, "_safelink_browser_ready_cached", None)
-        if cached:
-            return True
-        browser = None
-        try:
-            from playwright.sync_api import sync_playwright
+        from tme3bot.worker.resolver_client import resolver_addon_ready
 
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                ready = True
-        except Exception:
-            ready = False
-        finally:
-            if browser is not None:
-                try:
-                    browser.close()
-                except Exception:
-                    ready = False
-        # Cache only a successful probe. A transient startup failure must not
-        # permanently hide resolver capability until the worker is restarted.
-        if ready:
-            self._safelink_browser_ready_cached = True
-        return ready
+        return resolver_addon_ready()
 
     def storage_profile(self) -> str:
         return self.runtime_settings.storage_profile()
@@ -852,6 +937,13 @@ class WorkerJobExecutor(
     def _unhandled_resource(self, command: dict[str, Any], exc: Exception) -> None:
         LOGGER.exception("Worker queue failed for job %s", command.get("job_id"))
         self._failed(command, exc)
+        command_id = str(command.get("command_id") or "")
+        if command_id:
+            self.command_store.finish(
+                command_id,
+                "failed",
+                ack={"error_code": "WORKER_JOB_FAILED"},
+            )
 
     def _resource_keys_for_command(self, command: dict[str, Any]) -> set[str]:
         profile = str(command.get("profile") or "default")
@@ -937,6 +1029,13 @@ class WorkerJobExecutor(
     def _run(self, command: dict[str, Any], resource_keys: set[str]) -> None:
         del resource_keys
         job_id = str(command["job_id"])
+        command_id = str(command.get("command_id") or "")
+        if command_id:
+            self.command_store.mark_running(command_id)
+            durable_status = self.command_store.get(command_id)
+            if durable_status and durable_status["status"] in {"cancelled", "cancelling"}:
+                with self._lock:
+                    self._cancel_requested.add(job_id)
         profile = str(command["profile"])
         kind = str(command["kind"])
         started_at = utc_now().isoformat()
@@ -976,6 +1075,7 @@ class WorkerJobExecutor(
         )
         heartbeat_stop = threading.Event()
         heartbeat_thread: threading.Thread | None = None
+        command_terminal_status = "failed"
         with self._lock:
             self._active[job_id] = (profile, kind)
             self._active_commands[job_id] = command
@@ -983,21 +1083,6 @@ class WorkerJobExecutor(
             self._log_snapshots[job_id] = snapshot
         try:
             self._wait_if_paused(job_id)
-            self.publisher.emit(
-                job_id,
-                "running",
-                "started",
-                progress={
-                    "phase": "starting",
-                    "started_at": started_at,
-                    "message": f"{kind} mulai diproses",
-                    "overall": {},
-                    "item": {},
-                    "transfer": {},
-                    "counters": {"succeeded": 0, "failed": 0, "skipped": 0},
-                    "indeterminate": True,
-                },
-            )
             heartbeat_thread = threading.Thread(
                 target=self._worker_heartbeat_loop,
                 args=(job_id, heartbeat_stop),
@@ -1005,7 +1090,48 @@ class WorkerJobExecutor(
                 name=f"worker-heartbeat-{job_id[:8]}",
             )
             heartbeat_thread.start()
-            result = self._execute(command)
+            with self._lock:
+                cancelled_before_execute = job_id in self._cancel_requested
+            if self.profile_sync.enabled and not cancelled_before_execute:
+                expected_revision = int(command.get("profile_revision") or 0)
+
+                def report_profile_wait(reason: str) -> None:
+                    self.publisher.emit(
+                        job_id,
+                        "running",
+                        "profile_sync",
+                        progress={
+                            "phase": "waiting_profile_sync",
+                            "reason": reason,
+                            "message": "Menunggu sesi profil siap pada worker.",
+                            "indeterminate": True,
+                        },
+                    )
+
+                ready = self.profile_sync.wait_until_ready(
+                    profile,
+                    expected_revision,
+                    cancelled=lambda: self._job_cancelled(job_id),
+                    on_wait=report_profile_wait,
+                )
+                cancelled_before_execute = not ready
+            if not cancelled_before_execute:
+                self.publisher.emit(
+                    job_id,
+                    "running",
+                    "started",
+                    progress={
+                        "phase": "starting",
+                        "started_at": started_at,
+                        "message": f"{kind} mulai diproses",
+                        "overall": {},
+                        "item": {},
+                        "transfer": {},
+                        "counters": {"succeeded": 0, "failed": 0, "skipped": 0},
+                        "indeterminate": True,
+                    },
+                )
+            result = None if cancelled_before_execute else self._execute(command)
             self._wait_if_paused(job_id)
             with self._lock:
                 cancelled = job_id in self._cancel_requested
@@ -1026,6 +1152,7 @@ class WorkerJobExecutor(
                     },
                     error={"code": "JOB_TERMINATED", "message": self._cancel_error(command)},
                 )
+                command_terminal_status = "cancelled"
             else:
                 self.publisher.emit(
                     job_id,
@@ -1037,6 +1164,7 @@ class WorkerJobExecutor(
                     },
                     result={"value": json_value(result)},
                 )
+                command_terminal_status = "succeeded"
         except Exception as exc:
             LOGGER.exception("Job %s (%s) failed", job_id, kind)
             self._append_job_log(f"[job failed: {exc}]")
@@ -1074,6 +1202,7 @@ class WorkerJobExecutor(
                         }
                     ),
                 )
+                command_terminal_status = "cancelled"
             else:
                 self._failed(
                     command,
@@ -1082,6 +1211,7 @@ class WorkerJobExecutor(
                     phase=self._quick_terminal_phase(command, "failed"),
                     staging_path=self._quick_staging_path(command),
                 )
+                command_terminal_status = "failed"
         finally:
             heartbeat_stop.set()
             if heartbeat_thread is not None:
@@ -1115,6 +1245,8 @@ class WorkerJobExecutor(
                 self._quick_active.discard(job_id)
                 self._quick_stage_jobs.pop(job_id, None)
                 self._cancel_requested.discard(job_id)
+            if command_id:
+                self.command_store.finish(command_id, command_terminal_status)
             self.publisher.forget(job_id)
 
     def _failed(
@@ -1145,6 +1277,10 @@ class WorkerJobExecutor(
             )
         except Exception:
             LOGGER.exception("Could not publish failure for job %s", command.get("job_id"))
+
+    def _job_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._cancel_requested
 
 
     def _append_job_log(self, line: str) -> None:

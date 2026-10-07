@@ -86,15 +86,15 @@ python3 run.py status
 python3 run.py logs
 ```
 
-Compose membangun image gateway satu kali. Container `telegram` menggunakan
-image yang sama tanpa build kedua.
+Compose menjalankan backend, Telegram, worker lokal, helper TTS, dan addon
+resolver dalam stack gateway. Container `telegram` memakai image gateway.
 
 ## Build Docker melalui GitHub Actions
 
 Release Docker dibangun oleh workflow
 `.github/workflows/docker-images.yml`. Workflow tersebut membuat image dasar
 Go/TDL/Python terlebih dahulu, kemudian membangun image gateway, worker, dan
-resolver browser dari base image immutable, lalu mem-publish semuanya ke GHCR.
+addon resolver browser dari base image immutable, lalu mem-publish semuanya ke GHCR.
 VPS tidak perlu lagi menjalankan `docker build` atau mengompilasi Go.
 
 Push ke `main` akan menghasilkan tag image berdasarkan 12 karakter SHA commit:
@@ -114,26 +114,28 @@ Pada VPS, isi `.env` dengan nama package GHCR dan tag commit yang sama:
 ```env
 GATEWAY_IMAGE_NAME=ghcr.io/<owner>/tme3bot-gateway
 WORKER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-worker
-RESOLVER_IMAGE_NAME=ghcr.io/<owner>/tme3bot-resolver
 IMAGE_TAG=<sha12>
 ```
 
-Setelah workflow berhasil dan VPS sudah login ke GHCR, deploy hanya perlu
-pull lalu menjalankan container:
+Nama image addon resolver otomatis mengikuti nama image worker dengan akhiran
+`-resolver`; tidak perlu menambah pengaturan env untuk addon.
+
+Tidak ada file env atau token tambahan untuk addon. Setelah workflow berhasil
+dan VPS sudah login ke GHCR, deploy hanya perlu pull lalu menjalankan container:
 
 ```bash
-docker compose -f docker-compose.gateway.yml pull
-docker compose -f docker-compose.gateway.yml up -d --remove-orphans
+python3 run.py deploy gateway --pull
 ```
 
-`python3 run.py deploy gateway --pull` dan `python3 run.py deploy worker --pull`
-tetap dapat dipakai sebagai wrapper. Build lokal dan `base-migrate.zip` masih
-tersedia sebagai fallback untuk recovery atau deployment offline.
-
-Worker shortlink memakai image terpisah yang menyertakan Playwright dan
-Chromium. Salin `.env.resolver.example` menjadi `.env.resolver` di host khusus,
-isi backend URL dan token worker unik, daftarkan worker itu pada gateway, lalu
-jalankan `python3 run.py deploy resolver --pull`.
+Perintah deploy gateway juga menjalankan worker lokal, tiga helper TTS, dan
+addon resolver. Deploy worker remote menjalankan worker beserta addon yang
+sama. Alurnya selalu backend → worker → helper TTS/resolver; backend hanya
+mengenal worker yang sudah terdaftar. Addon resolver memakai image terpisah
+yang menyertakan Playwright dan Chromium, hanya tersedia pada jaringan privat
+Compose, dan tidak memerlukan token atau berkas `.env` tersendiri. `COMPOSE_PROFILES`
+tidak perlu diatur.
+Build lokal dan `base-migrate.zip` masih tersedia sebagai fallback untuk
+recovery atau deployment offline.
 
 Jika arsitektur target bukan AMD64, workflow perlu ditambah target platform
 tersebut dan image multi-arsitektur harus dibangun sebelum VPS ARM melakukan
@@ -149,14 +151,16 @@ fingerprint dependency/base berubah, script akan memberi peringatan dan
 Pada VPS worker:
 
 ```bash
-cp .env.worker.example .env.worker
-docker compose --env-file .env.worker -f docker-compose.worker.yml up -d --build
+cp -n .env.example .env
+cp -n .env.worker.example .env.worker
+python3 run.py deploy worker --pull
 ```
 
 `BACKEND_API_URL` harus menunjuk domain backend HTTPS dan
 `BACKEND_INTERNAL_TOKEN` harus sama dengan backend. Worker API sendiri
 disarankan hanya tersedia melalui reverse proxy TLS atau jaringan privat.
 `PROFILE_ROOT` pada `.env.worker` adalah lokasi data persistent di host worker.
+`deploy worker` juga menyalakan helper TTS dan addon resolver secara otomatis.
 
 Daftarkan worker dari VPS utama:
 

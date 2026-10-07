@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
+from tme3bot.chat_refs import normalize_peer_identity
+
 
 @dataclass(frozen=True)
 class JobExecutionPlan:
@@ -40,6 +42,18 @@ def build_execution_plan(
 
     if kind in {"export", "leave"}:
         lane = "tdl-export"
+        if kind == "export":
+            resolved_peer = payload.get("_verified_export_peer")
+            if isinstance(resolved_peer, dict):
+                peer_type, peer_id = normalize_peer_identity(
+                    resolved_peer.get("peer_type", ""),
+                    resolved_peer.get("peer_id", ""),
+                )
+                # Peer identity is supplied only by the backend alias registry.
+                # This global key is independent of labels and worker routing.
+                keys.add(
+                    f"profile:{profile}:peer:{peer_type}:{peer_id}:export-cursor"
+                )
         if kind == "export" and bool(payload.get("quick_mode")):
             # Quick Mode is a single job, but its phases use different
             # sessions.  Only the export phase is admitted on the export

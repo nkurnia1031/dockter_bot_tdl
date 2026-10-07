@@ -346,6 +346,115 @@ class WorkerEventPublisher:
         self._workers: dict[str, str] = {}
         self._audit_callbacks: dict[str, Callable[[str], None]] = {}
         self._lock = threading.RLock()
+        self._outbox = None
+        self._command_bindings: dict[str, dict[str, Any]] = {}
+        self._sender_stop = threading.Event()
+        self._sender_ready = threading.Event()
+        self._sender_thread: threading.Thread | None = None
+
+    def attach_outbox(self, outbox) -> None:
+        """Enable durable event delivery while retaining legacy test adapters."""
+        self._outbox = outbox
+
+    @property
+    def sender_ready(self) -> bool:
+        return bool(
+            self._outbox is not None
+            and self._sender_ready.is_set()
+            and self._sender_thread is not None
+            and self._sender_thread.is_alive()
+        )
+
+    def start_sender(self) -> None:
+        if self.sender_ready:
+            return
+        if self._outbox is None:
+            return
+        self._sender_stop.clear()
+        self._sender_thread = threading.Thread(
+            target=self._send_outbox_loop,
+            daemon=True,
+            name="worker-event-outbox",
+        )
+        self._sender_thread.start()
+
+    def stop_sender(self, timeout: float = 5.0) -> None:
+        self._sender_stop.set()
+        thread = self._sender_thread
+        if thread is not None:
+            thread.join(timeout=max(0.0, timeout))
+        self._sender_ready.clear()
+
+    def bind_command(
+        self, job_id: str, command_id: str, attempt: int, dispatch_token: str
+    ) -> None:
+        with self._lock:
+            self._command_bindings[str(job_id)] = {
+                "command_id": str(command_id),
+                "attempt": int(attempt),
+                "dispatch_token": str(dispatch_token),
+            }
+
+    def _send_outbox_loop(self) -> None:
+        self._sender_ready.set()
+        while not self._sender_stop.is_set():
+            try:
+                item = self._outbox.claim_event()
+            except Exception as exc:
+                LOGGER.warning("Worker event outbox read failed (%s)", type(exc).__name__)
+                self._sender_stop.wait(1.0)
+                continue
+            if item is None:
+                self._sender_stop.wait(0.2)
+                continue
+            event_id, job_id, sequence, payload = item
+            started = time.monotonic()
+            try:
+                response = request_json(
+                    self.backend_url,
+                    self.token,
+                    "POST",
+                    f"/internal/v1/jobs/{job_id}/events",
+                    payload,
+                    timeout=8.0,
+                )
+                accepted = not (
+                    isinstance(response, dict) and response.get("accepted") is False
+                )
+                reason = "backend_rejected" if not accepted else ""
+                self._outbox.acknowledge_event(
+                    event_id, accepted=accepted, reason=reason
+                )
+                self._audit(
+                    job_id,
+                    "[telemetry] "
+                    f"{'delivered' if accepted else 'ignored'} sequence={sequence} "
+                    f"duration={time.monotonic() - started:.3f}s",
+                )
+            except JsonHttpError as exc:
+                if exc.status == 409:
+                    self._outbox.acknowledge_event(
+                        event_id, accepted=False, reason="stale_terminal"
+                    )
+                    self._audit(
+                        job_id,
+                        f"[telemetry] ignored sequence={sequence} status=409 terminal",
+                    )
+                else:
+                    self._outbox.retry_event(event_id, type(exc).__name__)
+                    self._audit(
+                        job_id,
+                        f"[telemetry] retry sequence={sequence} error_type={type(exc).__name__}",
+                    )
+            except Exception as exc:
+                try:
+                    self._outbox.retry_event(event_id, type(exc).__name__)
+                except Exception:
+                    LOGGER.exception("Could not reschedule worker event %s", sequence)
+                self._audit(
+                    job_id,
+                    f"[telemetry] retry sequence={sequence} error_type={type(exc).__name__}",
+                )
 
     def bind_job_worker(self, job_id: str, worker: str) -> None:
         with self._lock:
@@ -385,6 +494,30 @@ class WorkerEventPublisher:
         timeout_seconds: float = 5.0,
         max_attempts: int = 1,
     ) -> None:
+        if self._outbox is not None:
+            with self._lock:
+                worker = self._workers.get(job_id)
+                binding = dict(self._command_bindings.get(str(job_id)) or {})
+            payload = {
+                "status": status,
+                "event_type": event_type,
+                "sent_at": utc_now().isoformat(),
+                "transient": transient,
+                "progress": json_value(progress or {}),
+                "result": json_value(result) if result is not None else None,
+                "error": json_value(error) if error is not None else None,
+            }
+            if worker:
+                payload["worker"] = worker
+            payload.update(binding)
+            sequence = self._outbox.append_event(
+                str(job_id), payload, transient=bool(transient)
+            )
+            self._audit(
+                job_id,
+                f"[telemetry] queued sequence={sequence} event={event_type} transient={bool(transient)}",
+            )
+            return
         with self._lock:
             sequence = self._sequences.get(job_id, 1) + 1
             self._sequences[job_id] = sequence
@@ -474,9 +607,12 @@ class WorkerEventPublisher:
             self._sequences[str(job_id)] = max(
                 self._sequences.get(str(job_id), 0), int(sequence_start)
             )
+        if self._outbox is not None:
+            self._outbox.seed_sequence(str(job_id), int(sequence_start))
 
     def forget(self, job_id: str) -> None:
         with self._lock:
             self._sequences.pop(job_id, None)
             self._workers.pop(job_id, None)
             self._audit_callbacks.pop(job_id, None)
+            self._command_bindings.pop(job_id, None)

@@ -63,21 +63,31 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertFalse((PROJECT_ROOT / "Dockerfile.web").exists())
         self.assertTrue((PROJECT_ROOT / "deploy" / "nginx" / "tme3bot-ui.conf").is_file())
 
-    def test_resolver_image_has_playwright_chromium_and_worker_entrypoint(self) -> None:
+    def test_resolver_image_is_private_addon_instead_of_a_worker(self) -> None:
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
         compose = yaml.safe_load(
             (PROJECT_ROOT / "docker-compose.resolver.yml").read_text(encoding="utf-8")
         )
         requirements = (PROJECT_ROOT / "requirements-browser.txt").read_text(encoding="utf-8")
-        service = compose["services"]["worker"]
+        service = compose["services"]["resolver-addon"]
 
         self.assertIn("FROM runtime-base AS browser-resolver", dockerfile)
         self.assertIn("python3 -m playwright install --with-deps chromium", dockerfile)
         self.assertIn('CMD ["python3", "/app/bot.py"]', dockerfile)
         self.assertIn("playwright==1.55.0", requirements)
         self.assertEqual(service["build"]["target"], "browser-resolver")
-        self.assertIn("127.0.0.1", service["ports"][0])
-        self.assertEqual(service["env_file"], ["${RESOLVER_ENV_FILE:-.env.resolver}"])
+        self.assertEqual(service["command"], ["python3", "-m", "tme3bot.worker.resolver_addon"])
+        self.assertEqual(service["expose"], ["8091"])
+        self.assertNotIn("ports", service)
+        self.assertNotIn("volumes", service)
+        self.assertNotIn("env_file", service)
+
+    def test_tts_helpers_are_in_default_gateway_and_worker_stacks(self) -> None:
+        for filename in ("docker-compose.gateway.yml", "docker-compose.worker.yml"):
+            services = yaml.safe_load((PROJECT_ROOT / filename).read_text(encoding="utf-8"))["services"]
+            for name in ("tts-1", "tts-2", "tts-3"):
+                self.assertIn(name, services)
+                self.assertNotIn("profiles", services[name])
 
     def test_gateway_queue_uses_private_persistent_redis_without_worker_mounts(self) -> None:
         for filename in ("docker-compose.gateway.yml", "docker-compose.yml"):
@@ -126,6 +136,8 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("docker-compose.gateway.yml", names)
         self.assertIn("docker-compose.worker.yml", names)
         self.assertIn("docker-compose.resolver.yml", names)
+        self.assertNotIn("docker-compose.resolver-gateway.yml", names)
+        self.assertNotIn(".env.resolver.example", names)
         self.assertIn("requirements-browser.txt", names)
         self.assertIn(".env.backend.example", names)
         self.assertIn(".env.telegram.example", names)

@@ -232,7 +232,26 @@ def register_workers(app, context, *, current_actor):
                 status_code=503,
             )
         try:
-            return {"worker": name, **get_settings(name)}
+            values = get_settings(name)
+            settings_store = getattr(context, "runtime_settings_store", None)
+            if settings_store is not None:
+                try:
+                    settings_store.seed_worker_once(
+                        name, values, source="legacy-worker-settings"
+                    )
+                    snapshot = settings_store.snapshot("worker", worker=name)
+                    return {
+                        "worker": name,
+                        **values,
+                        "desired_version": snapshot["desired_version"],
+                        "applied_version": snapshot["applied_version"],
+                        "settings_status": snapshot["status"],
+                    }
+                except (TypeError, ValueError):
+                    # Keep the old endpoint readable if a legacy worker reports
+                    # a setting that no longer passes the current registry.
+                    pass
+            return {"worker": name, **values}
         except JsonHttpError as exc:
             if exc.status == 404:
                 raise DomainError(
@@ -268,7 +287,6 @@ def register_workers(app, context, *, current_actor):
     def update_worker_settings(
         name: str, body: WorkerRuntimeSettingsRequest, actor=Depends(current_actor)
     ):
-        del actor
         if context.worker_registry.get(name) is None:
             raise DomainError(
                 "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
@@ -282,7 +300,40 @@ def register_workers(app, context, *, current_actor):
             )
         try:
             payload = body.model_dump(exclude_unset=True) if hasattr(body, "model_dump") else body.dict(exclude_unset=True)
-            return {"worker": name, **update_settings(name, payload)}
+            applied = update_settings(name, payload)
+            settings_store = getattr(context, "runtime_settings_store", None)
+            if settings_store is not None:
+                desired = {
+                    key: value for key, value in payload.items()
+                    if key in {
+                        "job_stall_timeout_seconds", "tdl_export_stall_timeout_seconds",
+                        "tdl_download_stall_timeout_seconds", "storage_profile", "tts_helper_urls",
+                        "tts_tor_control_hosts", "tts_tor_control_ports", "tts_part_retries",
+                        "tts_retry_base_seconds", "tts_newnym_after_retries",
+                    }
+                }
+                if desired:
+                    if "job_stall_timeout_seconds" in desired:
+                        desired["worker_job_stall_timeout_seconds"] = desired.pop(
+                            "job_stall_timeout_seconds"
+                        )
+                    snapshot = settings_store.snapshot("worker", worker=name)
+                    saved = settings_store.update(
+                        "worker", desired,
+                        expected_version=int(snapshot["desired_version"]),
+                        worker=name,
+                        actor_user_id=int(actor.telegram_user_id),
+                        source="legacy-worker-settings",
+                    )
+                    saved = settings_store.acknowledge(
+                        "worker", name, int(saved["desired_version"])
+                    )
+                    applied.update({
+                        "desired_version": saved["desired_version"],
+                        "applied_version": saved["applied_version"],
+                        "settings_status": saved["status"],
+                    })
+            return {"worker": name, **applied}
         except JsonHttpError as exc:
             if exc.status == 404:
                 raise DomainError(

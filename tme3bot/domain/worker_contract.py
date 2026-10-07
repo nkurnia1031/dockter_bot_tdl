@@ -21,6 +21,7 @@ CAP_QUICKMODE_VERIFY = "quickmode.verify.v1"
 CAP_QUICKMODE_DELETE = "quickmode.delete.v1"
 CAP_TTS = "tts"
 CAP_SAFELINK_RESOLVE = "safelink_resolve.v1"
+CAP_SHARED_EXPORT_CURSOR = "shared_export_cursor_v1"
 
 WORKER_API_CAPABILITIES = frozenset(
     {

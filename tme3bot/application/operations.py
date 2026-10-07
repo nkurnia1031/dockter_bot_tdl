@@ -21,6 +21,7 @@ class PreparedOperation:
     job: Job | None = None
     execution_plan: dict[str, Any] | None = None
     command_payload: dict[str, Any] | None = None
+    private_job_values: dict[str, bytes] | None = None
 
 
 class OperationHandler(Protocol):
@@ -134,6 +135,7 @@ class OperationsService:
             job=prepared.job,
             execution_plan=prepared.execution_plan,
             command_payload=prepared.command_payload,
+            private_job_values=prepared.private_job_values,
         )
 
     def get(self, actor: Actor, operation_id: str) -> Operation:

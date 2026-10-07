@@ -178,6 +178,7 @@ class TtsHelperHealthItem(ApiResponse):
 
 class WorkerTtsHealthResponse(ApiResponse):
     worker: str
+    settings_version: int = 0
     ready: bool
     helpers_ready: bool
     profile_session_ready: bool
@@ -363,6 +364,22 @@ class BackupRuntimeSettingsRequest(BaseModel):
 class RuntimeSecretsRequest(BaseModel):
     bot_token: str | None = Field(default=None, min_length=20, max_length=256)
     telegram_tts_chat_id: str | None = Field(default=None, max_length=128)
+
+
+class RuntimeSettingsPutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=0)
+    values: dict[str, Any] = Field(default_factory=dict)
+    clear: list[str] = Field(default_factory=list, max_length=32)
+
+
+class RuntimeSettingsAckRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    worker: str = Field(min_length=1, max_length=48)
+    scope: str = Field(min_length=1, max_length=24)
+    applied_version: int = Field(ge=0)
+    success: bool = True
+    error_code: str = Field(default="", max_length=80)
 
 
 class LabelRequest(BaseModel):

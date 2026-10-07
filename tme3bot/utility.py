@@ -69,17 +69,28 @@ class UtilityPathError(ValueError):
 
 
 class UtilitySettingsStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, desired_store=None) -> None:
         self.path = path
+        self.desired_store = desired_store
         self._lock = threading.RLock()
         self._settings: dict[str, str] | None = None
 
     def get(self) -> dict[str, str]:
         with self._lock:
+            if self.desired_store is not None:
+                values = self.desired_store.get_values(
+                    "backend", include_secrets=True
+                )
+                return {
+                    key: str(values[key]) if key in values else str(default)
+                    for key, default in DEFAULT_UTILITY_SETTINGS.items()
+                }
             self._load()
             return dict(self._settings or DEFAULT_UTILITY_SETTINGS)
 
-    def set(self, key: str, value: str) -> None:
+    def set(
+        self, key: str, value: str, *, actor_user_id: int | None = None
+    ) -> None:
         if key not in DEFAULT_UTILITY_SETTINGS:
             raise ValueError(f"Pengaturan utility tidak dikenal: {key}")
         value = value.strip()
@@ -92,6 +103,17 @@ class UtilitySettingsStore:
         else:
             _validate_size(value)
         with self._lock:
+            if self.desired_store is not None:
+                snapshot = self.desired_store.snapshot("backend")
+                self.desired_store.update(
+                    "backend",
+                    {key: value},
+                    expected_version=int(snapshot["desired_version"]),
+                    source="legacy-utility-adapter",
+                    actor_user_id=actor_user_id,
+                )
+                self._settings = None
+                return
             self._load()
             assert self._settings is not None
             self._settings[key] = value

@@ -7,7 +7,11 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.infrastructure.job_store import SqliteJobRepository
-from tme3bot.domain.worker_contract import CAP_DURABLE_COMMANDS_V1, CAP_SAFELINK_RESOLVE
+from tme3bot.domain.worker_contract import (
+    CAP_DURABLE_COMMANDS_V1,
+    CAP_SAFELINK_RESOLVE,
+    CAP_SHARED_EXPORT_CURSOR,
+)
 from tme3bot.worker_registry import WorkerRegistry
 
 
@@ -55,6 +59,28 @@ class IncompatibleDispatcher(FakeDispatcher):
         raise DomainError(
             "WORKER_INCOMPATIBLE", "Worker perlu diperbarui.", status_code=409
         )
+
+
+class FakeExportCursorGate:
+    def __init__(self):
+        self.enabled = False
+        self.leases = set()
+        self.committed = set()
+
+    def lease_for_job(self, job_id):
+        return {"lease_attempt": 1} if job_id in self.leases else None
+
+    def job_has_active_lease(self, job_id):
+        return job_id in self.leases
+
+    def completion_applied(self, job_id, attempt=None):
+        del attempt
+        return job_id in self.committed
+
+    def finish_job(self, job_id, **kwargs):
+        del kwargs
+        self.leases.discard(job_id)
+        return True
 
 
 class ControlPlaneTests(unittest.TestCase):
@@ -175,20 +201,20 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_safelink_durable_job_auto_routes_and_keeps_input_private(self):
         registry = WorkerRegistry(
-            Path(self.temp.name) / "resolver-workers.json",
+            Path(self.temp.name) / "resolver-addon-workers.json",
             {
-                "resolver-a": "http://worker-a",
-                "resolver-b": "http://worker-b",
-                "ordinary": "http://worker-c",
+                "worker-a": "http://worker-a",
+                "worker-b": "http://worker-b",
+                "worker-c": "http://worker-c",
             },
-            {"resolver-a": "a", "resolver-b": "b", "ordinary": "c"},
+            {"worker-a": "a", "worker-b": "b", "worker-c": "c"},
         )
         dispatcher = FakeDispatcher()
         dispatcher.capabilities = lambda worker: {
-            "safelink_resolver": worker.startswith("resolver-"),
+            "safelink_resolver": worker != "worker-c",
             "capabilities": (
                 [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1]
-                if worker.startswith("resolver-")
+                if worker != "worker-c"
                 else []
             ),
         }
@@ -203,21 +229,21 @@ class ControlPlaneTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(prepared.job.worker, "resolver-a")
+        self.assertEqual(prepared.job.worker, "worker-a")
         self.assertEqual(prepared.job.payload, {"submitted": True})
         self.assertEqual(
             prepared.command_payload["payload"],
             {"url": "https://pndk.to/private-token"},
         )
         self.assertIn(
-            "worker:resolver-a:kind:safelink_resolve",
+            "worker:worker-a:kind:safelink_resolve",
             prepared.execution_plan["resource_keys"],
         )
 
         with self.assertRaises(DomainError) as forced_target:
             control.prepare_durable_job(
                 self.actor,
-                {"worker": "resolver-b"},
+                {"worker": "worker-b"},
                 {
                     "job_kind": "safelink_resolve",
                     "payload": {"url": "https://pndk.to/another"},
@@ -227,9 +253,9 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_safelink_router_uses_queue_depth_and_round_robin_ties(self):
         registry = WorkerRegistry(
-            Path(self.temp.name) / "resolver-load-workers.json",
-            {"resolver-a": "http://worker-a", "resolver-b": "http://worker-b", "offline": "http://worker-c"},
-            {"resolver-a": "a", "resolver-b": "b", "offline": "c"},
+            Path(self.temp.name) / "resolver-addon-load-workers.json",
+            {"worker-a": "http://worker-a", "worker-b": "http://worker-b", "offline": "http://worker-c"},
+            {"worker-a": "a", "worker-b": "b", "offline": "c"},
         )
         dispatcher = FakeDispatcher()
         dispatcher.capabilities = lambda worker: {
@@ -240,20 +266,20 @@ class ControlPlaneTests(unittest.TestCase):
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
 
-        self.assertEqual(control._select_safelink_worker(), "resolver-a")
-        self.assertEqual(control._select_safelink_worker(), "resolver-b")
+        self.assertEqual(control._select_safelink_worker(), "worker-a")
+        self.assertEqual(control._select_safelink_worker(), "worker-b")
         self.jobs.create(
             Job(
-                id="resolver-a-queued",
+                id="worker-a-queued",
                 kind="safelink_resolve",
                 profile="default",
                 actor_user_id=42,
-                worker="resolver-a",
+                worker="worker-a",
                 status=JobStatus.QUEUED,
                 payload={"submitted": True},
             )
         )
-        self.assertEqual(control._select_safelink_worker(), "resolver-b")
+        self.assertEqual(control._select_safelink_worker(), "worker-b")
 
     def test_safelink_submit_rejects_untrusted_domains_and_missing_workers(self):
         registry = WorkerRegistry(
@@ -397,6 +423,63 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertIn("worker:local:quick-stage:stage-1", retry_plan.resource_keys)
         self.assertNotIn("profile:default:worker:local:tdl:export", retry_plan.resource_keys)
+
+    def test_quickmode_json_ready_keeps_lane_until_shared_cursor_commit(self):
+        cursor = FakeExportCursorGate()
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "contract_version": 1,
+            "capabilities": [CAP_SHARED_EXPORT_CURSOR],
+        }
+        control = ControlPlane(
+            self.jobs,
+            dispatcher,
+            self.profiles,
+            export_cursor_service=cursor,
+        )
+        first = control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2", "quick_mode": True}
+        )
+        second = control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/3", "quick_mode": True}
+        )
+        self.assertEqual(first.status, JobStatus.DISPATCHED)
+        self.assertEqual(second.status, JobStatus.QUEUED)
+
+        cursor.enabled = True
+        cursor.leases.add(first.id)
+        control.append_worker_event(
+            JobEvent(
+                job_id=first.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="export.json_ready",
+                progress={"phase": "json_ready"},
+                result={"json_name": "export.json", "export_end_id": 10},
+            )
+        )
+        self.assertEqual(self.jobs.get(second.id).status, JobStatus.QUEUED)
+
+        cursor.committed.add(first.id)
+        cursor.leases.discard(first.id)
+        self.assertTrue(control.on_export_cursor_committed(first.id))
+        self.assertEqual(self.jobs.get(second.id).status, JobStatus.DISPATCHED)
+
+    def test_shared_cursor_gate_rejects_worker_without_capability(self):
+        cursor = FakeExportCursorGate()
+        cursor.enabled = True
+        control = ControlPlane(
+            self.jobs,
+            FakeDispatcher(),
+            self.profiles,
+            export_cursor_service=cursor,
+        )
+        with self.assertRaises(DomainError) as raised:
+            control.submit_job(
+                self.actor, "export", {"url": "https://t.me/c/1/2"}
+            )
+        self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
+        self.assertEqual(self.jobs.count(kind="export"), 0)
 
     def test_utility_sibling_paths_can_run_but_nested_path_waits(self):
         first = self.control.submit_job(

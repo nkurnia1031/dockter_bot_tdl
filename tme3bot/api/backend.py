@@ -66,6 +66,8 @@ from tme3bot.api.schemas import (
 )
 from tme3bot.api.routes.devices import register_device_routes
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
+from tme3bot.domain.worker_contract import CAP_SHARED_EXPORT_CURSOR, require_worker_contract
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.profile_provisioning import profile_transfer_is_secure
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
@@ -92,6 +94,7 @@ class BackendContext:
     worker_dispatcher: Any = None
     storage_maintenance: Any = None
     runtime_settings: Any = None
+    runtime_settings_store: Any = None
     backup_scheduler: Any = None
     profile_provisioner: Any = None
     device_auth: Any = None
@@ -189,6 +192,7 @@ def job_dict(job: Job) -> dict[str, Any]:
         "profile": job.profile,
         "actor_user_id": job.actor_user_id,
         "worker": job.worker,
+        "settings_version": job.settings_version,
         "status": job.status.value,
         "payload": job.payload,
         "progress": job.progress,
@@ -445,6 +449,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         context,
         current_actor=current_actor,
         require_service=require_service,
+        require_internal=require_internal,
     )
 
     def verify_target(
@@ -953,7 +958,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
 
 
-    _add_internal_state_routes(app, context, require_internal)
+    _add_internal_state_routes(
+        app, context, require_internal, current_actor=current_actor
+    )
     _add_management_routes(app, context, require_management)
     register_device_routes(
         app,
@@ -969,6 +976,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         and context.queue_publisher is not None
         and context.queue_command_service is not None
     ):
+        from tme3bot.api.routes.profile_sync import (
+            advance_profile_sync_cancel,
+            advance_profile_sync_command,
+            prepare_profile_sync_operation,
+        )
+
         def prepare_background_job(actor, target, input_data):
             job_kind = str(input_data.get("job_kind") or "").strip().lower()
             if job_kind == "tts":
@@ -1000,15 +1013,36 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     operations.mark_waiting_worker_for_job(str(private["job_id"]))
             return result
 
+        def advance_accepted_operation(command):
+            if command.get("kind") == "profile.sync":
+                return advance_profile_sync_command(command, context)
+            return advance_background_job(command)
+
+        def advance_retry_operation(command):
+            if command.get("kind") == "profile.sync":
+                return advance_profile_sync_command(command, context)
+            return advance_background_job(command)
+
+        def advance_cancel_operation(command):
+            if command.get("kind") == "profile.sync":
+                return advance_profile_sync_cancel(command, context)
+            return context.control_plane.advance_durable_cancel(command)
+
         operations.register_handler("job.submit", prepare_background_job)
-        operations.register_command_handler(
-            "operation.accepted", advance_background_job
+        operations.register_handler(
+            "profile.sync",
+            lambda actor, target, input_data: prepare_profile_sync_operation(
+                context, actor, target, input_data
+            ),
         )
         operations.register_command_handler(
-            "operation.retry", advance_background_job
+            "operation.accepted", advance_accepted_operation
         )
         operations.register_command_handler(
-            "operation.cancel", context.control_plane.advance_durable_cancel
+            "operation.retry", advance_retry_operation
+        )
+        operations.register_command_handler(
+            "operation.cancel", advance_cancel_operation
         )
     register_operations(
         app,
@@ -1119,7 +1153,289 @@ def _profile_artifact(context: BackendContext, actor, artifact_id: str):
     return item
 
 
-def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_internal):
+def _add_internal_state_routes(
+    app: FastAPI, context: BackendContext, require_internal, *, current_actor
+):
+    from tme3bot.api.routes.profile_sync import register_profile_sync
+
+    register_profile_sync(app, context, require_internal=require_internal)
+
+    cursor_service = None
+    if context.source_repository is not None:
+        from tme3bot.application.export_cursor import ExportCursorService
+
+        cursor_service = getattr(context.control_plane, "export_cursor_service", None)
+        if cursor_service is None:
+            cursor_service = ExportCursorService(
+                context.source_repository,
+                context.export_catalog,
+                context.control_plane.jobs,
+            )
+            context.control_plane.export_cursor_service = cursor_service
+
+    def require_cursor_service():
+        if cursor_service is None:
+            raise DomainError(
+                "EXPORT_CURSOR_UNAVAILABLE",
+                "Repository cursor export belum tersedia.",
+                status_code=503,
+            )
+        if not cursor_service.enabled:
+            raise DomainError(
+                "EXPORT_CURSOR_DISABLED",
+                "Shared export cursor belum diaktifkan untuk worker yang kompatibel.",
+                status_code=409,
+            )
+        return cursor_service
+
+    @app.get("/api/v1/peer-aliases/pending")
+    def pending_peer_aliases(profile: str | None = None, actor=Depends(current_actor)):
+        if context.source_repository is None:
+            raise DomainError("EXPORT_CURSOR_UNAVAILABLE", "Repository cursor export belum tersedia.", status_code=503)
+        selected_profile = context.control_plane.require_profile(actor, profile)
+        return {
+            "items": context.source_repository.list_peer_alias_candidates(selected_profile)
+        }
+
+    @app.post("/api/v1/peer-aliases/confirm")
+    def confirm_peer_alias(body: dict[str, Any], actor=Depends(current_actor)):
+        if set(body) - {"profile", "requested_ref", "peer_type", "peer_id"} or not {
+            "requested_ref", "peer_type", "peer_id"
+        }.issubset(body):
+            raise DomainError("PEER_ALIAS_CONFIRMATION_INVALID", "Payload konfirmasi alias tidak valid.", status_code=422)
+        if context.source_repository is None:
+            raise DomainError("EXPORT_CURSOR_UNAVAILABLE", "Repository cursor export belum tersedia.", status_code=503)
+        selected_profile = context.control_plane.require_profile(actor, body.get("profile"))
+        try:
+            return {
+                "confirmed": True,
+                **context.source_repository.confirm_peer_alias_candidate(
+                    selected_profile,
+                    str(body["requested_ref"]),
+                    str(body["peer_type"]),
+                    body["peer_id"],
+                ),
+            }
+        except Exception as exc:
+            from tme3bot.infrastructure.source_store import (
+                PeerAliasCursorConflict,
+                PeerAliasNotFound,
+            )
+
+            if isinstance(exc, PeerAliasCursorConflict):
+                raise DomainError(
+                    "PEER_ALIAS_CURSOR_RECONCILIATION_REQUIRED",
+                    "Cursor lama berbeda; hentikan lane ini sampai cursor legacy direkonsiliasi.",
+                    status_code=409,
+                ) from exc
+            if isinstance(exc, PeerAliasNotFound):
+                raise DomainError("PEER_ALIAS_CANDIDATE_NOT_FOUND", str(exc), status_code=404) from exc
+            raise
+
+    def validate_cursor_job(
+        body: dict[str, Any], *, needs_ref: bool, require_capability: bool = True
+    ):
+        service = require_cursor_service()
+        job_id = str(body.get("job_id") or "").strip()
+        job = context.control_plane.jobs.get(job_id)
+        if job is None:
+            raise DomainError("JOB_NOT_FOUND", "Job export tidak ditemukan.", status_code=404)
+        if job.kind != "export" or job.status.terminal:
+            raise DomainError("EXPORT_CURSOR_JOB_INVALID", "Job tidak aktif atau bukan job export.", status_code=409)
+        worker = str(body.get("worker") or "").strip().lower()
+        if not worker or worker != str(job.worker).strip().lower():
+            raise DomainError(
+                "JOB_WORKER_MISMATCH",
+                "Worker bukan pemilik job export.",
+                status_code=403,
+            )
+        profile = str(body.get("profile") or job.profile).strip()
+        if profile != job.profile:
+            raise DomainError("JOB_PROFILE_MISMATCH", "Profile bukan pemilik job export.", status_code=403)
+
+        stored = context.control_plane.jobs.command_payload(job.id)
+        if not isinstance(stored, dict):
+            raise DomainError("JOB_PAYLOAD_UNAVAILABLE", "Payload internal job tidak tersedia.", status_code=409)
+        if stored.get("dispatch_mode") == "durable":
+            internal_payload = stored.get("payload") if isinstance(stored.get("payload"), dict) else {}
+            expected_attempt = max(1, int(stored.get("attempt") or 1))
+        else:
+            internal_payload = stored
+            expected_attempt = 1 + sum(
+                1 for event in context.control_plane.jobs.events(job.id)
+                if event.event_type == "retry_started"
+            )
+        attempt = body.get("attempt")
+        if type(attempt) is not int or attempt != expected_attempt:
+            raise DomainError("JOB_ATTEMPT_MISMATCH", "Attempt job export sudah tidak berlaku.", status_code=409)
+
+        requested_ref = ""
+        if needs_ref:
+            try:
+                requested_ref = normalize_tdl_chat_ref(str(body.get("requested_ref") or ""))
+                expected_ref = str(internal_payload.get("chat_ref") or "").strip()
+                if not expected_ref and internal_payload.get("url"):
+                    from tme3bot.url_parser import parse_tme3_url
+
+                    expected_ref = parse_tme3_url(
+                        str(internal_payload["url"]), str(context.config.tme3_host)
+                    ).chat_ref
+                expected_ref = normalize_tdl_chat_ref(expected_ref)
+            except (TypeError, ValueError) as exc:
+                raise DomainError("EXPORT_REFERENCE_INVALID", "Referensi chat job tidak valid.", status_code=422) from exc
+            if requested_ref != expected_ref:
+                raise DomainError(
+                    "EXPORT_REFERENCE_MISMATCH",
+                    "Worker mengirim referensi chat yang berbeda dari job.",
+                    status_code=403,
+                )
+
+        if require_capability:
+            capabilities = getattr(context.worker_dispatcher, "capabilities", None)
+            if not callable(capabilities):
+                raise DomainError("WORKER_INCOMPATIBLE", "Capability worker export tidak dapat diverifikasi.", status_code=409)
+            try:
+                require_worker_contract(
+                    capabilities(worker),
+                    worker,
+                    required_capabilities={CAP_SHARED_EXPORT_CURSOR},
+                )
+            except DomainError:
+                raise
+            except Exception as exc:
+                raise DomainError("WORKER_OFFLINE", "Worker tidak dapat diverifikasi untuk cursor export.", status_code=503) from exc
+        return service, job, profile, worker, attempt, requested_ref
+
+    @app.post(
+        "/internal/v1/export-cursor/resolve",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def resolve_export_peer(body: dict[str, Any]):
+        required = {"job_id", "worker", "profile", "attempt", "requested_ref", "peer_type", "peer_id"}
+        if set(body) != required:
+            raise DomainError("EXPORT_CURSOR_INPUT_INVALID", "Payload resolve peer tidak valid.", status_code=422)
+        service, _job, profile, _worker, _attempt, requested_ref = validate_cursor_job(body, needs_ref=True)
+        try:
+            return {
+                "resolved": True,
+                **service.resolve_alias(
+                    profile,
+                    requested_ref,
+                    str(body["peer_type"]),
+                    body["peer_id"],
+                ),
+            }
+        except Exception as exc:
+            from tme3bot.infrastructure.source_store import (
+                PeerAliasConflict,
+                PeerAliasCursorConflict,
+            )
+
+            if isinstance(exc, PeerAliasConflict):
+                if isinstance(exc, PeerAliasCursorConflict):
+                    raise DomainError(
+                        "PEER_ALIAS_CURSOR_RECONCILIATION_REQUIRED",
+                        "Cursor lama berbeda; hentikan lane ini sampai cursor legacy direkonsiliasi.",
+                        status_code=409,
+                    ) from exc
+                raise DomainError(
+                    "PEER_ALIAS_REMAP_CONFIRMATION_REQUIRED",
+                    "Alias chat ini sudah terikat ke peer lain; konfirmasi pemetaan diperlukan.",
+                    status_code=409,
+                ) from exc
+            raise
+
+    @app.post(
+        "/internal/v1/export-cursor/lease",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def acquire_export_cursor(body: dict[str, Any]):
+        required = {"job_id", "worker", "profile", "attempt", "requested_ref"}
+        if set(body) != required:
+            raise DomainError("EXPORT_CURSOR_INPUT_INVALID", "Payload lease export tidak valid.", status_code=422)
+        service, _job, profile, worker, attempt, requested_ref = validate_cursor_job(body, needs_ref=True)
+        try:
+            return service.acquire(
+                profile=profile,
+                requested_ref=requested_ref,
+                job_id=str(body["job_id"]),
+                worker=worker,
+                attempt=attempt,
+            )
+        except Exception as exc:
+            from tme3bot.infrastructure.source_store import ExportCursorBusy, PeerAliasNotFound
+
+            if isinstance(exc, ExportCursorBusy):
+                raise DomainError("EXPORT_CURSOR_BUSY", str(exc), status_code=409) from exc
+            if isinstance(exc, PeerAliasNotFound):
+                raise DomainError("EXPORT_PEER_NOT_RESOLVED", str(exc), status_code=409) from exc
+            raise
+
+    @app.post(
+        "/internal/v1/export-cursor/heartbeat",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def heartbeat_export_cursor(body: dict[str, Any]):
+        required = {"job_id", "worker", "attempt", "fencing_token"}
+        if set(body) != required or type(body.get("attempt")) is not int or type(body.get("fencing_token")) is not int:
+            raise DomainError("EXPORT_CURSOR_INPUT_INVALID", "Payload heartbeat lease tidak valid.", status_code=422)
+        base = dict(body)
+        lease = cursor_service.lease_for_job(str(body["job_id"])) if cursor_service else None
+        if lease is None:
+            raise DomainError("EXPORT_CURSOR_STALE", "Lease export tidak ditemukan.", status_code=409)
+        base["profile"] = str(lease["profile"])
+        service, _job, _profile, worker, attempt, _requested = validate_cursor_job(
+            base, needs_ref=False, require_capability=False
+        )
+        try:
+            return {"ok": service.heartbeat(
+                job_id=str(body["job_id"]),
+                worker=worker,
+                attempt=attempt,
+                fencing_token=int(body["fencing_token"]),
+            )}
+        except Exception as exc:
+            from tme3bot.infrastructure.source_store import StaleExportLease
+
+            if isinstance(exc, StaleExportLease):
+                raise DomainError("EXPORT_CURSOR_STALE", str(exc), status_code=409) from exc
+            raise
+
+    @app.post(
+        "/internal/v1/export-cursor/commit",
+        include_in_schema=False,
+        dependencies=[Depends(require_internal)],
+    )
+    def commit_export_cursor(body: dict[str, Any]):
+        required = {"job_id", "worker", "profile", "attempt", "fencing_token", "expected_revision", "last_id", "artifact"}
+        integer_fields = {"attempt", "fencing_token", "expected_revision", "last_id"}
+        if set(body) != required or any(type(body.get(key)) is not int for key in integer_fields) or not isinstance(body.get("artifact"), dict):
+            raise DomainError("EXPORT_CURSOR_INPUT_INVALID", "Payload commit cursor tidak valid.", status_code=422)
+        service, job, _profile, worker, attempt, _requested = validate_cursor_job(
+            body, needs_ref=False, require_capability=False
+        )
+        try:
+            completed = service.commit(
+                job_id=job.id,
+                attempt=attempt,
+                worker=worker,
+                fencing_token=int(body["fencing_token"]),
+                expected_revision=int(body["expected_revision"]),
+                last_id=int(body["last_id"]),
+                artifact=body["artifact"],
+            )
+        except Exception as exc:
+            from tme3bot.infrastructure.source_store import StaleExportLease
+
+            if isinstance(exc, StaleExportLease):
+                raise DomainError("EXPORT_CURSOR_STALE", str(exc), status_code=409) from exc
+            raise
+        context.control_plane.on_export_cursor_committed(job.id)
+        return completed
+
     prefix = "/internal/v1/profiles/{profile}/state"
 
     @app.post(
@@ -1134,14 +1450,31 @@ def _add_internal_state_routes(app: FastAPI, context: BackendContext, require_in
         if registry is None:
             raise DomainError("PROFILE_REGISTRY_UNAVAILABLE", "Registry profile backend tidak tersedia.", status_code=503)
         synced: list[str] = []
+        candidates: list[str] = []
+        protected: list[str] = []
         for item in profiles:
             if not isinstance(item, dict):
                 continue
             try:
-                synced.append(registry.register(item.get("name", ""), item.get("telegram_user_id")))
+                name = str(item.get("name", ""))
+                raw_user_id = item.get("telegram_user_id")
+                user_id = int(raw_user_id) if raw_user_id is not None else None
+                vault = getattr(context.profile_provisioner, "store", None)
+                if vault is not None and vault.is_vaulted(name):
+                    protected.append(name)
+                    continue
+                if vault is not None and user_id is not None:
+                    vault.record_legacy_discovery(name, user_id)
+                    candidates.append(name)
+                if registry.register_discovered(name, user_id):
+                    synced.append(name)
             except (TypeError, ValueError) as exc:
                 raise DomainError("PROFILE_SYNC_INVALID", str(exc), status_code=422) from exc
-        return {"profiles": sorted(set(synced))}
+        return {
+            "profiles": sorted(set(synced)),
+            "adoption_candidates": sorted(set(candidates)),
+            "vault_protected": sorted(set(protected)),
+        }
 
     @app.get(
         prefix + "/sources",

@@ -13,13 +13,18 @@ class FakeExecutor:
         self.commands = []
         self.deleted_stages = []
         self.tts_ready = False
+        self.safelink_ready = False
         self.tts_helper_recoveries = []
+        self.durable_ready = False
+        self.durable_commands = {}
         self.artifact_file = None
         self.runtime_updates = []
         self.worker_api_token = "worker-secret"
         self.previous_worker_api_token = ""
         self.profile_inputs = []
         self.profile_installs = []
+        self.profile_sync_requests = []
+        self.profile_sync_snapshot = {"status": "ready", "backend_available": True, "profiles": {}}
         self.worker_settings_values = {
             "storage_profile": "default",
             "storage_profile_available": True,
@@ -34,7 +39,47 @@ class FakeExecutor:
         }
 
     def capabilities(self):
-        return {"profiles": ["default"], "tts": self.tts_ready}
+        return {
+            "profiles": ["default"],
+            "tts": self.tts_ready,
+            "safelink_resolver": self.safelink_ready,
+            "profile_sync": {"status": "ready"},
+        }
+
+    def profile_sync_status(self):
+        return dict(self.profile_sync_snapshot)
+
+    def request_profile_sync(self, profile=None, mode="check"):
+        self.profile_sync_requests.append((profile, mode))
+        return {"accepted": True, "status": "sync_pending", "profile": profile}
+
+    def durable_commands_ready(self):
+        return self.durable_ready
+
+    def accept_durable_command(self, envelope):
+        if not self.durable_ready:
+            raise DomainError(
+                "DURABLE_COMMANDS_NOT_READY", "Jurnal belum siap.", status_code=503
+            )
+        command_id = str(envelope["command_id"])
+        previous = self.durable_commands.get(command_id)
+        if previous is not None and previous["payload"] != envelope:
+            raise DomainError("COMMAND_ID_CONFLICT", "Conflict.", status_code=409)
+        if previous is None:
+            self.durable_commands[command_id] = {
+                "payload": dict(envelope),
+                "snapshot": {
+                    "command_id": command_id,
+                    "job_id": envelope.get("job_id"),
+                    "status": "accepted",
+                    "accepted": True,
+                },
+            }
+        return {**self.durable_commands[command_id]["snapshot"], "replayed": previous is not None}
+
+    def durable_command_status(self, command_id):
+        entry = self.durable_commands.get(command_id)
+        return dict(entry["snapshot"]) if entry else None
 
     def tts_health(self):
         return {
@@ -190,6 +235,96 @@ class WorkerApiTests(unittest.TestCase):
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 404)
 
+    def test_healthz_distinguishes_running_process_from_pending_profile_sync(self):
+        ready = self.client.get("/healthz")
+        self.assertEqual(ready.json()["ok"], True)
+        self.assertTrue(ready.json()["profiles_ready"])
+
+        self.executor.profile_sync_snapshot["status"] = "sync_pending"
+        pending = self.client.get("/healthz")
+        self.assertEqual(pending.json()["ok"], True)
+        self.assertFalse(pending.json()["profiles_ready"])
+        self.assertEqual(pending.json()["profile_sync_status"], "sync_pending")
+
+    def test_profile_sync_status_and_manual_request_require_worker_auth(self):
+        denied_status = self.client.get("/internal/v1/profile-sync")
+        self.assertEqual(denied_status.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        status = self.client.get("/internal/v1/profile-sync", headers=headers)
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["status"], "ready")
+
+        denied_request = self.client.post(
+            "/internal/v1/profile-sync", json={"profile": "irang"}
+        )
+        self.assertEqual(denied_request.status_code, 401)
+        accepted = self.client.post(
+            "/internal/v1/profile-sync",
+            headers=headers,
+            json={"profile": "irang", "mode": "repair"},
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(self.executor.profile_sync_requests, [("irang", "repair")])
+
+        invalid_mode = self.client.post(
+            "/internal/v1/profile-sync",
+            headers=headers,
+            json={"mode": "force-shell"},
+        )
+        self.assertEqual(invalid_mode.status_code, 422)
+        extra = self.client.post(
+            "/internal/v1/profile-sync",
+            headers=headers,
+            json={"profile": "irang", "url": "http://attacker.invalid"},
+        )
+        self.assertEqual(extra.status_code, 422)
+        self.assertEqual(len(self.executor.profile_sync_requests), 1)
+
+    def test_durable_command_endpoints_require_auth_and_ready_journal(self):
+        envelope = {
+            "command_id": "command-1",
+            "operation_id": "operation-1",
+            "job_id": "job-durable-1",
+            "attempt": 1,
+            "dispatch_token": "private-dispatch-token",
+            "job": {
+                "kind": "export",
+                "profile": "default",
+                "actor_user_id": 42,
+                "worker": "local",
+                "payload": {"url": "https://t.me/c/1/2"},
+            },
+        }
+        denied = self.client.post("/internal/v1/commands", json=envelope)
+        self.assertEqual(denied.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        not_ready = self.client.post(
+            "/internal/v1/commands", headers=headers, json=envelope
+        )
+        self.assertEqual(not_ready.status_code, 503)
+        self.executor.durable_ready = True
+        accepted = self.client.post(
+            "/internal/v1/commands", headers=headers, json=envelope
+        )
+        self.assertEqual(accepted.status_code, 200)
+        self.assertTrue(accepted.json()["accepted"])
+        self.assertNotIn("payload", accepted.json())
+        self.assertNotIn("dispatch_token", accepted.json())
+        status = self.client.get(
+            "/internal/v1/commands/command-1", headers=headers
+        )
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["status"], "accepted")
+        changed = {**envelope, "job": {**envelope["job"], "payload": {"secret": "changed"}}}
+        conflict = self.client.post(
+            "/internal/v1/commands", headers=headers, json=changed
+        )
+        self.assertEqual(conflict.status_code, 409)
+        missing = self.client.get(
+            "/internal/v1/commands/missing", headers=headers
+        )
+        self.assertEqual(missing.status_code, 404)
+
     def test_tts_capability_is_dynamic_and_audio_route_is_internal(self):
         denied_capability = self.client.get("/internal/v1/capabilities")
         self.assertEqual(denied_capability.status_code, 401)
@@ -211,6 +346,15 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         self.assertEqual(audio.content, b"audio")
         self.assertIn("artifact-", audio.headers["content-disposition"])
+
+    def test_resolver_capability_tracks_private_addon_readiness(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        not_ready = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertNotIn("safelink_resolve.v1", not_ready.json()["capabilities"])
+
+        self.executor.safelink_ready = True
+        ready = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertIn("safelink_resolve.v1", ready.json()["capabilities"])
 
     def test_tts_health_and_helper_recovery_require_worker_auth(self):
         denied = self.client.get("/internal/v1/tts/health")

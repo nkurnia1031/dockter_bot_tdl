@@ -60,6 +60,52 @@ class ProfileRegistry:
             self._save_locked()
         return normalized
 
+    def register_vaulted(self, name: str, telegram_user_id: int) -> str:
+        """Apply backend vault identity as authoritative registry data."""
+        normalized = normalize_profile_name(name)
+        if not normalized:
+            raise ValueError("Nama profile tidak valid.")
+        user_id = int(telegram_user_id)
+        with self._lock:
+            self._load_locked()
+            assert self._profiles is not None
+            for other_name, other in self._profiles.items():
+                if other_name != normalized and other.get("telegram_user_id") == user_id:
+                    other.pop("telegram_user_id", None)
+                    other["updated_at"] = utc_now_iso()
+            value = dict(self._profiles.get(normalized, {}))
+            value["telegram_user_id"] = user_id
+            value["updated_at"] = utc_now_iso()
+            self._profiles[normalized] = value
+            self._save_locked()
+        return normalized
+
+    def register_discovered(self, name: str, telegram_user_id: int | None) -> bool:
+        """Accept only new legacy metadata; do not let a worker rewrite identity."""
+        normalized = normalize_profile_name(name)
+        if not normalized:
+            raise ValueError("Nama profile tidak valid.")
+        with self._lock:
+            self._load_locked()
+            assert self._profiles is not None
+            existing = self._profiles.get(normalized)
+            if existing is not None and existing.get("telegram_user_id") is not None:
+                return telegram_user_id is None or int(existing["telegram_user_id"]) == int(telegram_user_id)
+            if telegram_user_id is not None:
+                user_id = int(telegram_user_id)
+                if any(
+                    other_name != normalized and other.get("telegram_user_id") == user_id
+                    for other_name, other in self._profiles.items()
+                ):
+                    return False
+            value = dict(existing or {})
+            if telegram_user_id is not None:
+                value["telegram_user_id"] = int(telegram_user_id)
+            value["updated_at"] = utc_now_iso()
+            self._profiles[normalized] = value
+            self._save_locked()
+            return True
+
     def bootstrap_from_identities(self, profiles: dict[str, int | None]) -> None:
         """One-way migration for installations created before the registry."""
         for name, telegram_user_id in profiles.items():

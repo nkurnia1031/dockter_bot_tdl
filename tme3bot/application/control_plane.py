@@ -19,11 +19,13 @@ from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_STAGING,
     CAP_DURABLE_COMMANDS_V1,
     CAP_SAFELINK_RESOLVE,
+    CAP_SHARED_EXPORT_CURSOR,
     CAP_TTS,
     DURABLE_COMMAND_CAPABILITIES,
     require_worker_contract,
 )
 from tme3bot.chat_refs import normalize_tdl_chat_ref
+from tme3bot.url_parser import parse_tme3_url
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS
 from tme3bot.safelink import normalize_shortlink_url
 
@@ -47,10 +49,12 @@ class ControlPlane:
         worker_registry=None,
         utility_folders=None,
         utility_settings=None,
+        runtime_settings_store=None,
         backup_coordinator=None,
         storage_delivery=None,
         profile_readiness=None,
         label_store=None,
+        export_cursor_service=None,
         job_stall_timeout_seconds: int = 600,
         job_cancel_grace_seconds: int = 30,
     ) -> None:
@@ -62,10 +66,12 @@ class ControlPlane:
         self.worker_registry = worker_registry
         self.utility_folders = utility_folders
         self.utility_settings = utility_settings
+        self.runtime_settings_store = runtime_settings_store
         self.backup_coordinator = backup_coordinator
         self.storage_delivery = storage_delivery
         self.profile_readiness = profile_readiness
         self.label_store = label_store
+        self.export_cursor_service = export_cursor_service
         self.job_stall_timeout_seconds = max(0, int(job_stall_timeout_seconds))
         self.job_cancel_grace_seconds = max(0, int(job_cancel_grace_seconds))
         self._event_observers: list[Callable[[JobEvent], None]] = []
@@ -138,6 +144,7 @@ class ControlPlane:
         profile: str | None = None,
         worker: str | None = None,
         job_id: str | None = None,
+        private_job_values: dict[str, str] | None = None,
     ) -> Job:
         if kind == "tts":
             selected_profile = self.require_profile(actor, profile)
@@ -146,17 +153,33 @@ class ControlPlane:
             selected_profile, selected_worker = self.resolve_target(
                 actor, profile=profile, worker=worker
             )
+        if kind == "export" and self._shared_export_cursor_enabled():
+            self._require_shared_export_cursor_worker(selected_worker)
         available_profiles = ()
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
         if callable(list_profiles):
             available_profiles = list_profiles()
         job_id = str(job_id or uuid.uuid4())
         redacted_payload = self._redacted_payload(kind, payload)
+        settings_version = self._worker_settings_version(selected_worker)
+        encrypted_private_values = self._encrypt_private_job_values(
+            job_id, private_job_values or {}
+        )
         existing = self.jobs.get(job_id)
         if existing is not None and existing.status.terminal:
             # Retry is an in-place reset. The event stream remains attached to
             # the stable ID, while the current row becomes the new attempt.
-            job = self.jobs.reset_for_retry(job_id, redacted_payload)
+            reset = self.jobs.reset_for_retry
+            if encrypted_private_values:
+                reset(
+                    job_id,
+                    redacted_payload,
+                    settings_version=settings_version,
+                    private_values=encrypted_private_values,
+                )
+            else:
+                reset(job_id, redacted_payload, settings_version=settings_version)
+            job = self.jobs.get(job_id)
             retry_attempt = 1 + sum(
                 1
                 for event in self.jobs.events(job_id)
@@ -201,16 +224,30 @@ class ControlPlane:
                 worker=selected_worker,
                 status=JobStatus.QUEUED,
                 payload=redacted_payload,
+                settings_version=settings_version,
             )
-            self.jobs.create(job)
+            if encrypted_private_values:
+                creator = getattr(self.jobs, "create_with_private_values", None)
+                if not callable(creator):
+                    raise DomainError(
+                        "JOB_PRIVATE_STORAGE_UNAVAILABLE",
+                        "Penyimpanan privat job belum tersedia.",
+                        status_code=503,
+                    )
+                creator(job, encrypted_private_values)
+            else:
+                self.jobs.create(job)
         retry_meta = payload.get("quick_retry") or {}
         retry_meta = retry_meta if isinstance(retry_meta, dict) else {}
         stable_stage_id = retry_meta.get("stage_job_id")
+        execution_payload = self._plan_payload_with_verified_peer(
+            selected_profile, kind, payload
+        )
         execution = build_execution_plan(
             kind,
             selected_profile,
             selected_worker,
-            payload,
+            execution_payload,
             available_profiles,
             stage_job_id=(
                 str(stable_stage_id or job_id)
@@ -281,7 +318,7 @@ class ControlPlane:
             if str(target.get("worker") or "").strip():
                 raise DomainError(
                     "SAFELINK_WORKER_AUTO_SELECTED",
-                    "Worker resolver dipilih otomatis berdasarkan kesiapan dan panjang antrean.",
+                    "Worker dipilih otomatis berdasarkan kesiapan addon resolver dan panjang antrean.",
                     status_code=422,
                 )
             selected_profile = self.require_profile(actor, str(target.get("profile") or actor.profile))
@@ -306,14 +343,18 @@ class ControlPlane:
             retry.setdefault("stage_job_id", job_id)
             payload = {**payload, "quick_retry": retry}
         profiles = getattr(self.profile_manager, "list_profiles", None)
+        execution_payload = self._plan_payload_with_verified_peer(
+            selected_profile, kind, payload
+        )
         execution = build_execution_plan(
             kind,
             selected_profile,
             selected_worker,
-            payload,
+            execution_payload,
             profiles() if callable(profiles) else (),
             stage_job_id=job_id if kind == "export" and bool(payload.get("quick_mode")) else None,
         )
+        settings_version = self._worker_settings_version(selected_worker)
         command_payload = {
             "dispatch_mode": "durable",
             "command_id": str(uuid.uuid4()),
@@ -321,7 +362,7 @@ class ControlPlane:
             "attempt": 1,
             "dispatch_started": False,
             "profile_revision": 0,
-            "settings_version": 0,
+            "settings_version": settings_version,
             "job_id": job_id,
             "kind": kind,
             "profile": selected_profile,
@@ -338,12 +379,26 @@ class ControlPlane:
             worker=selected_worker,
             status=JobStatus.QUEUED,
             payload=self._redacted_payload(kind, payload),
+            settings_version=settings_version,
         )
+        private_job_values: dict[str, bytes] = {}
+        if kind == "tts":
+            chat_ref = self._current_tts_chat_ref()
+            if not chat_ref:
+                raise DomainError(
+                    "TTS_CHAT_UNAVAILABLE",
+                    "Chat tujuan TTS belum dikonfigurasi.",
+                    status_code=503,
+                )
+            private_job_values = self._encrypt_private_job_values(
+                job_id, {"telegram_tts_chat_id": chat_ref}
+            )
         return PreparedOperation(
             profile=selected_profile,
             target={"profile": selected_profile, "worker": selected_worker, "job_kind": kind},
             private_payload={"job_id": job_id},
             job=job,
+            private_job_values=private_job_values,
             execution_plan=execution.as_dict(),
             command_payload=command_payload,
         )
@@ -539,6 +594,64 @@ class ControlPlane:
         values = getter() if callable(getter) else DEFAULT_UTILITY_SETTINGS
         return deepcopy(values if isinstance(values, dict) else DEFAULT_UTILITY_SETTINGS)
 
+    def _worker_settings_version(self, worker: str) -> int:
+        snapshotter = getattr(self.runtime_settings_store, "snapshot", None)
+        if not callable(snapshotter):
+            return 0
+        try:
+            snapshot = snapshotter("worker", worker=str(worker).strip().lower())
+        except Exception:
+            return 0
+        if not isinstance(snapshot, dict):
+            return 0
+        try:
+            return max(0, int(snapshot.get("desired_version") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _current_tts_chat_ref(self) -> str:
+        getter = getattr(self.runtime_settings_store, "get_values", None)
+        if not callable(getter):
+            return ""
+        try:
+            values = getter("telegram", include_secrets=True)
+        except Exception:
+            return ""
+        return str(values.get("telegram_tts_chat_id") or "").strip() if isinstance(values, dict) else ""
+
+    def _encrypt_private_job_values(
+        self, job_id: str, values: dict[str, str]
+    ) -> dict[str, bytes]:
+        if not values:
+            return {}
+        encryptor = getattr(self.runtime_settings_store, "encrypt_job_secret", None)
+        if not callable(encryptor):
+            raise DomainError(
+                "JOB_PRIVATE_STORAGE_UNAVAILABLE",
+                "Penyimpanan privat job belum tersedia.",
+                status_code=503,
+            )
+        result: dict[str, bytes] = {}
+        for key, value in values.items():
+            if key != "telegram_tts_chat_id" or not isinstance(value, str) or not value.strip():
+                raise DomainError(
+                    "JOB_PRIVATE_VALUE_INVALID",
+                    "Snapshot privat job tidak valid.",
+                    status_code=422,
+                )
+            result[key] = encryptor(job_id, key, value.strip())
+        return result
+
+    def private_job_value(self, job_id: str, key: str) -> str | None:
+        getter = getattr(self.jobs, "private_value", None)
+        decryptor = getattr(self.runtime_settings_store, "decrypt_job_secret", None)
+        if not callable(getter) or not callable(decryptor):
+            return None
+        ciphertext = getter(str(job_id), str(key))
+        if ciphertext is None:
+            return None
+        return decryptor(str(job_id), str(key), ciphertext)
+
     def advance_durable_job(self, command: dict[str, Any]) -> dict[str, str]:
         private = command.get("private_payload") if isinstance(command.get("private_payload"), dict) else {}
         job_id = str(private.get("job_id") or "")
@@ -595,6 +708,8 @@ class ControlPlane:
         if not callable(capabilities) or not callable(dispatch_command):
             return {"status": "wait", "reason": "not_ready"}
         required = set(DURABLE_COMMAND_CAPABILITIES)
+        if job.kind == "export" and self._shared_export_cursor_enabled():
+            required.add(CAP_SHARED_EXPORT_CURSOR)
         if job.kind == "tts":
             required.add(CAP_TTS)
         if job.kind == "safelink_resolve":
@@ -753,7 +868,7 @@ class ControlPlane:
         if not options:
             raise DomainError(
                 "SAFELINK_WORKER_UNAVAILABLE",
-                "Belum ada worker resolver yang siap. Deploy worker resolver dengan Playwright dan Chromium, lalu periksa status worker.",
+                "Belum ada worker dengan addon resolver yang siap. Pastikan deployment worker terbaru sudah berjalan, lalu periksa status worker.",
                 status_code=503,
             )
         if requested:
@@ -763,7 +878,7 @@ class ControlPlane:
                     return option["name"]
             raise DomainError(
                 "SAFELINK_WORKER_UNAVAILABLE",
-                "Worker yang dipilih belum siap untuk resolver shortlink.",
+                "Worker yang dipilih belum siap dengan addon resolver shortlink.",
                 status_code=503,
             )
         counts = {option["name"]: int(option["queued_jobs"]) for option in options}
@@ -965,6 +1080,13 @@ class ControlPlane:
                     # advance command. The legacy scheduler must not claim
                     # the same queued row or send a v1 dispatch in parallel.
                     continue
+                if queued.kind == "export" and self._shared_export_cursor_enabled():
+                    try:
+                        self._require_shared_export_cursor_worker(queued.worker)
+                    except DomainError:
+                        # Keep incompatible/offline workers queued. The gate
+                        # must never silently fall back to worker-local state.
+                        continue
                 admission = self.jobs.try_acquire_execution(queued.id)
                 self.jobs.set_queue_info(
                     queued.id,
@@ -1080,6 +1202,25 @@ class ControlPlane:
         # Side effects are idempotent and intentionally replayed when a worker
         # retries an already persisted event after a transient API failure.
         self._apply_event_side_effects(job, event)
+        if event.status.terminal and self.export_cursor_service is not None:
+            lease = self.export_cursor_service.lease_for_job(job.id)
+            if lease is not None:
+                worker_confirmed = not (
+                    event.event_type.startswith("backend_")
+                    or event.event_type.startswith("force_cancelled")
+                    or event.event_type in {
+                        "dispatch_failed",
+                        "cancelled_queued",
+                        "cancelled_paused_queue",
+                        "operation_cancelled_queued",
+                    }
+                )
+                self.export_cursor_service.finish_job(
+                    job.id,
+                    attempt=int(lease["lease_attempt"]),
+                    worker_confirmed=worker_confirmed,
+                    require_applied_completion=event.status == JobStatus.SUCCEEDED,
+                )
         if inserted:
             if (
                 event.event_type == "export.json_ready"
@@ -1090,18 +1231,17 @@ class ControlPlane:
                 # The export TDL session is no longer needed after JSON has
                 # been created.  Let the next Quick Mode begin exporting
                 # while this job uses the separate download/session lanes.
-                plan = self.jobs.execution_plan(job.id) or {}
-                current_keys = set(plan.get("resource_keys") or [])
-                export_keys = {
-                    key
-                    for key in current_keys
-                    if ":kind:export" in str(key) or ":tdl:export" in str(key)
-                }
-                if export_keys:
-                    remaining = current_keys - export_keys
-                    replacer = getattr(self.jobs, "replace_execution_resources", None)
-                    if callable(replacer) and replacer(job.id, remaining):
-                        self._dispatch_pending_jobs()
+                lease_held = bool(
+                    self.export_cursor_service is not None
+                    and self.export_cursor_service.job_has_active_lease(job.id)
+                )
+                cursor_required = self._shared_export_cursor_enabled() or lease_held
+                cursor_committed = bool(
+                    self.export_cursor_service is not None
+                    and self.export_cursor_service.completion_applied(job.id)
+                )
+                if not cursor_required or cursor_committed:
+                    self._release_quick_export_resources(job.id)
             if event.status.terminal:
                 self.jobs.release_execution(job.id)
             for observer in tuple(self._event_observers):
@@ -1111,6 +1251,90 @@ class ControlPlane:
             elif event.status == JobStatus.PAUSED:
                 self._dispatch_pending_jobs()
         return job
+
+    def _shared_export_cursor_enabled(self) -> bool:
+        return bool(
+            self.export_cursor_service is not None
+            and self.export_cursor_service.enabled
+        )
+
+    def _require_shared_export_cursor_worker(self, worker: str) -> None:
+        get_capabilities = getattr(self.dispatcher, "capabilities", None)
+        if not callable(get_capabilities):
+            raise DomainError(
+                "WORKER_INCOMPATIBLE",
+                "Worker belum dapat diverifikasi untuk shared export cursor.",
+                status_code=409,
+                details={"worker": worker, "missing_capabilities": [CAP_SHARED_EXPORT_CURSOR]},
+            )
+        try:
+            require_worker_contract(
+                get_capabilities(worker),
+                worker,
+                required_capabilities={CAP_SHARED_EXPORT_CURSOR},
+            )
+        except DomainError:
+            raise
+        except Exception as exc:
+            raise DomainError(
+                "WORKER_OFFLINE",
+                f"Worker {worker} belum dapat diverifikasi untuk export.",
+                status_code=503,
+            ) from exc
+
+    def _plan_payload_with_verified_peer(
+        self, profile: str, kind: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if kind != "export" or not self._shared_export_cursor_enabled():
+            return payload
+        requested_ref = str(payload.get("chat_ref") or "").strip()
+        if not requested_ref and payload.get("url"):
+            config = getattr(self.profile_manager, "base_config", None)
+            host = str(getattr(config, "tme3_host", "") or "").strip()
+            if host:
+                try:
+                    requested_ref = parse_tme3_url(str(payload["url"]), host).chat_ref
+                except ValueError:
+                    requested_ref = ""
+        if not requested_ref:
+            return payload
+        identity = self.export_cursor_service.alias_identity(profile, requested_ref)
+        if not identity:
+            return payload
+        return {**payload, "_verified_export_peer": identity}
+
+    def _release_quick_export_resources(self, job_id: str) -> bool:
+        plan = self.jobs.execution_plan(job_id) or {}
+        current_keys = set(plan.get("resource_keys") or [])
+        export_keys = {
+            key
+            for key in current_keys
+            if ":kind:export" in str(key) or ":tdl:export" in str(key)
+        }
+        if not export_keys:
+            return False
+        replacer = getattr(self.jobs, "replace_execution_resources", None)
+        if callable(replacer) and replacer(job_id, current_keys - export_keys):
+            self._dispatch_pending_jobs()
+            return True
+        return False
+
+    def on_export_cursor_committed(self, job_id: str) -> bool:
+        """Release only the Quick Mode export phase after durable completion."""
+        job = self.jobs.get(str(job_id))
+        if (
+            job is None
+            or job.kind != "export"
+            or not bool(job.payload.get("quick_mode"))
+            or job.status.terminal
+        ):
+            return False
+        cursor_required = self._shared_export_cursor_enabled() or bool(
+            self.export_cursor_service.job_has_active_lease(job.id)
+        )
+        if cursor_required and not self.export_cursor_service.completion_applied(job.id):
+            return False
+        return self._release_quick_export_resources(job.id)
 
     def update_worker_progress(self, event: JobEvent) -> Job:
         """Update the latest telemetry without growing persistent event history."""

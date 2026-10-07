@@ -94,7 +94,6 @@ services:
   tts-1:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
-    profiles: ["tts"]
     restart: unless-stopped
     expose: ["8090"]
     environment:
@@ -114,7 +113,6 @@ services:
   tts-2:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
-    profiles: ["tts"]
     restart: unless-stopped
     expose: ["8090"]
     environment:
@@ -134,7 +132,6 @@ services:
   tts-3:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
-    profiles: ["tts"]
     restart: unless-stopped
     expose: ["8090"]
     environment:

@@ -53,8 +53,9 @@ def register_utility(app, context, *, _model_dict, current_actor, job_dict, veri
 
     @app.put("/api/v1/utility/settings/{key}", response_model=ObjectResponse)
     def set_utility_setting(key: str, body: SettingRequest, actor=Depends(current_actor)):
-        del actor
-        context.utility_settings.set(key, body.value)
+        context.utility_settings.set(
+            key, body.value, actor_user_id=int(actor.telegram_user_id)
+        )
         values = context.utility_settings.get()
         return {
             "move_size": values["move_size"],

@@ -222,6 +222,11 @@ class ProfileSessionManager:
         entries = validate_profile_bundle(bundle)
         profile_config = build_profile_config(self.config, normalized)
         profile_root = Path(profile_config.profile_root)
+        if profile_root.is_symlink():
+            raise ValueError("Direktori profil tidak aman.")
+        for session_parent in (profile_root / "root", profile_root / "user1"):
+            if session_parent.is_symlink():
+                raise ValueError("Direktori sesi profil tidak aman.")
         expected_identity = int(telegram_user_id)
         with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
             try:
@@ -428,6 +433,54 @@ class ProfileSessionManager:
         data = output.getvalue()
         validate_profile_bundle(data)
         return user_id, data
+
+    def verify_installed(self, profile: str, expected_user_id: int | None = None) -> int | bool:
+        """Check identity and both private Bolt session trees without opening Bolt."""
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            return False
+        root = Path(build_profile_config(self.config, normalized).profile_root)
+        if root.is_symlink():
+            return False
+        identity_path = root / "identity.json"
+        if identity_path.is_symlink() or not identity_path.is_file():
+            return False
+        try:
+            payload = json.loads(identity_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return False
+            user_id = int(payload.get("telegram_user_id", payload.get("tdl_user_id")))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
+        if user_id < 1 or (expected_user_id is not None and user_id != int(expected_user_id)):
+            return False
+        session_files: list[set[tuple[int, int]]] = []
+        for relative in ("root/.tdl", "user1/.tdl"):
+            session_root = root / relative
+            session_parent = root / relative.split("/", 1)[0]
+            data_root = session_root / "data"
+            if (
+                session_parent.is_symlink()
+                or session_root.is_symlink()
+                or not session_root.is_dir()
+                or data_root.is_symlink()
+                or not data_root.is_dir()
+            ):
+                return False
+            try:
+                files = {
+                    (item.stat().st_dev, item.stat().st_ino)
+                    for item in data_root.iterdir()
+                    if item.is_file() and not item.is_symlink() and item.stat().st_size > 0
+                }
+            except OSError:
+                return False
+            if not files:
+                return False
+            session_files.append(files)
+        if session_files[0] & session_files[1]:
+            return False
+        return user_id
 
     def remove_bundle(self, profile: str, operation_id: str) -> bool:
         return self.rollback_bundle(profile, operation_id)

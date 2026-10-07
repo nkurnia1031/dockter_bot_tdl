@@ -35,7 +35,8 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             raise DomainError("TTS_TITLE_REQUIRED", "Judul wajib diisi.", status_code=422)
         if not text:
             raise DomainError("TTS_TEXT_REQUIRED", "Teks wajib diisi.", status_code=422)
-        if not _tts_chat_ref(context):
+        chat_ref = _tts_chat_ref(context)
+        if not chat_ref:
             raise DomainError(
                 "TTS_CHAT_UNAVAILABLE",
                 "Chat tujuan TTS belum dikonfigurasi.",
@@ -47,6 +48,7 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             {"title": title, "text": text},
             profile=actor.profile,
             worker=body.worker,
+            private_job_values={"telegram_tts_chat_id": chat_ref},
         )
         return job_dict(job)
 
@@ -95,7 +97,13 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             str(job.payload.get("title") or "Audio TTS"),
             normalized,
         )
-        return {"registered_parts": count, "chat_ref": _tts_chat_ref(context)}
+        pinned_chat_ref = context.control_plane.private_job_value(
+            job.id, "telegram_tts_chat_id"
+        )
+        return {
+            "registered_parts": count,
+            "chat_ref": pinned_chat_ref or _tts_chat_ref(context),
+        }
 
     @app.get(
         "/internal/v1/tts/jobs/{job_id}/delivery",

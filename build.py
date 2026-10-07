@@ -40,7 +40,6 @@ INCLUDE_ROOTS = (
     ".env.telegram.example",
     ".env.worker.example",
     ".env.worker.local.example",
-    ".env.resolver.example",
     "requirements.txt",
     "requirements-browser.txt",
     "build.py",

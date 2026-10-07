@@ -416,19 +416,31 @@ git rev-parse --short=12 HEAD
 ```
 
 Jika registry private dan node belum login, lakukan login GHCR seperti pada VPS
-builder. Kemudian deploy backend, Telegram frontend, dan worker lokal:
+builder. Addon resolver dan helper TTS mengikuti worker lokal, tanpa token atau
+konfigurasi host tambahan. Kemudian deploy backend,
+Telegram frontend, worker lokal, dan addon:
 
 ```bash
 python3 run.py deploy gateway --pull
 ```
 
+Backend hanya mengirim job ke worker terdaftar. Worker lokal meneruskan job
+shortlink ke addon resolver privat di Compose; resolver tidak didaftarkan
+sebagai worker tersendiri.
+
 Periksa container dan health backend:
 
 ```bash
-docker compose -f docker-compose.gateway.yml ps
+docker compose \
+  -f docker-compose.gateway.yml \
+  -f docker-compose.resolver.yml ps
 curl -fsS http://127.0.0.1:8080/healthz
-docker compose -f docker-compose.gateway.yml logs --tail=100 backend
-docker compose -f docker-compose.gateway.yml logs --tail=100 worker-local
+docker compose \
+  -f docker-compose.gateway.yml \
+  -f docker-compose.resolver.yml logs --tail=100 backend
+docker compose \
+  -f docker-compose.gateway.yml \
+  -f docker-compose.resolver.yml logs --tail=100 worker-local resolver-addon
 ```
 
 Jangan deploy web dahulu. Selesaikan semua worker remote pada bagian D agar UI
@@ -483,18 +495,22 @@ openssl rand -hex 32
 Docker host. Domain worker harus diproxy aaPanel/Nginx ke
 `127.0.0.1:<WORKER_PORT>` dan meneruskan header `Authorization`.
 
-Jika image registry private, login GHCR pada VPS remote dengan permission pull,
-lalu deploy image yang sudah dipublish:
+Jika image registry private, login GHCR pada VPS remote dengan permission pull.
+Addon resolver dan helper TTS sudah menjadi bagian stack worker:
 
 ```bash
+cp -n .env.example .env
 docker login ghcr.io
 python3 run.py deploy worker --pull
-docker compose -f docker-compose.worker.yml ps
+docker compose -f docker-compose.worker.yml -f docker-compose.resolver.yml ps
 curl -fsS https://worker1.example.com/healthz
 ```
 
 Healthcheck `/healthz` tidak memerlukan token. Endpoint internal tetap wajib
-menggunakan bearer token worker.
+menggunakan bearer token worker. Perintah deploy worker mengambil image
+resolver, menjalankan tiga helper TTS, dan menyalakan addon resolver tanpa
+`COMPOSE_PROFILES`. Port resolver tidak diterbitkan ke host dan tidak perlu
+subdomain/proxy khusus.
 
 ### D.2 Daftarkan worker pada VPS gateway
 
@@ -520,39 +536,7 @@ Output akan menampilkan nama, URL, dan token dalam bentuk tersamarkan.
 Perintah `worker add` langsung menulis registry gateway; tidak diperlukan
 rebuild image atau restart worker untuk menambah worker berikutnya.
 
-### D.3 Worker resolver shortlink
-
-Resolver memakai image tersendiri dengan Playwright dan Chromium. Siapkan host
-khusus seperti worker remote, tetapi gunakan file `.env.resolver`:
-
-```bash
-cp .env.resolver.example .env.resolver
-cp .env.example .env
-```
-
-Isi `PROFILE_ROOT`, `BACKEND_API_URL`, `BACKEND_INTERNAL_TOKEN`, port, dan
-`WORKER_API_TOKEN` unik. Proxy domain worker ke port localhost yang dipilih,
-daftarkan worker dari gateway dengan token yang sama, lalu deploy image yang
-sudah dipublish oleh workflow:
-
-```bash
-python3 run.py deploy resolver --pull
-docker compose -f docker-compose.resolver.yml ps
-curl -fsS https://resolver1.example.com/healthz
-```
-
-Worker harus muncul dengan capability `safelink_resolve.v1` sebelum menerima
-job. Worker ini hanya mengikuti halaman dan mengembalikan URL tujuan; ia tidak
-mengunduh file dari tujuan tersebut. Jangan gunakan resolver sebagai worker
-umum TDL atau TTS. Daftarkan worker dari gateway:
-
-```bash
-python3 run.py worker add resolver-1 https://resolver1.example.com
-```
-
-Saat diminta token, masukkan `WORKER_API_TOKEN` dari `.env.resolver`.
-
-### D.4 Verifikasi worker dan route legacy
+### D.3 Verifikasi worker dan route legacy
 
 Registrasi worker belum otomatis memindahkan route profile. Untuk alur baru,
 pilih target profile-worker langsung di halaman Export, atau pilih worker di
@@ -566,7 +550,7 @@ untuk batch besar. Untuk menambah worker kedua, ulangi konfigurasi worker pada
 bagian D.1 dan registrasi gateway pada D.2 dengan nama berbeda, misalnya
 `remote-2`, URL berbeda, `PROFILE_ROOT` berbeda, dan token berbeda.
 
-### D.5 Mengaktifkan atau menonaktifkan worker dari Web UI
+### D.4 Mengaktifkan atau menonaktifkan worker dari Web UI
 
 Buka menu **Workers** pada Web UI. Setiap worker memiliki status `Siap` atau
 `Nonaktif` dan tombol **Aktifkan/Nonaktifkan**. Status ini adalah kontrol
@@ -608,8 +592,12 @@ jika environment tersebut belum diekspor.
 Periksa worker:
 
 ```bash
-docker compose -f docker-compose.worker.yml ps
-docker compose -f docker-compose.worker.yml logs --tail=100 worker
+docker compose \
+  -f docker-compose.worker.yml \
+  -f docker-compose.resolver.yml ps
+docker compose \
+  -f docker-compose.worker.yml \
+  -f docker-compose.resolver.yml logs --tail=100 worker
 ```
 
 Pastikan tidak ada error autentikasi internal, `401`, atau worker callback yang
@@ -677,13 +665,13 @@ cache immutable.
 Pantau server saat smoke test:
 
 ```bash
-docker compose -f docker-compose.gateway.yml logs -f backend worker-local
+docker compose -f docker-compose.gateway.yml -f docker-compose.resolver.yml logs -f backend worker-local resolver-addon
 ```
 
 Untuk worker remote:
 
 ```bash
-docker compose -f docker-compose.worker.yml logs -f worker
+docker compose -f docker-compose.worker.yml -f docker-compose.resolver.yml logs -f worker resolver-addon
 ```
 
 Telemetry per detik tidak disimpan sebagai baris `job_events`; hanya snapshot

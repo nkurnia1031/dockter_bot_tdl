@@ -321,6 +321,27 @@ class ProfileManager:
             self._runtimes[normalized] = runtime
             return runtime
 
+    def refresh_profile_runtime(self, profile_name: str) -> None:
+        """Refresh cached session paths after a locked install or rollback."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        with self._lock:
+            runtime = self._runtimes.get(normalized)
+            if runtime is None:
+                return
+            profile_config = build_profile_config(self.base_config, normalized)
+            export_storage = self.export_tdl_storage_path(normalized)
+            if Path(profile_config.tdl_export_storage).resolve() != export_storage.resolve():
+                profile_config = replace(
+                    profile_config,
+                    tdl_export_storage=export_storage,
+                    tdl_export_home=export_storage.parent,
+                )
+            runtime.config = profile_config
+            runtime.export_tdl_client.storage_root = export_storage
+            runtime.export_tdl_client.home = export_storage.parent
+            runtime.download_tdl_client.storage_root = Path(profile_config.tdl_download_storage)
+            runtime.download_tdl_client.home = Path(profile_config.tdl_download_home)
+
     def export_tdl_storage_path(self, profile_name: str) -> Path:
         """Resolve the session path, including a legacy default-profile location."""
         normalized = normalize_profile_name(profile_name) or self.default_profile

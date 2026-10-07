@@ -19,6 +19,8 @@ from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.settings_store import SqliteSettingsStore
+from tme3bot.profile_provisioning import ProfileProvisioningStore, build_profile_bundle
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_links import sign_storage_item
@@ -298,6 +300,35 @@ class BackendApiTests(unittest.TestCase):
                 "web_public_origin": "",
             },
         )()
+        runtime_settings = BackendRuntimeSettings(
+            root / "runtime-settings.json",
+            {
+                "backup_enabled": True,
+                "backup_schedule": "03:00",
+                "backup_timezone": "Asia/Jakarta",
+                "backup_retention": 7,
+                "backup_volume_size": "45m",
+                "backup_channel": "456",
+                "backup_channel_id": -100456,
+                "storage_trash_retention_days": 30,
+                "job_stall_timeout_seconds": 600,
+                "job_cancel_grace_seconds": 30,
+                "bot_token": "123456:abcdefghijklmnopqrstuvwxyzABCDE12345",
+                "telegram_tts_chat_id": "123456789",
+            },
+        )
+        utility_settings = UtilitySettingsStore(root / "settings.json")
+        runtime_settings_store = SqliteSettingsStore(
+            db, root / "runtime-settings" / "settings.key"
+        )
+        runtime_settings_store.seed_once(
+            "test-runtime-seed-v1", runtime_settings.get(), source="test-env"
+        )
+        runtime_settings_store.seed_once(
+            "test-utility-seed-v1", utility_settings.get(), source="test-json"
+        )
+        runtime_settings.attach_settings_store(runtime_settings_store)
+        self.control.runtime_settings_store = runtime_settings_store
         context = BackendContext(
             config=config,
             control_plane=self.control,
@@ -309,25 +340,13 @@ class BackendApiTests(unittest.TestCase):
             utility_folders=UtilityFolderStore(
                 root / "folders.json", root / "workspace"
             ),
-            utility_settings=UtilitySettingsStore(root / "settings.json"),
+            utility_settings=UtilitySettingsStore(
+                root / "settings.json", desired_store=runtime_settings_store
+            ),
             worker_dispatcher=self.dispatcher,
             bot=self.bot,
-            runtime_settings=BackendRuntimeSettings(
-                root / "runtime-settings.json",
-                {
-                    "backup_enabled": True,
-                    "backup_schedule": "03:00",
-                    "backup_timezone": "Asia/Jakarta",
-                    "backup_retention": 7,
-                    "backup_volume_size": "45m",
-                    "backup_channel": "456",
-                    "storage_trash_retention_days": 30,
-                    "job_stall_timeout_seconds": 600,
-                    "job_cancel_grace_seconds": 30,
-                    "bot_token": "123456:abcdefghijklmnopqrstuvwxyzABCDE12345",
-                    "telegram_tts_chat_id": "123456789",
-                },
-            ),
+            runtime_settings=runtime_settings,
+            runtime_settings_store=runtime_settings_store,
             device_auth=DeviceAuthService(
                 self.auth_repository, self.auth, "https://ui.example.test"
             ),
@@ -456,6 +475,68 @@ class BackendApiTests(unittest.TestCase):
     def test_background_job_submit_is_not_advertised_without_queue(self):
         capabilities = self.client.get("/api/v1/capabilities").json()
         self.assertNotIn("job.submit", capabilities["operations"]["supported_kinds"])
+
+    def test_profile_sync_is_a_durable_operation_completed_by_worker_ack(self):
+        from tme3bot.api.routes.profile_sync import advance_profile_sync_command
+
+        vault = ProfileProvisioningStore(
+            Path(self.temp.name) / "app.db", Path(self.temp.name) / "vault"
+        )
+        provisioning_id = vault.begin(
+            profile="default", actor_user_id=42, bootstrap_worker="local",
+            source="adoption", target_workers=["local"],
+        )
+        bundle = build_profile_bundle({"data/default": b"vault-session"}, 42)
+        vault.store_bundle(provisioning_id, 42, bundle)
+        vault.update_distribution("default", "local", "ready", provisioning_id=provisioning_id)
+        vault.mark_active(provisioning_id)
+        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        client = TestClient(create_backend_app(self.context))
+
+        response = client.post(
+            "/api/v1/operations",
+            headers={**self.login(42), "Idempotency-Key": "profile-sync-default-local"},
+            json={"kind": "profile.sync", "target": {"profile": "default", "worker": "local"}, "input": {}},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertIn("profile.sync", client.get("/api/v1/capabilities").json()["operations"]["supported_kinds"])
+        operation_id = response.json()["operation_id"]
+        private = self.operation_service.store.get_private_payload(operation_id)
+        self.assertNotIn("bundle", private)
+        command = {
+            "operation_id": operation_id,
+            "kind": "profile.sync",
+            "private_payload": private,
+        }
+        self.assertEqual(advance_profile_sync_command(command, self.context)["status"], "accepted")
+        self.assertEqual(
+            self.operation_service.get(self.control.actor(42), operation_id).status.value,
+            "waiting_worker",
+        )
+
+        revision = vault.desired_revision("default")
+        acknowledged = client.post(
+            "/internal/v1/profiles/default/ack",
+            headers={
+                "Authorization": "Bearer internal",
+                "X-Worker-Name": "local",
+                "X-Worker-Token": "secret",
+            },
+            json={
+                "revision": revision["revision"],
+                "bundle_sha256": revision["bundle_sha256"],
+                "telegram_user_id": 42,
+            },
+        )
+        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
+        self.assertEqual(
+            self.operation_service.get(self.control.actor(42), operation_id).status.value,
+            "succeeded",
+        )
+        client.close()
 
     def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
         self.context.queue_publisher = object()
@@ -673,6 +754,10 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(renamed.status_code, 404)
 
     def test_worker_profile_sync_persists_gateway_registry(self):
+        vault = ProfileProvisioningStore(
+            Path(self.temp.name) / "app.db", Path(self.temp.name) / "vault"
+        )
+        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
         response = self.client.post(
             "/internal/v1/profiles/sync",
             headers={"Authorization": "Bearer internal"},
@@ -681,7 +766,43 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["profiles"], ["remote-1"])
+        self.assertEqual(response.json()["adoption_candidates"], ["remote-1"])
         self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
+
+        changed = self.client.post(
+            "/internal/v1/profiles/sync",
+            headers={"Authorization": "Bearer internal"},
+            json={"profiles": [{"name": "remote-1", "telegram_user_id": 43}]},
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
+        self.assertIsNone(self.profiles.profile_registry.profile_for_user(43))
+
+    def test_worker_profile_sync_cannot_rewrite_vaulted_identity(self):
+        vault = ProfileProvisioningStore(
+            Path(self.temp.name) / "app.db", Path(self.temp.name) / "vault"
+        )
+        operation_id = vault.begin(
+            profile="vaulted", actor_user_id=42, bootstrap_worker="local",
+            source="adoption", target_workers=["local"],
+        )
+        vault.store_bundle(
+            operation_id, 4242, build_profile_bundle({"data/default": b"session"}, 4242)
+        )
+        self.profiles.profile_registry.register_vaulted("vaulted", 4242)
+        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
+
+        response = self.client.post(
+            "/internal/v1/profiles/sync",
+            headers={"Authorization": "Bearer internal"},
+            json={"profiles": [{"name": "vaulted", "telegram_user_id": 9999}]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["vault_protected"], ["vaulted"])
+        self.assertEqual(self.profiles.profile_registry.profile_for_user(4242), "vaulted")
+        self.assertIsNone(self.profiles.profile_registry.profile_for_user(9999))
+        self.assertEqual(vault.legacy_candidates("vaulted"), [])
 
     def test_web_profile_upload_and_stepwise_login_keep_private_input_out_of_response(self):
         headers = self.login()
@@ -830,6 +951,8 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(current.status_code, 200)
         self.assertEqual(current.json()["storage_profile"], "storage")
         self.assertNotIn("token", current.json())
+        self.assertGreaterEqual(current.json()["desired_version"], 1)
+        self.assertEqual(current.json()["settings_status"], "applied")
 
         updated = self.client.put(
             "/api/v1/workers/local/settings",
@@ -838,6 +961,7 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(updated.status_code, 200)
         self.assertEqual(updated.json()["storage_profile"], "archive")
+        self.assertEqual(updated.json()["settings_status"], "applied")
 
         rejected = self.client.put(
             "/api/v1/workers/local/settings",
@@ -870,6 +994,81 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/backups/status", headers=headers).json()["schedule"], "04:15")
         self.assertEqual(self.context.config.backup_channel_id, -100789)
         self.assertEqual(self.context.control_plane.job_stall_timeout_seconds, 900)
+
+    def test_desired_worker_settings_are_persisted_without_worker_rpc_then_acked(self):
+        headers = self.login()
+        response = self.client.put(
+            "/api/v1/runtime/settings?scope=worker&worker=local",
+            headers=headers,
+            json={
+                "expected_version": 0,
+                "values": {
+                    "tts_helper_urls": [
+                        "http://tts-1:8090",
+                        "http://tts-2:8090",
+                        "http://tts-3:8090",
+                    ]
+                },
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "pending")
+        self.assertEqual(response.json()["desired_version"], 1)
+        self.assertEqual(response.json()["applied_version"], 0)
+        self.assertEqual(
+            self.client.get(
+                "/api/v1/runtime/settings?scope=worker&worker=local", headers=headers
+            ).json()["settings"]["tts_helper_urls"],
+            ["http://tts-1:8090", "http://tts-2:8090", "http://tts-3:8090"],
+        )
+        stale = self.client.put(
+            "/api/v1/runtime/settings?scope=worker&worker=local",
+            headers=headers,
+            json={"expected_version": 0, "values": {"tts_part_retries": 4}},
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["error"]["details"]["current_version"], 1)
+
+        internal = {"Authorization": "Bearer internal"}
+        denied_manifest = self.client.get(
+            "/internal/v1/runtime/settings?worker=local", headers=internal
+        )
+        self.assertEqual(denied_manifest.status_code, 401)
+        internal["X-Worker-Token"] = "secret"
+        manifest = self.client.get(
+            "/internal/v1/runtime/settings?worker=local", headers=internal
+        )
+        self.assertEqual(manifest.status_code, 200)
+        self.assertEqual(manifest.json()["desired_version"], 1)
+        wrong_scope = self.client.post(
+            "/internal/v1/runtime/settings/ack",
+            headers=internal,
+            json={"worker": "local", "scope": "backend", "applied_version": 1},
+        )
+        self.assertEqual(wrong_scope.status_code, 422)
+        ack = self.client.post(
+            "/internal/v1/runtime/settings/ack",
+            headers=internal,
+            json={"worker": "local", "scope": "worker", "applied_version": 1},
+        )
+        self.assertEqual(ack.status_code, 200)
+        self.assertEqual(ack.json()["status"], "applied")
+
+    def test_desired_settings_api_requires_actor_and_redacts_secrets(self):
+        denied = self.client.get("/api/v1/runtime/settings?scope=telegram")
+        self.assertEqual(denied.status_code, 401)
+        headers = self.login()
+        response = self.client.get(
+            "/api/v1/runtime/settings?scope=telegram", headers=headers
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("bot_token", response.json()["settings"])
+        self.assertTrue(response.json()["secret_status"]["bot_token"])
+        schema = self.client.get(
+            "/api/v1/runtime/settings/schema?scope=backend", headers=headers
+        )
+        self.assertEqual(schema.status_code, 200)
+        self.assertTrue(any(item["scope"] == "deployment" for item in schema.json()["items"]))
 
     def test_backup_runtime_settings_reject_invalid_timezone_without_applying(self):
         headers = self.login()
@@ -1992,9 +2191,14 @@ class BackendApiTests(unittest.TestCase):
         job = created.json()
         self.assertEqual(job["kind"], "tts")
         self.assertEqual(job["payload"], {"title": "Bab rahasia", "character_count": len(secret_text)})
+        self.assertEqual(job["settings_version"], 0)
         self.assertNotIn(secret_text, created.text)
         internal_command = self.dispatcher.commands[-1][1]
         self.assertEqual(internal_command["payload"]["text"], secret_text)
+        encrypted_chat_ref = self.jobs.private_value(job["id"], "telegram_tts_chat_id")
+        self.assertIsNotNone(encrypted_chat_ref)
+        self.assertNotIn(b"123456789", encrypted_chat_ref)
+        self.context.runtime_settings.update({"telegram_tts_chat_id": "987654321"})
 
         artifact_ref = "a" * 48
         registered = self.client.post(
@@ -2013,6 +2217,7 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(registered.status_code, 200, registered.text)
         self.assertNotIn(artifact_ref, registered.text)
+        self.assertEqual(registered.json()["chat_ref"], "123456789")
         self.assertEqual(
             self.client.post(
                 "/internal/v1/tts/artifacts/ready",

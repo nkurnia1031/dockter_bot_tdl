@@ -46,6 +46,14 @@ class RunScriptTests(unittest.TestCase):
             )
         inspect.assert_called_once_with("ghcr.io/example/gateway:abc123", {})
 
+    def test_resolver_addon_image_follows_worker_package_without_extra_env(self):
+        self.assertEqual(
+            run.resolver_addon_image_name(
+                {"WORKER_IMAGE_NAME": "ghcr.io/example/tme3bot-worker"}
+            ),
+            "ghcr.io/example/tme3bot-resolver",
+        )
+
     def test_gateway_data_root_is_accepted_by_preflight_helpers(self) -> None:
         self.assertEqual(run.data_root_value({"GATEWAY_DATA_ROOT": "/srv/gateway"}), "/srv/gateway")
 
@@ -56,6 +64,8 @@ class RunScriptTests(unittest.TestCase):
         ):
             command = run.compose_base_command({"COMPOSE_FILE": "docker-compose.gateway.yml"})
         self.assertEqual(command[:2], ["docker-compose", "-f"])
+        self.assertIn("docker-compose.resolver.yml", command)
+        self.assertNotIn("docker-compose.resolver-gateway.yml", command)
 
     def test_cleanup_prunes_only_dangling_images(self) -> None:
         env = {"DOCKER_CMD": "docker"}
@@ -125,7 +135,8 @@ class RunScriptTests(unittest.TestCase):
             run.run_compose(["ps"], env)
 
         self.assertEqual(subprocess_run.call_args.args[0], [
-            "docker", "compose", "-f", "docker-compose.gateway.yml", "ps"
+            "docker", "compose", "-f", "docker-compose.gateway.yml",
+            "-f", "docker-compose.resolver.yml", "ps"
         ])
 
     def test_static_web_install_preserves_aapanel_files_and_replaces_managed_assets(self) -> None:
@@ -151,16 +162,19 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual((target / "custom-aapanel-file.txt").read_text(encoding="utf-8"), "keep")
 
     def test_deploy_gateway_reuses_base_and_recreates_services(self) -> None:
-        env = {"COMPOSE_FILE": "docker-compose.worker.yml"}
-        with (
-            patch.object(run, "require_env_file"),
-            patch.object(run, "validate_local_base_image") as validate_base,
-            patch.object(run, "ensure_base_image_available"),
-            patch.object(run, "ensure_profile_root") as ensure_root,
-            patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
-            patch.object(run, "run_compose") as run_compose,
-        ):
-            run.deploy_application(env, ["gateway"])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project = Path(temp_dir)
+            env = {"COMPOSE_FILE": "docker-compose.worker.yml"}
+            with (
+                patch.object(run, "PROJECT_DIR", project),
+                patch.object(run, "require_env_file"),
+                patch.object(run, "validate_local_base_image") as validate_base,
+                patch.object(run, "ensure_base_image_available"),
+                patch.object(run, "ensure_profile_root") as ensure_root,
+                patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
+                patch.object(run, "run_compose") as run_compose,
+            ):
+                run.deploy_application(env, ["gateway"])
 
         validate_base.assert_called_once_with()
         ensure_root.assert_called_once()
@@ -170,14 +184,17 @@ class RunScriptTests(unittest.TestCase):
             ["up", "-d", "--remove-orphans"],
             ["ps"],
         ])
-        self.assertEqual(run_compose.call_args_list[0].args[1]["COMPOSE_FILE"], "docker-compose.gateway.yml")
+        self.assertEqual(
+            run_compose.call_args_list[0].args[1]["COMPOSE_FILE"],
+            run.compose_files_for_target("gateway"),
+        )
 
     def test_deploy_worker_imports_profile_root_for_compose_interpolation(self) -> None:
-        env = {"WORKER_ENV_FILE": ".env.worker.test"}
         with tempfile.TemporaryDirectory() as temp_dir:
             project = Path(temp_dir)
             worker_env = project / ".env.worker.test"
             worker_env.write_text("PROFILE_ROOT=/srv/remote-worker\n", encoding="utf-8")
+            env = {"WORKER_ENV_FILE": worker_env.name}
             with (
                 patch.object(run, "PROJECT_DIR", project),
                 patch.object(run, "require_env_file"),
@@ -190,28 +207,24 @@ class RunScriptTests(unittest.TestCase):
 
         deploy_env = run_compose.call_args.args[1]
         self.assertEqual(deploy_env["PROFILE_ROOT"], "/srv/remote-worker")
+        self.assertEqual(
+            deploy_env["COMPOSE_FILE"], run.compose_files_for_target("worker")
+        )
 
-    def test_deploy_resolver_uses_its_compose_and_env_file(self) -> None:
-        env = {"RESOLVER_ENV_FILE": ".env.resolver.test"}
-        with tempfile.TemporaryDirectory() as temp_dir:
-            project = Path(temp_dir)
-            resolver_env = project / ".env.resolver.test"
-            resolver_env.write_text("PROFILE_ROOT=/srv/resolver\n", encoding="utf-8")
-            with (
-                patch.object(run, "PROJECT_DIR", project),
-                patch.object(run, "require_env_file"),
-                patch.object(run, "validate_local_base_image"),
-                patch.object(run, "ensure_profile_root"),
-                patch.object(run, "prepare_tdl_build_asset"),
-                patch.object(run, "run_compose") as run_compose,
-            ):
-                run.deploy_application(env, ["resolver", "--pull"], start_services=False)
+    def test_gateway_and_worker_stacks_include_resolver_addon(self) -> None:
+        self.assertEqual(
+            run.compose_files_for_target("gateway").split(run.os.pathsep),
+            [
+                "docker-compose.gateway.yml",
+                "docker-compose.resolver.yml",
+            ],
+        )
+        self.assertEqual(
+            run.compose_files_for_target("worker").split(run.os.pathsep),
+            ["docker-compose.worker.yml", "docker-compose.resolver.yml"],
+        )
 
-        deploy_env = run_compose.call_args.args[1]
-        self.assertEqual(deploy_env["COMPOSE_FILE"], "docker-compose.resolver.yml")
-        self.assertEqual(deploy_env["PROFILE_ROOT"], "/srv/resolver")
-
-    def test_migrate_builds_all_split_compose_files_and_saves_images(self) -> None:
+    def test_migrate_builds_gateway_and_worker_stacks_with_addons(self) -> None:
         env = {}
 
         def fake_docker(args, _env):
@@ -228,7 +241,8 @@ class RunScriptTests(unittest.TestCase):
             patch.object(run, "prepare_tdl_build_asset"),
             patch.object(run, "run_compose") as run_compose,
             patch.object(run, "capture_compose", side_effect=[
-                "gateway-image\nworker-image\n", "worker-image\n", "resolver-image\n"
+                "gateway-image\nworker-image\nresolver-image\n",
+                "worker-image\nresolver-image\n",
             ]),
             patch.object(run, "run_docker", side_effect=fake_docker) as run_docker,
             patch.object(run, "build_migration_archive", side_effect=fake_archive),
@@ -236,14 +250,14 @@ class RunScriptTests(unittest.TestCase):
             output = run.migrate_images(env)
 
         self.assertEqual(output, run.PROJECT_DIR / "migrate.zip")
-        self.assertEqual(run_compose.call_count, 3)
+        self.assertEqual(run_compose.call_count, 2)
         worker_build_env = run_compose.call_args_list[1].args[1]
         self.assertEqual(
             worker_build_env["PROFILE_ROOT"], "/tmp/tme3bot-worker-build"
         )
-        resolver_build_env = run_compose.call_args_list[2].args[1]
-        self.assertEqual(resolver_build_env["PROFILE_ROOT"], "/tmp/tme3bot-resolver-build")
-        self.assertEqual(resolver_build_env["COMPOSE_FILE"], "docker-compose.resolver.yml")
+        self.assertEqual(
+            worker_build_env["COMPOSE_FILE"], run.compose_files_for_target("worker")
+        )
         run_docker.assert_called_once()
         self.assertEqual(run_docker.call_args.args[0][:2], ["save", "-o"])
 

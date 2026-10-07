@@ -13,6 +13,7 @@ from tme3bot.domain.worker_contract import (
 )
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 
 
 class FakeProfiles:
@@ -82,10 +83,19 @@ class DurableDispatchTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.db_file = Path(self.temp.name) / "jobs.db"
         self.jobs = SqliteJobRepository(self.db_file)
+        self.settings = SqliteSettingsStore(
+            self.db_file, Path(self.temp.name) / "runtime-settings" / "settings.key"
+        )
+        self.settings.update(
+            "telegram", {"telegram_tts_chat_id": "123456789"}, expected_version=0
+        )
         self.store = SqliteOperationStore(self.jobs)
         self.operations = OperationsService(self.store)
         self.dispatcher = FakeDispatcher()
-        self.control = ControlPlane(self.jobs, self.dispatcher, FakeProfiles())
+        self.control = ControlPlane(
+            self.jobs, self.dispatcher, FakeProfiles(),
+            runtime_settings_store=self.settings,
+        )
         self.control.utility_settings = FakeUtilitySettings()
         self.control.add_event_observer(self.operations.on_job_event)
         self.operations.register_handler("job.submit", self.control.prepare_durable_job)
@@ -135,6 +145,30 @@ class DurableDispatchTests(unittest.TestCase):
                 (operation.id,),
             ).fetchone()
         self.assertEqual(tuple(outbox), ("operation.accepted", "pending"))
+
+    def test_job_pins_worker_settings_version_and_encrypts_tts_recipient(self):
+        self.settings.update(
+            "worker", {"tts_part_retries": 7}, expected_version=0, worker="local"
+        )
+        operation = self.submit("tts", {"title": "Narasi", "text": "teks privat"})
+        job = self.jobs.get(operation.job_id)
+        self.assertEqual(job.settings_version, 1)
+        self.assertEqual(self.jobs.command_payload(job.id)["settings_version"], 1)
+        encrypted = self.jobs.private_value(job.id, "telegram_tts_chat_id")
+        self.assertIsNotNone(encrypted)
+        self.assertNotIn(b"123456789", encrypted)
+        self.assertEqual(
+            self.settings.decrypt_job_secret(job.id, "telegram_tts_chat_id", encrypted),
+            "123456789",
+        )
+        dispatched = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(dispatched["status"], "accepted")
+        self.assertEqual(self.dispatcher.commands[-1][1]["settings_version"], 1)
+        with self.jobs._db() as db:
+            row = db.execute(
+                "SELECT settings_version FROM jobs WHERE id=?", (job.id,)
+            ).fetchone()
+        self.assertEqual(int(row["settings_version"]), 1)
 
     def test_client_cannot_override_internal_settings_or_quickmode_checkpoint(self):
         with self.assertRaises(DomainError) as utility_error:

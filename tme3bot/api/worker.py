@@ -98,20 +98,79 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "role": "worker"}
+        snapshot = getattr(context.executor, "profile_sync_status", None)
+        profile_sync = snapshot() if callable(snapshot) else {"status": "disabled"}
+        status = str(profile_sync.get("status") or "disabled")
+        return {
+            "ok": True,
+            "role": "worker",
+            "profiles_ready": status in {"ready", "disabled"},
+            "profile_sync_status": status,
+        }
 
     @app.get("/internal/v1/capabilities", dependencies=[Depends(authorize)])
     def capabilities():
         details = context.executor.capabilities()
         contract = worker_contract_metadata()
         capabilities = list(contract["capabilities"])
-        capabilities.append(CAP_DURABLE_COMMANDS_V1)
+        durable_ready = getattr(context.executor, "durable_commands_ready", None)
+        if callable(durable_ready) and durable_ready():
+            capabilities.append(CAP_DURABLE_COMMANDS_V1)
         if details.get("tts"):
             capabilities.append(CAP_TTS)
         if details.get("safelink_resolver"):
             capabilities.append(CAP_SAFELINK_RESOLVE)
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
+
+    @app.get("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
+    def profile_sync_status():
+        snapshot = getattr(context.executor, "profile_sync_status", None)
+        if not callable(snapshot):
+            return {"status": "disabled", "backend_available": None, "profiles": {}}
+        return snapshot()
+
+    @app.post("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
+    def request_profile_sync(body: dict[str, Any]):
+        if set(body) - {"profile", "mode"}:
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID",
+                "Payload sinkronisasi profil tidak valid.",
+                status_code=422,
+            )
+        profile = body.get("profile")
+        if profile is not None and (not isinstance(profile, str) or len(profile) > 48):
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID",
+                "Nama profil sinkronisasi tidak valid.",
+                status_code=422,
+            )
+        mode = str(body.get("mode") or "check").strip().lower()
+        if mode not in {"check", "repair"}:
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID",
+                "Mode sinkronisasi harus check atau repair.",
+                status_code=422,
+            )
+        request_sync = getattr(context.executor, "request_profile_sync", None)
+        if not callable(request_sync):
+            raise DomainError(
+                "PROFILE_SYNC_UNAVAILABLE",
+                "Worker belum mendukung sinkronisasi profil.",
+                status_code=503,
+            )
+        try:
+            return request_sync(profile=profile, mode=mode)
+        except ValueError as exc:
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID", str(exc), status_code=422
+            ) from exc
+        except RuntimeError as exc:
+            raise DomainError(
+                "PROFILE_SYNC_UNAVAILABLE",
+                "Sinkronisasi profil backend belum dikonfigurasi pada worker.",
+                status_code=503,
+            ) from exc
 
     @app.get("/internal/v1/tts/health", dependencies=[Depends(authorize)])
     def tts_health():
@@ -313,6 +372,33 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     )
     def quickmode_delete_stage(stage_job_id: str):
         return context.executor.quickmode_delete(stage_job_id)
+
+    @app.post("/internal/v1/commands", dependencies=[Depends(authorize)])
+    def accept_command(body: dict[str, Any]):
+        accept = getattr(context.executor, "accept_durable_command", None)
+        if not callable(accept):
+            raise DomainError(
+                "DURABLE_COMMANDS_NOT_READY",
+                "Jurnal command worker belum siap.",
+                status_code=503,
+            )
+        return accept(body)
+
+    @app.get(
+        "/internal/v1/commands/{command_id}", dependencies=[Depends(authorize)]
+    )
+    def durable_command_status(
+        command_id: str = ApiPath(min_length=1, max_length=160),
+    ):
+        lookup = getattr(context.executor, "durable_command_status", None)
+        snapshot = lookup(command_id) if callable(lookup) else None
+        if snapshot is None:
+            raise DomainError(
+                "WORKER_COMMAND_NOT_FOUND",
+                "Command worker tidak ditemukan.",
+                status_code=404,
+            )
+        return snapshot
 
     @app.post("/internal/v1/jobs", dependencies=[Depends(authorize)])
     def submit_job(body: WorkerJobRequest):

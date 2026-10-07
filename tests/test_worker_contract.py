@@ -25,9 +25,13 @@ from tme3bot.worker.executor_support import WorkerEventPublisher
 class ContractWorkerExecutor:
     def __init__(self):
         self.commands = []
+        self.durable_ready = True
 
     def capabilities(self):
         return {"profiles": ["default"], "workspace": True}
+
+    def durable_commands_ready(self):
+        return self.durable_ready
 
     def enqueue(self, command):
         self.commands.append(command)
@@ -152,6 +156,22 @@ class WorkerContractTests(unittest.TestCase):
             WORKER_API_CAPABILITIES | {CAP_DURABLE_COMMANDS_V1},
         )
         self.assertEqual(body["profiles"], ["default"])
+
+    def test_durable_capability_is_hidden_until_journal_and_sender_are_ready(self):
+        executor = ContractWorkerExecutor()
+        executor.durable_ready = False
+        app = create_worker_app(
+            WorkerContext(
+                type("Config", (), {"worker_api_token": "worker-token"})(),
+                executor,
+            )
+        )
+        response = TestClient(app).get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": "Bearer worker-token"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(CAP_DURABLE_COMMANDS_V1, response.json()["capabilities"])
 
     def test_worker_resolver_capability_is_advertised_only_when_browser_ready(self):
         executor = ContractWorkerExecutor()

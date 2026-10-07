@@ -218,6 +218,7 @@ class SqliteOperationStore:
         job: Job | None = None,
         execution_plan: dict[str, Any] | None = None,
         command_payload: dict[str, Any] | None = None,
+        private_job_values: dict[str, bytes] | None = None,
     ) -> tuple[Operation, bool]:
         if job is not None and (execution_plan is None or command_payload is None):
             raise ValueError("Job operation membutuhkan execution plan dan command payload.")
@@ -260,7 +261,9 @@ class SqliteOperationStore:
             self._insert_outbox(db, operation.id, operation.attempt, "operation.accepted", {"operation_id": operation.id, "attempt": operation.attempt}, now)
             if job is not None:
                 assert execution_plan is not None and command_payload is not None
-                SqliteJobRepository.insert_prepared_job(db, job, execution_plan, command_payload)
+                SqliteJobRepository.insert_prepared_job(
+                    db, job, execution_plan, command_payload, private_job_values
+                )
             return operation, True
 
     def get_for_actor(self, operation_id: str, actor_user_id: int) -> Operation | None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from tme3bot.domain.operations import OperationStatus
 from tme3bot.names import normalize_profile_name
 
 
@@ -28,14 +30,15 @@ _PHONE_RE = re.compile(r"^[+0-9(). -]{4,32}$")
 
 
 def profile_transfer_is_secure(worker_url: str) -> bool:
-    """Allow HTTPS remote workers and explicit internal deployment hosts."""
+    """Allow HTTPS remote workers and explicit internal Compose service hosts."""
     try:
         parsed = urlsplit(str(worker_url))
         if not parsed.hostname or parsed.username is not None or parsed.password is not None:
             return False
         return parsed.scheme == "https" or (
             parsed.scheme == "http"
-            and parsed.hostname in {"worker-local", "local", "localhost", "127.0.0.1", "::1"}
+            and parsed.hostname
+            in {"worker-local", "resolver", "local", "localhost", "127.0.0.1", "::1"}
         )
     except ValueError:
         return False
@@ -242,7 +245,23 @@ class ProfileProvisioningStore:
                     encrypted_bundle BLOB NOT NULL,
                     active INTEGER NOT NULL DEFAULT 0,
                     source TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    desired_revision INTEGER NOT NULL DEFAULT 0,
+                    format_version INTEGER NOT NULL DEFAULT 1,
+                    bundle_sha256 TEXT,
+                    source_worker TEXT
+                );
+                CREATE TABLE IF NOT EXISTS profile_session_revisions (
+                    profile TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    format_version INTEGER NOT NULL,
+                    bundle_sha256 TEXT NOT NULL,
+                    telegram_user_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    source_worker TEXT,
+                    encrypted_bundle BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(profile, revision)
                 );
                 CREATE TABLE IF NOT EXISTS profile_provisionings (
                     id TEXT PRIMARY KEY,
@@ -264,7 +283,31 @@ class ProfileProvisioningStore:
                     provisioning_id TEXT,
                     error TEXT,
                     updated_at TEXT NOT NULL,
+                    desired_revision INTEGER,
+                    installed_revision INTEGER,
+                    installed_sha256 TEXT,
+                    installed_telegram_user_id INTEGER,
+                    sync_requested INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(profile, worker)
+                );
+                CREATE TABLE IF NOT EXISTS profile_sync_requests (
+                    operation_id TEXT PRIMARY KEY,
+                    actor_user_id INTEGER NOT NULL,
+                    profile TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    desired_revision INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_profile_sync_requests_target
+                    ON profile_sync_requests(profile, worker, desired_revision, status);
+                CREATE TABLE IF NOT EXISTS profile_legacy_candidates (
+                    profile TEXT NOT NULL,
+                    telegram_user_id INTEGER NOT NULL,
+                    source_worker TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL,
+                    PRIMARY KEY(profile, telegram_user_id, source_worker)
                 );
                 CREATE INDEX IF NOT EXISTS idx_profile_provisionings_status
                     ON profile_provisionings(status, updated_at);
@@ -276,6 +319,75 @@ class ProfileProvisioningStore:
                     WHERE status IN ('authenticating','validating','distributing');
                 """
             )
+            self._ensure_columns(
+                db,
+                "profile_sessions",
+                {
+                    "desired_revision": "INTEGER NOT NULL DEFAULT 0",
+                    "format_version": "INTEGER NOT NULL DEFAULT 1",
+                    "bundle_sha256": "TEXT",
+                    "source_worker": "TEXT",
+                },
+            )
+            self._ensure_columns(
+                db,
+                "profile_distributions",
+                {
+                    "desired_revision": "INTEGER",
+                    "installed_revision": "INTEGER",
+                    "installed_sha256": "TEXT",
+                    "installed_telegram_user_id": "INTEGER",
+                    "sync_requested": "INTEGER NOT NULL DEFAULT 0",
+                },
+            )
+            # Additive migration: make each pre-versioned vault row revision 1.
+            legacy_rows = db.execute(
+                "SELECT profile,telegram_user_id,encrypted_bundle,source,updated_at,desired_revision "
+                "FROM profile_sessions WHERE desired_revision=0"
+            ).fetchall()
+            for row in legacy_rows:
+                profile = str(row["profile"])
+                plaintext = self._decrypt(profile, bytes(row["encrypted_bundle"]))
+                digest = hashlib.sha256(plaintext).hexdigest()
+                source_row = db.execute(
+                    "SELECT bootstrap_worker FROM profile_provisionings WHERE profile=? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (profile,),
+                ).fetchone()
+                source_worker = str(source_row[0]) if source_row else None
+                db.execute(
+                    "INSERT OR IGNORE INTO profile_session_revisions "
+                    "(profile,revision,format_version,bundle_sha256,telegram_user_id,source,source_worker,encrypted_bundle,created_at) "
+                    "VALUES(?,1,1,?,?,?,?,?,?)",
+                    (
+                        profile,
+                        digest,
+                        int(row["telegram_user_id"]),
+                        str(row["source"]),
+                        source_worker,
+                        bytes(row["encrypted_bundle"]),
+                        str(row["updated_at"]),
+                    ),
+                )
+                db.execute(
+                    "UPDATE profile_sessions SET desired_revision=1,format_version=1,bundle_sha256=?,source_worker=? WHERE profile=?",
+                    (digest, source_worker, profile),
+                )
+                db.execute(
+                    "UPDATE profile_distributions SET desired_revision=1, "
+                    "installed_revision=CASE WHEN status='ready' THEN 1 ELSE installed_revision END, "
+                    "installed_sha256=CASE WHEN status='ready' THEN ? ELSE installed_sha256 END, "
+                    "installed_telegram_user_id=CASE WHEN status='ready' THEN ? ELSE installed_telegram_user_id END "
+                    "WHERE profile=?",
+                    (digest, int(row["telegram_user_id"]), profile),
+                )
+
+    @staticmethod
+    def _ensure_columns(db: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+        existing = {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def _encrypt(self, profile: str, data: bytes) -> bytes:
         nonce = os.urandom(12)
@@ -316,29 +428,67 @@ class ProfileProvisioningStore:
         if profile_bundle_identity(bundle) != int(user_id):
             raise ValueError("Identity bundle tidak cocok dengan sesi TDL.")
         now = _now()
+        bundle_sha256 = hashlib.sha256(bundle).hexdigest()
         with self._lock, self._db() as db:
             row = db.execute(
-                "SELECT profile,source,status FROM profile_provisionings WHERE id=?", (operation_id,)
+                "SELECT profile,source,status,bootstrap_worker FROM profile_provisionings WHERE id=?", (operation_id,)
             ).fetchone()
             if row is None:
                 raise KeyError(operation_id)
             if str(row["status"]) not in {"authenticating", "validating"}:
                 raise ValueError("Provisioning profil sudah tidak menerima sesi.")
             profile = str(row["profile"])
+            latest = db.execute(
+                "SELECT COALESCE(MAX(revision),0) FROM profile_session_revisions WHERE profile=?",
+                (profile,),
+            ).fetchone()
+            revision = int(latest[0] or 0) + 1
+            encrypted_bundle = self._encrypt(profile, bundle)
+            db.execute(
+                "INSERT INTO profile_session_revisions "
+                "(profile,revision,format_version,bundle_sha256,telegram_user_id,source,source_worker,encrypted_bundle,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    profile,
+                    revision,
+                    1,
+                    bundle_sha256,
+                    int(user_id),
+                    str(row["source"]),
+                    str(row["bootstrap_worker"]),
+                    encrypted_bundle,
+                    now,
+                ),
+            )
             try:
                 db.execute(
-                    "INSERT INTO profile_sessions(profile,telegram_user_id,encrypted_bundle,active,source,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(profile) DO UPDATE SET telegram_user_id=excluded.telegram_user_id,encrypted_bundle=excluded.encrypted_bundle,active=0,source=excluded.source,updated_at=excluded.updated_at",
+                    "INSERT INTO profile_sessions(profile,telegram_user_id,encrypted_bundle,active,source,updated_at,desired_revision,format_version,bundle_sha256,source_worker) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(profile) DO UPDATE SET telegram_user_id=excluded.telegram_user_id,encrypted_bundle=excluded.encrypted_bundle,active=0,source=excluded.source,updated_at=excluded.updated_at,desired_revision=excluded.desired_revision,format_version=excluded.format_version,bundle_sha256=excluded.bundle_sha256,source_worker=excluded.source_worker",
                     (
                         profile,
                         int(user_id),
-                        self._encrypt(profile, bundle),
+                        encrypted_bundle,
                         0,
                         str(row["source"]),
                         now,
+                        revision,
+                        1,
+                        bundle_sha256,
+                        str(row["bootstrap_worker"]),
                     ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise FileExistsError("Akun Telegram tersebut sudah terdaftar pada profil lain.") from exc
+            db.execute(
+                "UPDATE profile_distributions SET status='waiting',error=NULL,desired_revision=?,installed_revision=NULL,installed_sha256=NULL,installed_telegram_user_id=NULL,sync_requested=0,updated_at=? WHERE profile=?",
+                (revision, now, profile),
+            )
+            db.execute(
+                "DELETE FROM profile_legacy_candidates WHERE profile=?", (profile,)
+            )
+            db.execute(
+                "UPDATE profile_sync_requests SET desired_revision=?,status='pending',updated_at=? WHERE profile=? AND status='pending'",
+                (revision, now, profile),
+            )
             db.execute(
                 "UPDATE profile_provisionings SET telegram_user_id=?,status='distributing',error=NULL,updated_at=? WHERE id=?",
                 (int(user_id), now, operation_id),
@@ -347,12 +497,285 @@ class ProfileProvisioningStore:
     def bundle(self, profile: str) -> tuple[int, bytes] | None:
         with self._db() as db:
             row = db.execute(
-                "SELECT telegram_user_id,encrypted_bundle FROM profile_sessions WHERE profile=?",
-                (profile,),
+                "SELECT telegram_user_id,encrypted_bundle FROM profile_session_revisions "
+                "WHERE profile=? AND revision=(SELECT desired_revision FROM profile_sessions WHERE profile=?)",
+                (profile, profile),
             ).fetchone()
+            if row is None:
+                row = db.execute(
+                    "SELECT telegram_user_id,encrypted_bundle FROM profile_sessions WHERE profile=?",
+                    (profile,),
+                ).fetchone()
         if row is None:
             return None
         return int(row["telegram_user_id"]), self._decrypt(profile, bytes(row["encrypted_bundle"]))
+
+    def desired_revision(self, profile: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT profile,desired_revision,format_version,bundle_sha256,telegram_user_id,source,source_worker "
+                "FROM profile_sessions WHERE profile=?",
+                (str(profile),),
+            ).fetchone()
+        if row is None or int(row["desired_revision"] or 0) < 1 or not row["bundle_sha256"]:
+            return None
+        return {
+            "profile": str(row["profile"]),
+            "revision": int(row["desired_revision"]),
+            "format_version": int(row["format_version"]),
+            "bundle_sha256": str(row["bundle_sha256"]),
+            "telegram_user_id": int(row["telegram_user_id"]),
+            "source": str(row["source"]),
+            "source_worker": str(row["source_worker"] or ""),
+        }
+
+    def vaulted_identities(self) -> dict[str, int]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT profile,telegram_user_id FROM profile_sessions ORDER BY profile"
+            ).fetchall()
+        return {str(row["profile"]): int(row["telegram_user_id"]) for row in rows}
+
+    def is_vaulted(self, profile: str) -> bool:
+        with self._db() as db:
+            return db.execute(
+                "SELECT 1 FROM profile_sessions WHERE profile=?", (str(profile),)
+            ).fetchone() is not None
+
+    def record_legacy_discovery(
+        self, profile: str, telegram_user_id: int, source_worker: str = "legacy-unattributed"
+    ) -> bool:
+        """Keep old worker identity reports as adoption candidates, never as vault data."""
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            raise ValueError("Nama profile tidak valid.")
+        with self._lock, self._db() as db:
+            if db.execute(
+                "SELECT 1 FROM profile_sessions WHERE profile=?", (normalized,)
+            ).fetchone():
+                return False
+            db.execute(
+                "INSERT INTO profile_legacy_candidates(profile,telegram_user_id,source_worker,discovered_at) "
+                "VALUES(?,?,?,?) ON CONFLICT(profile,telegram_user_id,source_worker) "
+                "DO UPDATE SET discovered_at=excluded.discovered_at",
+                (normalized, int(telegram_user_id), str(source_worker)[:48], _now()),
+            )
+        return True
+
+    def legacy_candidates(self, profile: str | None = None) -> list[dict[str, Any]]:
+        with self._db() as db:
+            if profile is None:
+                rows = db.execute(
+                    "SELECT profile,source_worker,discovered_at FROM profile_legacy_candidates ORDER BY profile,source_worker"
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT profile,source_worker,discovered_at FROM profile_legacy_candidates WHERE profile=? ORDER BY source_worker",
+                    (str(profile),),
+                ).fetchall()
+        return [
+            {"profile": str(row["profile"]), "source_worker": str(row["source_worker"]), "discovered_at": str(row["discovered_at"])}
+            for row in rows
+        ]
+
+    def profile_manifest(self, worker: str) -> list[dict[str, Any]]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT p.profile,p.desired_revision,p.format_version,p.bundle_sha256,p.active, "
+                "d.status,d.installed_revision,d.installed_sha256,d.sync_requested "
+                "FROM profile_sessions p JOIN profile_distributions d ON d.profile=p.profile "
+                "WHERE d.worker=? ORDER BY p.profile",
+                (str(worker),),
+            ).fetchall()
+        return [
+            {
+                "profile": str(row["profile"]),
+                "revision": int(row["desired_revision"]),
+                "format_version": int(row["format_version"]),
+                "bundle_sha256": str(row["bundle_sha256"]),
+                "admission_status": (
+                    "ready" if bool(row["active"])
+                    and str(row["status"]) == "ready"
+                    and row["installed_revision"] is not None
+                    and int(row["installed_revision"]) == int(row["desired_revision"])
+                    and str(row["installed_sha256"] or "") == str(row["bundle_sha256"])
+                    else "pending"
+                ),
+                "sync_requested": bool(row["sync_requested"]),
+            }
+            for row in rows
+        ]
+
+    def bundle_for_worker(self, profile: str, revision: int, worker: str) -> dict[str, Any] | None:
+        with self._db() as db:
+            assigned = db.execute(
+                "SELECT desired_revision FROM profile_distributions WHERE profile=? AND worker=?",
+                (str(profile), str(worker)),
+            ).fetchone()
+            if assigned is None or assigned["desired_revision"] is None or int(assigned["desired_revision"]) != int(revision):
+                return None
+            row = db.execute(
+                "SELECT revision,format_version,bundle_sha256,telegram_user_id,encrypted_bundle "
+                "FROM profile_session_revisions WHERE profile=? AND revision=?",
+                (str(profile), int(revision)),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "profile": str(profile),
+            "revision": int(row["revision"]),
+            "format_version": int(row["format_version"]),
+            "bundle_sha256": str(row["bundle_sha256"]),
+            "telegram_user_id": int(row["telegram_user_id"]),
+            "bundle": self._decrypt(str(profile), bytes(row["encrypted_bundle"])),
+        }
+
+    def acknowledge_bundle(
+        self, profile: str, worker: str, revision: int, bundle_sha256: str,
+        telegram_user_id: int, *, error_code: str | None = None,
+    ) -> dict[str, Any]:
+        now = _now()
+        with self._lock, self._db() as db:
+            assignment = db.execute(
+                "SELECT desired_revision FROM profile_distributions WHERE profile=? AND worker=?",
+                (str(profile), str(worker)),
+            ).fetchone()
+            expected = db.execute(
+                "SELECT bundle_sha256,telegram_user_id FROM profile_session_revisions WHERE profile=? AND revision=?",
+                (str(profile), int(revision)),
+            ).fetchone()
+            if assignment is None or expected is None:
+                return {"accepted": False, "reason": "not_assigned"}
+            desired = int(assignment["desired_revision"] or 0)
+            stale = desired != int(revision)
+            metadata_matches = (
+                str(expected["bundle_sha256"]) == str(bundle_sha256)
+                and int(expected["telegram_user_id"]) == int(telegram_user_id)
+            )
+            if not metadata_matches:
+                db.execute(
+                    "UPDATE profile_distributions SET status='failed',error='ACK_METADATA_MISMATCH',updated_at=? WHERE profile=? AND worker=?",
+                    (now, str(profile), str(worker)),
+                )
+                return {"accepted": False, "reason": "metadata_mismatch", "desired_revision": desired}
+            if stale:
+                db.execute(
+                    "UPDATE profile_distributions SET status='waiting',error='STALE_REVISION_ACK', "
+                    "installed_revision=CASE WHEN ? IS NULL THEN installed_revision ELSE ? END, "
+                    "installed_sha256=CASE WHEN ? IS NULL THEN installed_sha256 ELSE ? END, "
+                    "installed_telegram_user_id=CASE WHEN ? IS NULL THEN installed_telegram_user_id ELSE ? END, "
+                    "sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
+                    (
+                        error_code, int(revision), error_code, str(bundle_sha256),
+                        error_code, int(telegram_user_id), now, str(profile), str(worker),
+                    ),
+                )
+            elif error_code:
+                safe_code = re.sub(r"[^A-Z0-9_-]", "", str(error_code).upper())[:64] or "INSTALL_FAILED"
+                db.execute(
+                    "UPDATE profile_distributions SET status='failed',error=?,sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
+                    (safe_code, now, str(profile), str(worker)),
+                )
+            else:
+                db.execute(
+                    "UPDATE profile_distributions SET status='ready',error=NULL,installed_revision=?,installed_sha256=?,installed_telegram_user_id=?,sync_requested=0,updated_at=? WHERE profile=? AND worker=?",
+                    (int(revision), str(bundle_sha256), int(telegram_user_id), now, str(profile), str(worker)),
+                )
+            current_revision = db.execute(
+                "SELECT desired_revision FROM profile_sessions WHERE profile=?", (str(profile),)
+            ).fetchone()
+            return {
+                "accepted": not stale and not bool(error_code),
+                "reason": "stale_revision" if stale else ("install_failed" if error_code else "installed"),
+                "desired_revision": int(current_revision[0]) if current_revision else desired,
+            }
+
+    def distribution_provisioning_id(self, profile: str, worker: str) -> str | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT provisioning_id FROM profile_distributions WHERE profile=? AND worker=?",
+                (str(profile), str(worker)),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else None
+
+    def request_sync(self, operation_id: str, actor_user_id: int, profile: str, worker: str, revision: int) -> None:
+        now = _now()
+        with self._lock, self._db() as db:
+            current = db.execute(
+                "SELECT desired_revision FROM profile_sessions WHERE profile=?", (str(profile),)
+            ).fetchone()
+            if current is None or int(current["desired_revision"]) != int(revision):
+                raise ValueError("Revision profil berubah sebelum permintaan sinkronisasi disimpan.")
+            assigned = db.execute(
+                "SELECT 1 FROM profile_distributions WHERE profile=? AND worker=?",
+                (str(profile), str(worker)),
+            ).fetchone()
+            if assigned is None:
+                raise KeyError(worker)
+            db.execute(
+                "INSERT INTO profile_sync_requests(operation_id,actor_user_id,profile,worker,desired_revision,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,'pending',?,?) ON CONFLICT(operation_id) DO UPDATE SET desired_revision=excluded.desired_revision,status='pending',updated_at=excluded.updated_at",
+                (str(operation_id), int(actor_user_id), str(profile), str(worker), int(revision), now, now),
+            )
+            db.execute(
+                "UPDATE profile_distributions SET desired_revision=?, "
+                "status=CASE WHEN installed_revision=desired_revision AND installed_sha256=(SELECT bundle_sha256 FROM profile_sessions WHERE profile=?) THEN status ELSE 'waiting' END, "
+                "error=NULL,sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
+                (int(revision), str(profile), now, str(profile), str(worker)),
+            )
+
+    def cancel_sync_request(self, operation_id: str) -> None:
+        with self._lock, self._db() as db:
+            request = db.execute(
+                "SELECT profile,worker FROM profile_sync_requests WHERE operation_id=?",
+                (str(operation_id),),
+            ).fetchone()
+            if request is None:
+                return
+            db.execute(
+                "UPDATE profile_sync_requests SET status='cancelled',updated_at=? WHERE operation_id=?",
+                (_now(), str(operation_id)),
+            )
+            still_pending = db.execute(
+                "SELECT 1 FROM profile_sync_requests WHERE profile=? AND worker=? AND status='pending' LIMIT 1",
+                (str(request["profile"]), str(request["worker"])),
+            ).fetchone()
+            if not still_pending:
+                db.execute(
+                    "UPDATE profile_distributions SET sync_requested=0 WHERE profile=? AND worker=?",
+                    (str(request["profile"]), str(request["worker"])),
+                )
+
+    def finish_sync_requests(self, profile: str, worker: str, revision: int, status: str) -> list[dict[str, Any]]:
+        if status not in {"succeeded", "failed"}:
+            raise ValueError("Status operasi sinkronisasi tidak valid.")
+        now = _now()
+        with self._lock, self._db() as db:
+            rows = db.execute(
+                "SELECT operation_id,actor_user_id FROM profile_sync_requests WHERE profile=? AND worker=? AND desired_revision=? AND status='pending' ORDER BY created_at",
+                (str(profile), str(worker), int(revision)),
+            ).fetchall()
+            db.execute(
+                "UPDATE profile_sync_requests SET status=?,updated_at=? WHERE profile=? AND worker=? AND desired_revision=? AND status='pending'",
+                (status, now, str(profile), str(worker), int(revision)),
+            )
+            return [
+                {"operation_id": str(row["operation_id"]), "actor_user_id": int(row["actor_user_id"])}
+                for row in rows
+            ]
+
+    def sync_requests(self, profile: str, worker: str, revision: int | None = None) -> list[dict[str, Any]]:
+        query = "SELECT operation_id,actor_user_id,desired_revision FROM profile_sync_requests WHERE profile=? AND worker=? AND status='pending'"
+        values: list[Any] = [str(profile), str(worker)]
+        if revision is not None:
+            query += " AND desired_revision=?"
+            values.append(int(revision))
+        with self._db() as db:
+            rows = db.execute(query + " ORDER BY created_at", values).fetchall()
+        return [
+            {"operation_id": str(row["operation_id"]), "actor_user_id": int(row["actor_user_id"]), "desired_revision": int(row["desired_revision"])}
+            for row in rows
+        ]
 
     def active_profiles(self) -> list[str]:
         with self._db() as db:
@@ -373,8 +796,8 @@ class ProfileProvisioningStore:
             profile = str(row["profile"])
             user_id = int(row["telegram_user_id"])
             pending = db.execute(
-                "SELECT COUNT(*) AS total FROM profile_distributions WHERE profile=? AND status!='ready'",
-                (profile,),
+                "SELECT COUNT(*) AS total FROM profile_distributions WHERE profile=? AND provisioning_id=? AND status!='ready'",
+                (profile, operation_id),
             ).fetchone()
             if pending and int(pending["total"]):
                 return profile, user_id
@@ -394,6 +817,28 @@ class ProfileProvisioningStore:
                 "INSERT INTO profile_distributions(profile,worker,status,provisioning_id,error,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(profile,worker) DO UPDATE SET status=excluded.status,provisioning_id=COALESCE(excluded.provisioning_id,profile_distributions.provisioning_id),error=excluded.error,updated_at=excluded.updated_at",
                 (profile, worker, status, provisioning_id, error, _now()),
             )
+            revision = db.execute(
+                "SELECT desired_revision,bundle_sha256,telegram_user_id FROM profile_sessions WHERE profile=?",
+                (str(profile),),
+            ).fetchone()
+            if revision is not None:
+                if status == "ready":
+                    db.execute(
+                        "UPDATE profile_distributions SET desired_revision=?,installed_revision=?,installed_sha256=?,installed_telegram_user_id=?,sync_requested=0 WHERE profile=? AND worker=?",
+                        (
+                            int(revision["desired_revision"]),
+                            int(revision["desired_revision"]),
+                            str(revision["bundle_sha256"] or ""),
+                            int(revision["telegram_user_id"]),
+                            str(profile),
+                            str(worker),
+                        ),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE profile_distributions SET desired_revision=? WHERE profile=? AND worker=?",
+                        (int(revision["desired_revision"]), str(profile), str(worker)),
+                    )
 
     def distribution_ready(self, profile: str, worker: str) -> bool:
         with self._db() as db:
@@ -401,7 +846,9 @@ class ProfileProvisioningStore:
                 "SELECT 1 FROM profile_sessions WHERE profile=?", (profile,)
             ).fetchone()
             item = db.execute(
-                "SELECT status FROM profile_distributions WHERE profile=? AND worker=?",
+                "SELECT d.status,d.desired_revision,d.installed_revision,d.installed_sha256,p.bundle_sha256 "
+                "FROM profile_distributions d JOIN profile_sessions p ON p.profile=d.profile "
+                "WHERE d.profile=? AND d.worker=?",
                 (profile, worker),
             ).fetchone()
         # Legacy profiles without a vault retain their pre-existing behavior.
@@ -411,7 +858,14 @@ class ProfileProvisioningStore:
         # its own distribution. Global activation remains gated on every
         # worker in the provisioning snapshot, but an offline worker must not
         # block targets that are already ready.
-        return item is not None and str(item["status"]) == "ready"
+        return bool(
+            item is not None
+            and str(item["status"]) == "ready"
+            and item["desired_revision"] is not None
+            and item["installed_revision"] is not None
+            and int(item["installed_revision"]) == int(item["desired_revision"])
+            and str(item["installed_sha256"] or "") == str(item["bundle_sha256"] or "")
+        )
 
     def provisioning(self, operation_id: str) -> dict[str, Any] | None:
         with self._db() as db:
@@ -419,7 +873,7 @@ class ProfileProvisioningStore:
                 "SELECT * FROM profile_provisionings WHERE id=?", (operation_id,)
             ).fetchone()
             targets = db.execute(
-                "SELECT worker,status,error,updated_at FROM profile_distributions WHERE provisioning_id=? ORDER BY worker",
+                "SELECT worker,status,error,updated_at,desired_revision,installed_revision FROM profile_distributions WHERE provisioning_id=? ORDER BY worker",
                 (operation_id,),
             ).fetchall()
         if row is None:
@@ -435,7 +889,14 @@ class ProfileProvisioningStore:
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
             "workers": [
-                {"worker": str(item["worker"]), "status": str(item["status"]), "error": str(item["error"] or ""), "updated_at": str(item["updated_at"])}
+                {
+                    "worker": str(item["worker"]),
+                    "status": str(item["status"]),
+                    "error": str(item["error"] or ""),
+                    "updated_at": str(item["updated_at"]),
+                    "desired_revision": int(item["desired_revision"]) if item["desired_revision"] is not None else None,
+                    "installed_revision": int(item["installed_revision"]) if item["installed_revision"] is not None else None,
+                }
                 for item in targets
             ],
         }
@@ -443,12 +904,14 @@ class ProfileProvisioningStore:
     def list_profiles(self) -> list[dict[str, Any]]:
         with self._db() as db:
             profiles = db.execute(
-                "SELECT profile,active,source,updated_at FROM profile_sessions ORDER BY profile"
+                "SELECT profile,active,source,updated_at,desired_revision,format_version,bundle_sha256,source_worker "
+                "FROM profile_sessions ORDER BY profile"
             ).fetchall()
             results = []
             for profile in profiles:
                 workers = db.execute(
-                    "SELECT worker,status,error,updated_at FROM profile_distributions WHERE profile=? ORDER BY worker",
+                    "SELECT worker,status,error,updated_at,desired_revision,installed_revision,installed_sha256,installed_telegram_user_id,sync_requested "
+                    "FROM profile_distributions WHERE profile=? ORDER BY worker",
                     (profile["profile"],),
                 ).fetchall()
                 results.append(
@@ -457,8 +920,21 @@ class ProfileProvisioningStore:
                         "active": bool(profile["active"]),
                         "source": str(profile["source"]),
                         "updated_at": str(profile["updated_at"]),
+                        "desired_revision": int(profile["desired_revision"]),
+                        "format_version": int(profile["format_version"]),
+                        "bundle_sha256": str(profile["bundle_sha256"] or ""),
+                        "source_worker": str(profile["source_worker"] or ""),
                         "workers": [
-                            {"worker": str(item["worker"]), "status": str(item["status"]), "error": str(item["error"] or ""), "updated_at": str(item["updated_at"])}
+                            {
+                                "worker": str(item["worker"]),
+                                "status": str(item["status"]),
+                                "error": str(item["error"] or ""),
+                                "updated_at": str(item["updated_at"]),
+                                "desired_revision": int(item["desired_revision"]) if item["desired_revision"] is not None else None,
+                                "installed_revision": int(item["installed_revision"]) if item["installed_revision"] is not None else None,
+                                "installed_sha256": str(item["installed_sha256"] or ""),
+                                "sync_requested": bool(item["sync_requested"]),
+                            }
                             for item in workers
                         ],
                     }
@@ -512,12 +988,12 @@ class ProfileProvisioningStore:
         now = _now()
         with self._db() as db:
             rows = db.execute(
-                "SELECT profile FROM profile_sessions WHERE active=1"
+                "SELECT profile,desired_revision FROM profile_sessions"
             ).fetchall()
             for row in rows:
                 db.execute(
-                    "INSERT OR IGNORE INTO profile_distributions(profile,worker,status,updated_at) VALUES(?,?,?,?)",
-                    (str(row["profile"]), worker, "waiting", now),
+                    "INSERT OR IGNORE INTO profile_distributions(profile,worker,status,updated_at,desired_revision) VALUES(?,?,?,?,?)",
+                    (str(row["profile"]), worker, "waiting", now, int(row["desired_revision"])),
                 )
 
     def cancel(self, operation_id: str) -> dict[str, Any]:
@@ -533,6 +1009,7 @@ class ProfileProvisioningStore:
             ).fetchall()
             db.execute("UPDATE profile_provisionings SET status='cancelled',updated_at=? WHERE id=?", (_now(), operation_id))
             db.execute("DELETE FROM profile_sessions WHERE profile=? AND active=0", (info["profile"],))
+            db.execute("DELETE FROM profile_session_revisions WHERE profile=? AND NOT EXISTS (SELECT 1 FROM profile_sessions WHERE profile=? )", (info["profile"], info["profile"]))
             db.execute("DELETE FROM profile_distributions WHERE profile=? AND provisioning_id=?", (info["profile"], operation_id))
         return {"profile": info["profile"], "workers": [(str(row["worker"]), str(row["status"])) for row in rows], "source": info["source"]}
 
@@ -548,11 +1025,15 @@ class ProfileProvisioningStore:
 
 
 class ProfileProvisioningService:
-    def __init__(self, store: ProfileProvisioningStore, profile_manager, worker_registry, dispatcher) -> None:
+    def __init__(
+        self, store: ProfileProvisioningStore, profile_manager, worker_registry,
+        dispatcher, operation_service=None,
+    ) -> None:
         self.store = store
         self.profile_manager = profile_manager
         self.worker_registry = worker_registry
         self.dispatcher = dispatcher
+        self.operation_service = operation_service
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -669,6 +1150,11 @@ class ProfileProvisioningService:
                 if not isinstance(installed, dict) or not installed.get("ready"):
                     raise RuntimeError("Worker tidak mengonfirmasi sesi siap.")
                 self.store.update_distribution(profile, worker, "ready", provisioning_id=operation_id)
+                desired = self.store.desired_revision(profile)
+                if desired is not None:
+                    self._complete_sync_operations(
+                        profile, worker, int(desired["revision"]), succeeded=True
+                    )
                 if not operation_id:
                     self.dispatcher.commit_profile_bundle(worker, profile, "sync-" + profile)
                 else:
@@ -693,7 +1179,7 @@ class ProfileProvisioningService:
                 ):
                     profile_name, user_id = self.store.mark_active(operation_id)
                     with self._lock:
-                        self.profile_manager.profile_registry.register(profile_name, user_id)
+                        self.profile_manager.profile_registry.register_vaulted(profile_name, user_id)
                     for item in info["workers"]:
                         try:
                             self.dispatcher.commit_profile_bundle(
@@ -727,6 +1213,7 @@ class ProfileProvisioningService:
                     "status": "legacy",
                     "vault": False,
                     "adoptable": True,
+                    "adoption_candidates": self.store.legacy_candidates(name),
                     "workers": [],
                 })
             else:
@@ -940,3 +1427,36 @@ class ProfileProvisioningService:
 
     def worker_ready(self, profile: str, worker: str) -> bool:
         return self.ready(profile, worker)
+
+    def _complete_sync_operations(
+        self, profile: str, worker: str, revision: int, *, succeeded: bool
+    ) -> None:
+        requests = self.store.finish_sync_requests(
+            profile, worker, revision, "succeeded" if succeeded else "failed"
+        )
+        if self.operation_service is None:
+            return
+        operation_store = self.operation_service.store
+        for request in requests:
+            operation = operation_store.get_for_actor(
+                request["operation_id"], request["actor_user_id"]
+            )
+            if operation is None or operation.status.terminal:
+                continue
+            if operation.status == OperationStatus.WAITING_WORKER:
+                operation = operation_store.transition_from_job(
+                    operation.id,
+                    expected_revision=operation.revision,
+                    status=OperationStatus.RUNNING,
+                    phase="install_confirmed",
+                    safe_progress={"worker": worker},
+                )
+                if operation is None:
+                    continue
+            operation_store.transition_from_job(
+                operation.id,
+                expected_revision=operation.revision,
+                status=(OperationStatus.SUCCEEDED if succeeded else OperationStatus.FAILED),
+                phase="installed" if succeeded else "install_failed",
+                safe_progress={"worker": worker, "installed_revision": int(revision)},
+            )

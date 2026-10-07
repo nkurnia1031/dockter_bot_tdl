@@ -97,8 +97,16 @@ class SqliteJobRepository:
                     error TEXT,
                     progress_sequence INTEGER NOT NULL DEFAULT 0,
                     archived_at TEXT,
+                    settings_version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS job_private_values (
+                    job_id TEXT NOT NULL,
+                    setting_key TEXT NOT NULL,
+                    ciphertext BLOB NOT NULL,
+                    PRIMARY KEY(job_id, setting_key),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
                 CREATE INDEX IF NOT EXISTS jobs_profile_status
                     ON jobs(profile, status, updated_at);
@@ -208,6 +216,10 @@ class SqliteJobRepository:
                 db.execute(
                     "ALTER TABLE jobs ADD COLUMN progress_sequence INTEGER NOT NULL DEFAULT 0"
                 )
+            if "settings_version" not in columns:
+                db.execute(
+                    "ALTER TABLE jobs ADD COLUMN settings_version INTEGER NOT NULL DEFAULT 0"
+                )
             plan_columns = {
                 str(row["name"])
                 for row in db.execute(
@@ -238,13 +250,18 @@ class SqliteJobRepository:
             )
 
     def create(self, job: Job) -> Job:
+        return self.create_with_private_values(job, {})
+
+    def create_with_private_values(
+        self, job: Job, private_values: dict[str, bytes]
+    ) -> Job:
         with self._db() as db:
             db.execute(
                 """
                 INSERT INTO jobs(
                     id, kind, profile, actor_user_id, worker, status, payload,
-                    progress, result, error, archived_at, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    progress, result, error, archived_at, settings_version, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -258,11 +275,31 @@ class SqliteJobRepository:
                     _dump(job.result) if job.result is not None else None,
                     _dump(job.error) if job.error is not None else None,
                     job.archived_at.isoformat() if job.archived_at else None,
+                    max(0, int(job.settings_version)),
                     job.created_at.isoformat(),
                     job.updated_at.isoformat(),
                 ),
             )
+            self._insert_private_values(db, job.id, private_values)
         return job
+
+    @staticmethod
+    def _insert_private_values(
+        db: sqlite3.Connection, job_id: str, private_values: dict[str, bytes] | None
+    ) -> None:
+        for key, ciphertext in (private_values or {}).items():
+            db.execute(
+                "INSERT INTO job_private_values(job_id,setting_key,ciphertext) VALUES(?,?,?)",
+                (str(job_id), str(key), sqlite3.Binary(ciphertext)),
+            )
+
+    def private_value(self, job_id: str, key: str) -> bytes | None:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT ciphertext FROM job_private_values WHERE job_id=? AND setting_key=?",
+                (str(job_id), str(key)),
+            ).fetchone()
+        return bytes(row["ciphertext"]) if row is not None else None
 
     @staticmethod
     def insert_prepared_job(
@@ -270,22 +307,25 @@ class SqliteJobRepository:
         job: Job,
         execution_plan: dict[str, Any],
         command_payload: dict[str, Any],
+        private_values: dict[str, bytes] | None = None,
     ) -> None:
         """Insert a job, scheduler plan, and private command on a caller's transaction."""
         db.execute(
             """INSERT INTO jobs(
                    id, kind, profile, actor_user_id, worker, status, payload,
-                   progress, result, error, archived_at, created_at, updated_at
-               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   progress, result, error, archived_at, settings_version, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job.id, job.kind, job.profile, job.actor_user_id, job.worker,
                 job.status.value, _dump(job.payload), _dump(job.progress),
                 _dump(job.result) if job.result is not None else None,
                 _dump(job.error) if job.error is not None else None,
                 job.archived_at.isoformat() if job.archived_at else None,
+                max(0, int(job.settings_version)),
                 job.created_at.isoformat(), job.updated_at.isoformat(),
             ),
         )
+        SqliteJobRepository._insert_private_values(db, job.id, private_values)
         db.execute(
             """INSERT INTO job_execution_plans(
                    job_id, concurrency_keys, queue_group, priority, lane,
@@ -310,7 +350,11 @@ class SqliteJobRepository:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return self._job(row)
 
-    def reset_for_retry(self, job_id: str, payload: dict[str, Any]) -> Job:
+    def reset_for_retry(
+        self, job_id: str, payload: dict[str, Any], *,
+        settings_version: int | None = None,
+        private_values: dict[str, bytes] | None = None,
+    ) -> Job:
         """Reset a terminal row for a new attempt without changing its ID.
 
         The old lifecycle remains in ``job_events``. A monotonically
@@ -321,7 +365,7 @@ class SqliteJobRepository:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT status FROM jobs WHERE id = ?", (job_id,)
+                "SELECT status,settings_version FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             if row is None:
                 raise KeyError(f"Unknown job: {job_id}")
@@ -333,11 +377,17 @@ class SqliteJobRepository:
                     (job_id,),
                 ).fetchone()[0]
             )
+            selected_settings_version = (
+                max(0, int(settings_version))
+                if settings_version is not None
+                else int(row["settings_version"] or 0)
+            )
             db.execute(
                 """
                 UPDATE jobs
                 SET status = 'queued', payload = ?, progress = ?, result = NULL,
                     error = NULL, progress_sequence = ?, archived_at = NULL,
+                    settings_version = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -345,10 +395,14 @@ class SqliteJobRepository:
                     _dump(payload),
                     _dump({"phase": "queued", "retry_sequence": max_sequence + 1}),
                     max_sequence,
+                    selected_settings_version,
                     now,
                     job_id,
                 ),
             )
+            if private_values is not None:
+                db.execute("DELETE FROM job_private_values WHERE job_id=?", (job_id,))
+                self._insert_private_values(db, job_id, private_values)
             db.execute(
                 "DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,)
             )
@@ -1522,6 +1576,7 @@ class SqliteJobRepository:
                 if row["archived_at"]
                 else None
             ),
+            settings_version=int(row["settings_version"] or 0),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )

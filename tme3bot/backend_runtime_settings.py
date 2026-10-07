@@ -31,19 +31,37 @@ class BackendRuntimeSettings:
 
     def __init__(self, path: Path, defaults: dict[str, Any]) -> None:
         self.path = Path(path)
+        self._settings_store = None
         self.defaults = {key: defaults[key] for key in _SETTING_KEYS if key in defaults}
         self.values = self._normalize(dict(self.defaults))
         self._load()
 
+    def attach_settings_store(self, store) -> None:
+        """Use the backend-owned SQLite registry after its one-time legacy import."""
+        self._settings_store = store
+        self.values = self.get()
+
     def get(self) -> dict[str, Any]:
+        if self._settings_store is not None:
+            values = self._settings_store.get_values("backend", include_secrets=True)
+            values.update(self._settings_store.get_values("telegram", include_secrets=True))
+            return self._normalize({**self.defaults, **values})
         return dict(self.values)
 
-    def update(self, values: dict[str, Any]) -> dict[str, Any]:
+    def update(
+        self, values: dict[str, Any], *, actor_user_id: int | None = None
+    ) -> dict[str, Any]:
         unknown = set(values) - _SETTING_KEYS
         if unknown:
             raise ValueError("Ada pengaturan backend yang tidak dikenal.")
         candidate = self._normalize({**self.values, **values})
         self._validate(candidate)
+        if self._settings_store is not None:
+            self._settings_store.update_legacy(
+                values, actor_user_id=actor_user_id
+            )
+            self.values = self.get()
+            return self.get()
         write_json_atomic_private(self.path, candidate)
         self.values = candidate
         return self.get()

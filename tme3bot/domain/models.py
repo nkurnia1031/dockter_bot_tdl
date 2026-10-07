@@ -105,6 +105,7 @@ class Job:
     archived_at: datetime | None = None
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
+    settings_version: int = 0
 
     def ensure_transition(self, target: JobStatus) -> None:
         if target == self.status:

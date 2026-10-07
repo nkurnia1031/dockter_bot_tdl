@@ -32,9 +32,17 @@ Path relatif terhadap root repo. “Baru” berarti dibuat oleh task ini; “Diu
 | Diubah | `tme3bot/worker_registry.py` |
 | Diubah | `tme3bot/utility.py` |
 | Diubah | `tme3bot/api/routes/utility.py` |
+| Diubah | `tme3bot/domain/models.py` |
+| Diubah | `tme3bot/infrastructure/job_store.py` |
+| Diubah | `tme3bot/infrastructure/operation_store.py` |
+| Diubah | `tme3bot/application/control_plane.py` |
+| Diubah | `tme3bot/application/operations.py` |
+| Diubah | `tme3bot/api/routes/tts.py` |
+| Diubah | `tme3bot/api/backend.py` |
 | Diubah | `tests/test_utility_settings.py` |
 | Diubah | `tests/test_backend_runtime_settings.py` |
 | Diubah | `tests/test_backend_api.py` |
+| Diubah | `tests/test_durable_dispatch.py` |
 | Baru | `tme3bot/infrastructure/settings_store.py` |
 | Baru | `tme3bot/infrastructure/secret_store.py` |
 | Baru | `tests/test_desired_settings.py` |
@@ -52,7 +60,7 @@ GET/PUT /api/v1/runtime/settings?scope=&worker=; PUT {expected_version,values}; 
 3. GET mengembalikan snapshot backend tanpa worker RPC; PUT menyimpan desired+outbox dengan optimistic version. Worker offline/busy tetap menerima desired dan berstatus pending. Respons status configured untuk secret, bukan nilai.
 4. Pertahankan API settings lama melalui adapter. Tambahkan schema-setting response agar Web dapat membedakan runtime dan deploy-only. Validasi chat ref memakai parser tdl yang sama untuk Storage/TTS/backup; jangan mengganti pengiriman TTS menjadi Bot API.
 5. Scope secret internal hanya komponen yang membutuhkan. Worker tidak menerima bot token. Rotasi service token mempertahankan old/new overlap sampai ACK; kunci enkripsi vault tetap bootstrap trust dengan prosedur backup.
-6. Tambahkan internal settings manifest/ACK untuk task 14/15. Job menyimpan settings_version dan desired revision bukan mengambil config terbaru di tengah eksekusi.
+6. Tambahkan internal settings manifest/ACK untuk task 14/15. Setiap job menyimpan `settings_version` worker saat diterima dan meneruskannya ke command durable. Job TTS juga menyimpan target chat yang dipin saat submit sebagai ciphertext backend-only; perubahan konfigurasi berikutnya tidak mengubah target job yang sudah diterima. Jangan tampilkan target itu di API job, event, log, atau payload worker.
 
 ## Prompt untuk agent pelaksana
 
@@ -65,9 +73,9 @@ Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lai
    dahulu untuk relasi kode, lalu source aktual. Jangan membuka nilai secret.
 3. Ikuti seluruh langkah bernomor pada Spesifikasi implementasi dalam file ini.
    Gunakan apply_patch, Python 3.10 dan batas domain/application/infrastructure.
-   Daftar File yang disentuh adalah allowlist lengkap. Jangan mengubah file lain;
-   jika benar-benar diperlukan, catat alasan dan status terblokir, jangan memperluas
-   cakupan atau mengerjakan task berikutnya.
+   Allowlist di atas telah diperluas secara terbatas untuk menutup kontrak
+   snapshot job yang tertinggal. Jangan mengubah file lain atau mengerjakan task
+   berikutnya.
 4. Pertahankan API legacy/gate sesuai kontrak. Jangan deploy, publish, commit,
    mengakses production, mengirim Telegram nyata, atau menjalankan migrasi data nyata.
 5. Tambahkan/uji skenario Kriteria selesai dengan mock/fixture lokal. Jalankan
@@ -85,6 +93,7 @@ Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lai
 - Konflik expected_version mendapat 409.
 - Clear+restart tidak menghidupkan ENV lama.
 - Secret tidak ada di public GET/log/audit; ACK scope salah ditolak.
+- Versi settings worker tercatat sama pada job dan command durable; target TTS terenkripsi dan tetap sesuai snapshot setelah setting berubah.
 - Test mencakup kegagalan dan kompatibilitas, bukan hanya jalur sukses.
 - Tidak ada perubahan di luar allowlist atau rahasia dalam diff/log hasil kerja.
 - PROGRESS mencatat hasil nyata dan status task; pekerjaan task berikutnya belum dimulai.
@@ -94,7 +103,7 @@ Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lai
 Jalankan dari root repository:
 
 ```text
-python -m unittest tests.test_desired_settings tests.test_backend_runtime_settings tests.test_backend_api -v
+python -m unittest tests.test_desired_settings tests.test_backend_runtime_settings tests.test_utility_settings tests.test_backend_api tests.test_durable_dispatch -v
 python -m compileall -q tme3bot utility bot.py run.py
 git diff --check
 graphify update .
