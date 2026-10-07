@@ -480,9 +480,9 @@
     "semantic_hash": ""
   },
   "tme3bot/worker/executor.py": {
-    "mtime": 1791350770.8040924,
-    "seen": 1791351622.5915473,
-    "ast_hash": "565750b6be9c8eda1460032fa2ff8b87",
+    "mtime": 1791358904.624811,
+    "seen": 1791358998.7232409,
+    "ast_hash": "2289db1f382819ff314e006926bd1b4a",
     "semantic_hash": ""
   },
   "DEPLOYMENT_RUNBOOK.md": {
@@ -1692,15 +1692,15 @@
     "semantic_hash": ""
   },
   "tests/test_worker_profile_sync.py": {
-    "mtime": 1791304538.584509,
-    "seen": 1791304624.2425861,
-    "ast_hash": "34443fe7191f69f64304d3e33fd3495a",
+    "mtime": 1791358916.4709995,
+    "seen": 1791358998.7232409,
+    "ast_hash": "92615d1cad6aaf58abbc977ea6c5de11",
     "semantic_hash": ""
   },
   "tme3bot/worker/profile_sync.py": {
-    "mtime": 1791304532.79314,
-    "seen": 1791304624.2425861,
-    "ast_hash": "2e71fff3839ab097044cc2eeb8de7182",
+    "mtime": 1791358904.6274092,
+    "seen": 1791358998.7232409,
+    "ast_hash": "a9d851c3ef50f8414caebce2e00e7d2d",
     "semantic_hash": ""
   },
   "tests/test_resolver_addon.py": {
@@ -1719,6 +1719,12 @@
     "mtime": 1791350770.8005078,
     "seen": 1791351622.5915473,
     "ast_hash": "b9a1d585e20c144382e6333969a45d09",
+    "semantic_hash": ""
+  },
+  "tests/test_worker_profile_admission.py": {
+    "mtime": 1791358924.1285386,
+    "seen": 1791358998.7232409,
+    "ast_hash": "8963499a7d9c1278f40de1e41b8bc90d",
     "semantic_hash": ""
   }
 }

@@ -559,7 +559,11 @@ class WorkerJobExecutor(
             interrupt("utility", utility_runner.cancel_current)
         # An active Quick Mode job is cancellable even when its current phase
         # has no subprocess (for example while resolving a Telegram result).
-        return bool(cancelled or quick_active or kind in {"export", "backup_node", "tts"})
+        return bool(
+            cancelled
+            or quick_active
+            or kind in {"export", "backup_node", "tts", "safelink_resolve"}
+        )
 
     def pause(self, job_id: str) -> bool:
         target = str(job_id)

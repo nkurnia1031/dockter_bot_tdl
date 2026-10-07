@@ -13283,7 +13283,7 @@
       "file_type": "code",
       "norm_label": "export_progress()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1577"
+      "source_location": "L1581"
     },
     {
       "id": "tests_test_safelink_resolver_fakebutton_click",
@@ -19847,7 +19847,7 @@
       "file_type": "code",
       "norm_label": ".available_storage_profiles()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L754"
+      "source_location": "L758"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_rollback_profile_bundle",
@@ -37463,7 +37463,7 @@
       "file_type": "code",
       "norm_label": "._append_job_log()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1307"
+      "source_location": "L1311"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_cancel",
@@ -37487,7 +37487,7 @@
       "file_type": "code",
       "norm_label": "._cancel_error()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1023"
+      "source_location": "L1027"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_cancel_interrupt",
@@ -37523,7 +37523,7 @@
       "file_type": "code",
       "norm_label": ".capabilities()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L695"
+      "source_location": "L699"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_capture_tdl_commands",
@@ -37535,7 +37535,7 @@
       "file_type": "code",
       "norm_label": "._capture_tdl_commands()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1430"
+      "source_location": "L1434"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_capture_tdl_output",
@@ -37547,7 +37547,7 @@
       "file_type": "code",
       "norm_label": "._capture_tdl_output()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1409"
+      "source_location": "L1413"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_capture_tdl_output_capture",
@@ -37559,7 +37559,7 @@
       "file_type": "code",
       "norm_label": "capture()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1413"
+      "source_location": "L1417"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_capture_tdl_progress",
@@ -37571,7 +37571,7 @@
       "file_type": "code",
       "norm_label": "._capture_tdl_progress()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1442"
+      "source_location": "L1446"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_capture_tdl_progress_capture",
@@ -37583,7 +37583,7 @@
       "file_type": "code",
       "norm_label": "capture()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1445"
+      "source_location": "L1449"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_command_callback",
@@ -37595,7 +37595,7 @@
       "file_type": "code",
       "norm_label": "._command_callback()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1392"
+      "source_location": "L1396"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_commit_profile_bundle",
@@ -37619,7 +37619,7 @@
       "file_type": "code",
       "norm_label": "._download_progress_operation()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1457"
+      "source_location": "L1461"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_durable_command_status",
@@ -37667,7 +37667,7 @@
       "file_type": "code",
       "norm_label": "._execute()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1466"
+      "source_location": "L1470"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_export",
@@ -37679,7 +37679,7 @@
       "file_type": "code",
       "norm_label": "._export()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1487"
+      "source_location": "L1491"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_export_profile_bundle",
@@ -37703,7 +37703,7 @@
       "file_type": "code",
       "norm_label": "._failed()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1273"
+      "source_location": "L1277"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_install_profile_bundle",
@@ -37727,7 +37727,7 @@
       "file_type": "code",
       "norm_label": "._job_cancelled()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1302"
+      "source_location": "L1306"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_job_log_snapshot",
@@ -37739,7 +37739,7 @@
       "file_type": "code",
       "norm_label": ".job_log_snapshot()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1403"
+      "source_location": "L1407"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_leave",
@@ -37751,7 +37751,7 @@
       "file_type": "code",
       "norm_label": "._leave()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1776"
+      "source_location": "L1780"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_pause",
@@ -37763,7 +37763,7 @@
       "file_type": "code",
       "norm_label": ".pause()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L564"
+      "source_location": "L568"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_profile_login_bundle_path",
@@ -37823,7 +37823,7 @@
       "file_type": "code",
       "norm_label": "._publish_log_snapshot()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1395"
+      "source_location": "L1399"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_queue_size",
@@ -37835,7 +37835,7 @@
       "file_type": "code",
       "norm_label": ".queue_size()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L691"
+      "source_location": "L695"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_recover_legacy_quick_stages",
@@ -37871,7 +37871,7 @@
       "file_type": "code",
       "norm_label": "._resource_keys_for_command()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L948"
+      "source_location": "L952"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_resume",
@@ -37883,7 +37883,7 @@
       "file_type": "code",
       "norm_label": ".resume()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L623"
+      "source_location": "L627"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_run",
@@ -37895,7 +37895,7 @@
       "file_type": "code",
       "norm_label": "._run()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1049"
+      "source_location": "L1053"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_run_profile_sync_operation",
@@ -37919,7 +37919,7 @@
       "file_type": "code",
       "norm_label": "report_profile_wait()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1118"
+      "source_location": "L1122"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_safelink_browser_ready",
@@ -37931,7 +37931,7 @@
       "file_type": "code",
       "norm_label": "._safelink_browser_ready()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L746"
+      "source_location": "L750"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_set_job_process_paused",
@@ -37943,7 +37943,7 @@
       "file_type": "code",
       "norm_label": "._set_job_process_paused()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L653"
+      "source_location": "L657"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_start",
@@ -37979,7 +37979,7 @@
       "file_type": "code",
       "norm_label": ".storage_profile()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L751"
+      "source_location": "L755"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_storage_settings_busy",
@@ -37991,7 +37991,7 @@
       "file_type": "code",
       "norm_label": "._storage_settings_busy()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L872"
+      "source_location": "L876"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_sync_profiles",
@@ -38015,7 +38015,7 @@
       "file_type": "code",
       "norm_label": "._unhandled_resource()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L937"
+      "source_location": "L941"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_update_storage_profile",
@@ -38027,7 +38027,7 @@
       "file_type": "code",
       "norm_label": ".update_storage_profile()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L793"
+      "source_location": "L797"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_update_worker_settings",
@@ -38039,7 +38039,7 @@
       "file_type": "code",
       "norm_label": ".update_worker_settings()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L796"
+      "source_location": "L800"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_validate_profile_session",
@@ -38063,7 +38063,7 @@
       "file_type": "code",
       "norm_label": "._validate_tts_settings()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L888"
+      "source_location": "L892"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_wait_for_profile_sync",
@@ -38075,7 +38075,7 @@
       "file_type": "code",
       "norm_label": "._wait_for_profile_sync()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1029"
+      "source_location": "L1033"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_wait_if_paused",
@@ -38087,7 +38087,7 @@
       "file_type": "code",
       "norm_label": "._wait_if_paused()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1382"
+      "source_location": "L1386"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_worker_heartbeat_loop",
@@ -38099,7 +38099,7 @@
       "file_type": "code",
       "norm_label": "._worker_heartbeat_loop()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1350"
+      "source_location": "L1354"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_worker_settings",
@@ -38111,7 +38111,7 @@
       "file_type": "code",
       "norm_label": ".worker_settings()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L774"
+      "source_location": "L778"
     },
     {
       "id": "tme3bot_worker_executor_workerjobexecutor_worker_token_matches",
@@ -38123,7 +38123,7 @@
       "file_type": "code",
       "norm_label": ".worker_token_matches()",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L869"
+      "source_location": "L873"
     },
     {
       "id": "tme3bot_worker_resolver_client_resolver_addon_ready",
@@ -54996,7 +54996,7 @@
       "source_location": "L121"
     },
     {
-      "id": "tme3bot_worker_executor_rationale_1353",
+      "id": "tme3bot_worker_executor_rationale_1357",
       "label": "Keep backend liveness independent from noisy subprocess output. A Quick Mode\u2026",
       "_origin": "ast",
       "community": 92,
@@ -55004,10 +55004,10 @@
       "file_type": "rationale",
       "norm_label": "keep backend liveness independent from noisy subprocess output. a quick mode...",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1353"
+      "source_location": "L1357"
     },
     {
-      "id": "tme3bot_worker_executor_rationale_1458",
+      "id": "tme3bot_worker_executor_rationale_1462",
       "label": "Bind the shared tracker callback only while owning its TDL lock.",
       "_origin": "ast",
       "community": 92,
@@ -55015,7 +55015,7 @@
       "file_type": "rationale",
       "norm_label": "bind the shared tracker callback only while owning its tdl lock.",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1458"
+      "source_location": "L1462"
     },
     {
       "id": "tme3bot_worker_executor_rationale_228",
@@ -55040,7 +55040,7 @@
       "source_location": "L248"
     },
     {
-      "id": "tme3bot_worker_executor_rationale_696",
+      "id": "tme3bot_worker_executor_rationale_700",
       "label": "Return non-secret worker capabilities for backend target checks.",
       "_origin": "ast",
       "community": 92,
@@ -55048,7 +55048,7 @@
       "file_type": "rationale",
       "norm_label": "return non-secret worker capabilities for backend target checks.",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L696"
+      "source_location": "L700"
     },
     {
       "id": "tme3bot_worker_init_rationale_1",
@@ -96969,7 +96969,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1314",
+      "source_location": "L1318",
       "weight": 1.0
     },
     {
@@ -96981,7 +96981,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1339",
+      "source_location": "L1343",
       "weight": 1.0
     },
     {
@@ -96993,7 +96993,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L764",
+      "source_location": "L768",
       "weight": 1.0
     },
     {
@@ -97005,7 +97005,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L768",
+      "source_location": "L772",
       "weight": 1.0
     },
     {
@@ -97053,7 +97053,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L698",
+      "source_location": "L702",
       "weight": 1.0
     },
     {
@@ -97065,7 +97065,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L709",
+      "source_location": "L713",
       "weight": 1.0
     },
     {
@@ -97077,7 +97077,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L739",
+      "source_location": "L743",
       "weight": 1.0
     },
     {
@@ -97089,7 +97089,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1432",
+      "source_location": "L1436",
       "weight": 1.0
     },
     {
@@ -97101,7 +97101,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1419",
+      "source_location": "L1423",
       "weight": 1.0
     },
     {
@@ -97137,7 +97137,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1490",
+      "source_location": "L1494",
       "weight": 1.0
     },
     {
@@ -97149,7 +97149,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1516",
+      "source_location": "L1520",
       "weight": 1.0
     },
     {
@@ -97161,7 +97161,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1600",
+      "source_location": "L1604",
       "weight": 1.0
     },
     {
@@ -97173,7 +97173,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1601",
+      "source_location": "L1605",
       "weight": 1.0
     },
     {
@@ -97185,7 +97185,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1622",
+      "source_location": "L1626",
       "weight": 1.0
     },
     {
@@ -97197,7 +97197,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1659",
+      "source_location": "L1663",
       "weight": 1.0
     },
     {
@@ -97209,7 +97209,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1661",
+      "source_location": "L1665",
       "weight": 1.0
     },
     {
@@ -97221,7 +97221,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1682",
+      "source_location": "L1686",
       "weight": 1.0
     },
     {
@@ -97233,7 +97233,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1683",
+      "source_location": "L1687",
       "weight": 1.0
     },
     {
@@ -97245,7 +97245,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1578",
+      "source_location": "L1582",
       "weight": 1.0
     },
     {
@@ -97257,7 +97257,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1292",
+      "source_location": "L1296",
       "weight": 1.0
     },
     {
@@ -97329,7 +97329,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1782",
+      "source_location": "L1786",
       "weight": 1.0
     },
     {
@@ -97341,7 +97341,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L601",
+      "source_location": "L605",
       "weight": 1.0
     },
     {
@@ -97365,7 +97365,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L636",
+      "source_location": "L640",
       "weight": 1.0
     },
     {
@@ -97377,7 +97377,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L645",
+      "source_location": "L649",
       "weight": 1.0
     },
     {
@@ -97389,7 +97389,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1061",
+      "source_location": "L1065",
       "weight": 1.0
     },
     {
@@ -97401,7 +97401,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1062",
+      "source_location": "L1066",
       "weight": 1.0
     },
     {
@@ -97413,7 +97413,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1072",
+      "source_location": "L1076",
       "weight": 1.0
     },
     {
@@ -97425,7 +97425,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1076",
+      "source_location": "L1080",
       "weight": 1.0
     },
     {
@@ -97437,7 +97437,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1092",
+      "source_location": "L1096",
       "weight": 1.0
     },
     {
@@ -97449,7 +97449,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1131",
+      "source_location": "L1135",
       "weight": 1.0
     },
     {
@@ -97461,7 +97461,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1135",
+      "source_location": "L1139",
       "weight": 1.0
     },
     {
@@ -97473,7 +97473,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1155",
+      "source_location": "L1159",
       "weight": 1.0
     },
     {
@@ -97485,7 +97485,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1160",
+      "source_location": "L1164",
       "weight": 1.0
     },
     {
@@ -97497,7 +97497,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1174",
+      "source_location": "L1178",
       "weight": 1.0
     },
     {
@@ -97509,7 +97509,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1186",
+      "source_location": "L1190",
       "weight": 1.0
     },
     {
@@ -97521,7 +97521,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1228",
+      "source_location": "L1232",
       "weight": 1.0
     },
     {
@@ -97545,7 +97545,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L749",
+      "source_location": "L753",
       "weight": 1.0
     },
     {
@@ -97557,7 +97557,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L670",
+      "source_location": "L674",
       "weight": 1.0
     },
     {
@@ -97593,7 +97593,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L939",
+      "source_location": "L943",
       "weight": 1.0
     },
     {
@@ -97605,7 +97605,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L794",
+      "source_location": "L798",
       "weight": 1.0
     },
     {
@@ -97617,7 +97617,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L800",
+      "source_location": "L804",
       "weight": 1.0
     },
     {
@@ -97629,7 +97629,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L802",
+      "source_location": "L806",
       "weight": 1.0
     },
     {
@@ -97641,7 +97641,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L830",
+      "source_location": "L834",
       "weight": 1.0
     },
     {
@@ -97653,7 +97653,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L833",
+      "source_location": "L837",
       "weight": 1.0
     },
     {
@@ -97665,7 +97665,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L867",
+      "source_location": "L871",
       "weight": 1.0
     },
     {
@@ -97677,7 +97677,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L913",
+      "source_location": "L917",
       "weight": 1.0
     },
     {
@@ -97689,7 +97689,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1389",
+      "source_location": "L1393",
       "weight": 1.0
     },
     {
@@ -97701,7 +97701,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1372",
+      "source_location": "L1376",
       "weight": 1.0
     },
     {
@@ -97713,7 +97713,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L775",
+      "source_location": "L779",
       "weight": 1.0
     },
     {
@@ -97725,7 +97725,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L776",
+      "source_location": "L780",
       "weight": 1.0
     },
     {
@@ -108333,7 +108333,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1023",
+      "source_location": "L1027",
       "weight": 1.0
     },
     {
@@ -108345,7 +108345,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L695",
+      "source_location": "L699",
       "weight": 1.0
     },
     {
@@ -108381,7 +108381,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1273",
+      "source_location": "L1277",
       "weight": 1.0
     },
     {
@@ -108405,7 +108405,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1403",
+      "source_location": "L1407",
       "weight": 1.0
     },
     {
@@ -108417,7 +108417,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1776",
+      "source_location": "L1780",
       "weight": 1.0
     },
     {
@@ -108477,7 +108477,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L948",
+      "source_location": "L952",
       "weight": 1.0
     },
     {
@@ -108489,7 +108489,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1049",
+      "source_location": "L1053",
       "weight": 1.0
     },
     {
@@ -108525,7 +108525,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L937",
+      "source_location": "L941",
       "weight": 1.0
     },
     {
@@ -108537,7 +108537,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L793",
+      "source_location": "L797",
       "weight": 1.0
     },
     {
@@ -108549,7 +108549,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L796",
+      "source_location": "L800",
       "weight": 1.0
     },
     {
@@ -108561,7 +108561,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L888",
+      "source_location": "L892",
       "weight": 1.0
     },
     {
@@ -108573,7 +108573,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L774",
+      "source_location": "L778",
       "weight": 1.0
     },
     {
@@ -118221,7 +118221,7 @@
       "confidence_score": 1.0,
       "context": "import",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L747",
+      "source_location": "L751",
       "weight": 1.0
     },
     {
@@ -129873,7 +129873,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1273",
+      "source_location": "L1277",
       "weight": 1.0
     },
     {
@@ -129897,7 +129897,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1395",
+      "source_location": "L1399",
       "weight": 1.0
     },
     {
@@ -129909,7 +129909,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L937",
+      "source_location": "L941",
       "weight": 1.0
     },
     {
@@ -129921,7 +129921,7 @@
       "confidence_score": 1.0,
       "context": "parameter_type",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1350",
+      "source_location": "L1354",
       "weight": 1.0
     },
     {
@@ -131877,7 +131877,7 @@
       "confidence_score": 1.0,
       "context": "return_type",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1466",
+      "source_location": "L1470",
       "weight": 1.0
     },
     {
@@ -131889,7 +131889,7 @@
       "confidence_score": 1.0,
       "context": "return_type",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1487",
+      "source_location": "L1491",
       "weight": 1.0
     },
     {
@@ -147706,7 +147706,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1445",
+      "source_location": "L1449",
       "weight": 1.0
     },
     {
@@ -173764,7 +173764,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1023",
+      "source_location": "L1027",
       "weight": 1.0
     },
     {
@@ -173775,7 +173775,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1029",
+      "source_location": "L1033",
       "weight": 1.0
     },
     {
@@ -173786,7 +173786,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1049",
+      "source_location": "L1053",
       "weight": 1.0
     },
     {
@@ -173808,7 +173808,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1273",
+      "source_location": "L1277",
       "weight": 1.0
     },
     {
@@ -173819,7 +173819,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1302",
+      "source_location": "L1306",
       "weight": 1.0
     },
     {
@@ -173830,7 +173830,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1307",
+      "source_location": "L1311",
       "weight": 1.0
     },
     {
@@ -173841,7 +173841,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1350",
+      "source_location": "L1354",
       "weight": 1.0
     },
     {
@@ -173852,7 +173852,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1382",
+      "source_location": "L1386",
       "weight": 1.0
     },
     {
@@ -173863,7 +173863,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1392",
+      "source_location": "L1396",
       "weight": 1.0
     },
     {
@@ -173874,7 +173874,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1395",
+      "source_location": "L1399",
       "weight": 1.0
     },
     {
@@ -173885,7 +173885,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1403",
+      "source_location": "L1407",
       "weight": 1.0
     },
     {
@@ -173896,7 +173896,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1409",
+      "source_location": "L1413",
       "weight": 1.0
     },
     {
@@ -173907,7 +173907,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1430",
+      "source_location": "L1434",
       "weight": 1.0
     },
     {
@@ -173918,7 +173918,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1442",
+      "source_location": "L1446",
       "weight": 1.0
     },
     {
@@ -173929,7 +173929,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1457",
+      "source_location": "L1461",
       "weight": 1.0
     },
     {
@@ -173940,7 +173940,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1466",
+      "source_location": "L1470",
       "weight": 1.0
     },
     {
@@ -173951,7 +173951,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1487",
+      "source_location": "L1491",
       "weight": 1.0
     },
     {
@@ -173962,7 +173962,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1776",
+      "source_location": "L1780",
       "weight": 1.0
     },
     {
@@ -174204,7 +174204,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L564",
+      "source_location": "L568",
       "weight": 1.0
     },
     {
@@ -174215,7 +174215,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L623",
+      "source_location": "L627",
       "weight": 1.0
     },
     {
@@ -174226,7 +174226,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L653",
+      "source_location": "L657",
       "weight": 1.0
     },
     {
@@ -174237,7 +174237,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L691",
+      "source_location": "L695",
       "weight": 1.0
     },
     {
@@ -174248,7 +174248,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L695",
+      "source_location": "L699",
       "weight": 1.0
     },
     {
@@ -174259,7 +174259,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L746",
+      "source_location": "L750",
       "weight": 1.0
     },
     {
@@ -174270,7 +174270,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L751",
+      "source_location": "L755",
       "weight": 1.0
     },
     {
@@ -174281,7 +174281,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L754",
+      "source_location": "L758",
       "weight": 1.0
     },
     {
@@ -174292,7 +174292,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L774",
+      "source_location": "L778",
       "weight": 1.0
     },
     {
@@ -174303,7 +174303,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L793",
+      "source_location": "L797",
       "weight": 1.0
     },
     {
@@ -174314,7 +174314,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L796",
+      "source_location": "L800",
       "weight": 1.0
     },
     {
@@ -174325,7 +174325,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L869",
+      "source_location": "L873",
       "weight": 1.0
     },
     {
@@ -174336,7 +174336,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L872",
+      "source_location": "L876",
       "weight": 1.0
     },
     {
@@ -174347,7 +174347,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L888",
+      "source_location": "L892",
       "weight": 1.0
     },
     {
@@ -174358,7 +174358,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L937",
+      "source_location": "L941",
       "weight": 1.0
     },
     {
@@ -174369,7 +174369,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L948",
+      "source_location": "L952",
       "weight": 1.0
     },
     {
@@ -178069,25 +178069,25 @@
       "weight": 1.0
     },
     {
-      "source": "tme3bot_worker_executor_rationale_1353",
+      "source": "tme3bot_worker_executor_rationale_1357",
       "target": "tme3bot_worker_executor_workerjobexecutor_worker_heartbeat_loop",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1353",
+      "source_location": "L1357",
       "weight": 1.0
     },
     {
-      "source": "tme3bot_worker_executor_rationale_1458",
+      "source": "tme3bot_worker_executor_rationale_1462",
       "target": "tme3bot_worker_executor_workerjobexecutor_download_progress_operation",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1458",
+      "source_location": "L1462",
       "weight": 1.0
     },
     {
@@ -178113,14 +178113,14 @@
       "weight": 1.0
     },
     {
-      "source": "tme3bot_worker_executor_rationale_696",
+      "source": "tme3bot_worker_executor_rationale_700",
       "target": "tme3bot_worker_executor_workerjobexecutor_capabilities",
       "relation": "rationale_for",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L696",
+      "source_location": "L700",
       "weight": 1.0
     },
     {
@@ -180659,7 +180659,7 @@
       "confidence_score": 0.85,
       "context": "argument",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1602",
+      "source_location": "L1606",
       "weight": 1.0
     },
     {
@@ -180671,7 +180671,7 @@
       "confidence_score": 0.85,
       "context": "argument",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1136",
+      "source_location": "L1140",
       "weight": 1.0
     },
     {
@@ -180995,7 +180995,7 @@
       "confidence_score": 0.85,
       "context": "assignment",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1418",
+      "source_location": "L1422",
       "weight": 1.0
     },
     {
@@ -181007,7 +181007,7 @@
       "confidence_score": 0.85,
       "context": "assignment",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1450",
+      "source_location": "L1454",
       "weight": 1.0
     },
     {
@@ -182999,7 +182999,7 @@
       "confidence_score": 0.85,
       "context": "getattr",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1308",
+      "source_location": "L1312",
       "weight": 1.0
     },
     {
@@ -183011,7 +183011,7 @@
       "confidence_score": 0.85,
       "context": "getattr",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L759",
+      "source_location": "L763",
       "weight": 1.0
     },
     {
@@ -183035,7 +183035,7 @@
       "confidence_score": 0.85,
       "context": "getattr",
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L725",
+      "source_location": "L729",
       "weight": 1.0
     },
     {
@@ -187934,7 +187934,7 @@
       "confidence": "INFERRED",
       "confidence_score": 0.95,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1072",
+      "source_location": "L1076",
       "weight": 0.8
     },
     {
@@ -187945,7 +187945,7 @@
       "confidence": "INFERRED",
       "confidence_score": 0.95,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1194",
+      "source_location": "L1198",
       "weight": 0.8
     },
     {
@@ -187956,7 +187956,7 @@
       "confidence": "INFERRED",
       "confidence_score": 0.95,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1194",
+      "source_location": "L1198",
       "weight": 0.8
     },
     {
@@ -188022,7 +188022,7 @@
       "confidence": "INFERRED",
       "confidence_score": 0.95,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1490",
+      "source_location": "L1494",
       "weight": 0.8
     },
     {
@@ -188066,7 +188066,7 @@
       "confidence": "INFERRED",
       "confidence_score": 0.95,
       "source_file": "tme3bot/worker/executor.py",
-      "source_location": "L1683",
+      "source_location": "L1687",
       "weight": 0.8
     },
     {
@@ -188192,5 +188192,5 @@
     }
   ],
   "hyperedges": [],
-  "built_at_commit": "8be1dc9b208c72ab43b10fbf71eb124848ae7ae3"
+  "built_at_commit": "99c0d3932484a522a108abc4075b0dde2a49b032"
 }
