@@ -231,6 +231,37 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertFalse(client.profile_ready("irang"))
         self.assertFalse(client.wait_until_ready("irang", cancelled=lambda: True))
 
+    def test_wait_reports_unchanged_backend_reason_only_once(self):
+        client, _ = self.make_client([], {})
+        client._startup_checked = True
+        client._state = {"backend_available": False, "profiles": {}, "managed_profiles": []}
+
+        class ImmediateCondition:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def wait(self, timeout=None):
+                del timeout
+
+        client._condition = ImmediateCondition()
+        reports = []
+        checks = 0
+
+        def cancel_after_checks():
+            nonlocal checks
+            checks += 1
+            return checks >= 5
+
+        self.assertFalse(
+            client.wait_until_ready(
+                "irang", cancelled=cancel_after_checks, on_wait=reports.append
+            )
+        )
+        self.assertEqual(reports, ["waiting_worker"])
+
     def test_only_https_or_internal_backend_hosts_enable_pull(self):
         client, _ = self.make_client([], {})
         self.config.backend_api_url = "http://backend:8000"

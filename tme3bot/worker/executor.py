@@ -1026,6 +1026,26 @@ class WorkerJobExecutor(
             return f"Job dihentikan oleh user (Ctrl+C). Staging dipertahankan di {staging}."
         return "Job dihentikan oleh user (Ctrl+C)."
 
+    def _wait_for_profile_sync(
+        self,
+        kind: str,
+        profile: str,
+        expected_revision: int,
+        *,
+        cancelled: Callable[[], bool],
+        on_wait: Callable[[str], None],
+    ) -> bool:
+        # Resolver only needs its browser addon. It must not depend on a TDL
+        # profile being installed or synchronized on this worker.
+        if kind == "safelink_resolve" or not self.profile_sync.enabled:
+            return True
+        return self.profile_sync.wait_until_ready(
+            profile,
+            expected_revision,
+            cancelled=cancelled,
+            on_wait=on_wait,
+        )
+
     def _run(self, command: dict[str, Any], resource_keys: set[str]) -> None:
         del resource_keys
         job_id = str(command["job_id"])
@@ -1092,7 +1112,7 @@ class WorkerJobExecutor(
             heartbeat_thread.start()
             with self._lock:
                 cancelled_before_execute = job_id in self._cancel_requested
-            if self.profile_sync.enabled and not cancelled_before_execute:
+            if not cancelled_before_execute:
                 expected_revision = int(command.get("profile_revision") or 0)
 
                 def report_profile_wait(reason: str) -> None:
@@ -1108,7 +1128,8 @@ class WorkerJobExecutor(
                         },
                     )
 
-                ready = self.profile_sync.wait_until_ready(
+                ready = self._wait_for_profile_sync(
+                    kind,
                     profile,
                     expected_revision,
                     cancelled=lambda: self._job_cancelled(job_id),

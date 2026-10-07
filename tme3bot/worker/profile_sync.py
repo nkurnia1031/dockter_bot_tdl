@@ -236,7 +236,7 @@ class ProfileSyncClient:
                 return bool(self.session_manager.verify_installed(normalized))
             except Exception:
                 return False
-        announced = ""
+        announced: str | None = None
         while True:
             if cancelled is not None and cancelled():
                 return False
@@ -270,16 +270,15 @@ class ProfileSyncClient:
                         reason = "legacy_profile_unavailable"
                 else:
                     reason = "waiting_worker"
-                if reason != announced and on_wait is not None:
+                should_announce = reason != announced
+                if should_announce:
                     announced = reason
                     # Run callback outside the condition below.
-                else:
-                    announced = ""
-                if not announced:
+                if not should_announce or on_wait is None:
                     self._condition.wait(timeout=1.0)
                     continue
             try:
-                on_wait(announced)
+                on_wait(reason)
             except Exception:
                 LOGGER.debug("Could not report profile sync wait state")
 
