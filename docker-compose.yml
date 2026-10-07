@@ -11,6 +11,7 @@ services:
     env_file:
       - ${BACKEND_ENV_FILE:-.env.backend}
     environment:
+      DURABLE_DISPATCH_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
     restart: unless-stopped
     ports:

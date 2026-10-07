@@ -115,6 +115,7 @@ class ContainerBuildTests(unittest.TestCase):
 
             backend = services["backend"]
             self.assertIn("queue-private", backend["networks"])
+            self.assertEqual(backend["environment"]["DURABLE_DISPATCH_ENABLED"], "true")
             self.assertEqual(backend["environment"]["REDIS_URL"], "redis://redis:6379/0")
 
         remote = yaml.safe_load((PROJECT_ROOT / "docker-compose.worker.yml").read_text(encoding="utf-8"))
