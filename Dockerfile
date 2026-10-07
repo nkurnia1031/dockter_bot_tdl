@@ -9,28 +9,24 @@ COPY requirements.txt /tmp/tme3bot-requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/tme3bot-requirements.txt \
     && rm -f /tmp/tme3bot-requirements.txt
 
+# The base image contains Python dependencies, tdl, and the fixed Go helper.
+# Copy application source after dependency installation so source-only updates
+# preserve the expensive dependency layers in the gateway and worker images.
+FROM runtime-base AS gateway
 COPY bot.py /app/bot.py
 COPY pkg_resources.py /app/pkg_resources.py
 COPY tme3bot /app/tme3bot
 COPY utility /app/utility
-
-# The base image contains Python dependencies, tdl, and the fixed Go helper.
-FROM runtime-base AS gateway
 CMD ["python3", "/app/bot.py"]
 
 FROM runtime-base AS worker
-COPY requirements-tts.txt /app/requirements-tts.txt
-RUN python3 -m pip install --no-cache-dir -r /app/requirements-tts.txt \
+COPY requirements-tts.txt /tmp/requirements-tts.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements-tts.txt \
     && apt-get update \
     && apt-get install -y --no-install-recommends tor \
-    && rm -rf /var/lib/apt/lists/*
-CMD ["python3", "/app/bot.py"]
-
-FROM runtime-base AS browser-resolver
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-COPY requirements-browser.txt /app/requirements-browser.txt
-RUN mkdir -p /ms-playwright \
-    && python3 -m pip install --no-cache-dir -r /app/requirements-browser.txt \
-    && python3 -m playwright install --with-deps chromium \
-    && rm -f /app/requirements-browser.txt
+    && rm -rf /var/lib/apt/lists/* /tmp/requirements-tts.txt
+COPY bot.py /app/bot.py
+COPY pkg_resources.py /app/pkg_resources.py
+COPY tme3bot /app/tme3bot
+COPY utility /app/utility
 CMD ["python3", "/app/bot.py"]

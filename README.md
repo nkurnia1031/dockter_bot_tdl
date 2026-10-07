@@ -93,9 +93,10 @@ resolver dalam stack gateway. Container `telegram` memakai image gateway.
 
 Release Docker dibangun oleh workflow
 `.github/workflows/docker-images.yml`. Workflow tersebut membuat image dasar
-Go/TDL/Python terlebih dahulu, kemudian membangun image gateway, worker, dan
-addon resolver browser dari base image immutable, lalu mem-publish semuanya ke GHCR.
-VPS tidak perlu lagi menjalankan `docker build` atau mengompilasi Go.
+Go/TDL/Python bila input dasarnya berubah, lalu membangun hanya target aplikasi
+yang source atau dependensinya berubah. Image target yang tidak berubah diberi
+tag SHA release baru dengan manifest yang sama dari release sebelumnya.
+VPS tidak perlu menjalankan `docker build` atau mengompilasi Go.
 
 Push ke `main` akan menghasilkan tag image berdasarkan 12 karakter SHA commit:
 
@@ -107,7 +108,10 @@ ghcr.io/<owner>/tme3bot-resolver:<sha12>
 ```
 
 Workflow juga memperbarui tag `latest` untuk penggunaan sederhana. Untuk
-produksi, gunakan tag SHA agar gateway dan worker tetap immutable.
+produksi, gunakan tag SHA agar gateway dan worker tetap immutable. Resolver
+dibangun dari `Dockerfile.resolver` dan dependency HTTP minimalnya sendiri;
+image ini tidak membawa TDL, Tor, Chromium, atau Playwright. Perubahan resolver
+hanya membangun image addon kecil tanpa membangun ulang base image worker.
 
 Pada VPS, isi `.env` dengan nama package GHCR dan tag commit yang sama:
 
@@ -130,10 +134,10 @@ python3 run.py deploy gateway --pull
 Perintah deploy gateway juga menjalankan worker lokal, tiga helper TTS, dan
 addon resolver. Deploy worker remote menjalankan worker beserta addon yang
 sama. Alurnya selalu backend → worker → helper TTS/resolver; backend hanya
-mengenal worker yang sudah terdaftar. Addon resolver memakai image terpisah
-yang menyertakan Playwright dan Chromium, hanya tersedia pada jaringan privat
-Compose, dan tidak memerlukan token atau berkas `.env` tersendiri. `COMPOSE_PROFILES`
-tidak perlu diatur.
+mengenal worker yang sudah terdaftar. Addon resolver memakai image Python
+ringan terpisah, melakukan request Livewire dengan HTTPX, hanya tersedia pada
+jaringan privat Compose, dan tidak memerlukan token atau berkas `.env`
+tersendiri. `COMPOSE_PROFILES` tidak perlu diatur.
 Build lokal dan `base-migrate.zip` masih tersedia sebagai fallback untuk
 recovery atau deployment offline.
 

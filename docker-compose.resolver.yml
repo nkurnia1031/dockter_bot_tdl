@@ -3,11 +3,8 @@ services:
     image: ${RESOLVER_IMAGE_NAME:-tme3bot-resolver}:${IMAGE_TAG:-latest}
     build:
       context: .
-      dockerfile: Dockerfile
-      target: browser-resolver
-      args:
-        TME3BOT_BASE_IMAGE: ${TME3BOT_BASE_IMAGE:-tme3bot-base:py310-tdl0203}
-    command: ["python3", "-m", "tme3bot.worker.resolver_addon"]
+      dockerfile: Dockerfile.resolver
+      target: resolver
     restart: unless-stopped
     expose: ["8091"]
     healthcheck:

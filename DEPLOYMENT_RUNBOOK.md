@@ -1,6 +1,6 @@
 # TME3Bot Deployment Runbook
 
-Versi: 4.0 - GitHub Actions Docker release dan pull-only VPS
+Versi: 4.2 - selective image release dan HTTP-only resolver
 
 Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
 `backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
@@ -14,6 +14,26 @@ tidak membutuhkan Node.js atau container web di VPS target.
 | VPS gateway | `backend`, `telegram`, `worker-local` | `python3 run.py deploy gateway --pull` |
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
 | aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
+
+## Build dan pull image bertahap
+
+Workflow tetap menerbitkan tag SHA untuk base, gateway, worker, dan Resolver.
+Workflow membandingkan file yang berubah: target yang terdampak dibangun,
+sedangkan target lain memakai ulang manifest image dari commit sebelumnya.
+Dengan demikian, preflight dan deploy tetap memakai satu SHA release yang sama
+tanpa membangun ulang semua image.
+
+Image Resolver dibangun terpisah dari `Dockerfile.resolver` menggunakan Python
+3.10 slim dan dependency HTTP minimal. Ia tidak membawa base worker, TDL, Tor,
+Playwright, atau Chromium. Perubahan resolver hanya membangun ulang addon kecil
+dan tidak memicu build base worker.
+
+CI membangun base image hanya ketika `Dockerfile.base`, requirements bersama,
+helper Go, atau asset `.docker` berubah. CI membangun Resolver saat
+`Dockerfile.resolver`, `requirements-resolver.txt`, atau modul resolver yang
+dipakainya berubah. Build
+manual lokal tetap membangun target Compose yang diminta dan menggunakan cache
+Docker yang tersedia.
 
 Untuk update Download manager ini, urutan wajib adalah:
 

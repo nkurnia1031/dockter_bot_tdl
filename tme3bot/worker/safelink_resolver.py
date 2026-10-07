@@ -1,43 +1,54 @@
-"""Playwright resolver for supported multi-step Safelink pages.
+"""HTTP-only resolver for supported multi-step Safelink pages.
 
-The resolver follows visible controls and their normal timers only. It does
-not invoke site JavaScript directly, solve CAPTCHA, or download destination
-files. Browser requests are checked before they leave Chromium so redirects
-cannot target local or reserved addresses.
+The target pages expose their Livewire 2 component state in the initial HTML.
+This module carries the session cookies and signed component state through the
+same Livewire HTTP endpoint without starting a browser. It never opens or
+downloads the final destination.
 """
 
 from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import re
 import socket
 import time
+from html.parser import HTMLParser
 from typing import Any, Callable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urljoin, urlsplit
+
+import httpx
 
 from tme3bot.safelink import normalize_shortlink_url
 
 
 DEFAULT_TIMEOUT_SECONDS = 480
-DEFAULT_MAX_RESTARTS = 4
-STATE_RETRY_SECONDS = 20
-CLICK_RETRY_SECONDS = 5
-NAVIGATION_TIMEOUT_MS = 15_000
+DEFAULT_MAX_RETRIES = 4
+MAX_REDIRECTS = 12
+MAX_PAGE_BYTES = 1_000_000
+MAX_LIVEWIRE_BYTES = 2_000_000
+REQUEST_TIMEOUT_SECONDS = 20
+RETRYABLE_GET_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+)
+_GATE_HOST_SUFFIXES = (
+    "pndk.to",
+    "go.fakta.id",
+    "datapendidikan.com",
+    "urlwebsite.com",
+    "adtival.network",
+)
 _CAPTCHA_TEXT = re.compile(
     r"(?:captcha|recaptcha|hcaptcha|turnstile|verify\s+you\s+are\s+human|"
-    r"verifikasi\s+(?:bahwa\s+)?anda\s+manusia|i\s+am\s+not\s+a\s+robot)",
+    r"verifikasi\s+(?:bahwa\s+)?anda manusia|i\s+am\s+not\s+a\s+robot)",
     re.IGNORECASE,
 )
-_CAPTCHA_SELECTORS = (
-    "iframe[src*='captcha']",
-    "iframe[src*='recaptcha']",
-    "iframe[src*='hcaptcha']",
-    ".g-recaptcha",
-    ".h-captcha",
-    ".cf-turnstile",
-    "[data-sitekey]",
-)
+_LIVEWIRE_TOKEN = re.compile(r"window\.livewire_token\s*=\s*['\"]([^'\"]+)['\"]")
+_STEP_TEXT = re.compile(r"\bStep\s*(\d+)\s*/\s*\d+", re.IGNORECASE)
+_COMPONENT_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
 
 class SafelinkResolveError(RuntimeError):
@@ -46,6 +57,30 @@ class SafelinkResolveError(RuntimeError):
 
 class SafelinkCancelled(SafelinkResolveError):
     """Raised when the persisted job receives a cancellation request."""
+
+
+class _PageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.initial_data: str | None = None
+        self.text: list[str] = []
+        self._skip_tags: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        initial_data = attributes.get("wire:initial-data")
+        if self.initial_data is None and initial_data:
+            self.initial_data = initial_data
+        if tag in {"script", "style"}:
+            self._skip_tags.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._skip_tags and self._skip_tags[-1] == tag:
+            self._skip_tags.pop()
+
+    def handle_data(self, data: str) -> None:
+        if not self._skip_tags:
+            self.text.append(data)
 
 
 def _host_addresses(host: str, port: int, resolver=socket.getaddrinfo) -> list[str]:
@@ -69,7 +104,8 @@ def assert_public_http_url(url: str, *, resolver=socket.getaddrinfo) -> str:
         parsed = urlsplit(str(url))
         scheme = parsed.scheme.lower()
         host = (parsed.hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
-        port = parsed.port or (443 if scheme == "https" else 80)
+        explicit_port = parsed.port
+        port = explicit_port if explicit_port is not None else (443 if scheme == "https" else 80)
     except (UnicodeError, ValueError):
         raise SafelinkResolveError("URL halaman atau tujuan tidak valid.") from None
     if scheme not in {"http", "https"} or not host:
@@ -111,91 +147,287 @@ def decode_safelinkearn_url(url: str, *, resolver=socket.getaddrinfo) -> str | N
     return None
 
 
-def _visible_buttons(page) -> list[tuple[str, str, bool, Any]]:
-    found: list[tuple[str, str, bool, Any]] = []
-    for button in page.locator("button:visible").all():
-        try:
-            label = " ".join(button.inner_text(timeout=500).split())
-            handler = button.get_attribute("x-on:click") or button.get_attribute("@click") or ""
-            if label or handler:
-                found.append((label, handler.strip(), bool(button.is_disabled()), button))
-        except Exception:
-            continue
-    return found
-
-
-def _choose_gate_action(step: int | None, buttons: list[tuple[str, str, bool, Any]]):
-    active = [(label, handler, locator) for label, handler, disabled, locator in buttons if not disabled]
-
-    def match(label: str, handler: str):
-        for current_label, current_handler, locator in active:
-            if current_label.strip().lower() == label.lower() and current_handler.replace(" ", "").lower() == handler.lower():
-                return current_label, current_handler, locator
-        return None
-
-    if step == 3:
-        return match("Go", "go()") or match("Next", "next()") or match("Next Step", "scrollDown")
-    if step == 4:
-        return match("Next Step", "openClick()") or match("Next", "openClick()")
-    if step is not None and step >= 5:
-        for label, handler, locator in active:
-            normalized = label.strip().lower()
-            if "bot" in normalized and handler.replace(" ", "").lower() == "confirm()":
-                return label, handler, locator
-            if normalized == "click to continue" and handler.replace(" ", "").lower() == "confirm()":
-                return label, handler, locator
-        return None
-    return match("Scroll Down", "next")
-
-
-def _captcha_present(page, body: str) -> bool:
-    if _CAPTCHA_TEXT.search(body):
-        return True
-    for selector in _CAPTCHA_SELECTORS:
-        try:
-            locator = page.locator(selector)
-            if locator.count() and locator.first.is_visible():
-                return True
-        except Exception:
-            continue
-    for frame in getattr(page, "frames", []):
-        try:
-            host = (urlsplit(frame.url).hostname or "").lower()
-        except ValueError:
-            continue
-        if any(token in host for token in ("captcha", "recaptcha", "hcaptcha")):
-            return True
-    return False
-
-
-def _close_ad_overlay(page) -> bool:
-    for frame in getattr(page, "frames", []):
-        try:
-            if "googleads.g.doubleclick.net/pagead/html" not in frame.url:
-                continue
-            close = frame.locator('div#dismiss-button[role="button"][aria-label="Tutup iklan"]')
-            if close.count() and close.first.is_visible():
-                close.first.click(timeout=7000)
-                return True
-        except Exception:
-            continue
+def _url_host(url: str) -> str:
     try:
-        close = page.get_by_role("button", name=re.compile(r"^Tutup$", re.IGNORECASE))
-        if close.count() and close.first.is_visible():
-            close.first.click(timeout=5000)
-            return True
+        return (urlsplit(url).hostname or "").encode("idna").decode("ascii").lower().rstrip(".")
+    except (UnicodeError, ValueError):
+        raise SafelinkResolveError("URL halaman atau tujuan tidak valid.") from None
+
+
+def _is_safelinkearn(host: str) -> bool:
+    return host == "safelinkearn.com" or host.endswith(".safelinkearn.com")
+
+
+def _is_gate_host(host: str) -> bool:
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _GATE_HOST_SUFFIXES)
+
+
+def _request_timeout(deadline: float, monotonic: Callable[[], float]) -> float:
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise SafelinkResolveError("Batas waktu resolver 480 detik tercapai.")
+    return min(REQUEST_TIMEOUT_SECONDS, remaining)
+
+
+def _check_cancelled(is_cancelled: Callable[[], bool] | None) -> None:
+    if is_cancelled is not None and is_cancelled():
+        raise SafelinkCancelled("Job resolver dibatalkan.")
+
+
+def _read_limited(
+    response: httpx.Response,
+    *,
+    limit: int,
+    is_cancelled: Callable[[], bool] | None,
+) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_bytes(chunk_size=64 * 1024):
+        _check_cancelled(is_cancelled)
+        total += len(chunk)
+        if total > limit:
+            raise SafelinkResolveError("Respons halaman melebihi batas ukuran resolver.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _sleep_retry(
+    attempt: int,
+    *,
+    deadline: float,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    is_cancelled: Callable[[], bool] | None,
+) -> None:
+    _check_cancelled(is_cancelled)
+    delay = min(0.5 * (2**attempt), 2.0, max(0.0, deadline - monotonic()))
+    if delay > 0:
+        sleep(delay)
+    _check_cancelled(is_cancelled)
+
+
+def _get_gate_response(
+    client: httpx.Client,
+    url: str,
+    *,
+    deadline: float,
+    retries: int,
+    resolver,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    is_cancelled: Callable[[], bool] | None,
+    progress: Callable[[str, str], None],
+) -> tuple[int, dict[str, str], bytes]:
+    assert_public_http_url(url, resolver=resolver)
+    host = _url_host(url)
+    if not _is_gate_host(host):
+        raise SafelinkResolveError("Domain gate berubah dan belum didukung resolver.")
+
+    for attempt in range(retries + 1):
+        _check_cancelled(is_cancelled)
+        timeout = _request_timeout(deadline, monotonic)
+        retry_status: int | None = None
+        try:
+            with client.stream("GET", url, timeout=timeout) as response:
+                headers = dict(response.headers)
+                status = response.status_code
+                if status in RETRYABLE_GET_STATUSES:
+                    retry_status = status
+                elif 300 <= status < 400:
+                    return status, headers, b""
+                elif status != 200:
+                    raise SafelinkResolveError(f"Halaman gate menolak request (HTTP {status}).")
+                else:
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+                        return status, headers, b""
+                    body = _read_limited(response, limit=MAX_PAGE_BYTES, is_cancelled=is_cancelled)
+                    return status, headers, body
+        except SafelinkResolveError:
+            raise
+        except httpx.TransportError:
+            if attempt >= retries:
+                raise SafelinkResolveError("Halaman gate tidak dapat dijangkau setelah dicoba ulang.") from None
+            retry_status = None
+
+        if attempt >= retries:
+            if retry_status is not None:
+                raise SafelinkResolveError(
+                    f"Halaman gate masih membatasi request (HTTP {retry_status})."
+                )
+            raise SafelinkResolveError("Halaman gate tidak dapat dijangkau setelah dicoba ulang.")
+        progress("retrying", f"Mencoba ulang koneksi gate ({attempt + 1}/{retries}).")
+        _sleep_retry(
+            attempt,
+            deadline=deadline,
+            monotonic=monotonic,
+            sleep=sleep,
+            is_cancelled=is_cancelled,
+        )
+
+    raise SafelinkResolveError("Halaman gate tidak dapat dijangkau.")
+
+
+def _parse_livewire_page(html_text: str) -> dict[str, Any]:
+    parser = _PageParser()
+    try:
+        parser.feed(html_text)
+        parser.close()
     except Exception:
-        pass
-    return False
+        raise SafelinkResolveError("HTML halaman gate tidak dapat dibaca.") from None
 
-
-def _guard_request(route, *, resolver) -> None:
+    if not parser.initial_data:
+        raise SafelinkResolveError("Halaman gate tidak memiliki state Livewire yang didukung.")
     try:
-        assert_public_http_url(route.request.url, resolver=resolver)
-    except SafelinkResolveError:
-        route.abort()
-        return
-    route.continue_()
+        # HTMLParser already decodes attribute entities. A second unescape could
+        # corrupt literal entity text inside Livewire's JSON payload.
+        initial = json.loads(parser.initial_data)
+    except (TypeError, ValueError):
+        raise SafelinkResolveError("State Livewire halaman tidak valid.") from None
+    if not isinstance(initial, dict):
+        raise SafelinkResolveError("State Livewire halaman tidak valid.")
+
+    fingerprint = initial.get("fingerprint")
+    server_memo = initial.get("serverMemo")
+    if not isinstance(fingerprint, dict) or not isinstance(server_memo, dict):
+        raise SafelinkResolveError("State Livewire halaman tidak lengkap.")
+    component_name = fingerprint.get("name")
+    component_id = fingerprint.get("id")
+    if not isinstance(component_name, str) or not _COMPONENT_NAME.fullmatch(component_name):
+        raise SafelinkResolveError("Nama komponen Livewire tidak didukung.")
+    if not isinstance(component_id, str) or not component_id or len(component_id) > 128:
+        raise SafelinkResolveError("Identitas komponen Livewire tidak valid.")
+
+    state = server_memo.get("data")
+    if not isinstance(state, dict):
+        raise SafelinkResolveError("State komponen Livewire tidak lengkap.")
+    visible_text = " ".join(parser.text)
+    step_match = _STEP_TEXT.search(visible_text)
+    if not step_match:
+        raise SafelinkResolveError("Nomor langkah shortlink tidak ditemukan.")
+    token_match = _LIVEWIRE_TOKEN.search(html_text)
+    if not token_match:
+        raise SafelinkResolveError("Token sesi halaman tidak ditemukan.")
+
+    captcha_flag = state.get("captcha")
+    if _CAPTCHA_TEXT.search(visible_text) or (
+        state.get("hasCaptcha") is True and captcha_flag is not True
+    ):
+        raise SafelinkResolveError(
+            "Shortlink meminta verifikasi CAPTCHA. Selesaikan manual lalu kirim ulang job."
+        )
+
+    return {
+        "fingerprint": fingerprint,
+        "serverMemo": server_memo,
+        "component_id": component_id,
+        "component_name": component_name,
+        "step": int(step_match.group(1)),
+        "phase": state.get("phase"),
+        "token": token_match.group(1),
+    }
+
+
+def _decode_target(url: str, *, resolver) -> str:
+    destination = decode_safelinkearn_url(url, resolver=resolver)
+    if not destination:
+        raise SafelinkResolveError("Halaman SafelinkEarn tercapai, tetapi URL tujuan tidak dapat dibaca.")
+    return destination
+
+
+def _load_page_or_destination(
+    client: httpx.Client,
+    url: str,
+    *,
+    allow_external_destination: bool,
+    deadline: float,
+    retries: int,
+    resolver,
+    monotonic: Callable[[], float],
+    sleep: Callable[[float], None],
+    is_cancelled: Callable[[], bool] | None,
+    progress: Callable[[str, str], None],
+) -> tuple[str | None, dict[str, Any] | None, str | None]:
+    current_url = url
+    for _ in range(MAX_REDIRECTS + 1):
+        _check_cancelled(is_cancelled)
+        assert_public_http_url(current_url, resolver=resolver)
+        host = _url_host(current_url)
+        if _is_safelinkearn(host):
+            return None, None, _decode_target(current_url, resolver=resolver)
+        if not _is_gate_host(host):
+            if allow_external_destination:
+                return None, None, assert_public_http_url(current_url, resolver=resolver)
+            raise SafelinkResolveError("Shortlink mengarah ke domain gate yang belum didukung.")
+
+        status, headers, body = _get_gate_response(
+            client,
+            current_url,
+            deadline=deadline,
+            retries=retries,
+            resolver=resolver,
+            monotonic=monotonic,
+            sleep=sleep,
+            is_cancelled=is_cancelled,
+            progress=progress,
+        )
+        if 300 <= status < 400:
+            location = headers.get("location")
+            if not location:
+                raise SafelinkResolveError("Halaman gate mengirim redirect tanpa tujuan.")
+            next_url = assert_public_http_url(urljoin(current_url, location), resolver=resolver)
+            next_host = _url_host(next_url)
+            if _is_safelinkearn(next_host):
+                return None, None, _decode_target(next_url, resolver=resolver)
+            if _is_gate_host(next_host):
+                current_url = next_url
+                progress("resolving", "Mengikuti redirect halaman gate.")
+                continue
+            if allow_external_destination:
+                return None, None, next_url
+            raise SafelinkResolveError("Redirect gate mengarah ke domain yang belum didukung.")
+
+        content_type = headers.get("content-type", "").lower()
+        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+            if allow_external_destination:
+                return None, None, assert_public_http_url(current_url, resolver=resolver)
+            raise SafelinkResolveError("Halaman gate tidak mengembalikan HTML.")
+        try:
+            html_text = body.decode("utf-8", "replace")
+        except Exception:
+            raise SafelinkResolveError("HTML halaman gate tidak dapat dibaca.") from None
+        return current_url, _parse_livewire_page(html_text), None
+
+    raise SafelinkResolveError("Jumlah redirect halaman gate melebihi batas.")
+
+
+def _set_link_from_response(data: Any, *, resolver) -> str:
+    if not isinstance(data, dict):
+        raise SafelinkResolveError("Respons Livewire tidak valid.")
+    effects = data.get("effects")
+    emits = effects.get("emits") if isinstance(effects, dict) else None
+    if not isinstance(emits, list):
+        raise SafelinkResolveError("Respons Livewire tidak membawa event setLink.")
+    for emitted in emits:
+        if not isinstance(emitted, dict) or emitted.get("event") != "setLink":
+            continue
+        params = emitted.get("params")
+        if not isinstance(params, list) or not params or not isinstance(params[0], str):
+            continue
+        target = params[0]
+        if len(target) > 4096:
+            raise SafelinkResolveError("Link hasil Livewire terlalu panjang.")
+        return assert_public_http_url(target, resolver=resolver)
+    raise SafelinkResolveError("Respons Livewire tidak membawa event setLink.")
+
+
+def _default_http_client_factory() -> httpx.Client:
+    return httpx.Client(
+        follow_redirects=False,
+        trust_env=False,
+        headers={"User-Agent": _USER_AGENT, "Accept": "text/html, application/xhtml+xml, application/json, */*"},
+        timeout=httpx.Timeout(REQUEST_TIMEOUT_SECONDS),
+    )
 
 
 def resolve_shortlink(
@@ -204,193 +436,133 @@ def resolve_shortlink(
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
-    max_restarts: int = DEFAULT_MAX_RESTARTS,
+    max_retries: int = DEFAULT_MAX_RETRIES,
     resolver=socket.getaddrinfo,
     monotonic: Callable[[], float] = time.monotonic,
-    playwright_factory=None,
+    sleep: Callable[[float], None] = time.sleep,
+    http_client_factory: Callable[[], httpx.Client] | None = None,
 ) -> dict[str, str]:
-    """Resolve the destination URL using visible UI controls and regular timers."""
+    """Resolve a supported shortlink through Livewire HTTP requests only."""
 
     def progress(phase: str, message: str) -> None:
         if on_progress is not None:
             on_progress({"phase": phase, "message": message})
 
-    def check_cancelled() -> None:
-        if is_cancelled is not None and is_cancelled():
-            raise SafelinkCancelled("Job resolver dibatalkan.")
-
     source = normalize_shortlink_url(input_url)
-    parsed_source = urlsplit(source)
-    source_host = (parsed_source.hostname or "").lower().rstrip(".")
-    # The source domain is constrained separately from public egress checks.
-    if source_host not in {"pndk.to", "go.fakta.id"}:
-        raise SafelinkResolveError("Domain shortlink tidak didukung.")
     assert_public_http_url(source, resolver=resolver)
+    deadline = monotonic() + max(0, int(timeout_seconds))
+    retries = max(0, min(int(max_retries), DEFAULT_MAX_RETRIES))
+    client_factory = http_client_factory or _default_http_client_factory
+    progress("starting", "Menyiapkan sesi HTTP resolver.")
+    visited: set[tuple[str, int, str, str]] = set()
+    current_url = source
+    allow_external_destination = False
+
     try:
-        if playwright_factory is None:
-            from playwright.sync_api import sync_playwright
-
-            playwright_factory = sync_playwright
-        deadline = monotonic() + max(0, int(timeout_seconds))
-        progress("starting", "Menyiapkan browser resolver.")
-        with playwright_factory() as playwright:
-            try:
-                browser = playwright.chromium.launch(headless=True)
-            except Exception:
-                raise SafelinkResolveError("Browser resolver tidak dapat dijalankan.") from None
-            try:
-                context = browser.new_context(
-                    viewport={"width": 1365, "height": 900},
-                    locale="id-ID",
-                    accept_downloads=False,
+        with client_factory() as client:
+            for _ in range(32):
+                _check_cancelled(is_cancelled)
+                page_url, page, destination = _load_page_or_destination(
+                    client,
+                    current_url,
+                    allow_external_destination=allow_external_destination,
+                    deadline=deadline,
+                    retries=retries,
+                    resolver=resolver,
+                    monotonic=monotonic,
+                    sleep=sleep,
+                    is_cancelled=is_cancelled,
+                    progress=progress,
                 )
-                context.route("**/*", lambda route: _guard_request(route, resolver=resolver))
-                # This tool only reads the target URL; never allow site WebSocket
-                # traffic to bypass the HTTP request guard.
-                route_web_socket = getattr(context, "route_web_socket", None)
-                if callable(route_web_socket):
-                    route_web_socket("**/*", lambda socket_route: socket_route.close())
-                page = context.new_page()
-                download_attempted = False
+                if destination:
+                    progress("completed", "URL tujuan berhasil ditemukan.")
+                    return {"destination_url": destination}
+                if page_url is None or page is None:
+                    raise SafelinkResolveError("State halaman gate tidak tersedia.")
 
-                def reject_download(download) -> None:
-                    nonlocal download_attempted
-                    download_attempted = True
-                    try:
-                        download.cancel()
-                    except Exception:
-                        pass
+                step = int(page["step"])
+                phase = page.get("phase")
+                event = "getData" if step >= 5 and str(phase) == "5" else "changePhase"
+                signature = (page_url, step, str(phase), event)
+                if signature in visited:
+                    raise SafelinkResolveError("Tahap Livewire berulang; resolver menghentikan job.")
+                visited.add(signature)
+                progress("resolving", f"Membaca langkah {step}/5.")
 
-                page.on("download", reject_download)
+                component_name = str(page["component_name"])
+                endpoint = urljoin(page_url, f"/livewire/message/{quote(component_name, safe='')}")
+                assert_public_http_url(endpoint, resolver=resolver)
+                page_origin = urlsplit(page_url)
+                endpoint_origin = urlsplit(endpoint)
+                if (
+                    endpoint_origin.scheme != page_origin.scheme
+                    or endpoint_origin.netloc.lower() != page_origin.netloc.lower()
+                ):
+                    raise SafelinkResolveError("Endpoint Livewire keluar dari origin halaman.")
+
+                payload = {
+                    "fingerprint": page["fingerprint"],
+                    "serverMemo": page["serverMemo"],
+                    "updates": [
+                        {
+                            "type": "fireEvent",
+                            "payload": {
+                                "id": page["component_id"],
+                                "event": event,
+                                "params": [],
+                            },
+                        }
+                    ],
+                }
+                headers = {
+                    "Origin": f"{page_origin.scheme}://{page_origin.netloc}",
+                    "Referer": page_url,
+                    "X-Livewire": "true",
+                    "X-CSRF-TOKEN": str(page["token"]),
+                    "Content-Type": "application/json",
+                }
+                _check_cancelled(is_cancelled)
+                timeout = _request_timeout(deadline, monotonic)
                 try:
-                    page.goto(source, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-                except Exception:
-                    raise SafelinkResolveError("Halaman shortlink gagal dibuka.") from None
-                restart_count = 0
-                last_url = ""
-                last_step: int | None = None
-                last_action: tuple[str, int | None, str, str] | None = None
-                last_action_time = 0.0
-                last_state_signature = ""
-                last_state_change = monotonic()
-                dismissed_overlay = False
-                while monotonic() < deadline:
-                    check_cancelled()
-                    page.wait_for_timeout(700)
-                    check_cancelled()
-                    if download_attempted:
-                        raise SafelinkResolveError(
-                            "Halaman mencoba mengunduh file. Resolver hanya mengembalikan URL tujuan."
+                    with client.stream(
+                        "POST",
+                        endpoint,
+                        json=payload,
+                        headers=headers,
+                        timeout=timeout,
+                    ) as response:
+                        if response.status_code != 200:
+                            if response.status_code == 419:
+                                raise SafelinkResolveError("Sesi Livewire kedaluwarsa; kirim ulang job.")
+                            raise SafelinkResolveError(
+                                f"Request Livewire gagal (HTTP {response.status_code})."
+                            )
+                        body = _read_limited(
+                            response,
+                            limit=MAX_LIVEWIRE_BYTES,
+                            is_cancelled=is_cancelled,
                         )
-                    current_url = page.url
-                    current = urlsplit(current_url)
-                    current_host = (current.hostname or "").lower().rstrip(".")
-                    if current_host == "safelinkearn.com" or current_host.endswith(".safelinkearn.com"):
-                        destination = decode_safelinkearn_url(current_url, resolver=resolver)
-                        if destination:
-                            progress("completed", "URL tujuan berhasil ditemukan.")
-                            return {"destination_url": destination}
-                        raise SafelinkResolveError("Halaman tujuan tercapai, tetapi URL target tidak dapat dibaca.")
+                except SafelinkResolveError:
+                    raise
+                except httpx.TransportError:
+                    # A phase event may already have been applied by the server.
+                    # Never replay an ambiguous POST automatically.
+                    raise SafelinkResolveError(
+                        "Respons Livewire tidak dapat dipastikan; job dihentikan agar fase tidak terkirim dua kali."
+                    ) from None
 
-                    try:
-                        body = page.locator("body").inner_text(timeout=1500)
-                    except Exception:
-                        body = ""
-                    if _captcha_present(page, body):
-                        raise SafelinkResolveError(
-                            "Shortlink meminta verifikasi CAPTCHA. Job dihentikan; selesaikan verifikasi secara manual lalu kirim ulang."
-                        )
-                    step_match = re.search(r"Step\s*(\d+)\s*/\s*\d+", body, re.IGNORECASE)
-                    step = int(step_match.group(1)) if step_match else None
-                    if current_url != last_url or step != last_step:
-                        last_url, last_step = current_url, step
-                        last_action = None
-                        last_state_signature = ""
-                        last_state_change = monotonic()
-                        dismissed_overlay = False
-                        progress("resolving", f"Membaca langkah {step}/5." if step else "Menunggu langkah shortlink.")
-
-                    has_overlay = "google_vignette" in current_url or "Beralihlah dan hemat dengan AI" in body
-                    if has_overlay and not dismissed_overlay:
-                        if _close_ad_overlay(page):
-                            dismissed_overlay = True
-                            progress("resolving", "Overlay iklan ditutup.")
-                            continue
-                        restart_count += 1
-                        if restart_count > max_restarts:
-                            raise SafelinkResolveError("Overlay iklan menutupi halaman; batas pengulangan tercapai.")
-                        progress("retrying", f"Mengulang halaman ({restart_count}/{max_restarts}).")
-                        page.goto(source, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-                        last_url = ""
-                        last_step = None
-                        last_action = None
-                        last_state_signature = ""
-                        last_state_change = monotonic()
-                        continue
-
-                    buttons = _visible_buttons(page)
-                    visible_gate = [
-                        (label, handler, disabled)
-                        for label, handler, disabled, _ in buttons
-                        if handler.lower() not in ("openpopup", "opentxt") and (label or handler)
-                    ]
-                    signature = repr((step, visible_gate))
-                    if signature != last_state_signature:
-                        last_state_signature = signature
-                        last_state_change = monotonic()
-                    waiting = any(re.search(r"please\s*wait", label, re.IGNORECASE) for label, _, _ in visible_gate)
-                    action = None if waiting else _choose_gate_action(step, buttons)
-                    now = monotonic()
-                    if action:
-                        label, handler, locator = action
-                        action_key = (current_url, step, label, handler)
-                        if action_key != last_action or now - last_action_time >= CLICK_RETRY_SECONDS:
-                            check_cancelled()
-                            try:
-                                locator.click(timeout=5000)
-                                progress("resolving", f"Tombol langkah {step or '?'} ditekan.")
-                            except Exception:
-                                progress("resolving", f"Menunggu tombol langkah {step or '?'} siap.")
-                            last_action = action_key
-                            last_action_time = now
-                            continue
-
-                    continue_link = page.locator("#continue")
-                    if not waiting and continue_link.count() and continue_link.first.is_visible():
-                        action_key = (current_url, step, "Continue", "#continue")
-                        if action_key != last_action or now - last_action_time >= CLICK_RETRY_SECONDS:
-                            check_cancelled()
-                            try:
-                                continue_link.first.click(timeout=5000)
-                                progress("resolving", "Tombol Continue ditekan.")
-                            except Exception:
-                                progress("resolving", "Menunggu tombol Continue siap.")
-                            last_action = action_key
-                            last_action_time = now
-                            continue
-
-                    stalled = monotonic() - last_state_change >= STATE_RETRY_SECONDS
-                    no_step_or_timer = step is None or not visible_gate or (waiting and stalled)
-                    if no_step_or_timer and stalled:
-                        restart_count += 1
-                        if restart_count > max_restarts:
-                            raise SafelinkResolveError("Timer atau langkah shortlink tidak muncul; batas pengulangan tercapai.")
-                        progress("retrying", f"Langkah belum muncul; mengulang ({restart_count}/{max_restarts}).")
-                        page.goto(source, wait_until="domcontentloaded", timeout=NAVIGATION_TIMEOUT_MS)
-                        last_url = ""
-                        last_step = None
-                        last_action = None
-                        last_state_signature = ""
-                        last_state_change = monotonic()
-                        dismissed_overlay = False
-                raise SafelinkResolveError("Batas waktu resolver 480 detik tercapai.")
-            finally:
                 try:
-                    browser.close()
-                except Exception:
-                    pass
-    except (SafelinkResolveError, SafelinkCancelled):
+                    response_data = json.loads(body)
+                except (TypeError, ValueError):
+                    raise SafelinkResolveError("Respons Livewire bukan JSON yang valid.") from None
+                next_url = _set_link_from_response(response_data, resolver=resolver)
+                progress("resolving", f"Livewire {event} dijalankan pada langkah {step}.")
+                current_url = next_url
+                allow_external_destination = event == "getData"
+
+            raise SafelinkResolveError("Batas tahap HTTP resolver tercapai.")
+    except (SafelinkCancelled, SafelinkResolveError):
         raise
     except Exception:
-        # Playwright exceptions commonly include the complete URL and query.
+        # HTTP exception details can contain the complete shortlink and query.
         raise SafelinkResolveError("Resolver mengalami kendala saat memproses halaman.") from None

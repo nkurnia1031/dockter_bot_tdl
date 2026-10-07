@@ -1,6 +1,4 @@
 import unittest
-import sys
-from types import ModuleType
 from unittest.mock import call, patch
 
 from fastapi.testclient import TestClient
@@ -46,94 +44,11 @@ class ContractWorkerRegistry:
 
 
 class WorkerContractTests(unittest.TestCase):
-    def test_resolver_browser_readiness_launches_chromium_once_and_caches_result(self):
-        class Browser:
-            def __init__(self):
-                self.close_calls = 0
-
-            def close(self):
-                self.close_calls += 1
-
-        class Chromium:
-            def __init__(self, browser):
-                self.browser = browser
-                self.launch_calls = 0
-
-            def launch(self, *, headless):
-                self.launch_calls += 1
-                if not headless:
-                    raise AssertionError("readiness check must use headless Chromium")
-                return self.browser
-
-        class PlaywrightContext:
-            def __init__(self, chromium):
-                self.chromium = chromium
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                del exc
-                return False
-
-        browser = Browser()
-        chromium = Chromium(browser)
-        package = ModuleType("playwright")
-        sync_api = ModuleType("playwright.sync_api")
-        sync_api.sync_playwright = lambda: PlaywrightContext(chromium)
+    def test_resolver_readiness_uses_private_http_addon_health(self):
         executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
-
-        with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": sync_api}):
-            self.assertTrue(executor._safelink_browser_ready())
-            self.assertTrue(executor._safelink_browser_ready())
-
-        self.assertEqual(chromium.launch_calls, 1)
-        self.assertEqual(browser.close_calls, 1)
-
-    def test_resolver_browser_readiness_retries_after_chromium_startup_failure(self):
-        class Browser:
-            def __init__(self):
-                self.close_calls = 0
-
-            def close(self):
-                self.close_calls += 1
-
-        class Chromium:
-            def __init__(self):
-                self.launch_calls = 0
-                self.browser = Browser()
-
-            def launch(self, **kwargs):
-                del kwargs
-                self.launch_calls += 1
-                if self.launch_calls == 1:
-                    raise RuntimeError("browser still starting")
-                return self.browser
-
-        class PlaywrightContext:
-            def __init__(self, chromium):
-                self.chromium = chromium
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *exc):
-                del exc
-                return False
-
-        package = ModuleType("playwright")
-        sync_api = ModuleType("playwright.sync_api")
-        chromium = Chromium()
-        sync_api.sync_playwright = lambda: PlaywrightContext(chromium)
-        executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
-
-        with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": sync_api}):
-            self.assertFalse(executor._safelink_browser_ready())
-            self.assertTrue(executor._safelink_browser_ready())
-            self.assertTrue(executor._safelink_browser_ready())
-
-        self.assertEqual(chromium.launch_calls, 2)
-        self.assertEqual(chromium.browser.close_calls, 1)
+        with patch("tme3bot.worker.resolver_client.resolver_addon_ready", return_value=True) as ready:
+            self.assertTrue(executor._safelink_resolver_ready())
+        ready.assert_called_once_with()
 
     def test_worker_capability_endpoint_advertises_versioned_wire_features(self):
         executor = ContractWorkerExecutor()
@@ -173,7 +88,7 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(CAP_DURABLE_COMMANDS_V1, response.json()["capabilities"])
 
-    def test_worker_resolver_capability_is_advertised_only_when_browser_ready(self):
+    def test_worker_resolver_capability_tracks_http_addon_readiness(self):
         executor = ContractWorkerExecutor()
         executor.capabilities = lambda: {
             "profiles": ["default"],

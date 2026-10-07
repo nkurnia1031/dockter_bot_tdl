@@ -1,0 +1,25 @@
+FROM python:3.10-slim-bookworm AS resolver
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+COPY requirements-resolver.txt /tmp/requirements-resolver.txt
+RUN python -m pip install --no-cache-dir -r /tmp/requirements-resolver.txt \
+    && rm -f /tmp/requirements-resolver.txt \
+    && useradd --system --uid 10001 --no-create-home resolver
+
+# This addon is an HTTP client only; it does not include the worker runtime,
+# TDL, Tor, a browser, or a browser automation framework.
+COPY --chown=10001:10001 tme3bot/__init__.py /app/tme3bot/__init__.py
+COPY --chown=10001:10001 tme3bot/safelink.py /app/tme3bot/safelink.py
+COPY --chown=10001:10001 tme3bot/worker/__init__.py /app/tme3bot/worker/__init__.py
+COPY --chown=10001:10001 tme3bot/worker/resolver_addon.py /app/tme3bot/worker/resolver_addon.py
+COPY --chown=10001:10001 tme3bot/worker/safelink_resolver.py /app/tme3bot/worker/safelink_resolver.py
+
+USER 10001:10001
+EXPOSE 8091
+CMD ["python", "-m", "tme3bot.worker.resolver_addon"]

@@ -1,0 +1,9 @@
+**
+!requirements-resolver.txt
+!tme3bot/
+!tme3bot/__init__.py
+!tme3bot/safelink.py
+!tme3bot/worker/
+!tme3bot/worker/__init__.py
+!tme3bot/worker/resolver_addon.py
+!tme3bot/worker/safelink_resolver.py

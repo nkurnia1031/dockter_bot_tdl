@@ -20,12 +20,14 @@ class ResolverAddonTests(unittest.TestCase):
             return {"destination_url": "https://example.org/file"}
 
         with (
-            patch.object(resolver_addon, "_browser_ready", return_value=True),
             patch.object(resolver_addon, "resolve_shortlink", side_effect=fake_resolve),
             TestClient(resolver_addon.app) as client,
         ):
+            health = client.get("/healthz")
             response = client.post("/resolve", json={"url": "https://pndk.to/example"})
 
+        self.assertEqual(health.status_code, 200)
+        self.assertEqual(health.json(), {"ready": True, "engine": "http"})
         self.assertEqual(response.status_code, 200)
         lines = [json.loads(line) for line in response.text.splitlines()]
         self.assertEqual(lines[0]["type"], "progress")

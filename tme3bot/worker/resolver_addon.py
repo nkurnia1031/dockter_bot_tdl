@@ -1,4 +1,4 @@
-"""Private HTTP addon that runs Playwright shortlink resolution for a worker."""
+"""Private HTTP addon that resolves supported shortlinks over HTTP."""
 
 from __future__ import annotations
 
@@ -6,10 +6,9 @@ import asyncio
 import json
 import queue
 import threading
-from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -27,38 +26,12 @@ class ResolveRequest(BaseModel):
     url: str = Field(min_length=1, max_length=4096)
 
 
-def _browser_ready() -> bool:
-    browser = None
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
-        return True
-    except Exception:
-        return False
-    finally:
-        if browser is not None:
-            try:
-                browser.close()
-            except Exception:
-                pass
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    app.state.browser_ready = await asyncio.to_thread(_browser_ready)
-    yield
-
-
-app = FastAPI(title="Tme3Bot resolver addon", lifespan=lifespan)
+app = FastAPI(title="Tme3Bot HTTP resolver addon")
 
 
 @app.get("/healthz")
 def healthz():
-    if not bool(getattr(app.state, "browser_ready", False)):
-        raise HTTPException(status_code=503, detail="browser_unavailable")
-    return {"ready": True}
+    return {"ready": True, "engine": "http"}
 
 
 def _line(item: dict[str, Any]) -> bytes:
@@ -67,8 +40,6 @@ def _line(item: dict[str, Any]) -> bytes:
 
 @app.post("/resolve")
 async def resolve(request: ResolveRequest):
-    if not bool(getattr(app.state, "browser_ready", False)):
-        raise HTTPException(status_code=503, detail="browser_unavailable")
     if not _RESOLVE_LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="resolver_busy")
 
@@ -90,6 +61,7 @@ async def resolve(request: ResolveRequest):
         except Exception:
             events.put({"type": "error", "message": "Resolver mengalami kendala saat memproses halaman."})
         finally:
+            _RESOLVE_LOCK.release()
             events.put({"type": "done"})
 
     thread = threading.Thread(target=run_resolver, name="resolver-job", daemon=True)
@@ -108,7 +80,6 @@ async def resolve(request: ResolveRequest):
                     break
         finally:
             cancelled.set()
-            _RESOLVE_LOCK.release()
 
     return StreamingResponse(stream(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
 

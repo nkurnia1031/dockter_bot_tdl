@@ -42,7 +42,7 @@ def resolve_with_addon(
                 if response.status_code == 409:
                     raise SafelinkResolveError("Resolver sedang memproses job lain.")
                 if response.status_code == 503:
-                    raise SafelinkResolveError("Browser resolver belum siap.")
+                    raise SafelinkResolveError("Layanan resolver belum siap.")
                 if response.status_code >= 400:
                     raise SafelinkResolveError("Resolver tidak dapat menerima job.")
 

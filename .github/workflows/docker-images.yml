@@ -3,19 +3,6 @@ name: Build and publish Docker images
 on:
   push:
     branches: [main]
-    paths:
-      - 'Dockerfile'
-      - 'Dockerfile.base'
-      - '.dockerignore'
-      - '.docker/**'
-      - 'requirements.txt'
-      - 'requirements-browser.txt'
-      - 'docker-compose.resolver.yml'
-      - 'leave-helper/**'
-      - 'bot.py'
-      - 'tme3bot/**'
-      - 'utility/**'
-      - '.github/workflows/docker-images.yml'
   workflow_dispatch:
 
 permissions:
@@ -37,6 +24,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Resolve image names
         id: meta
@@ -59,7 +48,52 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Detect base image input changes
+        id: base_changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA")"
+          pattern='^(Dockerfile\.base|\.dockerignore|requirements\.txt|\.docker/.*|leave-helper/.*)$'
+          if printf '%s\n' "$changed_files" | grep -Eq "$pattern"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check base release and previous version
+        id: base_release
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ steps.meta.outputs.owner }}/tme3bot-base
+          TAG: py310-tdl0203-${{ steps.meta.outputs.tag }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "current_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          source_tag=""
+          if [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            previous_tag="py310-tdl0203-${BEFORE_SHA:0:12}"
+            if docker buildx imagetools inspect "$IMAGE:$previous_tag" >/dev/null 2>&1; then
+              source_tag="$previous_tag"
+            fi
+          fi
+          echo "source_tag=$source_tag" >> "$GITHUB_OUTPUT"
+
       - name: Build and publish base image
+        if: steps.base_release.outputs.current_exists != 'true' && (steps.base_changes.outputs.changed == 'true' || steps.base_release.outputs.source_tag == '')
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -72,6 +106,15 @@ jobs:
           cache-from: type=gha,scope=tme3bot-base
           cache-to: type=gha,mode=max,scope=tme3bot-base
 
+      - name: Reuse unchanged base image for this release
+        if: steps.base_release.outputs.current_exists != 'true' && steps.base_changes.outputs.changed != 'true' && steps.base_release.outputs.source_tag != ''
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ steps.meta.outputs.owner }}/tme3bot-base
+          TAG: py310-tdl0203-${{ steps.meta.outputs.tag }}
+          SOURCE_TAG: ${{ steps.base_release.outputs.source_tag }}
+        run: docker buildx imagetools create --tag "$IMAGE:$TAG" "$IMAGE:$SOURCE_TAG"
+
   application:
     name: Build ${{ matrix.image }} image
     needs: base
@@ -81,14 +124,19 @@ jobs:
       matrix:
         include:
           - image: gateway
+            dockerfile: Dockerfile
             target: gateway
           - image: worker
+            dockerfile: Dockerfile
             target: worker
           - image: resolver
-            target: browser-resolver
+            dockerfile: Dockerfile.resolver
+            target: resolver
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -100,11 +148,87 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish application image
+      - name: Detect image input changes
+        id: changes
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || -z "$BEFORE_SHA" || "$BEFORE_SHA" =~ ^0+$ ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          changed_files="$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA")"
+          case "$IMAGE" in
+            gateway)
+              pattern='^(Dockerfile|Dockerfile\.base|\.dockerignore|requirements\.txt|bot\.py|pkg_resources\.py|\.docker/.*|leave-helper/.*|tme3bot/.*|utility/.*)$'
+              ;;
+            worker)
+              pattern='^(Dockerfile|Dockerfile\.base|\.dockerignore|requirements\.txt|requirements-tts\.txt|bot\.py|pkg_resources\.py|\.docker/.*|leave-helper/.*|tme3bot/.*|utility/.*)$'
+              ;;
+            resolver)
+              pattern='^(Dockerfile\.resolver|Dockerfile\.resolver\.dockerignore|requirements-resolver\.txt|tme3bot/__init__\.py|tme3bot/safelink\.py|tme3bot/worker/__init__\.py|tme3bot/worker/resolver_addon\.py|tme3bot/worker/safelink_resolver\.py)$'
+              ;;
+            *)
+              echo "Unknown image target: $IMAGE" >&2
+              exit 1
+              ;;
+          esac
+
+          if printf '%s\n' "$changed_files" | grep -Eq "$pattern"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check release and previous version
+        id: release
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}
+          TAG: ${{ needs.base.outputs.tag }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "current_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          source_tag=""
+          if [[ "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            previous_tag="${BEFORE_SHA:0:12}"
+            if docker buildx imagetools inspect "$IMAGE:$previous_tag" >/dev/null 2>&1; then
+              source_tag="$previous_tag"
+            fi
+          fi
+          echo "source_tag=$source_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish resolver addon image
+        if: matrix.image == 'resolver' && steps.release.outputs.current_exists != 'true' && (steps.changes.outputs.changed == 'true' || steps.release.outputs.source_tag == '')
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}:${{ needs.base.outputs.tag }}
+            ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}:latest
+          cache-from: type=gha,scope=tme3bot-${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=tme3bot-${{ matrix.image }}
+
+      - name: Build and publish gateway or worker image
+        if: matrix.image != 'resolver' && steps.release.outputs.current_exists != 'true' && (steps.changes.outputs.changed == 'true' || steps.release.outputs.source_tag == '')
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ matrix.dockerfile }}
           target: ${{ matrix.target }}
           platforms: linux/amd64
           push: true
@@ -115,3 +239,12 @@ jobs:
             ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}:latest
           cache-from: type=gha,scope=tme3bot-${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=tme3bot-${{ matrix.image }}
+
+      - name: Reuse unchanged image for this release
+        if: steps.release.outputs.current_exists != 'true' && steps.changes.outputs.changed != 'true' && steps.release.outputs.source_tag != ''
+        shell: bash
+        env:
+          IMAGE: ghcr.io/${{ needs.base.outputs.owner }}/tme3bot-${{ matrix.image }}
+          TAG: ${{ needs.base.outputs.tag }}
+          SOURCE_TAG: ${{ steps.release.outputs.source_tag }}
+        run: docker buildx imagetools create --tag "$IMAGE:$TAG" "$IMAGE:$SOURCE_TAG"

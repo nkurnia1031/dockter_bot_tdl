@@ -27,6 +27,8 @@ BASE_FINGERPRINT_FILES = (
 INCLUDE_ROOTS = (
     "bot.py",
     "Dockerfile",
+    "Dockerfile.resolver",
+    "Dockerfile.resolver.dockerignore",
     "Dockerfile.base",
     "base-image-manifest.json",
     "docker-compose.yml",
@@ -41,7 +43,7 @@ INCLUDE_ROOTS = (
     ".env.worker.example",
     ".env.worker.local.example",
     "requirements.txt",
-    "requirements-browser.txt",
+    "requirements-resolver.txt",
     "build.py",
     "run.py",
     "README.md",

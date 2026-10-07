@@ -64,19 +64,26 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertTrue((PROJECT_ROOT / "deploy" / "nginx" / "tme3bot-ui.conf").is_file())
 
     def test_resolver_image_is_private_addon_instead_of_a_worker(self) -> None:
-        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        dockerfile = (PROJECT_ROOT / "Dockerfile.resolver").read_text(encoding="utf-8")
         compose = yaml.safe_load(
             (PROJECT_ROOT / "docker-compose.resolver.yml").read_text(encoding="utf-8")
         )
-        requirements = (PROJECT_ROOT / "requirements-browser.txt").read_text(encoding="utf-8")
+        requirements = (PROJECT_ROOT / "requirements-resolver.txt").read_text(encoding="utf-8")
         service = compose["services"]["resolver-addon"]
 
-        self.assertIn("FROM runtime-base AS browser-resolver", dockerfile)
-        self.assertIn("python3 -m playwright install --with-deps chromium", dockerfile)
-        self.assertIn('CMD ["python3", "/app/bot.py"]', dockerfile)
-        self.assertIn("playwright==1.55.0", requirements)
-        self.assertEqual(service["build"]["target"], "browser-resolver")
-        self.assertEqual(service["command"], ["python3", "-m", "tme3bot.worker.resolver_addon"])
+        self.assertIn("FROM python:3.10-slim-bookworm AS resolver", dockerfile)
+        self.assertIn("USER 10001:10001", dockerfile)
+        self.assertNotIn("playwright", dockerfile.lower())
+        self.assertNotIn("chromium", dockerfile.lower())
+        self.assertEqual(
+            set(requirements.splitlines()),
+            {"fastapi==0.115.14", "pydantic==2.11.7", "uvicorn==0.34.3", "httpx==0.28.1"},
+        )
+        self.assertIn("Dockerfile.resolver.dockerignore", build.INCLUDE_ROOTS)
+        self.assertEqual(service["build"]["dockerfile"], "Dockerfile.resolver")
+        self.assertEqual(service["build"]["target"], "resolver")
+        self.assertIn('CMD ["python", "-m", "tme3bot.worker.resolver_addon"]', dockerfile)
+        self.assertNotIn("command", service)
         self.assertEqual(service["expose"], ["8091"])
         self.assertNotIn("ports", service)
         self.assertNotIn("volumes", service)
@@ -137,9 +144,12 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("docker-compose.gateway.yml", names)
         self.assertIn("docker-compose.worker.yml", names)
         self.assertIn("docker-compose.resolver.yml", names)
+        self.assertIn("Dockerfile.resolver", names)
+        self.assertIn("Dockerfile.resolver.dockerignore", names)
         self.assertNotIn("docker-compose.resolver-gateway.yml", names)
         self.assertNotIn(".env.resolver.example", names)
-        self.assertIn("requirements-browser.txt", names)
+        self.assertIn("requirements-resolver.txt", names)
+        self.assertNotIn("requirements-browser.txt", names)
         self.assertIn(".env.backend.example", names)
         self.assertIn(".env.telegram.example", names)
         self.assertIn(".env.worker.example", names)

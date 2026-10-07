@@ -726,7 +726,7 @@ class WorkerJobExecutor(
             tts_ready = bool(tts_health.get("helpers_ready")) and bool(tts_profiles)
         except Exception:
             tts_ready = False
-        resolver_probe = getattr(self, "_safelink_browser_ready", None)
+        resolver_probe = getattr(self, "_safelink_resolver_ready", None)
         resolver_ready = bool(resolver_probe()) if callable(resolver_probe) else False
         tts_profiles = self.available_storage_profiles()
         if self.profile_sync.enabled:
@@ -747,7 +747,7 @@ class WorkerJobExecutor(
             "safelink_resolver": resolver_ready,
         }
 
-    def _safelink_browser_ready(self) -> bool:
+    def _safelink_resolver_ready(self) -> bool:
         from tme3bot.worker.resolver_client import resolver_addon_ready
 
         return resolver_addon_ready()

@@ -503,7 +503,7 @@ def image_names_for_release(env: dict[str, str]) -> list[str]:
 
 
 def resolver_addon_image_name(env: dict[str, str]) -> str:
-    """Derive the browser addon package from the worker package name."""
+    """Derive the HTTP resolver addon package from the worker image name."""
     configured = env.get("RESOLVER_IMAGE_NAME", "").strip()
     if configured:
         return configured

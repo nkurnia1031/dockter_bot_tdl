@@ -106,7 +106,7 @@ def build_execution_plan(
         keys = {f"worker:{worker}:kind:tts"}
         lane = "tts"
     elif kind == "safelink_resolve":
-        # Resolver browser contexts share one Chromium-capable worker slot.
+        # The HTTP resolver addon exposes one active resolution slot per worker.
         keys = {f"worker:{worker}:kind:safelink_resolve"}
         lane = "safelink-resolver"
     elif kind in {"download", "download_clear_failed"}:
