@@ -152,48 +152,28 @@ def register_workers(app, context, *, current_actor):
     def worker_tts_health(name: str, actor=Depends(current_actor)):
         if context.worker_registry.get(name) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
-        get_health = getattr(context.worker_dispatcher, "tts_health", None)
-        if not callable(get_health):
-            raise DomainError("WORKER_UPDATE_REQUIRED", "Backend belum mendukung diagnosis TTS worker.", status_code=409)
-        try:
-            result = get_health(name)
-        except Exception as exc:
-            raise tts_worker_error(name, exc) from None
-        helpers = result.get("helpers") if isinstance(result, dict) else []
-        helpers_ready = bool(result.get("helpers_ready")) if isinstance(result, dict) else False
-        available_profiles = result.get("available_profiles") if isinstance(result, dict) else []
-        if not isinstance(available_profiles, list):
-            available_profiles = []
-        safe_helpers = []
-        allowed_statuses = {"ready", "bootstrapping", "tor_unreachable", "helper_unreachable"}
-        for helper in helpers if isinstance(helpers, list) else []:
-            if not isinstance(helper, dict):
-                continue
-            status = str(helper.get("status") or "helper_unreachable")
-            if status not in allowed_statuses:
-                status = "helper_unreachable"
-            slot = helper.get("slot")
-            if isinstance(slot, bool) or not isinstance(slot, int) or slot < 1 or slot > 3:
-                continue
-            percent = helper.get("bootstrap_percent")
-            if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
-                percent = None
-            if status in {"tor_unreachable", "helper_unreachable"}:
-                percent = None
-            safe_helpers.append({
-                "slot": slot,
-                "status": status,
-                "bootstrap_percent": percent,
-                "checked_at": str(helper.get("checked_at") or "") or None,
-            })
-        safe_helpers.sort(key=lambda item: item["slot"])
-        profile_session_ready = str(actor.profile) in {str(item) for item in available_profiles}
-        helpers_ready = helpers_ready and len(safe_helpers) == 3 and all(item["status"] == "ready" for item in safe_helpers)
+        diagnostics = context.control_plane.tts_worker_diagnostics(profile=actor.profile, worker=name)
+        item = diagnostics[0] if diagnostics else {}
+        safe_helpers = item.get("helpers") if isinstance(item.get("helpers"), list) else []
+        provisioner = context.profile_provisioner
+        if provisioner is not None:
+            provisioner.store.append_diagnostic_log(
+                category="tts",
+                actor_user_id=actor.telegram_user_id,
+                profile=actor.profile,
+                worker=name,
+                event_type="worker_health_check",
+                code=str(item.get("reason_code") or "worker_unavailable"),
+                details=item,
+            )
         return {
             "worker": name,
-            "ready": helpers_ready and profile_session_ready,
-            "helpers_ready": helpers_ready,
-            "profile_session_ready": profile_session_ready,
+            "ready": bool(item.get("ready")),
+            "helpers_ready": bool(item.get("helpers_ready")),
+            "capability_ready": bool(item.get("capability_ready")),
+            "profile_session_ready": bool(item.get("profile_session_ready")),
+            "profile_sync_ready": bool(item.get("profile_sync_ready")),
+            "reason_code": str(item.get("reason_code") or "worker_unavailable"),
             "helpers": safe_helpers,
         }
 

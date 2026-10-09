@@ -91,6 +91,13 @@ class FakeExecutor:
             ],
         }
 
+    def diagnose_profile_export(self, profile):
+        return {
+            "ready": profile == "default",
+            "reason_codes": [] if profile == "default" else ["PROFILE_ROOT_SESSION_MISSING"],
+            "checks": [{"name": "root_session", "ready": profile == "default", "code": "PROFILE_ROOT_SESSION_READY" if profile == "default" else "PROFILE_ROOT_SESSION_MISSING"}],
+        }
+
     def recover_tts_helper(self, slot):
         self.tts_helper_recoveries.append(slot)
         return {"accepted": True, "status": "restarting"}
@@ -574,6 +581,17 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(installed.status_code, 200)
         self.assertEqual(self.executor.profile_installs[-1][0:2], ("novel", 123))
+
+    def test_profile_export_diagnostics_requires_worker_token_and_never_returns_paths(self):
+        denied = self.client.get("/internal/v1/profiles/default/session/diagnostics")
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.get(
+            "/internal/v1/profiles/default/session/diagnostics",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["ready"])
+        self.assertNotIn("/workspace", response.text)
 
 
 if __name__ == "__main__":

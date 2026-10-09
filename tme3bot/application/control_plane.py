@@ -826,41 +826,114 @@ class ControlPlane:
         return selected
 
     def tts_worker_options(self, *, profile: str | None = None) -> list[dict[str, Any]]:
+        return [
+            {"name": item["name"], "queued_jobs": item["queued_jobs"]}
+            for item in self.tts_worker_diagnostics(profile=profile)
+            if item["ready"]
+        ]
+
+    def tts_worker_diagnostics(
+        self, *, profile: str | None = None, worker: str | None = None
+    ) -> list[dict[str, Any]]:
         registry = self.worker_registry
         checker = getattr(self.dispatcher, "capabilities", None)
         if registry is None or not callable(checker):
             return []
-        enabled = getattr(registry, "enabled_names", None)
-        candidates = list(enabled()) if callable(enabled) else registry.names()
+        candidates = [worker] if worker else list(registry.names())
         statuses = ("queued", "dispatched", "running", "paused")
         result: list[dict[str, Any]] = []
         for name in candidates:
             record = registry.get(name)
-            if record is None or not bool(record.get("enabled", True)):
+            if record is None:
+                continue
+            enabled = bool(record.get("enabled", True))
+            item: dict[str, Any] = {
+                "name": str(name),
+                "enabled": enabled,
+                "ready": False,
+                "capability_ready": False,
+                "helpers_ready": False,
+                "profile_session_ready": False,
+                "profile_sync_ready": False,
+                "reason_code": "worker_disabled" if not enabled else "capability_unavailable",
+                "helpers": [],
+                "queued_jobs": 0,
+            }
+            if not enabled:
+                result.append(item)
                 continue
             try:
                 response = checker(name)
-            except Exception:
+            except Exception as exc:
+                status = getattr(exc, "status", None)
+                item["reason_code"] = (
+                    "worker_update_required" if status == 404 else "worker_unavailable"
+                )
+                result.append(item)
                 continue
             capabilities = response.get("capabilities", []) if isinstance(response, dict) else []
-            if not isinstance(response, dict) or not (
-                response.get("tts") is True
-                or (isinstance(capabilities, list) and "tts" in capabilities)
-            ):
-                continue
-            if profile:
-                tts_profiles = response.get("tts_profiles")
-                if isinstance(tts_profiles, list) and str(profile) not in {
-                    str(item) for item in tts_profiles
-                }:
+            if isinstance(response, dict) and isinstance(response.get("tts"), bool):
+                item["capability_ready"] = response["tts"]
+            else:
+                item["capability_ready"] = bool(
+                    isinstance(capabilities, list) and CAP_TTS in capabilities
+                )
+            health = response.get("tts_health") if isinstance(response, dict) else None
+            health = health if isinstance(health, dict) else {}
+            helpers = health.get("helpers")
+            allowed_statuses = {"ready", "bootstrapping", "tor_unreachable", "helper_unreachable"}
+            safe_helpers = []
+            for helper in helpers if isinstance(helpers, list) else []:
+                if not isinstance(helper, dict):
                     continue
-                if callable(self.profile_readiness) and not self.profile_readiness(profile, name):
+                slot = helper.get("slot")
+                if isinstance(slot, bool) or not isinstance(slot, int) or slot < 1 or slot > 3:
                     continue
-            queued_jobs = sum(
+                status = str(helper.get("status") or "helper_unreachable")
+                if status not in allowed_statuses:
+                    status = "helper_unreachable"
+                percent = helper.get("bootstrap_percent")
+                if isinstance(percent, bool) or not isinstance(percent, int) or not 0 <= percent <= 100:
+                    percent = None
+                if status in {"tor_unreachable", "helper_unreachable"}:
+                    percent = None
+                safe_helpers.append({"slot": slot, "status": status, "bootstrap_percent": percent})
+            safe_helpers.sort(key=lambda helper: helper["slot"])
+            item["helpers"] = safe_helpers
+            item["helpers_ready"] = bool(health.get("helpers_ready")) and len(safe_helpers) == 3 and all(
+                helper["status"] == "ready" for helper in safe_helpers
+            )
+            tts_profiles = response.get("tts_profiles") if isinstance(response, dict) else None
+            advertised_profile = bool(
+                isinstance(tts_profiles, list)
+                and (profile is None or str(profile) in {str(value) for value in tts_profiles})
+            )
+            try:
+                backend_profile_ready = (
+                    bool(self.profile_readiness(profile, name))
+                    if profile and callable(self.profile_readiness)
+                    else True
+                )
+            except Exception:
+                backend_profile_ready = False
+            item["profile_sync_ready"] = backend_profile_ready
+            item["profile_session_ready"] = advertised_profile and backend_profile_ready
+            if not item["helpers_ready"]:
+                item["reason_code"] = "helpers_not_ready"
+            elif not advertised_profile:
+                item["reason_code"] = "profile_not_available"
+            elif not backend_profile_ready:
+                item["reason_code"] = "profile_not_synced"
+            elif not item["capability_ready"]:
+                item["reason_code"] = "tts_capability_missing"
+            else:
+                item["ready"] = True
+                item["reason_code"] = "ready"
+            item["queued_jobs"] = sum(
                 self.jobs.count(kind="tts", worker=name, status=status, archived=False)
                 for status in statuses
             )
-            result.append({"name": str(name), "queued_jobs": queued_jobs})
+            result.append(item)
         return sorted(result, key=lambda option: option["name"].lower())
 
     def _select_safelink_worker(self, requested: str | None = None) -> str:

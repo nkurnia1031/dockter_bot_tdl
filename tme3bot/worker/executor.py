@@ -321,6 +321,37 @@ class WorkerJobExecutor(
             with runtime.download_operation_lock:
                 return self._profile_sessions.export_bundle(profile)
 
+    def diagnose_profile_export(self, profile: str) -> dict[str, Any]:
+        cached_runtime = getattr(self.profile_manager, "cached_runtime", None)
+        runtime = cached_runtime(profile) if callable(cached_runtime) else None
+        if runtime is None:
+            # A profile with no active executor runtime cannot be changing its
+            # Bolt files. Avoid creating runtime directories as a side effect
+            # of this read-only diagnostic.
+            return self._profile_sessions.diagnose_export_bundle(profile)
+        export_lock = runtime.export_operation_lock
+        download_lock = runtime.download_operation_lock
+        if not export_lock.acquire(blocking=False):
+            return {
+                "ready": False,
+                "reason_codes": ["PROFILE_SESSION_BUSY"],
+                "checks": [{"name": "session_locks", "ready": False, "code": "PROFILE_SESSION_BUSY"}],
+            }
+        download_acquired = False
+        try:
+            download_acquired = download_lock.acquire(blocking=False)
+            if not download_acquired:
+                return {
+                    "ready": False,
+                    "reason_codes": ["PROFILE_SESSION_BUSY"],
+                    "checks": [{"name": "session_locks", "ready": False, "code": "PROFILE_SESSION_BUSY"}],
+                }
+            return self._profile_sessions.diagnose_export_bundle(profile)
+        finally:
+            if download_acquired:
+                download_lock.release()
+            export_lock.release()
+
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])
         worker = str(command.get("worker") or self.config.backup_node_name).strip()
@@ -700,40 +731,44 @@ class WorkerJobExecutor(
         """Return non-secret worker capabilities for backend target checks."""
         profiles = [str(item) for item in self.profile_manager.list_profiles()]
         storage_profiles_available = self.available_storage_profiles()
-        profile_sync = self.profile_sync.snapshot()
-        if self.profile_sync.enabled:
+        profile_sync_manager = getattr(self, "profile_sync", None)
+        snapshot = getattr(profile_sync_manager, "snapshot", None)
+        profile_sync = snapshot() if callable(snapshot) else {
+            "enabled": False,
+            "status": "disabled",
+            "profiles": {},
+        }
+        if bool(getattr(profile_sync_manager, "enabled", False)):
             profiles = [
-                name for name in profiles if self.profile_sync.profile_ready(name)
+                name for name in profiles if profile_sync_manager.profile_ready(name)
             ]
             storage_profiles_available = [
                 name
                 for name in storage_profiles_available
-                if self.profile_sync.profile_ready(name)
+                if profile_sync_manager.profile_ready(name)
             ]
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
         tts_ready = False
         tts_health: dict[str, Any] = {
             "helpers_ready": False,
+            "ready": False,
+            "available_profiles": storage_profiles_available,
+            "tts_profiles": [],
             "helpers": [
                 {"slot": slot, "status": "helper_unreachable", "bootstrap_percent": None, "checked_at": None}
                 for slot in range(1, 4)
             ],
         }
-        tts_profiles = self.available_storage_profiles()
+        tts_profiles: list[str] = []
         try:
             tts_health = self.tts_health()
-            tts_ready = bool(tts_health.get("helpers_ready")) and bool(tts_profiles)
+            tts_profiles = [str(item) for item in tts_health.get("tts_profiles", [])]
+            tts_ready = bool(tts_health.get("ready"))
         except Exception:
             tts_ready = False
         resolver_probe = getattr(self, "_safelink_resolver_ready", None)
         resolver_ready = bool(resolver_probe()) if callable(resolver_probe) else False
-        tts_profiles = self.available_storage_profiles()
-        if self.profile_sync.enabled:
-            tts_profiles = [
-                name for name in tts_profiles if self.profile_sync.profile_ready(name)
-            ]
-            tts_ready = tts_ready and bool(tts_profiles)
         return {
             "profiles": profiles,
             "profile_sync": profile_sync,

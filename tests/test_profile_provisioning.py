@@ -89,6 +89,15 @@ class FakeProfileDispatcher:
         self.committed = []
         self.login_state_value = {"status": "waiting_input", "step": "qr", "qr_text": "qr-test"}
         self.login_bundle_downloads = []
+        self.profile_diagnostic_result = {
+            "ready": True,
+            "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "PROFILE_IDENTITY_READY"},
+                {"name": "root_session", "ready": True, "code": "PROFILE_ROOT_SESSION_READY"},
+                {"name": "user1_session", "ready": True, "code": "PROFILE_USER1_SESSION_READY"},
+            ],
+        }
 
     def validate_profile_session(self, worker, data):
         return 987654
@@ -105,6 +114,9 @@ class FakeProfileDispatcher:
 
     def export_profile_bundle(self, worker, profile):
         return 987654, build_profile_bundle({"data/default": b"vault-session"}, 987654)
+
+    def profile_export_diagnostics(self, worker, profile):
+        return dict(self.profile_diagnostic_result)
 
     def install_profile_bundle(self, worker, profile, user_id, bundle, operation_id):
         if worker not in self.online:
@@ -128,6 +140,34 @@ class MutableWorkerRegistry(FakeWorkerRegistry):
 
 
 class ProfileProvisioningTests(unittest.TestCase):
+    def test_legacy_profile_export_diagnosis_checks_both_sessions_without_exposing_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = ProfileSessionManager(make_config(root))
+            missing = manager.diagnose_export_bundle("storage")
+            self.assertFalse(missing["ready"])
+            self.assertIn("PROFILE_IDENTITY_MISSING", missing["reason_codes"])
+
+            profile_root = root / "profiles" / "storage"
+            profile_root.mkdir(parents=True)
+            (profile_root / "identity.json").write_text(
+                '{"telegram_user_id":123,"tdl_user_id":123}', encoding="utf-8"
+            )
+            for session in ("root/.tdl/data", "user1/.tdl/data"):
+                session_root = profile_root / Path(session)
+                session_root.mkdir(parents=True)
+                (session_root / "default").write_bytes(b"session")
+
+            ready = manager.diagnose_export_bundle("storage")
+            self.assertTrue(ready["ready"])
+            self.assertEqual([item["name"] for item in ready["checks"]], ["identity", "root_session", "user1_session"])
+            self.assertNotIn(str(profile_root), str(ready))
+
+            (profile_root / "user1" / ".tdl" / "data" / "default").unlink()
+            incomplete = manager.diagnose_export_bundle("storage")
+            self.assertFalse(incomplete["ready"])
+            self.assertIn("PROFILE_USER1_SESSION_EMPTY", incomplete["reason_codes"])
+
     def test_profile_adoption_export_waits_until_both_tdl_lanes_are_locked(self):
         runtime = SimpleNamespace(
             export_operation_lock=threading.Lock(),
@@ -446,6 +486,10 @@ class ProfileProvisioningTests(unittest.TestCase):
 
             operation = service.adopt("default", "local", 42)
 
+            self.assertIsNone(store.bundle("default"))
+            self.assertEqual(store.provisioning(operation)["status"], "validating")
+            service.process_once()
+
             stored_user_id, stored_bundle = store.bundle("default")
             self.assertEqual(stored_user_id, 987654)
             validate_profile_bundle(stored_bundle)
@@ -458,6 +502,64 @@ class ProfileProvisioningTests(unittest.TestCase):
                 {item["worker"] for item in info["workers"]},
                 {"local", "remote-offline"},
             )
+
+    def test_adoption_source_diagnostics_and_operation_logs_are_json_safe_and_actor_scoped(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            service = ProfileProvisioningService(
+                store, FakeProfileManager(root), FakeWorkerRegistry(), FakeProfileDispatcher()
+            )
+
+            result = service.diagnose_adoption("default", "local", 42)
+
+            self.assertTrue(result["ready"])
+            self.assertEqual(result["worker"], "local")
+            self.assertNotIn("path", str(result).lower())
+            operation_id = service.adopt("default", "local", 42)
+            service.process_once()
+            owner_logs = store.provisioning_logs(operation_id, 42)
+            self.assertTrue(owner_logs)
+            self.assertIsNone(store.provisioning_logs(operation_id, 43))
+            self.assertIn("TARGET_INSTALL_READY", {item["code"] for item in owner_logs})
+
+            store.append_diagnostic_log(
+                category="profile_export",
+                actor_user_id=42,
+                event_type="source_check",
+                code="PROFILE_SESSION_UNAVAILABLE",
+                details={"checks": [{"name": "root/.tdl/data", "ready": False, "code": "x", "secret": "hidden"}]},
+            )
+            logs = store.diagnostic_logs(42, "profile_export")
+            self.assertNotIn("secret", str(logs))
+            self.assertNotIn("root/.tdl/data", str(logs))
+
+    def test_failed_adoption_can_be_retried_with_a_selected_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            dispatcher = FakeProfileDispatcher()
+            dispatcher.profile_diagnostic_result = {
+                "ready": False,
+                "reason_codes": ["PROFILE_ROOT_SESSION_MISSING"],
+                "checks": [{"name": "root_session", "ready": False, "code": "PROFILE_ROOT_SESSION_MISSING"}],
+            }
+            workers = FakeWorkerRegistry()
+            service = ProfileProvisioningService(store, FakeProfileManager(root), workers, dispatcher)
+
+            operation_id = service.adopt("default", "local", 42)
+            self.assertEqual(store.provisioning(operation_id)["status"], "validating")
+            service.process_once()
+            self.assertEqual(store.provisioning(operation_id)["status"], "failed")
+            self.assertIsNone(store.bundle("default"))
+
+            dispatcher.profile_diagnostic_result = {"ready": True, "reason_codes": [], "checks": []}
+            service.retry(operation_id, 42, "local")
+            self.assertEqual(store.provisioning(operation_id)["bootstrap_worker"], "local")
+            self.assertEqual(store.provisioning(operation_id)["status"], "validating")
+            service.process_once()
+            self.assertEqual(store.provisioning(operation_id)["status"], "distributing")
+            self.assertIsNotNone(store.bundle("default"))
 
     def test_profile_names_must_not_be_silently_rewritten(self):
         with tempfile.TemporaryDirectory() as temporary:

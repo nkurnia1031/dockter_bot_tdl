@@ -316,6 +316,46 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             headers={"X-Telegram-User-ID": str(user_id)},
         )
 
+    @app.get("/internal/v1/profiles/{profile}/session/diagnostics", dependencies=[Depends(authorize)])
+    def diagnose_profile_export(profile: str):
+        diagnose = getattr(context.executor, "diagnose_profile_export", None)
+        if not callable(diagnose):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung diagnosis sesi profil.",
+                status_code=404,
+            )
+        try:
+            result = diagnose(profile)
+        except ValueError as exc:
+            known_codes = {
+                "PROFILE_IDENTITY_MISSING", "PROFILE_IDENTITY_INVALID", "PROFILE_IDENTITY_UNSAFE",
+                "PROFILE_ROOT_SESSION_MISSING", "PROFILE_USER1_SESSION_MISSING",
+                "PROFILE_ROOT_SESSION_EMPTY", "PROFILE_USER1_SESSION_EMPTY",
+                "PROFILE_SESSION_UNSAFE", "PROFILE_SESSION_UNREADABLE", "PROFILE_SESSION_BUSY",
+                "PROFILE_SESSION_UNAVAILABLE",
+            }
+            code = str(exc) if str(exc) in known_codes else "PROFILE_SESSION_UNAVAILABLE"
+            return {
+                "ready": False,
+                "reason_codes": [code],
+                "checks": [{"name": "profile_session", "ready": False, "code": code}],
+            }
+        except Exception:
+            LOGGER.warning("Worker profile diagnosis failed")
+            raise DomainError(
+                "PROFILE_DIAGNOSTICS_FAILED",
+                "Worker tidak dapat memeriksa sesi profil.",
+                status_code=503,
+            ) from None
+        if not isinstance(result, dict):
+            raise DomainError(
+                "PROFILE_DIAGNOSTICS_FAILED",
+                "Worker tidak dapat memeriksa sesi profil.",
+                status_code=503,
+            )
+        return result
+
     @app.post("/internal/v1/profiles/{profile}/session/commit", dependencies=[Depends(authorize)])
     def commit_profile_bundle(profile: str, body: dict[str, Any]):
         return {"committed": context.executor.commit_profile_bundle(profile, str(body.get("operation_id") or ""))}

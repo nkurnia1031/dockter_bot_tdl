@@ -84,7 +84,21 @@ class FakeDispatcher:
         return {"position": 1}
 
     def capabilities(self, worker):
-        return {"capabilities": ["tts"] if self.tts_ready else []}
+        del worker
+        health = dict(self.tts_health_result)
+        if self.tts_ready:
+            health["helpers_ready"] = True
+            health["helpers"] = [
+                {"slot": slot, "status": "ready", "bootstrap_percent": 100, "checked_at": "now"}
+                for slot in range(1, 4)
+            ]
+        profiles = list(health.get("available_profiles") or []) if self.tts_ready else []
+        return {
+            "tts": self.tts_ready,
+            "capabilities": ["tts"] if self.tts_ready else [],
+            "tts_profiles": profiles,
+            "tts_health": health,
+        }
 
     def tts_health(self, worker):
         del worker
@@ -208,6 +222,7 @@ class FakeProfileProvisioner:
     def __init__(self):
         self.uploaded = None
         self.login = None
+        self.store = FakeDiagnosticStore()
 
     def profiles(self, actor_user_id=None):
         del actor_user_id
@@ -230,14 +245,54 @@ class FakeProfileProvisioner:
         self.login_input_call = (operation_id, actor_user_id, field, value)
         return {"status": "waiting_input", "step": "password"}
 
-    def retry(self, operation_id, actor_user_id):
+    def diagnose_adoption(self, profile, worker, actor_user_id):
+        self.store.append_diagnostic_log(
+            category="profile_export",
+            actor_user_id=actor_user_id,
+            profile=profile,
+            worker=worker,
+            event_type="source_check",
+            code="PROFILE_SOURCE_READY",
+            details={"ready": True},
+        )
+        return {
+            "profile": profile,
+            "worker": worker,
+            "ready": True,
+            "reason_codes": [],
+            "checks": [{"name": "root_session", "ready": True, "code": "PROFILE_ROOT_SESSION_READY"}],
+            "logs_url": "/api/v1/diagnostics/profile-exports/logs?limit=100",
+        }
+
+    def retry(self, operation_id, actor_user_id, source_worker=None):
+        self.retry_call = (operation_id, actor_user_id, source_worker)
         return None
 
     def cancel(self, operation_id, actor_user_id):
         return {"cancelled": True}
 
     def adopt(self, profile, worker, actor_user_id):
+        self.adopt_call = (profile, worker, actor_user_id)
         return "operation-adopt"
+
+
+class FakeDiagnosticStore:
+    def __init__(self):
+        self.logs = []
+
+    def append_diagnostic_log(self, **values):
+        self.logs.append(dict(values))
+
+    def diagnostic_logs(self, actor_user_id, category, limit=100):
+        return [
+            {"worker": item.get("worker"), "code": item.get("code"), "details": item.get("details") or {}}
+            for item in self.logs
+            if item.get("actor_user_id") == actor_user_id and item.get("category") == category
+        ][:limit]
+
+    def provisioning_logs(self, operation_id, actor_user_id, limit=500):
+        del operation_id, actor_user_id, limit
+        return []
 
 
 class BackendApiTests(unittest.TestCase):
@@ -841,6 +896,39 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(state.json()["login"]["step"], "qr")
         self.assertNotIn("actor_user_id", state.text)
 
+    def test_profile_adoption_runs_as_a_background_operation_and_exposes_json_logs(self):
+        headers = self.login()
+        provisioner = FakeProfileProvisioner()
+        self.context.profile_provisioner = provisioner
+
+        denied = self.client.post(
+            "/api/v1/profiles/default/adoption-diagnostics", json={"worker": "local"}
+        )
+        self.assertEqual(denied.status_code, 401)
+        checked = self.client.post(
+            "/api/v1/profiles/default/adoption-diagnostics",
+            headers=headers,
+            json={"worker": "local"},
+        )
+        self.assertEqual(checked.status_code, 200, checked.text)
+        self.assertTrue(checked.json()["ready"])
+
+        adopted = self.client.post(
+            "/api/v1/profiles/default/adopt",
+            headers=headers,
+            json={"worker": "local"},
+        )
+        self.assertEqual(adopted.status_code, 200, adopted.text)
+        self.assertEqual(adopted.json(), {"id": "operation-adopt", "status": "validating"})
+        self.assertEqual(provisioner.adopt_call, ("default", "local", 42))
+
+        logs = self.client.get(
+            "/api/v1/diagnostics/profile-exports/logs?limit=50", headers=headers
+        )
+        self.assertEqual(logs.status_code, 200, logs.text)
+        self.assertEqual(logs.json()["items"][0]["worker"], "local")
+        self.assertEqual(logs.json()["items"][0]["code"], "PROFILE_SOURCE_READY")
+
     def test_profile_management_uses_fast_worker_health_check(self):
         headers = self.login()
         self.context.profile_provisioner = FakeProfileProvisioner()
@@ -894,6 +982,7 @@ class BackendApiTests(unittest.TestCase):
                 for slot in range(1, 4)
             ],
         }
+        self.dispatcher.tts_ready = True
         ready = self.client.get("/api/v1/workers/local/tts/health", headers=headers)
         self.assertEqual(ready.status_code, 200, ready.text)
         self.assertTrue(ready.json()["ready"])
@@ -2327,6 +2416,8 @@ class BackendApiTests(unittest.TestCase):
         self.workers.upsert("remote-tts", "http://remote-tts", "remote-token")
         headers = self.login()
 
+        self.dispatcher.tts_health_result["available_profiles"] = ["default"]
+
         options = self.client.get("/api/v1/tts/workers", headers=headers)
         self.assertEqual(options.status_code, 200, options.text)
         self.assertEqual(
@@ -2334,6 +2425,7 @@ class BackendApiTests(unittest.TestCase):
             {"local", "remote-tts"},
         )
         self.assertTrue(all(item["queued_jobs"] == 0 for item in options.json()["items"]))
+        self.assertTrue(all(item["ready"] for item in options.json()["items"]))
 
         created = self.client.post(
             "/api/v1/tts/jobs",
@@ -2344,6 +2436,32 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(created.json()["worker"], "remote-tts")
         self.assertEqual(self.dispatcher.commands[-1][0], "remote-tts")
 
+    def test_tts_worker_diagnostics_are_complete_and_logs_are_authenticated_json(self):
+        headers = self.login()
+        store = ProfileProvisioningStore(
+            Path(self.temp.name) / "diagnostic.db", Path(self.temp.name) / "diagnostic-vault"
+        )
+        self.context.profile_provisioner = type("Provisioner", (), {"store": store})()
+        self.dispatcher.tts_health_result = {
+            "helpers_ready": False,
+            "available_profiles": ["default"],
+            "helpers": [
+                {"slot": slot, "status": "tor_unreachable", "bootstrap_percent": None}
+                for slot in range(1, 4)
+            ],
+        }
+        response = self.client.get("/api/v1/tts/workers", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["items"]), 1)
+        self.assertFalse(response.json()["items"][0]["ready"])
+        self.assertEqual(response.json()["items"][0]["reason_code"], "helpers_not_ready")
+
+        denied = self.client.get("/api/v1/diagnostics/tts/logs")
+        self.assertEqual(denied.status_code, 401)
+        logs = self.client.get("/api/v1/diagnostics/tts/logs?limit=20", headers=headers)
+        self.assertEqual(logs.status_code, 200, logs.text)
+        self.assertEqual(logs.json()["items"][0]["worker"], "local")
+        self.assertEqual(logs.json()["items"][0]["code"], "HELPERS_NOT_READY")
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,7 +25,31 @@ def _tts_chat_ref(context) -> str:
 def register_tts(app, context, *, current_actor, job_dict, require_internal, require_service):
     @app.get("/api/v1/tts/workers")
     def list_tts_workers(actor=Depends(current_actor)):
-        return {"items": context.control_plane.tts_worker_options(profile=actor.profile)}
+        items = context.control_plane.tts_worker_diagnostics(profile=actor.profile)
+        provisioner = context.profile_provisioner
+        if provisioner is not None:
+            for item in items:
+                provisioner.store.append_diagnostic_log(
+                    category="tts",
+                    actor_user_id=actor.telegram_user_id,
+                    profile=actor.profile,
+                    worker=item["name"],
+                    event_type="readiness_check",
+                    code=item["reason_code"],
+                    details=item,
+                )
+        return {"items": items}
+
+    @app.get("/api/v1/diagnostics/tts/logs")
+    def tts_diagnostic_logs(limit: int = Query(100, ge=1, le=500), actor=Depends(current_actor)):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError(
+                "DIAGNOSTIC_LOGS_UNAVAILABLE",
+                "Log diagnosis belum tersedia.",
+                status_code=503,
+            )
+        return {"items": provisioner.store.diagnostic_logs(actor.telegram_user_id, "tts", limit)}
 
     @app.post("/api/v1/tts/jobs", response_model=JobResponse)
     def submit_tts(body: TtsJobRequest, actor=Depends(current_actor)):

@@ -29,7 +29,7 @@
   type WorkerOpsDraft = { job_stall: string; export_stall: string; download_stall: string };
   type TtsHelperStatus = 'ready' | 'bootstrapping' | 'tor_unreachable' | 'helper_unreachable';
   type TtsHelper = { slot: number; status: TtsHelperStatus; bootstrap_percent: number | null; checked_at: string | null };
-  type TtsHealth = { worker: string; ready: boolean; helpers_ready: boolean; profile_session_ready: boolean; helpers: TtsHelper[] };
+  type TtsHealth = { worker: string; ready: boolean; helpers_ready: boolean; capability_ready: boolean; profile_session_ready: boolean; profile_sync_ready: boolean; reason_code: string; helpers: TtsHelper[] };
   let workers = $state<Worker[]>([]);
   let name = $state(''); let url = $state(''); let token = $state(''); let message = $state('');
   let editing = $state<Worker|null>(null); let deleting = $state<Worker|null>(null); let editOpen = $state(false); let deleteOpen = $state(false); let editUrl = $state(''); let editToken = $state('');
@@ -257,7 +257,8 @@
                     </div>
                     {#if ttsHealth[worker.name]}
                       {@const health = ttsHealth[worker.name]}
-                      <p class="muted mt-3 text-xs">Sesi profil aktif: {health.profile_session_ready ? 'tersedia' : 'belum tersedia pada worker ini'} · Kesiapan helper: {health.helpers_ready ? 'siap' : 'belum siap'}</p>
+                      <p class="muted mt-3 text-xs">Status job TTS: {health.ready ? 'siap' : health.reason_code} · Capability: {health.capability_ready ? 'siap' : 'belum tersedia'} · Sesi profil aktif: {health.profile_session_ready ? 'tersedia' : 'belum tersedia'} · Sinkronisasi vault: {health.profile_sync_ready ? 'terkonfirmasi' : 'belum terkonfirmasi'} · Kesiapan helper: {health.helpers_ready ? 'siap' : 'belum siap'}</p>
+                      <a class="muted mt-2 inline-block text-xs underline" href="/api/v1/diagnostics/tts/logs?limit=100" target="_blank" rel="noreferrer">Log diagnosis TTS JSON</a>
                       <div class="mt-3 grid gap-2 sm:grid-cols-3">
                         {#each health.helpers as helper (helper.slot)}
                           <div class="rounded-lg bg-[var(--panel)] p-3" data-testid={`tts-helper-${worker.name}-${helper.slot}`}>

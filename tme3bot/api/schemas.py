@@ -181,7 +181,10 @@ class WorkerTtsHealthResponse(ApiResponse):
     settings_version: int = 0
     ready: bool
     helpers_ready: bool
+    capability_ready: bool = False
     profile_session_ready: bool
+    profile_sync_ready: bool = False
+    reason_code: str = "unknown"
     helpers: list[TtsHelperHealthItem]
 
 

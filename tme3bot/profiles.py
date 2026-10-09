@@ -321,6 +321,14 @@ class ProfileManager:
             self._runtimes[normalized] = runtime
             return runtime
 
+    def cached_runtime(self, profile_name: str) -> ProfileRuntime | None:
+        """Return an already initialized runtime without creating profile files."""
+        normalized = normalize_profile_name(profile_name)
+        if not normalized:
+            return None
+        with self._lock:
+            return self._runtimes.get(normalized)
+
     def refresh_profile_runtime(self, profile_name: str) -> None:
         """Refresh cached session paths after a locked install or rollback."""
         normalized = normalize_profile_name(profile_name) or self.default_profile

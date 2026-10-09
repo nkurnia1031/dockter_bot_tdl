@@ -155,6 +155,14 @@ class ControlPlaneTests(unittest.TestCase):
         dispatcher.capabilities = lambda worker: {
             "tts": worker in {"tts-ready", "remote"},
             "capabilities": ["tts"] if worker in {"tts-ready", "remote"} else [],
+            "tts_profiles": ["default", "archive"] if worker in {"tts-ready", "remote"} else [],
+            "tts_health": {
+                "helpers_ready": worker in {"tts-ready", "remote"},
+                "helpers": [
+                    {"slot": slot, "status": "ready" if worker in {"tts-ready", "remote"} else "helper_unreachable"}
+                    for slot in range(1, 4)
+                ],
+            },
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
 
@@ -176,7 +184,15 @@ class ControlPlaneTests(unittest.TestCase):
             {"tts-ready": "a"},
         )
         dispatcher = FakeDispatcher()
-        dispatcher.capabilities = lambda worker: {"tts": True, "capabilities": ["tts"]}
+        dispatcher.capabilities = lambda worker: {
+            "tts": True,
+            "capabilities": ["tts"],
+            "tts_profiles": ["default", "archive"],
+            "tts_health": {
+                "helpers_ready": True,
+                "helpers": [{"slot": slot, "status": "ready"} for slot in range(1, 4)],
+            },
+        }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
 
         first = control.submit_job(self.actor, "tts", {"title": "A", "text": "one"})
@@ -198,6 +214,30 @@ class ControlPlaneTests(unittest.TestCase):
             control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
         self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
         self.assertEqual(self.jobs.count(kind="tts"), 0)
+
+    def test_explicit_false_tts_capability_is_not_overridden_by_a_stale_capability_list(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "stale-tts-capability.json",
+            {"local": "http://worker"},
+            {"local": "token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "tts": False,
+            "capabilities": ["tts"],
+            "tts_profiles": ["default"],
+            "tts_health": {
+                "helpers_ready": True,
+                "helpers": [{"slot": slot, "status": "ready"} for slot in range(1, 4)],
+            },
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+
+        status = control.tts_worker_diagnostics(profile="default")
+
+        self.assertFalse(status[0]["ready"])
+        self.assertFalse(status[0]["capability_ready"])
+        self.assertEqual(status[0]["reason_code"], "tts_capability_missing")
 
     def test_safelink_durable_job_auto_routes_and_keeps_input_private(self):
         registry = WorkerRegistry(
@@ -321,6 +361,14 @@ class ControlPlaneTests(unittest.TestCase):
             "tts": True,
             "capabilities": ["tts"],
             "tts_profiles": ["default"] if worker == "tts-default" else ["archive"],
+            "tts_health": {
+                "ready": True,
+                "helpers_ready": True,
+                "helpers": [
+                    {"slot": slot, "status": "ready", "bootstrap_percent": 100}
+                    for slot in range(1, 4)
+                ],
+            },
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
 

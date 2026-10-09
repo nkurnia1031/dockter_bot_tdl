@@ -797,6 +797,29 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         except Exception as exc:
             raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker login belum dapat dihubungi.", status_code=503) from exc
 
+    @app.get("/api/v1/profiles/provisionings/{operation_id}/logs")
+    def profile_provisioning_logs(
+        operation_id: str,
+        limit: int = Query(500, ge=1, le=500),
+        actor=Depends(current_actor),
+    ):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Log provisioning belum tersedia.", status_code=503)
+        items = provisioner.store.provisioning_logs(operation_id, actor.telegram_user_id, limit)
+        if items is None:
+            raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404)
+        return {"items": items}
+
+    @app.get("/api/v1/diagnostics/profile-exports/logs")
+    def profile_export_diagnostic_logs(
+        limit: int = Query(100, ge=1, le=500), actor=Depends(current_actor)
+    ):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("DIAGNOSTIC_LOGS_UNAVAILABLE", "Log diagnosis belum tersedia.", status_code=503)
+        return {"items": provisioner.store.diagnostic_logs(actor.telegram_user_id, "profile_export", limit)}
+
     @app.post("/api/v1/profiles/provisionings/{operation_id}/input")
     def profile_login_input(operation_id: str, body: dict[str, Any], actor=Depends(current_actor)):
         if context.profile_provisioner is None:
@@ -816,15 +839,23 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker login TDL tidak dapat dihubungi.", status_code=503) from exc
 
     @app.post("/api/v1/profiles/provisionings/{operation_id}/retry")
-    def retry_profile_provisioning(operation_id: str, actor=Depends(current_actor)):
+    def retry_profile_provisioning(
+        operation_id: str, body: dict[str, Any] | None = None, actor=Depends(current_actor)
+    ):
         if context.profile_provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
         try:
-            context.profile_provisioner.retry(operation_id, actor.telegram_user_id)
+            context.profile_provisioner.retry(
+                operation_id,
+                actor.telegram_user_id,
+                str((body or {}).get("worker") or "") or None,
+            )
         except KeyError as exc:
             raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404) from exc
         except PermissionError as exc:
             raise DomainError("PROFILE_PROVISIONING_FORBIDDEN", "Provisioning dimiliki actor lain.", status_code=403) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_PROVISIONING_RETRY_INVALID", str(exc), status_code=409) from exc
         return {"retried": True}
 
     @app.delete("/api/v1/profiles/provisionings/{operation_id}")
@@ -855,7 +886,26 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError("PROFILE_ADOPTION_INVALID", str(exc), status_code=409) from exc
         except Exception as exc:
             raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker sumber tidak dapat mengekspor sesi profil.", status_code=503) from exc
-        return {"id": operation_id, "status": "distributing"}
+        return {"id": operation_id, "status": "validating"}
+
+    @app.post("/api/v1/profiles/{profile}/adoption-diagnostics")
+    def diagnose_profile_adoption(profile: str, body: dict[str, Any], actor=Depends(current_actor)):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            return provisioner.diagnose_adoption(
+                profile,
+                str(body.get("worker") or ""),
+                actor.telegram_user_id,
+            )
+        except FileExistsError as exc:
+            raise DomainError("PROFILE_ALREADY_VAULTED", str(exc), status_code=409) from exc
+        except KeyError as exc:
+            raise DomainError("PROFILE_OR_WORKER_NOT_FOUND", "Profil atau worker sumber tidak ditemukan.", status_code=404) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_ADOPTION_INVALID", str(exc), status_code=409) from exc
+
 
     from tme3bot.api.routes.jobs import register_jobs
     register_jobs(

@@ -6,8 +6,9 @@
 
   type Worker = { name: string; enabled: boolean; online: boolean; secure: boolean };
   type WorkerState = { worker: string; status: string; error?: string };
-  type Profile = { name: string; active: boolean; status: string; source?: string; vault: boolean; adoptable?: boolean; operation_id?: string; workers: WorkerState[] };
-  type Operation = { id: string; profile: string; status: string; source: string; error?: string; workers: WorkerState[]; login?: { status: string; step?: string; qr_text?: string; error?: string } };
+  type Profile = { name: string; active: boolean; status: string; source?: string; vault: boolean; adoptable?: boolean; operation_id?: string; bootstrap_worker?: string; error?: string; workers: WorkerState[] };
+  type Operation = { id: string; profile: string; status: string; source: string; bootstrap_worker?: string; error?: string; workers: WorkerState[]; login?: { status: string; step?: string; qr_text?: string; error?: string } };
+  type AdoptionCheck = { profile: string; worker: string; ready: boolean; reason_codes: string[]; checks: { name: string; ready: boolean; code?: string }[]; logs_url: string };
 
   let profiles = $state<Profile[]>([]);
   let workers = $state<Worker[]>([]);
@@ -21,6 +22,9 @@
   let operation = $state<Operation | null>(null);
   let adopting = $state('');
   let adoptWorker = $state('');
+  let adoptionCheck = $state<AdoptionCheck | null>(null);
+  let checkingAdoption = $state(false);
+  let retrySourceWorker = $state('');
   let loading = $state(false);
   let saving = $state(false);
   let message = $state('');
@@ -44,6 +48,8 @@
             profile: pending.name,
             status: pending.status,
             source: pending.source || 'upload',
+            bootstrap_worker: pending.bootstrap_worker,
+            error: pending.error,
             workers: pending.workers || []
           };
         }
@@ -130,20 +136,42 @@
     } finally { saving = false; }
   }
 
-  async function retryOperation(id: string) {
+  async function retryOperation(id: string, sourceWorker?: string) {
     failure = '';
-    try { await post(`/profiles/provisionings/${encodeURIComponent(id)}/retry`); await load(); }
+    try {
+      await post(`/profiles/provisionings/${encodeURIComponent(id)}/retry`, sourceWorker ? { worker: sourceWorker } : undefined);
+      operation = await api<Operation>(`/profiles/provisionings/${encodeURIComponent(id)}`);
+      retrySourceWorker = '';
+      await load();
+    }
     catch (cause) { failure = cause instanceof Error ? cause.message : 'Retry distribusi gagal.'; }
   }
 
+  async function diagnoseAdoption(profileName: string) {
+    if (!adoptWorker || checkingAdoption || saving) return;
+    checkingAdoption = true;
+    adoptionCheck = null;
+    failure = '';
+    try {
+      adoptionCheck = await post<AdoptionCheck>(`/profiles/${encodeURIComponent(profileName)}/adoption-diagnostics`, { worker: adoptWorker });
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : 'Pemeriksaan sesi worker gagal.';
+    } finally {
+      checkingAdoption = false;
+    }
+  }
+
   async function adoptProfile(profileName: string) {
-    if (!adopting || !adoptWorker) return;
+    if (!adopting || !adoptWorker || !adoptionCheck?.ready || adoptionCheck.profile !== adopting || adoptionCheck.worker !== adoptWorker) return;
     failure = ''; saving = true;
     try {
       const result = await post<{ id: string; status: string }>(`/profiles/${encodeURIComponent(profileName)}/adopt`, { worker: adoptWorker });
-      operation = { id: result.id, profile: profileName, status: result.status, source: 'adoption', workers: [] };
-      message = `Sesi ${profileName} disalin dari ${adoptWorker} ke semua worker. Profil dijeda sementara sinkronisasi berlangsung.`;
-      adopting = ''; adoptWorker = ''; await load();
+      operation = { id: result.id, profile: profileName, status: result.status, source: 'adoption', bootstrap_worker: adoptWorker, workers: [] };
+      message = `Ekspor sesi ${profileName} dari ${adoptWorker} berjalan di background. Buka log JSON atau perbarui status untuk melihat hasilnya.`;
+      profiles = profiles.map((item) => item.name === profileName
+        ? { ...item, status: result.status, source: 'adoption', operation_id: result.id, bootstrap_worker: adoptWorker }
+        : item);
+      adopting = ''; adoptWorker = ''; adoptionCheck = null;
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Adopsi profil gagal.';
     } finally { saving = false; }
@@ -189,7 +217,7 @@
 
     {#if operation}
       <article class="mt-5 rounded-2xl border border-violet-300/50 bg-violet-50/50 p-4 dark:bg-violet-950/20">
-        <div class="flex flex-wrap items-center justify-between gap-2"><div><p class="text-xs font-bold uppercase tracking-wider text-violet-600">Provisioning {operation.profile}</p><p class="mt-1 font-bold">{profileStatus(operation.status)}</p></div><div class="flex gap-2"><button class="button secondary !px-3 !py-2" onclick={() => refreshOperation(operation!.id)} disabled={loading || saving} aria-label="Perbarui status provisioning"><RefreshCw size={15}/>Perbarui status</button>{#if operation.source !== 'adoption'}<button class="button secondary !px-3 !py-2" onclick={cancelOperation} disabled={saving || operation.status === 'active'}><X size={15}/>Batalkan</button>{/if}</div></div>
+        <div class="flex flex-wrap items-center justify-between gap-2"><div><p class="text-xs font-bold uppercase tracking-wider text-violet-600">Provisioning {operation.profile}</p><p class="mt-1 font-bold">{profileStatus(operation.status)}</p></div><div class="flex flex-wrap gap-2"><a class="button secondary !px-3 !py-2" href={`/api/v1/profiles/provisionings/${encodeURIComponent(operation.id)}/logs?limit=500`} target="_blank" rel="noreferrer">Log JSON</a><button class="button secondary !px-3 !py-2" onclick={() => refreshOperation(operation!.id)} disabled={loading || saving} aria-label="Perbarui status provisioning"><RefreshCw size={15}/>Perbarui status</button>{#if operation.status !== 'active' && operation.status !== 'distributing'}<button class="button secondary !px-3 !py-2" onclick={cancelOperation} disabled={saving}><X size={15}/>Batalkan</button>{/if}</div></div>
         {#if operation.login && operation.status === 'authenticating'}
           <div class="mt-4 space-y-3">
             {#if operation.login.step === 'qr'}
@@ -204,6 +232,14 @@
         {/if}
         {#if operation.status === 'validating'}<p class="muted mt-3 text-sm">Worker memvalidasi sesi TDL di background. Perbarui status untuk melihat hasilnya.</p>{/if}
         {#if operation.error}<p class="mt-3 text-sm text-rose-600">{operation.error}</p>{/if}
+        {#if operation.source === 'adoption' && operation.status === 'failed'}
+          <div class="mt-4 flex flex-wrap items-end gap-2 rounded-xl border border-rose-300/40 p-3">
+            <label class="min-w-48 flex-1 text-xs font-bold">Worker sumber
+              <select class="field mt-1" bind:value={retrySourceWorker}><option value="">{operation.bootstrap_worker || 'Pilih worker'}</option>{#each availableWorkers as item}<option value={item.name}>{item.name}</option>{/each}</select>
+            </label>
+            <button class="button" onclick={() => retryOperation(operation!.id, retrySourceWorker || operation!.bootstrap_worker)} disabled={saving || !availableWorkers.length}><RefreshCw size={15}/>Coba ekspor lagi</button>
+          </div>
+        {/if}
         {#if operation.workers?.length}<div class="mt-4 grid gap-2 sm:grid-cols-2">{#each operation.workers as item}<div class="rounded-lg border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm"><div class="flex items-center justify-between gap-2"><span class="font-semibold">{item.worker}</span><span class="badge">{workerStatus(item.status)}</span></div>{#if item.error}<p class="muted mt-1 text-xs">{item.error}</p>{/if}</div>{/each}</div>{/if}
       </article>
     {/if}
@@ -213,9 +249,12 @@
         <article class="rounded-2xl border border-[var(--line)] p-4">
           <div class="flex flex-wrap items-center justify-between gap-2"><div class="flex items-center gap-2"><h3 class="font-extrabold">{profile.name}</h3><span class="badge">{profileStatus(profile.status)}</span></div>{#if profile.vault && profile.operation_id && (profile.status !== 'active' || profile.workers.some((item) => item.status !== 'ready'))}<button class="button secondary !px-3 !py-2" onclick={() => retryOperation(profile.operation_id!)}><RefreshCw size={14}/>Retry</button>{/if}</div>
           {#if profile.workers?.length}<div class="mt-3 grid gap-2 sm:grid-cols-2">{#each profile.workers as item}<div class="rounded-lg bg-[var(--panel-strong)] px-3 py-2 text-xs"><div class="flex items-center justify-between gap-2"><span class="font-semibold">{item.worker}</span><span class={item.status === 'ready' ? 'text-emerald-600' : 'text-amber-600'}>{workerStatus(item.status)}</span></div>{#if item.error}<p class="muted mt-1">{item.error}</p>{/if}</div>{/each}</div>{/if}
-          {#if profile.status === 'legacy' && profile.adoptable !== false}
+          {#if profile.error}<p class="mt-2 text-sm text-rose-600">{profile.error}</p>{/if}
+          {#if (profile.status === 'legacy' || (profile.source === 'adoption' && profile.status === 'failed')) && profile.adoptable !== false}
             {#if adopting === profile.name}
-              <div class="mt-4 rounded-xl border border-amber-300/50 bg-amber-50 p-3 text-sm dark:bg-amber-950/20"><p>Sesi `root` dan `user1` dari worker terpilih akan menggantikan sesi profil ini di semua worker. Profil sementara tidak dapat dipakai sampai seluruh worker selesai.</p><div class="mt-3 flex flex-wrap gap-2"><select class="field min-w-44 flex-1" bind:value={adoptWorker}><option value="">Worker sumber</option>{#each availableWorkers as item}<option value={item.name}>{item.name}</option>{/each}</select><button class="button" onclick={() => adoptProfile(profile.name)} disabled={saving || !adoptWorker}>Adopsi dan sebarkan</button><button class="button secondary" onclick={() => adopting = ''}>Batal</button></div></div>
+              <div class="mt-4 rounded-xl border border-amber-300/50 bg-amber-50 p-3 text-sm dark:bg-amber-950/20"><p>Sesi `root` dan `user1` dari worker terpilih akan disalin ke vault, lalu disebarkan ke semua worker. Periksa sumber sebelum memulai.</p><div class="mt-3 flex flex-wrap gap-2"><select class="field min-w-44 flex-1" bind:value={adoptWorker} onchange={() => adoptionCheck = null}><option value="">Worker sumber</option>{#each availableWorkers as item}<option value={item.name}>{item.name}</option>{/each}</select><button class="button secondary" onclick={() => diagnoseAdoption(profile.name)} disabled={checkingAdoption || saving || !adoptWorker}><RefreshCw size={15}/>{checkingAdoption ? 'Memeriksa...' : 'Periksa sumber'}</button>{#if adoptionCheck?.ready && adoptionCheck.profile === profile.name && adoptionCheck.worker === adoptWorker}<button class="button" onclick={() => adoptProfile(profile.name)} disabled={saving}>Adopsi dan sebarkan</button>{/if}<button class="button secondary" onclick={() => { adopting = ''; adoptionCheck = null; }}>Batal</button></div>
+                {#if adoptionCheck?.profile === profile.name && adoptionCheck.worker === adoptWorker}<div class="mt-3 rounded-lg bg-[var(--panel)] p-3"><p class={adoptionCheck.ready ? 'text-emerald-600' : 'text-amber-600'}>{adoptionCheck.ready ? 'Sesi root dan user1 tersedia untuk diekspor.' : `Belum siap: ${adoptionCheck.reason_codes.join(', ')}`}</p>{#if adoptionCheck.checks.length}<ul class="muted mt-2 space-y-1 text-xs">{#each adoptionCheck.checks as check}<li>{check.ready ? '✓' : '✕'} {check.name}: {check.code || (check.ready ? 'ready' : 'not_ready')}</li>{/each}</ul>{/if}<a class="muted mt-2 inline-block text-xs underline" href={adoptionCheck.logs_url} target="_blank" rel="noreferrer">Buka log diagnosis JSON</a></div>{/if}
+              </div>
             {:else}<button class="button secondary mt-3" onclick={() => { adopting = profile.name; adoptWorker = availableWorkers[0]?.name || ''; }} disabled={!availableWorkers.length}>Adopsi ke vault</button>{/if}
           {/if}
         </article>

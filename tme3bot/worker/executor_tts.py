@@ -62,7 +62,24 @@ class TtsExecutorMixin:
     def tts_health(self) -> dict[str, Any]:
         pipeline = self._tts_pipeline()
         health = pipeline.diagnostics()
-        health["available_profiles"] = self.available_storage_profiles()
+        available_profiles = self.available_storage_profiles()
+        profile_sync = getattr(self, "profile_sync", None)
+        sync_enabled = bool(getattr(profile_sync, "enabled", False))
+        ready_profiles = available_profiles
+        if sync_enabled:
+            ready_profiles = [
+                profile for profile in available_profiles
+                if profile_sync.profile_ready(profile)
+            ]
+        helpers = health.get("helpers")
+        helpers_ready = bool(health.get("helpers_ready")) and isinstance(helpers, list) and len(helpers) == 3 and all(
+            isinstance(item, dict) and item.get("status") == "ready" for item in helpers
+        )
+        health["helpers_ready"] = helpers_ready
+        health["available_profiles"] = available_profiles
+        health["tts_profiles"] = ready_profiles
+        health["profile_sync_enabled"] = sync_enabled
+        health["ready"] = helpers_ready and bool(ready_profiles)
         return health
 
     def recover_tts_helper(self, slot: int) -> dict[str, Any]:

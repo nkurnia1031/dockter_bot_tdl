@@ -103,13 +103,21 @@ class TtsExecutorTests(unittest.TestCase):
             executor = _Executor(directory)
             executor.profile_manager.list_profiles = lambda: ["default"]
             executor.config.utility_workspace_root = directory
-            with patch.object(executor, "tts_health", return_value={"helpers_ready": True}):
+            with patch.object(executor, "tts_health", return_value={
+                "helpers_ready": True,
+                "ready": True,
+                "tts_profiles": ["default"],
+            }):
                 ready = WorkerJobExecutor.capabilities(executor)
             self.assertTrue(ready["tts"])
             self.assertEqual(ready["tts_profiles"], ["default"])
 
             executor.available_storage_profiles = lambda: []
-            with patch.object(executor, "tts_health", return_value={"helpers_ready": True}):
+            with patch.object(executor, "tts_health", return_value={
+                "helpers_ready": True,
+                "ready": False,
+                "tts_profiles": [],
+            }):
                 no_profile = WorkerJobExecutor.capabilities(executor)
             self.assertFalse(no_profile["tts"])
             self.assertEqual(no_profile["tts_profiles"], [])

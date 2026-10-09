@@ -1,15 +1,24 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { Volume2 } from '@lucide/svelte';
+  import { RefreshCw, Volume2 } from '@lucide/svelte';
   import JobTable from '$lib/components/JobTable.svelte';
   import { api, post, put } from '$lib/api';
   import { normalizeTdlChatRef } from '$lib/chatRef';
 
-  type TtsWorker = { name: string; queued_jobs: number };
+  type Helper = { slot: number; status: string; bootstrap_percent?: number | null };
+  type TtsWorker = {
+    name: string;
+    enabled: boolean;
+    ready: boolean;
+    queued_jobs: number;
+    reason_code: string;
+    helpers: Helper[];
+  };
 
   let title = $state('');
   let text = $state('');
   let workers = $state<TtsWorker[]>([]);
+  let workersRefreshing = $state(false);
   let worker = $state('');
   let workersLoading = $state(true);
   let chatConfigured = $state(false);
@@ -21,17 +30,37 @@
   let error = $state('');
   let notice = $state('');
   const maxChars = 100_000;
+  const readyWorkers = $derived(workers.filter((item) => item.ready));
+  const workerReason = (code: string) => ({
+    ready: 'Siap menerima job',
+    worker_disabled: 'Dinonaktifkan untuk job baru',
+    worker_unavailable: 'Worker tidak dapat dihubungi',
+    worker_update_required: 'Perlu update worker',
+    helpers_not_ready: 'Helper gTTS atau Tor belum siap',
+    profile_not_available: 'Profil belum tersedia di worker',
+    profile_not_synced: 'Sinkronisasi profil belum terkonfirmasi',
+    tts_capability_missing: 'Capability TTS belum dilaporkan',
+    capability_unavailable: 'Capability worker belum dapat diperiksa',
+  } as Record<string, string>)[code] || code;
 
   async function loadWorkers() {
     workersLoading = true;
     try {
       const result = await api<{ items: TtsWorker[] }>('/tts/workers');
       workers = result.items || [];
+      if (worker && !workers.some((item) => item.name === worker && item.ready)) worker = '';
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Daftar worker TTS gagal dimuat.';
     } finally {
       workersLoading = false;
+      workersRefreshing = false;
     }
+  }
+
+  async function refreshWorkers() {
+    if (workersRefreshing) return;
+    workersRefreshing = true;
+    await loadWorkers();
   }
 
   async function loadChatStatus() {
@@ -131,14 +160,30 @@
     <p class="muted mt-2 text-xs">Terima ID numeric, username, link publik t.me, dan nomor telepon internasional. Tujuan harus bisa dijangkau sesi TDL pada profile aktif.</p>
   </div>
   <div>
-    <h2 class="text-lg font-extrabold">Worker TTS</h2>
-    <p class="muted mt-1 text-sm">Worker yang ditampilkan sudah melaporkan helper gTTS dan jalur Tor siap.</p>
+    <div class="flex items-center justify-between gap-3">
+      <h2 class="text-lg font-extrabold">Worker TTS</h2>
+      <button class="button secondary !px-3 !py-2" onclick={refreshWorkers} disabled={workersLoading || workersRefreshing}>
+        <RefreshCw size={15}/>{workersRefreshing ? 'Memeriksa...' : 'Periksa ulang'}
+      </button>
+    </div>
+    <p class="muted mt-1 text-sm">Kesiapan dihitung dengan pemeriksaan capability dan profil yang sama dengan routing job.</p>
     {#if workersLoading}
       <p class="muted mt-3 text-sm">Memeriksa worker...</p>
-    {:else if workers.length === 0}
-      <p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker TTS yang siap untuk profile aktif. Periksa helper, Tor, dan sesi TDL profile dari halaman Workers.</p>
     {:else}
-      <div class="mt-3 flex flex-wrap gap-2">{#each workers as option}<span class="badge">{option.name} · {option.queued_jobs} job</span>{/each}</div>
+      {#if workers.length === 0}<p class="muted mt-3 text-sm">Belum ada worker terdaftar.</p>{/if}
+      {#if workers.length > 0 && readyWorkers.length === 0}<p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker yang memenuhi syarat TTS untuk profil aktif. Lihat alasan tiap worker di bawah.</p>{/if}
+      <div class="mt-3 space-y-2">
+        {#each workers as option}
+          <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class="font-bold">{option.name}</span>
+              <span class={option.ready ? 'text-emerald-600' : 'text-amber-600'}>{workerReason(option.reason_code)}</span>
+            </div>
+            <p class="muted mt-1 text-xs">{option.ready ? `${option.queued_jobs} job dalam antrean` : option.helpers?.length ? option.helpers.map((helper) => `H${helper.slot}: ${helper.status}`).join(' · ') : 'Periksa status worker dan sesi profil di menu Workers.'}</p>
+          </div>
+        {/each}
+      </div>
+      <a class="muted mt-2 inline-block text-xs underline" href="/api/v1/diagnostics/tts/logs?limit=100" target="_blank" rel="noreferrer">Buka log diagnosis JSON</a>
     {/if}
   </div>
 </section>
@@ -149,11 +194,11 @@
     <p class="muted mt-1 text-sm">Teks maksimal 100.000 karakter. Monitor hanya menampilkan judul, jumlah karakter, progress, dan status.</p>
   </div>
   <form class="grid gap-4" onsubmit={submit}>
-    {#if workers.length > 0 && !workersLoading}
+    {#if readyWorkers.length > 0 && !workersLoading}
       <label class="grid gap-1.5 text-sm font-semibold">Worker untuk job ini
         <select class="field" bind:value={worker}>
           <option value="">Otomatis — antrean terpendek</option>
-          {#each workers as option}<option value={option.name}>{option.name} · {option.queued_jobs} job dalam antrean</option>{/each}
+          {#each readyWorkers as option}<option value={option.name}>{option.name} · {option.queued_jobs} job dalam antrean</option>{/each}
         </select>
       </label>
     {/if}
@@ -170,7 +215,7 @@
     {#if notice}<p role="status" class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">{notice}</p>{/if}
     <div class="flex flex-wrap items-center justify-between gap-3">
       <p class="muted text-xs">Pause berlaku setelah batch aktif selesai. Resume melanjutkan dari checkpoint.</p>
-      <button class="button primary" type="submit" disabled={submitting || workersLoading || workers.length === 0 || !title.trim() || !text.trim() || text.length > maxChars}>
+      <button class="button primary" type="submit" disabled={submitting || workersLoading || readyWorkers.length === 0 || !title.trim() || !text.trim() || text.length > maxChars}>
         <Volume2 size={16}/>{submitting ? 'Mengirim...' : 'Buat job TTS'}
       </button>
     </div>

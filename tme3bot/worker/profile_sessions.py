@@ -413,19 +413,25 @@ class ProfileSessionManager:
 
     def export_bundle(self, profile: str) -> tuple[int, bytes]:
         normalized = normalize_profile_name(profile)
+        if not normalized:
+            raise ValueError("PROFILE_NAME_INVALID")
         config = build_profile_config(self.config, normalized)
         root = Path(config.profile_root)
+        diagnosis = self.diagnose_export_bundle(normalized)
+        if not diagnosis["ready"]:
+            raise ValueError(str(diagnosis["reason_codes"][0]))
         try:
             identity = json.loads((root / "identity.json").read_text(encoding="utf-8"))
             user_id = int(identity.get("telegram_user_id", identity.get("tdl_user_id")))
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise ValueError("Identity profil belum tersedia pada worker.") from exc
+            raise ValueError("PROFILE_IDENTITY_MISSING") from exc
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for relative in ("root/.tdl", "user1/.tdl"):
                 source = root / relative
                 if not source.is_dir():
-                    raise ValueError(f"Sesi {relative} belum tersedia pada worker.")
+                    code = "PROFILE_ROOT_SESSION_MISSING" if relative.startswith("root/") else "PROFILE_USER1_SESSION_MISSING"
+                    raise ValueError(code)
                 for path in source.rglob("*"):
                     if path.is_file():
                         archive.write(path, path.relative_to(root).as_posix())
@@ -433,6 +439,65 @@ class ProfileSessionManager:
         data = output.getvalue()
         validate_profile_bundle(data)
         return user_id, data
+
+    def diagnose_export_bundle(self, profile: str) -> dict[str, Any]:
+        """Check whether a legacy profile can be exported without reading session contents."""
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            return {
+                "ready": False,
+                "reason_codes": ["PROFILE_NAME_INVALID"],
+                "checks": [{"name": "profile_name", "ready": False, "code": "PROFILE_NAME_INVALID"}],
+            }
+
+        root = Path(build_profile_config(self.config, normalized).profile_root)
+        checks: list[dict[str, Any]] = []
+
+        identity_path = root / "identity.json"
+        identity_ready = False
+        if root.is_symlink() or identity_path.is_symlink():
+            identity_code = "PROFILE_IDENTITY_UNSAFE"
+        else:
+            try:
+                identity = json.loads(identity_path.read_text(encoding="utf-8"))
+                if not isinstance(identity, dict):
+                    raise TypeError("identity must be an object")
+                identity_id = int(identity.get("telegram_user_id", identity.get("tdl_user_id")))
+                identity_ready = identity_id > 0
+                identity_code = "OK" if identity_ready else "PROFILE_IDENTITY_INVALID"
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                identity_code = "PROFILE_IDENTITY_MISSING"
+        checks.append({"name": "identity", "ready": identity_ready, "code": identity_code})
+
+        for key, relative in (("root_session", "root/.tdl"), ("user1_session", "user1/.tdl")):
+            session_root = root / relative
+            data_root = session_root / "data"
+            code = "OK"
+            ready = False
+            if root.is_symlink() or session_root.is_symlink() or data_root.is_symlink():
+                code = "PROFILE_SESSION_UNSAFE"
+            elif not session_root.is_dir() or not data_root.is_dir():
+                code = "PROFILE_ROOT_SESSION_MISSING" if key == "root_session" else "PROFILE_USER1_SESSION_MISSING"
+            else:
+                try:
+                    entries = list(session_root.rglob("*"))
+                    if any(item.is_symlink() for item in entries):
+                        code = "PROFILE_SESSION_UNSAFE"
+                    else:
+                        ready = any(
+                            item.is_file()
+                            and not item.is_symlink()
+                            and item.stat().st_size > 0
+                            for item in data_root.iterdir()
+                        )
+                        if not ready:
+                            code = "PROFILE_ROOT_SESSION_EMPTY" if key == "root_session" else "PROFILE_USER1_SESSION_EMPTY"
+                except OSError:
+                    code = "PROFILE_SESSION_UNREADABLE"
+            checks.append({"name": key, "ready": ready, "code": code})
+
+        reasons = [str(item["code"]) for item in checks if not item["ready"]]
+        return {"ready": not reasons, "reason_codes": reasons, "checks": checks}
 
     def verify_installed(self, profile: str, expected_user_id: int | None = None) -> int | bool:
         """Check identity and both private Bolt session trees without opening Bolt."""

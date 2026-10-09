@@ -309,6 +309,22 @@ class ProfileProvisioningStore:
                     discovered_at TEXT NOT NULL,
                     PRIMARY KEY(profile, telegram_user_id, source_worker)
                 );
+                CREATE TABLE IF NOT EXISTS profile_diagnostic_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL,
+                    actor_user_id INTEGER NOT NULL,
+                    operation_id TEXT,
+                    profile TEXT,
+                    worker TEXT,
+                    event_type TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_profile_diagnostic_logs_actor_category
+                    ON profile_diagnostic_logs(actor_user_id,category,id DESC);
+                CREATE INDEX IF NOT EXISTS idx_profile_diagnostic_logs_operation
+                    ON profile_diagnostic_logs(operation_id,id);
                 CREATE INDEX IF NOT EXISTS idx_profile_provisionings_status
                     ON profile_provisionings(status, updated_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sessions_user_id
@@ -389,6 +405,143 @@ class ProfileProvisioningStore:
             if name not in existing:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
+    @staticmethod
+    def _safe_log_details(category: str, details: dict[str, Any] | None) -> dict[str, Any]:
+        details = details if isinstance(details, dict) else {}
+        if category == "tts":
+            allowed = {
+                "ready", "reason_code", "helpers_ready", "capability_ready",
+                "profile_session_ready", "profile_sync_ready", "helpers", "queued_jobs",
+            }
+            result = {key: details[key] for key in allowed if key in details}
+            for key in ("ready", "helpers_ready", "capability_ready", "profile_session_ready", "profile_sync_ready"):
+                if key in result:
+                    result[key] = bool(result[key])
+            if "queued_jobs" in result:
+                value = result["queued_jobs"]
+                result["queued_jobs"] = max(0, min(1_000_000, int(value))) if isinstance(value, int) else 0
+            if "reason_code" in result:
+                result["reason_code"] = re.sub(r"[^a-z0-9_-]", "", str(result["reason_code"]).lower())[:64]
+            if isinstance(result.get("helpers"), list):
+                result["helpers"] = [
+                    {
+                        "slot": item.get("slot"),
+                        "status": item.get("status") if item.get("status") in {"ready", "bootstrapping", "tor_unreachable", "helper_unreachable"} else "helper_unreachable",
+                        "bootstrap_percent": item.get("bootstrap_percent") if isinstance(item.get("bootstrap_percent"), int) and 0 <= item.get("bootstrap_percent") <= 100 else None,
+                    }
+                    for item in result["helpers"]
+                    if isinstance(item, dict)
+                ][:3]
+        else:
+            allowed = {"ready", "reason_code", "checks", "attempt", "bundle_size_bytes", "target_count"}
+            result = {key: details[key] for key in allowed if key in details}
+            if isinstance(result.get("checks"), list):
+                result["checks"] = [
+                    {
+                        "name": re.sub(r"[^a-z0-9_-]", "", str(item.get("name") or "check").lower())[:48],
+                        "ready": bool(item.get("ready")),
+                        "code": re.sub(r"[^A-Z0-9_-]", "", str(item.get("code") or "").upper())[:64],
+                    }
+                    for item in result["checks"]
+                    if isinstance(item, dict)
+                ][:8]
+            if "ready" in result:
+                result["ready"] = bool(result["ready"])
+            if "reason_code" in result:
+                result["reason_code"] = re.sub(r"[^A-Z0-9_-]", "", str(result["reason_code"]).upper())[:64]
+            for key in ("attempt", "bundle_size_bytes", "target_count"):
+                if key in result:
+                    value = result[key]
+                    result[key] = max(0, min(2**31 - 1, int(value))) if isinstance(value, int) else 0
+        # Log payloads are deliberately limited to scalar statuses and bounded lists.
+        return result
+
+    def append_diagnostic_log(
+        self,
+        *,
+        category: str,
+        actor_user_id: int,
+        event_type: str,
+        code: str,
+        profile: str | None = None,
+        worker: str | None = None,
+        operation_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        category = str(category)
+        if category not in {"tts", "profile_export", "profile_operation"}:
+            raise ValueError("Kategori log diagnostik tidak valid.")
+        safe_details = self._safe_log_details(category, details)
+        event_type = re.sub(r"[^a-z0-9_]", "", str(event_type).lower())[:64] or "event"
+        code = re.sub(r"[^A-Z0-9_-]", "", str(code).upper())[:64] or "UNKNOWN"
+        created_at = _now()
+        with self._lock, self._db() as db:
+            db.execute(
+                "INSERT INTO profile_diagnostic_logs(category,actor_user_id,operation_id,profile,worker,event_type,code,details_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    category, int(actor_user_id), str(operation_id) if operation_id else None,
+                    str(profile)[:48] if profile else None, str(worker)[:48] if worker else None,
+                    event_type, code, json.dumps(safe_details, separators=(",", ":")), created_at,
+                ),
+            )
+            db.execute(
+                "DELETE FROM profile_diagnostic_logs WHERE id NOT IN "
+                "(SELECT id FROM profile_diagnostic_logs ORDER BY id DESC LIMIT 10000)"
+            )
+
+    def diagnostic_logs(
+        self, actor_user_id: int, category: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        safe_limit = min(500, max(1, int(limit)))
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT id,category,operation_id,profile,worker,event_type,code,details_json,created_at "
+                "FROM profile_diagnostic_logs WHERE actor_user_id=? AND category=? ORDER BY id DESC LIMIT ?",
+                (int(actor_user_id), str(category), safe_limit),
+            ).fetchall()
+        return [self._diagnostic_log_row(row) for row in rows]
+
+    def operation_accepts_bundle(self, operation_id: str) -> bool:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT status,source FROM profile_provisionings WHERE id=?", (str(operation_id),)
+            ).fetchone()
+        return bool(row is not None and str(row["status"]) == "validating" and str(row["source"]) == "adoption")
+
+    def provisioning_logs(self, operation_id: str, actor_user_id: int, limit: int = 500) -> list[dict[str, Any]] | None:
+        safe_limit = min(500, max(1, int(limit)))
+        with self._db() as db:
+            owner = db.execute(
+                "SELECT actor_user_id FROM profile_provisionings WHERE id=?", (str(operation_id),)
+            ).fetchone()
+            if owner is None or int(owner["actor_user_id"]) != int(actor_user_id):
+                return None
+            rows = db.execute(
+                "SELECT id,category,operation_id,profile,worker,event_type,code,details_json,created_at "
+                "FROM profile_diagnostic_logs WHERE operation_id=? ORDER BY id DESC LIMIT ?",
+                (str(operation_id), safe_limit),
+            ).fetchall()
+        return [self._diagnostic_log_row(row) for row in rows]
+
+    @staticmethod
+    def _diagnostic_log_row(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            details = json.loads(str(row["details_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            details = {}
+        return {
+            "id": int(row["id"]),
+            "category": str(row["category"]),
+            "operation_id": str(row["operation_id"]) if row["operation_id"] else None,
+            "profile": str(row["profile"]) if row["profile"] else None,
+            "worker": str(row["worker"]) if row["worker"] else None,
+            "event": str(row["event_type"]),
+            "code": str(row["code"]),
+            "details": details if isinstance(details, dict) else {},
+            "created_at": str(row["created_at"]),
+        }
+
     def _encrypt(self, profile: str, data: bytes) -> bytes:
         nonce = os.urandom(12)
         return nonce + AESGCM(self._key).encrypt(nonce, data, profile.encode("utf-8"))
@@ -405,14 +558,17 @@ class ProfileProvisioningStore:
         source: str,
         method: str | None = None,
         target_workers: list[str],
+        status: str = "authenticating",
     ) -> str:
+        if status not in {"authenticating", "validating"}:
+            raise ValueError("Status provisioning awal tidak valid.")
         operation_id = str(uuid.uuid4())
         now = _now()
         with self._lock, self._db() as db:
             try:
                 db.execute(
                     "INSERT INTO profile_provisionings(id,profile,actor_user_id,bootstrap_worker,source,method,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (operation_id, profile, int(actor_user_id), bootstrap_worker, source, method, "authenticating", now, now),
+                    (operation_id, profile, int(actor_user_id), bootstrap_worker, source, method, status, now, now),
                 )
             except sqlite3.IntegrityError as exc:
                 raise FileExistsError("Profil sedang menjalani provisioning lain.") from exc
@@ -1013,15 +1169,25 @@ class ProfileProvisioningStore:
             db.execute("DELETE FROM profile_distributions WHERE profile=? AND provisioning_id=?", (info["profile"], operation_id))
         return {"profile": info["profile"], "workers": [(str(row["worker"]), str(row["status"])) for row in rows], "source": info["source"]}
 
-    def retry(self, operation_id: str) -> None:
+    def retry(self, operation_id: str, source_worker: str | None = None) -> None:
         with self._lock, self._db() as db:
-            row = db.execute("SELECT profile,status FROM profile_provisionings WHERE id=?", (operation_id,)).fetchone()
+            row = db.execute("SELECT profile,status,source,bootstrap_worker FROM profile_provisionings WHERE id=?", (operation_id,)).fetchone()
             if row is None:
                 raise KeyError(operation_id)
             if str(row["status"]) == "active":
                 db.execute("UPDATE profile_distributions SET status='waiting',error=NULL,updated_at=? WHERE profile=? AND status IN ('waiting','failed')", (_now(), row["profile"]))
             elif row["status"] == "distributing":
                 db.execute("UPDATE profile_distributions SET status='waiting',error=NULL,updated_at=? WHERE provisioning_id=?", (_now(), operation_id))
+            elif str(row["source"]) == "adoption" and str(row["status"]) == "failed":
+                worker = str(source_worker or row["bootstrap_worker"])
+                db.execute(
+                    "UPDATE profile_provisionings SET status='validating',bootstrap_worker=?,error=NULL,updated_at=? WHERE id=?",
+                    (worker, _now(), operation_id),
+                )
+                db.execute(
+                    "UPDATE profile_distributions SET status='waiting',error=NULL,provisioning_id=?,updated_at=? WHERE profile=?",
+                    (operation_id, _now(), row["profile"]),
+                )
 
 
 class ProfileProvisioningService:
@@ -1116,11 +1282,135 @@ class ProfileProvisioningService:
         except Exception:
             pass
 
+    def _operation_log(
+        self,
+        operation_id: str,
+        event_type: str,
+        code: str,
+        *,
+        worker: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        info = self.store.provisioning(operation_id)
+        if info is None:
+            return
+        self.store.append_diagnostic_log(
+            category="profile_operation",
+            actor_user_id=int(info["actor_user_id"]),
+            operation_id=operation_id,
+            profile=str(info["profile"]),
+            worker=worker or str(info["bootstrap_worker"]),
+            event_type=event_type,
+            code=code,
+            details=details,
+        )
+
+    @staticmethod
+    def _export_error(code: str) -> tuple[str, str]:
+        messages = {
+            "PROFILE_IDENTITY_MISSING": "Worker sumber belum memiliki identity.json yang valid.",
+            "PROFILE_IDENTITY_INVALID": "Identitas pada worker sumber tidak valid.",
+            "PROFILE_IDENTITY_UNSAFE": "File identitas pada worker sumber tidak aman.",
+            "PROFILE_ROOT_SESSION_MISSING": "Sesi root TDL belum tersedia pada worker sumber.",
+            "PROFILE_USER1_SESSION_MISSING": "Sesi user1 TDL belum tersedia pada worker sumber.",
+            "PROFILE_ROOT_SESSION_EMPTY": "Database sesi root TDL kosong pada worker sumber.",
+            "PROFILE_USER1_SESSION_EMPTY": "Database sesi user1 TDL kosong pada worker sumber.",
+            "PROFILE_SESSION_UNSAFE": "Sesi TDL worker sumber memiliki struktur file yang tidak aman.",
+            "PROFILE_SESSION_UNREADABLE": "Sesi TDL worker sumber tidak dapat dibaca.",
+            "PROFILE_SESSION_BUSY": "Sesi worker sedang dipakai job lain. Coba periksa atau adopsi lagi setelah job selesai.",
+            "PROFILE_SESSION_UNAVAILABLE": "Struktur sesi worker sumber belum lengkap.",
+            "WORKER_UPDATE_REQUIRED": "Perbarui worker sumber agar pemeriksaan dan ekspor sesi tersedia.",
+            "WORKER_UNAVAILABLE": "Worker sumber tidak dapat dihubungi. Pilih worker lain atau coba lagi nanti.",
+            "DUPLICATE_TELEGRAM_IDENTITY": "Akun Telegram ini sudah terdaftar pada profil lain.",
+            "PROFILE_NAME_INVALID": "Nama profil tidak valid.",
+        }
+        if code not in messages:
+            code = "SOURCE_EXPORT_FAILED"
+            messages[code] = "Worker sumber gagal mengekspor sesi. Periksa log JSON untuk kode diagnosis."
+        return code, messages[code]
+
+    def _complete_adoption(self, operation_id: str) -> None:
+        info = self.store.provisioning(operation_id)
+        if info is None or info["status"] != "validating" or info["source"] != "adoption":
+            return
+        worker = str(info["bootstrap_worker"])
+        profile = str(info["profile"])
+        self._operation_log(operation_id, "source_export_started", "SOURCE_EXPORT_STARTED", worker=worker)
+        try:
+            diagnose = getattr(self.dispatcher, "profile_export_diagnostics", None)
+            if callable(diagnose):
+                result = diagnose(worker, profile)
+                if not isinstance(result, dict):
+                    raise RuntimeError("PROFILE_DIAGNOSTICS_UNAVAILABLE")
+                checks = result.get("checks") if isinstance(result.get("checks"), list) else []
+                reasons = result.get("reason_codes") if isinstance(result.get("reason_codes"), list) else []
+                self._operation_log(
+                    operation_id,
+                    "source_preflight_completed",
+                    "SOURCE_READY" if result.get("ready") else (str(reasons[0]) if reasons else "SOURCE_NOT_READY"),
+                    worker=worker,
+                    details={"ready": bool(result.get("ready")), "checks": checks},
+                )
+                if not result.get("ready"):
+                    code, message = self._export_error(str(reasons[0]) if reasons else "SOURCE_EXPORT_FAILED")
+                    self.store.fail(operation_id, message)
+                    self._operation_log(operation_id, "source_export_failed", code, worker=worker, details={"reason_code": code})
+                    return
+
+            user_id, bundle = self.dispatcher.export_profile_bundle(worker, profile)
+            if not self.store.operation_accepts_bundle(operation_id):
+                self._operation_log(operation_id, "source_export_discarded", "OPERATION_CANCELLED", worker=worker)
+                return
+            validate_profile_bundle(bundle)
+            registered_id = self.profile_manager.profile_registry.profile_for_user(user_id)
+            if registered_id is not None and registered_id != profile:
+                raise FileExistsError("DUPLICATE_TELEGRAM_IDENTITY")
+            self.store.store_bundle(operation_id, int(user_id), bundle)
+            self._operation_log(
+                operation_id,
+                "bundle_stored",
+                "BUNDLE_STORED",
+                worker=worker,
+                details={"bundle_size_bytes": len(bundle), "target_count": len(info["workers"])},
+            )
+        except FileExistsError:
+            code, message = self._export_error("DUPLICATE_TELEGRAM_IDENTITY")
+            self.store.fail(operation_id, message)
+            self._operation_log(operation_id, "source_export_failed", code, worker=worker, details={"reason_code": code})
+        except Exception as exc:
+            raw_code = ""
+            payload = getattr(exc, "payload", None)
+            if isinstance(payload, dict):
+                error = payload.get("error")
+                if isinstance(error, dict):
+                    raw_code = str(error.get("code") or "")
+            status = getattr(exc, "status", None)
+            if not raw_code and status == 404:
+                raw_code = "WORKER_UPDATE_REQUIRED"
+            elif not raw_code and status in {409, 422}:
+                raw_code = "PROFILE_SESSION_UNAVAILABLE"
+            elif not raw_code and isinstance(status, int) and status >= 500:
+                raw_code = "WORKER_UNAVAILABLE"
+            if not raw_code and str(exc).startswith("PROFILE_"):
+                raw_code = str(exc)
+            code, message = self._export_error(raw_code or "SOURCE_EXPORT_FAILED")
+            self.store.fail(operation_id, message)
+            self._operation_log(
+                operation_id,
+                "source_export_failed",
+                code,
+                worker=worker,
+                details={"reason_code": code},
+            )
+
     def _process_once(self) -> None:
         for operation in self.store.pending_operations():
             if operation["status"] == "validating":
                 try:
-                    self._complete_login(str(operation["id"]))
+                    if str(operation.get("source") or "") == "adoption":
+                        self._complete_adoption(str(operation["id"]))
+                    else:
+                        self._complete_login(str(operation["id"]))
                 except Exception:
                     # A later background pass retries worker and TDL outages.
                     pass
@@ -1150,6 +1440,13 @@ class ProfileProvisioningService:
                 if not isinstance(installed, dict) or not installed.get("ready"):
                     raise RuntimeError("Worker tidak mengonfirmasi sesi siap.")
                 self.store.update_distribution(profile, worker, "ready", provisioning_id=operation_id)
+                if operation_id:
+                    self._operation_log(
+                        operation_id,
+                        "target_install_ready",
+                        "TARGET_INSTALL_READY",
+                        worker=worker,
+                    )
                 desired = self.store.desired_revision(profile)
                 if desired is not None:
                     self._complete_sync_operations(
@@ -1165,6 +1462,11 @@ class ProfileProvisioningService:
                         # immediately so the previous session backup is removed.
                         self.dispatcher.commit_profile_bundle(worker, profile, operation_id)
             except Exception:
+                current = self.store.provisioning(operation_id) if operation_id else None
+                previous = next(
+                    (item for item in current["workers"] if item["worker"] == worker),
+                    None,
+                ) if current else None
                 self.store.update_distribution(
                     profile,
                     worker,
@@ -1172,12 +1474,20 @@ class ProfileProvisioningService:
                     "Worker belum menerima sesi; sinkronisasi akan dicoba ulang.",
                     operation_id,
                 )
+                if operation_id and (not previous or previous["status"] != "waiting" or not previous["error"]):
+                    self._operation_log(
+                        operation_id,
+                        "target_install_waiting",
+                        "TARGET_INSTALL_RETRYING",
+                        worker=worker,
+                    )
             if operation_id:
                 info = self.store.provisioning(operation_id)
                 if info and info["status"] == "distributing" and all(
                     item["status"] == "ready" for item in info["workers"]
                 ):
                     profile_name, user_id = self.store.mark_active(operation_id)
+                    self._operation_log(operation_id, "distribution_complete", "PROFILE_DISTRIBUTED")
                     with self._lock:
                         self.profile_manager.profile_registry.register_vaulted(profile_name, user_id)
                     for item in info["workers"]:
@@ -1226,6 +1536,15 @@ class ProfileProvisioningService:
                 if operation["updated_at"] >= current.get("updated_at", ""):
                     if actor_user_id is None or int(operation.get("actor_user_id", -1)) == int(actor_user_id):
                         current["operation_id"] = str(operation["id"])
+                        if str(operation.get("source")) == "adoption" and not current.get("vault"):
+                            details = self.store.provisioning(str(operation["id"])) or {}
+                            current.update({
+                                "source": "adoption",
+                                "status": str(operation["status"]),
+                                "error": str(details.get("error") or ""),
+                                    "bootstrap_worker": str(details.get("bootstrap_worker") or ""),
+                                "workers": details.get("workers", []),
+                            })
                 continue
             current = self.store.provisioning(str(operation["id"])) or {}
             owner_user_id = int(current.get("actor_user_id", -1))
@@ -1366,25 +1685,79 @@ class ProfileProvisioningService:
             raise FileExistsError("Profil sudah tersimpan di vault.")
         if self.worker_registry.get(worker) is None:
             raise KeyError(worker)
-        user_id, bundle = self.dispatcher.export_profile_bundle(worker, profile)
-        validate_profile_bundle(bundle)
-        registered_id = self.profile_manager.profile_registry.profile_for_user(user_id)
-        if registered_id is not None and registered_id != profile:
-            raise ValueError("Identity worker sumber tidak cocok dengan profil yang dipilih.")
         with self._lock:
             if self.store.bundle(profile) is not None:
                 raise FileExistsError("Profil sudah tersimpan di vault.")
             targets = self.worker_registry.names()
             if not targets:
                 raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
-            operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source="adoption", target_workers=targets)
-            try:
-                self.store.store_bundle(operation_id, int(user_id), bundle)
-            except Exception:
-                self.store.cancel(operation_id)
-                raise
+            operation_id = self.store.begin(
+                profile=profile,
+                actor_user_id=actor_user_id,
+                bootstrap_worker=worker,
+                source="adoption",
+                target_workers=targets,
+                status="validating",
+            )
+        self._operation_log(operation_id, "adoption_queued", "ADOPTION_QUEUED", worker=worker)
         self._wake.set()
         return operation_id
+
+    def diagnose_adoption(self, profile: str, worker: str, actor_user_id: int) -> dict[str, Any]:
+        selected_profile = normalize_profile_name(profile)
+        if not selected_profile or selected_profile not in self.profile_manager.list_profiles():
+            raise KeyError(profile)
+        if self.store.bundle(selected_profile) is not None:
+            raise FileExistsError("Profil sudah tersimpan di vault.")
+        if self.worker_registry.get(worker) is None:
+            raise KeyError(worker)
+        diagnose = getattr(self.dispatcher, "profile_export_diagnostics", None)
+        if not callable(diagnose):
+            result = {
+                "ready": False,
+                "reason_codes": ["WORKER_UPDATE_REQUIRED"],
+                "checks": [{"name": "worker_capability", "ready": False, "code": "WORKER_UPDATE_REQUIRED"}],
+            }
+        else:
+            try:
+                raw = diagnose(worker, selected_profile)
+                reasons = raw.get("reason_codes") if isinstance(raw, dict) else None
+                checks = raw.get("checks") if isinstance(raw, dict) else None
+                safe_reasons = [
+                    str(code)
+                    for code in reasons[:8]
+                    if isinstance(code, str) and re.fullmatch(r"(?:PROFILE|WORKER)_[A-Z0-9_]{1,56}", code)
+                ] if isinstance(reasons, list) else []
+                result = {
+                    "ready": bool(isinstance(raw, dict) and raw.get("ready")),
+                    "reason_codes": safe_reasons or ([] if isinstance(raw, dict) and raw.get("ready") else ["PROFILE_DIAGNOSTICS_UNAVAILABLE"]),
+                    "checks": checks if isinstance(checks, list) else [],
+                }
+            except Exception:
+                result = {
+                    "ready": False,
+                    "reason_codes": ["WORKER_UNAVAILABLE"],
+                    "checks": [{"name": "worker_connection", "ready": False, "code": "WORKER_UNAVAILABLE"}],
+                }
+        reasons = result["reason_codes"] or ["PROFILE_DIAGNOSTICS_UNAVAILABLE"]
+        code = reasons[0]
+        self.store.append_diagnostic_log(
+            category="profile_export",
+            actor_user_id=int(actor_user_id),
+            profile=selected_profile,
+            worker=worker,
+            event_type="source_check",
+            code=code,
+            details={"ready": result["ready"], "reason_code": code, "checks": result["checks"]},
+        )
+        return {
+            "profile": selected_profile,
+            "worker": worker,
+            "ready": result["ready"],
+            "reason_codes": reasons,
+            "checks": ProfileProvisioningStore._safe_log_details("profile_export", {"checks": result["checks"]}).get("checks", []),
+            "logs_url": "/api/v1/diagnostics/profile-exports/logs?limit=100",
+        }
 
     def _require_owner(self, operation_id: str, actor_user_id: int) -> dict[str, Any]:
         info = self.store.provisioning(operation_id)
@@ -1404,13 +1777,14 @@ class ProfileProvisioningService:
     def cancel(self, operation_id: str, actor_user_id: int) -> dict[str, Any]:
         with self._lock:
             info = self._require_owner(operation_id, actor_user_id)
-            if info["source"] == "adoption" and info["status"] in {"validating", "distributing"}:
+            if info["source"] == "adoption" and info["status"] == "distributing":
                 raise ValueError("Adopsi tidak dapat dibatalkan setelah distribusi dimulai.")
             result = self.store.cancel(operation_id)
-        try:
-            self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
-        except Exception:
-            pass
+        if info["source"] != "adoption":
+            try:
+                self.dispatcher.cancel_profile_login(info["bootstrap_worker"], operation_id)
+            except Exception:
+                pass
         if info["source"] != "adoption":
             for worker, _status in result["workers"]:
                 try:
@@ -1419,10 +1793,27 @@ class ProfileProvisioningService:
                     pass
         return {"cancelled": True, "profile": info["profile"]}
 
-    def retry(self, operation_id: str, actor_user_id: int) -> None:
+    def retry(self, operation_id: str, actor_user_id: int, source_worker: str | None = None) -> None:
         with self._lock:
-            self._require_owner(operation_id, actor_user_id)
-            self.store.retry(operation_id)
+            info = self._require_owner(operation_id, actor_user_id)
+            if info["source"] == "adoption":
+                if info["status"] != "failed":
+                    raise ValueError("Adopsi hanya dapat dicoba ulang setelah gagal.")
+                selected_worker = str(source_worker or info["bootstrap_worker"])
+                if self.worker_registry.get(selected_worker) is None:
+                    raise KeyError(selected_worker)
+                self.store.retry(operation_id, selected_worker)
+            else:
+                if source_worker:
+                    raise ValueError("Worker sumber hanya berlaku untuk retry adopsi.")
+                self.store.retry(operation_id)
+        if info["source"] == "adoption":
+            self._operation_log(
+                operation_id,
+                "adoption_retry_queued",
+                "ADOPTION_RETRY_QUEUED",
+                worker=str(source_worker or info["bootstrap_worker"]),
+            )
         self._wake.set()
 
     def worker_ready(self, profile: str, worker: str) -> bool:

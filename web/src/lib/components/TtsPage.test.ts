@@ -16,7 +16,8 @@ describe('TTS page target controls', () => {
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
       requests.push({ path, method, body });
       if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [
-        { name: 'local', queued_jobs: 1 }, { name: 'remote-tts', queued_jobs: 0 },
+        { name: 'local', enabled: true, ready: true, reason_code: 'ready', helpers: [], queued_jobs: 1 },
+        { name: 'remote-tts', enabled: true, ready: true, reason_code: 'ready', helpers: [], queued_jobs: 0 },
       ] }), { status: 200 });
       if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: true }), { status: 200 });
       if (path.endsWith('/tts/jobs') && method === 'POST') return new Response(JSON.stringify({ id: 'tts-job-1', status: 'queued' }), { status: 200 });

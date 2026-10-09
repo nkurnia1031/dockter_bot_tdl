@@ -1,17 +1,17 @@
-# Graph Report - dockter_bot_tdl  (2026-10-10)
+# Graph Report - dockter_bot_tdl  (2026-10-07)
 
 ## Corpus Check
-- 277 files · ~258,535 words
+- 277 files · ~254,759 words
 - Verdict: corpus is large enough that graph structure adds value.
 - Unclassified: 11 file(s) not represented in the graph (top: (none) 6, .base 1, .resolver 1)
 
 ## Summary
-- 4655 nodes · 11507 edges · 209 communities (166 shown, 37 thin omitted)
-- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 779 edges (avg confidence: 0.91)
+- 4615 nodes · 11399 edges · 215 communities (168 shown, 41 thin omitted)
+- Extraction: 93% EXTRACTED · 7% INFERRED · 0% AMBIGUOUS · INFERRED: 773 edges (avg confidence: 0.91)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `8b03e40d`
+- Built from commit: `b65f3f57`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -21,7 +21,7 @@
 - PanelManager
 - ProfileSyncClient
 - organize_media_from_json.py
-- Job
+- JobRepository
 - config.py
 - Any
 - StateStore
@@ -34,7 +34,7 @@
 - QueueTransportTests
 - StorageCatalog
 - WorkerRuntimeSettings
-- tme3bot/utility.py
+- UtilityRunner
 - compilerOptions
 - telegram/app.py
 - source_store.py
@@ -49,7 +49,7 @@
 - StoragePage.svelte
 - tme3bot/__init__.py
 - pindah.sh script
-- composition.py
+- build_backend_context
 - ExportArtifactCatalog
 - BackendApiTests
 - ProfileProvisioningService
@@ -57,13 +57,13 @@
 - +layout.ts
 - 8. Urutan implementasi
 - TtsPipeline
-- SqliteSourceRepositoryTests
+- SqliteProfileStateStore
 - api.ts
 - RunScriptTests
 - LabelStore
 - vitest
 - preflight_report
-- _add_internal_state_routes
+- SubprocessRunner
 - test_pindah.py
 - ProfileProvisioningStore
 - ExportWorkspaceState
@@ -72,7 +72,7 @@
 - 12. Bootstrap VPS baru dan satu-command deployment
 - SqliteSourceRepository
 - SqliteAuthRepository
-- OperationsService
+- storage_catalog.py
 - migrate_source_state.py
 - job-progress.ts
 - presentation.ts
@@ -84,7 +84,7 @@
 - DurableDispatchTests
 - SqliteOperationStore
 - WorkerEventPublisher
-- executor_tts.py
+- test_tts_executor.py
 - TME3Bot Deployment Runbook
 - request_json
 - ../styles.css
@@ -98,34 +98,34 @@
 - TtsPipelineTests
 - 3. Keputusan desain
 - SqliteSettingsStore
-- DeviceAuthTests
+- FakeProfiles
 - build.py
-- ._storage_upload
+- Connection
 - register_storage
 - BackupService
 - Path
 - ContainerBuildTests
 - WorkerJobExecutor
-- AesGcmSecretStore
+- settings_store.py
 - WorkerHttpDispatcher
 - TrustedDeviceError
-- DomainError
+- register_workers
 - OperationTests
-- write_json_atomic
+- ProfileManager
 - pkg_resources.py
-- BackendRuntimeSettings
-- BotAuthService
+- normalize_tdl_chat_ref
+- StorageItem
 - P0 — Akses production dari laptop tepercaya
 - Rencana pemisahan backend, worker, dan Web
 - WorkerCommandStore
 - SharedExportCursorTests
 - 21 — Penyederhanaan ENV dan inventaris pemakaian
-- ProfileRegistry
+- register_runtime_settings
 - executor.py
 - 22 — Uji kegagalan lintas komponen dan panduan cutover
 - Arsitektur Sistem tme3bot
 - routes/__init__.py
-- JsonHttpError
+- FakeDispatcher
 - ARSITEKTUR_SISTEM.md
 - tme3bot
 - ProfileProvisioningTests
@@ -142,15 +142,15 @@
 - Rollback
 - TDLClient
 - Pengaturan aplikasi dari Web
-- .capabilities
+- StorageMaintenanceService
 - 02 — Inventarisasi dan migrasi state lama tanpa kehilangan progress
 - 03 — Operation persisten dan transactional outbox
-- register_utility
+- ObjectResponse
 - dependencies
 - WorkerApiTests
 - 04 — Redis privat dan proses RQ untuk orkestrasi
 - TtsExecutorMixin
-- AuthServiceTests
+- register_downloads
 - tts_helper.py
 - safelink_resolver.py
 - 05 — Penerimaan cepat dan kontrak dispatch berversi
@@ -162,7 +162,7 @@
 - 10 — Tarik profil saat startup dan sinkronisasi manual
 - 11 — Executor export memakai cursor bersama dan mengarsip state lokal
 - WorkerCommandStoreTests
-- settings_store.py
+- UtilityFolderStore
 - 12 — Supervisor login TDL yang tidak bergantung pada browser
 - 13 — Workflow profil upload, login, adopsi, dan distribusi
 - PROGRESS.md
@@ -172,65 +172,71 @@
 - 18 — Halaman Profil pulih setelah ditutup
 - 19 — Monitor progress terpusat dan refresh berdasarkan aksi
 - 20 — Pengaturan Web dengan desired/applied status
-- create_backend_app
+- DomainError
 - FakeProfileProvisioner
 - WorkspaceExecutorMixin
-- ._capture_tdl_output
+- Overview.svelte
 - .setUp
 - WorkerContractTests
 - ProgressReporter
-- tts_pipeline.py
+- TtsError
 - http_client.py
 - 00-OVERVIEW.md
-- DeviceAuthService
+- BotAuthService
 - register_operations
 - devDependencies
 - SourceState
 - .patch
 - .test_tor_recovery_restarts_only_the_child_process
 - WorkerProfileSyncTests
-- models.py
+- composition.py
 - WorkspaceExplorer.svelte
 - BackupCoordinator
 - SqliteQueueState
 - decrypt/+page.svelte
 - svelte.config.js
 - CommandMilestoneRecorder
-- FakeDiagnosticStore
-- normalize_tdl_chat_ref
-- .setUp
-- Queue
-- WorkerProfileAdmissionTests
+- AppConfig
+- register_sources
+- _FakeQueue
+- pindah.py
+- build_profile_runtime
 - DownloadExecutorMixin
-- ._recover_legacy_quick_stages
+- FakeWorkers
+- .test_build_base_builds_and_exports_only_the_base_image
 - test_worker_command_store.py
+- BackupScheduler
 - RcloneRunner
 - ProfileSyncContractTests
-- register_queue
+- .test_internal_endpoint_requires_service_auth_and_valid_lease
 - JobTable.svelte
-- test_profile_provisioning.py
+- extract_single_session
 - .test_operations_api_is_idempotent_private_and_actor_scoped
-- DesiredSettingsTests
+- UtilitySettingsStore
 - @tailwindcss/vite
 - WorkerCommandRunner
-- JobEvent
+- ControlPlaneTests
 - ProfileTests
 - QueueOutboxPublisher
 - build_base_image
+- FakeDispatcher
+- write_json_atomic_private
 - SourceMigrationTests
 - bootstrap_python_dependencies
+- .request_sync
+- _RejectRedirects
 
 ## God Nodes (most connected - your core abstractions)
-1. `DomainError` - 265 edges
-2. `create_backend_app()` - 117 edges
-3. `WorkerJobExecutor` - 103 edges
-4. `BackendApiTests` - 94 edges
-5. `ControlPlane` - 91 edges
-6. `SqliteJobRepository` - 91 edges
+1. `DomainError` - 260 edges
+2. `create_backend_app()` - 114 edges
+3. `WorkerJobExecutor` - 102 edges
+4. `BackendApiTests` - 92 edges
+5. `SqliteJobRepository` - 91 edges
+6. `ControlPlane` - 89 edges
 7. `StorageCatalog` - 86 edges
 8. `TelegramFrontendApp` - 76 edges
-9. `ProfileProvisioningStore` - 76 edges
-10. `Job` - 72 edges
+9. `Job` - 72 edges
+10. `JobEvent` - 71 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `_download()` --indirect_call--> `output()`  [INFERRED]
@@ -247,11 +253,11 @@
 ## Import Cycles
 - None detected.
 
-## Communities (209 total, 37 thin omitted)
+## Communities (215 total, 41 thin omitted)
 
 ### Community 0 - "normalize_profile_name"
-Cohesion: 0.10
-Nodes (21): normalize_profile_name(), build_profile_config(), chown_paths(), chown_tree(), ensure_profile_runtime_dirs(), get_profile_download_mode(), profile_settings_path(), ProfileManager (+13 more)
+Cohesion: 0.11
+Nodes (16): normalize_profile_name(), write_json_atomic(), ProfileRegistry, Path, One-way migration for installations created before the registry., Gateway-owned registry for profile metadata, separate from TDL sessions. A…, Apply backend vault identity as authoritative registry data., Accept only new legacy metadata; do not let a worker rewrite identity. (+8 more)
 
 ### Community 1 - "pindah4.py"
 Cohesion: 0.70
@@ -262,40 +268,40 @@ Cohesion: 0.07
 Nodes (17): Message, PanelViewStoreTests, FakeBot, FakeMessage, TelegramPanelRecoveryTests, PanelManager, Bot, InlineKeyboardMarkup (+9 more)
 
 ### Community 3 - "ProfileSyncClient"
-Cohesion: 0.12
-Nodes (19): _header(), hmac_compare(), _now(), _positive_int(), ProfileSyncClient, ProfileSyncError, Any, HTTPRedirectHandler (+11 more)
+Cohesion: 0.14
+Nodes (17): profile_bundle_identity(), Read the Telegram identity embedded in a validated bundle., _header(), hmac_compare(), _now(), _positive_int(), ProfileSyncClient, ProfileSyncError (+9 more)
 
 ### Community 4 - "organize_media_from_json.py"
 Cohesion: 0.08
 Nodes (58): cleanup_empty_directories(), collect_potential_folder_names(), collect_referenced_media(), collect_referenced_media_from_html(), crosscheck_unreferenced_media(), discover_json_files(), ensure_target_directory(), entry_identity() (+50 more)
 
-### Community 5 - "Job"
-Cohesion: 0.05
-Nodes (14): Update the latest telemetry without growing persistent event history., Return whether a transient worker snapshot advanced the job., Attach phase timing and event latency to this job's own event., ActorResolver, JobRepository, ProfileStateStore, Any, Protocol (+6 more)
+### Community 5 - "JobRepository"
+Cohesion: 0.06
+Nodes (10): ActorResolver, JobRepository, ProfileStateStore, Any, Protocol, Profile-scoped source state used by export and metadata endpoints., Backend-owned source records with atomic revision-checked commits., SourceRepository (+2 more)
 
 ### Community 6 - "config.py"
-Cohesion: 0.20
-Nodes (8): ChannelRefTests, channel_chat_id(), channel_tdl_ref(), compact_channel_ref(), Normalize Telegram private channel links and compact numeric references., Return the peer reference format expected by tdl. Bot API uses `-100<peer id>`…, load_dotenv(), _parse_named_values()
+Cohesion: 0.18
+Nodes (5): ChannelRefTests, channel_tdl_ref(), Return the peer reference format expected by tdl. Bot API uses `-100<peer id>`…, load_dotenv(), _parse_named_values()
 
 ### Community 7 - "Any"
-Cohesion: 0.15
-Nodes (10): Thread, PendingInput, Any, Recover subscriptions after the Telegram container restarts., expire(), expire(), loop(), loop() (+2 more)
+Cohesion: 0.16
+Nodes (8): Thread, Any, Recover subscriptions after the Telegram container restarts., expire(), expire(), loop(), main_menu_markup(), edit_menu_message()
 
 ### Community 8 - "StateStore"
 Cohesion: 0.05
-Nodes (38): FakeDownloadTDLClient, FakeExportTDLClient, Path, ServiceTests, download(), StateStoreTests, ParseTme3UrlTests, configure_logging() (+30 more)
+Nodes (33): first_callback(), first_download(), second_callback(), second_download(), runtime(), FakeDownloadTDLClient, FakeExportTDLClient, Path (+25 more)
 
 ### Community 9 - "run.py"
 Cohesion: 0.16
 Nodes (27): active_env_file(), add_profile(), backend_management_request(), build_migration_archive(), configured_service(), data_root_value(), deploy_web(), _download() (+19 more)
 
 ### Community 11 - "create_worker_app"
-Cohesion: 0.06
-Nodes (29): ContractWorkerExecutor, WorkerJobRequest, create_worker_app(), accept_command(), authorize(), diagnose_profile_export(), domain_error(), durable_command_status() (+21 more)
+Cohesion: 0.07
+Nodes (24): create_worker_app(), authorize(), domain_error(), durable_command_status(), export_profile_bundle(), healthz(), install_profile_bundle(), job_log_snapshot() (+16 more)
 
 ### Community 12 - "ControlPlane"
-Cohesion: 0.09
-Nodes (13): ControlPlane, Any, Exception, Resume queued commands after backend restart or terminal events., Cancel jobs whose worker has stopped reporting progress. Worker cancellation is…, Release only the Quick Mode export phase after durable completion., Restart an export attempt while preserving its stable job ID., Find the original TDL message range without reading the JSON file. New jobs… (+5 more)
+Cohesion: 0.07
+Nodes (23): worker_event(), ControlPlane, Any, Exception, Release only the Quick Mode export phase after durable completion., Update the latest telemetry without growing persistent event history., Return whether a transient worker snapshot advanced the job., Attach phase timing and event latency to this job's own event. (+15 more)
 
 ### Community 13 - "boltStorage"
 Cohesion: 0.18
@@ -310,28 +316,28 @@ Cohesion: 0.25
 Nodes (3): QueueTransportTests, QueueCommandService, Claim and advance an outbox command without running work in a request.
 
 ### Community 16 - "StorageCatalog"
-Cohesion: 0.05
-Nodes (22): BackupServiceTests, make_config(), Path, item_values(), StorageCatalogTests, FakeBot, StorageMaintenanceTests, build_storage_caption() (+14 more)
+Cohesion: 0.18
+Nodes (3): StorageCatalog, StorageFolder, utc_now()
 
 ### Community 17 - "WorkerRuntimeSettings"
-Cohesion: 0.13
+Cohesion: 0.15
 Nodes (7): Path, RuntimeProfileManager, WorkerRuntimeSettingsTests, Any, Path, Persistent allowlisted worker options that can be changed through Web., WorkerRuntimeSettings
 
-### Community 18 - "tme3bot/utility.py"
-Cohesion: 0.10
-Nodes (12): UtilitySettingsTests, UtilitySummaryTests, CommandCallback, Path, Popen, Remove the two intermediate JSON files produced by ``pindah``. ``pindah4.py``…, UtilityFolderStore, UtilityPathError (+4 more)
+### Community 18 - "UtilityRunner"
+Cohesion: 0.12
+Nodes (8): UtilitySummaryTests, CommandCallback, Path, Popen, Remove the two intermediate JSON files produced by ``pindah``. ``pindah4.py``…, UtilityRunner, consume_line(), watchdog()
 
 ### Community 19 - "compilerOptions"
 Cohesion: 0.20
 Nodes (9): ./.svelte-kit/tsconfig.json, compilerOptions, allowJs, checkJs, esModuleInterop, forceConsistentCasingInFileNames, skipLibCheck, strict (+1 more)
 
 ### Community 20 - "telegram/app.py"
-Cohesion: 0.12
-Nodes (25): Canonical chat references for TDL commands and Telegram Bot API targets., Telegram presentation adapter and UI-only helpers., backup_menu_markup(), check_profile_markup(), clear_confirm_markup(), download_status_markup(), export_input_cancel_markup(), _export_source_compact_markup() (+17 more)
+Cohesion: 0.15
+Nodes (22): PendingInput, Telegram presentation adapter and UI-only helpers., backup_menu_markup(), check_profile_markup(), clear_confirm_markup(), download_status_markup(), export_input_cancel_markup(), _export_source_compact_markup() (+14 more)
 
 ### Community 21 - "source_store.py"
-Cohesion: 0.14
-Nodes (16): Application service for verified peer aliases and shared export cursors., ExportCursorBusy, MigrationPlanConflict, PeerAliasConflict, PeerAliasCursorConflict, PeerAliasNotFound, RuntimeError, A source write was based on an outdated revision. (+8 more)
+Cohesion: 0.15
+Nodes (14): Application service for verified peer aliases and shared export cursors., ExportCursorBusy, MigrationPlanConflict, PeerAliasConflict, PeerAliasCursorConflict, PeerAliasNotFound, RuntimeError, A source write was based on an outdated revision. (+6 more)
 
 ### Community 22 - "QuickModeExecutorMixin"
 Cohesion: 0.09
@@ -346,16 +352,16 @@ Cohesion: 0.10
 Nodes (19): Arsitektur, Catatan diagnosis produksi terakhir, Checklist memulai sesi baru, Deployment yang benar, Download Manager: aturan penting, graphify, Jebakan, Langkah operasional berikutnya (+11 more)
 
 ### Community 26 - "ProfileSessionManager"
-Cohesion: 0.20
-Nodes (5): _LoginProcess, ProfileSessionManager, Any, Path, Narrow TDL login bridge and safe profile session installer for workers.
+Cohesion: 0.18
+Nodes (7): build_profile_config(), _LoginProcess, ProfileSessionManager, Any, Path, Check identity and both private Bolt session trees without opening Bolt., Narrow TDL login bridge and safe profile session installer for workers.
 
 ### Community 27 - "ResourceAwareQueue"
 Cohesion: 0.06
 Nodes (17): ErrorHandler, JobHandler, JobT, KeyT, PriorityQueue, ResourceAwareQueueTests, SerialPerKeyQueueTests, handle() (+9 more)
 
 ### Community 28 - "backend.py"
-Cohesion: 0.08
-Nodes (71): ActorResponse, ApiResponse, ApproveChallengeRequest, BackupRuntimeSettingsRequest, BatchSourcesRequest, BrowserChallengeResponse, BrowserProfileRequest, BrowserSessionResponse (+63 more)
+Cohesion: 0.09
+Nodes (56): ActorResponse, ApiResponse, ApproveChallengeRequest, BackupRuntimeSettingsRequest, BrowserChallengeResponse, BrowserProfileRequest, BrowserSessionResponse, ChallengeExchangeResponse (+48 more)
 
 ### Community 29 - "package.json"
 Cohesion: 0.11
@@ -365,9 +371,9 @@ Nodes (18): bits-ui, crypto-js, flowbite-svelte, jsdom, @lucide/svelte, svelte, 
 Cohesion: 0.06
 Nodes (34): patch(), post(), chooseScope(), clearSelection(), createFolder(), createOpen, currentName, deliver() (+26 more)
 
-### Community 34 - "composition.py"
-Cohesion: 0.25
-Nodes (5): BackendContext, build_backend_context(), ControlPlaneBackupRouter, _first_actor(), _NullCoordinator
+### Community 34 - "build_backend_context"
+Cohesion: 0.22
+Nodes (4): build_backend_context(), ControlPlaneBackupRouter, _first_actor(), _NullCoordinator
 
 ### Community 35 - "ExportArtifactCatalog"
 Cohesion: 0.13
@@ -385,41 +391,45 @@ Nodes (8): 8. Urutan implementasi, Milestone 0 — Baseline, Milestone 1 — Res
 Cohesion: 0.13
 Nodes (6): Any, Event, Path, Return fixed-slot helper health without exposing configured URLs., Three-route gTTS pipeline with stable per-part checkpoints., TtsPipeline
 
+### Community 43 - "SqliteProfileStateStore"
+Cohesion: 0.10
+Nodes (3): SqliteSourceRepositoryTests, StateStore-compatible adapter that binds the shared repository to a profile., SqliteProfileStateStore
+
 ### Community 44 - "api.ts"
-Cohesion: 0.16
-Nodes (14): api(), ApiError, beginRequest(), csrf(), emitRequestEvent(), endRequest(), put(), remove() (+6 more)
+Cohesion: 0.18
+Nodes (10): api(), ApiError, beginRequest(), csrf(), emitRequestEvent(), endRequest(), put(), remove() (+2 more)
 
 ### Community 46 - "LabelStore"
 Cohesion: 0.25
 Nodes (5): LabelStoreTests, label_digest(), LabelStore, Path, SavedLabel
 
 ### Community 48 - "vitest"
-Cohesion: 0.14
+Cohesion: 0.18
 Nodes (5): @testing-library/svelte, vitest, publicKey, { apiMock, postMock }, workerSettings
 
 ### Community 49 - "preflight_report"
 Cohesion: 0.14
 Nodes (20): capture_compose(), _command_available(), _compose_available(), compose_base_command(), compose_env(), docker_image_exists(), docker_manifest_exists(), git_remote_revision() (+12 more)
 
-### Community 50 - "_add_internal_state_routes"
-Cohesion: 0.10
-Nodes (14): _add_internal_state_routes(), acquire_export_cursor(), commit_export_cursor(), confirm_peer_alias(), heartbeat_export_cursor(), pending_peer_aliases(), require_cursor_service(), resolve_export_peer() (+6 more)
+### Community 50 - "SubprocessRunner"
+Cohesion: 0.07
+Nodes (17): OutputCallback, ProgressCallback, Queue, CompletedProcess, skipIf, output(), run(), notify_command_completed() (+9 more)
 
 ### Community 52 - "ProfileProvisioningStore"
-Cohesion: 0.09
-Nodes (8): _now(), ProfileProvisioningStore, Any, Connection, Path, Row, Persistent encrypted session vault and profile distribution state., Keep old worker identity reports as adoption candidates, never as vault data.
+Cohesion: 0.10
+Nodes (7): _now(), ProfileProvisioningStore, Any, Connection, Path, Persistent encrypted session vault and profile distribution state., Keep old worker identity reports as adoption candidates, never as vault data.
 
 ### Community 53 - "ExportWorkspaceState"
-Cohesion: 0.10
-Nodes (16): ExportWorkspaceTests, export_report(), ExportWorkspaceState, format_export_job(), format_export_status(), format_rate(), is_numeric_chat_ref(), normalize_chat_ref() (+8 more)
+Cohesion: 0.09
+Nodes (18): ExportWorkspaceTests, delete_quick_mode_staging(), loop(), export_report(), ExportWorkspaceState, format_export_job(), format_export_status(), format_rate() (+10 more)
 
 ### Community 54 - "QuickThumbnailBuilder"
-Cohesion: 0.18
-Nodes (9): ProcessStalledError, Raised when a worker subprocess stops making meaningful progress., CommandCallback, Popen, QuickThumbnailBuilder, probe_next_video(), skip_media(), watchdog() (+1 more)
+Cohesion: 0.21
+Nodes (7): CommandCallback, Popen, QuickThumbnailBuilder, probe_next_video(), skip_media(), watchdog(), Build a bounded, padded visual collage using ffmpeg/ffprobe. The process handle…
 
 ### Community 55 - "register_jobs"
-Cohesion: 0.07
-Nodes (44): event_dict(), job_dict(), _newest_first_log_response(), _owned_job(), _profile_artifact(), Any, Normalize current and legacy worker snapshots for the public API., register_downloads() (+36 more)
+Cohesion: 0.08
+Nodes (40): verify_context(), verify_target(), event_dict(), job_dict(), _model_dict(), _newest_first_log_response(), _owned_job(), Any (+32 more)
 
 ### Community 56 - "12. Bootstrap VPS baru dan satu-command deployment"
 Cohesion: 0.17
@@ -427,15 +437,15 @@ Nodes (12): 12.10 Report dan exit code, 12.11 Test tambahan run.py, 12.1 Tujuan,
 
 ### Community 57 - "SqliteSourceRepository"
 Cohesion: 0.13
-Nodes (9): normalize_peer_identity(), Normalize a TDL-resolved peer identity before it enters the alias map. A…, Connection, Row, Apply approved sources and ledger decisions atomically; return replay status., Keep cross-worker execution gated until workers implement the contract., Backend-owned, profile-scoped source state in the application database., SqliteSourceRepository (+1 more)
+Nodes (11): normalize_peer_identity(), Normalize a TDL-resolved peer identity before it enters the alias map. A…, Connection, Row, Apply approved sources and ledger decisions atomically; return replay status., Keep cross-worker execution gated until workers implement the contract., A lease owner, attempt, or fencing generation is no longer current., Backend-owned, profile-scoped source state in the application database. (+3 more)
 
 ### Community 58 - "SqliteAuthRepository"
-Cohesion: 0.13
-Nodes (7): _now(), Any, Connection, datetime, Path, Run security-sensitive read/modify/write work under a SQLite write lock., SqliteAuthRepository
+Cohesion: 0.11
+Nodes (9): AuthServiceTests, Path, _now(), Any, Connection, datetime, Path, Run security-sensitive read/modify/write work under a SQLite write lock. (+1 more)
 
-### Community 59 - "OperationsService"
-Cohesion: 0.16
-Nodes (6): _canonical(), OperationHandler, OperationsService, Any, Protocol, Validates bounded actions and persists them without executing side effects.
+### Community 59 - "storage_catalog.py"
+Cohesion: 0.19
+Nodes (6): item_values(), StorageCatalogTests, build_storage_caption(), _caption_value(), Persistent catalog for the shared Telegram storage channel., _slug()
 
 ### Community 60 - "migrate_source_state.py"
 Cohesion: 0.18
@@ -454,8 +464,8 @@ Cohesion: 0.09
 Nodes (10): challenge, contextRevision, current, loading, loadWorkers(), selectedWorkers(), session, SessionWorker (+2 more)
 
 ### Community 64 - "ExportWorkspaceStore"
-Cohesion: 0.13
-Nodes (5): AppMenuTests, fake_update(), FakeClient, FakePanel, ExportWorkspaceStore
+Cohesion: 0.11
+Nodes (8): AppMenuTests, fake_update(), FakeClient, FakePanel, ExportWorkspaceStore, help_text(), Text helpers owned by the Telegram presentation adapter., source_digest()
 
 ### Community 65 - "SqliteJobRepository"
 Cohesion: 0.06
@@ -470,16 +480,16 @@ Cohesion: 0.29
 Nodes (7): 4.1 Execution plan, 4.2 Backend admission, 4.3 Persistensi, 4.4 Pending dispatcher dan queue worker, 4.5 Internal command, 4.6 Utility path, 4. Arsitektur scheduler
 
 ### Community 69 - "SqliteOperationStore"
-Cohesion: 0.10
-Nodes (19): OperationRepository, ensure_operation_transition(), Operation, OperationStatus, Any, datetime, Enum, str (+11 more)
+Cohesion: 0.07
+Nodes (22): _canonical(), OperationHandler, OperationsService, Any, Protocol, Validates bounded actions and persists them without executing side effects., OperationRepository, ensure_operation_transition() (+14 more)
 
 ### Community 70 - "WorkerEventPublisher"
-Cohesion: 0.11
+Cohesion: 0.12
 Nodes (3): Enable durable event delivery while retaining legacy test adapters., Seed event numbering for a reused job ID., WorkerEventPublisher
 
-### Community 71 - "executor_tts.py"
-Cohesion: 0.12
-Nodes (7): _Executor, _FakePipeline, _FakeTdl, TtsExecutorTests, Build a portable audio filename from the user-visible TTS title., _truncate_utf8(), tts_delivery_filename()
+### Community 71 - "test_tts_executor.py"
+Cohesion: 0.11
+Nodes (8): _Executor, _FakePipeline, _FakeTdl, TtsExecutorTests, request(), Build a portable audio filename from the user-visible TTS title., _truncate_utf8(), tts_delivery_filename()
 
 ### Community 72 - "TME3Bot Deployment Runbook"
 Cohesion: 0.10
@@ -506,8 +516,8 @@ Cohesion: 0.40
 Nodes (5): 6.1 Inline picker searchable, 6.2 Search dan pagination, 6.3 Callback stabil, 6.4 Mini App fase berikutnya, 6. Source picker Export Fokus
 
 ### Community 82 - "TtsPipelineTests"
-Cohesion: 0.12
-Nodes (4): make_pipeline(), TtsPipelineTests, request_part(), request_part()
+Cohesion: 0.13
+Nodes (3): make_pipeline(), TtsPipelineTests, request_part()
 
 ### Community 83 - "3. Keputusan desain"
 Cohesion: 0.50
@@ -517,69 +527,61 @@ Nodes (4): 3.1 Aturan concurrency, 3.2 Resource key, 3.3 Batasan dua sesi TDL, 3
 Cohesion: 0.16
 Nodes (13): _json(), _now(), Any, Connection, Row, ValueError, Import a legacy snapshot once; existing rows and tombstones always win., Import one online worker's local runtime JSON at most once. (+5 more)
 
-### Community 85 - "DeviceAuthTests"
-Cohesion: 0.18
-Nodes (3): DeviceAuthTests, actor(), challenge_payload()
-
 ### Community 86 - "build.py"
 Cohesion: 0.28
 Nodes (14): base_fingerprint(), base_manifest_is_current(), build_archive(), build_base_archive(), build_migration_archive(), is_excluded(), iter_files(), main() (+6 more)
 
-### Community 87 - "._storage_upload"
-Cohesion: 0.15
-Nodes (9): StorageWorkerPathTests, Any, Path, Upload workspace files through the worker-local rclone config., upload_progress(), Path, Return nested directories, including empty ones, as portable paths., storage_logical_folder() (+1 more)
+### Community 87 - "Connection"
+Cohesion: 0.18
+Nodes (4): Connection, Path, Insert a callback result, returning the existing item on retry., Create a consistent SQLite snapshot, including WAL contents.
 
 ### Community 88 - "register_storage"
-Cohesion: 0.11
-Nodes (28): StorageLinkTests, _active_storage_item(), _deliver_storage_telegram(), _require_storage_folders_idle(), _storage_item(), register_storage(), create_storage_folder(), delete_storage_item() (+20 more)
+Cohesion: 0.12
+Nodes (23): StorageLinkTests, _require_storage_folders_idle(), _storage_item(), register_storage(), create_storage_folder(), delete_storage_item(), get_storage_item(), move_storage_entries() (+15 more)
 
 ### Community 89 - "BackupService"
-Cohesion: 0.17
-Nodes (10): BackupArchive, BackupService, Path, Create encrypted, runtime-only per-node backup archives., safe_node_name(), sha256_file(), utc_now(), BackupExecutorMixin (+2 more)
+Cohesion: 0.21
+Nodes (8): BackupServiceTests, make_config(), Path, BackupArchive, BackupService, Path, safe_node_name(), utc_now()
 
 ### Community 90 - "Path"
 Cohesion: 0.04
-Nodes (23): ExportMilestoneTests, export_from_url(), export_from_url(), Path, QuickPipelineTests, download_export_to(), run(), QuickThumbnailTests (+15 more)
+Nodes (17): ExportMilestoneTests, export_from_url(), export_from_url(), Path, QuickPipelineTests, download_export_to(), run(), QuickThumbnailTests (+9 more)
 
 ### Community 92 - "WorkerJobExecutor"
-Cohesion: 0.07
-Nodes (9): Any, Event, Exception, Executes domain jobs and publishes JSON events; no UI dependency., Keep backend liveness independent from noisy subprocess output. A Quick Mode…, Bind the shared tracker callback only while owning its TDL lock., WorkerJobExecutor, __getattr__() (+1 more)
+Cohesion: 0.04
+Nodes (23): WorkerProfileAdmissionTests, accept_command(), capabilities(), datetime, utc_now(), Any, Event, Exception (+15 more)
 
-### Community 93 - "AesGcmSecretStore"
+### Community 93 - "settings_store.py"
 Cohesion: 0.18
 Nodes (4): AesGcmSecretStore, Path, Encrypt setting values with a persistent owner-only AES-256 key., Path
 
 ### Community 94 - "WorkerHttpDispatcher"
-Cohesion: 0.17
-Nodes (3): Any, RuntimeError, WorkerHttpDispatcher
+Cohesion: 0.13
+Nodes (6): Any, RuntimeError, Check worker availability without loading its full capabilities., Send a durable command using a stable ID and reconcile lost ACKs., WorkerHttpDispatcher, current_receipt()
 
 ### Community 95 - "TrustedDeviceError"
 Cohesion: 0.07
 Nodes (32): FakeProtector, skipUnless, TrustedDeviceHelperTests, protect(), _browser_executable(), main(), open_trusted_context(), same_origin_only() (+24 more)
 
-### Community 96 - "DomainError"
-Cohesion: 0.06
-Nodes (53): register_device_routes(), device_challenge(), device_exchange(), list_devices(), register_device(), remote_key(), rename_device(), require_browser_actor() (+45 more)
+### Community 96 - "register_workers"
+Cohesion: 0.21
+Nodes (9): register_workers(), recover_worker_tts_helper(), remove_worker(), set_worker_enabled(), tts_worker_error(), update_worker(), update_worker_settings(), worker_settings() (+1 more)
 
 ### Community 97 - "OperationTests"
-Cohesion: 0.16
-Nodes (9): OperationTests, prepare(), prepare(), advance_profile_sync_cancel(), advance_profile_sync_command(), _complete_sync_operation(), prepare_profile_sync_operation(), Any (+1 more)
+Cohesion: 0.26
+Nodes (3): OperationTests, prepare(), prepare()
 
-### Community 98 - "write_json_atomic"
-Cohesion: 0.21
-Nodes (6): Any, Path, Atomically write JSON containing secrets with owner-only Unix mode., write_json_atomic(), write_json_atomic_private(), ProfileSelectionStore
+### Community 98 - "ProfileManager"
+Cohesion: 0.13
+Nodes (8): ProfileManager, ProfileSelectionStore, Path, Metadata a worker can safely publish to the backend registry., Refresh cached session paths after a locked install or rollback., Resolve the session path, including a legacy default-profile location., Return whether TDL initialized its Bolt database in this session root., _tdl_session_database_ready()
 
 ### Community 99 - "pkg_resources.py"
 Cohesion: 0.29
 Nodes (7): PackageNotFoundError, DistributionNotFound, get_distribution(), iter_entry_points(), Small importlib-backed compatibility shim for legacy APScheduler. python-…, Compatibility name used by APScheduler 3.x., Return importlib entry points with the old pkg_resources API shape.
 
-### Community 100 - "BackendRuntimeSettings"
-Cohesion: 0.16
-Nodes (12): BackendRuntimeSettingsTests, register_backups(), start_backup(), update_backup_settings(), BackendRuntimeSettings, Any, Path, Update fields read by the live backend services without replacing config. (+4 more)
-
-### Community 101 - "BotAuthService"
-Cohesion: 0.28
-Nodes (5): AuthChallengeStatus, str, BotAuthService, _hash_secret(), TokenPair
+### Community 100 - "normalize_tdl_chat_ref"
+Cohesion: 0.11
+Nodes (18): BackendRuntimeSettingsTests, ChatReferenceTests, register_backups(), update_backup_settings(), BackendRuntimeSettings, Any, Path, Update fields read by the live backend services without replacing config. (+10 more)
 
 ### Community 102 - "P0 — Akses production dari laptop tepercaya"
 Cohesion: 0.11
@@ -601,13 +603,13 @@ Nodes (5): FailingCatalog, SharedExportCursorTests, current_actor(), Path, Read 
 Cohesion: 0.14
 Nodes (13): 21 — Penyederhanaan ENV dan inventaris pemakaian, Cara verifikasi, File yang disentuh, Konteks khusus task, Kontrak dan perilaku, Kriteria selesai, Lampiran — inventaris ENV baseline, Penambahan yang direncanakan (+5 more)
 
-### Community 107 - "ProfileRegistry"
+### Community 107 - "register_runtime_settings"
 Cohesion: 0.22
-Nodes (6): ProfileRegistry, Path, One-way migration for installations created before the registry., Gateway-owned registry for profile metadata, separate from TDL sessions. A…, Apply backend vault identity as authoritative registry data., Accept only new legacy metadata; do not let a worker rewrite identity.
+Nodes (14): register_runtime_settings(), acknowledge_worker_settings(), desired_store(), get_runtime_settings(), put_runtime_settings(), runtime_settings_schema(), update_runtime_secrets(), validate_target() (+6 more)
 
 ### Community 108 - "executor.py"
-Cohesion: 0.07
-Nodes (67): bounded_output_tail(), Safe, bounded command output helpers used by worker milestones., Remove known and obvious secret values from command output., Return only the newest output without splitting a line when possible., Redact obvious secret flags and values before persisting a command., sanitize_command(), sanitize_text(), discard_export_without_media() (+59 more)
+Cohesion: 0.06
+Nodes (70): StorageWorkerPathTests, Gateway orchestration, channel upload, scheduling, and retention., Create encrypted, runtime-only per-node backup archives., sha256_file(), bounded_output_tail(), Safe, bounded command output helpers used by worker milestones., Remove known and obvious secret values from command output., Return only the newest output without splitting a line when possible. (+62 more)
 
 ### Community 109 - "22 — Uji kegagalan lintas komponen dan panduan cutover"
 Cohesion: 0.17
@@ -616,10 +618,6 @@ Nodes (11): 22 — Uji kegagalan lintas komponen dan panduan cutover, Cara verif
 ### Community 110 - "Arsitektur Sistem tme3bot"
 Cohesion: 0.18
 Nodes (11): Alur job, Antrean dan kerja bersamaan, Arsitektur Sistem tme3bot, Bagian sistem, Data dan keamanan, Deployment dan source map, Komunikasi backend dan worker, Quick Mode dan folder staging (+3 more)
-
-### Community 112 - "JsonHttpError"
-Cohesion: 0.09
-Nodes (5): FakeDispatcher, JsonHttpError, Check worker availability without loading its full capabilities., Send a durable command using a stable ID and reconcile lost ACKs., current_receipt()
 
 ### Community 113 - "ARSITEKTUR_SISTEM.md"
 Cohesion: 0.29
@@ -630,7 +628,7 @@ Cohesion: 0.22
 Nodes (9): Arsitektur, Build Docker melalui GitHub Actions, Job dan progress, Login web melalui bot, Setup VPS utama, Storage dan backup, tme3bot, Verifikasi (+1 more)
 
 ### Community 115 - "ProfileProvisioningTests"
-Cohesion: 0.11
+Cohesion: 0.12
 Nodes (9): FakeProfileDispatcher, FakeProfileManager, FakeWorkerRegistry, make_config(), MutableWorkerRegistry, ProfileProvisioningTests, Path, single_session_zip() (+1 more)
 
 ### Community 118 - "ExportCursorService"
@@ -670,16 +668,16 @@ Cohesion: 0.67
 Nodes (3): Rollback, Rollback backend dan worker, Rollback web saja
 
 ### Community 127 - "TDLClient"
-Cohesion: 0.04
-Nodes (44): OutputCallback, ProgressCallback, FakeRunner, CompletedProcess, skipIf, TDLClientTests, output(), run() (+36 more)
+Cohesion: 0.06
+Nodes (45): FakeRunner, TDLClientTests, has_downloadable_media(), is_image_message(), Any, media_ids_in_export(), Resolve a chat in the active download session, then allow one retry., decode_process_output() (+37 more)
 
 ### Community 128 - "Pengaturan aplikasi dari Web"
 Cohesion: 0.29
 Nodes (6): Kontrak implementasi, Pengaturan aplikasi dari Web, Pengaturan deployment, Pengaturan yang sudah ada di Web, Pengelolaan rahasia, Status migrasi konfigurasi
 
-### Community 129 - ".capabilities"
-Cohesion: 0.22
-Nodes (3): Path, Return non-secret worker capabilities for backend target checks., resolver_addon_ready()
+### Community 129 - "StorageMaintenanceService"
+Cohesion: 0.16
+Nodes (4): FakeBot, StorageMaintenanceTests, Background maintenance for Storage captions and recycle bin., StorageMaintenanceService
 
 ### Community 130 - "02 — Inventarisasi dan migrasi state lama tanpa kehilangan progress"
 Cohesion: 0.17
@@ -689,9 +687,9 @@ Nodes (11): 02 — Inventarisasi dan migrasi state lama tanpa kehilangan progres
 Cohesion: 0.17
 Nodes (11): 03 — Operation persisten dan transactional outbox, Cara verifikasi, File yang disentuh, Konteks khusus task, Kontrak dan perilaku, Kriteria selesai, Prasyarat, Prompt untuk agent pelaksana (+3 more)
 
-### Community 132 - "register_utility"
-Cohesion: 0.13
-Nodes (13): verify_context(), verify_target(), _model_dict(), submit_download(), submit_export(), submit_storage_upload(), update_storage_folder(), register_utility() (+5 more)
+### Community 132 - "ObjectResponse"
+Cohesion: 0.17
+Nodes (10): register_utility(), utility_settings_meta(), utility_tree(), ObjectResponse, Typed object envelope for small mutation/settings responses., SettingRequest, UtilityFolderRequest, UtilityJobRequest (+2 more)
 
 ### Community 133 - "dependencies"
 Cohesion: 0.33
@@ -702,12 +700,12 @@ Cohesion: 0.17
 Nodes (11): 04 — Redis privat dan proses RQ untuk orkestrasi, Cara verifikasi, File yang disentuh, Konteks khusus task, Kontrak dan perilaku, Kriteria selesai, Prasyarat, Prompt untuk agent pelaksana (+3 more)
 
 ### Community 136 - "TtsExecutorMixin"
-Cohesion: 0.24
-Nodes (7): Any, Path, Keep the opaque artifact for retries, and upload a title-named copy., TtsExecutorMixin, RuntimeError, TtsCancelled, TtsError
+Cohesion: 0.26
+Nodes (4): Any, Path, Keep the opaque artifact for retries, and upload a title-named copy., TtsExecutorMixin
 
-### Community 137 - "AuthServiceTests"
-Cohesion: 0.46
-Nodes (3): AuthServiceTests, actor(), Path
+### Community 137 - "register_downloads"
+Cohesion: 0.17
+Nodes (14): _profile_artifact(), register_downloads(), archive_artifact(), clear_failed(), delete_artifact_file(), delete_artifacts_batch(), list_artifacts(), purge_artifact() (+6 more)
 
 ### Community 138 - "tts_helper.py"
 Cohesion: 0.24
@@ -715,7 +713,7 @@ Nodes (15): _bootstrap_percent(), diagnostics(), get, post, ready(), readyz(), r
 
 ### Community 139 - "safelink_resolver.py"
 Cohesion: 0.05
-Nodes (59): Client, Response, ResolverAddonTests, _livewire_page(), _public_dns(), ResolverHttpTests, handler(), handler() (+51 more)
+Nodes (58): Client, Response, ResolverAddonTests, _livewire_page(), _public_dns(), ResolverHttpTests, handler(), handler() (+50 more)
 
 ### Community 140 - "05 — Penerimaan cepat dan kontrak dispatch berversi"
 Cohesion: 0.17
@@ -749,9 +747,9 @@ Nodes (11): 10 — Tarik profil saat startup dan sinkronisasi manual, Cara verif
 Cohesion: 0.17
 Nodes (11): 11 — Executor export memakai cursor bersama dan mengarsip state lokal, Cara verifikasi, File yang disentuh, Konteks khusus task, Kontrak dan perilaku, Kriteria selesai, Prasyarat, Prompt untuk agent pelaksana (+3 more)
 
-### Community 149 - "settings_store.py"
-Cohesion: 0.42
-Nodes (5): ValueError, Validate a remote destination before it reaches a worker command., _validate_password(), validate_rclone_destination(), _validate_size()
+### Community 149 - "UtilityFolderStore"
+Cohesion: 0.23
+Nodes (7): ValueError, Validate a remote destination before it reaches a worker command., UtilityFolderStore, UtilityPathError, _validate_password(), validate_rclone_destination(), _validate_size()
 
 ### Community 150 - "12 — Supervisor login TDL yang tidak bergantung pada browser"
 Cohesion: 0.17
@@ -789,41 +787,41 @@ Nodes (11): 19 — Monitor progress terpusat dan refresh berdasarkan aksi, Cara 
 Cohesion: 0.17
 Nodes (11): 20 — Pengaturan Web dengan desired/applied status, Cara verifikasi, File yang disentuh, Konteks khusus task, Kontrak dan perilaku, Kriteria selesai, Prasyarat, Prompt untuk agent pelaksana (+3 more)
 
-### Community 159 - "create_backend_app"
-Cohesion: 0.05
-Nodes (48): create_backend_app(), adopt_profile(), advance_accepted_operation(), advance_background_job(), advance_cancel_operation(), advance_retry_operation(), browser_actor_dict(), browser_challenge() (+40 more)
+### Community 159 - "DomainError"
+Cohesion: 0.03
+Nodes (95): actor(), _active_storage_item(), _add_internal_state_routes(), acquire_export_cursor(), commit_export_cursor(), confirm_peer_alias(), heartbeat_export_cursor(), pending_peer_aliases() (+87 more)
 
 ### Community 161 - "WorkspaceExecutorMixin"
 Cohesion: 0.38
 Nodes (4): Any, Path, Return a safe, shallow directory listing for the active workspace., WorkspaceExecutorMixin
 
-### Community 163 - ".setUp"
-Cohesion: 0.10
-Nodes (3): FakeProfiles, FakeTelegramBot, FakeWorkers
+### Community 162 - "Overview.svelte"
+Cohesion: 0.40
+Nodes (4): describe(), error, icons, label()
 
 ### Community 164 - "WorkerContractTests"
-Cohesion: 0.26
-Nodes (5): patch, ContractWorkerRegistry, WorkerContractTests, Return the non-secret version and feature set advertised by a worker., worker_contract_metadata()
+Cohesion: 0.14
+Nodes (9): patch, ContractWorkerExecutor, ContractWorkerRegistry, WorkerContractTests, WorkerContext, Any, Return the non-secret version and feature set advertised by a worker., worker_contract_metadata() (+1 more)
 
 ### Community 165 - "ProgressReporter"
-Cohesion: 0.08
-Nodes (27): FakePublisher, ProgressReporterTests, _progress_percent(), ProgressReporter, Any, Throttled current-state telemetry plus persistent milestone events., Normalize transfer telemetry and smooth noisy instantaneous speed., utc_timestamp() (+19 more)
+Cohesion: 0.07
+Nodes (20): FakePublisher, ProgressReporterTests, _progress_percent(), ProgressReporter, Any, Throttled current-state telemetry plus persistent milestone events., Normalize transfer telemetry and smooth noisy instantaneous speed., utc_timestamp() (+12 more)
 
-### Community 166 - "tts_pipeline.py"
-Cohesion: 0.25
-Nodes (5): normalize_text(), Split normalized text into word-aware chunks no longer than 90 chars., Request a fresh Tor circuit without logging the control credential., split_text(), _tor_command()
+### Community 166 - "TtsError"
+Cohesion: 0.20
+Nodes (9): request_part(), normalize_text(), RuntimeError, Split normalized text into word-aware chunks no longer than 90 chars., Request a fresh Tor circuit without logging the control credential., split_text(), _tor_command(), TtsCancelled (+1 more)
 
 ### Community 167 - "http_client.py"
-Cohesion: 0.15
-Nodes (11): Any, Reject workers whose advertised API cannot satisfy a backend operation., require_worker_contract(), HTTPRedirectHandler, Keep authenticated profile bundle transfers on the configured URL., _RejectRedirects, advance_command(), RuntimeError (+3 more)
+Cohesion: 0.14
+Nodes (11): profile_management(), HTTPRedirectHandler, Keep authenticated profile bundle transfers on the configured URL., _RejectRedirects, profile_transfer_is_secure(), Allow HTTPS remote workers and explicit internal Compose service hosts., advance_command(), RuntimeError (+3 more)
 
 ### Community 168 - "00-OVERVIEW.md"
 Cohesion: 0.11
 Nodes (15): File yang disentuh, Kontrak dan perilaku, Kriteria selesai, P1 — Diagnosis dan pemulihan kesiapan helper TTS, Prasyarat dan konteks, Prompt implementasi, Rollback, Tujuan (+7 more)
 
-### Community 169 - "DeviceAuthService"
-Cohesion: 0.17
-Nodes (13): make_test_certificates(), Path, skipUnless, TrustedDevicePlaywrightHttpsE2ETests, prepare_state(), _b64url(), _canonical_origin(), _decode_b64url() (+5 more)
+### Community 169 - "BotAuthService"
+Cohesion: 0.07
+Nodes (21): DeviceAuthTests, actor(), make_test_certificates(), Path, skipUnless, TrustedDevicePlaywrightHttpsE2ETests, prepare_state(), AuthChallengeStatus (+13 more)
 
 ### Community 170 - "register_operations"
 Cohesion: 0.49
@@ -834,8 +832,8 @@ Cohesion: 0.15
 Nodes (13): devDependencies, jsdom, svelte-check, @sveltejs/adapter-static, @sveltejs/kit, @sveltejs/vite-plugin-svelte, tailwindcss, @tailwindcss/vite (+5 more)
 
 ### Community 172 - "SourceState"
-Cohesion: 0.11
-Nodes (9): StateStore-compatible adapter that binds the shared repository to a profile., SqliteProfileStateStore, HttpStateStore, normalize_chat_ref(), Any, Canonical source key for usernames, links, phones, and numeric IDs., StateStore-compatible client used by a worker without a local state file., SourceState (+1 more)
+Cohesion: 0.15
+Nodes (7): HttpStateStore, normalize_chat_ref(), Any, Canonical source key for usernames, links, phones, and numeric IDs., StateStore-compatible client used by a worker without a local state file., SourceState, StateSnapshot
 
 ### Community 174 - ".test_tor_recovery_restarts_only_the_child_process"
 Cohesion: 0.12
@@ -845,20 +843,20 @@ Nodes (3): skipIf, assert_release(), write_to_fp()
 Cohesion: 0.14
 Nodes (5): bundle_for(), FakeSessions, FakeTransport, manifest_row(), WorkerProfileSyncTests
 
-### Community 176 - "models.py"
+### Community 176 - "composition.py"
 Cohesion: 0.08
-Nodes (19): FakeProfiles, FakeDispatcher, FakeProfiles, FakeUtilitySettings, worker_event(), _elapsed_since(), datetime, serializable() (+11 more)
+Nodes (25): FakeProfiles, FakeUtilitySettings, advance_profile_sync_cancel(), advance_profile_sync_command(), _complete_sync_operation(), prepare_profile_sync_operation(), Any, Request (+17 more)
 
 ### Community 177 - "WorkspaceExplorer.svelte"
 Cohesion: 0.28
 Nodes (7): crumbs, error, folders, goUp(), load(), loading, openCrumb()
 
 ### Community 178 - "BackupCoordinator"
-Cohesion: 0.10
-Nodes (7): BackupCoordinator, BackupNodeJob, BackupScheduler, datetime, Gateway orchestration, channel upload, scheduling, and retention., Worker-neutral command payload for one node backup., Recheck enabled state or the schedule after a Web update.
+Cohesion: 0.22
+Nodes (4): BackupCoordinator, BackupNodeJob, datetime, Worker-neutral command payload for one node backup.
 
 ### Community 179 - "SqliteQueueState"
-Cohesion: 0.23
+Cohesion: 0.26
 Nodes (6): _now(), Any, Connection, datetime, Queue-specific SQLite adapter over the durable operation outbox., SqliteQueueState
 
 ### Community 180 - "decrypt/+page.svelte"
@@ -869,17 +867,25 @@ Nodes (23): copied, decrypt(), encrypted, error, loadResolverJobs(), notice, pla
 Cohesion: 0.20
 Nodes (4): CommandMilestoneRecorder, Persist bounded command results without allowing telemetry to fail work., Create the pending milestone before a subprocess begins work., Complete the pending milestone with bounded, sanitized output.
 
-### Community 184 - "normalize_tdl_chat_ref"
-Cohesion: 0.13
-Nodes (9): ChatReferenceTests, list_artifacts(), register_sources(), add_label(), get_source(), submit_leave(), update_source(), normalize_tdl_chat_ref() (+1 more)
+### Community 183 - "AppConfig"
+Cohesion: 0.40
+Nodes (7): configure_logging(), main(), run_backend(), run_queue(), run_worker(), AppConfig, Fail fast when a production role is missing its trust boundary.
 
-### Community 185 - ".setUp"
-Cohesion: 0.18
+### Community 184 - "register_sources"
+Cohesion: 0.15
+Nodes (11): register_sources(), add_label(), get_source(), submit_leave(), update_source(), BatchSourcesRequest, ExportRequest, JobResponse (+3 more)
+
+### Community 185 - "_FakeQueue"
+Cohesion: 0.20
 Nodes (3): _FakeConnection, _FakeJob, _FakeQueue
 
-### Community 186 - "Queue"
-Cohesion: 0.24
-Nodes (11): Queue, find_best_combination(), find_best_combination_worker(), load_json(), main(), move_size_limit(), parse_size(), Convert the shared Utility setting (for example ``750m``) to bytes. (+3 more)
+### Community 186 - "pindah.py"
+Cohesion: 0.27
+Nodes (10): find_best_combination(), find_best_combination_worker(), load_json(), main(), move_size_limit(), parse_size(), Convert the shared Utility setting (for example ``750m``) to bytes., Membaca dan mengembalikan konten file JSON. (+2 more)
+
+### Community 187 - "build_profile_runtime"
+Cohesion: 0.27
+Nodes (6): LeaveResult, LeaveService, CommandCallback, build_profile_runtime(), ProfileRuntime, Return source state without constructing profile TDL clients.
 
 ### Community 188 - "DownloadExecutorMixin"
 Cohesion: 0.33
@@ -890,24 +896,32 @@ Cohesion: 0.15
 Nodes (11): CommandCallback, Path, RuntimeError, Raised when an rclone transfer cannot be completed., Verify exact remote files without downloading or mutating them., Small, cancellable rclone adapter for files already in the workspace., Check remote/config access separately from per-file differences., RcloneError (+3 more)
 
 ### Community 198 - "JobTable.svelte"
-Cohesion: 0.17
+Cohesion: 0.18
 Nodes (4): normalizeBotApiChatRef(), normalizeTdlChatRef(), if(), length()
 
-### Community 199 - "test_profile_provisioning.py"
-Cohesion: 0.25
-Nodes (9): extract_single_session(), profile_bundle_identity(), profile_transfer_is_secure(), Read the Telegram identity embedded in a validated bundle., Allow HTTPS remote workers and explicit internal Compose service hosts., Read a ZIP containing exactly one top-level .tdl directory., _safe_zip_entries(), validate_profile_bundle() (+1 more)
+### Community 199 - "extract_single_session"
+Cohesion: 0.33
+Nodes (5): extract_single_session(), Read a ZIP containing exactly one top-level .tdl directory., _safe_zip_entries(), validate_profile_bundle(), ZipInfo
 
-### Community 207 - "JobEvent"
-Cohesion: 0.05
-Nodes (13): ControlPlaneTests, FailingDispatcher, FakeDispatcher, FakeExportCursorGate, IncompatibleDispatcher, WorkerRegistryTests, JobEvent, _as_enabled() (+5 more)
+### Community 202 - "UtilitySettingsStore"
+Cohesion: 0.13
+Nodes (4): DesiredSettingsTests, UtilitySettingsTests, SettingsConflict, UtilitySettingsStore
+
+### Community 207 - "ControlPlaneTests"
+Cohesion: 0.04
+Nodes (11): ControlPlaneTests, FailingDispatcher, FakeDispatcher, FakeExportCursorGate, IncompatibleDispatcher, WorkerRegistryTests, _as_enabled(), normalize_worker_name() (+3 more)
 
 ### Community 213 - "QueueOutboxPublisher"
-Cohesion: 0.24
+Cohesion: 0.22
 Nodes (3): skipUnless, QueueOutboxPublisher, Moves SQLite outbox messages to RQ and repairs missing Redis jobs.
 
 ### Community 217 - "build_base_image"
 Cohesion: 0.25
 Nodes (9): build_base_archive(), build_base_image(), configured_base_image(), ensure_base_image_available(), login_registry(), Login to the image registry without exposing the PAT in process output., Ensure Docker can resolve the immutable base image before Compose builds.…, Build and export the expensive immutable runtime/Go base image once. (+1 more)
+
+### Community 221 - "write_json_atomic_private"
+Cohesion: 0.21
+Nodes (4): Any, Path, Atomically write JSON containing secrets with owner-only Unix mode., write_json_atomic_private()
 
 ### Community 228 - "bootstrap_python_dependencies"
 Cohesion: 0.33
@@ -915,18 +929,18 @@ Nodes (6): bootstrap_python_dependencies(), _pip_supports_flag(), _python_requir
 
 ## Knowledge Gaps
 - **484 isolated node(s):** `tme3bot-leave-helper`, `compress.sh script`, `pindah.sh script`, `name`, `version` (+479 more)
-  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 1446 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
-- **37 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 1434 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **41 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `DomainError` connect `DomainError` to `register_utility`, `Job`, `AuthServiceTests`, `create_worker_app`, `ControlPlane`, `WorkerRuntimeSettings`, `WorkerCommandStoreTests`, `source_store.py`, `QuickModeExecutorMixin`, `backend.py`, `create_backend_app`, `WorkerContractTests`, `http_client.py`, `DeviceAuthService`, `register_operations`, `models.py`, `_add_internal_state_routes`, `register_jobs`, `normalize_tdl_chat_ref`, `SqliteAuthRepository`, `OperationsService`, `test_worker_command_store.py`, `SqliteJobRepository`, `DurableDispatchTests`, `ProfileSyncContractTests`, `SqliteOperationStore`, `JobEvent`, `FakeExecutor`, `DeviceAuthTests`, `register_storage`, `Path`, `WorkerJobExecutor`, `OperationTests`, `BackendRuntimeSettings`, `BotAuthService`, `WorkerCommandStore`, `SharedExportCursorTests`, `executor.py`?**
+- **Why does `DomainError` connect `DomainError` to `ObjectResponse`, `register_downloads`, `create_worker_app`, `ControlPlane`, `WorkerRuntimeSettings`, `WorkerCommandStoreTests`, `source_store.py`, `QuickModeExecutorMixin`, `backend.py`, `WorkerContractTests`, `http_client.py`, `BotAuthService`, `register_operations`, `composition.py`, `ExportWorkspaceState`, `register_jobs`, `register_sources`, `SqliteAuthRepository`, `test_worker_command_store.py`, `SqliteJobRepository`, `DurableDispatchTests`, `ProfileSyncContractTests`, `SqliteOperationStore`, `ControlPlaneTests`, `FakeExecutor`, `register_storage`, `Path`, `WorkerJobExecutor`, `register_workers`, `OperationTests`, `normalize_tdl_chat_ref`, `WorkerCommandStore`, `SharedExportCursorTests`, `register_runtime_settings`, `executor.py`?**
   _High betweenness centrality (0.124) - this node is a cross-community bridge._
-- **Why does `WorkerJobExecutor` connect `WorkerJobExecutor` to `normalize_profile_name`, `.capabilities`, `ProfileSyncClient`, `StateStore`, `TtsExecutorMixin`, `safelink_resolver.py`, `WorkerRuntimeSettings`, `tme3bot/utility.py`, `QuickModeExecutorMixin`, `ProfileSessionManager`, `ResourceAwareQueue`, `WorkspaceExecutorMixin`, `composition.py`, `._capture_tdl_output`, `WorkerContractTests`, `ProgressReporter`, `QuickThumbnailBuilder`, `CommandMilestoneRecorder`, `WorkerProfileAdmissionTests`, `DownloadExecutorMixin`, `._recover_legacy_quick_stages`, `RcloneRunner`, `WorkerEventPublisher`, `executor_tts.py`, `test_profile_provisioning.py`, `WorkerCommandRunner`, `BackupService`, `Path`, `DomainError`, `WorkerCommandStore`, `executor.py`, `ProfileProvisioningTests`, `TDLClient`?**
-  _High betweenness centrality (0.060) - this node is a cross-community bridge._
-- **Why does `BackendApiTests` connect `BackendApiTests` to `ControlPlane`, `StorageCatalog`, `tme3bot/utility.py`, `FakeProfileProvisioner`, `composition.py`, `.setUp`, `ExportArtifactCatalog`, `DeviceAuthService`, `models.py`, `ProfileProvisioningStore`, `SqliteAuthRepository`, `OperationsService`, `SqliteJobRepository`, `.insert_storage_item`, `SqliteOperationStore`, `.browser_login`, `.test_operations_api_is_idempotent_private_and_actor_scoped`, `JobEvent`, `SqliteSettingsStore`, `OperationTests`, `BackendRuntimeSettings`, `BotAuthService`, `ProfileRegistry`, `JsonHttpError`?**
-  _High betweenness centrality (0.046) - this node is a cross-community bridge._
+- **Why does `WorkerJobExecutor` connect `WorkerJobExecutor` to `ProfileSyncClient`, `TtsExecutorMixin`, `safelink_resolver.py`, `WorkerRuntimeSettings`, `UtilityRunner`, `QuickModeExecutorMixin`, `ProfileSessionManager`, `ResourceAwareQueue`, `DomainError`, `WorkspaceExecutorMixin`, `WorkerContractTests`, `ProgressReporter`, `composition.py`, `CommandMilestoneRecorder`, `AppConfig`, `QuickThumbnailBuilder`, `DownloadExecutorMixin`, `RcloneRunner`, `WorkerEventPublisher`, `test_tts_executor.py`, `WorkerCommandRunner`, `Path`, `write_json_atomic_private`, `ProfileManager`, `WorkerCommandStore`, `executor.py`, `ProfileProvisioningTests`, `TDLClient`?**
+  _High betweenness centrality (0.063) - this node is a cross-community bridge._
+- **Why does `BackendApiTests` connect `BackendApiTests` to `normalize_profile_name`, `ControlPlane`, `StorageCatalog`, `UtilityFolderStore`, `DomainError`, `FakeProfileProvisioner`, `.setUp`, `ExportArtifactCatalog`, `WorkerContractTests`, `BotAuthService`, `composition.py`, `ProfileProvisioningStore`, `SqliteAuthRepository`, `SqliteJobRepository`, `.insert_storage_item`, `SqliteOperationStore`, `.browser_login`, `.test_operations_api_is_idempotent_private_and_actor_scoped`, `UtilitySettingsStore`, `SqliteSettingsStore`, `normalize_tdl_chat_ref`?**
+  _High betweenness centrality (0.047) - this node is a cross-community bridge._
 - **Are the 22 inferred relationships involving `DomainError` (e.g. with `AuthServiceTests` and `ControlPlaneTests`) actually correct?**
   _`DomainError` has 22 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 38 inferred relationships involving `create_backend_app()` (e.g. with `_active_storage_item()` and `advance_accepted_operation()`) actually correct?**

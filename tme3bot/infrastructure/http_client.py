@@ -225,6 +225,14 @@ class WorkerHttpDispatcher:
         )
         return int(headers.get("X-Telegram-User-ID") or 0), data
 
+    def profile_export_diagnostics(self, worker: str, profile: str) -> dict[str, Any]:
+        return self._profile_json(
+            worker,
+            "GET",
+            f"/internal/v1/profiles/{quote(profile, safe='')}/session/diagnostics",
+            timeout=20,
+        )
+
     def dispatch(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:
