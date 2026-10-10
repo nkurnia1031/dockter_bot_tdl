@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
@@ -26,6 +27,7 @@ _TDL_ACCESS_ERROR_MESSAGES = {
     "TDL_SESSION_DATABASE_INVALID": "Database sesi TDL export profil ini bukan file yang valid.",
     "TDL_SESSION_UNREADABLE": "Worker tidak dapat membaca database sesi TDL export profil ini.",
     "TDL_SESSION_UNAVAILABLE": "Sesi TDL export profil ini tidak tersedia untuk diuji.",
+    "TDL_ACCESS_MARKER_PERMISSION_FAILED": "Worker tidak dapat menyiapkan file uji untuk user TDL.",
     "CHAT_WRITE_FORBIDDEN": "Telegram menolak pengiriman karena akun tidak diizinkan mengirim ke tujuan.",
     "CHAT_ADMIN_REQUIRED": "Telegram mensyaratkan hak admin untuk mengirim ke tujuan.",
     "USER_BANNED_IN_CHANNEL": "Akun diblokir dari channel tujuan.",
@@ -34,6 +36,29 @@ _TDL_ACCESS_ERROR_MESSAGES = {
     "USER_RESTRICTED": "Telegram membatasi akun untuk mengirim ke tujuan.",
     "VERIFICATION_FAILED": "Perintah TDL gagal. Buka log diagnosis worker untuk detail teknis yang aman.",
 }
+
+
+class TdlAccessMarkerPermissionError(RuntimeError):
+    """Raised when the configured TDL process cannot read its test marker."""
+
+
+def _prepare_tdl_access_marker(marker: Path, user: str | None) -> None:
+    """Keep the test marker private while making it readable by the TDL user."""
+    try:
+        marker.parent.chmod(0o700)
+        marker.chmod(0o600)
+        if not user or user == "root" or os.name != "posix" or os.geteuid() != 0:
+            return
+
+        import pwd
+
+        account = pwd.getpwnam(user)
+        os.chown(marker.parent, account.pw_uid, account.pw_gid)
+        os.chown(marker, account.pw_uid, account.pw_gid)
+    except (AttributeError, ImportError, KeyError, OSError):
+        raise TdlAccessMarkerPermissionError(
+            "TDL_ACCESS_MARKER_PERMISSION_FAILED"
+        ) from None
 
 
 class TdlAccessExecutorMixin:
@@ -164,6 +189,10 @@ class TdlAccessExecutorMixin:
                             "Pesan uji akses TDL. Pesan ini dapat dihapus manual setelah verifikasi.",
                             encoding="utf-8",
                         )
+                        _prepare_tdl_access_marker(
+                            marker,
+                            getattr(runtime.export_tdl_client, "run_as_user", None),
+                        )
                         runtime.export_tdl_client.upload(
                             marker,
                             destination,
@@ -171,6 +200,11 @@ class TdlAccessExecutorMixin:
                         )
                     outcome["ready"] = True
                     LOGGER.info("TDL access verification succeeded job=%s purpose=%s profile=%s", job_id, purpose, profile)
+                except TdlAccessMarkerPermissionError:
+                    outcome["error_code"] = "TDL_ACCESS_MARKER_PERMISSION_FAILED"
+                    outcome["error_message"] = _TDL_ACCESS_ERROR_MESSAGES[
+                        "TDL_ACCESS_MARKER_PERMISSION_FAILED"
+                    ]
                 except Exception as exc:
                     denial = tdl_write_denial_code(exc)
                     outcome["error_code"] = denial or "VERIFICATION_FAILED"

@@ -1,11 +1,12 @@
 import hashlib
 import json
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.tdl import TDLCommandError, tdl_write_denial_code
@@ -107,6 +108,81 @@ class _VerifyExecutor(TdlAccessExecutorMixin):
 
 
 class TdlAccessWorkerTests(unittest.TestCase):
+    def test_marker_permissions_are_private_and_owned_by_the_tdl_user(self):
+        from tme3bot.worker.executor_tdl_access import _prepare_tdl_access_marker
+
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root) / "marker.txt"
+            marker.write_text("test", encoding="utf-8")
+            account = SimpleNamespace(pw_uid=1234, pw_gid=5678)
+            pwd_module = SimpleNamespace(getpwnam=lambda name: account)
+
+            with (
+                patch("tme3bot.worker.executor_tdl_access.os.name", "posix"),
+                patch("tme3bot.worker.executor_tdl_access.os.geteuid", return_value=0, create=True),
+                patch("tme3bot.worker.executor_tdl_access.os.chown", create=True) as chown,
+                patch.object(Path, "chmod") as chmod,
+                patch.dict(sys.modules, {"pwd": pwd_module}),
+            ):
+                _prepare_tdl_access_marker(marker, "user1")
+
+            self.assertEqual(
+                chmod.call_args_list,
+                [call(0o700), call(0o600)],
+            )
+            self.assertEqual(
+                chown.call_args_list,
+                [call(marker.parent, 1234, 5678), call(marker, 1234, 5678)],
+            )
+
+    def test_verification_prepares_each_marker_for_the_configured_tdl_user(self):
+        executor = _VerifyExecutor()
+        for client in executor.clients.values():
+            client.run_as_user = "user1"
+
+        with (
+            patch(
+                "tme3bot.worker.executor_tdl_access.request_json",
+                return_value={"purpose": "storage", "target": "-100123"},
+            ),
+            patch("tme3bot.worker.executor_tdl_access._prepare_tdl_access_marker") as prepare,
+        ):
+            result = executor._tdl_access_verify(
+                {"job_id": "job-1", "worker": "local", "payload": {"purpose": "storage"}}
+            )
+
+        self.assertEqual(result["summary"]["ready"], 1)
+        self.assertEqual(prepare.call_count, 2)
+        self.assertTrue(all(call.args[1] == "user1" for call in prepare.call_args_list))
+
+    def test_marker_permission_failure_is_reported_per_profile(self):
+        from tme3bot.worker.executor_tdl_access import TdlAccessMarkerPermissionError
+
+        executor = _VerifyExecutor()
+        with (
+            patch(
+                "tme3bot.worker.executor_tdl_access.request_json",
+                return_value={"purpose": "storage", "target": "-100123"},
+            ),
+            patch(
+                "tme3bot.worker.executor_tdl_access._prepare_tdl_access_marker",
+                side_effect=TdlAccessMarkerPermissionError(),
+            ),
+        ):
+            result = executor._tdl_access_verify(
+                {"job_id": "job-1", "worker": "local", "payload": {"purpose": "storage"}}
+            )
+
+        self.assertEqual(result["summary"]["ready"], 0)
+        self.assertEqual(
+            {item["error_code"] for item in result["profiles"]},
+            {"TDL_ACCESS_MARKER_PERMISSION_FAILED"},
+        )
+        self.assertEqual(
+            {item["error_message"] for item in result["profiles"]},
+            {"Worker tidak dapat menyiapkan file uji untuk user TDL."},
+        )
+
     def test_verification_reports_unavailable_profiles_and_redacted_command_contract(self):
         executor = _VerifyExecutor()
         executor.profile_manager = SimpleNamespace(
