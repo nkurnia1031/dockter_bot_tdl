@@ -107,6 +107,41 @@ class _VerifyExecutor(TdlAccessExecutorMixin):
 
 
 class TdlAccessWorkerTests(unittest.TestCase):
+    def test_verification_reports_unavailable_profiles_and_redacted_command_contract(self):
+        executor = _VerifyExecutor()
+        executor.profile_manager = SimpleNamespace(
+            list_profiles=lambda: ["default", "archive"],
+            tdl_session_diagnostic=lambda profile, purpose: {
+                "profile": profile,
+                "available": profile == "archive",
+                "error_code": None if profile == "archive" else "TDL_SESSION_DATABASE_MISSING",
+            },
+            runtime=lambda name: SimpleNamespace(
+                export_tdl_client=executor.clients[name],
+                export_operation_lock=threading.RLock(),
+            ),
+        )
+        executor.available_storage_profiles = lambda: ["archive"]
+
+        with patch(
+            "tme3bot.worker.executor_tdl_access.request_json",
+            return_value={"purpose": "storage", "target": "-100-secret"},
+        ):
+            result = executor._tdl_access_verify(
+                {"job_id": "job-1", "worker": "local", "payload": {"purpose": "storage"}}
+            )
+
+        profiles = {item["profile"]: item for item in result["profiles"]}
+        self.assertEqual(set(profiles), {"default", "archive"})
+        self.assertEqual(profiles["default"]["error_code"], "TDL_SESSION_DATABASE_MISSING")
+        self.assertFalse(profiles["default"]["command_attempted"])
+        self.assertTrue(profiles["archive"]["command_attempted"])
+        self.assertIn("tdl", result["command_template"])
+        self.assertIn("--storage", result["command_template"])
+        self.assertIn("up -p", result["command_template"])
+        self.assertNotIn("-100-secret", json.dumps(result))
+        self.assertNotIn("/data/", json.dumps(result))
+
     def test_verification_checks_each_local_profile_and_returns_only_safe_metadata(self):
         executor = _VerifyExecutor()
         with patch(

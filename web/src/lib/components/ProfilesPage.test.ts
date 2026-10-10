@@ -179,4 +179,5 @@ describe('ProfilesPage', () => {
     expect(screen.queryByRole('button', { name: 'Pulihkan' })).toBeNull();
     expect(screen.queryByRole('button', { name: /Periksa \/ sinkronkan/ })).toBeNull();
   });
+
 });

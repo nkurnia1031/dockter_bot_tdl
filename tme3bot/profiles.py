@@ -373,6 +373,12 @@ class ProfileManager:
 
     def tdl_session_available(self, profile_name: str, purpose: str = "export") -> bool:
         """Check an initialized local TDL session without creating runtime files."""
+        return self.tdl_session_diagnostic(profile_name, purpose)["available"] is True
+
+    def tdl_session_diagnostic(
+        self, profile_name: str, purpose: str = "export"
+    ) -> dict[str, object]:
+        """Return safe local session health metadata without exposing its path."""
         normalized = normalize_profile_name(profile_name) or self.default_profile
         config = build_profile_config(self.base_config, normalized)
         purpose = str(purpose or "export").strip().lower()
@@ -381,7 +387,13 @@ class ProfileManager:
             if purpose in {"export", "storage", "tts", "leave"}
             else Path(config.tdl_download_storage)
         )
-        return _tdl_session_database_ready(storage_root)
+        error_code = _tdl_session_database_error(storage_root)
+        return {
+            "profile": normalized,
+            "purpose": purpose,
+            "available": error_code is None,
+            "error_code": error_code,
+        }
 
     def profiles_with_tdl_session(self, purpose: str = "export") -> list[str]:
         """Return locally initialized sessions; vault ACK state is diagnostic only."""
@@ -463,11 +475,25 @@ def describe_download_mode(mode: str) -> str:
 
 def _tdl_session_database_ready(storage_root: Path) -> bool:
     """Return whether TDL initialized its Bolt database in this session root."""
+    return _tdl_session_database_error(storage_root) is None
+
+
+def _tdl_session_database_error(storage_root: Path) -> str | None:
+    """Classify a missing or invalid Bolt database without returning local paths."""
+    root = Path(storage_root)
     database = Path(storage_root) / "data"
     try:
-        return database.is_file() and database.stat().st_size > 0
+        if not root.is_dir():
+            return "TDL_SESSION_DIRECTORY_MISSING"
+        if not database.exists():
+            return "TDL_SESSION_DATABASE_MISSING"
+        if not database.is_file():
+            return "TDL_SESSION_DATABASE_INVALID"
+        if database.stat().st_size <= 0:
+            return "TDL_SESSION_DATABASE_EMPTY"
+        return None
     except OSError:
-        return False
+        return "TDL_SESSION_UNREADABLE"
 
 
 def build_profile_runtime(

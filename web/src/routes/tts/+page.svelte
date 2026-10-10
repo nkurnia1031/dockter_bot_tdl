@@ -18,7 +18,8 @@
     profile_session_ready?: boolean;
   };
   type AccessOperation = { operation_id: string; status: string; phase: string; job_id?: string | null };
-  type AccessProfile = { profile: string; ready: boolean; error_code?: string | null };
+  type AccessProfile = { profile: string; ready: boolean; error_code?: string | null; error_message?: string | null; session_status?: string; command_attempted?: boolean };
+  type AccessJob = { progress?: { message?: string | null }; result?: { value?: { profiles?: AccessProfile[]; command_template?: string; summary?: { total: number; tested: number; ready: number; failed: number } } } };
 
   let title = $state('');
   let text = $state('');
@@ -38,6 +39,9 @@
   let accessProfiles = $state<AccessProfile[]>([]);
   let accessLoading = $state(false);
   let accessError = $state('');
+  let accessProgress = $state('');
+  let accessCommand = $state('');
+  let accessSummary = $state<{ total: number; tested: number; ready: number; failed: number } | null>(null);
   const maxChars = 100_000;
   const readyWorkers = $derived(workers.filter((item) => item.ready));
   const workerReason = (code: string) => ({
@@ -115,6 +119,9 @@
   async function verifyTdlAccess(workerName: string) {
     accessError = '';
     accessProfiles = [];
+    accessProgress = '';
+    accessCommand = '';
+    accessSummary = null;
     accessLoading = true;
     try {
       accessOperation = {
@@ -138,17 +145,25 @@
     accessError = '';
     accessLoading = true;
     try {
+      let hasOperationResult = false;
       const operation = await api<AccessOperation>(`/operations/${accessOperation.operation_id}`);
       accessOperation = { ...operation, worker: accessOperation.worker };
       localStorage.setItem('tts-tdl-access-operation', JSON.stringify(accessOperation));
-      if (operation.status === 'succeeded' && operation.job_id) {
-        const job = await api<{ result?: { value?: { profiles?: AccessProfile[] } } }>(`/jobs/${operation.job_id}`);
-        accessProfiles = job.result?.value?.profiles || [];
+      if (operation.job_id) {
+        const job = await api<AccessJob>(`/jobs/${operation.job_id}`);
+        accessProgress = job.progress?.message || '';
+        const result = job.result?.value;
+        if (result) {
+          hasOperationResult = true;
+          accessProfiles = result.profiles || [];
+          accessCommand = result.command_template || '';
+          accessSummary = result.summary || null;
+        }
       }
       const current = await api<{ profiles: AccessProfile[] }>(
         `/tdl-access/verification?purpose=tts&worker=${encodeURIComponent(accessOperation.worker)}`
       );
-      if (current.profiles) accessProfiles = current.profiles;
+      if (!hasOperationResult && current.profiles) accessProfiles = current.profiles;
       await loadWorkers();
     } catch (cause) {
       accessError = cause instanceof Error ? cause.message : 'Status verifikasi akses TDL gagal dimuat.';
@@ -253,7 +268,10 @@
       <div class="mt-3 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3 text-sm">
         <div class="flex flex-wrap items-center justify-between gap-2"><b>Verifikasi {accessOperation.worker}</b><button class="button secondary !px-3 !py-2 text-xs" onclick={refreshTdlAccess} disabled={accessLoading}><RefreshCw size={14}/>{accessLoading ? 'Memuat...' : 'Muat status'}</button></div>
         <p class="muted mt-1 text-xs">Operation {accessOperation.status} · tahap {accessOperation.phase}. Pemeriksaan mengirim satu pesan penanda per profil; pesan tersebut tidak dihapus otomatis.</p>
-        {#if accessProfiles.length}<ul class="mt-2 space-y-1 text-xs">{#each accessProfiles as item}<li>{item.profile}: {item.ready ? 'dapat mengirim' : `gagal (${item.error_code || 'VERIFICATION_FAILED'})`}</li>{/each}</ul>{/if}
+        {#if accessProgress}<p role="status" class="mt-2 text-sm">{accessProgress}</p>{/if}
+        {#if accessSummary}<p class="muted mt-2 text-xs">{accessSummary.ready} profil dapat mengirim dari {accessSummary.total} · {accessSummary.tested} perintah TDL dijalankan · {accessSummary.failed} gagal atau dilewati.</p>{/if}
+        {#if accessCommand}<details class="mt-2 text-xs"><summary class="cursor-pointer font-semibold">Lihat bentuk perintah TDL</summary><code class="mt-2 block overflow-x-auto rounded-lg bg-[var(--surface-soft)] p-2">{accessCommand}</code><span class="muted mt-1 block">Tujuan chat, path sesi, dan nama file sementara disamarkan.</span></details>{/if}
+        {#if accessProfiles.length}<ul class="mt-2 space-y-2 text-xs">{#each accessProfiles as item}<li class="rounded-lg border border-[var(--line)] p-2"><div><b>{item.profile}</b> · {item.ready ? 'dapat mengirim' : `gagal (${item.error_code || 'VERIFICATION_FAILED'})`}</div>{#if !item.ready && item.error_message}<p class="mt-1 text-rose-700 dark:text-rose-300">{item.error_message}</p>{/if}{#if item.command_attempted === false}<span class="muted block">Perintah TDL tidak dijalankan karena sesi tidak tersedia.</span>{:else if item.command_attempted === true}<span class="muted block">Perintah TDL dijalankan dengan sesi export profil ini.</span>{/if}</li>{/each}</ul>{:else}<p class="muted mt-2 text-xs">Belum ada hasil pemeriksaan profil. Tekan Muat status untuk mengambil hasil terbaru.</p>{/if}
         {#if accessError}<p role="alert" class="mt-2 text-xs text-rose-600">{accessError}</p>{/if}
       </div>
     {/if}
