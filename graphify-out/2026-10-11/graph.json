@@ -4627,7 +4627,7 @@
       "file_type": "code",
       "norm_label": "build_profile_config()",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L597"
+      "source_location": "L593"
     },
     {
       "id": "tme3bot_profiles_profilemanager_active_profile_for_chat",
@@ -9439,7 +9439,7 @@
       "file_type": "code",
       "norm_label": ".test_profile_registry_rejects_one_telegram_identity_on_two_profiles()",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L235"
+      "source_location": "L231"
     },
     {
       "id": "tests_test_profiles_profiletests_test_runtime_role_validation_fails_fast_for_missing_trust_tokens",
@@ -9451,7 +9451,7 @@
       "file_type": "code",
       "norm_label": ".test_runtime_role_validation_fails_fast_for_missing_trust_tokens()",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L285"
+      "source_location": "L281"
     },
     {
       "id": "tests_test_profiles_profiletests_test_tdl_session_diagnostic_reports_safe_reasons_for_each_profile",
@@ -9535,7 +9535,7 @@
       "file_type": "code",
       "norm_label": "build_profile_runtime()",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L538"
+      "source_location": "L534"
     },
     {
       "id": "tme3bot_profiles_chown_paths",
@@ -9547,7 +9547,7 @@
       "file_type": "code",
       "norm_label": "chown_paths()",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L659"
+      "source_location": "L655"
     },
     {
       "id": "tme3bot_profiles_chown_tree",
@@ -9559,7 +9559,7 @@
       "file_type": "code",
       "norm_label": "chown_tree()",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L671"
+      "source_location": "L667"
     },
     {
       "id": "tme3bot_profiles_describe_download_mode",
@@ -9583,7 +9583,7 @@
       "file_type": "code",
       "norm_label": "ensure_profile_runtime_dirs()",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L630"
+      "source_location": "L626"
     },
     {
       "id": "tme3bot_profiles_get_profile_download_mode",
@@ -41263,7 +41263,7 @@
       "file_type": "code",
       "norm_label": ".test_app_config_accepts_custom_gateway_and_worker_ports()",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L256"
+      "source_location": "L252"
     },
     {
       "id": "tests_test_profiles_profiletests_test_app_config_parses_multiple_named_worker_endpoints",
@@ -41275,7 +41275,7 @@
       "file_type": "code",
       "norm_label": ".test_app_config_parses_multiple_named_worker_endpoints()",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L267"
+      "source_location": "L263"
     },
     {
       "id": "tests_test_profiles_profiletests_test_app_config_uses_container_profile_root_not_compose_host_path",
@@ -41287,7 +41287,7 @@
       "file_type": "code",
       "norm_label": ".test_app_config_uses_container_profile_root_not_compose_host_path()",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L242"
+      "source_location": "L238"
     },
     {
       "id": "tests_test_queue_transport_queuetransporttests_test_backend_queue_role_requires_only_backend_and_redis_bootstrap",
@@ -68026,7 +68026,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L262",
+      "source_location": "L258",
       "weight": 1.0
     },
     {
@@ -68038,7 +68038,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L279",
+      "source_location": "L275",
       "weight": 1.0
     },
     {
@@ -68050,7 +68050,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L252",
+      "source_location": "L248",
       "weight": 1.0
     },
     {
@@ -68374,7 +68374,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L237",
+      "source_location": "L233",
       "weight": 1.0
     },
     {
@@ -68386,7 +68386,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L237",
+      "source_location": "L233",
       "weight": 1.0
     },
     {
@@ -68398,7 +68398,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L287",
+      "source_location": "L283",
       "weight": 1.0
     },
     {
@@ -68410,7 +68410,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tests/test_profiles.py",
-      "source_location": "L287",
+      "source_location": "L283",
       "weight": 1.0
     },
     {
@@ -95446,7 +95446,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L598",
+      "source_location": "L594",
       "weight": 1.0
     },
     {
@@ -95458,7 +95458,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L606",
+      "source_location": "L602",
       "weight": 1.0
     },
     {
@@ -95470,7 +95470,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L548",
+      "source_location": "L544",
       "weight": 1.0
     },
     {
@@ -95482,7 +95482,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L554",
+      "source_location": "L550",
       "weight": 1.0
     },
     {
@@ -95494,7 +95494,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L556",
+      "source_location": "L552",
       "weight": 1.0
     },
     {
@@ -95506,7 +95506,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L557",
+      "source_location": "L553",
       "weight": 1.0
     },
     {
@@ -95518,7 +95518,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L576",
+      "source_location": "L572",
       "weight": 1.0
     },
     {
@@ -95530,7 +95530,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L577",
+      "source_location": "L573",
       "weight": 1.0
     },
     {
@@ -95542,7 +95542,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L580",
+      "source_location": "L576",
       "weight": 1.0
     },
     {
@@ -95554,7 +95554,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L582",
+      "source_location": "L578",
       "weight": 1.0
     },
     {
@@ -95566,7 +95566,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L668",
+      "source_location": "L664",
       "weight": 1.0
     },
     {
@@ -95578,7 +95578,7 @@
       "confidence_score": 1.0,
       "context": "call",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L654",
+      "source_location": "L650",
       "weight": 1.0
     },
     {
@@ -115330,7 +115330,7 @@
       "confidence_score": 1.0,
       "context": "generic_arg",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L538",
+      "source_location": "L534",
       "weight": 1.0
     },
     {
@@ -156933,7 +156933,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L538",
+      "source_location": "L534",
       "weight": 1.0
     },
     {
@@ -156944,7 +156944,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L597",
+      "source_location": "L593",
       "weight": 1.0
     },
     {
@@ -156955,7 +156955,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L630",
+      "source_location": "L626",
       "weight": 1.0
     },
     {
@@ -156966,7 +156966,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L659",
+      "source_location": "L655",
       "weight": 1.0
     },
     {
@@ -156977,7 +156977,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L671",
+      "source_location": "L667",
       "weight": 1.0
     },
     {
@@ -169560,7 +169560,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tests/test_profiles.py",
-      "source_location": "L235",
+      "source_location": "L231",
       "weight": 1.0
     },
     {
@@ -169571,7 +169571,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tests/test_profiles.py",
-      "source_location": "L242",
+      "source_location": "L238",
       "weight": 1.0
     },
     {
@@ -169593,7 +169593,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tests/test_profiles.py",
-      "source_location": "L256",
+      "source_location": "L252",
       "weight": 1.0
     },
     {
@@ -169604,7 +169604,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tests/test_profiles.py",
-      "source_location": "L267",
+      "source_location": "L263",
       "weight": 1.0
     },
     {
@@ -169615,7 +169615,7 @@
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "tests/test_profiles.py",
-      "source_location": "L285",
+      "source_location": "L281",
       "weight": 1.0
     },
     {
@@ -196419,7 +196419,7 @@
       "confidence_score": 0.95,
       "context": "parameter_type",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L540",
+      "source_location": "L536",
       "weight": 0.8
     },
     {
@@ -196431,7 +196431,7 @@
       "confidence_score": 0.95,
       "context": "parameter_type",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L542",
+      "source_location": "L538",
       "weight": 0.8
     },
     {
@@ -196443,7 +196443,7 @@
       "confidence_score": 0.95,
       "context": "parameter_type",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L630",
+      "source_location": "L626",
       "weight": 0.8
     },
     {
@@ -196539,7 +196539,7 @@
       "confidence_score": 0.95,
       "context": "return_type",
       "source_file": "tme3bot/profiles.py",
-      "source_location": "L597",
+      "source_location": "L593",
       "weight": 0.8
     },
     {
@@ -197705,7 +197705,7 @@
       "confidence": "INFERRED",
       "confidence_score": 0.95,
       "source_file": "tests/test_profiles.py",
-      "source_location": "L237",
+      "source_location": "L233",
       "weight": 0.8
     },
     {

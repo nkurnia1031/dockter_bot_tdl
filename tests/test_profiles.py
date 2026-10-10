@@ -204,14 +204,19 @@ class ProfileTests(unittest.TestCase):
     def test_tdl_session_diagnostic_reports_safe_reasons_for_each_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            config = self.make_config(root)
+            config = replace(self.make_config(root), app_role="worker")
             manager = ProfileManager(config)
-            ready_db = root / "user1" / ".tdl" / "data"
+            ready_db = root / "user1" / ".tdl" / "data" / "default"
             ready_db.parent.mkdir(parents=True)
             ready_db.write_bytes(b"bolt")
+            archive_db = (
+                root / "profiles" / "archive" / "user1" / ".tdl" / "data" / "default"
+            )
+            archive_db.parent.mkdir(parents=True)
+            archive_db.write_bytes(b"archive bolt")
             empty_db = root / "profiles" / "empty" / "user1" / ".tdl" / "data"
-            empty_db.parent.mkdir(parents=True)
-            empty_db.write_bytes(b"")
+            empty_db.mkdir(parents=True)
+            (empty_db / "default").write_bytes(b"")
 
             ready = manager.tdl_session_diagnostic("default", "storage")
             missing = manager.tdl_session_diagnostic("missing", "storage")
@@ -223,7 +228,9 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(missing["error_code"], "TDL_SESSION_DIRECTORY_MISSING")
             self.assertEqual(empty["error_code"], "TDL_SESSION_DATABASE_EMPTY")
             self.assertNotIn(str(root), str([ready, missing, empty]))
-            self.assertEqual(manager.profiles_with_tdl_session("storage"), ["default"])
+            self.assertEqual(
+                manager.profiles_with_tdl_session("storage"), ["archive", "default"]
+            )
 
     def test_profile_registry_rejects_one_telegram_identity_on_two_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

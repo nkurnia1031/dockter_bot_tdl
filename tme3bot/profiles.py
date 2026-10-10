@@ -379,10 +379,11 @@ class ProfileManager:
             / "user1"
             / ".tdl"
         )
+        namespace = self.base_config.tdl_export_namespace
         if (
             legacy.resolve() != configured.resolve()
-            and _tdl_session_database_ready(legacy)
-            and not _tdl_session_database_ready(configured)
+            and _tdl_session_database_ready(legacy, namespace)
+            and not _tdl_session_database_ready(configured, namespace)
         ):
             return legacy
         return configured
@@ -403,7 +404,12 @@ class ProfileManager:
             if purpose in {"export", "storage", "tts", "leave"}
             else Path(config.tdl_download_storage)
         )
-        error_code = _tdl_session_database_error(storage_root)
+        namespace = (
+            config.tdl_export_namespace
+            if purpose in {"export", "storage", "tts", "leave"}
+            else config.tdl_download_namespace
+        )
+        error_code = _tdl_session_database_error(storage_root, namespace)
         return {
             "profile": normalized,
             "purpose": purpose,
@@ -489,18 +495,35 @@ def describe_download_mode(mode: str) -> str:
     )
 
 
-def _tdl_session_database_ready(storage_root: Path) -> bool:
+def _tdl_session_database_ready(storage_root: Path, namespace: str) -> bool:
     """Return whether TDL initialized its Bolt database in this session root."""
-    return _tdl_session_database_error(storage_root) is None
+    return _tdl_session_database_error(storage_root, namespace) is None
 
 
-def _tdl_session_database_error(storage_root: Path) -> str | None:
-    """Classify a missing or invalid Bolt database without returning local paths."""
+def _tdl_session_database_error(storage_root: Path, namespace: str) -> str | None:
+    """Check the configured Bolt namespace without returning local paths."""
     root = Path(storage_root)
-    database = Path(storage_root) / "data"
+    data_root = root / "data"
+    namespace_name = str(namespace or "").strip()
+    if (
+        not namespace_name
+        or namespace_name in {".", ".."}
+        or "/" in namespace_name
+        or "\\" in namespace_name
+    ):
+        return "TDL_SESSION_DATABASE_INVALID"
     try:
-        if not root.is_dir():
+        if root.is_symlink() or not root.is_dir():
             return "TDL_SESSION_DIRECTORY_MISSING"
+        if data_root.is_symlink():
+            return "TDL_SESSION_DATABASE_INVALID"
+        if not data_root.exists():
+            return "TDL_SESSION_DATABASE_MISSING"
+        if not data_root.is_dir():
+            return "TDL_SESSION_DATABASE_INVALID"
+        database = data_root / namespace_name
+        if database.is_symlink():
+            return "TDL_SESSION_DATABASE_INVALID"
         if not database.exists():
             return "TDL_SESSION_DATABASE_MISSING"
         if not database.is_file():
