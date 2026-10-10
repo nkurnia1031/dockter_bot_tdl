@@ -275,6 +275,14 @@ def advance_profile_sync_command(command: dict[str, Any], context) -> dict[str, 
                 phase="waiting_worker",
                 safe_progress={"worker": worker, "desired_revision": int(revision["revision"])},
             )
+    request_worker_sync = getattr(context.worker_dispatcher, "request_profile_sync", None)
+    if callable(request_worker_sync):
+        try:
+            request_worker_sync(worker, profile=profile, mode="check")
+        except Exception:
+            # Keep the durable operation waiting. The outbox retries this
+            # command, and the Web can show the worker's current diagnostic.
+            return {"status": "retry", "reason": "worker_sync_unavailable"}
     return {"status": "accepted"}
 
 
@@ -285,8 +293,31 @@ def advance_profile_sync_cancel(command: dict[str, Any], context) -> dict[str, s
     operation_id = str(command.get("operation_id") or "")
     actor_user_id = int(payload.get("actor_user_id") or 0)
     provisioner = context.profile_provisioner
+    sync_request = None
+    worker_cancel_status = "already_finished"
     if provisioner is not None:
-        provisioner.store.cancel_sync_request(operation_id)
+        sync_request = provisioner.store.cancel_sync_request(operation_id)
+    if provisioner is not None and sync_request is not None:
+        remaining = provisioner.store.sync_requests(
+            sync_request["profile"],
+            sync_request["worker"],
+        )
+        cancel_worker_sync = getattr(context.worker_dispatcher, "cancel_profile_sync", None)
+        if remaining:
+            worker_cancel_status = "other_requests_pending"
+        elif callable(cancel_worker_sync):
+            try:
+                result = cancel_worker_sync(
+                    sync_request["worker"], sync_request["profile"], mode="check"
+                )
+                status = str(result.get("status") or "unknown") if isinstance(result, dict) else "unknown"
+                worker_cancel_status = status if status in {"cancelled", "cancelling", "not_found"} else "unknown"
+            except Exception:
+                # The operation is still cancelled while an offline worker's
+                # process state remains unconfirmed.
+                worker_cancel_status = "worker_unavailable"
+        else:
+            worker_cancel_status = "unsupported"
     service = context.operation_service
     operation_store = service.store if service is not None else None
     if operation_store is not None:
@@ -297,6 +328,9 @@ def advance_profile_sync_cancel(command: dict[str, Any], context) -> dict[str, s
                 expected_revision=operation.revision,
                 status=OperationStatus.CANCELLED,
                 phase="cancelled",
-                safe_progress={"worker": operation.target.get("worker", "")},
+                safe_progress={
+                    "worker": operation.target.get("worker", ""),
+                    "worker_sync_cancel": worker_cancel_status,
+                },
             )
-    return {"status": "terminal"}
+    return {"status": "terminal", "worker_sync_cancel": worker_cancel_status}

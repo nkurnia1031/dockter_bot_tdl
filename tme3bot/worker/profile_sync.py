@@ -44,6 +44,10 @@ class ProfileSyncError(RuntimeError):
         super().__init__(code)
 
 
+class _ProfileSyncCancelled(Exception):
+    """Internal signal to stop a profile pull at a safe boundary."""
+
+
 class ProfileSyncClient:
     """Fetch, verify, safely install, and ACK backend-owned profile revisions."""
 
@@ -71,6 +75,7 @@ class ProfileSyncClient:
         self._requests: queue.Queue[tuple[str | None, str]] = queue.Queue()
         self._queued: set[tuple[str | None, str]] = set()
         self._active_request: tuple[str | None, str] | None = None
+        self._cancelled_syncs: set[tuple[str, str]] = set()
         self._legacy_discovery_lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._state = self._load_state()
@@ -138,6 +143,26 @@ class ProfileSyncClient:
                 return self._sync(mode=mode, profile=normalized)
             finally:
                 self._mark_startup_checked()
+
+    def cancel_sync(
+        self, *, profile: str, mode: str = "check"
+    ) -> dict[str, Any]:
+        """Cancel a queued sync, or ask an active sync to stop at a safe point."""
+        normalized = normalize_profile_name(profile)
+        mode = str(mode or "check").strip().lower()
+        if not normalized or mode not in {"check", "repair"}:
+            raise ValueError("Target sinkronisasi profil tidak valid.")
+        request_key = (normalized, mode)
+        with self._condition:
+            if request_key in self._queued:
+                self._cancelled_syncs.add(request_key)
+                self._condition.notify_all()
+                return {"accepted": True, "status": "cancelled", "profile": normalized}
+            if self._active_request == request_key:
+                self._cancelled_syncs.add(request_key)
+                self._condition.notify_all()
+                return {"accepted": True, "status": "cancelling", "profile": normalized}
+        return {"accepted": False, "status": "not_found", "profile": normalized}
 
     def snapshot(self) -> dict[str, Any]:
         with self._condition:
@@ -284,25 +309,49 @@ class ProfileSyncClient:
 
     def _run_requests(self) -> None:
         while True:
-            key = self._requests.get()
-            with self._condition:
-                self._queued.discard(key)
-                self._active_request = key
-                self._condition.notify_all()
-            try:
-                with self._sync_lock:
-                    self._sync(mode=key[1], profile=key[0])
-            except Exception as exc:  # Defensive boundary for the daemon loop.
-                LOGGER.warning("Worker profile sync failed (%s)", type(exc).__name__)
-                self._set_backend_unavailable("SYNC_FAILED")
-            finally:
-                self._mark_startup_checked()
-                with self._condition:
-                    self._active_request = None
-                    self._condition.notify_all()
-                self._requests.task_done()
+            self._run_one_request()
 
-    def _sync(self, *, mode: str, profile: str | None) -> dict[str, Any]:
+    def _run_one_request(self) -> None:
+        key = self._requests.get()
+        with self._condition:
+            self._queued.discard(key)
+            if key in self._cancelled_syncs:
+                self._cancelled_syncs.discard(key)
+                self._condition.notify_all()
+                self._requests.task_done()
+                return
+            self._active_request = key
+            self._condition.notify_all()
+        try:
+            with self._sync_lock:
+                self._sync(
+                    mode=key[1],
+                    profile=key[0],
+                    cancelled=lambda profile: self._sync_cancelled(profile, key[1]),
+                )
+        except _ProfileSyncCancelled:
+            LOGGER.info("Worker profile sync cancelled at a safe boundary")
+        except Exception as exc:  # Defensive boundary for the daemon loop.
+            LOGGER.warning("Worker profile sync failed (%s)", type(exc).__name__)
+            self._set_backend_unavailable("SYNC_FAILED")
+        finally:
+            self._mark_startup_checked()
+            with self._condition:
+                self._active_request = None
+                self._cancelled_syncs.discard((key[0], key[1]))
+                self._condition.notify_all()
+            self._requests.task_done()
+
+    def _sync(
+        self,
+        *,
+        mode: str,
+        profile: str | None,
+        cancelled: Callable[[str], bool] | None = None,
+    ) -> dict[str, Any]:
+        is_cancelled = cancelled or (lambda _profile: False)
+        if profile and is_cancelled(profile):
+            raise _ProfileSyncCancelled()
         try:
             manifest = self._get_manifest()
         except Exception as exc:
@@ -315,6 +364,8 @@ class ProfileSyncClient:
         except ProfileSyncError as exc:
             self._set_backend_unavailable(exc.code)
             return {"status": "waiting_worker", "synced": 0}
+        if profile and is_cancelled(profile):
+            raise _ProfileSyncCancelled()
         now = _now()
         current_profiles = {str(item["profile"]) for item in entries}
         with self._condition:
@@ -365,6 +416,7 @@ class ProfileSyncClient:
 
         synced = 0
         failures = 0
+        cancelled_count = 0
         if profile and profile not in current_profiles:
             with self._condition:
                 self._state["managed_profiles"] = sorted(
@@ -384,10 +436,19 @@ class ProfileSyncClient:
             if profile and entry["profile"] != profile:
                 continue
             try:
-                if self._sync_entry(entry, mode=mode):
+                if is_cancelled(entry["profile"]):
+                    raise _ProfileSyncCancelled()
+                if self._sync_entry(entry, mode=mode, cancelled=is_cancelled):
                     synced += 1
                 else:
                     failures += 1
+            except _ProfileSyncCancelled:
+                self._set_profile(
+                    entry["profile"], status="sync_pending", error_code="SYNC_CANCELLED"
+                )
+                if profile is not None:
+                    raise
+                cancelled_count += 1
             except Exception as exc:
                 code = getattr(exc, "code", "PROFILE_SYNC_FAILED")
                 self._set_profile(entry["profile"], status="sync_pending", error_code=str(code))
@@ -404,10 +465,26 @@ class ProfileSyncClient:
             self._condition.notify_all()
         if failures:
             return {"status": "sync_pending", "synced": synced, "failed": failures}
+        if cancelled_count:
+            return {
+                "status": "sync_pending",
+                "synced": synced,
+                "failed": 0,
+                "cancelled": cancelled_count,
+            }
         return {"status": "ready", "synced": synced, "failed": 0}
 
-    def _sync_entry(self, entry: dict[str, Any], *, mode: str) -> bool:
+    def _sync_entry(
+        self,
+        entry: dict[str, Any],
+        *,
+        mode: str,
+        cancelled: Callable[[str], bool] | None = None,
+    ) -> bool:
         profile = entry["profile"]
+        is_cancelled = cancelled or (lambda _profile: False)
+        if is_cancelled(profile):
+            raise _ProfileSyncCancelled()
         revision = entry["revision"]
         digest = entry["bundle_sha256"]
         if entry["format_version"] != _SUPPORTED_FORMAT:
@@ -431,9 +508,14 @@ class ProfileSyncClient:
                     telegram_user_id=int(installed_identity),
                     error_code="",
                 )
+                if is_cancelled(profile):
+                    self._set_profile(profile, status="sync_pending", error_code="SYNC_CANCELLED")
+                    raise _ProfileSyncCancelled()
                 return self._ack(profile, revision, digest, int(installed_identity))
 
         bundle, headers = self._get_bundle(profile, revision)
+        if is_cancelled(profile):
+            raise _ProfileSyncCancelled()
         actual_digest = hashlib.sha256(bundle).hexdigest()
         if not hmac_compare(actual_digest, digest):
             raise ProfileSyncError("PROFILE_BUNDLE_HASH_MISMATCH")
@@ -474,7 +556,14 @@ class ProfileSyncClient:
             telegram_user_id=user_id,
             error_code="",
         )
+        if is_cancelled(profile):
+            self._set_profile(profile, status="sync_pending", error_code="SYNC_CANCELLED")
+            raise _ProfileSyncCancelled()
         return self._ack(profile, revision, digest, user_id)
+
+    def _sync_cancelled(self, profile: str, mode: str) -> bool:
+        with self._condition:
+            return (profile, mode) in self._cancelled_syncs
 
     def _ack(self, profile: str, revision: int, digest: str, user_id: int) -> bool:
         response, _ = self._request(

@@ -371,6 +371,26 @@ class ProfileManager:
             return legacy
         return configured
 
+    def tdl_session_available(self, profile_name: str, purpose: str = "export") -> bool:
+        """Check an initialized local TDL session without creating runtime files."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        config = build_profile_config(self.base_config, normalized)
+        purpose = str(purpose or "export").strip().lower()
+        storage_root = (
+            self.export_tdl_storage_path(normalized)
+            if purpose in {"export", "storage", "tts", "leave"}
+            else Path(config.tdl_download_storage)
+        )
+        return _tdl_session_database_ready(storage_root)
+
+    def profiles_with_tdl_session(self, purpose: str = "export") -> list[str]:
+        """Return locally initialized sessions; vault ACK state is diagnostic only."""
+        return [
+            profile
+            for profile in self.list_profiles()
+            if self.tdl_session_available(profile, purpose)
+        ]
+
 
 def profile_settings_path(base_config: AppConfig, profile_name: str) -> Path:
     normalized = normalize_profile_name(profile_name) or normalize_profile_name(

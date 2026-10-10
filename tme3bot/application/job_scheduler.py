@@ -99,12 +99,24 @@ def build_execution_plan(
             keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
     elif kind == "storage_upload":
         keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
+        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+        for sender_profile in sender_profiles:
+            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
         lane = "tdl-storage"
     elif kind == "tts":
         # Keep one end-to-end TTS job per worker, including Telegram delivery.
         # Different workers remain independent and can each use three routes.
         keys = {f"worker:{worker}:kind:tts"}
+        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+        for sender_profile in sender_profiles:
+            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
         lane = "tts"
+    elif kind == "tdl_access_verify":
+        keys = {f"worker:{worker}:kind:tdl_access_verify"}
+        candidate_profiles = payload.get("candidate_profiles") or profiles
+        for candidate_profile in candidate_profiles:
+            keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:export")
+        lane = "tdl-access-verification"
     elif kind == "safelink_resolve":
         # The HTTP resolver addon exposes one active resolution slot per worker.
         keys = {f"worker:{worker}:kind:safelink_resolve"}

@@ -331,13 +331,26 @@ class WorkerCommandStore:
                     and str(job.get("kind") or "") == "tts"
                     and phase in {"starting", "synthesizing", "merging"}
                 )
-                next_status = "accepted" if safe_tts_resume else "needs_reconciliation"
-                next_phase = "recovered" if safe_tts_resume else "needs_reconciliation"
+                safe_export_commit_resume = (
+                    row["status"] in {"running", "cancelling"}
+                    and str(job.get("kind") or "") == "export"
+                    and isinstance(checkpoint, dict)
+                    and isinstance(checkpoint.get("cursor_commit"), dict)
+                )
+                safe_resume = safe_tts_resume or safe_export_commit_resume
+                next_status = "accepted" if safe_resume else "needs_reconciliation"
+                next_phase = (
+                    "recovered_cursor_commit"
+                    if safe_export_commit_resume
+                    else "recovered"
+                    if safe_tts_resume
+                    else "needs_reconciliation"
+                )
                 db.execute(
                     "UPDATE worker_commands SET status=?,phase=?,updated_at=? WHERE command_id=?",
                     (next_status, next_phase, now, row["command_id"]),
                 )
-                if safe_tts_resume:
+                if safe_resume:
                     accepted += 1
                 else:
                     uncertain += 1
@@ -388,6 +401,24 @@ class WorkerCommandStore:
                     "progress": progress_snapshot,
                     "event_sequence": sequence,
                 }
+                command_row = db.execute(
+                    "SELECT checkpoint FROM worker_commands WHERE command_id=? AND job_id=? AND attempt=? AND dispatch_token=?",
+                    (
+                        command_id,
+                        str(job_id),
+                        int(payload.get("attempt") or 0),
+                        str(payload.get("dispatch_token") or ""),
+                    ),
+                ).fetchone()
+                if command_row is not None and command_row["checkpoint"]:
+                    try:
+                        existing_checkpoint = json.loads(command_row["checkpoint"])
+                    except (TypeError, json.JSONDecodeError):
+                        existing_checkpoint = {}
+                    if isinstance(existing_checkpoint, dict) and isinstance(
+                        existing_checkpoint.get("cursor_commit"), dict
+                    ):
+                        checkpoint["cursor_commit"] = existing_checkpoint["cursor_commit"]
                 db.execute(
                     """UPDATE worker_commands SET phase=?,checkpoint=?,updated_at=?
                     WHERE command_id=? AND job_id=? AND attempt=? AND dispatch_token=?""",

@@ -11,15 +11,24 @@ from tme3bot.worker.runtime_settings import WorkerRuntimeSettings
 
 class RuntimeProfileManager:
     def __init__(self, root: Path, profiles: list[str]):
+        self.root = Path(root)
         self.profiles = profiles
         self.base_config = SimpleNamespace(
             default_profile="default",
-            tdl_export_storage=root / "default" / ".tdl",
-            profile_root=str(root / "default"),
+            tdl_export_storage=self.root / "default" / ".tdl",
+            profile_root=str(self.root / "default"),
         )
 
     def list_profiles(self):
         return list(self.profiles)
+
+    def tdl_session_available(self, profile, purpose="export"):
+        del purpose
+        return (self.root / str(profile) / ".tdl" / "data").is_file()
+
+    def profiles_with_tdl_session(self, purpose="export"):
+        del purpose
+        return [profile for profile in self.profiles if self.tdl_session_available(profile)]
 
 
 class WorkerRuntimeSettingsTests(unittest.TestCase):
@@ -164,6 +173,7 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
             root = Path(directory)
             session_path = root / "default" / ".tdl"
             session_path.mkdir(parents=True)
+            (session_path / "data").write_bytes(b"tdl-session")
             manager = RuntimeProfileManager(root, ["default", "archive"])
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
             executor.config = SimpleNamespace(
@@ -192,7 +202,9 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
     def test_profile_cannot_change_while_storage_job_is_running(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "default" / ".tdl").mkdir(parents=True)
+            session = root / "default" / ".tdl"
+            session.mkdir(parents=True)
+            (session / "data").write_bytes(b"tdl-session")
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
             executor.config = SimpleNamespace(
                 state_file=root / "state.json", worker_storage_profile="default"
@@ -214,7 +226,9 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
     def test_profile_cannot_change_during_quickmode_before_quick_lane_is_marked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "default" / ".tdl").mkdir(parents=True)
+            session = root / "default" / ".tdl"
+            session.mkdir(parents=True)
+            (session / "data").write_bytes(b"tdl-session")
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
             executor.config = SimpleNamespace(
                 state_file=root / "state.json", worker_storage_profile="default"

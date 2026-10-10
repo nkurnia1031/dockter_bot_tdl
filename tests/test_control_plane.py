@@ -7,6 +7,7 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
     CAP_SAFELINK_RESOLVE,
@@ -25,6 +26,19 @@ class FakeProfiles:
     def set_worker_route(self, profile, route):
         self.route = route
         return route
+
+    def list_profiles(self):
+        return ["default", "archive", "other"]
+
+
+class FakeJobSecretStore:
+    def encrypt_job_secret(self, job_id, key, value):
+        del job_id, key
+        return value.encode("utf-8")
+
+    def decrypt_job_secret(self, job_id, key, ciphertext):
+        del job_id, key
+        return bytes(ciphertext).decode("utf-8")
 
 
 class FakeDispatcher:
@@ -95,6 +109,26 @@ class ControlPlaneTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def configure_tdl_access(self, control, dispatcher, registry, purposes=("tts", "storage")):
+        store = SqliteTdlAccessStore(Path(self.temp.name) / f"tdl-access-{id(control)}.db")
+        control.tdl_access_store = store
+        control.tdl_access_target_resolver = lambda _purpose: "123456789"
+        control.runtime_settings_store = FakeJobSecretStore()
+        for worker in registry.names():
+            response = dispatcher.capabilities(worker)
+            profiles = response.get("export_profiles") or response.get("available_storage_profiles") or response.get("profiles") or []
+            destination_hash = store.destination_fingerprint("123456789")
+            inventory_hash = store.inventory_fingerprint(profiles)
+            for purpose in purposes:
+                store.replace_results(
+                    worker,
+                    purpose,
+                    destination_hash,
+                    inventory_hash,
+                    [{"profile": profile, "ready": True} for profile in profiles],
+                )
+        return store
+
     def test_active_job_keeps_original_worker_when_route_changes(self):
         first_job = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2"}
@@ -156,6 +190,7 @@ class ControlPlaneTests(unittest.TestCase):
             "tts": worker in {"tts-ready", "remote"},
             "capabilities": ["tts"] if worker in {"tts-ready", "remote"} else [],
             "tts_profiles": ["default", "archive"] if worker in {"tts-ready", "remote"} else [],
+            "export_profiles": ["default", "archive"] if worker in {"tts-ready", "remote"} else [],
             "tts_health": {
                 "helpers_ready": worker in {"tts-ready", "remote"},
                 "helpers": [
@@ -165,6 +200,7 @@ class ControlPlaneTests(unittest.TestCase):
             },
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
 
         jobs = [
             control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"}),
@@ -175,7 +211,11 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual([job.worker for job in jobs], ["remote", "tts-ready", "remote"])
         self.assertTrue(all(job.kind == "tts" for job in jobs))
         self.assertNotIn("text", jobs[0].payload)
-        self.assertEqual(self.jobs.command_payload(jobs[0].id), {"title": "A", "text": "private text"})
+        internal = self.jobs.command_payload(jobs[0].id)
+        self.assertEqual(internal["title"], "A")
+        self.assertEqual(internal["text"], "private text")
+        self.assertIn(internal["_tdl_sender_profile"], {"default", "archive"})
+        self.assertNotIn("tdl_access_target", internal)
 
     def test_tts_worker_lane_admits_one_job_and_queues_another(self):
         registry = WorkerRegistry(
@@ -188,12 +228,14 @@ class ControlPlaneTests(unittest.TestCase):
             "tts": True,
             "capabilities": ["tts"],
             "tts_profiles": ["default", "archive"],
+            "export_profiles": ["default", "archive"],
             "tts_health": {
                 "helpers_ready": True,
                 "helpers": [{"slot": slot, "status": "ready"} for slot in range(1, 4)],
             },
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
 
         first = control.submit_job(self.actor, "tts", {"title": "A", "text": "one"})
         second = control.submit_job(self.actor, "tts", {"title": "B", "text": "two"}, profile="archive")
@@ -210,6 +252,7 @@ class ControlPlaneTests(unittest.TestCase):
             {"local": "a"},
         )
         control = ControlPlane(self.jobs, FakeDispatcher(), self.profiles, worker_registry=registry)
+        control.tdl_access_target_resolver = lambda _purpose: "123456789"
         with self.assertRaises(DomainError) as error:
             control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
         self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
@@ -226,12 +269,14 @@ class ControlPlaneTests(unittest.TestCase):
             "tts": False,
             "capabilities": ["tts"],
             "tts_profiles": ["default"],
+            "export_profiles": ["default"],
             "tts_health": {
                 "helpers_ready": True,
                 "helpers": [{"slot": slot, "status": "ready"} for slot in range(1, 4)],
             },
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        control.tdl_access_target_resolver = lambda _purpose: "123456789"
 
         status = control.tts_worker_diagnostics(profile="default")
 
@@ -361,6 +406,7 @@ class ControlPlaneTests(unittest.TestCase):
             "tts": True,
             "capabilities": ["tts"],
             "tts_profiles": ["default"] if worker == "tts-default" else ["archive"],
+            "export_profiles": ["default"] if worker == "tts-default" else ["archive"],
             "tts_health": {
                 "ready": True,
                 "helpers_ready": True,
@@ -371,6 +417,7 @@ class ControlPlaneTests(unittest.TestCase):
             },
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
 
         job = control.submit_job(
             self.actor,
@@ -380,6 +427,8 @@ class ControlPlaneTests(unittest.TestCase):
         )
 
         self.assertEqual(job.worker, "tts-archive")
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(dispatcher.commands[-1]["profile"], "archive")
 
     def test_same_kind_different_profiles_can_run_in_parallel(self):
         first = self.control.submit_job(
@@ -392,6 +441,50 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(first.status.value, "dispatched")
         self.assertEqual(second.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
+
+    def test_utility_does_not_wait_for_unrelated_profile_sync(self):
+        self.control.profile_readiness = lambda _profile, _worker: False
+        job = self.control.submit_job(
+            self.actor,
+            "utility",
+            {"utility": "compress", "folders": ["/workspace/biasa"]},
+        )
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+
+    def test_storage_uses_verified_sender_profile_but_keeps_actor_as_job_owner(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "storage-sender-workers.json",
+            {"local": "http://worker-local"},
+            {"local": "worker-token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "profiles": ["default", "archive"],
+            "export_profiles": ["default", "archive"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-sender.db")
+        control.tdl_access_store = store
+        control.tdl_access_target_resolver = lambda purpose: "-100123" if purpose == "storage" else ""
+        control.runtime_settings_store = FakeJobSecretStore()
+        destination_hash = store.destination_fingerprint("-100123")
+        inventory_hash = store.inventory_fingerprint(["default", "archive"])
+        store.replace_results(
+            "local", "storage", destination_hash, inventory_hash,
+            [{"profile": "archive", "ready": True}],
+        )
+
+        job = control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/source"},
+            worker="local",
+        )
+        command = dispatcher.commands[0]
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(command["profile"], "archive")
+        self.assertEqual(command["payload"]["tdl_access_target"], "-100123")
+        self.assertEqual(job.payload["sender_profile"], "archive")
 
     def test_quick_mode_other_profile_can_fill_worker_slot_behind_blocked_profile_queue(self):
         first = self.control.submit_job(
@@ -528,6 +621,28 @@ class ControlPlaneTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
         self.assertEqual(self.jobs.count(kind="export"), 0)
+
+    def test_shared_cursor_dispatch_marks_worker_payload_only_when_enabled(self):
+        cursor = FakeExportCursorGate()
+        cursor.enabled = True
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "contract_version": 1,
+            "capabilities": [CAP_SHARED_EXPORT_CURSOR],
+        }
+        control = ControlPlane(
+            self.jobs,
+            dispatcher,
+            self.profiles,
+            export_cursor_service=cursor,
+        )
+
+        job = control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+
+        self.assertTrue(dispatcher.commands[-1]["payload"]["_shared_export_cursor"])
+        self.assertNotIn("_shared_export_cursor", job.payload)
 
     def test_utility_sibling_paths_can_run_but_nested_path_waits(self):
         first = self.control.submit_job(

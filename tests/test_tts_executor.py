@@ -81,6 +81,9 @@ class _Executor(TtsExecutorMixin):
     def available_storage_profiles(self):
         return ["default"]
 
+    def available_download_profiles(self):
+        return ["default"]
+
     def storage_profile(self):
         return "default"
 
@@ -98,7 +101,7 @@ class TtsExecutorTests(unittest.TestCase):
         self.assertNotIn("helper_urls", result)
         self.assertEqual(recovered, {"accepted": True, "status": "restarting-2"})
 
-    def test_tts_capability_uses_helper_diagnosis_and_available_profile(self):
+    def test_tts_capability_uses_helper_health_independently_from_sender_profiles(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = _Executor(directory)
             executor.profile_manager.list_profiles = lambda: ["default"]
@@ -115,11 +118,11 @@ class TtsExecutorTests(unittest.TestCase):
             executor.available_storage_profiles = lambda: []
             with patch.object(executor, "tts_health", return_value={
                 "helpers_ready": True,
-                "ready": False,
+                "ready": True,
                 "tts_profiles": [],
             }):
                 no_profile = WorkerJobExecutor.capabilities(executor)
-            self.assertFalse(no_profile["tts"])
+            self.assertTrue(no_profile["tts"])
             self.assertEqual(no_profile["tts_profiles"], [])
 
     def test_tts_uploads_each_part_with_active_profile_tdl_session(self):

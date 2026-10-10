@@ -1,5 +1,6 @@
 import json
 import io
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,6 +29,45 @@ def make_config(root: Path) -> AppConfig:
 
 
 class BackupServiceTests(unittest.TestCase):
+    def test_worker_backup_omits_legacy_business_state_and_snapshots_command_journal(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = make_config(root)
+            config.state_file.write_text('{"last_id": 999}', encoding="utf-8")
+            config.legacy_max_json.write_text('{"last_id": 999}', encoding="utf-8")
+            (root / "identity.json").write_text('{"telegram_user_id": 42}', encoding="utf-8")
+            profile_root = config.profiles_root / "novel"
+            profile_root.mkdir(parents=True)
+            (profile_root / "state.json").write_text('{"last_id": 888}', encoding="utf-8")
+            (profile_root / "identity.json").write_text('{"telegram_user_id": 43}', encoding="utf-8")
+            journal = root / "worker-command-journal.sqlite3"
+            db = sqlite3.connect(journal)
+            try:
+                db.execute("CREATE TABLE journal_marker (value TEXT)")
+                db.execute("INSERT INTO journal_marker VALUES ('checkpoint')")
+                db.commit()
+            finally:
+                db.close()
+            service = BackupService(config)
+            staging = root / "worker-staging"
+
+            service._build_worker_staging(staging)
+
+            self.assertFalse((staging / "data/state.json").exists())
+            self.assertFalse((staging / "data/max.json").exists())
+            self.assertFalse((staging / "data/profiles/novel/state.json").exists())
+            self.assertTrue((staging / "data/identity.json").exists())
+            snapshot = staging / "data/worker-command-journal.sqlite3"
+            self.assertTrue(snapshot.is_file())
+            db = sqlite3.connect(snapshot)
+            try:
+                self.assertEqual(
+                    db.execute("SELECT value FROM journal_marker").fetchone()[0],
+                    "checkpoint",
+                )
+            finally:
+                db.close()
+
     def test_runtime_staging_includes_json_and_excludes_workspace_media(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

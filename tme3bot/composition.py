@@ -28,6 +28,7 @@ from tme3bot.infrastructure.source_store import (
     SqliteSourceRepository,
 )
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
+from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
@@ -144,6 +145,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
+    tdl_access_store = SqliteTdlAccessStore(config.storage_db_file)
     operation_store = SqliteOperationStore(jobs)
     operation_service = OperationsService(operation_store)
     queue_command_service = QueueCommandService(operation_store)
@@ -171,6 +173,19 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         config.utility_settings_file, desired_store=runtime_settings_store
     )
     labels = LabelStore(config.state_file.parent / "labels.json")
+    def tdl_access_target(purpose: str) -> str:
+        if purpose == "tts":
+            values = runtime_settings_store.get_values("telegram", include_secrets=True)
+            return str(values.get("telegram_tts_chat_id") or "")
+        if purpose == "storage":
+            return str(
+                getattr(config, "storage_channel_ref", "")
+                or getattr(config, "storage_channel", "")
+                or getattr(config, "storage_channel_id", "")
+                or ""
+            )
+        return ""
+
     control_plane = ControlPlane(
         jobs,
         dispatcher,
@@ -183,6 +198,8 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         utility_settings=settings,
         runtime_settings_store=runtime_settings_store,
         label_store=labels,
+        tdl_access_store=tdl_access_store,
+        tdl_access_target_resolver=tdl_access_target,
         job_stall_timeout_seconds=config.job_stall_timeout_seconds,
         job_cancel_grace_seconds=config.job_cancel_grace_seconds,
     )

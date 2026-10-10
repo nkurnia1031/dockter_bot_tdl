@@ -13,6 +13,14 @@ from tme3bot.chat_refs import canonical_chat_key
 from tme3bot.persistence import utc_now_iso, write_json_atomic
 
 
+class StateApiError(RuntimeError):
+    """Sanitized error returned by the authenticated backend state client."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        self.status_code = status_code
+        super().__init__(message)
+
+
 def normalize_chat_ref(chat_ref: str) -> str:
     """Canonical source key for usernames, links, phones, and numeric IDs."""
     return canonical_chat_key(chat_ref)
@@ -290,6 +298,69 @@ class HttpStateStore:
     def delete_source(self, chat_ref: str) -> bool:
         return bool(self.delete_sources([chat_ref]))
 
+    def resolve_export_peer(
+        self,
+        *,
+        job_id: str,
+        worker: str,
+        attempt: int,
+        requested_ref: str,
+        peer_type: str,
+        peer_id: str | int,
+    ) -> dict[str, Any]:
+        return self._request("POST", "/internal/v1/export-cursor/resolve", {
+            "job_id": str(job_id),
+            "worker": str(worker),
+            "profile": self.profile_name,
+            "attempt": int(attempt),
+            "requested_ref": normalize_chat_ref(requested_ref),
+            "peer_type": str(peer_type),
+            "peer_id": str(peer_id),
+        })
+
+    def acquire_export_cursor(
+        self, *, job_id: str, worker: str, attempt: int, requested_ref: str
+    ) -> dict[str, Any]:
+        return self._request("POST", "/internal/v1/export-cursor/lease", {
+            "job_id": str(job_id),
+            "worker": str(worker),
+            "profile": self.profile_name,
+            "attempt": int(attempt),
+            "requested_ref": normalize_chat_ref(requested_ref),
+        })
+
+    def heartbeat_export_cursor(
+        self, *, job_id: str, worker: str, attempt: int, fencing_token: int
+    ) -> dict[str, Any]:
+        return self._request("POST", "/internal/v1/export-cursor/heartbeat", {
+            "job_id": str(job_id),
+            "worker": str(worker),
+            "attempt": int(attempt),
+            "fencing_token": int(fencing_token),
+        })
+
+    def commit_export_cursor(
+        self,
+        *,
+        job_id: str,
+        worker: str,
+        attempt: int,
+        fencing_token: int,
+        expected_revision: int,
+        last_id: int,
+        artifact: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self._request("POST", "/internal/v1/export-cursor/commit", {
+            "job_id": str(job_id),
+            "worker": str(worker),
+            "profile": self.profile_name,
+            "attempt": int(attempt),
+            "fencing_token": int(fencing_token),
+            "expected_revision": int(expected_revision),
+            "last_id": int(last_id),
+            "artifact": dict(artifact),
+        })
+
     def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self.base_url:
             raise RuntimeError("BACKEND_API_URL wajib diisi untuk APP_ROLE=worker.")
@@ -303,5 +374,10 @@ class HttpStateStore:
         try:
             with urllib.request.urlopen(request, timeout=30) as response:
                 return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise RuntimeError(f"Backend state API gagal: {exc}") from exc
+        except urllib.error.HTTPError as exc:
+            raise StateApiError(
+                f"Backend state API mengembalikan HTTP {int(exc.code)}.",
+                status_code=int(exc.code),
+            ) from None
+        except (urllib.error.URLError, json.JSONDecodeError):
+            raise StateApiError("Backend state API tidak dapat dijangkau atau memberi respons tidak valid.") from None

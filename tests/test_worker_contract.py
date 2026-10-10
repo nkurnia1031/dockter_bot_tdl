@@ -163,6 +163,7 @@ class WorkerContractTests(unittest.TestCase):
             "profile": "default",
             "actor_user_id": 42,
             "event_sequence_start": 17,
+            "attempt": 2,
             "execution": {"lane": "export"},
             "payload": {"url": "https://t.me/c/1/2"},
         }
@@ -190,6 +191,7 @@ class WorkerContractTests(unittest.TestCase):
             "profile": "default",
             "actor_user_id": 42,
             "event_sequence_start": 9,
+            "attempt": 2,
             "execution": {"lane": "export"},
             "payload": {"url": "https://t.me/c/1/2"},
         }
@@ -223,6 +225,28 @@ class WorkerContractTests(unittest.TestCase):
         with self.assertRaises(DomainError) as raised:
             dispatcher.dispatch("remote", {"job_id": "job-2", "payload": {}})
 
+        self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
+        self.assertEqual(request.call_count, 1)
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_shared_cursor_dispatch_requires_worker_capability(self, request):
+        request.return_value = worker_contract_metadata()
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+        with self.assertRaises(DomainError) as raised:
+            dispatcher.dispatch(
+                "remote",
+                {
+                    "job_id": "job-1",
+                    "kind": "export",
+                    "profile": "default",
+                    "actor_user_id": 42,
+                    "worker": "remote",
+                    "payload": {
+                        "url": "https://t.me/c/1/2",
+                        "_shared_export_cursor": True,
+                    },
+                },
+            )
         self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
         self.assertEqual(request.call_count, 1)
 

@@ -21,8 +21,20 @@ class WorkerProfileAdmissionTests(unittest.TestCase):
         self.assertTrue(ready)
         self.executor.profile_sync.wait_until_ready.assert_not_called()
 
-    def test_profile_dependent_job_still_waits_for_profile_sync(self):
-        self.executor.profile_sync.wait_until_ready.return_value = True
+    def test_utility_does_not_wait_for_telegram_profile_sync(self):
+        ready = self.executor._wait_for_profile_sync(
+            "utility",
+            "irang",
+            0,
+            cancelled=Mock(return_value=False),
+            on_wait=Mock(),
+        )
+
+        self.assertTrue(ready)
+        self.executor.profile_sync.wait_until_ready.assert_not_called()
+
+    def test_profile_job_does_not_wait_for_vault_ack_when_local_session_check_is_separate(self):
+        self.executor.profile_sync.wait_until_ready.return_value = False
         cancelled = Mock(return_value=False)
         on_wait = Mock()
 
@@ -31,9 +43,7 @@ class WorkerProfileAdmissionTests(unittest.TestCase):
         )
 
         self.assertTrue(ready)
-        self.executor.profile_sync.wait_until_ready.assert_called_once_with(
-            "irang", 3, cancelled=cancelled, on_wait=on_wait
-        )
+        self.executor.profile_sync.wait_until_ready.assert_not_called()
 
 
 if __name__ == "__main__":

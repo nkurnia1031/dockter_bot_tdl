@@ -76,7 +76,7 @@ describe('WorkersPage TTS health controls', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Periksa ulang TTS remote-tts' }));
     expect(await screen.findByText('Bootstrap 63%')).toBeTruthy();
     expect(screen.getByText('Helper tidak terjangkau')).toBeTruthy();
-    expect(screen.getByText(/Sesi profil aktif: tersedia/)).toBeTruthy();
+    expect(screen.getByText(/Profil yang terverifikasi mengirim: belum ada/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Pulihkan helper 3 remote-tts' })).toBeNull();
 
     await fireEvent.click(screen.getByRole('button', { name: 'Pulihkan helper 2 remote-tts' }));

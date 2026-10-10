@@ -28,6 +28,8 @@
     current_folder:FolderEntry|null; breadcrumbs:{id:number;name:string}[];
     folders:FolderEntry[]; items:Item[]; total_folders:number; total_items:number
   };
+  type AccessOperation = { operation_id:string; status:string; phase:string; job_id?:string|null; worker:string };
+  type AccessProfile = { profile:string; ready:boolean; error_code?:string|null; checked_at?:string };
 
   let folderId = $state<number|null>(null);
   let scope = $state<'current'|'global'|'recent'|'trash'>('current');
@@ -58,8 +60,15 @@
   let editKeywords = $state('');
   let worker = $state('');
   let verified = $state<any>(null);
+  let tdlAccessOperation = $state<AccessOperation|null>(null);
+  let tdlAccessProfiles = $state<AccessProfile[]>([]);
+  let tdlAccessReady = $state(false);
+  let tdlAccessWorker = $state('');
+  let tdlAccessLoading = $state(false);
+  let tdlAccessError = $state('');
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
+  const storageTdlAccessReady = $derived(tdlAccessReady && tdlAccessWorker === worker);
   const isTrash = $derived(scope === 'trash');
   const currentName = $derived(data.current_folder?.name || (scope === 'trash' ? 'Recycle Bin' : scope === 'recent' ? 'Recent' : scope === 'global' ? 'All Files' : 'My Drive'));
 
@@ -144,12 +153,76 @@
   async function upload() {
     if (!workspaceFolders[0]) return;
     if (!verified || verified.worker !== worker) { message = 'Verifikasi worker terlebih dahulu.'; return; }
+    try {
+      const access = await api<{worker:string;ready:boolean;profiles:AccessProfile[]}>(
+        `/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker)}`
+      );
+      tdlAccessProfiles = access.profiles || [];
+      tdlAccessReady = access.ready;
+      tdlAccessWorker = access.worker;
+      if (!access.ready) {
+        message = 'Verifikasi akses kirim TDL untuk worker ini terlebih dahulu.';
+        return;
+      }
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Status akses kirim TDL gagal diperiksa.';
+      return;
+    }
     await post('/storage/uploads', {
       folder_path:workspaceFolders[0], destination_folder_id:destinationId,
       preserve_structure:true, keywords, worker, rclone_upload:rcloneUpload
     });
     uploadOpen=false; workspaceFolders=[]; keywords=''; rcloneUpload=false;
     message='Upload masuk antrean. Struktur subfolder akan dipertahankan.';
+  }
+  function accessIdempotencyKey() {
+    return globalThis.crypto?.randomUUID?.() || `storage-tdl-access-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  async function verifyStorageTdlAccess() {
+    if (!worker) { tdlAccessError = 'Pilih worker terlebih dahulu.'; return; }
+    tdlAccessError = '';
+    tdlAccessProfiles = [];
+    tdlAccessReady = false;
+    tdlAccessLoading = true;
+    try {
+      const operation = await api<Omit<AccessOperation, 'worker'>>('/tdl-access/verification', {
+        method:'POST',
+        headers:{'Idempotency-Key':accessIdempotencyKey()},
+        body:JSON.stringify({purpose:'storage',worker})
+      });
+      tdlAccessOperation = {...operation,worker};
+      localStorage.setItem('storage-tdl-access-operation', JSON.stringify(tdlAccessOperation));
+    } catch (cause) {
+      tdlAccessError = cause instanceof Error ? cause.message : 'Verifikasi akses TDL gagal dimulai.';
+    } finally { tdlAccessLoading = false; }
+  }
+  async function refreshStorageTdlAccess() {
+    tdlAccessError = '';
+    tdlAccessLoading = true;
+    try {
+      if (tdlAccessOperation) {
+        const operation = await api<Omit<AccessOperation, 'worker'>>(`/operations/${tdlAccessOperation.operation_id}`);
+        tdlAccessOperation = {...operation,worker:tdlAccessOperation.worker};
+        localStorage.setItem('storage-tdl-access-operation', JSON.stringify(tdlAccessOperation));
+        if (operation.status === 'succeeded' && operation.job_id) {
+          const job = await api<{result?:{value?:{profiles?:AccessProfile[]}}}>(`/jobs/${operation.job_id}`);
+          tdlAccessProfiles = job.result?.value?.profiles || [];
+        }
+      }
+      if (worker) {
+        const current = await api<{worker:string;ready:boolean;profiles:AccessProfile[]}>(
+          `/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker)}`
+        );
+        tdlAccessProfiles = current.profiles || [];
+        tdlAccessReady = current.ready;
+        tdlAccessWorker = current.worker;
+      } else {
+        tdlAccessReady = false;
+        tdlAccessWorker = '';
+      }
+    } catch (cause) {
+      tdlAccessError = cause instanceof Error ? cause.message : 'Status verifikasi akses TDL gagal dimuat.';
+    } finally { tdlAccessLoading = false; }
   }
   async function deliver(item:Item) {
     await post(`/storage/items/${item.id}/deliveries`, {method:'telegram'});
@@ -194,6 +267,10 @@
     folderId=urlFolder();
     view=(localStorage.getItem('storage-view') as 'list'|'grid') || 'grid';
     sort=localStorage.getItem('storage-sort') || 'name';
+    try {
+      const saved = localStorage.getItem('storage-tdl-access-operation');
+      if (saved) tdlAccessOperation = JSON.parse(saved) as AccessOperation;
+    } catch { localStorage.removeItem('storage-tdl-access-operation'); }
     load();
   });
   function setView(next:'list'|'grid') { view=next; localStorage.setItem('storage-view',next); }
@@ -206,6 +283,13 @@
 </header>
 
 <div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified /></div>
+
+<section class="card mt-4 p-4 sm:p-5">
+  <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Akses kirim Storage</h2><p class="muted mt-1 text-sm">Profil pengirim diuji ke tujuan Storage yang tersimpan. Setiap profil yang diuji meninggalkan satu pesan penanda di chat.</p></div><div class="flex gap-2"><button class="button secondary" onclick={verifyStorageTdlAccess} disabled={!worker || tdlAccessLoading}><Send size={15}/>{tdlAccessLoading ? 'Memulai...' : 'Verifikasi akses TDL'}</button><button class="button secondary" onclick={refreshStorageTdlAccess} disabled={!worker || tdlAccessLoading}><RefreshCw size={15}/>{tdlAccessLoading ? 'Memuat...' : 'Muat status'}</button></div></div>
+  {#if tdlAccessOperation}<p class="muted mt-3 text-xs">Operation {tdlAccessOperation.status} · tahap {tdlAccessOperation.phase} · worker {tdlAccessOperation.worker}. Status diperbarui saat tombol Muat status ditekan.</p>{/if}
+  {#if tdlAccessProfiles.length}<ul class="mt-2 grid gap-1 text-sm sm:grid-cols-2">{#each tdlAccessProfiles as item}<li>{item.profile}: {item.ready ? 'dapat mengirim' : `gagal (${item.error_code || 'VERIFICATION_FAILED'})`}</li>{/each}</ul>{:else}<p class="muted mt-2 text-sm">Belum ada profil yang lolos verifikasi untuk worker terpilih.</p>{/if}
+  {#if tdlAccessError}<p role="alert" class="mt-2 text-sm text-rose-600">{tdlAccessError}</p>{/if}
+</section>
 
 {#if message}<div class="mt-5 flex items-center justify-between rounded-2xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-800 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-100"><span>{message}</span><button onclick={() => message=''}><X size={16}/></button></div>{/if}
 
@@ -333,7 +417,7 @@
   <div class="mt-4 grid gap-3 sm:grid-cols-2"><label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
   <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--line)] p-3 text-sm"><input class="mt-1" type="checkbox" bind:checked={rcloneUpload}/><span><b>Salin juga ke Google Drive</b><small class="muted mt-1 block">Memakai tujuan rclone pada Pengaturan dan konfigurasi <code>/data/.config/rclone.conf</code>.</small></span></label>
   <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>Destination dipilih dari folder Storage, bukan input teks. Nested dan empty folder dipertahankan.</p></div>
-  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || !storageTdlAccessReady} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
 </Modal>
 
 <Modal open={moveOpen} onclose={() => moveOpen=false} title="Pindahkan ke folder" size="md"><label class="text-sm font-bold">Folder tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => moveOpen=false}>Batal</button><button class="button" onclick={moveSelection}><Move size={16}/>Pindahkan</button></div></Modal>

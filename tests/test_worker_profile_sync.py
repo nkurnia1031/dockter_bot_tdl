@@ -8,7 +8,11 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
-from tme3bot.worker.profile_sync import ProfileSyncClient, ProfileSyncError
+from tme3bot.worker.profile_sync import (
+    ProfileSyncClient,
+    ProfileSyncError,
+    _ProfileSyncCancelled,
+)
 
 
 def bundle_for(user_id=12345):
@@ -261,6 +265,62 @@ class WorkerProfileSyncTests(unittest.TestCase):
             )
         )
         self.assertEqual(reports, ["waiting_worker"])
+
+    def test_cancel_queued_profile_sync_skips_the_request(self):
+        client, transport = self.make_client([], {})
+        key = ("irang", "check")
+        client._queued.add(key)
+        client._requests.put(key)
+
+        result = client.cancel_sync(profile="irang")
+        client._run_one_request()
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertFalse(client._queued)
+        self.assertIsNone(client._active_request)
+        self.assertEqual(transport.bundle_requests, [])
+        self.assertEqual(client._requests.unfinished_tasks, 0)
+
+    def test_cancel_active_profile_sync_stops_before_bundle_install(self):
+        content = bundle_for()
+        entry = manifest_row("irang", 7, content)
+        client, transport = self.make_client([entry], {("irang", 7): content})
+        client._active_request = ("irang", "check")
+
+        result = client.cancel_sync(profile="irang")
+        checks = 0
+
+        def cancelled(_profile):
+            nonlocal checks
+            checks += 1
+            return checks > 1
+
+        with self.assertRaises(_ProfileSyncCancelled):
+            client._sync_entry(entry, mode="check", cancelled=cancelled)
+
+        self.assertEqual(result["status"], "cancelling")
+        self.assertEqual(transport.bundle_requests, [("irang", 7)])
+        self.assertEqual(self.installs, [])
+        self.assertEqual(transport.acks, [])
+
+    def test_cancelling_one_profile_does_not_stop_other_startup_syncs(self):
+        alpha = bundle_for(111)
+        beta = bundle_for(222)
+        entries = [manifest_row("alpha", 1, alpha), manifest_row("beta", 1, beta)]
+        client, transport = self.make_client(
+            entries, {("alpha", 1): alpha, ("beta", 1): beta}
+        )
+
+        result = client._sync(
+            mode="check", profile=None, cancelled=lambda profile: profile == "alpha"
+        )
+
+        self.assertEqual(result["status"], "sync_pending")
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual([item[0] for item in self.installs], ["beta"])
+        self.assertEqual(len(transport.acks), 1)
+        self.assertEqual(client.snapshot()["profiles"]["alpha"]["error_code"], "SYNC_CANCELLED")
+        self.assertEqual(client.snapshot()["profiles"]["beta"]["status"], "ready")
 
     def test_only_https_or_internal_backend_hosts_enable_pull(self):
         client, _ = self.make_client([], {})

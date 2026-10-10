@@ -14,6 +14,7 @@ from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_SCAN,
     CAP_QUICKMODE_STAGING,
     CAP_SAFELINK_RESOLVE,
+    CAP_SHARED_EXPORT_CURSOR,
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_VERIFY,
     CAP_TTS,
@@ -171,6 +172,27 @@ class WorkerHttpDispatcher:
     def cancel_profile_login(self, worker: str, operation_id: str) -> None:
         self._profile_json(worker, "DELETE", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}")
 
+    def profile_sync_status(self, worker: str) -> dict[str, Any]:
+        return self._profile_json(worker, "GET", "/internal/v1/profile-sync")
+
+    def request_profile_sync(
+        self, worker: str, *, profile: str | None = None, mode: str = "check"
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"mode": mode}
+        if profile:
+            payload["profile"] = profile
+        return self._profile_json(worker, "POST", "/internal/v1/profile-sync", payload)
+
+    def cancel_profile_sync(
+        self, worker: str, profile: str, *, mode: str = "check"
+    ) -> dict[str, Any]:
+        return self._profile_json(
+            worker,
+            "DELETE",
+            "/internal/v1/profile-sync",
+            {"profile": profile, "mode": mode},
+        )
+
     def check_worker_fast(self, worker: str, *, timeout: float = 2.5) -> dict[str, Any]:
         """Check worker availability without loading its full capabilities."""
         record = self.worker_registry.get(worker)
@@ -241,6 +263,8 @@ class WorkerHttpDispatcher:
         job_payload = payload.get("payload")
         if isinstance(job_payload, dict) and bool(job_payload.get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
+        if isinstance(job_payload, dict) and bool(job_payload.get("_shared_export_cursor")):
+            required.add(CAP_SHARED_EXPORT_CURSOR)
         if str(payload.get("kind") or "") == "tts":
             required.add(CAP_TTS)
         self._require_capabilities(worker, required, record=record)
@@ -267,6 +291,10 @@ class WorkerHttpDispatcher:
             required.add(CAP_TTS)
         if str(job.get("kind") or "") == "safelink_resolve":
             required.add(CAP_SAFELINK_RESOLVE)
+        if str(job.get("kind") or "") == "export" and bool(
+            job_payload.get("_shared_export_cursor")
+        ):
+            required.add(CAP_SHARED_EXPORT_CURSOR)
         if bool(job_payload.get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
         self._require_capabilities(worker, required, record=record)

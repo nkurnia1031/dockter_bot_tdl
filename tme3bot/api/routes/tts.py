@@ -25,7 +25,7 @@ def _tts_chat_ref(context) -> str:
 def register_tts(app, context, *, current_actor, job_dict, require_internal, require_service):
     @app.get("/api/v1/tts/workers")
     def list_tts_workers(actor=Depends(current_actor)):
-        items = context.control_plane.tts_worker_diagnostics(profile=actor.profile)
+        items = context.control_plane.tts_worker_diagnostics(destination=_tts_chat_ref(context))
         provisioner = context.profile_provisioner
         if provisioner is not None:
             for item in items:

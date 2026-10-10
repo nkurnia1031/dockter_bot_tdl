@@ -119,8 +119,8 @@ class ExportCursorService:
         if catalog:
             if not normalized.get("filename") or not normalized.get("artifact_key"):
                 raise ValueError("Nama file dan key artifact wajib untuk pencatatan katalog.")
-        elif normalized.get("artifact_kind") != "quickmode_stage":
-            raise ValueError("Artifact tanpa katalog hanya berlaku untuk staging Quick Mode.")
+        elif normalized.get("artifact_kind") not in {"quickmode_stage", "empty_export"}:
+            raise ValueError("Jenis artifact tanpa katalog tidak valid.")
         elif not normalized.get("filename") or not normalized.get("artifact_key"):
             raise ValueError("Nama dan key artifact staging wajib diisi.")
         return normalized

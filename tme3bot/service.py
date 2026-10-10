@@ -70,10 +70,20 @@ class ExportService:
         *,
         tdl_client: TDLClient | None = None,
         output_dir: Path | None = None,
+        read_source: bool = True,
+        source_last_id: int | None = None,
+        source_exists: bool | None = None,
     ) -> ExportJobResult:
         parsed = self.validate_url(url)
-        source = self.state_store.get_source(parsed.chat_ref)
-        is_new_source = source is None
+        source = self.state_store.get_source(parsed.chat_ref) if read_source else None
+        known_last_id = (
+            max(0, int(source_last_id))
+            if source_last_id is not None
+            else (source.last_id if source is not None else None)
+        )
+        is_new_source = (
+            source is None if source_exists is None else not bool(source_exists)
+        )
         # Numeric Telegram references are often one-off private/channel IDs.
         # Do not create persistent state for those unless the caller explicitly
         # opts in. Existing saved numeric sources remain persistent so their
@@ -120,11 +130,13 @@ class ExportService:
         export_path = unique_path(export_path)
         shutil.move(str(temp_path), str(export_path))
 
-        latest_id = source.last_id if source is not None else None
+        latest_id = known_last_id
         if export_result.max_message_id is not None:
             next_last_id = max(
                 export_result.max_message_id,
-                source.last_id if source is not None else export_result.max_message_id,
+                known_last_id
+                if known_last_id is not None
+                else export_result.max_message_id,
             )
             latest_id = next_last_id
             if persist_source:

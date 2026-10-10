@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -474,6 +474,9 @@ class WorkerJobRequest(BaseModel):
     # ID and therefore retains its previous event history.  This field must
     # reach the worker; dropping it makes every worker event look stale.
     event_sequence_start: int | None = None
+    # Retry attempt binds internal shared-cursor operations to the current
+    # backend execution and rejects requests from an older attempt.
+    attempt: int | None = None
     execution: dict[str, Any] = Field(default_factory=dict)
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -482,6 +485,12 @@ class TtsJobRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     text: str = Field(min_length=1, max_length=100_000)
     worker: str | None = Field(default=None, min_length=1, max_length=48)
+
+
+class TdlAccessVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    purpose: Literal["tts", "storage"]
+    worker: str = Field(min_length=1, max_length=48)
 
 
 class SafelinkJobRequest(BaseModel):

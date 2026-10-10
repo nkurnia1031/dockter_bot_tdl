@@ -24,10 +24,11 @@ from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.profiles import build_profile_config
+from tme3bot.state import HttpStateStore, StateApiError
 from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
 from tme3bot.storage_catalog import build_storage_caption
-from tme3bot.tdl import ProcessStalledError, TDLStalledError
+from tme3bot.tdl import ProcessStalledError, TDLClient, TDLStalledError
 from tme3bot.tdl_output import is_tdl_telemetry_line
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
 from tme3bot.worker.quick_export import (
@@ -103,6 +104,7 @@ from .executor_backup import BackupExecutorMixin
 from .executor_downloads import DownloadExecutorMixin
 from .executor_quickmode import QuickModeExecutorMixin
 from .executor_storage import StorageExecutorMixin
+from .executor_tdl_access import TdlAccessExecutorMixin
 from .executor_safelink import SafelinkExecutorMixin
 from .executor_tts import TtsExecutorMixin
 from .executor_utility import UtilityExecutorMixin
@@ -113,6 +115,7 @@ class WorkerJobExecutor(
     DownloadExecutorMixin,
     UtilityExecutorMixin,
     StorageExecutorMixin,
+    TdlAccessExecutorMixin,
     SafelinkExecutorMixin,
     TtsExecutorMixin,
     BackupExecutorMixin,
@@ -212,6 +215,26 @@ class WorkerJobExecutor(
             and self.command_runner.ready
         )
 
+    def shared_export_cursor_ready(self) -> bool:
+        """Advertise cursor support only when authenticated backend state is configured."""
+        try:
+            store = self.profile_manager.state_store(
+                str(getattr(self.config, "default_profile", "default") or "default")
+            )
+        except Exception:
+            return False
+        return bool(
+            isinstance(store, HttpStateStore)
+            and store.base_url
+            and store.token
+            and callable(getattr(store, "resolve_export_peer", None))
+            and callable(getattr(store, "acquire_export_cursor", None))
+            and callable(getattr(store, "heartbeat_export_cursor", None))
+            and callable(getattr(store, "commit_export_cursor", None))
+            and callable(getattr(TDLClient, "resolve_chat_peer", None))
+            and shutil.which("tdl") is not None
+        )
+
     def accept_durable_command(self, envelope: dict[str, Any]) -> dict[str, Any]:
         if not self.durable_commands_ready():
             raise DomainError(
@@ -253,6 +276,9 @@ class WorkerJobExecutor(
 
     def request_profile_sync(self, profile: str | None = None, mode: str = "check") -> dict[str, Any]:
         return self.profile_sync.request_sync(profile=profile, mode=mode)
+
+    def cancel_profile_sync(self, profile: str, mode: str = "check") -> dict[str, Any]:
+        return self.profile_sync.cancel_sync(profile=profile, mode=mode)
 
     def _run_profile_sync_operation(self, envelope: dict[str, Any]) -> None:
         operation = envelope.get("operation")
@@ -729,8 +755,10 @@ class WorkerJobExecutor(
 
     def capabilities(self) -> dict[str, Any]:
         """Return non-secret worker capabilities for backend target checks."""
-        profiles = [str(item) for item in self.profile_manager.list_profiles()]
-        storage_profiles_available = self.available_storage_profiles()
+        export_profiles = self.available_storage_profiles()
+        download_profiles = self.available_download_profiles()
+        profiles = export_profiles
+        storage_profiles_available = export_profiles
         profile_sync_manager = getattr(self, "profile_sync", None)
         snapshot = getattr(profile_sync_manager, "snapshot", None)
         profile_sync = snapshot() if callable(snapshot) else {
@@ -738,15 +766,6 @@ class WorkerJobExecutor(
             "status": "disabled",
             "profiles": {},
         }
-        if bool(getattr(profile_sync_manager, "enabled", False)):
-            profiles = [
-                name for name in profiles if profile_sync_manager.profile_ready(name)
-            ]
-            storage_profiles_available = [
-                name
-                for name in storage_profiles_available
-                if profile_sync_manager.profile_ready(name)
-            ]
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
         tts_ready = False
@@ -771,6 +790,8 @@ class WorkerJobExecutor(
         resolver_ready = bool(resolver_probe()) if callable(resolver_probe) else False
         return {
             "profiles": profiles,
+            "export_profiles": export_profiles,
+            "download_profiles": download_profiles,
             "profile_sync": profile_sync,
             "storage_profile": storage_profile,
             "storage_profile_available": storage_available,
@@ -791,24 +812,16 @@ class WorkerJobExecutor(
         return self.runtime_settings.storage_profile()
 
     def available_storage_profiles(self) -> list[str]:
-        available: list[str] = []
-        for profile in self.profile_manager.list_profiles():
-            try:
-                resolve_storage = getattr(
-                    self.profile_manager, "export_tdl_storage_path", None
-                )
-                if callable(resolve_storage):
-                    storage_path = resolve_storage(str(profile))
-                else:
-                    runtime_config = build_profile_config(
-                        self.profile_manager.base_config, str(profile)
-                    )
-                    storage_path = runtime_config.tdl_export_storage
-                if Path(storage_path).is_dir():
-                    available.append(str(profile))
-            except Exception:
-                continue
-        return available
+        list_profiles = getattr(self.profile_manager, "profiles_with_tdl_session", None)
+        if callable(list_profiles):
+            return [str(item) for item in list_profiles("export")]
+        return []
+
+    def available_download_profiles(self) -> list[str]:
+        list_profiles = getattr(self.profile_manager, "profiles_with_tdl_session", None)
+        if callable(list_profiles):
+            return [str(item) for item in list_profiles("download")]
+        return []
 
     def worker_settings(self) -> dict[str, Any]:
         selected = self.storage_profile()
@@ -1010,11 +1023,20 @@ class WorkerJobExecutor(
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         elif kind == "storage_upload":
             keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
+            sender_profiles = (command.get("payload") or {}).get("_tdl_sender_profiles") or [profile]
+            for sender_profile in sender_profiles:
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
         elif kind == "tts":
-            # TTS delivery uses the active profile's export TDL session.
-            # Keep it serial with export/leave jobs for that same profile,
-            # while different profiles may still run on the worker together.
-            keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
+            # Lock every verified fallback profile because only explicit
+            # pre-send permission denials may move this job to another one.
+            sender_profiles = (command.get("payload") or {}).get("_tdl_sender_profiles") or [profile]
+            for sender_profile in sender_profiles:
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
+        elif kind == "tdl_access_verify":
+            keys = {f"worker:{worker}:kind:tdl_access_verify"}
+            candidate_profiles = (command.get("payload") or {}).get("candidate_profiles") or self.profile_manager.list_profiles()
+            for candidate_profile in candidate_profiles:
+                keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:export")
         elif kind == "safelink_resolve":
             keys = {f"worker:{worker}:kind:safelink_resolve"}
         elif kind in {"download", "download_clear_failed"}:
@@ -1074,15 +1096,30 @@ class WorkerJobExecutor(
         cancelled: Callable[[], bool],
         on_wait: Callable[[str], None],
     ) -> bool:
-        # Resolver only needs its browser addon. It must not depend on a TDL
-        # profile being installed or synchronized on this worker.
-        if kind == "safelink_resolve" or not self.profile_sync.enabled:
-            return True
-        return self.profile_sync.wait_until_ready(
-            profile,
-            expected_revision,
-            cancelled=cancelled,
-            on_wait=on_wait,
+        # Desired vault revision is diagnostic. A job's real session
+        # prerequisite is checked locally immediately before execution.
+        del kind, profile, expected_revision, cancelled, on_wait
+        return True
+
+    def _require_local_job_session(self, command: dict[str, Any]) -> None:
+        kind = str(command.get("kind") or "")
+        purpose = {
+            "export": "export",
+            "leave": "export",
+            "download": "download",
+            "download_clear_failed": "download",
+            "storage_upload": "export",
+            "tts": "export",
+        }.get(kind)
+        if purpose is None:
+            return
+        profile = str(command.get("profile") or "")
+        checker = getattr(self.profile_manager, "tdl_session_available", None)
+        if callable(checker) and checker(profile, purpose):
+            return
+        raise RuntimeError(
+            f"PROFILE_SESSION_UNAVAILABLE: sesi TDL profil {profile or '(kosong)'} "
+            f"untuk {purpose} tidak tersedia di worker ini."
         )
 
     def _run(self, command: dict[str, Any], resource_keys: set[str]) -> None:
@@ -1104,6 +1141,7 @@ class WorkerJobExecutor(
         quick_settings = payload.get("quick_settings") if isinstance(payload, dict) else {}
         secrets = [
             str(payload.get("password") or "") if isinstance(payload, dict) else "",
+            str(payload.get("tdl_access_target") or "") if isinstance(payload, dict) else "",
             str(quick_settings.get("compress_password") or "")
             if isinstance(quick_settings, dict)
             else "",
@@ -1155,6 +1193,28 @@ class WorkerJobExecutor(
                 expected_revision = int(command.get("profile_revision") or 0)
 
                 def report_profile_wait(reason: str) -> None:
+                    sync_error_code = ""
+                    message = "Menunggu sesi profil siap pada worker."
+                    try:
+                        sync_snapshot = self.profile_sync.snapshot()
+                        profile_state = (sync_snapshot.get("profiles") or {}).get(profile, {})
+                        sync_error_code = str(profile_state.get("error_code") or "")
+                    except Exception:
+                        profile_state = {}
+                    if sync_error_code:
+                        message = {
+                            "BACKEND_UNAVAILABLE": "Worker tidak dapat menghubungi backend vault untuk mengambil profil.",
+                            "PROFILE_BACKEND_REJECTED": "Backend menolak permintaan sinkronisasi profil worker.",
+                            "WORKER_IDENTITY_NOT_CONFIGURED": "Identitas worker untuk sinkronisasi profil belum lengkap.",
+                            "PROFILE_NOT_ASSIGNED": "Profil ini belum ditugaskan ke worker.",
+                            "PROFILE_ACK_PENDING": "Sesi terpasang, tetapi backend belum mengonfirmasi hasil sinkronisasi.",
+                        }.get(sync_error_code, f"Sinkronisasi profil gagal: {sync_error_code}.")
+                    elif reason == "waiting_worker":
+                        message = "Worker belum dapat mengakses backend sinkronisasi profil."
+                    elif reason == "legacy_profile_unavailable":
+                        message = "Sesi profil tidak tersedia pada worker dan belum ditemukan di vault."
+                    elif reason == "not_assigned":
+                        message = "Profil belum ditugaskan ke worker ini."
                     self.publisher.emit(
                         job_id,
                         "running",
@@ -1162,7 +1222,8 @@ class WorkerJobExecutor(
                         progress={
                             "phase": "waiting_profile_sync",
                             "reason": reason,
-                            "message": "Menunggu sesi profil siap pada worker.",
+                            **({"profile_sync_error_code": sync_error_code} if sync_error_code else {}),
+                            "message": message,
                             "indeterminate": True,
                         },
                     )
@@ -1175,6 +1236,8 @@ class WorkerJobExecutor(
                     on_wait=report_profile_wait,
                 )
                 cancelled_before_execute = not ready
+                if not cancelled_before_execute:
+                    self._require_local_job_session(command)
             if not cancelled_before_execute:
                 self.publisher.emit(
                     job_id,
@@ -1515,12 +1578,165 @@ class WorkerJobExecutor(
             "storage_upload": self._storage_upload,
             "backup_node": self._backup,
             "tts": self._tts,
+            "tdl_access_verify": self._tdl_access_verify,
             "safelink_resolve": self._safelink_resolve,
         }
         handler = handlers.get(kind)
         if handler is None:
             raise ValueError(f"Jenis job tidak dikenal: {kind}.")
         return handler(command)
+
+    def _cursor_commit_checkpoint(self, command: dict[str, Any]) -> dict[str, Any] | None:
+        command_id = str(command.get("command_id") or "")
+        if not command_id:
+            return None
+        snapshot = self.command_store.get(command_id)
+        checkpoint = snapshot.get("checkpoint") if isinstance(snapshot, dict) else None
+        cursor = checkpoint.get("cursor_commit") if isinstance(checkpoint, dict) else None
+        return cursor if isinstance(cursor, dict) else None
+
+    @staticmethod
+    def _restore_export_result(snapshot: dict[str, Any]) -> tuple[ExportJobResult, dict[str, Any]]:
+        raw_result = snapshot.get("result")
+        raw_stats = snapshot.get("stats")
+        if not isinstance(raw_result, dict) or not isinstance(raw_stats, dict):
+            raise RuntimeError("Checkpoint commit cursor export tidak lengkap.")
+        values = dict(raw_result)
+        values["export_path"] = Path(str(values["export_path"]))
+        return ExportJobResult(**values), dict(raw_stats)
+
+    def _replay_cursor_commit(
+        self, command: dict[str, Any], runtime: Any
+    ) -> tuple[ExportJobResult, dict[str, Any]] | None:
+        snapshot = self._cursor_commit_checkpoint(command)
+        if snapshot is None:
+            return None
+        request = snapshot.get("request")
+        if not isinstance(request, dict):
+            raise RuntimeError("Checkpoint commit cursor export tidak valid.")
+        result, stats = self._restore_export_result(snapshot)
+        artifact = request.get("artifact")
+        if not isinstance(artifact, dict):
+            raise RuntimeError("Checkpoint artifact cursor export tidak valid.")
+        if (
+            (bool(artifact.get("catalog")) or bool((command.get("payload") or {}).get("quick_mode")))
+            and not result.export_path.is_file()
+        ):
+            raise RuntimeError("Artifact export untuk pemulihan cursor tidak ditemukan; job perlu rekonsiliasi.")
+        commit = getattr(runtime.state_store, "commit_export_cursor", None)
+        if not callable(commit):
+            raise RuntimeError("Worker tidak mendukung pemulihan commit cursor export.")
+        self._submit_cursor_commit(command, commit, request)
+        return result, stats
+
+    def _submit_cursor_commit(
+        self,
+        command: dict[str, Any],
+        commit: Callable[..., Any],
+        request: dict[str, Any],
+    ) -> Any:
+        retries = 0
+        while True:
+            try:
+                return commit(**request)
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                retryable = (
+                    status is None
+                    or int(status) in {408, 425, 429}
+                    or int(status) >= 500
+                )
+                if not retryable or (
+                    status is None and not isinstance(
+                        exc, (StateApiError, TimeoutError, ConnectionError, OSError)
+                    )
+                ):
+                    raise
+                retries += 1
+                if retries == 1 or retries % 5 == 0:
+                    LOGGER.warning(
+                        "Shared export cursor commit pending for job %s (%s)",
+                        command.get("job_id"),
+                        type(exc).__name__,
+                    )
+                    try:
+                        self.publisher.emit(
+                            str(command["job_id"]),
+                            "running",
+                            "export.cursor_commit_pending",
+                            progress={
+                                "phase": "cursor_commit_pending",
+                                "message": "Menunggu konfirmasi backend untuk menyimpan hasil export.",
+                                "indeterminate": True,
+                            },
+                        )
+                    except Exception:
+                        pass
+                time.sleep(min(30, 2 ** min(retries - 1, 5)))
+
+    def _commit_export_cursor(
+        self,
+        command: dict[str, Any],
+        runtime: Any,
+        lease: dict[str, Any],
+        result: ExportJobResult,
+        stats: dict[str, Any],
+        *,
+        quick_mode: bool,
+    ) -> None:
+        commit = getattr(runtime.state_store, "commit_export_cursor", None)
+        if not callable(commit):
+            raise RuntimeError("Backend cursor export tidak tersedia; source lokal tidak digunakan sebagai fallback.")
+        filename = result.export_path.name
+        media_count = int(stats.get("media_count") or 0)
+        artifact_kind = (
+            "quickmode_stage"
+            if quick_mode
+            else "export"
+            if media_count > 0
+            else "empty_export"
+        )
+        artifact = {
+            "artifact_kind": artifact_kind,
+            "catalog": artifact_kind == "export",
+            "artifact_key": filename,
+            "filename": filename,
+            "chat_ref": str(stats.get("chat_ref") or result.chat_ref),
+            "label": stats.get("label"),
+            "json_bytes": int(stats.get("json_bytes") or 0),
+            "message_count": int(stats.get("message_count") or 0),
+            "media_count": media_count,
+            "photo_count": int(stats.get("photo_count") or 0),
+            "video_count": int(stats.get("video_count") or 0),
+            "other_media_count": int(stats.get("other_media_count") or 0),
+            "expected_media_bytes": stats.get("expected_media_bytes"),
+        }
+        request = {
+            "job_id": str(command["job_id"]),
+            "worker": str(command.get("worker") or self.config.backup_node_name),
+            "attempt": int(command.get("attempt") or 1),
+            "fencing_token": int(lease["fencing_token"]),
+            "expected_revision": int(lease["revision"]),
+            "last_id": max(int(lease.get("last_id") or 0), int(result.end_id or 0)),
+            "artifact": artifact,
+        }
+        command_id = str(command.get("command_id") or "")
+        if command_id:
+            result_data = asdict(result)
+            result_data["export_path"] = str(result.export_path)
+            self.command_store.set_status(
+                command_id,
+                "running",
+                phase="cursor_commit_pending",
+                checkpoint={
+                    "cursor_commit": {
+                        "request": request,
+                        "result": result_data,
+                        "stats": stats,
+                    }
+                },
+            )
+        self._submit_cursor_commit(command, commit, request)
 
 
     def _export(self, command: dict[str, Any]) -> Any:
@@ -1634,31 +1850,148 @@ class WorkerJobExecutor(
             export_client = self._quick_isolated_client(runtime, stage_root, "export")
             with self._lock:
                 self._quick_export_clients[str(command["job_id"])] = export_client
+        shared_cursor = bool(payload.get("_shared_export_cursor"))
+        cursor_lease: dict[str, Any] | None = None
+        replayed_cursor = False
         try:
-            with runtime.export_operation_lock:
-                with self._capture_tdl_output(export_client):
-                    with self._capture_tdl_progress(
-                        export_client, export_progress
-                    ):
-                        result = runtime.export_service.export_from_url(
-                            str(url),
-                            use_url_message_id=bool(payload.get("use_url_message_id", False)),
-                            save_source=(
-                                bool(payload["save_source"])
-                                if "save_source" in payload
-                                and payload.get("save_source") is not None
-                                else None
-                            ),
-                            export_start_id=export_start_id,
-                            export_end_id=export_end_id,
-                            tdl_client=export_client if quick_mode else None,
-                            output_dir=stage_root if quick_mode else None,
+            restored = (
+                self._replay_cursor_commit(command, runtime)
+                if shared_cursor
+                else None
+            )
+            if restored is not None:
+                result, stats = restored
+                replayed_cursor = True
+            else:
+                heartbeat_stop = threading.Event()
+                heartbeat_thread: threading.Thread | None = None
+                heartbeat_errors: list[str] = []
+                with runtime.export_operation_lock:
+                    if shared_cursor:
+                        store = runtime.state_store
+                        resolver = getattr(export_client, "resolve_chat_peer", None)
+                        if not callable(resolver):
+                            raise RuntimeError("TDL worker belum mendukung resolve identitas peer.")
+                        if not all(
+                            callable(getattr(store, name, None))
+                            for name in (
+                                "resolve_export_peer",
+                                "acquire_export_cursor",
+                                "heartbeat_export_cursor",
+                                "commit_export_cursor",
+                            )
+                        ):
+                            raise RuntimeError("Worker tidak memiliki kontrak backend shared export cursor.")
+                        parsed = runtime.export_service.validate_url(str(url))
+                        peer = resolver(parsed.chat_ref)
+                        worker_name = str(command.get("worker") or self.config.backup_node_name)
+                        attempt = int(command.get("attempt") or 1)
+                        store.resolve_export_peer(
+                            job_id=str(command["job_id"]),
+                            worker=worker_name,
+                            attempt=attempt,
+                            requested_ref=parsed.chat_ref,
+                            peer_type=str(peer["peer_type"]),
+                            peer_id=str(peer["peer_id"]),
                         )
+                        cursor_lease = store.acquire_export_cursor(
+                            job_id=str(command["job_id"]),
+                            worker=worker_name,
+                            attempt=attempt,
+                            requested_ref=parsed.chat_ref,
+                        )
+                        if not all(
+                            key in cursor_lease
+                            for key in ("last_id", "revision", "fencing_token")
+                        ):
+                            raise RuntimeError("Backend mengembalikan lease cursor yang tidak lengkap.")
+                        if export_start_id is None:
+                            explicit_start = payload.get("start_id")
+                            if explicit_start is not None:
+                                export_start_id = max(1, int(explicit_start))
+                            elif bool(payload.get("use_url_message_id")):
+                                export_start_id = parsed.bootstrap_message_id
+                            else:
+                                export_start_id = max(1, int(cursor_lease["last_id"]) + 1)
+
+                        def heartbeat_loop() -> None:
+                            while not heartbeat_stop.wait(30):
+                                try:
+                                    store.heartbeat_export_cursor(
+                                        job_id=str(command["job_id"]),
+                                        worker=worker_name,
+                                        attempt=attempt,
+                                        fencing_token=int(cursor_lease["fencing_token"]),
+                                    )
+                                except Exception:
+                                    heartbeat_errors.append("failed")
+                                    return
+
+                        heartbeat_thread = threading.Thread(
+                            target=heartbeat_loop,
+                            daemon=True,
+                            name=f"export-cursor-heartbeat-{str(command['job_id'])[:8]}",
+                        )
+                        heartbeat_thread.start()
+
+                    export_options: dict[str, Any] = {
+                        "use_url_message_id": bool(payload.get("use_url_message_id", False)),
+                        "save_source": (
+                            bool(payload["save_source"])
+                            if "save_source" in payload
+                            and payload.get("save_source") is not None
+                            else None
+                        ),
+                        "export_start_id": export_start_id,
+                        "export_end_id": export_end_id,
+                        "tdl_client": export_client if quick_mode else None,
+                        "output_dir": stage_root if quick_mode else None,
+                    }
+                    if shared_cursor and cursor_lease is not None:
+                        export_options.update(
+                            {
+                                "save_source": False,
+                                "read_source": False,
+                                "source_last_id": int(cursor_lease["last_id"]),
+                                "source_exists": int(cursor_lease["last_id"]) > 0,
+                            }
+                        )
+                    try:
+                        with self._capture_tdl_output(export_client):
+                            with self._capture_tdl_progress(
+                                export_client, export_progress
+                            ):
+                                result = runtime.export_service.export_from_url(
+                                    str(url),
+                                    **export_options,
+                                )
+                    finally:
+                        if heartbeat_thread is not None:
+                            heartbeat_stop.set()
+                            heartbeat_thread.join(timeout=2)
+                    if heartbeat_errors:
+                        raise RuntimeError("Backend tidak mengonfirmasi heartbeat lease export.")
         finally:
+            if 'heartbeat_stop' in locals():
+                heartbeat_stop.set()
+            if 'heartbeat_thread' in locals() and heartbeat_thread is not None:
+                heartbeat_thread.join(timeout=2)
             if quick_mode:
                 with self._lock:
                     self._quick_export_clients.pop(str(command["job_id"]), None)
-        stats = inspect_export_json(result.export_path)
+        if not replayed_cursor:
+            stats = inspect_export_json(result.export_path)
+            if shared_cursor:
+                if cursor_lease is None:
+                    raise RuntimeError("Lease backend untuk export tidak tersedia.")
+                self._commit_export_cursor(
+                    command,
+                    runtime,
+                    cursor_lease,
+                    result,
+                    stats,
+                    quick_mode=quick_mode,
+                )
         json_ready_progress = reporter.report(
             phase="json_ready",
             message=f"File JSON berhasil dibuat: {result.export_path.name}",
@@ -1803,12 +2136,13 @@ class WorkerJobExecutor(
             counters={"succeeded": result.exported_count},
             force=True,
         )
-        self.publisher.emit(
-            str(command["job_id"]),
-            "running",
-            "artifact.discovered",
-            result={"artifact": artifact},
-        )
+        if not shared_cursor:
+            self.publisher.emit(
+                str(command["job_id"]),
+                "running",
+                "artifact.discovered",
+                result={"artifact": artifact},
+            )
         return {**asdict(result), **stats}
 
 

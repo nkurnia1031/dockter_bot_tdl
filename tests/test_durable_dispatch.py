@@ -14,6 +14,7 @@ from tme3bot.domain.worker_contract import (
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
+from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 
 
 class FakeProfiles:
@@ -33,6 +34,14 @@ class FakeUtilitySettings:
             "compress_password": "server-only-password",
             "rclone_destination": "googledrive:backup",
         }
+
+
+class FakeWorkerRegistry:
+    def names(self):
+        return ["local", "remote-2"]
+
+    def get(self, name):
+        return {"enabled": True} if name in self.names() else None
 
 
 class FakeArtifactCatalog:
@@ -61,6 +70,18 @@ class FakeDispatcher:
         return {
             "contract_version": WORKER_API_CONTRACT_VERSION,
             "capabilities": sorted(capabilities),
+            "tts": True,
+            "profiles": ["default", "archive"],
+            "export_profiles": ["default", "archive"],
+            "download_profiles": ["default", "archive"],
+            "available_storage_profiles": ["default", "archive"],
+            "tts_health": {
+                "helpers_ready": True,
+                "helpers": [
+                    {"slot": slot, "status": "ready", "bootstrap_percent": 100}
+                    for slot in range(1, 4)
+                ],
+            },
         }
 
     def dispatch(self, worker, command):
@@ -92,10 +113,22 @@ class DurableDispatchTests(unittest.TestCase):
         self.store = SqliteOperationStore(self.jobs)
         self.operations = OperationsService(self.store)
         self.dispatcher = FakeDispatcher()
+        self.workers = FakeWorkerRegistry()
+        self.tdl_access = SqliteTdlAccessStore(self.db_file)
         self.control = ControlPlane(
             self.jobs, self.dispatcher, FakeProfiles(),
             runtime_settings_store=self.settings,
+            worker_registry=self.workers,
+            tdl_access_store=self.tdl_access,
+            tdl_access_target_resolver=lambda purpose: "123456789" if purpose == "tts" else "123",
         )
+        inventory_hash = self.tdl_access.inventory_fingerprint(["default", "archive"])
+        destination_hash = self.tdl_access.destination_fingerprint("123456789")
+        for worker in self.workers.names():
+            self.tdl_access.replace_results(
+                worker, "tts", destination_hash, inventory_hash,
+                [{"profile": profile, "ready": True} for profile in ("default", "archive")],
+            )
         self.control.utility_settings = FakeUtilitySettings()
         self.control.add_event_observer(self.operations.on_job_event)
         self.operations.register_handler("job.submit", self.control.prepare_durable_job)
@@ -131,12 +164,21 @@ class DurableDispatchTests(unittest.TestCase):
 
         self.assertEqual(operation.status.value, "queued")
         self.assertEqual(job.status, JobStatus.QUEUED)
-        self.assertEqual(job.payload, {"title": "Narasi", "character_count": 11})
+        self.assertEqual(job.payload, {
+            "title": "Narasi", "character_count": 11, "sender_profile": "archive",
+        })
         self.assertEqual(command["payload"]["text"], "teks privat")
         self.assertEqual(command["dispatch_mode"], "durable")
         self.assertEqual(command["attempt"], 1)
         self.assertFalse(command["dispatch_started"])
-        self.assertEqual(self.jobs.execution_plan(job.id)["resource_keys"], ["worker:local:kind:tts"])
+        self.assertEqual(
+            self.jobs.execution_plan(job.id)["resource_keys"],
+            [
+                "profile:archive:worker:local:tdl:export",
+                "profile:default:worker:local:tdl:export",
+                "worker:local:kind:tts",
+            ],
+        )
         self.assertEqual(self.dispatcher.commands, [])
         self.assertEqual(self.dispatcher.legacy_commands, [])
         with self.jobs._db() as db:
@@ -193,6 +235,17 @@ class DurableDispatchTests(unittest.TestCase):
             )
         self.assertEqual(quick_error.exception.code, "JOB_PAYLOAD_INVALID")
 
+    def test_leave_operation_uses_requesting_actor_profile(self):
+        prepared = self.control.prepare_durable_job(
+            self.actor,
+            {"profile": "archive", "worker": "local"},
+            {"job_kind": "leave", "payload": {"chat_refs": ["@example"]}},
+        )
+
+        self.assertEqual(prepared.profile, "default")
+        self.assertEqual(prepared.job.profile, "default")
+        self.assertEqual(prepared.command_payload["profile"], "default")
+
     def test_utility_settings_are_snapshotted_privately_by_backend(self):
         operation = self.submit(
             "utility",
@@ -217,15 +270,15 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertFalse(self.jobs.command_payload(operation.job_id)["dispatch_started"])
         self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
 
-    def test_unready_profile_is_accepted_then_waits_in_background(self):
+    def test_unready_profile_sync_does_not_block_job_dispatch(self):
         self.control.profile_readiness = lambda profile, worker: False
 
         operation = self.submit()
         result = self.control.advance_durable_job(self.queue_command(operation))
 
         self.assertEqual(operation.status.value, "queued")
-        self.assertEqual(result["status"], "wait")
-        self.assertEqual(self.dispatcher.commands, [])
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(len(self.dispatcher.commands), 1)
 
     def test_download_payload_is_rebuilt_from_artifacts_pinned_to_target_origin(self):
         artifact = {

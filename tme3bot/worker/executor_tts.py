@@ -12,6 +12,7 @@ from typing import Any
 
 from tme3bot.domain.models import utc_now
 from tme3bot.infrastructure.http_client import request_json
+from tme3bot.tdl import tdl_write_denial_code
 from tme3bot.worker.tts_pipeline import TtsCancelled, TtsError, TtsPipeline
 
 LOGGER = logging.getLogger(__name__)
@@ -63,23 +64,16 @@ class TtsExecutorMixin:
         pipeline = self._tts_pipeline()
         health = pipeline.diagnostics()
         available_profiles = self.available_storage_profiles()
-        profile_sync = getattr(self, "profile_sync", None)
-        sync_enabled = bool(getattr(profile_sync, "enabled", False))
-        ready_profiles = available_profiles
-        if sync_enabled:
-            ready_profiles = [
-                profile for profile in available_profiles
-                if profile_sync.profile_ready(profile)
-            ]
         helpers = health.get("helpers")
         helpers_ready = bool(health.get("helpers_ready")) and isinstance(helpers, list) and len(helpers) == 3 and all(
             isinstance(item, dict) and item.get("status") == "ready" for item in helpers
         )
         health["helpers_ready"] = helpers_ready
         health["available_profiles"] = available_profiles
-        health["tts_profiles"] = ready_profiles
-        health["profile_sync_enabled"] = sync_enabled
-        health["ready"] = helpers_ready and bool(ready_profiles)
+        # Profile send access is destination-specific and verified separately
+        # by the backend. Capability reports local sessions and helper health.
+        health["tts_profiles"] = available_profiles
+        health["ready"] = helpers_ready
         return health
 
     def recover_tts_helper(self, slot: int) -> dict[str, Any]:
@@ -235,8 +229,17 @@ class TtsExecutorMixin:
             secrets = getattr(self._job_log, "secrets", None)
             if isinstance(secrets, list) and target_chat not in secrets:
                 secrets.append(target_chat)
-            runtime = self.profile_manager.runtime(str(command["profile"]))
-            tdl_client = runtime.export_tdl_client
+            selected_profile = str(command["profile"]).strip().lower()
+            raw_sender_profiles = payload.get("_tdl_sender_profiles")
+            sender_profiles = [
+                str(item).strip().lower()
+                for item in raw_sender_profiles
+                if str(item).strip()
+            ] if isinstance(raw_sender_profiles, list) else []
+            if selected_profile not in sender_profiles:
+                sender_profiles.insert(0, selected_profile)
+            sender_profiles = list(dict.fromkeys(sender_profiles))
+            runtime = self.profile_manager.runtime(selected_profile)
             self._append_job_log(
                 f"[TTS] mengirim lewat TDL profile={runtime.name} parts={len(result['artifacts'])}"
             )
@@ -299,11 +302,36 @@ class TtsExecutorMixin:
                             artifact_path, title, part_index, total_parts
                         )
                         try:
-                            with runtime.export_operation_lock:
-                                tdl_client.upload(
-                                    upload_path,
-                                    target_chat,
-                                    caption,
+                            uploaded = False
+                            last_denial = None
+                            for sender_index, sender_profile in enumerate(sender_profiles):
+                                sender_runtime = self.profile_manager.runtime(sender_profile)
+                                try:
+                                    with sender_runtime.export_operation_lock:
+                                        sender_runtime.export_tdl_client.upload(
+                                            upload_path,
+                                            target_chat,
+                                            caption,
+                                        )
+                                    if sender_profile != selected_profile:
+                                        self._append_job_log(
+                                            f"[TTS] memakai profil pengirim cadangan={sender_profile} setelah penolakan izin eksplisit"
+                                        )
+                                        selected_profile = sender_profile
+                                    uploaded = True
+                                    break
+                                except Exception as send_error:
+                                    denial = tdl_write_denial_code(send_error)
+                                    if denial and sender_index + 1 < len(sender_profiles):
+                                        last_denial = denial
+                                        self._append_job_log(
+                                            f"[TTS] profil pengirim ditolak={sender_profile} code={denial}; mencoba profil berikutnya"
+                                        )
+                                        continue
+                                    raise
+                            if not uploaded:
+                                raise TtsError(
+                                    f"Semua profil pengirim ditolak ({last_denial or 'TDL_WRITE_FORBIDDEN'})."
                                 )
                         finally:
                             upload_path.unlink(missing_ok=True)

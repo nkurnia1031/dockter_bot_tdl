@@ -15,6 +15,7 @@ from tme3bot.domain.models import DomainError
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
     CAP_SAFELINK_RESOLVE,
+    CAP_SHARED_EXPORT_CURSOR,
     CAP_TTS,
     worker_contract_metadata,
 )
@@ -120,6 +121,9 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             capabilities.append(CAP_TTS)
         if details.get("safelink_resolver"):
             capabilities.append(CAP_SAFELINK_RESOLVE)
+        cursor_ready = getattr(context.executor, "shared_export_cursor_ready", None)
+        if callable(cursor_ready) and cursor_ready():
+            capabilities.append(CAP_SHARED_EXPORT_CURSOR)
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
 
@@ -170,6 +174,42 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 "PROFILE_SYNC_UNAVAILABLE",
                 "Sinkronisasi profil backend belum dikonfigurasi pada worker.",
                 status_code=503,
+            ) from exc
+
+    @app.delete("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
+    def cancel_profile_sync(body: dict[str, Any]):
+        if set(body) - {"profile", "mode"} or not isinstance(body.get("profile"), str):
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID",
+                "Target pembatalan sinkronisasi profil tidak valid.",
+                status_code=422,
+            )
+        profile = body["profile"]
+        if len(profile) > 48:
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID",
+                "Nama profil sinkronisasi tidak valid.",
+                status_code=422,
+            )
+        mode = str(body.get("mode") or "check").strip().lower()
+        if mode not in {"check", "repair"}:
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID",
+                "Mode sinkronisasi harus check atau repair.",
+                status_code=422,
+            )
+        cancel_sync = getattr(context.executor, "cancel_profile_sync", None)
+        if not callable(cancel_sync):
+            raise DomainError(
+                "PROFILE_SYNC_UNAVAILABLE",
+                "Worker belum mendukung pembatalan sinkronisasi profil.",
+                status_code=503,
+            )
+        try:
+            return cancel_sync(profile=profile, mode=mode)
+        except ValueError as exc:
+            raise DomainError(
+                "PROFILE_SYNC_REQUEST_INVALID", str(exc), status_code=422
             ) from exc
 
     @app.get("/internal/v1/tts/health", dependencies=[Depends(authorize)])
@@ -447,6 +487,8 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             payload.pop("execution", None)
         if payload.get("event_sequence_start") is None:
             payload.pop("event_sequence_start", None)
+        if payload.get("attempt") is None:
+            payload.pop("attempt", None)
         if payload.get("worker") is None:
             payload.pop("worker", None)
         return {"position": context.executor.enqueue(payload), "job_id": body.job_id}

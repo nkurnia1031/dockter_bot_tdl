@@ -1,5 +1,10 @@
 # 11 — Executor export memakai cursor bersama dan mengarsip state lokal
 
+> **Koreksi allowlist 2026-10-10:** task ini sebelumnya terblokir karena capability
+> `shared_export_cursor_v1` perlu didaftarkan pada kontrak worker dan hanya
+> diiklankan oleh API worker saat dukungan runtime tersedia. Perubahan berikut
+> ditambahkan ke allowlist task ini agar implementasi dan pengujiannya tercakup.
+
 ## Tujuan
 
 Pasang handler resolve peer sebelum export dari kontrak task 06, memakai TDL terkontrol pada profile/worker yang sudah sinkron. Hasil resolve dilaporkan tanpa mencatat isi pesan.
@@ -32,10 +37,21 @@ Path relatif terhadap root repo. “Baru” berarti dibuat oleh task ini; “Diu
 | Diubah | `tme3bot/worker/quick_export.py` |
 | Diubah | `tme3bot/backup_service.py` |
 | Diubah | `tme3bot/worker/executor_backup.py` |
+| Diubah | `tme3bot/application/control_plane.py` |
+| Diubah | `tme3bot/application/export_cursor.py` |
+| Diubah | `tme3bot/worker/command_store.py` |
+| Diubah | `tme3bot/infrastructure/http_client.py` |
 | Diubah | `tests/test_service.py` |
 | Diubah | `tests/test_quick_export.py` |
 | Diubah | `tests/test_backup_service.py` |
+| Diubah | `tests/test_tdl.py` |
+| Diubah | `tests/test_control_plane.py` |
+| Diubah | `tme3bot/domain/worker_contract.py` |
+| Diubah | `tme3bot/api/worker.py` |
+| Diubah | `tme3bot/api/schemas.py` |
 | Baru | `tests/test_worker_shared_cursor.py` |
+| Diubah | `tests/test_worker_api.py` |
+| Diubah | `tests/test_worker_contract.py` |
 | Diubah | `plan/PROGRESS.md` |
 | Dihasilkan tool | `graphify-out/` (hanya output `graphify update .`) |
 
@@ -92,7 +108,7 @@ Baca plan/00-OVERVIEW.md dan seluruh file task ini. Tidak perlu membaca task lai
 Jalankan dari root repository:
 
 ```text
-python -m unittest tests.test_worker_shared_cursor tests.test_service tests.test_quick_export tests.test_backup_service -v
+python -m unittest tests.test_worker_shared_cursor tests.test_service.ServiceTests.test_shared_cursor_export_skips_worker_state_reads_and_writes tests.test_quick_export tests.test_backup_service tests.test_worker_api tests.test_worker_contract tests.test_control_plane tests.test_tdl tests.test_shared_export_cursor -v
 python -m compileall -q tme3bot utility bot.py run.py
 git diff --check
 graphify update .

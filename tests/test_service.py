@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tme3bot.config import AppConfig
 from tme3bot.progress import DownloadProgressTracker
@@ -136,6 +137,36 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(store.get_source("@bot").label, "1langs")
             self.assertFalse(store.get_source("@bot").warmup_done)
             self.assertEqual(store.get_source("@bot").warmup_url, "https://t.me/bot/8")
+
+    def test_shared_cursor_export_skips_worker_state_reads_and_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            store = StateStore(config.state_file, config.legacy_max_json)
+            client = FakeExportTDLClient(
+                ExportResult(
+                    export_path=root / "ignored.json",
+                    messages=[],
+                    exported_count=0,
+                    max_message_id=None,
+                    has_media=False,
+                )
+            )
+            service = ExportService(config, store, client)
+            with patch.object(store, "get_source", wraps=store.get_source) as get_source:
+                result = service.export_from_url(
+                    "https://t.me3/c/@channel/1",
+                    save_source=False,
+                    export_start_id=44,
+                    read_source=False,
+                    source_last_id=43,
+                    source_exists=True,
+                )
+
+            self.assertEqual(get_source.call_count, 0)
+            self.assertEqual(client.export_calls[0][1], 44)
+            self.assertEqual(result.latest_id, 43)
+            self.assertEqual(store.list_sources(), [])
 
     def test_builds_correct_warmup_url_for_private_numeric_chat(self) -> None:
         self.assertEqual(

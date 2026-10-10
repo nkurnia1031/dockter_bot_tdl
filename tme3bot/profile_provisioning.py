@@ -880,14 +880,14 @@ class ProfileProvisioningStore:
                 (int(revision), str(profile), now, str(profile), str(worker)),
             )
 
-    def cancel_sync_request(self, operation_id: str) -> None:
+    def cancel_sync_request(self, operation_id: str) -> dict[str, Any] | None:
         with self._lock, self._db() as db:
             request = db.execute(
-                "SELECT profile,worker FROM profile_sync_requests WHERE operation_id=?",
+                "SELECT profile,worker,desired_revision,status FROM profile_sync_requests WHERE operation_id=?",
                 (str(operation_id),),
             ).fetchone()
-            if request is None:
-                return
+            if request is None or str(request["status"]) != "pending":
+                return None
             db.execute(
                 "UPDATE profile_sync_requests SET status='cancelled',updated_at=? WHERE operation_id=?",
                 (_now(), str(operation_id)),
@@ -901,6 +901,11 @@ class ProfileProvisioningStore:
                     "UPDATE profile_distributions SET sync_requested=0 WHERE profile=? AND worker=?",
                     (str(request["profile"]), str(request["worker"])),
                 )
+            return {
+                "profile": str(request["profile"]),
+                "worker": str(request["worker"]),
+                "desired_revision": int(request["desired_revision"]),
+            }
 
     def finish_sync_requests(self, profile: str, worker: str, revision: int, status: str) -> list[dict[str, Any]]:
         if status not in {"succeeded", "failed"}:

@@ -20,6 +20,7 @@ from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payl
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
+from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.profile_provisioning import ProfileProvisioningStore, build_profile_bundle
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
@@ -62,6 +63,22 @@ class FakeDispatcher:
             ],
         }
         self.tts_recoveries = []
+        self.profile_sync_requests = []
+        self.profile_sync_snapshot = {
+            "status": "waiting_worker",
+            "backend_available": False,
+            "last_checked_at": "2026-10-10T00:00:00Z",
+            "profiles": {
+                "default": {
+                    "status": "waiting_worker",
+                    "error_code": "BACKEND_UNAVAILABLE",
+                    "desired_revision": 4,
+                    "installed_revision": 3,
+                    "bundle_sha256": "private-hash",
+                }
+            },
+            "queued_requests": [{"profile": "default", "mode": "check"}],
+        }
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
         self.quick_deletions = []
@@ -92,11 +109,17 @@ class FakeDispatcher:
                 {"slot": slot, "status": "ready", "bootstrap_percent": 100, "checked_at": "now"}
                 for slot in range(1, 4)
             ]
-        profiles = list(health.get("available_profiles") or []) if self.tts_ready else []
+        # Profile sessions are independent of addon readiness. TTS capability
+        # still follows helper health, while Storage and other TDL jobs can
+        # use the same local session inventory without a TTS helper.
+        profiles = list(health.get("available_profiles") or [])
         return {
             "tts": self.tts_ready,
             "capabilities": ["tts"] if self.tts_ready else [],
-            "tts_profiles": profiles,
+            "tts_profiles": profiles if self.tts_ready else [],
+            "profiles": profiles,
+            "export_profiles": profiles,
+            "available_storage_profiles": profiles,
             "tts_health": health,
         }
 
@@ -107,6 +130,14 @@ class FakeDispatcher:
     def recover_tts_helper(self, worker, slot):
         self.tts_recoveries.append((worker, slot))
         return {"accepted": True, "status": "restarting"}
+
+    def profile_sync_status(self, worker):
+        del worker
+        return self.profile_sync_snapshot
+
+    def request_profile_sync(self, worker, *, profile=None, mode="check"):
+        self.profile_sync_requests.append((worker, profile, mode))
+        return {"accepted": True, "status": "sync_pending", "profile": profile}
 
     def worker_settings(self, worker):
         return dict(self.runtime_settings)
@@ -384,6 +415,10 @@ class BackendApiTests(unittest.TestCase):
         )
         runtime_settings.attach_settings_store(runtime_settings_store)
         self.control.runtime_settings_store = runtime_settings_store
+        self.control.tdl_access_store = SqliteTdlAccessStore(db)
+        self.control.tdl_access_target_resolver = lambda purpose: (
+            "123456789" if purpose == "tts" else "123" if purpose == "storage" else ""
+        )
         context = BackendContext(
             config=config,
             control_plane=self.control,
@@ -409,6 +444,18 @@ class BackendApiTests(unittest.TestCase):
         )
         self.context = context
         self.client = TestClient(create_backend_app(context))
+
+    def seed_tdl_access(self, worker="local", purpose="tts", profiles=None):
+        profiles = list(profiles if profiles is not None else self.dispatcher.capabilities(worker).get("export_profiles", []))
+        store = self.control.tdl_access_store
+        destination = "123456789" if purpose == "tts" else "123"
+        store.replace_results(
+            worker,
+            purpose,
+            store.destination_fingerprint(destination),
+            store.inventory_fingerprint(profiles),
+            [{"profile": profile, "ready": True} for profile in profiles],
+        )
 
     def tearDown(self):
         self.temp.cleanup()
@@ -567,6 +614,7 @@ class BackendApiTests(unittest.TestCase):
             "private_payload": private,
         }
         self.assertEqual(advance_profile_sync_command(command, self.context)["status"], "accepted")
+        self.assertEqual(self.dispatcher.profile_sync_requests, [("local", "default", "check")])
         self.assertEqual(
             self.operation_service.get(self.control.actor(42), operation_id).status.value,
             "waiting_worker",
@@ -592,6 +640,19 @@ class BackendApiTests(unittest.TestCase):
             "succeeded",
         )
         client.close()
+
+    def test_worker_profile_sync_status_is_authenticated_and_redacted(self):
+        denied = self.client.get("/api/v1/workers/local/profile-sync")
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.get(
+            "/api/v1/workers/local/profile-sync", headers=self.login()
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "waiting_worker")
+        self.assertEqual(response.json()["profiles"]["default"]["error_code"], "BACKEND_UNAVAILABLE")
+        self.assertNotIn("bundle_sha256", response.text)
+        self.assertNotIn("private-hash", response.text)
+        self.assertNotIn("queued_requests", response.json())
 
     def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
         self.context.queue_publisher = object()
@@ -983,6 +1044,7 @@ class BackendApiTests(unittest.TestCase):
             ],
         }
         self.dispatcher.tts_ready = True
+        self.seed_tdl_access(worker="local", purpose="tts", profiles=["default"])
         ready = self.client.get("/api/v1/workers/local/tts/health", headers=headers)
         self.assertEqual(ready.status_code, 200, ready.text)
         self.assertTrue(ready.json()["ready"])
@@ -1812,6 +1874,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_storage_upload_can_snapshot_rclone_destination(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         created = self.client.post(
             "/api/v1/storage/uploads",
             headers=headers,
@@ -2247,6 +2310,7 @@ class BackendApiTests(unittest.TestCase):
         self.dispatcher.tts_ready = True
         self.jobs.set_tts_telegram_ready(True)
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="tts")
         secret_text = "Teks rahasia untuk audio ini"
         marker = "PRIVATE-NOVEL-TEXT-"
         too_long = marker * 5_556
@@ -2279,7 +2343,11 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(created.status_code, 200, created.text)
         job = created.json()
         self.assertEqual(job["kind"], "tts")
-        self.assertEqual(job["payload"], {"title": "Bab rahasia", "character_count": len(secret_text)})
+        self.assertEqual(job["payload"], {
+            "title": "Bab rahasia",
+            "character_count": len(secret_text),
+            "sender_profile": "default",
+        })
         self.assertEqual(job["settings_version"], 0)
         self.assertNotIn(secret_text, created.text)
         internal_command = self.dispatcher.commands[-1][1]
@@ -2357,6 +2425,7 @@ class BackendApiTests(unittest.TestCase):
     def test_tts_worker_delivery_claim_is_scoped_and_exposes_ref_only_internal(self):
         self.dispatcher.tts_ready = True
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="tts")
         created = self.client.post(
             "/api/v1/tts/jobs",
             headers=headers,
@@ -2417,6 +2486,8 @@ class BackendApiTests(unittest.TestCase):
         headers = self.login()
 
         self.dispatcher.tts_health_result["available_profiles"] = ["default"]
+        self.seed_tdl_access("local", "tts", ["default"])
+        self.seed_tdl_access("remote-tts", "tts", ["default"])
 
         options = self.client.get("/api/v1/tts/workers", headers=headers)
         self.assertEqual(options.status_code, 200, options.text)
@@ -2434,7 +2505,54 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(created.status_code, 200, created.text)
         self.assertEqual(created.json()["worker"], "remote-tts")
+        self.assertEqual(created.json()["profile"], "default")
+        self.assertEqual(created.json()["payload"]["sender_profile"], "default")
         self.assertEqual(self.dispatcher.commands[-1][0], "remote-tts")
+
+    def test_tdl_access_verification_is_durable_and_target_is_private_to_owner_worker(self):
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        client = TestClient(create_backend_app(self.context))
+        headers = self.login(42)
+        submitted = client.post(
+            "/api/v1/tdl-access/verification",
+            headers={**headers, "Idempotency-Key": "tdl-access-test-1"},
+            json={"purpose": "storage", "worker": "local"},
+        )
+        self.assertEqual(submitted.status_code, 202, submitted.text)
+        self.assertEqual(submitted.json()["status"], "queued")
+        self.assertEqual(submitted.json()["target"]["job_kind"], "tdl_access_verify")
+        self.assertNotIn("123", submitted.text)
+        job_id = submitted.json()["job_id"]
+        target_path = f"/internal/v1/tdl-access/jobs/{job_id}/target?worker=local"
+        unauthorized = client.get(target_path)
+        self.assertEqual(unauthorized.status_code, 401)
+        wrong_worker = client.get(
+            target_path.replace("worker=local", "worker=remote"),
+            headers={"Authorization": "Bearer internal"},
+        )
+        self.assertEqual(wrong_worker.status_code, 403)
+        target = client.get(target_path, headers={"Authorization": "Bearer internal"})
+        self.assertEqual(target.status_code, 200, target.text)
+        self.assertEqual(target.json(), {"purpose": "storage", "target": "123"})
+
+    def test_tdl_access_status_invalidates_when_worker_inventory_changes(self):
+        self.dispatcher.tts_ready = True
+        self.dispatcher.tts_health_result["available_profiles"] = ["default"]
+        self.seed_tdl_access("local", "storage", ["default"])
+        headers = self.login(42)
+        initial = self.client.get(
+            "/api/v1/tdl-access/verification?purpose=storage&worker=local",
+            headers=headers,
+        )
+        self.assertTrue(initial.json()["ready"])
+        self.dispatcher.tts_health_result["available_profiles"] = ["archive"]
+        stale = self.client.get(
+            "/api/v1/tdl-access/verification?purpose=storage&worker=local",
+            headers=headers,
+        )
+        self.assertFalse(stale.json()["ready"])
+        self.assertEqual(stale.json()["verified_profiles"], [])
 
     def test_tts_worker_diagnostics_are_complete_and_logs_are_authenticated_json(self):
         headers = self.login()

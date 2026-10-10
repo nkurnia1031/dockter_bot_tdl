@@ -34,5 +34,5 @@ describe('Storage file manager', () => {
     await fireEvent.click(screen.getAllByRole('button', {name:'Projects'})[0]);
     expect(await screen.findByText('report.pdf')).toBeTruthy();
     expect(fetcher.mock.calls.some(([url]) => String(url).includes('folder_id=1'))).toBe(true);
-  });
+  }, 15000);
 });

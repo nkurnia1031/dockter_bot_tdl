@@ -33,12 +33,27 @@ class ProfileSyncContractTests(unittest.TestCase):
         self.profile_registry = ProfileRegistry(
             root / "profile-registry.json", "default"
         )
+        self.worker_sync_requests = []
+        self.worker_sync_cancellations = []
+
+        def request_profile_sync(worker, *, profile=None, mode="check"):
+            self.worker_sync_requests.append((worker, profile, mode))
+            return {"accepted": True, "status": "sync_pending", "profile": profile}
+
+        def cancel_profile_sync(worker, profile, *, mode="check"):
+            self.worker_sync_cancellations.append((worker, profile, mode))
+            return {"accepted": True, "status": "cancelled", "profile": profile}
+
         self.context = SimpleNamespace(
             profile_provisioner=SimpleNamespace(
                 store=self.store,
                 profile_manager=SimpleNamespace(profile_registry=self.profile_registry),
             ),
             worker_registry=self.workers,
+            worker_dispatcher=SimpleNamespace(
+                request_profile_sync=request_profile_sync,
+                cancel_profile_sync=cancel_profile_sync,
+            ),
             operation_service=None,
             control_plane=SimpleNamespace(require_profile=lambda actor, profile: profile),
         )
@@ -237,11 +252,26 @@ class ProfileSyncContractTests(unittest.TestCase):
             "private_payload": prepared.private_payload,
         }
         self.assertEqual(advance_profile_sync_command(command, self.context)["status"], "accepted")
+        self.assertEqual(self.worker_sync_requests, [("worker-b", "novel", "check")])
         manifest = self.store.profile_manifest("worker-b")
         self.assertTrue(manifest[0]["sync_requested"])
 
-        self.assertEqual(advance_profile_sync_cancel(command, self.context)["status"], "terminal")
+        cancelled = advance_profile_sync_cancel(command, self.context)
+        self.assertEqual(cancelled["status"], "terminal")
+        self.assertEqual(cancelled["worker_sync_cancel"], "cancelled")
+        self.assertEqual(self.worker_sync_cancellations, [("worker-b", "novel", "check")])
         self.assertFalse(self.store.profile_manifest("worker-b")[0]["sync_requested"])
+
+    def test_cancel_sync_does_not_stop_worker_needed_by_another_operation(self):
+        self.store.request_sync("sync-op-1", 9, "novel", "worker-b", 1)
+        self.store.request_sync("sync-op-2", 9, "novel", "worker-b", 1)
+        result = advance_profile_sync_cancel(
+            {"operation_id": "sync-op-1", "private_payload": {"actor_user_id": 9}},
+            self.context,
+        )
+        self.assertEqual(result["worker_sync_cancel"], "other_requests_pending")
+        self.assertEqual(self.worker_sync_cancellations, [])
+        self.assertTrue(self.store.profile_manifest("worker-b")[0]["sync_requested"])
 
     def test_legacy_identity_is_only_a_candidate_and_cannot_rewrite_vault_identity(self):
         self.assertFalse(self.store.record_legacy_discovery("novel", 20002))

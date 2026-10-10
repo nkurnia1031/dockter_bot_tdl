@@ -272,12 +272,12 @@ class SqliteSettingsStore:
 
     def encrypt_job_secret(self, job_id: str, key: str, value: str) -> bytes:
         """Encrypt a backend-only, job-pinned secret such as a TTS recipient."""
-        if key != "telegram_tts_chat_id" or not str(job_id).strip():
+        if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref"} or not str(job_id).strip():
             raise ValueError("Snapshot secret job tidak dikenal.")
         return self._secret_store.encrypt(str(value), self._job_secret_aad(job_id, key))
 
     def decrypt_job_secret(self, job_id: str, key: str, ciphertext: bytes) -> str:
-        if key != "telegram_tts_chat_id" or not str(job_id).strip():
+        if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref"} or not str(job_id).strip():
             raise ValueError("Snapshot secret job tidak dikenal.")
         return self._secret_store.decrypt(
             bytes(ciphertext), self._job_secret_aad(job_id, key)

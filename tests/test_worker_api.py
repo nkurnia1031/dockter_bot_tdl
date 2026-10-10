@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.domain.models import DomainError
+from tme3bot.domain.worker_contract import CAP_SHARED_EXPORT_CURSOR
 
 
 class FakeExecutor:
@@ -24,6 +25,7 @@ class FakeExecutor:
         self.profile_inputs = []
         self.profile_installs = []
         self.profile_sync_requests = []
+        self.profile_sync_cancellations = []
         self.profile_sync_snapshot = {"status": "ready", "backend_available": True, "profiles": {}}
         self.worker_settings_values = {
             "storage_profile": "default",
@@ -52,6 +54,10 @@ class FakeExecutor:
     def request_profile_sync(self, profile=None, mode="check"):
         self.profile_sync_requests.append((profile, mode))
         return {"accepted": True, "status": "sync_pending", "profile": profile}
+
+    def cancel_profile_sync(self, profile, mode="check"):
+        self.profile_sync_cancellations.append((profile, mode))
+        return {"accepted": True, "status": "cancelling", "profile": profile}
 
     def durable_commands_ready(self):
         return self.durable_ready
@@ -286,6 +292,27 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(extra.status_code, 422)
         self.assertEqual(len(self.executor.profile_sync_requests), 1)
+
+        denied_cancel = self.client.request(
+            "DELETE", "/internal/v1/profile-sync", json={"profile": "irang"}
+        )
+        self.assertEqual(denied_cancel.status_code, 401)
+        cancelled = self.client.request(
+            "DELETE",
+            "/internal/v1/profile-sync",
+            headers=headers,
+            json={"profile": "irang", "mode": "check"},
+        )
+        self.assertEqual(cancelled.status_code, 200)
+        self.assertEqual(cancelled.json()["status"], "cancelling")
+        self.assertEqual(self.executor.profile_sync_cancellations, [("irang", "check")])
+        invalid_cancel = self.client.request(
+            "DELETE",
+            "/internal/v1/profile-sync",
+            headers=headers,
+            json={"profile": "irang", "url": "http://attacker.invalid"},
+        )
+        self.assertEqual(invalid_cancel.status_code, 422)
 
     def test_durable_command_endpoints_require_auth_and_ready_journal(self):
         envelope = {
@@ -592,6 +619,22 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["ready"])
         self.assertNotIn("/workspace", response.text)
+
+    def test_shared_export_cursor_capability_is_dynamic(self):
+        self.executor.shared_export_cursor_ready = lambda: True
+        ready = self.client.get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(ready.status_code, 200)
+        self.assertIn(CAP_SHARED_EXPORT_CURSOR, ready.json()["capabilities"])
+
+        self.executor.shared_export_cursor_ready = lambda: False
+        unavailable = self.client.get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertNotIn(CAP_SHARED_EXPORT_CURSOR, unavailable.json()["capabilities"])
 
 
 if __name__ == "__main__":

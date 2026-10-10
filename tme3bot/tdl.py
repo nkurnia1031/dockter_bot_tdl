@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.media import has_downloadable_media
 from tme3bot.tdl_output import (
     CommandProgress,
@@ -44,6 +45,30 @@ class TDLCommandError(RuntimeError):
         self.stderr = stderr
         detail = stderr.strip() or stdout.strip() or "unknown error"
         super().__init__(f"TDL command failed ({returncode}): {detail}")
+
+
+_TDL_WRITE_DENIAL_CODES = (
+    "CHAT_WRITE_FORBIDDEN",
+    "CHAT_ADMIN_REQUIRED",
+    "USER_BANNED_IN_CHANNEL",
+    "CHANNEL_PRIVATE",
+    "CHAT_RESTRICTED",
+    "USER_RESTRICTED",
+)
+
+
+def tdl_write_denial_code(exc: BaseException) -> str | None:
+    """Return a Telegram error code only for an explicit send-permission denial."""
+    sources = [str(exc)]
+    for name in ("stdout", "stderr"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str):
+            sources.append(value)
+    text = "\n".join(sources).upper()
+    for code in _TDL_WRITE_DENIAL_CODES:
+        if code in text:
+            return code
+    return None
 
 
 def pause_process_group(process: subprocess.Popen[Any]) -> bool:
@@ -184,16 +209,18 @@ class SubprocessRunner:
         progress_callback: ProgressCallback | None = None,
         output_callback: OutputCallback | None = None,
         command_callback: CommandCallback | None = None,
+        quiet_output: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command_owner = str(getattr(command_callback, "job_id", "") or "") or None
         with self._pause_condition:
             while self._pause_requested and self._pause_owner in {None, command_owner}:
                 self._pause_condition.wait(timeout=1.0)
         process_command = prepare_subprocess_command(command, env)
-        if process_command == command:
-            LOGGER.info("%s start: %s", log_prefix, " ".join(command))
-        else:
-            LOGGER.info("%s start via pseudo-tty: %s", log_prefix, " ".join(command))
+        if not quiet_output:
+            if process_command == command:
+                LOGGER.info("%s start: %s", log_prefix, " ".join(command))
+            else:
+                LOGGER.info("%s start via pseudo-tty: %s", log_prefix, " ".join(command))
         if output_callback is not None:
             output_callback(f"$ {' '.join(command)}")
         started_at = time.time()
@@ -256,6 +283,7 @@ class SubprocessRunner:
                     log_prefix,
                     progress_callback,
                     output_callback,
+                    quiet_output=quiet_output,
                 )
                 if stall_timeout_seconds > 0 and self._is_stalled(
                     stall_timeout_seconds
@@ -273,7 +301,8 @@ class SubprocessRunner:
             stdout_thread.join(timeout=2)
             stderr_thread.join(timeout=2)
             self._drain_output(
-                output_queue, stdout_lines, stderr_lines, log_prefix, progress_callback, output_callback
+                output_queue, stdout_lines, stderr_lines, log_prefix,
+                progress_callback, output_callback, quiet_output=quiet_output
             )
             returncode = process.poll()
             if returncode is None:
@@ -294,7 +323,9 @@ class SubprocessRunner:
         stdout = "".join(stdout_lines)
         stderr = "".join(stderr_lines)
         if returncode != 0:
-            self._log_failure_output(log_prefix, returncode, stdout, stderr)
+            self._log_failure_output(
+                log_prefix, returncode, stdout, stderr, quiet_output=quiet_output
+            )
         LOGGER.info("%s finished with exit code %s", log_prefix, returncode)
         if output_callback is not None:
             output_callback(f"[process exited with code {returncode}]")
@@ -424,6 +455,8 @@ class SubprocessRunner:
         log_prefix: str,
         progress_callback: ProgressCallback | None,
         output_callback: OutputCallback | None,
+        *,
+        quiet_output: bool = False,
     ) -> None:
         while True:
             try:
@@ -435,11 +468,13 @@ class SubprocessRunner:
             if not clean_line:
                 continue
 
-            if output_callback is not None:
+            if output_callback is not None and not quiet_output:
                 output_callback(clean_line)
 
             target_lines = stderr_lines if stream_name == "stderr" else stdout_lines
             target_lines.append(clean_line + "\n")
+            if quiet_output:
+                continue
             if is_nonsemantic_tdl_output_line(clean_line):
                 LOGGER.debug(
                     "%s %s skipped nonsemantic tdl line | %s",
@@ -475,7 +510,12 @@ class SubprocessRunner:
         returncode: int,
         stdout: str,
         stderr: str,
+        *,
+        quiet_output: bool = False,
     ) -> None:
+        if quiet_output:
+            LOGGER.error("%s failed with exit code %s", log_prefix, returncode)
+            return
         LOGGER.error(
             "%s failed with exit code %s; complete captured output follows",
             log_prefix,
@@ -697,6 +737,93 @@ class TDLClient:
             max_message_id=max_message_id,
             has_media=has_media,
         )
+
+    def resolve_chat_peer(self, chat_ref: str) -> dict[str, str]:
+        """Resolve a selector using this authenticated TDL session.
+
+        The chat listing contains account metadata, so its output is captured
+        privately and the subprocess logger is silenced for this command.
+        """
+        requested = normalize_tdl_chat_ref(chat_ref)
+        command = self._wrap_command(self._base_command() + ["chat", "ls", "-o", "json"])
+        try:
+            result = self.runner.run(
+                command,
+                env=self._command_env(),
+                log_prefix=f"{self.log_prefix}:resolve-peer",
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                quiet_output=True,
+            )
+            self._ensure_success(command, result)
+            rows = self._parse_chat_rows(str(result.stdout or ""))
+        except Exception:
+            raise TDLDataError("TDL tidak dapat membaca identitas chat.") from None
+
+        matches = [row for row in rows if self._chat_row_matches(row, requested)]
+        if len(matches) != 1:
+            raise TDLDataError("Referensi chat tidak menghasilkan satu peer Telegram yang pasti.")
+        row = matches[0]
+        peer_type = str(self._chat_field(row, "Type", "type") or "").strip().casefold()
+        peer_id = str(self._chat_field(row, "ID", "Id", "id") or "").strip()
+        if not peer_type or not peer_id:
+            raise TDLDataError("TDL mengembalikan identitas peer yang tidak lengkap.")
+        return {"peer_type": peer_type, "peer_id": peer_id}
+
+    @staticmethod
+    def _parse_chat_rows(output: str) -> list[dict[str, Any]]:
+        decoder = json.JSONDecoder()
+        parsed: Any = None
+        for index, char in enumerate(output):
+            if char not in "[{":
+                continue
+            try:
+                parsed, _end = decoder.raw_decode(output[index:])
+                break
+            except json.JSONDecodeError:
+                continue
+        if isinstance(parsed, dict):
+            parsed = next(
+                (
+                    parsed[key]
+                    for key in ("dialogs", "chats", "items", "data")
+                    if isinstance(parsed.get(key), list)
+                ),
+                None,
+            )
+        if not isinstance(parsed, list) or any(not isinstance(item, dict) for item in parsed):
+            raise TDLDataError("Format daftar chat TDL tidak valid.")
+        return parsed
+
+    @staticmethod
+    def _chat_field(row: dict[str, Any], *names: str) -> Any:
+        folded = {str(key).casefold(): value for key, value in row.items()}
+        for name in names:
+            if name.casefold() in folded:
+                return folded[name.casefold()]
+        return None
+
+    @classmethod
+    def _chat_row_matches(cls, row: dict[str, Any], requested: str) -> bool:
+        if requested.startswith("+"):
+            phone = str(
+                cls._chat_field(row, "Phone", "PhoneNumber", "phone_number") or ""
+            )
+            try:
+                return normalize_tdl_chat_ref(phone) == requested if phone else False
+            except ValueError:
+                return False
+        username = str(cls._chat_field(row, "Username", "username") or "")
+        username = username.strip().lstrip("@").casefold()
+        if not requested.lstrip("-").isdigit():
+            return username == requested.casefold()
+
+        peer_id = str(cls._chat_field(row, "ID", "Id", "id") or "").strip()
+        if not peer_id.lstrip("-").isdigit():
+            return False
+        if peer_id == requested:
+            return True
+        # TDL represents a public /c/<id> channel as -100<id>.
+        return requested.isdigit() and peer_id == f"-100{requested}"
 
     def download(
         self, export_path: Path, download_dir: Path

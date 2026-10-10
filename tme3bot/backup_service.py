@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -158,7 +159,9 @@ class BackupService:
                 vault_key_target.chmod(0o600)
             except OSError:
                 pass
-        self._copy_profile_metadata(Path(self.config.profiles_root), data_target / "profiles")
+        self._copy_profile_metadata(
+            Path(self.config.profiles_root), data_target / "profiles"
+        )
         self._copy_json_tree(Path(self.config.export_pending_dir), data_target / "exports" / "pending")
         self._copy_json_tree(Path(self.config.export_processing_dir), data_target / "exports" / "processing")
         self._copy_json_tree(Path(self.config.export_done_dir), data_target / "exports" / "done")
@@ -168,9 +171,15 @@ class BackupService:
         data_root = Path(self.config.profile_root)
         data_target = staging / "data"
         data_target.mkdir(parents=True, exist_ok=True)
-        for name in ("state.json", "max.json", "profile_state.json", "identity.json", "profile.json"):
+        for name in ("identity.json", "profile.json"):
             self._copy_file(data_root / name, data_target / name)
-        self._copy_profile_metadata(Path(self.config.profiles_root), data_target / "profiles")
+        self._copy_profile_metadata(
+            Path(self.config.profiles_root), data_target / "profiles", include_state=False
+        )
+        self._backup_sqlite_snapshot(
+            data_root / "worker-command-journal.sqlite3",
+            data_target / "worker-command-journal.sqlite3",
+        )
         for source, name in (
             (self.config.tdl_download_home, "root/.tdl"),
             (self.config.tdl_export_home, "user1/.tdl"),
@@ -218,12 +227,38 @@ class BackupService:
                 cls._copy_file(path, destination / path.relative_to(source))
 
     @classmethod
-    def _copy_profile_metadata(cls, source: Path, destination: Path) -> None:
+    def _copy_profile_metadata(
+        cls, source: Path, destination: Path, *, include_state: bool = True
+    ) -> None:
         if not source.exists():
             return
+        allowed = {"identity.json", "profile.json"}
+        if include_state:
+            allowed.update({"state.json", "max.json"})
         for path in source.rglob("*"):
-            if path.is_file() and path.name in {"state.json", "identity.json", "profile.json", "max.json"}:
+            if path.is_file() and path.name in allowed:
                 cls._copy_file(path, destination / path.relative_to(source))
+
+    @staticmethod
+    def _backup_sqlite_snapshot(source: Path, destination: Path) -> None:
+        """Copy a live SQLite journal consistently, including any WAL pages."""
+        if not source.is_file():
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source_connection = sqlite3.connect(
+            f"file:{source.resolve().as_posix()}?mode=ro", uri=True, timeout=15
+        )
+        target_connection = sqlite3.connect(destination)
+        try:
+            source_connection.backup(target_connection)
+            target_connection.commit()
+        finally:
+            target_connection.close()
+            source_connection.close()
+        try:
+            destination.chmod(0o600)
+        except OSError:
+            pass
 
     def _write_runtime_env(self, staging: Path) -> None:
         lines = []

@@ -37,6 +37,7 @@ class FakeRunner:
         stall_timeout_seconds: int = 0,
         progress_callback=None,
         output_callback=None,
+        quiet_output: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
         self.envs.append(env)
@@ -89,6 +90,54 @@ class FakeRunner:
 
 
 class TDLClientTests(unittest.TestCase):
+    def test_resolve_chat_peer_uses_quiet_json_chat_listing(self):
+        class ChatRunner:
+            def __init__(self):
+                self.call = None
+
+            def run(self, command, **kwargs):
+                self.call = (command, kwargs)
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps([
+                        {"ID": -10012345, "Type": "channel", "Username": "NewsFeed"},
+                        {"ID": 42, "Type": "private", "Username": ""},
+                    ]),
+                    "",
+                )
+
+        runner = ChatRunner()
+        client = TDLClient(Path("/tmp/session"), "user1", runner=runner)
+
+        resolved = client.resolve_chat_peer("https://t.me/c/12345/9")
+
+        self.assertEqual(resolved, {"peer_type": "channel", "peer_id": "-10012345"})
+        command, options = runner.call
+        self.assertEqual(command[-4:], ["chat", "ls", "-o", "json"])
+        self.assertTrue(options["quiet_output"])
+
+    def test_resolve_chat_peer_rejects_ambiguous_or_unknown_alias(self):
+        class ChatRunner:
+            def run(self, command, **kwargs):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    json.dumps([
+                        {"ID": 1, "Type": "channel", "Username": "same_name"},
+                        {"ID": 2, "Type": "channel", "Username": "same_name"},
+                    ]),
+                    "",
+                )
+
+        client = TDLClient(Path("/tmp/session"), "user1", runner=ChatRunner())
+        from tme3bot.tdl import TDLDataError
+
+        with self.assertRaises(TDLDataError):
+            client.resolve_chat_peer("@same_name")
+        with self.assertRaises(TDLDataError):
+            client.resolve_chat_peer("@missing_name")
+
     @unittest.skipIf(os.name == "nt", "SIGSTOP/SIGCONT process groups are Linux worker behavior")
     def test_subprocess_runner_freezes_and_resumes_current_process(self):
         runner = SubprocessRunner()

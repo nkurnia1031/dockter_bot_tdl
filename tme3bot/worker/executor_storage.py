@@ -8,6 +8,7 @@ from pathlib import (
 from tme3bot.progress_reporter import (
     ProgressReporter,
 )
+from tme3bot.tdl import tdl_write_denial_code
 from tme3bot.rclone import (
     RcloneRunner,
 )
@@ -109,7 +110,7 @@ class StorageExecutorMixin:
         upload_item_callback=None,
     ) -> dict[str, Any]:
         payload = command["payload"]
-        storage_profile = self.storage_profile()
+        storage_profile = str(command.get("profile") or self.storage_profile()).strip().lower()
         if storage_profile not in self.profile_manager.list_profiles():
             raise ValueError(
                 f"STORAGE_PROFILE_UNAVAILABLE: profile worker {storage_profile} belum memiliki sesi TDL."
@@ -119,6 +120,18 @@ class StorageExecutorMixin:
             raise ValueError(
                 f"STORAGE_PROFILE_UNAVAILABLE: sesi TDL {storage_profile} belum tersedia."
             )
+        raw_sender_profiles = payload.get("_tdl_sender_profiles")
+        sender_profiles = [
+            str(item).strip().lower()
+            for item in raw_sender_profiles
+            if str(item).strip()
+        ] if isinstance(raw_sender_profiles, list) else []
+        if storage_profile not in sender_profiles:
+            sender_profiles.insert(0, storage_profile)
+        sender_profiles = list(dict.fromkeys(sender_profiles))
+        target_chat = str(payload.get("tdl_access_target") or runtime.config.storage_channel_ref).strip()
+        if not target_chat:
+            raise ValueError("TDL_ACCESS_TARGET_UNAVAILABLE: tujuan TDL Storage tidak tersedia.")
         reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         reporter.report(
             phase="scanning",
@@ -322,25 +335,46 @@ class StorageExecutorMixin:
                             },
                             force=True,
                         )
-                        with self._capture_tdl_progress(
-                            runtime.export_tdl_client, upload_progress
-                        ):
-                            upload_kwargs = {"status_callback": upload_phase}
-                            if last_message_id is not None:
-                                # TDL can finish an upload before it reports the
-                                # channel message ID.  Quick Mode intentionally
-                                # uses the same caption for every file, so the
-                                # delayed resolver must start after the message
-                                # uploaded immediately before this one.
-                                upload_kwargs["resolve_after_id"] = last_message_id
-                            if path.name in photo_names:
-                                upload_kwargs["as_photo"] = True
-                            result = runtime.export_tdl_client.upload(
-                                path,
-                                runtime.config.storage_channel_ref,
-                                caption,
-                                **upload_kwargs,
-                            )
+                        upload_kwargs = {"status_callback": upload_phase}
+                        if last_message_id is not None:
+                            # Do not resolve the previous message until this
+                            # upload was accepted by Telegram.
+                            upload_kwargs["resolve_after_id"] = last_message_id
+                        if path.name in photo_names:
+                            upload_kwargs["as_photo"] = True
+                        result = None
+                        for sender_index, sender_profile in enumerate(sender_profiles):
+                            sender_runtime = self.profile_manager.runtime(sender_profile)
+                            try:
+                                with self._capture_tdl_progress(
+                                    sender_runtime.export_tdl_client, upload_progress
+                                ):
+                                    result = sender_runtime.export_tdl_client.upload(
+                                        path,
+                                        target_chat,
+                                        caption,
+                                        **upload_kwargs,
+                                    )
+                                if sender_profile != storage_profile:
+                                    self._append_job_log(
+                                        f"[Storage] memakai profil pengirim cadangan={sender_profile} setelah penolakan izin eksplisit"
+                                    )
+                                    storage_profile = sender_profile
+                                    runtime = sender_runtime
+                                break
+                            except Exception as send_error:
+                                denial = tdl_write_denial_code(send_error)
+                                if denial and sender_index + 1 < len(sender_profiles):
+                                    self._append_job_log(
+                                        f"[Storage] profil pengirim ditolak={sender_profile} code={denial}; mencoba profil berikutnya"
+                                    )
+                                    continue
+                                code = denial or "TDL_UPLOAD_FAILED"
+                                raise RuntimeError(
+                                    f"{code}: upload Storage tidak berhasil."
+                                ) from None
+                        if result is None:
+                            raise RuntimeError("TDL_WRITE_FORBIDDEN: tidak ada profil yang dapat mengirim.")
                         # Telegram has accepted the file.  Failures while
                         # hashing, publishing progress, or registering the
                         # catalog event must not turn that physical upload

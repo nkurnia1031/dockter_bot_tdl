@@ -500,12 +500,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 status_code=409,
             )
         storage_profile = str(capabilities.get("storage_profile") or getattr(context.config, "worker_storage_profile", "storage"))
-        if purpose == "storage" and capabilities and not bool(capabilities.get("storage_profile_available")):
-            raise DomainError(
-                "STORAGE_PROFILE_UNAVAILABLE",
-                f"Sesi Storage {storage_profile} belum tersedia pada worker {selected_worker}.",
-                status_code=409,
-            )
         if purpose == "export" and quick_mode and (
             not callable(checker) or not bool(capabilities.get("storage_profile_available"))
         ):
@@ -522,7 +516,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             "profile": selected_profile if purpose == "export" else None,
             "worker": selected_worker,
             "worker_health": health,
-            "storage_profile": storage_profile if purpose == "storage" or quick_mode else None,
+            "storage_profile": storage_profile if quick_mode else None,
             "quick_mode": bool(quick_mode),
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -962,6 +956,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         job_dict=job_dict,
         require_internal=require_internal,
         require_service=require_service,
+    )
+
+    from tme3bot.api.routes.tdl_access import register_tdl_access
+    register_tdl_access(
+        app,
+        context,
+        current_actor=current_actor,
+        require_internal=require_internal,
     )
 
 
