@@ -33,8 +33,14 @@ class ProfileSyncContractTests(unittest.TestCase):
         self.profile_registry = ProfileRegistry(
             root / "profile-registry.json", "default"
         )
+        self.actor = Actor(telegram_user_id=9, profile="novel")
         self.worker_sync_requests = []
         self.worker_sync_cancellations = []
+
+        def require_profile(actor, profile):
+            if actor.profile != profile:
+                raise DomainError("PROFILE_FORBIDDEN", "Profil tidak diizinkan.", status_code=403)
+            return profile
 
         def request_profile_sync(worker, *, profile=None, mode="check"):
             self.worker_sync_requests.append((worker, profile, mode))
@@ -55,7 +61,7 @@ class ProfileSyncContractTests(unittest.TestCase):
                 cancel_profile_sync=cancel_profile_sync,
             ),
             operation_service=None,
-            control_plane=SimpleNamespace(require_profile=lambda actor, profile: profile),
+            control_plane=SimpleNamespace(require_profile=require_profile),
         )
         self.app = FastAPI()
 
@@ -66,7 +72,12 @@ class ProfileSyncContractTests(unittest.TestCase):
                 content={"error": {"code": exc.code, "message": exc.message}},
             )
 
-        register_profile_sync(self.app, self.context, require_internal=lambda: None)
+        register_profile_sync(
+            self.app,
+            self.context,
+            require_internal=lambda: None,
+            current_actor=lambda: self.actor,
+        )
         self.secure_client = TestClient(self.app, base_url="https://gateway.example")
         self.bundle = build_profile_bundle({"data/default": b"tdl-session"}, 10001)
         self.provisioning_id = self.store.begin(
@@ -261,6 +272,104 @@ class ProfileSyncContractTests(unittest.TestCase):
         self.assertEqual(cancelled["worker_sync_cancel"], "cancelled")
         self.assertEqual(self.worker_sync_cancellations, [("worker-b", "novel", "check")])
         self.assertFalse(self.store.profile_manifest("worker-b")[0]["sync_requested"])
+
+    def test_worker_sync_events_are_idempotent_and_actor_readable_as_json(self):
+        body = {
+            "profile": "novel",
+            "run_id": "a" * 32,
+            "sequence": 1,
+            "revision": 1,
+            "phase": "bundle_validation",
+            "status": "succeeded",
+            "code": "",
+            "details": {"bundle_bytes": 12, "private_path": "/not-allowed"},
+        }
+        url = "/internal/v1/profile-sync/events"
+        first = self.secure_client.post(url, headers=self.headers("worker-a"), json=body)
+        duplicate = self.secure_client.post(url, headers=self.headers("worker-a"), json=body)
+        self.assertEqual(first.status_code, 200)
+        self.assertFalse(first.json()["duplicate"])
+        self.assertTrue(duplicate.json()["duplicate"])
+        second = self.secure_client.post(
+            url,
+            headers=self.headers("worker-a"),
+            json={**body, "sequence": 2, "phase": "completed", "status": "succeeded"},
+        )
+        self.assertEqual(second.status_code, 200)
+
+        logs_url = "/api/v1/profiles/novel/workers/worker-a/sync-logs?limit=10"
+        logs = self.secure_client.get(logs_url)
+        self.assertEqual(logs.status_code, 200)
+        payload = logs.json()
+        self.assertEqual(len(payload["items"]), 2)
+        self.assertEqual(payload["items"][0]["phase"], "bundle_validation")
+        self.assertEqual(payload["items"][0]["details"], {"bundle_bytes": 12})
+        self.assertEqual(payload["latest_status"], "succeeded")
+        self.assertFalse(payload["active"])
+        after_first = self.secure_client.get(
+            f"/api/v1/profiles/novel/workers/worker-a/sync-logs?after_id={payload['items'][0]['id']}"
+        )
+        self.assertEqual([item["phase"] for item in after_first.json()["items"]], ["completed"])
+        self.actor = Actor(telegram_user_id=10, profile="another-profile")
+        forbidden = self.secure_client.get(logs_url)
+        self.assertEqual(forbidden.status_code, 403)
+
+    def test_worker_sync_event_rejects_unassigned_profile_and_bad_phase(self):
+        base = {
+            "run_id": "b" * 32,
+            "sequence": 1,
+            "revision": 1,
+            "phase": "manifest_fetch",
+            "status": "running",
+        }
+        response = self.secure_client.post(
+            "/internal/v1/profile-sync/events",
+            headers=self.headers("worker-c"),
+            json={**base, "profile": "novel"},
+        )
+        self.assertEqual(response.status_code, 403)
+        invalid = self.secure_client.post(
+            "/internal/v1/profile-sync/events",
+            headers=self.headers("worker-a"),
+            json={**base, "profile": "novel", "phase": "dump-secret"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+
+    def test_stale_sync_failure_is_logged_without_failing_current_revision(self):
+        self.store.update_distribution("novel", "worker-a", "ready", provisioning_id=self.provisioning_id)
+        self.store.update_distribution("novel", "worker-b", "ready", provisioning_id=self.provisioning_id)
+        self.store.mark_active(self.provisioning_id)
+        replacement_id = self.store.begin(
+            profile="novel",
+            actor_user_id=9,
+            bootstrap_worker="worker-a",
+            source="upload",
+            target_workers=["worker-a", "worker-b"],
+        )
+        replacement = build_profile_bundle({"data/default": b"new-revision"}, 10001)
+        self.store.store_bundle(replacement_id, 10001, replacement)
+
+        stale = self.secure_client.post(
+            "/internal/v1/profile-sync/events",
+            headers=self.headers("worker-a"),
+            json={
+                "profile": "novel",
+                "run_id": "c" * 32,
+                "sequence": 1,
+                "revision": 1,
+                "phase": "completed",
+                "status": "failed",
+                "code": "PROFILE_INSTALL_FAILED",
+            },
+        )
+
+        self.assertEqual(stale.status_code, 200)
+        self.assertEqual(self.store.desired_revision("novel")["revision"], 2)
+        distribution = self.store.provisioning(replacement_id)["workers"]
+        self.assertEqual(
+            next(item["status"] for item in distribution if item["worker"] == "worker-a"),
+            "waiting",
+        )
 
     def test_cancel_sync_does_not_stop_worker_needed_by_another_operation(self):
         self.store.request_sync("sync-op-1", 9, "novel", "worker-b", 1)

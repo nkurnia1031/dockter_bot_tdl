@@ -41,6 +41,7 @@ class FakeTransport:
         self.bundles = bundles
         self.bundle_requests = []
         self.acks = []
+        self.sync_events = []
         self.legacy_profiles = []
         self.legacy_discovery_done = threading.Event()
         self.fail = None
@@ -64,6 +65,9 @@ class FakeTransport:
         if path.endswith("/ack"):
             payload = json.loads(data.decode())
             self.acks.append((path, payload))
+            return json.dumps({"accepted": True}).encode(), {}
+        if path == "/internal/v1/profile-sync/events":
+            self.sync_events.append(json.loads(data.decode("utf-8")))
             return json.dumps({"accepted": True}).encode(), {}
         if path == "/internal/v1/profiles/sync":
             payload = json.loads(data.decode())
@@ -157,6 +161,16 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertFalse(client.profile_ready("irang", expected_revision=2))
         with self.assertRaises(ProfileSyncError):
             client.wait_until_ready("irang", expected_revision=2)
+        self.assertEqual(
+            [event["phase"] for event in transport.sync_events],
+            [
+                "manifest_fetch", "revision_compare", "bundle_download", "bundle_download",
+                "bundle_validation", "session_install", "session_validation",
+                "session_commit", "session_commit", "acknowledgement", "completed",
+            ],
+        )
+        self.assertEqual(transport.sync_events[-1]["status"], "succeeded")
+        self.assertTrue(all("bundle" not in event for event in transport.sync_events))
 
     def test_same_revision_check_does_not_reinstall_but_repair_does(self):
         content = bundle_for()
@@ -169,6 +183,11 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertEqual(len(self.installs), 1)
         self.assertEqual(len(transport.bundle_requests), 1)
         self.assertTrue(client.profile_ready("irang"))
+        self.assertTrue(any(
+            event["phase"] == "revision_compare" and event.get("code") == "REVISION_CURRENT"
+            for event in transport.sync_events[11:]
+        ))
+        self.assertFalse(any(event["phase"] == "bundle_download" for event in transport.sync_events[11:]))
 
         client.sync_now(mode="repair", profile="irang")
         self.assertEqual(len(self.installs), 2)
@@ -280,6 +299,18 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertIsNone(client._active_request)
         self.assertEqual(transport.bundle_requests, [])
         self.assertEqual(client._requests.unfinished_tasks, 0)
+
+    def test_cancel_profile_sync_stops_a_scheduled_retry(self):
+        client, _ = self.make_client([], {})
+        key = ("irang", "repair")
+        timer = threading.Timer(60, lambda: None)
+        client._retry_timers[key] = timer
+
+        result = client.cancel_sync(profile="irang", mode="repair")
+
+        self.assertEqual(result["status"], "cancelled")
+        self.assertNotIn(key, client._retry_timers)
+        self.assertNotIn(key, client._retry_attempts)
 
     def test_cancel_active_profile_sync_stops_before_bundle_install(self):
         content = bundle_for()

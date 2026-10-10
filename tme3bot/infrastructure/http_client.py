@@ -212,8 +212,24 @@ class WorkerHttpDispatcher:
         return {"healthy": isinstance(result, dict) and result.get("ok") is True and result.get("role") == "worker"}
 
     def install_profile_bundle(
-        self, worker: str, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str
+        self,
+        worker: str,
+        profile: str,
+        telegram_user_id: int,
+        bundle: bytes,
+        operation_id: str,
+        *,
+        sync_run_id: str = "",
+        revision: int = 0,
     ) -> dict[str, Any]:
+        extra_headers = {
+            "X-Telegram-User-ID": str(int(telegram_user_id)),
+            "X-Provisioning-ID": operation_id,
+        }
+        if sync_run_id:
+            extra_headers["X-Profile-Sync-Run-ID"] = str(sync_run_id)
+        if revision > 0:
+            extra_headers["X-Profile-Sync-Revision"] = str(int(revision))
         data, _ = self._profile_request(
             worker,
             "PUT",
@@ -221,19 +237,25 @@ class WorkerHttpDispatcher:
             bundle,
             content_type="application/zip",
             timeout=180,
-            extra_headers={
-                "X-Telegram-User-ID": str(int(telegram_user_id)),
-                "X-Provisioning-ID": operation_id,
-            },
+            extra_headers=extra_headers,
         )
         return json.loads(data.decode("utf-8")) if data else {"ready": True}
 
-    def commit_profile_bundle(self, worker: str, profile: str, operation_id: str) -> None:
-        self._profile_json(
+    def commit_profile_bundle(
+        self, worker: str, profile: str, operation_id: str, *, sync_run_id: str = "", revision: int = 0
+    ) -> None:
+        payload: dict[str, Any] = {"operation_id": operation_id}
+        if sync_run_id:
+            payload["sync_run_id"] = str(sync_run_id)
+        if revision > 0:
+            payload["revision"] = int(revision)
+        result = self._profile_json(
             worker, "POST",
             f"/internal/v1/profiles/{quote(profile, safe='')}/session/commit",
-            {"operation_id": operation_id},
+            payload,
         )
+        if result.get("committed") is not True:
+            raise RuntimeError("PROFILE_INSTALL_COMMIT_FAILED")
 
     def remove_profile_bundle(self, worker: str, profile: str, operation_id: str) -> None:
         self._profile_json(

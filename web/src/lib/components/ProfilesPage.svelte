@@ -5,12 +5,14 @@
   import { CircleAlert, KeyRound, Plus, RefreshCw, ShieldCheck, Upload, UserRoundPlus, X } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; online: boolean; secure: boolean };
-  type WorkerState = { worker: string; status: string; error?: string };
+  type WorkerState = { worker: string; status: string; error?: string; desired_revision?: number | null; installed_revision?: number | null; installed_sha256?: string; sync_requested?: boolean };
   type Profile = { name: string; active: boolean; status: string; source?: string; vault: boolean; adoptable?: boolean; operation_id?: string; bootstrap_worker?: string; error?: string; workers: WorkerState[] };
   type Operation = { id: string; profile: string; status: string; source: string; bootstrap_worker?: string; error?: string; workers: WorkerState[]; login?: { status: string; step?: string; qr_text?: string; error?: string } };
   type AdoptionCheck = { profile: string; worker: string; ready: boolean; reason_codes: string[]; checks: { name: string; ready: boolean; code?: string }[]; logs_url: string };
   type SyncOperation = { operation_id: string; kind: string; profile: string; status: string; phase: string; target?: { profile?: string; worker?: string; desired_revision?: number }; progress?: Record<string, any>; error?: { code?: string; message?: string } | null; dismissed?: boolean };
   type WorkerProfileSync = { worker: string; status: string; error_code?: string; backend_available: boolean | null; last_checked_at: string; profiles: Record<string, { status: string; error_code: string; desired_revision: number | null; installed_revision: number | null }> };
+  type SyncLog = { id: number; run_id: string; revision: number | null; phase: string; status: string; code: string; details: Record<string, number>; created_at: string };
+  type SyncLogSnapshot = { items: SyncLog[]; next_after_id: number; latest_run_id: string | null; latest_status: string | null; active: boolean };
 
   let profiles = $state<Profile[]>([]);
   let workers = $state<Worker[]>([]);
@@ -35,6 +37,9 @@
   let syncOperationsError = $state('');
   let workerProfileSync = $state<Record<string, WorkerProfileSync | { status: 'unavailable'; error_code: string }>>({});
   let syncActionPending = $state<Record<string, boolean>>({});
+  let syncLogs = $state<Record<string, SyncLogSnapshot & { error?: string }>>({});
+  let syncLogExpanded = $state<Record<string, boolean>>({});
+  const syncLogTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   const availableWorkers = $derived(workers.filter((item) => item.online && item.secure));
   const workerStatus = (value: string) => ({ ready: 'Siap', waiting: 'Menunggu', failed: 'Perlu dicoba ulang' } as Record<string, string>)[value] || value;
@@ -78,16 +83,126 @@
     return syncOperations.find((item) => item.profile === profile && item.target?.worker === targetWorker && syncActiveStatuses.has(item.status));
   }
 
+  function syncLogKey(profile: string, targetWorker: string) {
+    return `${profile}:${targetWorker}`;
+  }
+
+  function syncLogUrl(profile: string, targetWorker: string) {
+    return `/api/v1/profiles/${encodeURIComponent(profile)}/workers/${encodeURIComponent(targetWorker)}/sync-logs?limit=500`;
+  }
+
+  function workerIsOnline(targetWorker: string) {
+    return Boolean(workers.find((item) => item.name === targetWorker)?.online);
+  }
+
+  function stopSyncLogPolling(key: string) {
+    const timer = syncLogTimers.get(key);
+    if (timer) clearTimeout(timer);
+    syncLogTimers.delete(key);
+  }
+
+  function scheduleSyncLogPolling(profile: string, targetWorker: string) {
+    const key = syncLogKey(profile, targetWorker);
+    stopSyncLogPolling(key);
+    if (document.hidden || !workerIsOnline(targetWorker) || !syncLogs[key]?.active) return;
+    syncLogTimers.set(key, setTimeout(() => {
+      void refreshSyncLog(profile, targetWorker, false);
+    }, 2500));
+  }
+
+  async function refreshSyncLog(profile: string, targetWorker: string, expand = true) {
+    const key = syncLogKey(profile, targetWorker);
+    if (expand) syncLogExpanded = { ...syncLogExpanded, [key]: true };
+    const previous = syncLogs[key];
+    const query = new URLSearchParams({ limit: '100' });
+    if (previous?.next_after_id) query.set('after_id', String(previous.next_after_id));
+    try {
+      const result = await api<SyncLogSnapshot>(`${syncLogUrl(profile, targetWorker).split('?')[0]}?${query}`);
+      const items = previous?.next_after_id
+        ? [...previous.items, ...(result.items || [])].slice(-200)
+        : result.items || [];
+      syncLogs = {
+        ...syncLogs,
+        [key]: { ...result, items, error: undefined }
+      };
+      if (result.active && workerIsOnline(targetWorker)) scheduleSyncLogPolling(profile, targetWorker);
+      else stopSyncLogPolling(key);
+    } catch (cause) {
+      syncLogs = {
+        ...syncLogs,
+        [key]: {
+          ...(previous || { items: [], next_after_id: 0, latest_run_id: null, latest_status: null, active: false }),
+          error: cause instanceof Error ? cause.message : 'Log sinkronisasi gagal dimuat.'
+        }
+      };
+      stopSyncLogPolling(key);
+    }
+  }
+
+  async function loadVisibleSyncLogs() {
+    const targets: Array<[string, string]> = [];
+    for (const profile of profiles) {
+      if (!profile.vault) continue;
+      for (const item of profile.workers || []) {
+        const local = workerProfileSync[item.worker];
+        const localProfile = local && 'profiles' in local ? local.profiles[profile.name] : undefined;
+        const active = syncOperationFor(profile.name, item.worker);
+        if (item.status !== 'ready' || localProfile?.status !== 'ready' || active) {
+          const key = syncLogKey(profile.name, item.worker);
+          syncLogExpanded = { ...syncLogExpanded, [key]: true };
+          targets.push([profile.name, item.worker]);
+        }
+      }
+    }
+    await Promise.all(targets.map(([profile, targetWorker]) => refreshSyncLog(profile, targetWorker, false)));
+  }
+
+  function syncPhaseLabel(phase: string) {
+    return ({
+      queued: 'Antrean', manifest_fetch: 'Mengambil manifest', revision_compare: 'Memeriksa revision',
+      bundle_download: 'Mengunduh bundle', bundle_validation: 'Memvalidasi bundle',
+      session_validation: 'Memvalidasi sesi', session_install: 'Memasang sesi',
+      session_commit: 'Commit sesi', acknowledgement: 'Konfirmasi backend',
+      worker_unreachable: 'Worker tidak terjangkau', completed: 'Selesai', cancelled: 'Dibatalkan'
+    } as Record<string, string>)[phase] || phase;
+  }
+
+  function syncLogMessage(item: SyncLog) {
+    if (item.code === 'PROFILE_SYNC_QUEUED') return 'Sinkronisasi revision masuk antrean.';
+    if (item.code === 'WORKER_SYNC_REQUESTED') return 'Perintah sinkronisasi dikirim ke worker.';
+    if (item.code === 'REVISION_CURRENT') return 'Revision sudah cocok; bundle tidak dipasang ulang.';
+    if (item.code === 'WORKER_UNAVAILABLE' || item.code === 'BACKEND_UNAVAILABLE') return 'Worker atau backend belum dapat dijangkau; akan dicoba lagi saat tersedia.';
+    if (item.code === 'PROFILE_SYNC_INSTALLED') return 'Revision sudah terpasang dan dikonfirmasi.';
+    if (item.status === 'failed') return `Tahap gagal (${item.code || 'PROFILE_SYNC_FAILED'}).`;
+    if (item.status === 'waiting') return `Menunggu koneksi (${item.code || 'WORKER_UNAVAILABLE'}).`;
+    if (item.status === 'cancelled') return 'Permintaan sinkronisasi dibatalkan.';
+    return `${syncPhaseLabel(item.phase)}${item.revision ? ` · revision ${item.revision}` : ''}.`;
+  }
+
+  function profileNeedsRepair(profile: string, item: WorkerState) {
+    if (!workerIsOnline(item.worker) || syncOperationFor(profile, item.worker)) return false;
+    if (item.status === 'ready' && item.installed_revision === item.desired_revision) return false;
+    if (syncLogs[syncLogKey(profile, item.worker)]?.active) return false;
+    if (!workers.find((candidate) => candidate.name === item.worker)?.secure) return false;
+    const runtime = workerProfileSync[item.worker];
+    const local = runtime && 'profiles' in runtime ? runtime.profiles[profile] : undefined;
+    if (item.status === 'failed' || Boolean(item.error) || local?.status === 'failed') return true;
+    if (local?.error_code && !['', 'WORKER_OFFLINE', 'BACKEND_UNAVAILABLE'].includes(local.error_code)) return true;
+    if (item.desired_revision && item.installed_revision !== item.desired_revision) return true;
+    return Boolean(local?.desired_revision && local.installed_revision !== local.desired_revision);
+  }
+
   function workerSyncMessage(profile: string, item: WorkerState) {
     const worker = workers.find((candidate) => candidate.name === item.worker);
     const runtime = workerProfileSync[item.worker];
     const local = runtime && 'profiles' in runtime ? runtime.profiles[profile] : undefined;
-    if (item.status === 'ready' && local?.status === 'ready') return `Revision ${local.installed_revision ?? '-'} sudah siap.`;
-    if (!worker?.online || runtime?.error_code === 'WORKER_OFFLINE') return 'Worker offline; profil menunggu worker kembali aktif.';
+    if (item.status === 'ready') return `Revision vault ${item.desired_revision ?? local?.desired_revision ?? '-'} sudah terpasang dan dikonfirmasi.`;
+    if (!worker?.online || runtime?.error_code === 'WORKER_OFFLINE') return 'Worker offline; revision terbaru akan disinkronkan otomatis saat worker kembali online.';
     if (runtime?.status === 'unavailable') return `Diagnosis worker gagal: ${runtime.error_code}.`;
+    if (local?.status === 'ready' && local.installed_revision === item.desired_revision) return `Worker melaporkan revision ${local.installed_revision} siap; backend menunggu konfirmasi distribusi.`;
     if (local?.status === 'waiting_worker' && local.error_code) return `Worker belum dapat menjangkau backend (${local.error_code}).`;
-    if (item.status === 'failed' || local?.error_code) return `Perlu diperiksa: ${item.error || local?.error_code || 'PROFILE_SYNC_FAILED'}.`;
-    if (item.status === 'waiting' || local?.status === 'sync_pending') return 'Worker belum mengonfirmasi sesi. Perbarui status atau coba sinkronkan ulang.';
+    if (item.status === 'failed' || local?.error_code) return `Sinkronisasi perlu dipulihkan: ${item.error || local?.error_code || 'PROFILE_SYNC_FAILED'}.`;
+    if (item.status === 'waiting' || local?.status === 'sync_pending') return `Menunggu revision ${local?.desired_revision ?? '-'} terpasang; lihat log untuk tahap terakhir.`;
     return '';
   }
 
@@ -142,6 +257,7 @@
       }
       if (!worker || !availableWorkers.some((item) => item.name === worker)) worker = availableWorkers[0]?.name || '';
       if (operation?.id) await refreshOperation(operation.id, false);
+      await loadVisibleSyncLogs();
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Data profil gagal dimuat.';
     } finally {
@@ -233,7 +349,7 @@
     catch (cause) { failure = cause instanceof Error ? cause.message : 'Retry distribusi gagal.'; }
   }
 
-  async function startProfileSync(profile: string, targetWorker: string) {
+  async function startProfileSync(profile: string, targetWorker: string, mode: 'check' | 'repair' = 'repair') {
     const key = `${profile}:${targetWorker}`;
     if (syncActionPending[key] || syncOperationFor(profile, targetWorker)) return;
     syncActionPending = { ...syncActionPending, [key]: true };
@@ -242,10 +358,11 @@
       await api<SyncOperation>('/operations', {
         method: 'POST',
         headers: { 'Idempotency-Key': operationKey() },
-        body: JSON.stringify({ kind: 'profile.sync', target: { profile, worker: targetWorker }, input: {} })
+        body: JSON.stringify({ kind: 'profile.sync', target: { profile, worker: targetWorker }, input: { mode } })
       });
-      message = `Pemeriksaan sinkronisasi ${profile} pada ${targetWorker} masuk antrean.`;
+      message = `Pemulihan revision ${profile} pada ${targetWorker} masuk antrean.`;
       await Promise.all([loadSyncOperations(true), loadWorkerSyncStatus(workers)]);
+      await refreshSyncLog(profile, targetWorker, true);
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Permintaan sinkronisasi gagal dibuat.';
     } finally {
@@ -266,7 +383,7 @@
         headers: { 'Idempotency-Key': operationKey() }
       });
       message = `Permintaan pembatalan sinkronisasi ${item.profile} pada ${item.target?.worker || 'worker'} dikirim.`;
-      await loadSyncOperations(true);
+      await Promise.all([loadSyncOperations(true), refreshSyncLog(item.profile, item.target?.worker || '', true)]);
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Operasi sinkronisasi tidak dapat dibatalkan.';
     } finally {
@@ -308,6 +425,25 @@
 
   onMount(() => {
     void load();
+    const onVisibilityChange = () => {
+      if (document.hidden) {
+        for (const key of syncLogTimers.keys()) stopSyncLogPolling(key);
+        return;
+      }
+      for (const profile of profiles) {
+        for (const item of profile.workers || []) {
+          const key = syncLogKey(profile.name, item.worker);
+          if (syncLogs[key]?.active && workerIsOnline(item.worker)) {
+            void refreshSyncLog(profile.name, item.worker, false);
+          }
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      for (const key of syncLogTimers.keys()) stopSyncLogPolling(key);
+    };
   });
 </script>
 
@@ -376,8 +512,49 @@
     <div class="mt-5 space-y-3">
       {#each profiles as profile}
         <article class="rounded-2xl border border-[var(--line)] p-4">
-          <div class="flex flex-wrap items-center justify-between gap-2"><div class="flex items-center gap-2"><h3 class="font-extrabold">{profile.name}</h3><span class="badge">{profileStatus(profile.status)}</span></div>{#if profile.vault && profile.operation_id && (profile.status !== 'active' || profile.workers.some((item) => item.status !== 'ready'))}<button class="button secondary !px-3 !py-2" onclick={() => retryOperation(profile.operation_id!)}><RefreshCw size={14}/>Retry</button>{/if}</div>
-          {#if profile.workers?.length}<div class="mt-3 grid gap-2 sm:grid-cols-2">{#each profile.workers as item}{@const activeSync = syncOperationFor(profile.name, item.worker)}<div class="rounded-lg bg-[var(--panel-strong)] px-3 py-2 text-xs"><div class="flex items-center justify-between gap-2"><span class="font-semibold">{item.worker}</span><span class={item.status === 'ready' ? 'text-emerald-600' : 'text-amber-600'}>{workerStatus(item.status)}</span></div>{#if item.error}<p class="muted mt-1">{item.error}</p>{:else if profile.vault && workerSyncMessage(profile.name, item)}<p class="muted mt-1">{workerSyncMessage(profile.name, item)}</p>{/if}{#if profile.vault}<div class="mt-2 flex flex-wrap items-center justify-between gap-2"><span class="muted">Runtime worker: {workerProfileSync[item.worker]?.status || 'belum diperiksa'}</span><button class="button secondary !px-2 !py-1 text-[11px]" onclick={() => startProfileSync(profile.name, item.worker)} disabled={Boolean(activeSync) || Boolean(syncActionPending[`${profile.name}:${item.worker}`]) || !workers.find((candidate) => candidate.name === item.worker)?.online}>{activeSync ? 'Sinkronisasi berjalan' : syncActionPending[`${profile.name}:${item.worker}`] ? 'Mengirim...' : 'Periksa / sinkronkan'}</button></div>{/if}</div>{/each}</div>{/if}
+          <div class="flex flex-wrap items-center justify-between gap-2"><div class="flex items-center gap-2"><h3 class="font-extrabold">{profile.name}</h3><span class="badge">{profileStatus(profile.status)}</span></div>{#if profile.vault && profile.operation_id && profile.status === 'failed'}<button class="button secondary !px-3 !py-2" onclick={() => retryOperation(profile.operation_id!)}><RefreshCw size={14}/>Retry distribusi</button>{/if}</div>
+          {#if profile.workers?.length}
+            <div class="mt-3 grid gap-2 sm:grid-cols-2">
+              {#each profile.workers as item}
+                {@const activeSync = syncOperationFor(profile.name, item.worker)}
+                {@const logKey = syncLogKey(profile.name, item.worker)}
+                {@const log = syncLogs[logKey]}
+                {@const showRepair = profileNeedsRepair(profile.name, item)}
+                <div class="rounded-lg bg-[var(--panel-strong)] px-3 py-2 text-xs">
+                  <div class="flex items-center justify-between gap-2"><span class="font-semibold">{item.worker}</span><span class={item.status === 'ready' ? 'text-emerald-600' : item.status === 'failed' ? 'text-rose-600' : 'text-amber-600'}>{workerStatus(item.status)}</span></div>
+                  {#if item.error}<p class="muted mt-1">{item.error}</p>{:else if profile.vault && workerSyncMessage(profile.name, item)}<p class="muted mt-1">{workerSyncMessage(profile.name, item)}</p>{/if}
+                  {#if profile.vault}
+                    <div class="mt-2 flex flex-wrap items-center justify-between gap-2">
+                      <span class="muted">Runtime worker: {workerProfileSync[item.worker]?.status || 'belum diperiksa'}</span>
+                      <div class="flex flex-wrap gap-2">
+                        <button class="button secondary !px-2 !py-1 text-[11px]" onclick={() => refreshSyncLog(profile.name, item.worker, !syncLogExpanded[logKey])}>
+                          {syncLogExpanded[logKey] ? 'Muat ulang log' : 'Lihat log'}{log?.active ? ' · berjalan' : ''}
+                        </button>
+                        {#if showRepair}<button class="button secondary !px-2 !py-1 text-[11px]" onclick={() => startProfileSync(profile.name, item.worker, 'repair')} disabled={Boolean(syncActionPending[`${profile.name}:${item.worker}`])}>{syncActionPending[`${profile.name}:${item.worker}`] ? 'Mengirim...' : 'Pulihkan'}</button>{/if}
+                        <a class="button secondary !px-2 !py-1 text-[11px]" href={syncLogUrl(profile.name, item.worker)} target="_blank" rel="noreferrer">Log JSON</a>
+                      </div>
+                    </div>
+                    {#if syncLogExpanded[logKey]}
+                      <div class="mt-3 rounded-lg border border-[var(--line)] bg-[var(--panel)] p-2">
+                        {#if log?.error}<p class="text-rose-600">{log.error}</p>{/if}
+                        {#if log?.items?.length}
+                          <ol class="space-y-2">
+                            {#each log.items as entry (entry.id)}
+                              <li class="flex flex-wrap items-start justify-between gap-2 border-b border-[var(--line)] pb-2 last:border-0 last:pb-0">
+                                <span><b>{syncPhaseLabel(entry.phase)}</b><span class="muted"> · {syncLogMessage(entry)}</span>{#if entry.revision}<span class="muted"> · rev {entry.revision}</span>{/if}</span>
+                                <time class="muted shrink-0" datetime={entry.created_at}>{new Date(entry.created_at).toLocaleString()}</time>
+                              </li>
+                            {/each}
+                          </ol>
+                        {:else if !log?.error}<p class="muted">Belum ada event sinkronisasi. Worker offline tetap akan mencoba revision terbaru saat aktif.</p>{/if}
+                        {#if log?.active && workerIsOnline(item.worker)}<p class="mt-2 text-[11px] text-violet-600">Log diperbarui otomatis selama proses berjalan.</p>{/if}
+                      </div>
+                    {/if}
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          {/if}
           {#if profile.error}<p class="mt-2 text-sm text-rose-600">{profile.error}</p>{/if}
           {#if (profile.status === 'legacy' || (profile.source === 'adoption' && profile.status === 'failed')) && profile.adoptable !== false}
             {#if adopting === profile.name}

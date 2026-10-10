@@ -296,6 +296,7 @@ class ProfileProvisioningStore:
                     profile TEXT NOT NULL,
                     worker TEXT NOT NULL,
                     desired_revision INTEGER NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'check',
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -325,6 +326,27 @@ class ProfileProvisioningStore:
                     ON profile_diagnostic_logs(actor_user_id,category,id DESC);
                 CREATE INDEX IF NOT EXISTS idx_profile_diagnostic_logs_operation
                     ON profile_diagnostic_logs(operation_id,id);
+                CREATE TABLE IF NOT EXISTS profile_sync_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER,
+                    revision INTEGER,
+                    phase TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_profile_sync_logs_target
+                    ON profile_sync_logs(profile,worker,id DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_logs_event
+                    ON profile_sync_logs(worker,run_id,sequence)
+                    WHERE sequence IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_logs_server_event
+                    ON profile_sync_logs(worker,run_id,phase,status,code)
+                    WHERE sequence IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_profile_provisionings_status
                     ON profile_provisionings(status, updated_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sessions_user_id
@@ -355,6 +377,11 @@ class ProfileProvisioningStore:
                     "installed_telegram_user_id": "INTEGER",
                     "sync_requested": "INTEGER NOT NULL DEFAULT 0",
                 },
+            )
+            self._ensure_columns(
+                db,
+                "profile_sync_requests",
+                {"mode": "TEXT NOT NULL DEFAULT 'check'"},
             )
             # Additive migration: make each pre-versioned vault row revision 1.
             legacy_rows = db.execute(
@@ -501,6 +528,105 @@ class ProfileProvisioningStore:
                 (int(actor_user_id), str(category), safe_limit),
             ).fetchall()
         return [self._diagnostic_log_row(row) for row in rows]
+
+    def append_profile_sync_log(
+        self,
+        *,
+        profile: str,
+        worker: str,
+        run_id: str,
+        phase: str,
+        status: str,
+        code: str = "",
+        revision: int | None = None,
+        sequence: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> int | None:
+        safe_details = self._safe_profile_sync_details(details)
+        now = _now()
+        with self._lock, self._db() as db:
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO profile_sync_logs "
+                "(profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(profile)[:48], str(worker)[:48], str(run_id)[:64],
+                    int(sequence) if sequence is not None else None,
+                    int(revision) if revision is not None else None,
+                    re.sub(r"[^a-z0-9_-]", "", str(phase).lower())[:64] or "event",
+                    str(status)[:24],
+                    re.sub(r"[^A-Z0-9_-]", "", str(code).upper())[:64],
+                    json.dumps(safe_details, separators=(",", ":")), now,
+                ),
+            )
+            db.execute(
+                "DELETE FROM profile_sync_logs WHERE id NOT IN "
+                "(SELECT id FROM profile_sync_logs ORDER BY id DESC LIMIT 50000)"
+            )
+            return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def profile_sync_logs(
+        self, profile: str, worker: str, *, after_id: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        safe_limit = min(500, max(1, int(limit)))
+        with self._db() as db:
+            latest = db.execute(
+                "SELECT run_id,status FROM profile_sync_logs "
+                "WHERE profile=? AND worker=? ORDER BY id DESC LIMIT 1",
+                (str(profile), str(worker)),
+            ).fetchone()
+            if int(after_id) <= 0:
+                rows = db.execute(
+                    "SELECT id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
+                    "FROM profile_sync_logs WHERE profile=? AND worker=? ORDER BY id DESC LIMIT ?",
+                    (str(profile), str(worker), safe_limit),
+                ).fetchall()[::-1]
+            else:
+                rows = db.execute(
+                    "SELECT id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
+                    "FROM profile_sync_logs WHERE profile=? AND worker=? AND id>? ORDER BY id LIMIT ?",
+                    (str(profile), str(worker), int(after_id), safe_limit),
+                ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                details = json.loads(str(row["details_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                details = {}
+            items.append({
+                "id": int(row["id"]),
+                "profile": str(row["profile"]),
+                "worker": str(row["worker"]),
+                "run_id": str(row["run_id"]),
+                "sequence": int(row["sequence"]) if row["sequence"] is not None else None,
+                "revision": int(row["revision"]) if row["revision"] is not None else None,
+                "phase": str(row["phase"]),
+                "status": str(row["status"]),
+                "code": str(row["code"]),
+                "details": details if isinstance(details, dict) else {},
+                "created_at": str(row["created_at"]),
+            })
+        last_id = items[-1]["id"] if items else max(0, int(after_id))
+        latest_status = str(latest["status"]) if latest else ""
+        return {
+            "items": items,
+            "next_after_id": last_id,
+            "latest_run_id": str(latest["run_id"]) if latest else None,
+            "latest_status": latest_status or None,
+            "active": latest_status in {"queued", "running"},
+        }
+
+    @staticmethod
+    def _safe_profile_sync_details(details: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(details, dict):
+            return {}
+        allowed = {"desired_revision", "installed_revision", "bundle_bytes", "entry_count", "attempt"}
+        result: dict[str, Any] = {}
+        for key in allowed:
+            value = details.get(key)
+            if type(value) is int:
+                result[key] = max(0, min(2**31 - 1, value))
+        return result
 
     def operation_accepts_bundle(self, operation_id: str) -> bool:
         with self._db() as db:
@@ -854,7 +980,10 @@ class ProfileProvisioningStore:
             ).fetchone()
         return str(row[0]) if row and row[0] else None
 
-    def request_sync(self, operation_id: str, actor_user_id: int, profile: str, worker: str, revision: int) -> None:
+    def request_sync(
+        self, operation_id: str, actor_user_id: int, profile: str, worker: str,
+        revision: int, mode: str = "check",
+    ) -> None:
         now = _now()
         with self._lock, self._db() as db:
             current = db.execute(
@@ -869,9 +998,9 @@ class ProfileProvisioningStore:
             if assigned is None:
                 raise KeyError(worker)
             db.execute(
-                "INSERT INTO profile_sync_requests(operation_id,actor_user_id,profile,worker,desired_revision,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,'pending',?,?) ON CONFLICT(operation_id) DO UPDATE SET desired_revision=excluded.desired_revision,status='pending',updated_at=excluded.updated_at",
-                (str(operation_id), int(actor_user_id), str(profile), str(worker), int(revision), now, now),
+                "INSERT INTO profile_sync_requests(operation_id,actor_user_id,profile,worker,desired_revision,mode,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,'pending',?,?) ON CONFLICT(operation_id) DO UPDATE SET desired_revision=excluded.desired_revision,mode=excluded.mode,status='pending',updated_at=excluded.updated_at",
+                (str(operation_id), int(actor_user_id), str(profile), str(worker), int(revision), str(mode), now, now),
             )
             db.execute(
                 "UPDATE profile_distributions SET desired_revision=?, "
@@ -883,7 +1012,7 @@ class ProfileProvisioningStore:
     def cancel_sync_request(self, operation_id: str) -> dict[str, Any] | None:
         with self._lock, self._db() as db:
             request = db.execute(
-                "SELECT profile,worker,desired_revision,status FROM profile_sync_requests WHERE operation_id=?",
+                "SELECT profile,worker,desired_revision,mode,status FROM profile_sync_requests WHERE operation_id=?",
                 (str(operation_id),),
             ).fetchone()
             if request is None or str(request["status"]) != "pending":
@@ -905,6 +1034,7 @@ class ProfileProvisioningStore:
                 "profile": str(request["profile"]),
                 "worker": str(request["worker"]),
                 "desired_revision": int(request["desired_revision"]),
+                "mode": str(request["mode"]),
             }
 
     def finish_sync_requests(self, profile: str, worker: str, revision: int, status: str) -> list[dict[str, Any]]:
@@ -926,7 +1056,7 @@ class ProfileProvisioningStore:
             ]
 
     def sync_requests(self, profile: str, worker: str, revision: int | None = None) -> list[dict[str, Any]]:
-        query = "SELECT operation_id,actor_user_id,desired_revision FROM profile_sync_requests WHERE profile=? AND worker=? AND status='pending'"
+        query = "SELECT operation_id,actor_user_id,desired_revision,mode FROM profile_sync_requests WHERE profile=? AND worker=? AND status='pending'"
         values: list[Any] = [str(profile), str(worker)]
         if revision is not None:
             query += " AND desired_revision=?"
@@ -934,7 +1064,7 @@ class ProfileProvisioningStore:
         with self._db() as db:
             rows = db.execute(query + " ORDER BY created_at", values).fetchall()
         return [
-            {"operation_id": str(row["operation_id"]), "actor_user_id": int(row["actor_user_id"]), "desired_revision": int(row["desired_revision"])}
+            {"operation_id": str(row["operation_id"]), "actor_user_id": int(row["actor_user_id"]), "desired_revision": int(row["desired_revision"]), "mode": str(row["mode"])}
             for row in rows
         ]
 
@@ -1426,10 +1556,20 @@ class ProfileProvisioningService:
             if pair is None:
                 continue
             user_id, bundle = pair
+            desired = self.store.desired_revision(profile)
+            if desired is None:
+                continue
+            revision = int(desired["revision"])
+            sync_run_id = uuid.uuid4().hex
             worker_record = self.worker_registry.get(worker)
             if worker_record is not None and not profile_transfer_is_secure(
                 str(worker_record.get("url") or "")
             ):
+                self.store.append_profile_sync_log(
+                    profile=profile, worker=worker, run_id=sync_run_id,
+                    revision=revision, phase="worker_unreachable", status="failed",
+                    code="PROFILE_TRANSFER_REQUIRES_HTTPS",
+                )
                 self.store.update_distribution(
                     profile,
                     worker,
@@ -1439,8 +1579,20 @@ class ProfileProvisioningService:
                 )
                 continue
             try:
+                self.store.append_profile_sync_log(
+                    profile=profile, worker=worker, run_id=sync_run_id,
+                    revision=revision, phase="queued", status="queued",
+                    code="PROFILE_SYNC_QUEUED",
+                    details={"desired_revision": revision},
+                )
                 installed = self.dispatcher.install_profile_bundle(
-                    worker, profile, user_id, bundle, operation_id or ""
+                    worker,
+                    profile,
+                    user_id,
+                    bundle,
+                    operation_id or f"sync-{sync_run_id}",
+                    sync_run_id=sync_run_id,
+                    revision=revision,
                 )
                 if not isinstance(installed, dict) or not installed.get("ready"):
                     raise RuntimeError("Worker tidak mengonfirmasi sesi siap.")
@@ -1458,15 +1610,43 @@ class ProfileProvisioningService:
                         profile, worker, int(desired["revision"]), succeeded=True
                     )
                 if not operation_id:
-                    self.dispatcher.commit_profile_bundle(worker, profile, "sync-" + profile)
+                    self.dispatcher.commit_profile_bundle(
+                        worker, profile, f"sync-{sync_run_id}",
+                        sync_run_id=sync_run_id, revision=revision,
+                    )
+                    self.store.append_profile_sync_log(
+                        profile=profile, worker=worker, run_id=sync_run_id,
+                        revision=revision, phase="completed", status="succeeded",
+                        code="PROFILE_SYNC_INSTALLED",
+                    )
                 else:
                     current_operation = self.store.provisioning(operation_id)
                     if current_operation and current_operation["status"] == "active":
                         # An explicit retry of an already-active profile only
                         # refreshes the affected worker. Commit its replacement
                         # immediately so the previous session backup is removed.
-                        self.dispatcher.commit_profile_bundle(worker, profile, operation_id)
-            except Exception:
+                        self.dispatcher.commit_profile_bundle(
+                            worker, profile, operation_id,
+                            sync_run_id=sync_run_id, revision=revision,
+                        )
+                        self.store.append_profile_sync_log(
+                            profile=profile, worker=worker, run_id=sync_run_id,
+                            revision=revision, phase="completed", status="succeeded",
+                            code="PROFILE_SYNC_INSTALLED",
+                        )
+            except Exception as exc:
+                raw_code = getattr(exc, "code", "WORKER_UNAVAILABLE")
+                payload = getattr(exc, "payload", None)
+                if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+                    raw_code = payload["error"].get("code") or raw_code
+                if str(exc).startswith("PROFILE_"):
+                    raw_code = str(exc)
+                sync_code = re.sub(r"[^A-Z0-9_-]", "", str(raw_code).upper())[:64] or "WORKER_UNAVAILABLE"
+                self.store.append_profile_sync_log(
+                    profile=profile, worker=worker, run_id=sync_run_id,
+                    revision=revision, phase="worker_unreachable", status="waiting",
+                    code=sync_code,
+                )
                 current = self.store.provisioning(operation_id) if operation_id else None
                 previous = next(
                     (item for item in current["workers"] if item["worker"] == worker),
@@ -1496,11 +1676,48 @@ class ProfileProvisioningService:
                     with self._lock:
                         self.profile_manager.profile_registry.register_vaulted(profile_name, user_id)
                     for item in info["workers"]:
+                        commit_run_id = uuid.uuid4().hex
+                        current_revision = self.store.desired_revision(profile_name)
+                        revision_value = int(current_revision["revision"]) if current_revision else 0
+                        self.store.append_profile_sync_log(
+                            profile=profile_name,
+                            worker=str(item["worker"]),
+                            run_id=commit_run_id,
+                            revision=revision_value or None,
+                            phase="session_commit",
+                            status="queued",
+                            code="PROFILE_COMMIT_QUEUED",
+                        )
                         try:
                             self.dispatcher.commit_profile_bundle(
-                                item["worker"], profile_name, operation_id
+                                item["worker"],
+                                profile_name,
+                                operation_id,
+                                **(
+                                    {"sync_run_id": commit_run_id, "revision": revision_value}
+                                    if revision_value > 0
+                                    else {}
+                                ),
+                            )
+                            self.store.append_profile_sync_log(
+                                profile=profile_name,
+                                worker=str(item["worker"]),
+                                run_id=commit_run_id,
+                                revision=revision_value or None,
+                                phase="completed",
+                                status="succeeded",
+                                code="PROFILE_SYNC_INSTALLED",
                             )
                         except Exception:
+                            self.store.append_profile_sync_log(
+                                profile=profile_name,
+                                worker=str(item["worker"]),
+                                run_id=commit_run_id,
+                                revision=revision_value or None,
+                                phase="session_commit",
+                                status="failed",
+                                code="PROFILE_INSTALL_COMMIT_FAILED",
+                            )
                             # Installation was already confirmed. A later
                             # idempotent sync can clean up a stale backup.
                             pass

@@ -1210,7 +1210,12 @@ def _add_internal_state_routes(
 ):
     from tme3bot.api.routes.profile_sync import register_profile_sync
 
-    register_profile_sync(app, context, require_internal=require_internal)
+    register_profile_sync(
+        app,
+        context,
+        require_internal=require_internal,
+        current_actor=current_actor,
+    )
 
     cursor_service = None
     if context.source_repository is not None:

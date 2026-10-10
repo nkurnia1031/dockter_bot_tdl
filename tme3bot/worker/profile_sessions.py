@@ -15,7 +15,7 @@ import time
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 try:
     import pty
@@ -213,7 +213,15 @@ class ProfileSessionManager:
             self._chown_user1(directory)
             return self._whoami(session_root)
 
-    def install_bundle(self, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str) -> dict[str, Any]:
+    def install_bundle(
+        self,
+        profile: str,
+        telegram_user_id: int,
+        bundle: bytes,
+        operation_id: str,
+        *,
+        on_stage: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         normalized = normalize_profile_name(profile)
         if not normalized:
             raise ValueError("Nama profil tidak valid.")
@@ -236,6 +244,8 @@ class ProfileSessionManager:
                 raise ValueError("Identity bundle profil tidak valid.") from exc
             if stored_id != expected_identity:
                 raise ValueError("Identity bundle tidak cocok dengan profil.")
+        if on_stage:
+            on_stage("bundle_validation")
 
         operation_id = self._valid_operation_id(operation_id or "sync-" + normalized)
         # Keep staging and rollback data beside profile files on the same
@@ -325,6 +335,8 @@ class ProfileSessionManager:
             except OSError:
                 pass
             self._chown_user1(profile_root / "user1")
+            if on_stage:
+                on_stage("session_validation")
             return {"profile": normalized, "ready": True}
         except Exception:
             shutil.rmtree(stage_root, ignore_errors=True)

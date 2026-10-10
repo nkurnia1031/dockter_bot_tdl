@@ -311,23 +311,90 @@ class WorkerJobExecutor(
         return self._profile_sessions.cancel(operation_id)
 
     def install_profile_bundle(
-        self, profile: str, telegram_user_id: int, bundle: bytes, operation_id: str
+        self,
+        profile: str,
+        telegram_user_id: int,
+        bundle: bytes,
+        operation_id: str,
+        *,
+        sync_run_id: str = "",
+        sync_revision: int = 0,
     ) -> dict[str, Any]:
         runtime = self.profile_manager.runtime(profile)
+        sequence = 0
+
+        def report(phase: str, status: str, code: str = "") -> None:
+            nonlocal sequence
+            if not sync_run_id or sync_revision < 1:
+                return
+            sequence += 1
+            try:
+                self.profile_sync.report_external_event(
+                    run_id=sync_run_id,
+                    sequence=sequence,
+                    profile=profile,
+                    revision=sync_revision,
+                    phase=phase,
+                    status=status,
+                    code=code,
+                )
+            except Exception:
+                LOGGER.debug("Could not report profile bundle install progress")
+
         # Wait for current TDL commands to release their session locks and keep
         # new commands out until the replacement has completed.
-        with runtime.export_operation_lock:
-            with runtime.download_operation_lock:
-                result = self._profile_sessions.install_bundle(
-                    profile, telegram_user_id, bundle, operation_id
-                )
-                refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
-                if callable(refresh):
-                    refresh(profile)
-                return result
+        report("session_install", "running")
+        try:
+            with runtime.export_operation_lock:
+                with runtime.download_operation_lock:
+                    stage_callback = None
+                    if sync_run_id:
+                        stage_callback = lambda phase: report(phase, "succeeded")
+                    result = self._profile_sessions.install_bundle(
+                        profile,
+                        telegram_user_id,
+                        bundle,
+                        operation_id,
+                        **({"on_stage": stage_callback} if stage_callback else {}),
+                    )
+                    refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
+                    if callable(refresh):
+                        refresh(profile)
+            report("session_install", "succeeded")
+            return result
+        except Exception as exc:
+            code = re.sub(r"[^A-Z0-9_-]", "", str(getattr(exc, "code", "PROFILE_INSTALL_FAILED")).upper())[:64]
+            report("session_install", "failed", code or "PROFILE_INSTALL_FAILED")
+            raise
 
-    def commit_profile_bundle(self, profile: str, operation_id: str) -> bool:
-        return self._profile_sessions.commit_bundle(profile, operation_id)
+    def commit_profile_bundle(
+        self,
+        profile: str,
+        operation_id: str,
+        *,
+        sync_run_id: str = "",
+        sync_revision: int = 0,
+    ) -> bool:
+        def report(sequence: int, status: str, code: str = "") -> None:
+            if not sync_run_id or sync_revision < 1:
+                return
+            try:
+                self.profile_sync.report_external_event(
+                    run_id=sync_run_id,
+                    sequence=sequence,
+                    profile=profile,
+                    revision=sync_revision,
+                    phase="session_commit",
+                    status=status,
+                    code=code,
+                )
+            except Exception:
+                LOGGER.debug("Could not report profile bundle commit progress")
+
+        report(5, "running")
+        committed = self._profile_sessions.commit_bundle(profile, operation_id)
+        report(6, "succeeded" if committed else "failed", "" if committed else "PROFILE_INSTALL_COMMIT_FAILED")
+        return committed
 
     def rollback_profile_bundle(self, profile: str, operation_id: str) -> bool:
         runtime = self.profile_manager.runtime(profile)

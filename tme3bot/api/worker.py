@@ -326,13 +326,22 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         request: Request,
         telegram_user_id: int = Header(alias="X-Telegram-User-ID"),
         provisioning_id: str = Header(default="", alias="X-Provisioning-ID"),
+        sync_run_id: str = Header(default="", alias="X-Profile-Sync-Run-ID"),
+        sync_revision: int = Header(default=0, alias="X-Profile-Sync-Revision"),
     ):
         data = await request.body()
         if len(data) > MAX_PROFILE_BUNDLE_BYTES:
             raise DomainError("PROFILE_ARCHIVE_TOO_LARGE", "Bundle profil melebihi batas.", status_code=413)
+        sync_kwargs = {}
+        if sync_run_id and sync_revision > 0:
+            sync_kwargs = {"sync_run_id": sync_run_id, "sync_revision": sync_revision}
         return profile_operation(
             lambda: context.executor.install_profile_bundle(
-                profile, telegram_user_id, data, provisioning_id
+                profile,
+                telegram_user_id,
+                data,
+                provisioning_id,
+                **sync_kwargs,
             ),
             "PROFILE_INSTALL_FAILED",
             "Worker tidak dapat memasang sesi profil.",
@@ -398,7 +407,19 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
 
     @app.post("/internal/v1/profiles/{profile}/session/commit", dependencies=[Depends(authorize)])
     def commit_profile_bundle(profile: str, body: dict[str, Any]):
-        return {"committed": context.executor.commit_profile_bundle(profile, str(body.get("operation_id") or ""))}
+        sync_kwargs = {}
+        if body.get("sync_run_id") and type(body.get("revision")) is int and body.get("revision", 0) > 0:
+            sync_kwargs = {
+                "sync_run_id": str(body["sync_run_id"]),
+                "sync_revision": int(body["revision"]),
+            }
+        return {
+            "committed": context.executor.commit_profile_bundle(
+                profile,
+                str(body.get("operation_id") or ""),
+                **sync_kwargs,
+            )
+        }
 
     @app.delete("/internal/v1/profiles/{profile}/session", dependencies=[Depends(authorize)])
     def rollback_profile_bundle(profile: str, operation_id: str = Query(..., min_length=1, max_length=64)):

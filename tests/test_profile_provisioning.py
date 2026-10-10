@@ -87,6 +87,7 @@ class FakeProfileDispatcher:
         self.online = {"local"}
         self.installed = {}
         self.committed = []
+        self.profile_sync_contexts = []
         self.login_state_value = {"status": "waiting_input", "step": "qr", "qr_text": "qr-test"}
         self.login_bundle_downloads = []
         self.profile_diagnostic_result = {
@@ -118,13 +119,14 @@ class FakeProfileDispatcher:
     def profile_export_diagnostics(self, worker, profile):
         return dict(self.profile_diagnostic_result)
 
-    def install_profile_bundle(self, worker, profile, user_id, bundle, operation_id):
+    def install_profile_bundle(self, worker, profile, user_id, bundle, operation_id, **sync_context):
+        self.profile_sync_contexts.append((worker, profile, dict(sync_context)))
         if worker not in self.online:
             raise RuntimeError("worker offline")
         self.installed[(profile, worker)] = (user_id, bundle, operation_id)
         return {"ready": True}
 
-    def commit_profile_bundle(self, worker, profile, operation_id):
+    def commit_profile_bundle(self, worker, profile, operation_id, **sync_context):
         self.committed.append((worker, profile, operation_id))
 
     def cancel_profile_login(self, worker, operation_id):
@@ -668,12 +670,22 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertNotIn("novel", manager.list_profiles())
             self.assertTrue(service.worker_ready("novel", "local"))
             self.assertFalse(service.worker_ready("novel", "remote-offline"))
+            offline_logs = store.profile_sync_logs("novel", "remote-offline")
+            self.assertEqual(offline_logs["latest_status"], "waiting")
+            self.assertEqual(offline_logs["items"][-1]["phase"], "worker_unreachable")
+            self.assertEqual(offline_logs["items"][-1]["code"], "WORKER_UNAVAILABLE")
+            local_context = next(item[2] for item in dispatcher.profile_sync_contexts if item[0] == "local")
+            self.assertEqual(local_context["revision"], 1)
+            self.assertRegex(local_context["sync_run_id"], r"^[a-f0-9]{32}$")
 
             dispatcher.online.add("remote-offline")
             service.process_once()
             self.assertIn("novel", manager.list_profiles())
             self.assertTrue(service.worker_ready("novel", "local"))
             self.assertTrue(service.worker_ready("novel", "remote-offline"))
+            remote_logs = store.profile_sync_logs("novel", "remote-offline")
+            self.assertEqual(remote_logs["latest_status"], "succeeded")
+            self.assertEqual(remote_logs["items"][-1]["code"], "PROFILE_SYNC_INSTALLED")
 
             workers.add("future-worker")
             dispatcher.online.add("future-worker")

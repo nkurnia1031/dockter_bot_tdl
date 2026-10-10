@@ -24,6 +24,8 @@ class FakeExecutor:
         self.previous_worker_api_token = ""
         self.profile_inputs = []
         self.profile_installs = []
+        self.profile_sync_contexts = []
+        self.profile_sync_commits = []
         self.profile_sync_requests = []
         self.profile_sync_cancellations = []
         self.profile_sync_snapshot = {"status": "ready", "backend_available": True, "profiles": {}}
@@ -195,14 +197,16 @@ class FakeExecutor:
     def cancel_profile_login(self, operation_id):
         return True
 
-    def install_profile_bundle(self, profile, telegram_user_id, bundle, operation_id):
+    def install_profile_bundle(self, profile, telegram_user_id, bundle, operation_id, **sync_context):
         self.profile_installs.append((profile, telegram_user_id, bundle, operation_id))
+        self.profile_sync_contexts.append(dict(sync_context))
         return {"profile": profile, "ready": True}
 
     def export_profile_bundle(self, profile):
         return 123, b"profile-bundle"
 
-    def commit_profile_bundle(self, profile, operation_id):
+    def commit_profile_bundle(self, profile, operation_id, **sync_context):
+        self.profile_sync_commits.append(dict(sync_context))
         return True
 
     def rollback_profile_bundle(self, profile, operation_id):
@@ -603,11 +607,25 @@ class WorkerApiTests(unittest.TestCase):
 
         installed = self.client.put(
             "/internal/v1/profiles/novel/session",
-            headers={**headers, "X-Telegram-User-ID": "123", "X-Provisioning-ID": "op-1"},
+            headers={
+                **headers,
+                "X-Telegram-User-ID": "123",
+                "X-Provisioning-ID": "op-1",
+                "X-Profile-Sync-Run-ID": "a" * 32,
+                "X-Profile-Sync-Revision": "7",
+            },
             content=b"profile-bundle",
         )
         self.assertEqual(installed.status_code, 200)
         self.assertEqual(self.executor.profile_installs[-1][0:2], ("novel", 123))
+        self.assertEqual(self.executor.profile_sync_contexts[-1], {"sync_run_id": "a" * 32, "sync_revision": 7})
+        committed = self.client.post(
+            "/internal/v1/profiles/novel/session/commit",
+            headers=headers,
+            json={"operation_id": "op-1", "sync_run_id": "a" * 32, "revision": 7},
+        )
+        self.assertEqual(committed.status_code, 200)
+        self.assertEqual(self.executor.profile_sync_commits[-1], {"sync_run_id": "a" * 32, "sync_revision": 7})
 
     def test_profile_export_diagnostics_requires_worker_token_and_never_returns_paths(self):
         denied = self.client.get("/internal/v1/profiles/default/session/diagnostics")
