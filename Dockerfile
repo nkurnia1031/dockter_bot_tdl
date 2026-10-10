@@ -13,8 +13,12 @@ RUN python3 -m pip install --no-cache-dir -r /tmp/tme3bot-requirements.txt \
 # Copy application source after dependency installation so source-only updates
 # preserve the expensive dependency layers in the gateway and worker images.
 FROM runtime-base AS gateway
+COPY requirements-verifier.txt /tmp/requirements-verifier.txt
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements-verifier.txt \
+    && rm -f /tmp/requirements-verifier.txt
 COPY bot.py /app/bot.py
 COPY pkg_resources.py /app/pkg_resources.py
+COPY tools/verify_profile_backup.py /app/tools/verify_profile_backup.py
 COPY tme3bot /app/tme3bot
 COPY utility /app/utility
 CMD ["python3", "/app/bot.py"]

@@ -117,6 +117,7 @@ class ProfileManager:
         self._worker_routes: dict[str, str] | None = None
         self._lock = threading.RLock()
         self._runtimes: dict[str, ProfileRuntime] = {}
+        self._operation_locks: dict[str, tuple[threading.RLock, threading.RLock]] = {}
         self.source_repository = source_repository
         self.source_state_store_factory = source_state_store_factory
         self._state_stores: dict[str, ProfileStateStore] = {}
@@ -294,17 +295,8 @@ class ProfileManager:
     def runtime(self, profile_name: str) -> ProfileRuntime:
         normalized = normalize_profile_name(profile_name) or self.default_profile
         with self._lock:
-            profile_config = build_profile_config(self.base_config, normalized)
-            export_storage = self.export_tdl_storage_path(normalized)
-            if Path(profile_config.tdl_export_storage).resolve() != export_storage.resolve():
-                # Older add-profile output could place a default profile under
-                # PROFILES_ROOT. Point the TDL client at that initialized
-                # session instead of creating an empty canonical directory.
-                profile_config = replace(
-                    profile_config,
-                    tdl_export_storage=export_storage,
-                    tdl_export_home=export_storage.parent,
-                )
+            profile_config = self.session_config(normalized)
+            export_storage = Path(profile_config.tdl_export_storage)
             profile_state_store = self.state_store(normalized)
             runtime = self._runtimes.get(normalized)
             if (
@@ -316,10 +308,40 @@ class ProfileManager:
                 return runtime
             ensure_profile_runtime_dirs(profile_config)
             runtime = build_profile_runtime(
-                normalized, profile_config, state_store=profile_state_store
+                normalized,
+                profile_config,
+                state_store=profile_state_store,
+                operation_locks=self.profile_operation_locks(normalized),
             )
             self._runtimes[normalized] = runtime
             return runtime
+
+    def profile_operation_locks(
+        self, profile_name: str
+    ) -> tuple[threading.RLock, threading.RLock]:
+        """Return stable locks shared by every runtime and diagnostic for a profile."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        with self._lock:
+            locks = self._operation_locks.get(normalized)
+            if locks is None:
+                locks = (threading.RLock(), threading.RLock())
+                self._operation_locks[normalized] = locks
+            return locks
+
+    def session_config(self, profile_name: str) -> AppConfig:
+        """Resolve the actual TDL session paths without loading state or creating files."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        profile_config = build_profile_config(self.base_config, normalized)
+        export_storage = self.export_tdl_storage_path(normalized)
+        if Path(profile_config.tdl_export_storage).resolve() != export_storage.resolve():
+            # Older add-profile output could place a default profile under
+            # PROFILES_ROOT. Point TDL operations at that initialized session.
+            profile_config = replace(
+                profile_config,
+                tdl_export_storage=export_storage,
+                tdl_export_home=export_storage.parent,
+            )
+        return profile_config
 
     def cached_runtime(self, profile_name: str) -> ProfileRuntime | None:
         """Return an already initialized runtime without creating profile files."""
@@ -336,14 +358,8 @@ class ProfileManager:
             runtime = self._runtimes.get(normalized)
             if runtime is None:
                 return
-            profile_config = build_profile_config(self.base_config, normalized)
-            export_storage = self.export_tdl_storage_path(normalized)
-            if Path(profile_config.tdl_export_storage).resolve() != export_storage.resolve():
-                profile_config = replace(
-                    profile_config,
-                    tdl_export_storage=export_storage,
-                    tdl_export_home=export_storage.parent,
-                )
+            profile_config = self.session_config(normalized)
+            export_storage = Path(profile_config.tdl_export_storage)
             runtime.config = profile_config
             runtime.export_tdl_client.storage_root = export_storage
             runtime.export_tdl_client.home = export_storage.parent
@@ -501,6 +517,7 @@ def build_profile_runtime(
     config: AppConfig,
     *,
     state_store: ProfileStateStore | None = None,
+    operation_locks: tuple[threading.RLock, threading.RLock] | None = None,
 ) -> ProfileRuntime:
     if state_store is None and config.app_role == "worker":
         # Workers must use the gateway API.  A local state.json here would
@@ -538,6 +555,7 @@ def build_profile_runtime(
         config, state_store, download_tdl_client, progress_tracker=download_progress
     )
     leave_service = LeaveService(config)
+    locks = operation_locks or (threading.RLock(), threading.RLock())
     return ProfileRuntime(
         name=profile_name,
         config=config,
@@ -548,8 +566,8 @@ def build_profile_runtime(
         export_service=export_service,
         download_service=download_service,
         leave_service=leave_service,
-        export_operation_lock=threading.RLock(),
-        download_operation_lock=threading.RLock(),
+        export_operation_lock=locks[0],
+        download_operation_lock=locks[1],
     )
 
 

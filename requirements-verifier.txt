@@ -1,0 +1,2 @@
+# Optional local operator tool; kept out of worker/Telegram runtime images.
+py7zr>=1.1,<2

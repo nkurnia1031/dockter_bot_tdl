@@ -445,6 +445,47 @@ class WorkerJobExecutor(
                 download_lock.release()
             export_lock.release()
 
+    def diagnose_profile_tdl(self, profile: str) -> dict[str, Any]:
+        """Open each configured TDL session read-only under its normal profile locks."""
+        locks_method = getattr(self.profile_manager, "profile_operation_locks", None)
+        config_method = getattr(self.profile_manager, "session_config", None)
+        if not callable(locks_method) or not callable(config_method):
+            return {
+                "ready": False,
+                "identity_match": False,
+                "reason_codes": ["WORKER_UPDATE_REQUIRED"],
+                "sessions": [
+                    {"name": name, "ready": False, "code": "WORKER_UPDATE_REQUIRED", "identity_matches_metadata": False}
+                    for name in ("root", "user1")
+                ],
+            }
+        export_lock, download_lock = locks_method(profile)
+        if not export_lock.acquire(blocking=False):
+            return self._profile_tdl_busy_result()
+        download_acquired = False
+        try:
+            download_acquired = download_lock.acquire(blocking=False)
+            if not download_acquired:
+                return self._profile_tdl_busy_result()
+            profile_config = config_method(profile)
+            return self._profile_sessions.diagnose_tdl_sessions(profile, profile_config)
+        finally:
+            if download_acquired:
+                download_lock.release()
+            export_lock.release()
+
+    @staticmethod
+    def _profile_tdl_busy_result() -> dict[str, Any]:
+        return {
+            "ready": False,
+            "identity_match": False,
+            "reason_codes": ["PROFILE_SESSION_BUSY"],
+            "sessions": [
+                {"name": name, "ready": False, "code": "PROFILE_SESSION_BUSY", "identity_matches_metadata": False}
+                for name in ("root", "user1")
+            ],
+        }
+
     def enqueue(self, command: dict[str, Any]) -> int:
         job_id = str(command["job_id"])
         worker = str(command.get("worker") or self.config.backup_node_name).strip()

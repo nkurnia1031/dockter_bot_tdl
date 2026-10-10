@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, Path as ApiPath, Query, Request, Response
@@ -19,7 +21,9 @@ from tme3bot.domain.worker_contract import (
     CAP_TTS,
     worker_contract_metadata,
 )
+from tme3bot.profile_diagnostics import PROFILE_TDL_DIAGNOSTIC_CODES
 from tme3bot.profile_provisioning import MAX_PROFILE_BUNDLE_BYTES, MAX_SESSION_ARCHIVE_BYTES
+from tme3bot.names import normalize_profile_name
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -404,6 +408,65 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 status_code=503,
             )
         return result
+
+    @app.get("/internal/v1/profiles/{profile}/tdl-diagnostics", dependencies=[Depends(authorize)])
+    def diagnose_profile_tdl(profile: str):
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            raise DomainError("PROFILE_NAME_INVALID", "Nama profil tidak valid.", status_code=422)
+        diagnose = getattr(context.executor, "diagnose_profile_tdl", None)
+        if not callable(diagnose):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung diagnosis TDL.",
+                status_code=404,
+            )
+        try:
+            result = diagnose(normalized)
+        except Exception:
+            LOGGER.warning("Worker TDL profile diagnosis failed")
+            raise DomainError(
+                "PROFILE_TDL_DIAGNOSTICS_FAILED",
+                "Worker tidak dapat memeriksa sesi TDL.",
+                status_code=503,
+            ) from None
+        if not isinstance(result, dict):
+            raise DomainError(
+                "PROFILE_TDL_DIAGNOSTICS_FAILED",
+                "Worker tidak dapat memeriksa sesi TDL.",
+                status_code=503,
+            )
+        allowed_codes = PROFILE_TDL_DIAGNOSTIC_CODES
+        sessions = []
+        raw_sessions = result.get("sessions")
+        if isinstance(raw_sessions, list):
+            for item in raw_sessions:
+                if not isinstance(item, dict) or item.get("name") not in {"root", "user1"}:
+                    continue
+                raw_code = str(item.get("code") or "PROFILE_SESSION_UNAVAILABLE")
+                code = raw_code if raw_code in allowed_codes else "PROFILE_SESSION_UNAVAILABLE"
+                sessions.append({
+                    "name": item["name"],
+                    "ready": bool(item.get("ready")),
+                    "code": code,
+                    "identity_matches_metadata": bool(item.get("identity_matches_metadata")),
+                })
+        reasons = result.get("reason_codes")
+        safe_reasons = [
+            str(code) for code in reasons
+            if isinstance(reasons, list) and str(code) in allowed_codes
+        ] if isinstance(reasons, list) else []
+        raw_worker_name = str(getattr(context.config, "backup_node_name", "worker") or "worker")
+        worker_name = raw_worker_name if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_worker_name) else "worker"
+        return {
+            "worker": worker_name[:64],
+            "profile": normalized,
+            "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "ready": bool(result.get("ready")),
+            "identity_match": bool(result.get("identity_match")),
+            "reason_codes": safe_reasons,
+            "sessions": sessions,
+        }
 
     @app.post("/internal/v1/profiles/{profile}/session/commit", dependencies=[Depends(authorize)])
     def commit_profile_bundle(profile: str, body: dict[str, Any]):

@@ -143,6 +143,17 @@ class ProfileTests(unittest.TestCase):
                 runtime = build_profile_runtime("default", config)
             self.assertIsInstance(runtime.state_store, HttpStateStore)
 
+    def test_profile_operation_locks_are_stable_and_shared_with_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = self.make_config(root)
+            manager = ProfileManager(config)
+            locks = manager.profile_operation_locks("default")
+            runtime = manager.runtime("default")
+            self.assertIs(runtime.export_operation_lock, locks[0])
+            self.assertIs(runtime.download_operation_lock, locks[1])
+            self.assertEqual(manager.profile_operation_locks("default"), locks)
+
     def test_backend_runtime_never_uses_its_own_backend_api_url_for_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

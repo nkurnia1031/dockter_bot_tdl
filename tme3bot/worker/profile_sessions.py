@@ -511,6 +511,184 @@ class ProfileSessionManager:
         reasons = [str(item["code"]) for item in checks if not item["ready"]]
         return {"ready": not reasons, "reason_codes": reasons, "checks": checks}
 
+    def diagnose_tdl_sessions(self, profile: str, profile_config: Any | None = None) -> dict[str, Any]:
+        """Run read-only authenticated identity checks on root and user1 separately."""
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            return {
+                "ready": False,
+                "identity_match": False,
+                "reason_codes": ["PROFILE_NAME_INVALID"],
+                "sessions": [
+                    {"name": name, "ready": False, "code": "PROFILE_NAME_INVALID", "identity_matches_metadata": False}
+                    for name in ("root", "user1")
+                ],
+            }
+
+        from tme3bot.profiles import build_profile_config
+
+        resolved_config = profile_config or build_profile_config(self.config, normalized)
+        profile_root = Path(resolved_config.profile_root)
+        metadata_id, metadata_code = self._read_identity_metadata(profile_root)
+        sessions: list[dict[str, Any]] = []
+        identity_ids: list[int | None] = []
+        specifications = (
+            (
+                "root",
+                Path(resolved_config.tdl_download_storage),
+                str(resolved_config.tdl_download_user),
+                str(resolved_config.tdl_download_namespace),
+                Path(resolved_config.tdl_download_home),
+            ),
+            (
+                "user1",
+                Path(resolved_config.tdl_export_storage),
+                str(resolved_config.tdl_export_user),
+                str(resolved_config.tdl_export_namespace),
+                Path(resolved_config.tdl_export_home),
+            ),
+        )
+        for name, storage_root, user, namespace, home in specifications:
+            user_id, code = self._diagnose_one_tdl_session(
+                profile_root, name, storage_root, user, namespace, home
+            )
+            identity_ids.append(user_id)
+            matches_metadata = user_id is not None and metadata_id is not None and user_id == metadata_id
+            if user_id is not None and metadata_id is not None and not matches_metadata:
+                code = "PROFILE_SESSION_METADATA_MISMATCH"
+            sessions.append({
+                "name": name,
+                "ready": user_id is not None and matches_metadata,
+                "code": code if code != "OK" else ("OK" if matches_metadata else metadata_code),
+                "identity_matches_metadata": bool(matches_metadata),
+            })
+
+        reasons = [str(item["code"]) for item in sessions if not item["ready"]]
+        if identity_ids[0] is not None and identity_ids[1] is not None and identity_ids[0] != identity_ids[1]:
+            reasons.append("PROFILE_SESSION_IDENTITY_MISMATCH")
+        identity_match = (
+            metadata_id is not None
+            and identity_ids[0] is not None
+            and identity_ids[1] is not None
+            and identity_ids[0] == identity_ids[1] == metadata_id
+        )
+        reasons = list(dict.fromkeys(reasons))
+        return {
+            "ready": identity_match and not reasons,
+            "identity_match": identity_match,
+            "reason_codes": reasons,
+            "sessions": sessions,
+        }
+
+    @staticmethod
+    def _read_identity_metadata(profile_root: Path) -> tuple[int | None, str]:
+        identity_path = profile_root / "identity.json"
+        if profile_root.is_symlink() or identity_path.is_symlink():
+            return None, "PROFILE_IDENTITY_UNSAFE"
+        try:
+            if not identity_path.is_file() or identity_path.stat().st_size > 64 * 1024:
+                return None, "PROFILE_IDENTITY_MISSING"
+            payload = json.loads(identity_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            value = int(payload.get("telegram_user_id", payload.get("tdl_user_id")))
+            if value < 1:
+                raise ValueError
+            return value, "OK"
+        except FileNotFoundError:
+            return None, "PROFILE_IDENTITY_MISSING"
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            return None, "PROFILE_IDENTITY_INVALID"
+
+    def _diagnose_one_tdl_session(
+        self,
+        profile_root: Path,
+        name: str,
+        storage_root: Path,
+        user: str,
+        namespace: str,
+        home: Path,
+    ) -> tuple[int | None, str]:
+        session_parent = profile_root / name
+        session_root = storage_root
+        data_root = session_root / "data"
+        database_file = data_root / namespace
+        if (
+            profile_root.is_symlink()
+            or session_parent.is_symlink()
+            or session_root.is_symlink()
+            or data_root.is_symlink()
+            or database_file.is_symlink()
+        ):
+            return None, "PROFILE_SESSION_UNSAFE"
+        try:
+            if not session_root.is_dir() or not data_root.is_dir():
+                return None, f"PROFILE_{name.upper()}_SESSION_MISSING"
+            # tdl-leave opens Bolt with create semantics. Require an existing,
+            # nonempty database so a diagnostic can never create an empty one.
+            if not database_file.is_file() or database_file.stat().st_size <= 0:
+                return None, f"PROFILE_{name.upper()}_SESSION_DATABASE_MISSING"
+        except OSError:
+            return None, "PROFILE_SESSION_UNREADABLE"
+
+        try:
+            user_id = self._run_whoami(
+                storage_root, user=user, namespace=namespace, home=home
+            )
+        except ValueError:
+            return None, f"PROFILE_{name.upper()}_SESSION_TDL_INVALID"
+        return user_id, "OK"
+
+    def _run_whoami(
+        self, storage_root: Path, *, user: str, namespace: str, home: Path
+    ) -> int:
+        helper = str(getattr(self.config, "leave_helper_binary", "/usr/local/bin/tdl-leave"))
+        with tempfile.TemporaryDirectory(prefix="tdl-diagnostic-") as raw_directory:
+            private_directory = Path(raw_directory)
+            self._set_private_tree(private_directory)
+            self._chown(private_directory, user)
+            # tdl-leave opens Bolt for writes even in --whoami mode. Use a
+            # private copy so the live session database remains untouched.
+            snapshot_storage = private_directory / "session-data"
+            snapshot_storage.mkdir(mode=0o700)
+            self._set_private_tree(snapshot_storage)
+            self._chown(snapshot_storage, user)
+            snapshot_database = snapshot_storage / namespace
+            shutil.copyfile(storage_root / "data" / namespace, snapshot_database)
+            try:
+                snapshot_database.chmod(0o600)
+            except OSError:
+                pass
+            self._chown(snapshot_database, user)
+            identity_file = private_directory / "identity.json"
+            command = [
+                "runuser", "-u", user, "--", helper,
+                "--storage", str(snapshot_storage),
+                "--namespace", namespace,
+                "--whoami", "--identity-file", str(identity_file),
+            ]
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=str(home),
+                    env={**os.environ, "HOME": str(home), "NO_COLOR": "1"},
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise ValueError("TDL identity check failed")
+                payload = json.loads(identity_file.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError("TDL identity output is invalid")
+                value = int(payload.get("telegram_user_id", payload.get("tdl_user_id")))
+                if value < 1:
+                    raise ValueError("TDL identity output is invalid")
+                return value
+            except (OSError, subprocess.TimeoutExpired, UnicodeError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Sesi TDL tidak valid atau belum login.") from exc
+
     def verify_installed(self, profile: str, expected_user_id: int | None = None) -> int | bool:
         """Check identity and both private Bolt session trees without opening Bolt."""
         normalized = normalize_profile_name(profile)
@@ -563,30 +741,12 @@ class ProfileSessionManager:
         return self.rollback_bundle(profile, operation_id)
 
     def _whoami(self, storage_root: Path) -> int:
-        identity_file = storage_root.parent / "identity.json"
-        helper = str(getattr(self.config, "leave_helper_binary", "/usr/local/bin/tdl-leave"))
-        command = [
-            "runuser", "-u", str(self.config.tdl_export_user), "--", helper,
-            "--storage", str(storage_root / "data"),
-            "--namespace", str(self.config.tdl_export_namespace),
-            "--whoami", "--identity-file", str(identity_file),
-        ]
-        try:
-            result = subprocess.run(
-                command,
-                cwd=str(self.config.tdl_export_home),
-                env={**os.environ, "HOME": str(self.config.tdl_export_home)},
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=60,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise ValueError("Sesi TDL tidak terautentikasi.")
-            payload = json.loads(identity_file.read_text(encoding="utf-8"))
-            return int(payload.get("telegram_user_id", payload.get("tdl_user_id")))
-        except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, json.JSONDecodeError) as exc:
-            raise ValueError("Sesi TDL tidak valid atau belum login.") from exc
+        return self._run_whoami(
+            storage_root,
+            user=str(self.config.tdl_export_user),
+            namespace=str(self.config.tdl_export_namespace),
+            home=Path(self.config.tdl_export_home),
+        )
 
     def _finish_if_exited(self, session: _LoginProcess) -> None:
         try:
@@ -703,6 +863,18 @@ class ProfileSessionManager:
             account = pwd.getpwnam("user1")
             for item in [path, *path.rglob("*")]:
                 os.chown(item, account.pw_uid, account.pw_gid)
+        except (KeyError, OSError):
+            pass
+
+    @staticmethod
+    def _chown(path: Path, username: str) -> None:
+        if os.name != "posix" or os.geteuid() != 0 or username == "root":
+            return
+        try:
+            import pwd
+
+            account = pwd.getpwnam(username)
+            os.chown(path, account.pw_uid, account.pw_gid)
         except (KeyError, OSError):
             pass
 

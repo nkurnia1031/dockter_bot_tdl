@@ -29,6 +29,15 @@ class FakeExecutor:
         self.profile_sync_requests = []
         self.profile_sync_cancellations = []
         self.profile_sync_snapshot = {"status": "ready", "backend_available": True, "profiles": {}}
+        self.profile_tdl_diagnostics = {
+            "ready": True,
+            "identity_match": True,
+            "reason_codes": [],
+            "sessions": [
+                {"name": "root", "ready": True, "code": "OK", "identity_matches_metadata": True},
+                {"name": "user1", "ready": True, "code": "OK", "identity_matches_metadata": True},
+            ],
+        }
         self.worker_settings_values = {
             "storage_profile": "default",
             "storage_profile_available": True,
@@ -105,6 +114,10 @@ class FakeExecutor:
             "reason_codes": [] if profile == "default" else ["PROFILE_ROOT_SESSION_MISSING"],
             "checks": [{"name": "root_session", "ready": profile == "default", "code": "PROFILE_ROOT_SESSION_READY" if profile == "default" else "PROFILE_ROOT_SESSION_MISSING"}],
         }
+
+    def diagnose_profile_tdl(self, profile):
+        self.last_tdl_diagnostic_profile = profile
+        return dict(self.profile_tdl_diagnostics)
 
     def recover_tts_helper(self, slot):
         self.tts_helper_recoveries.append(slot)
@@ -215,7 +228,7 @@ class FakeExecutor:
 
 class WorkerApiTests(unittest.TestCase):
     def setUp(self):
-        config = type("Config", (), {"worker_api_token": "worker-secret"})()
+        config = type("Config", (), {"worker_api_token": "worker-secret", "backup_node_name": "local"})()
         self.executor = FakeExecutor()
         self.temp = tempfile.TemporaryDirectory()
         self.executor.artifact_file = Path(self.temp.name) / ("artifact-" + "a" * 48 + ".mp3")
@@ -637,6 +650,24 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()["ready"])
         self.assertNotIn("/workspace", response.text)
+
+    def test_tdl_diagnostics_requires_worker_token_and_returns_redacted_evidence(self):
+        denied = self.client.get("/internal/v1/profiles/default/tdl-diagnostics")
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.get(
+            "/internal/v1/profiles/default/tdl-diagnostics",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["worker"], "local")
+        self.assertEqual(payload["profile"], "default")
+        self.assertTrue(payload["ready"])
+        self.assertEqual([row["name"] for row in payload["sessions"]], ["root", "user1"])
+        self.assertNotIn("telegram_user_id", response.text)
+        self.assertNotIn("/workspace", response.text)
+        self.assertIn("checked_at", payload)
+        self.assertEqual(payload["worker"], "local")
 
     def test_shared_export_cursor_capability_is_dynamic(self):
         self.executor.shared_export_cursor_ready = lambda: True
