@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import uuid
 import logging
+import re
 import threading
 import time
 from copy import deepcopy
@@ -18,6 +19,7 @@ from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, 
 from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_STAGING,
     CAP_DURABLE_COMMANDS_V1,
+    CAP_BACKUP_VERIFY,
     CAP_SAFELINK_RESOLVE,
     CAP_SHARED_EXPORT_CURSOR,
     CAP_TTS,
@@ -31,7 +33,7 @@ from tme3bot.safelink import normalize_shortlink_url
 
 _DURABLE_JOB_KINDS = frozenset({
     "export", "leave", "download", "utility", "storage_upload", "tts",
-    "safelink_resolve", "tdl_access_verify",
+    "safelink_resolve", "tdl_access_verify", "backup_verify",
 })
 
 
@@ -486,6 +488,17 @@ class ControlPlane:
             private_job_values = self._encrypt_private_job_values(
                 job_id, {"tdl_access_target": destination}
             )
+        elif kind == "backup_verify":
+            password = str(self._utility_settings_snapshot().get("compress_password") or "").strip()
+            if not password:
+                raise DomainError(
+                    "BACKUP_PASSWORD_UNAVAILABLE",
+                    "Password arsip backup belum tersedia di Pengaturan Utility.",
+                    status_code=503,
+                )
+            private_job_values = self._encrypt_private_job_values(
+                job_id, {"backup_archive_password": password}
+            )
         elif kind in {"tts", "storage_upload"}:
             purpose = "tts" if kind == "tts" else "storage"
             destination = self._tdl_access_target(purpose)
@@ -523,6 +536,7 @@ class ControlPlane:
                 "folder_path", "folder", "destination_folder_id",
                 "preserve_structure", "keywords", "rclone_upload",
             },
+            "backup_verify": {"run_id"},
             "tts": {"title", "text"},
             "tdl_access_verify": {"purpose"},
             "safelink_resolve": {"url"},
@@ -694,6 +708,70 @@ class ControlPlane:
                 "destination_hash": self.tdl_access_store.destination_fingerprint(destination),
             }
 
+        if kind == "backup_verify":
+            run_id = str(payload.get("run_id") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", run_id):
+                raise DomainError("BACKUP_SELECTION_INVALID", "Run backup yang dipilih tidak valid.", status_code=422)
+            if self.storage_catalog is None:
+                raise DomainError("BACKUP_CATALOG_UNAVAILABLE", "Katalog backup belum tersedia.", status_code=503)
+            runs = self.storage_catalog.backup_runs(node_name=worker, limit=200)
+            run = next((item for item in runs if str(item.get("run_id") or "") == run_id), None)
+            if run is None:
+                raise DomainError("BACKUP_RUN_NOT_FOUND", "Run backup tidak ditemukan untuk worker yang dipilih.", status_code=404)
+            if str(run.get("status") or "") != "complete":
+                raise DomainError("BACKUP_RUN_NOT_COMPLETE", "Run backup worker belum berstatus complete.", status_code=409)
+            raw_parts = self.storage_catalog.backup_parts(run_id, worker)
+            if not raw_parts or len(raw_parts) > 200:
+                raise DomainError("BACKUP_PARTS_INVALID", "Daftar part backup tidak tersedia atau terlalu besar.", status_code=409)
+            try:
+                channel_ids = {int(item.get("channel_id") or 0) for item in raw_parts}
+            except (TypeError, ValueError):
+                channel_ids = set()
+            if len(channel_ids) != 1 or not next(iter(channel_ids), 0):
+                raise DomainError("BACKUP_CHANNEL_INVALID", "Part backup tidak menunjuk ke satu channel Telegram yang sama.", status_code=409)
+            normalized_parts: list[dict[str, Any]] = []
+            for item in raw_parts:
+                part_name = str(item.get("part_name") or "")
+                message_id = item.get("channel_message_id")
+                size = item.get("file_size")
+                digest = str(item.get("sha256") or "").lower()
+                if (
+                    not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", part_name)
+                    or ".7z" not in part_name.lower()
+                    or type(message_id) is not int
+                    or message_id < 1
+                    or type(size) is not int
+                    or size < 1
+                    or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                    or str(item.get("status") or "") != "active"
+                ):
+                    raise DomainError("BACKUP_PART_METADATA_INVALID", "Metadata part backup tidak lengkap atau tidak aktif.", status_code=409)
+                normalized_parts.append({
+                    "part_name": part_name,
+                    "channel_message_id": message_id,
+                    "file_size": size,
+                    "sha256": digest,
+                    "status": "active",
+                })
+            from tme3bot.channel_ref import channel_tdl_ref
+
+            channel_ref = channel_tdl_ref(str(next(iter(channel_ids))))
+            if not channel_ref:
+                raise DomainError("BACKUP_CHANNEL_INVALID", "Referensi channel backup tidak dapat dipakai TDL.", status_code=409)
+            return {
+                "run_id": run_id,
+                "node_name": worker,
+                "profile": profile,
+                "run_record": {
+                    "run_id": run_id,
+                    "node_name": worker,
+                    "started_at": str(run.get("started_at") or ""),
+                    "status": str(run.get("status") or ""),
+                },
+                "parts": normalized_parts,
+                "channel_ref": channel_ref,
+            }
+
         if kind == "safelink_resolve":
             try:
                 return {"url": normalize_shortlink_url(payload.get("url"))}
@@ -845,7 +923,7 @@ class ControlPlane:
             )
         result: dict[str, bytes] = {}
         for key, value in values.items():
-            if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref"} or not isinstance(value, str) or not value.strip():
+            if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref", "backup_archive_password"} or not isinstance(value, str) or not value.strip():
                 raise DomainError(
                     "JOB_PRIVATE_VALUE_INVALID",
                     "Snapshot privat job tidak valid.",
@@ -927,6 +1005,8 @@ class ControlPlane:
             required.add(CAP_TTS)
         if job.kind == "safelink_resolve":
             required.add(CAP_SAFELINK_RESOLVE)
+        if job.kind == "backup_verify":
+            required.add(CAP_BACKUP_VERIFY)
         if bool((stored.get("payload") or {}).get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
         try:
@@ -934,6 +1014,11 @@ class ControlPlane:
             require_worker_contract(
                 worker_capabilities, job.worker, required_capabilities=required
             )
+        except DomainError as exc:
+            if job.kind == "backup_verify" and exc.code == "WORKER_INCOMPATIBLE":
+                self._fail_queued_job(job, exc.code, exc.message)
+                return {"status": "terminal", "reason": "worker_incompatible"}
+            return {"status": "wait", "reason": "not_ready"}
         except Exception:
             return {"status": "wait", "reason": "not_ready"}
 
@@ -945,6 +1030,7 @@ class ControlPlane:
             "download_clear_failed": "download_profiles",
             "storage_upload": "export_profiles",
             "tts": "export_profiles",
+            "backup_verify": "export_profiles",
         }.get(job.kind)
         if session_field:
             installed = worker_capabilities.get(session_field)
@@ -1280,6 +1366,9 @@ class ControlPlane:
     def _worker_payload(
         self, job_id: str, kind: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
+        if kind == "backup_verify":
+            password = self.private_job_value(job_id, "backup_archive_password")
+            return {**payload, **({"password": password} if password else {})}
         if kind in {"tts", "storage_upload"}:
             key = "telegram_tts_chat_id" if kind == "tts" else "tdl_storage_chat_ref"
             target = self.private_job_value(job_id, key)
@@ -2262,6 +2351,12 @@ class ControlPlane:
             return {"submitted": True}
         if kind == "tdl_access_verify":
             return {"purpose": str(payload.get("purpose") or "")}
+        if kind == "backup_verify":
+            return {
+                "run_id": str(payload.get("run_id") or ""),
+                "node_name": str(payload.get("node_name") or ""),
+                "part_count": len(payload.get("parts") or []),
+            }
         if kind == "tts":
             text = str(payload.get("text") or "")
             public = {

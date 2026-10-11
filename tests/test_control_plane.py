@@ -61,6 +61,27 @@ class FakeDispatcher:
         return {"tts": worker == "tts-ready", "capabilities": ["tts"] if worker == "tts-ready" else []}
 
 
+class FakeBackupCatalog:
+    def __init__(self, run_status="complete", *, node="remote-2"):
+        self.run = {"run_id": "run-abc", "node_name": node, "started_at": "2026-10-11T01:00:00+00:00", "status": run_status}
+
+    def backup_runs(self, node_name=None, limit=50):
+        del limit
+        return [self.run] if node_name == self.run["node_name"] else []
+
+    def backup_parts(self, run_id, node_name):
+        if run_id != self.run["run_id"] or node_name != self.run["node_name"]:
+            return []
+        return [{
+            "part_name": "backup-remote.7z.001",
+            "channel_id": -100123456,
+            "channel_message_id": 733,
+            "file_size": 1024,
+            "sha256": "a" * 64,
+            "status": "active",
+        }]
+
+
 class FailingDispatcher(FakeDispatcher):
     def dispatch(self, worker, command):
         del worker, command
@@ -142,6 +163,31 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(route, "remote-1")
         self.assertEqual(first_job.worker, "local")
         self.assertEqual(next_job.worker, "remote-1")
+
+    def test_backup_verification_payload_is_bound_to_selected_worker_and_run(self):
+        control = object.__new__(ControlPlane)
+        control.storage_catalog = FakeBackupCatalog()
+        payload = control._prepare_durable_payload(
+            self.actor, "backup_verify", {"run_id": "run-abc"}, "default", "remote-2"
+        )
+
+        self.assertEqual(payload["node_name"], "remote-2")
+        self.assertEqual(payload["profile"], "default")
+        self.assertEqual(payload["channel_ref"], "123456")
+        self.assertEqual(payload["parts"][0]["channel_message_id"], 733)
+        public = control._redacted_payload("backup_verify", payload)
+        self.assertEqual(public, {"run_id": "run-abc", "node_name": "remote-2", "part_count": 1})
+        self.assertNotIn("sha256", public)
+        self.assertNotIn("channel_message_id", public)
+
+    def test_backup_verification_rejects_incomplete_run(self):
+        control = object.__new__(ControlPlane)
+        control.storage_catalog = FakeBackupCatalog(run_status="running")
+        with self.assertRaises(DomainError) as raised:
+            control._prepare_durable_payload(
+                self.actor, "backup_verify", {"run_id": "run-abc"}, "default", "remote-2"
+            )
+        self.assertEqual(raised.exception.code, "BACKUP_RUN_NOT_COMPLETE")
 
     def test_same_kind_is_admitted_serially_while_download_lane_can_run(self):
         first = self.control.submit_job(

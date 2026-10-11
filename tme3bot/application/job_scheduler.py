@@ -132,6 +132,12 @@ def build_execution_plan(
         for name in profiles:
             keys.add(f"profile:{name}:tdl:export")
             keys.add(f"profile:{name}:tdl:download")
+    elif kind == "backup_verify":
+        keys = {
+            f"worker:{worker}:kind:backup_verify",
+            f"profile:{profile}:worker:{worker}:tdl:export",
+        }
+        lane = "tdl-backup-channel-verify"
     elif kind == "utility":
         lane = "filesystem"
         folders = payload.get("folders") or []

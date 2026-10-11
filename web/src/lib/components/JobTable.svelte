@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Modal, Toast } from 'flowbite-svelte';
-  import { AlertTriangle, ClipboardList, Copy, FileText, RefreshCw, SquareTerminal, XCircle } from '@lucide/svelte';
+  import { AlertTriangle, ClipboardList, Copy, Download, FileText, RefreshCw, SquareTerminal, XCircle } from '@lucide/svelte';
   import { api, post } from '$lib/api';
   import { formatBytes, formatDate, jobMessage, resultEntries, textValue } from '$lib/presentation';
   import { formatDuration, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
@@ -187,6 +187,22 @@
     }
   }
   async function copy(value: string) { await navigator.clipboard?.writeText(value); toastMessage = 'Disalin ke clipboard.'; toastOpen = true; }
+  function backupVerificationReport(job: Job | null) {
+    const result = job?.result?.value || job?.result || {};
+    const report = result?.report;
+    return job?.kind === 'backup_verify' && report && typeof report === 'object' ? report : null;
+  }
+  function downloadBackupVerificationReport(job: Job) {
+    const report = backupVerificationReport(job);
+    if (!report) return;
+    const safePart = (value: unknown) => String(value || '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 80) || 'unknown';
+    const url = URL.createObjectURL(new Blob([`${JSON.stringify(report, null, 2)}\n`], { type: 'application/json' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `backup-verification-${safePart(report.worker)}-${safePart(report.profile)}-${safePart(report.run_id)}.json`;
+    link.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
   const eventLine = (event: JobEvent) => {
     const batch = event.progress?.batch;
     const item = event.progress?.item;
@@ -318,7 +334,7 @@
 
 <Modal bind:open={reportOpen} title={selected ? `Detail ${selected.kind.replaceAll('_',' ')}` : 'Detail job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex max-h-[78dvh] min-h-0 flex-col">
-    <div class="border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span></div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>
+    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span></div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>{#if backupVerificationReport(selected)}<button class="button secondary" onclick={() => downloadBackupVerificationReport(selected!)}><Download size={15}/>Unduh JSON verifikasi</button>{/if}</div>
     <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
       <div class="mb-4 flex gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'summary' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'summary'}>Ringkasan</button>

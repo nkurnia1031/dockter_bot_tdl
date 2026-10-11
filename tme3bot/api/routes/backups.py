@@ -4,8 +4,8 @@ import re
 from datetime import datetime
 import uuid
 
-from fastapi import Depends
-from tme3bot.api.schemas import BackupRuntimeSettingsRequest, ItemListResponse, ObjectResponse
+from fastapi import Depends, Header, Response
+from tme3bot.api.schemas import BackupRuntimeSettingsRequest, BackupVerificationRequest, ItemListResponse, ObjectResponse
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.domain.models import DomainError
 from tme3bot.infrastructure.http_client import JsonHttpError
@@ -98,6 +98,39 @@ def _safe_tdl_diagnostics(payload, *, worker: str, profile: str) -> dict:
     }
 
 def register_backups(app, context, *, current_actor, job_dict):
+
+    @app.post("/api/v1/backups/verify", status_code=202)
+    def submit_backup_verification(
+        body: BackupVerificationRequest,
+        response: Response,
+        actor=Depends(current_actor),
+        idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
+    ):
+        worker = str(body.worker or "").strip().lower()
+        profile = normalize_profile_name(body.profile)
+        if not _WORKER_NAME_RE.fullmatch(worker):
+            raise DomainError("WORKER_NAME_INVALID", "Nama worker tidak valid.", status_code=422)
+        if not profile:
+            raise DomainError("PROFILE_NAME_INVALID", "Nama profil tidak valid.", status_code=422)
+        if context.worker_registry.get(worker) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        operations = context.operation_service
+        if operations is None:
+            raise DomainError("OPERATIONS_UNAVAILABLE", "Antrean job background belum tersedia.", status_code=503)
+        operation, _ = operations.submit(
+            actor,
+            kind="job.submit",
+            target={"profile": profile, "worker": worker},
+            input_data={"job_kind": "backup_verify", "payload": {"run_id": body.run_id}},
+            idempotency_key=idempotency_key,
+        )
+        job = context.control_plane.jobs.get(str(operation.job_id or ""))
+        if job is None:
+            raise DomainError("JOB_NOT_FOUND", "Job verifikasi backup tidak ditemukan setelah diterima.", status_code=500)
+        status_url = f"/api/v1/jobs/{job.id}"
+        response.headers["Location"] = status_url
+        response.headers["X-Operation-ID"] = operation.id
+        return {**job_dict(job), "operation_id": operation.id, "status_url": status_url}
 
     @app.post("/api/v1/backups/tdl-diagnostics")
     def backup_tdl_diagnostics(body: dict, actor=Depends(current_actor)):

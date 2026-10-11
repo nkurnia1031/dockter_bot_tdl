@@ -364,6 +364,13 @@ class BackupRuntimeSettingsRequest(BaseModel):
     job_cancel_grace_seconds: int = Field(ge=0, le=3600)
 
 
+class BackupVerificationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    worker: str = Field(min_length=1, max_length=48)
+    profile: str = Field(min_length=1, max_length=48)
+    run_id: str = Field(min_length=1, max_length=128)
+
+
 class RuntimeSecretsRequest(BaseModel):
     bot_token: str | None = Field(default=None, min_length=20, max_length=256)
     telegram_tts_chat_id: str | None = Field(default=None, max_length=128)

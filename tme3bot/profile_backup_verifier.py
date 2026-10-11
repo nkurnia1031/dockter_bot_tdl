@@ -30,10 +30,13 @@ def verify_profile_backup(
     node_name: str,
     profile: str,
     parts_dir: Path,
-    catalog_db: Path,
-    settings_file: Path,
+    catalog_db: Path | None = None,
+    settings_file: Path | None = None,
     tdl_diagnostics: Any | None = None,
     archive_factory: Callable[[Path, str], Any] | None = None,
+    run_record: dict[str, Any] | None = None,
+    part_records: list[dict[str, Any]] | None = None,
+    password: str | None = None,
 ) -> dict[str, Any]:
     """Verify part checksums, 7z password/integrity and profile session entries.
 
@@ -74,14 +77,30 @@ def verify_profile_backup(
             return _fail(report, exc.code)
 
     try:
-        run, rows = _read_catalog(Path(catalog_db), run_id, node_name)
+        supplied_catalog = run_record is not None or part_records is not None
+        if supplied_catalog:
+            if not isinstance(run_record, dict) or not isinstance(part_records, list):
+                raise _VerificationFailure("BACKUP_CATALOG_ENTRY_MISSING")
+            run, rows = run_record, part_records
+            if str(run.get("run_id") or "") != run_id or str(run.get("node_name") or "") != node_name:
+                raise _VerificationFailure("BACKUP_SELECTION_INVALID")
+        else:
+            if catalog_db is None or settings_file is None:
+                raise _VerificationFailure("BACKUP_CATALOG_UNAVAILABLE")
+            run, rows = _read_catalog(Path(catalog_db), run_id, node_name)
         report["backup_started_at"] = _safe_label(str(run.get("started_at") or "")) or None
         if str(run.get("status") or "") != "complete":
             raise _VerificationFailure("BACKUP_RUN_NOT_COMPLETE")
         parts = _validate_parts(Path(parts_dir), rows)
         report["part_count"] = len(parts)
         report["checksums_match"] = True
-        password = _read_backup_password(Path(settings_file))
+        if supplied_catalog:
+            password = str(password or "")
+            if not password:
+                raise _VerificationFailure("BACKUP_PASSWORD_UNAVAILABLE")
+        else:
+            assert settings_file is not None
+            password = _read_backup_password(Path(settings_file))
         factory = archive_factory or _load_py7zr_factory()
 
         with tempfile.TemporaryDirectory(prefix="profile-backup-verify-") as raw_temp:

@@ -135,6 +135,37 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.assertTrue(temporary_dirs)
         self.assertTrue(all(not path.exists() for path in temporary_dirs))
 
+    def test_worker_supplied_catalog_and_password_can_verify_without_backend_files(self):
+        def factory(path, password):
+            return FakeArchive(path, password, self.manifest)
+
+        report = verify_profile_backup(
+            run_id=self.run_id,
+            node_name=self.worker,
+            profile="default",
+            parts_dir=self.parts_dir,
+            run_record={
+                "run_id": self.run_id,
+                "node_name": self.worker,
+                "started_at": "2026-10-11T01:00:00+00:00",
+                "status": "complete",
+            },
+            part_records=[
+                {
+                    "part_name": self.part_name,
+                    "file_size": len(self.part_data),
+                    "sha256": hashlib.sha256(self.part_data).hexdigest(),
+                    "status": "active",
+                }
+            ],
+            password=self.password,
+            archive_factory=factory,
+        )
+
+        self.assertEqual(report["status"], "verified")
+        self.assertEqual(report["canary_evidence_status"], "tdl_not_attached")
+        self.assertNotIn(self.password, json.dumps(report))
+
     def test_missing_part_and_checksum_mismatch_fail_before_archive_open(self):
         (self.parts_dir / self.part_name).unlink()
         report, _ = self.verify()

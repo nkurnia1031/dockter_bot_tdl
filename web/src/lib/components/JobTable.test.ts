@@ -3,10 +3,15 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/sv
 import JobTable from './JobTable.svelte';
 
 describe('JobTable', () => {
+  const dialogMethodDescriptors = Object.fromEntries(['showModal', 'close'].map((name) => [name, Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, name)]));
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    for (const [name, descriptor] of Object.entries(dialogMethodDescriptors)) {
+      if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, name, descriptor);
+      else delete (HTMLDialogElement.prototype as any)[name];
+    }
   });
 
   it('shows an accessible empty state and global terminate action', async () => {
@@ -15,6 +20,32 @@ describe('JobTable', () => {
     expect(await screen.findByText('Belum ada job.')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Terminate semua aktif' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Refresh daftar job' })).toBeTruthy();
+  });
+
+  it('restores a completed backup verification report from history with a download action', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const report = { worker: 'remote-2', profile: 'default', run_id: 'run-123', status: 'verified' };
+    const job = {
+      id: 'backup-verify-1', kind: 'backup_verify', status: 'succeeded', profile: 'default', worker: 'remote-2',
+      result: { value: { report } }, updated_at: '2026-10-11T08:00:00Z'
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.endsWith('/jobs/backup-verify-1')) return new Response(JSON.stringify(job), { status: 200 });
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [job] }), { status: 200 });
+      if (url.includes('/events') || url.includes('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+    render(JobTable, { kind: 'backup_verify', view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+    expect(await screen.findByText('Unduh JSON verifikasi')).toBeTruthy();
   });
 
   it('filters Quick Mode globally and retries a failed attempt', async () => {

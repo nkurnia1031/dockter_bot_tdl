@@ -101,6 +101,7 @@ from .executor_support import (
 
 
 from .executor_backup import BackupExecutorMixin
+from .executor_backup_verify import BackupVerificationExecutorMixin
 from .executor_downloads import DownloadExecutorMixin
 from .executor_quickmode import QuickModeExecutorMixin
 from .executor_storage import StorageExecutorMixin
@@ -119,6 +120,7 @@ class WorkerJobExecutor(
     SafelinkExecutorMixin,
     TtsExecutorMixin,
     BackupExecutorMixin,
+    BackupVerificationExecutorMixin,
     WorkspaceExecutorMixin,
 ):
     """Executes domain jobs and publishes JSON events; no UI dependency."""
@@ -659,7 +661,7 @@ class WorkerJobExecutor(
                 "download",
                 getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
             )
-        elif kind in {"export", "backup_node"}:
+        elif kind in {"export", "backup_node", "backup_verify"}:
             interrupt(
                 "export",
                 getattr(getattr(runtime, "export_tdl_client", None), "interrupt_current", None),
@@ -727,7 +729,7 @@ class WorkerJobExecutor(
         return bool(
             cancelled
             or quick_active
-            or kind in {"export", "backup_node", "tts", "safelink_resolve"}
+            or kind in {"export", "backup_node", "backup_verify", "tts", "safelink_resolve"}
         )
 
     def pause(self, job_id: str) -> bool:
@@ -1145,6 +1147,11 @@ class WorkerJobExecutor(
             candidate_profiles = (command.get("payload") or {}).get("candidate_profiles") or self.profile_manager.list_profiles()
             for candidate_profile in candidate_profiles:
                 keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:export")
+        elif kind == "backup_verify":
+            keys = {
+                f"worker:{worker}:kind:backup_verify",
+                f"profile:{profile}:worker:{worker}:tdl:export",
+            }
         elif kind == "safelink_resolve":
             keys = {f"worker:{worker}:kind:safelink_resolve"}
         elif kind in {"download", "download_clear_failed"}:
@@ -1218,6 +1225,7 @@ class WorkerJobExecutor(
             "download_clear_failed": "download",
             "storage_upload": "export",
             "tts": "export",
+            "backup_verify": "export",
         }.get(kind)
         if purpose is None:
             return
@@ -1685,6 +1693,7 @@ class WorkerJobExecutor(
             "utility": self._utility,
             "storage_upload": self._storage_upload,
             "backup_node": self._backup,
+            "backup_verify": self._backup_verify,
             "tts": self._tts,
             "tdl_access_verify": self._tdl_access_verify,
             "safelink_resolve": self._safelink_resolve,

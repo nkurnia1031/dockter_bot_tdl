@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { apiMock, postMock, putMock } = vi.hoisted(() => ({
   apiMock: vi.fn(),
@@ -29,12 +29,27 @@ const diagnostic = {
 };
 
 describe('BackupsPage TDL diagnosis', () => {
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
-    apiMock.mockImplementation(async (path: string) => {
+    vi.stubGlobal('crypto', { randomUUID: () => 'backup-verify-test-key' });
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/backups/status') return { enabled: true, items: [{ run_id: 'full-run-id-for-test', node_name: 'remote-2', status: 'complete' }] };
       if (path === '/workers') return { items: [{ name: 'local', enabled: true }, { name: 'remote-2', enabled: true }] };
       if (path === '/profiles') return { items: [{ name: 'default' }, { name: 'irang' }] };
+      if (path === '/backups/verify' && init?.method === 'POST') return { id: 'backup-verify-job', kind: 'backup_verify', worker: 'remote-2', profile: 'default', status: 'queued' };
+      if (path === '/jobs/backup-verify-job') return {
+        id: 'backup-verify-job', kind: 'backup_verify', worker: 'remote-2', profile: 'default', status: 'succeeded',
+        result: { value: { report: {
+          worker: 'remote-2', profile: 'default', run_id: 'full-run-id-for-test', status: 'verified',
+          part_count: 2, reason_codes: [], canary_evidence_status: 'ready_for_operator_review',
+          tdl_diagnostics: { ready: true, identity_match: true },
+        } } },
+      };
       if (path.startsWith('/jobs?')) return { items: [] };
       if (path.startsWith('/jobs/metrics?')) return {};
       throw new Error(`Unexpected GET ${path}`);
@@ -45,10 +60,10 @@ describe('BackupsPage TDL diagnosis', () => {
   it('requests the selected worker/profile and shows the matching JSON and per-session results', async () => {
     render(BackupsPage);
 
-    const worker = await screen.findByLabelText('Worker');
+    const worker = (await screen.findAllByLabelText('Worker'))[0];
     await waitFor(() => expect((worker as HTMLSelectElement).options.length).toBe(3));
     await fireEvent.change(worker, { target: { value: 'remote-2' } });
-    await fireEvent.change(screen.getByLabelText('Profil'), { target: { value: 'default' } });
+    await fireEvent.change((await screen.findAllByLabelText('Profil'))[0], { target: { value: 'default' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Buat JSON diagnosis' }));
 
     await screen.findByText('remote-2 / default · Ada sesi yang gagal');
@@ -60,5 +75,58 @@ describe('BackupsPage TDL diagnosis', () => {
     expect(screen.getByRole('button', { name: 'Unduh JSON' })).toBeTruthy();
     expect(screen.getByText(/"worker": "remote-2"/)).toBeTruthy();
     expect(screen.getByText('full-run-id-for-test')).toBeTruthy();
+  });
+
+  it('submits a selected worker/profile/run and exposes the generated canary JSON', async () => {
+    render(BackupsPage);
+
+    const worker = (await screen.findAllByLabelText('Worker'))[0];
+    await waitFor(() => expect((worker as HTMLSelectElement).options.length).toBe(3));
+    await fireEvent.change(worker, { target: { value: 'remote-2' } });
+    await fireEvent.change((await screen.findAllByLabelText('Profil'))[0], { target: { value: 'default' } });
+    await waitFor(() => expect((screen.getByLabelText('Run backup lengkap untuk remote-2') as HTMLSelectElement).value).toBe('full-run-id-for-test'));
+    await fireEvent.click(screen.getAllByRole('button', { name: 'Unduh dari channel & verifikasi' })[0]);
+
+    await screen.findByText(/Job verifikasi.*remote-2 \/ default/);
+    const submit = apiMock.mock.calls.find(([path, init]) => path === '/backups/verify' && init?.method === 'POST');
+    expect(submit).toBeTruthy();
+    expect(JSON.parse(String(submit?.[1]?.body))).toEqual({
+      worker: 'remote-2', profile: 'default', run_id: 'full-run-id-for-test',
+    });
+    expect(submit?.[1]?.headers).toEqual({ 'Idempotency-Key': expect.any(String) });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
+    await screen.findByText('Arsip terverifikasi');
+    expect(screen.getByText('Sesi TDL lolos; bukti siap ditinjau untuk canary.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Salin JSON' })).toBeTruthy();
+    await fireEvent.click(screen.getByText('Lihat JSON canary lengkap'));
+    expect(screen.getByText(/"canary_evidence_status"/)).toBeTruthy();
+  });
+
+  it('distinguishes a completed verification job from an archive that failed verification', async () => {
+    const defaultApi = apiMock.getMockImplementation();
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path === '/jobs/backup-verify-job') return {
+        id: 'backup-verify-job', kind: 'backup_verify', worker: 'remote-2', profile: 'default', status: 'succeeded',
+        result: { value: { report: {
+          worker: 'remote-2', profile: 'default', run_id: 'full-run-id-for-test', status: 'failed',
+          part_count: 2, reason_codes: ['BACKUP_ARCHIVE_INTEGRITY_FAILED'], canary_evidence_status: 'backup_failed',
+          tdl_diagnostics: { ready: true, identity_match: true },
+        } } },
+      };
+      return defaultApi?.(path, init);
+    });
+
+    render(BackupsPage);
+    const worker = (await screen.findAllByLabelText('Worker'))[0];
+    await waitFor(() => expect((worker as HTMLSelectElement).options.length).toBe(3));
+    await fireEvent.change(worker, { target: { value: 'remote-2' } });
+    await fireEvent.change((await screen.findAllByLabelText('Profil'))[0], { target: { value: 'default' } });
+    await waitFor(() => expect((screen.getByLabelText('Run backup lengkap untuk remote-2') as HTMLSelectElement).value).toBe('full-run-id-for-test'));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Unduh dari channel & verifikasi' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Muat status' }));
+
+    expect(await screen.findByText(/Job selesai dijalankan, tetapi arsip tidak lolos pemeriksaan/)).toBeTruthy();
+    expect(screen.getAllByText(/BACKUP_ARCHIVE_INTEGRITY_FAILED/).length).toBeGreaterThan(0);
   });
 });

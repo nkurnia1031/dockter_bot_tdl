@@ -88,19 +88,35 @@ Perintah `--whoami` dijalankan sekali untuk masing-masing sesi menggunakan
 user, home, namespace, dan storage yang aktif. Output identitas dibuat di
 direktori sementara privat dan langsung dibersihkan.
 
-## Verifikasi arsip backup yang diunduh manual
+## Verifikasi arsip dari halaman Backup
 
-Belum ada jalur aplikasi yang aman untuk mengunduh semua bagian backup terpilih
-dari Telegram. Unduh bagian arsip secara manual, lalu tempatkan semuanya pada
-satu direktori yang tersedia dari container backend sebagai `/workspace/...`.
-Di halaman **Backup terenkripsi → Diagnosis TDL untuk verifikasi backup**, pilih
-worker dan profil yang sama, tekan **Buat JSON diagnosis**, lalu unduh hasilnya.
-Tempatkan file itu pada direktori part yang sama dengan nama
-`tdl-diagnostics.json`. Cara ini membuat worker dan profil pada JSON cocok
-dengan pilihan; command diagnosis manual di bagian sebelumnya tetap menjadi
-fallback jika UI tidak tersedia. Verifier membaca ukuran dan SHA-256 dari
-`storage.db`, password dari `utility_settings.json`, serta JSON diagnosis
-tersebut; ia tidak menerima password sebagai argumen.
+Jalur utama tersedia di halaman **Backup terenkripsi → Diagnosis dan verifikasi
+backup worker**. Pilih worker, profil lokal yang akan diuji, dan run backup
+berstatus `complete`, lalu tekan **Unduh dari channel & verifikasi**. Job
+berjalan di worker terpilih, memakai sesi TDL profil itu untuk mengunduh hanya
+message ID yang tercatat untuk run dan node tersebut. Worker memeriksa
+checksum, password, integritas, manifest, dan sesi `root`/`user1`, lalu
+menghasilkan satu JSON canary lengkap.
+
+Progress dan log tersedia di panel **Job verifikasi arsip backup**. Saat job
+selesai, halaman menampilkan tombol **Salin JSON** dan **Unduh JSON**. Arsip
+disimpan sementara dengan izin privat dan dihapus setelah pemeriksaan. Proses
+tidak mengirim ulang atau menghapus pesan Telegram. Sesi TDL dari profil worker
+yang dipilih membaca channel secara langsung.
+
+Tombol **Buat JSON diagnosis** tetap tersedia bila hanya perlu menguji sesi TDL
+tanpa mengunduh arsip. Unduhan manual dan CLI di bawah menjadi fallback jika
+job Web tidak tersedia.
+
+## Verifikasi arsip secara manual (fallback)
+
+Unduh semua part yang tercatat untuk satu worker/run secara manual, lalu
+tempatkan pada satu direktori yang tersedia dari container backend sebagai
+`/workspace/...`. Di halaman Backup, pilih worker dan profil yang sama, tekan
+**Buat JSON diagnosis**, lalu unduh hasilnya. Tempatkan file itu pada direktori
+part yang sama dengan nama `tdl-diagnostics.json`. Cara ini memastikan worker
+dan profil pada JSON cocok dengan pilihan; command diagnosis manual di bagian
+sebelumnya tetap menjadi fallback jika UI tidak tersedia.
 
 Caption Telegram hanya menampilkan 12 karakter awal `run_id`; salin `Run ID
 lengkap` dari riwayat backup di halaman Web atau ambil dari

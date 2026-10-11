@@ -18,6 +18,7 @@ from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_VERIFY,
     CAP_TTS,
+    CAP_BACKUP_VERIFY,
     CAP_WORKSPACE_TREE,
     WORKER_JOB_CAPABILITIES,
     require_worker_contract,
@@ -322,6 +323,8 @@ class WorkerHttpDispatcher:
             required.add(CAP_TTS)
         if str(job.get("kind") or "") == "safelink_resolve":
             required.add(CAP_SAFELINK_RESOLVE)
+        if str(job.get("kind") or "") == "backup_verify":
+            required.add(CAP_BACKUP_VERIFY)
         if str(job.get("kind") or "") == "export" and bool(
             job_payload.get("_shared_export_cursor")
         ):
