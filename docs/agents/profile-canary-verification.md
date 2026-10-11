@@ -93,17 +93,29 @@ direktori sementara privat dan langsung dibersihkan.
 Belum ada jalur aplikasi yang aman untuk mengunduh semua bagian backup terpilih
 dari Telegram. Unduh bagian arsip secara manual, lalu tempatkan semuanya pada
 satu direktori yang tersedia dari container backend sebagai `/workspace/...`.
-Simpan JSON diagnosis worker dari langkah sebelumnya sebagai file pendamping
-di workspace. Verifier membaca ukuran dan SHA-256 dari `storage.db`, password
-dari `utility_settings.json`, serta JSON diagnosis tersebut; ia tidak menerima
-password sebagai argumen.
+Di halaman **Backup terenkripsi → Diagnosis TDL untuk verifikasi backup**, pilih
+worker dan profil yang sama, tekan **Buat JSON diagnosis**, lalu unduh hasilnya.
+Tempatkan file itu pada direktori part yang sama dengan nama
+`tdl-diagnostics.json`. Cara ini membuat worker dan profil pada JSON cocok
+dengan pilihan; command diagnosis manual di bagian sebelumnya tetap menjadi
+fallback jika UI tidak tersedia. Verifier membaca ukuran dan SHA-256 dari
+`storage.db`, password dari `utility_settings.json`, serta JSON diagnosis
+tersebut; ia tidak menerima password sebagai argumen.
 
-Caption Telegram hanya menampilkan 12 karakter awal `run_id`; ambil `run_id`
-lengkap dari `python3 run.py backup status` di gateway atau daftar backup Web.
+Caption Telegram hanya menampilkan 12 karakter awal `run_id`; salin `Run ID
+lengkap` dari riwayat backup di halaman Web atau ambil dari
+`python3 run.py backup status` di gateway.
 Setiap `node_name` memiliki arsip sendiri meskipun `run_id`-nya sama. Untuk
 `--worker remote-2`, gunakan semua part `remote-2` dari run tersebut saja;
 part `backend` bukan kelanjutan arsip worker. Pastikan indeks part lengkap
 sesuai katalog sebelum menjalankan verifier.
+
+Simpan hasil endpoint diagnosis untuk pasangan yang sama sebagai
+`$PARTS_DIR/tdl-diagnostics.json`. Untuk pemeriksaan di bawah, JSON itu harus
+berisi `worker: "remote-2"` dan `profile: "default"`; salin output endpoint
+apa adanya dan jangan mengubah labelnya. Verifier tidak menghubungi worker
+sendiri. Pastikan file ada, dapat dibaca oleh container backend, dan merupakan
+JSON valid sebelum menjalankan verifier.
 
 Contoh setelah image gateway yang memuat verifier dideploy. Ganti nilai
 `FULL_RUN_ID_FROM_BACKUP_STATUS` dengan run ID lengkap sebelum menjalankan;
@@ -137,6 +149,17 @@ lengkap dari satu run nyata dan `WORKER` ke node yang arsipnya diperiksa. Nilai
 `--worker` harus cocok dengan label worker pada JSON diagnosis dan node backup
 di katalog. Jika salah satu tidak cocok, verifier akan berhenti sebelum
 menyatakan arsip valid.
+
+Jika hasil berisi `reason_codes: ["TDL_DIAGNOSTIC_SELECTION_MISMATCH"]`,
+`tdl_diagnostics: null`, `canary_evidence_status: "tdl_not_attached"`, dan
+`part_count: 0`, verifikasi berhenti saat memeriksa bukti diagnosis TDL.
+Arsip belum dibaca atau dinilai. Kode mismatch juga dapat muncul bila file
+JSON diagnosis hilang, tidak terbaca, atau rusak: CLI saat ini mengubah kondisi
+itu menjadi input kosong sebelum validasi. Ambil ulang diagnosis tepat dari
+worker dan profil yang dipilih, simpan di lokasi di atas, lalu jalankan ulang.
+Pastikan juga `RUN_ID` adalah ID lengkap dari katalog, bukan 12 karakter pada
+caption Telegram; ID singkat akan menghalangi pencarian run setelah input TDL
+berhasil divalidasi.
 
 Jika menjalankan verifier dari environment lokal, pasang dependensi opsional
 dengan `python -m pip install -r requirements-verifier.txt`, lalu berikan

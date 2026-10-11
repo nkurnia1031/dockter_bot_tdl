@@ -354,9 +354,9 @@
     "semantic_hash": ""
   },
   "tests/test_backend_api.py": {
-    "mtime": 1791621532.925969,
-    "seen": 1791622539.6723206,
-    "ast_hash": "43da6a8a4fe1bd5ef83f9a557b6d5ae6",
+    "mtime": 1791701881.5756273,
+    "seen": 1791702317.96116,
+    "ast_hash": "b0e9f47b30a38e7057dbca414e9cf078",
     "semantic_hash": ""
   },
   "tests/test_control_plane.py": {
@@ -462,9 +462,9 @@
     "semantic_hash": ""
   },
   "tme3bot/infrastructure/http_client.py": {
-    "mtime": 1791634898.2922032,
-    "seen": 1791643379.3866081,
-    "ast_hash": "da0f7db0e7495685f88b1de4b348b27e",
+    "mtime": 1791701850.622682,
+    "seen": 1791702317.962668,
+    "ast_hash": "17b26944bdf060048737507464ff0a97",
     "semantic_hash": ""
   },
   "tme3bot/infrastructure/job_store.py": {
@@ -738,9 +738,9 @@
     "semantic_hash": ""
   },
   "web/src/lib/components/BackupsPage.svelte": {
-    "mtime": 1790494311.8864572,
-    "seen": 1790499995.8747458,
-    "ast_hash": "3234230e9dd48695b61e3f5541ef3db7",
+    "mtime": 1791702557.9138322,
+    "seen": 1791702707.265971,
+    "ast_hash": "043819845450f31bbfeb4a90a524d508",
     "semantic_hash": ""
   },
   "web/src/lib/components/DownloadsPage.svelte": {
@@ -1008,9 +1008,9 @@
     "semantic_hash": ""
   },
   "tme3bot/api/routes/backups.py": {
-    "mtime": 1790494709.6236503,
-    "seen": 1790499995.8747458,
-    "ast_hash": "299e558c03c2532f5c8a935f1b454376",
+    "mtime": 1791701850.624987,
+    "seen": 1791702317.962668,
+    "ast_hash": "d8c3b01ead091b54c90e96d1e0cb7cb1",
     "semantic_hash": ""
   },
   "tme3bot/api/routes/downloads.py": {
@@ -1806,9 +1806,9 @@
     "semantic_hash": ""
   },
   "docs/agents/profile-canary-verification.md": {
-    "mtime": 1791662522.7247767,
-    "seen": 1791662809.08555,
-    "ast_hash": "a2b852bcfe2ee93b9c01235d3561829c",
+    "mtime": 1791702557.9163687,
+    "seen": 1791702707.265971,
+    "ast_hash": "5846904cd19f5487239ebbfb98486f16",
     "semantic_hash": ""
   },
   "plan/PROFILE_VAULT_REDESIGN.md": {
@@ -1827,6 +1827,12 @@
     "mtime": 1791663588.414033,
     "seen": 1791663655.4868054,
     "ast_hash": "84ee1427d9482b0b5bff74ca4e308ea1",
+    "semantic_hash": ""
+  },
+  "web/src/lib/components/BackupsPage.test.ts": {
+    "mtime": 1791702557.915248,
+    "seen": 1791702707.265971,
+    "ast_hash": "ff47d4f19ad4bb6384d1e02d0d1b6490",
     "semantic_hash": ""
   }
 }

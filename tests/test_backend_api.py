@@ -79,6 +79,19 @@ class FakeDispatcher:
             },
             "queued_requests": [{"profile": "default", "mode": "check"}],
         }
+        self.profile_tdl_diagnostic_calls = []
+        self.profile_tdl_diagnostic_result = {
+            "worker": "local",
+            "profile": "default",
+            "checked_at": "2026-10-11T06:46:22+00:00",
+            "ready": True,
+            "identity_match": True,
+            "reason_codes": [],
+            "sessions": [
+                {"name": name, "ready": True, "code": "OK", "identity_matches_metadata": True}
+                for name in ("root", "user1")
+            ],
+        }
         self.quick_scan = {"local": {"worker": "local", "items": []}}
         self.quick_verifications = []
         self.quick_deletions = []
@@ -134,6 +147,13 @@ class FakeDispatcher:
     def profile_sync_status(self, worker):
         del worker
         return self.profile_sync_snapshot
+
+    def profile_tdl_diagnostics(self, worker, profile):
+        self.profile_tdl_diagnostic_calls.append((worker, profile))
+        return {
+            **self.profile_tdl_diagnostic_result,
+            "sessions": [dict(item) for item in self.profile_tdl_diagnostic_result["sessions"]],
+        }
 
     def request_profile_sync(self, worker, *, profile=None, mode="check"):
         self.profile_sync_requests.append((worker, profile, mode))
@@ -1145,6 +1165,46 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/backups/status", headers=headers).json()["schedule"], "04:15")
         self.assertEqual(self.context.config.backup_channel_id, -100789)
         self.assertEqual(self.context.control_plane.job_stall_timeout_seconds, 900)
+
+    def test_backup_tdl_diagnostics_requires_auth_and_returns_worker_profile_pair(self):
+        denied = self.client.post(
+            "/api/v1/backups/tdl-diagnostics",
+            json={"worker": "local", "profile": "default"},
+        )
+        self.assertEqual(denied.status_code, 401)
+
+        response = self.client.post(
+            "/api/v1/backups/tdl-diagnostics",
+            headers=self.login(),
+            json={"worker": "local", "profile": "default"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.dispatcher.profile_tdl_diagnostic_calls, [("local", "default")])
+        self.assertEqual(response.json()["worker"], "local")
+        self.assertEqual(response.json()["profile"], "default")
+        self.assertEqual([item["name"] for item in response.json()["sessions"]], ["root", "user1"])
+        self.assertNotIn("path", response.text.lower())
+
+    def test_backup_tdl_diagnostics_rejects_worker_label_mismatch(self):
+        self.dispatcher.profile_tdl_diagnostic_result["worker"] = "gateway"
+        response = self.client.post(
+            "/api/v1/backups/tdl-diagnostics",
+            headers=self.login(),
+            json={"worker": "local", "profile": "default"},
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "BACKUP_DIAGNOSTIC_WORKER_MISMATCH")
+        self.assertEqual(response.json()["error"]["details"]["reported_worker"], "gateway")
+
+    def test_backup_tdl_diagnostics_rejects_invalid_profile_before_worker_rpc(self):
+        response = self.client.post(
+            "/api/v1/backups/tdl-diagnostics",
+            headers=self.login(),
+            json={"worker": "local", "profile": "!!!"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "PROFILE_NAME_INVALID")
+        self.assertEqual(self.dispatcher.profile_tdl_diagnostic_calls, [])
 
     def test_desired_worker_settings_are_persisted_without_worker_rpc_then_acked(self):
         headers = self.login()

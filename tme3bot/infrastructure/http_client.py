@@ -277,6 +277,15 @@ class WorkerHttpDispatcher:
             timeout=20,
         )
 
+    def profile_tdl_diagnostics(self, worker: str, profile: str) -> dict[str, Any]:
+        """Run read-only identity checks for both TDL sessions on a worker."""
+        return self._profile_json(
+            worker,
+            "GET",
+            f"/internal/v1/profiles/{quote(profile, safe='')}/tdl-diagnostics",
+            timeout=130,
+        )
+
     def dispatch(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:
