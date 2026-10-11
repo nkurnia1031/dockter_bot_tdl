@@ -58,6 +58,76 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             (data / namespace).write_bytes(b"bolt database")
         return root
 
+    def test_local_profile_inventory_returns_only_safe_per_session_checks(self):
+        class Manager:
+            def local_profiles(self):
+                return ["default", "irang"]
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = Manager()
+        executor.diagnose_profile_export = lambda profile: {
+            "ready": profile == "default",
+            "telegram_user_id": 424242,
+            "profile_root": "/data/profiles/private",
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {
+                    "name": "user1_session",
+                    "ready": profile == "default",
+                    "code": "OK" if profile == "default" else "PROFILE_USER1_SESSION_MISSING",
+                },
+            ],
+        }
+
+        result = executor.local_profile_inventory()
+
+        self.assertEqual([item["name"] for item in result["items"]], ["default", "irang"])
+        self.assertTrue(result["items"][0]["ready"])
+        self.assertFalse(result["items"][1]["ready"])
+        self.assertEqual(result["items"][1]["reason_codes"], ["PROFILE_USER1_SESSION_MISSING"])
+        serialized = json.dumps(result)
+        self.assertNotIn("424242", serialized)
+        self.assertNotIn("/data", serialized)
+
+    def test_local_profile_inventory_omits_uninitialized_default_placeholder(self):
+        class Manager:
+            def local_profiles(self):
+                return ["default"]
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = Manager()
+        executor.diagnose_profile_export = lambda _profile: {
+            "ready": False,
+            "checks": [
+                {"name": "identity", "ready": False, "code": "PROFILE_IDENTITY_MISSING"},
+                {"name": "root_session", "ready": False, "code": "PROFILE_ROOT_SESSION_MISSING"},
+                {"name": "user1_session", "ready": False, "code": "PROFILE_USER1_SESSION_MISSING"},
+            ],
+        }
+
+        self.assertEqual(executor.local_profile_inventory(), {"items": []})
+
+    def test_local_profile_inventory_reports_active_session_lock_without_opening_sessions(self):
+        class Manager:
+            def local_profiles(self):
+                return ["irang"]
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = Manager()
+        executor.diagnose_profile_export = lambda _profile: {
+            "ready": False,
+            "checks": [{"name": "session_locks", "ready": False, "code": "PROFILE_SESSION_BUSY"}],
+        }
+
+        result = executor.local_profile_inventory()
+
+        self.assertEqual(result["items"][0]["reason_codes"], ["PROFILE_SESSION_BUSY"])
+        self.assertEqual(
+            [check["code"] for check in result["items"][0]["checks"]],
+            ["PROFILE_SESSION_BUSY"] * 3,
+        )
+
     def test_tdl_diagnosis_checks_each_session_with_its_own_runtime_config(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

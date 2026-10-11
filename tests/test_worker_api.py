@@ -331,6 +331,39 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid_cancel.status_code, 422)
 
+    def test_local_profile_inventory_requires_worker_token_and_returns_safe_summary(self):
+        expected = {
+            "items": [
+                {
+                    "name": "irang",
+                    "ready": False,
+                    "reason_codes": ["PROFILE_USER1_SESSION_MISSING"],
+                    "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {
+                            "name": "user1_session",
+                            "ready": False,
+                            "code": "PROFILE_USER1_SESSION_MISSING",
+                        },
+                    ],
+                }
+            ]
+        }
+        self.executor.local_profile_inventory = lambda: expected
+
+        denied = self.client.get("/internal/v1/profiles/local")
+        self.assertEqual(denied.status_code, 401)
+
+        accepted = self.client.get(
+            "/internal/v1/profiles/local",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json(), expected)
+        self.assertNotIn("/data", accepted.text)
+        self.assertNotIn("telegram_user_id", accepted.text)
+
     def test_durable_command_endpoints_require_auth_and_ready_journal(self):
         envelope = {
             "command_id": "command-1",

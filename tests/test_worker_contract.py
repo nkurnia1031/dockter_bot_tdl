@@ -1,3 +1,5 @@
+import io
+import urllib.error
 import unittest
 from unittest.mock import call, patch
 
@@ -45,6 +47,37 @@ class ContractWorkerRegistry:
 
 
 class WorkerContractTests(unittest.TestCase):
+    def test_local_profile_inventory_dispatch_classifies_timeout_network_and_worker_error(self):
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+        with patch(
+            "tme3bot.infrastructure.http_client.profile_transfer_is_secure",
+            return_value=True,
+        ), patch("tme3bot.infrastructure.http_client.build_opener") as build_opener:
+            opener = build_opener.return_value
+            cases = (
+                (urllib.error.URLError(TimeoutError("slow")), 504, "timeout"),
+                (urllib.error.URLError(ConnectionError("offline")), 503, "network"),
+                (
+                    urllib.error.HTTPError(
+                        "https://worker.test/internal/v1/profiles/local",
+                        500,
+                        "Internal Server Error",
+                        {},
+                        io.BytesIO(b'{"error":{"message":"private detail"}}'),
+                    ),
+                    500,
+                    "response",
+                ),
+            )
+            for error, expected_status, expected_kind in cases:
+                with self.subTest(kind=expected_kind):
+                    opener.open.side_effect = error
+                    with self.assertRaises(JsonHttpError) as raised:
+                        dispatcher.profile_local_inventory("remote")
+                    self.assertEqual(raised.exception.status, expected_status)
+                    self.assertEqual(raised.exception.kind, expected_kind)
+                    self.assertNotIn("private detail", str(raised.exception))
+
     def test_resolver_readiness_uses_private_http_addon_health(self):
         executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
         with patch("tme3bot.worker.resolver_client.resolver_addon_ready", return_value=True) as ready:

@@ -23,7 +23,12 @@ from tme3bot.export_catalog import discard_export_without_media, inspect_export_
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
 from tme3bot.progress_reporter import ProgressReporter
+from tme3bot.profile_diagnostics import (
+    PROFILE_LOCAL_DIAGNOSTIC_CHECKS,
+    PROFILE_LOCAL_DIAGNOSTIC_CODES,
+)
 from tme3bot.profiles import build_profile_config
+from tme3bot.names import normalize_profile_name
 from tme3bot.state import HttpStateStore, StateApiError
 from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
@@ -275,6 +280,89 @@ class WorkerJobExecutor(
 
     def profile_sync_status(self) -> dict[str, Any]:
         return self.profile_sync.snapshot()
+
+    def local_profile_inventory(self) -> dict[str, Any]:
+        """Return a safe summary of the local profiles actually present on this worker."""
+        list_local = getattr(self.profile_manager, "local_profiles", None)
+        if not callable(list_local):
+            raise RuntimeError("Local profile inventory is unavailable.")
+        items: list[dict[str, Any]] = []
+        for raw_name in list_local():
+            profile = normalize_profile_name(str(raw_name or ""))
+            if not profile:
+                continue
+            try:
+                diagnostic = self.diagnose_profile_export(profile)
+            except Exception:
+                diagnostic = {
+                    "ready": False,
+                    "reason_codes": ["PROFILE_SESSION_UNAVAILABLE"],
+                    "checks": [
+                        {"name": "identity", "ready": False, "code": "PROFILE_SESSION_UNAVAILABLE"},
+                        {"name": "root_session", "ready": False, "code": "PROFILE_SESSION_UNAVAILABLE"},
+                        {"name": "user1_session", "ready": False, "code": "PROFILE_SESSION_UNAVAILABLE"},
+                    ],
+                }
+            if not isinstance(diagnostic, dict):
+                diagnostic = {}
+            checks = diagnostic.get("checks") if isinstance(diagnostic, dict) else None
+            checks_by_name: dict[str, dict[str, Any]] = {}
+            session_busy = False
+            if isinstance(checks, list):
+                for item in checks:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "")
+                    if name == "session_locks" and item.get("code") == "PROFILE_SESSION_BUSY":
+                        session_busy = True
+                        continue
+                    if name not in PROFILE_LOCAL_DIAGNOSTIC_CHECKS or name in checks_by_name:
+                        continue
+                    raw_code = str(item.get("code") or "PROFILE_SESSION_UNAVAILABLE")
+                    code = raw_code if raw_code in PROFILE_LOCAL_DIAGNOSTIC_CODES else "PROFILE_SESSION_UNAVAILABLE"
+                    checks_by_name[name] = {
+                        "name": name,
+                        "ready": bool(item.get("ready")),
+                        "code": code,
+                    }
+            safe_checks = [
+                {
+                    "name": name,
+                    "ready": False,
+                    "code": "PROFILE_SESSION_BUSY",
+                }
+                for name in ("identity", "root_session", "user1_session")
+            ] if session_busy else [
+                checks_by_name.get(name, {
+                    "name": name,
+                    "ready": False,
+                    "code": "PROFILE_SESSION_UNAVAILABLE",
+                })
+                for name in ("identity", "root_session", "user1_session")
+            ]
+            if profile == normalize_profile_name(
+                str(getattr(getattr(self, "config", None), "default_profile", "default") or "default")
+            ) and {
+                item["code"] for item in safe_checks
+            } == {
+                "PROFILE_IDENTITY_MISSING",
+                "PROFILE_ROOT_SESSION_MISSING",
+                "PROFILE_USER1_SESSION_MISSING",
+            }:
+                # The default profile is part of the runtime configuration,
+                # even on a fresh worker that has never had a local TDL login.
+                # Do not report that placeholder as an installed profile.
+                continue
+            reasons = list(dict.fromkeys(
+                str(item["code"]) for item in safe_checks if not item["ready"]
+            ))
+            items.append({
+                "name": profile,
+                "ready": bool(diagnostic.get("ready")) and not reasons,
+                "reason_codes": reasons,
+                "checks": safe_checks,
+            })
+        return {"items": items}
 
     def request_profile_sync(self, profile: str | None = None, mode: str = "check") -> dict[str, Any]:
         return self.profile_sync.request_sync(profile=profile, mode=mode)

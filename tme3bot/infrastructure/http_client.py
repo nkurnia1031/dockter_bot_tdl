@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 import urllib.error
 import urllib.request
 from typing import Any
@@ -27,10 +28,18 @@ from tme3bot.profile_provisioning import profile_transfer_is_secure
 
 
 class JsonHttpError(RuntimeError):
-    def __init__(self, status: int, message: str, payload: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        status: int,
+        message: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        kind: str | None = None,
+    ):
         super().__init__(message)
         self.status = status
         self.payload = payload or {}
+        self.kind = kind
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -121,9 +130,21 @@ class WorkerHttpDispatcher:
         except urllib.error.HTTPError as exc:
             # Do not return worker response bodies; they may contain TDL or
             # filesystem details that must remain private.
-            raise JsonHttpError(exc.code, "Worker menolak operasi provisioning profil.") from exc
+            raise JsonHttpError(
+                exc.code,
+                "Worker menolak operasi provisioning profil.",
+                kind="response",
+            ) from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise JsonHttpError(504, "Worker request timed out.", kind="timeout") from exc
         except urllib.error.URLError as exc:
-            raise JsonHttpError(503, "Worker provisioning tidak dapat dihubungi.") from exc
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise JsonHttpError(504, "Worker request timed out.", kind="timeout") from exc
+            raise JsonHttpError(
+                503,
+                "Worker provisioning tidak dapat dihubungi.",
+                kind="network",
+            ) from exc
 
     def _profile_json(
         self,
@@ -139,7 +160,16 @@ class WorkerHttpDispatcher:
             json.dumps(payload or {}).encode("utf-8") if method.upper() != "GET" else b"",
             timeout=timeout,
         )
-        return json.loads(data.decode("utf-8")) if data else {}
+        if not data:
+            return {}
+        try:
+            return json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise JsonHttpError(
+                502,
+                "Worker mengembalikan respons yang tidak valid.",
+                kind="protocol",
+            ) from exc
 
     def validate_profile_session(self, worker: str, archive_data: bytes) -> int:
         data, _ = self._profile_request(
@@ -175,6 +205,9 @@ class WorkerHttpDispatcher:
 
     def profile_sync_status(self, worker: str) -> dict[str, Any]:
         return self._profile_json(worker, "GET", "/internal/v1/profile-sync")
+
+    def profile_local_inventory(self, worker: str) -> dict[str, Any]:
+        return self._profile_json(worker, "GET", "/internal/v1/profiles/local", timeout=20)
 
     def request_profile_sync(
         self, worker: str, *, profile: str | None = None, mode: str = "check"

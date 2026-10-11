@@ -702,6 +702,66 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("private-hash", response.text)
         self.assertNotIn("queued_requests", response.json())
 
+    def test_local_profile_scan_requires_actor_and_returns_selected_worker_snapshot(self):
+        calls = []
+        self.dispatcher.profile_local_inventory = lambda worker: calls.append(worker) or {
+            "items": [
+                {
+                    "name": "irang",
+                    "ready": True,
+                    "reason_codes": [],
+                    "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": True, "code": "OK"},
+                    ],
+                }
+            ]
+        }
+
+        denied = self.client.post("/api/v1/workers/local/profiles/scan")
+        self.assertEqual(denied.status_code, 401)
+
+        response = self.client.post(
+            "/api/v1/workers/local/profiles/scan", headers=self.login(42)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(calls, ["local"])
+        self.assertEqual(body["worker"], "local")
+        self.assertTrue(body["checked_at"])
+        self.assertEqual(body["items"][0]["name"], "irang")
+        self.assertTrue(body["items"][0]["ready"])
+        self.assertNotIn("/data", response.text)
+        self.assertNotIn("telegram_user_id", response.text)
+
+        missing = self.client.post(
+            "/api/v1/workers/not-registered/profiles/scan", headers=self.login(42)
+        )
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(calls, ["local"])
+
+    def test_local_profile_scan_distinguishes_timeout_offline_and_worker_api_failure(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        auth = self.login(42)
+        client = TestClient(create_backend_app(self.context))
+        cases = (
+            (JsonHttpError(504, "timeout", kind="timeout"), 504, "WORKER_TIMEOUT"),
+            (JsonHttpError(503, "unavailable", kind="network"), 503, "WORKER_UNAVAILABLE"),
+            (JsonHttpError(500, "private worker detail", kind="response"), 502, "WORKER_SCAN_FAILED"),
+        )
+        for error, expected_status, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                def fail(_worker, current=error):
+                    raise current
+
+                self.dispatcher.profile_local_inventory = fail
+                response = client.post("/api/v1/workers/local/profiles/scan", headers=auth)
+                self.assertEqual(response.status_code, expected_status, response.text)
+                self.assertEqual(response.json()["error"]["code"], expected_code)
+                self.assertNotIn("private worker detail", response.text)
+
     def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
         self.context.queue_publisher = object()
         self.context.queue_command_service = object()

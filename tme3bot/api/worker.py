@@ -138,6 +138,21 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             return {"status": "disabled", "backend_available": None, "profiles": {}}
         return snapshot()
 
+    @app.get("/internal/v1/profiles/local", dependencies=[Depends(authorize)])
+    def local_profile_inventory():
+        inventory = getattr(context.executor, "local_profile_inventory", None)
+        if not callable(inventory):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung scan profil lokal.",
+                status_code=404,
+            )
+        return profile_operation(
+            inventory,
+            "PROFILE_INVENTORY_FAILED",
+            "Worker tidak dapat membaca inventaris profil lokal.",
+        )
+
     @app.post("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
     def request_profile_sync(body: dict[str, Any]):
         if set(body) - {"profile", "mode"}:
