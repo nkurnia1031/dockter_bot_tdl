@@ -98,24 +98,45 @@ di workspace. Verifier membaca ukuran dan SHA-256 dari `storage.db`, password
 dari `utility_settings.json`, serta JSON diagnosis tersebut; ia tidak menerima
 password sebagai argumen.
 
-Contoh setelah image gateway yang memuat verifier dideploy:
+Caption Telegram hanya menampilkan 12 karakter awal `run_id`; ambil `run_id`
+lengkap dari `python3 run.py backup status` di gateway atau daftar backup Web.
+Setiap `node_name` memiliki arsip sendiri meskipun `run_id`-nya sama. Untuk
+`--worker remote-2`, gunakan semua part `remote-2` dari run tersebut saja;
+part `backend` bukan kelanjutan arsip worker. Pastikan indeks part lengkap
+sesuai katalog sebelum menjalankan verifier.
+
+Contoh setelah image gateway yang memuat verifier dideploy. Ganti nilai
+`FULL_RUN_ID_FROM_BACKUP_STATUS` dengan run ID lengkap sebelum menjalankan;
+guard di bawah mencegah placeholder dipakai tanpa sengaja:
 
 ```bash
+RUN_ID='FULL_RUN_ID_FROM_BACKUP_STATUS'
+WORKER='remote-2'
+PROFILE='default'
+PARTS_DIR="/workspace/profile-backups/${RUN_ID}-${WORKER}"
+TDL_JSON="${PARTS_DIR}/tdl-diagnostics.json"
+
+if [ "$RUN_ID" = 'FULL_RUN_ID_FROM_BACKUP_STATUS' ]; then
+  echo 'Ganti RUN_ID dengan nilai lengkap dari katalog backup.' >&2
+  exit 2
+fi
+
 docker compose --env-file .env -f docker-compose.gateway.yml exec -T backend \
   python3 -m tools.verify_profile_backup \
-  --run-id RUN_ID \
-  --worker remote-1 \
-  --profile default \
-  --parts-dir /workspace/profile-backups/RUN_ID-remote-1 \
-  --tdl-diagnostics-json /workspace/profile-backups/RUN_ID-remote-1/tdl-diagnostics.json
+  --run-id "$RUN_ID" \
+  --worker "$WORKER" \
+  --profile "$PROFILE" \
+  --parts-dir "$PARTS_DIR" \
+  --tdl-diagnostics-json "$TDL_JSON"
 ```
 
 `.env` menyediakan nilai host untuk interpolasi Compose. Service `backend`
 sendiri tetap memuat `.env.backend` melalui `env_file`; jangan menaruh password
-backup pada command line atau menampilkan isi file env. Ganti `RUN_ID`, worker,
-dan direktori contoh dengan satu run backup nyata. Nilai `--worker` harus cocok
-dengan label worker pada JSON diagnosis dan node backup di katalog. Jika salah
-satu tidak cocok, verifier akan berhenti sebelum menyatakan arsip valid.
+backup pada command line atau menampilkan isi file env. Set `RUN_ID` ke ID
+lengkap dari satu run nyata dan `WORKER` ke node yang arsipnya diperiksa. Nilai
+`--worker` harus cocok dengan label worker pada JSON diagnosis dan node backup
+di katalog. Jika salah satu tidak cocok, verifier akan berhenti sebelum
+menyatakan arsip valid.
 
 Jika menjalankan verifier dari environment lokal, pasang dependensi opsional
 dengan `python -m pip install -r requirements-verifier.txt`, lalu berikan
