@@ -1,2 +1,2 @@
-# Optional local operator tool; kept out of worker/Telegram runtime images.
+# Required for worker-side backup verification and the local operator tool.
 py7zr>=1.1,<2

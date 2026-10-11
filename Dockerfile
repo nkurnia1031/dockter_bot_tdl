@@ -25,10 +25,14 @@ CMD ["python3", "/app/bot.py"]
 
 FROM runtime-base AS worker
 COPY requirements-tts.txt /tmp/requirements-tts.txt
-RUN python3 -m pip install --no-cache-dir -r /tmp/requirements-tts.txt \
+COPY requirements-verifier.txt /tmp/requirements-verifier.txt
+RUN python3 -m pip install --no-cache-dir \
+        -r /tmp/requirements-tts.txt \
+        -r /tmp/requirements-verifier.txt \
+    && python3 -c "import py7zr" \
     && apt-get update \
     && apt-get install -y --no-install-recommends tor \
-    && rm -rf /var/lib/apt/lists/* /tmp/requirements-tts.txt
+    && rm -rf /var/lib/apt/lists/* /tmp/requirements-tts.txt /tmp/requirements-verifier.txt
 COPY bot.py /app/bot.py
 COPY pkg_resources.py /app/pkg_resources.py
 COPY tme3bot /app/tme3bot
