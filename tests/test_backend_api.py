@@ -594,6 +594,34 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(job.worker, "local")
         self.assertEqual(self.jobs.command_payload(job.id)["dispatch_mode"], "durable")
 
+    def test_backup_verification_submit_accepts_private_archive_password_snapshot(self):
+        self.catalog.start_backup_run("backup-run-1", "local")
+        self.catalog.finish_backup_run("backup-run-1", "local")
+        self.control.utility_settings = self.context.utility_settings
+        self.context.utility_settings.set("compress_password", "test-archive-password")
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        client = TestClient(create_backend_app(self.context))
+
+        response = client.post(
+            "/api/v1/backups/verify",
+            headers={**self.login(42), "Idempotency-Key": "backup-verify-secret-snapshot"},
+            json={"worker": "local", "profile": "default", "run_id": "backup-run-1"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        job = self.jobs.get(response.json()["id"])
+        self.assertIsNotNone(job)
+        self.assertNotIn("test-archive-password", response.text)
+        ciphertext = self.jobs.private_value(job.id, "backup_archive_password")
+        self.assertIsNotNone(ciphertext)
+        self.assertEqual(
+            self.context.runtime_settings_store.decrypt_job_secret(
+                job.id, "backup_archive_password", ciphertext
+            ),
+            "test-archive-password",
+        )
+
     def test_background_job_submit_is_not_advertised_without_queue(self):
         capabilities = self.client.get("/api/v1/capabilities").json()
         self.assertNotIn("job.submit", capabilities["operations"]["supported_kinds"])

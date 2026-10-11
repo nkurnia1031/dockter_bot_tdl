@@ -52,6 +52,15 @@ _SPECS: dict[str, dict[str, Any]] = {
     "tts_newnym_after_retries": {"type": "integer", "scope": "worker", "apply_policy": "next_job"},
 }
 
+_JOB_SECRET_KEYS = frozenset(
+    {
+        "telegram_tts_chat_id",
+        "tdl_access_target",
+        "tdl_storage_chat_ref",
+        "backup_archive_password",
+    }
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -271,13 +280,13 @@ class SqliteSettingsStore:
         return f"job-settings:v1:{str(job_id)}:{key}".encode("utf-8")
 
     def encrypt_job_secret(self, job_id: str, key: str, value: str) -> bytes:
-        """Encrypt a backend-only, job-pinned secret such as a TTS recipient."""
-        if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref"} or not str(job_id).strip():
+        """Encrypt an allowlisted backend-only secret pinned to one job."""
+        if key not in _JOB_SECRET_KEYS or not str(job_id).strip():
             raise ValueError("Snapshot secret job tidak dikenal.")
         return self._secret_store.encrypt(str(value), self._job_secret_aad(job_id, key))
 
     def decrypt_job_secret(self, job_id: str, key: str, ciphertext: bytes) -> str:
-        if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref"} or not str(job_id).strip():
+        if key not in _JOB_SECRET_KEYS or not str(job_id).strip():
             raise ValueError("Snapshot secret job tidak dikenal.")
         return self._secret_store.decrypt(
             bytes(ciphertext), self._job_secret_aad(job_id, key)
