@@ -166,6 +166,33 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.assertEqual(report["canary_evidence_status"], "tdl_not_attached")
         self.assertNotIn(self.password, json.dumps(report))
 
+    def test_worker_supplied_parts_can_be_verified_when_catalog_checksum_metadata_is_missing(self):
+        def factory(path, password):
+            return FakeArchive(path, password, self.manifest)
+
+        timestamped_part_name = "backup-remote-2-2026-10-11T072127+0000.7z.001"
+        (self.parts_dir / timestamped_part_name).write_bytes(self.part_data)
+
+        report = verify_profile_backup(
+            run_id=self.run_id,
+            node_name=self.worker,
+            profile="default",
+            parts_dir=self.parts_dir,
+            run_record={
+                "run_id": self.run_id,
+                "node_name": self.worker,
+                "started_at": "2026-10-11T01:00:00+00:00",
+                "status": "complete",
+            },
+            part_records=[{"part_name": timestamped_part_name, "status": "metadata_missing"}],
+            password=self.password,
+            archive_factory=factory,
+        )
+
+        self.assertEqual(report["status"], "verified")
+        self.assertIsNone(report["checksums_match"])
+        self.assertEqual(report["checksum_validation"], "unavailable")
+
     def test_missing_part_and_checksum_mismatch_fail_before_archive_open(self):
         (self.parts_dir / self.part_name).unlink()
         report, _ = self.verify()

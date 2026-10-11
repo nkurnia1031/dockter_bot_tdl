@@ -7,6 +7,7 @@ from tme3bot.api.schemas import WorkerEventRequest
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.domain.models import DomainError
 from tme3bot.domain.worker_contract import (
+    CAP_BACKUP_VERIFY,
     CAP_DURABLE_COMMANDS_V1,
     CAP_QUICKMODE_DELETE,
     CAP_QUICKMODE_STAGING,
@@ -70,6 +71,8 @@ class WorkerContractTests(unittest.TestCase):
             set(body["capabilities"]),
             WORKER_API_CAPABILITIES | {CAP_DURABLE_COMMANDS_V1},
         )
+        self.assertEqual(CAP_BACKUP_VERIFY, "backup_channel_verify.v2")
+        self.assertIn(CAP_BACKUP_VERIFY, body["capabilities"])
         self.assertEqual(body["profiles"], ["default"])
 
     def test_durable_capability_is_hidden_until_journal_and_sender_are_ready(self):

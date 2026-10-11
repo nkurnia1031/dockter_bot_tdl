@@ -73,6 +73,7 @@ class BackupVerificationExecutorMixin:
         download_error = ""
         runtime = self.profile_manager.runtime(profile)
         current_part: dict[str, Any] = {}
+        matched_parts: list[dict[str, Any]] = []
         completed_bytes = 0
         expected_total_bytes = sum(
             int(item.get("file_size") or 0)
@@ -80,13 +81,46 @@ class BackupVerificationExecutorMixin:
             if isinstance(item, dict)
         )
 
-        def report_download(stage: str, index: int, total: int, part_name: str) -> None:
+        parts_dir: Path | None = None
+
+        def report_download(
+            stage: str,
+            index: int,
+            total: int,
+            part_name: str,
+            message_id: int | None = None,
+        ) -> None:
             nonlocal completed_bytes
             current_part.clear()
             row = next((item for item in parts if isinstance(item, dict) and item.get("part_name") == part_name), {})
             current_part.update({"index": index, "total": total, **row})
+            if stage == "matched" and message_id is not None:
+                matched_parts.append({"name": part_name, "message_id": message_id})
+                reporter.report(
+                    phase="matching_backup_parts",
+                    message=f"Part {index}/{total} cocok dengan worker dan run yang dipilih",
+                    overall={"current": index, "total": total, "unit": "parts"},
+                    item={"name": part_name, "index": index, "total": total},
+                    force=True,
+                )
+                return
+            if stage == "scanning":
+                reporter.report(
+                    phase="scanning_backup_channel",
+                    message="Mengekspor JSON channel backup untuk mencari caption worker dan run",
+                    overall={"current": 0, "total": 0, "unit": "messages"},
+                    indeterminate=True,
+                    force=True,
+                )
+                return
             if stage == "downloaded":
-                completed_bytes += int(row.get("file_size") or 0)
+                downloaded_path = parts_dir / part_name if parts_dir is not None else None
+                downloaded_size = (
+                    downloaded_path.stat().st_size
+                    if downloaded_path is not None and downloaded_path.is_file()
+                    else int(row.get("file_size") or 0)
+                )
+                completed_bytes += downloaded_size
                 progress = reporter.report(
                     phase="downloading_backup_parts",
                     message=f"Part {index}/{total} selesai diunduh dari channel backup",
@@ -105,11 +139,7 @@ class BackupVerificationExecutorMixin:
             else:
                 reporter.report(
                     phase="downloading_backup_parts",
-                    message=(
-                        f"Membaca metadata part {index}/{total} dari channel backup"
-                        if stage == "exporting"
-                        else f"Mengunduh part {index}/{total} dari channel backup"
-                    ),
+                    message=f"Mengunduh part {index}/{total} berdasarkan message ID hasil pencocokan",
                     overall={"current": index - 1, "total": total, "unit": "parts"},
                     item={"name": part_name, "index": index, "total": total},
                     indeterminate=stage == "downloading",
@@ -134,6 +164,8 @@ class BackupVerificationExecutorMixin:
                         download_backup_parts(
                             runtime.export_tdl_client,
                             channel_ref=channel_ref,
+                            node_name=worker,
+                            run_id=run_id,
                             parts=parts,
                             destination=parts_dir,
                             progress=report_download,
@@ -141,10 +173,32 @@ class BackupVerificationExecutorMixin:
             except BackupChannelDownloadError as exc:
                 download_error = exc.code
 
+            downloaded_files = sorted(
+                path
+                for path in parts_dir.iterdir()
+                if path.is_file() and not path.is_symlink()
+            )
+            catalog_parts_by_name = {
+                str(item.get("part_name") or ""): item
+                for item in parts
+                if isinstance(item, dict)
+            }
+            verification_parts: list[dict[str, Any]] = []
+            for path in downloaded_files:
+                record: dict[str, Any] = {"part_name": path.name}
+                catalog_part = catalog_parts_by_name.get(path.name, {})
+                size = catalog_part.get("file_size")
+                digest = str(catalog_part.get("sha256") or "").lower()
+                if type(size) is int and size > 0:
+                    record["file_size"] = size
+                if len(digest) == 64 and all(char in "0123456789abcdef" for char in digest):
+                    record["sha256"] = digest
+                verification_parts.append(record)
+
             reporter.report(
                 phase="verifying_archive",
                 message="Memeriksa checksum, password, integritas, dan sesi di arsip",
-                overall={"current": len(parts) if not download_error else 0, "total": len(parts), "unit": "parts"},
+                overall={"current": len(downloaded_files), "total": len(downloaded_files), "unit": "parts"},
                 indeterminate=True,
                 force=True,
             )
@@ -155,12 +209,14 @@ class BackupVerificationExecutorMixin:
                 parts_dir=parts_dir,
                 tdl_diagnostics=diagnostics,
                 run_record=run_record,
-                part_records=parts,
+                part_records=verification_parts,
                 password=password,
             )
             report["download"] = {
                 "status": "failed" if download_error else "complete",
                 "reason_code": download_error or None,
+                "source": "tdl_export_json_with_content",
+                "matched_parts": matched_parts,
             }
             if download_error:
                 report["status"] = "failed"
@@ -177,7 +233,12 @@ class BackupVerificationExecutorMixin:
                 if report.get("status") == "verified"
                 else "Pemeriksaan selesai; lihat kode alasan pada laporan JSON"
             ),
-            overall={"current": len(parts), "total": len(parts), "percent": 100, "unit": "parts"},
+            overall={
+                "current": int(report.get("part_count") or 0),
+                "total": int(report.get("part_count") or 0),
+                "percent": 100 if report.get("status") == "verified" else None,
+                "unit": "parts",
+            },
             indeterminate=False,
             force=True,
         )

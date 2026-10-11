@@ -174,11 +174,50 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(payload["node_name"], "remote-2")
         self.assertEqual(payload["profile"], "default")
         self.assertEqual(payload["channel_ref"], "123456")
-        self.assertEqual(payload["parts"][0]["channel_message_id"], 733)
+        self.assertEqual(payload["parts"], [])
         public = control._redacted_payload("backup_verify", payload)
-        self.assertEqual(public, {"run_id": "run-abc", "node_name": "remote-2", "part_count": 1})
-        self.assertNotIn("sha256", public)
-        self.assertNotIn("channel_message_id", public)
+        self.assertEqual(public, {
+            "run_id": "run-abc",
+            "node_name": "remote-2",
+            "part_discovery": "tdl_channel_caption_scan",
+        })
+
+    def test_backup_verification_can_recover_part_ids_from_channel_when_catalog_metadata_is_incomplete(self):
+        control = object.__new__(ControlPlane)
+        control.storage_catalog = FakeBackupCatalog()
+        control.storage_catalog.backup_parts = lambda run_id, node_name: [{
+            "part_name": "backup-remote-2-2026-10-11T072127+0000.7z.001",
+            "channel_id": -100123456,
+            "channel_message_id": None,
+            "file_size": None,
+            "sha256": "",
+            "status": "metadata_missing",
+        }]
+
+        payload = control._prepare_durable_payload(
+            self.actor, "backup_verify", {"run_id": "run-abc"}, "default", "remote-2"
+        )
+
+        self.assertEqual(payload["channel_ref"], "123456")
+        self.assertEqual(payload["parts"], [])
+
+    def test_backup_verification_can_use_configured_channel_without_catalog_part_rows(self):
+        class RuntimeSettings:
+            def get_values(self, scope, *, include_secrets=False):
+                del include_secrets
+                return {"backup_channel": "123456"} if scope == "backend" else {}
+
+        control = object.__new__(ControlPlane)
+        control.storage_catalog = FakeBackupCatalog()
+        control.storage_catalog.backup_parts = lambda _run_id, _node_name: []
+        control.runtime_settings_store = RuntimeSettings()
+
+        payload = control._prepare_durable_payload(
+            self.actor, "backup_verify", {"run_id": "run-abc"}, "default", "remote-2"
+        )
+
+        self.assertEqual(payload["channel_ref"], "123456")
+        self.assertEqual(payload["parts"], [])
 
     def test_backup_verification_rejects_incomplete_run(self):
         control = object.__new__(ControlPlane)

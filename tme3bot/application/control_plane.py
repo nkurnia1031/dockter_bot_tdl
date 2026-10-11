@@ -721,41 +721,41 @@ class ControlPlane:
             if str(run.get("status") or "") != "complete":
                 raise DomainError("BACKUP_RUN_NOT_COMPLETE", "Run backup worker belum berstatus complete.", status_code=409)
             raw_parts = self.storage_catalog.backup_parts(run_id, worker)
-            if not raw_parts or len(raw_parts) > 200:
-                raise DomainError("BACKUP_PARTS_INVALID", "Daftar part backup tidak tersedia atau terlalu besar.", status_code=409)
-            try:
-                channel_ids = {int(item.get("channel_id") or 0) for item in raw_parts}
-            except (TypeError, ValueError):
-                channel_ids = set()
-            if len(channel_ids) != 1 or not next(iter(channel_ids), 0):
+            channel_ids: set[int] = set()
+            for item in raw_parts if isinstance(raw_parts, list) else []:
+                try:
+                    channel_id = int(item.get("channel_id") or 0)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if channel_id:
+                    channel_ids.add(channel_id)
+            if len(channel_ids) > 1:
                 raise DomainError("BACKUP_CHANNEL_INVALID", "Part backup tidak menunjuk ke satu channel Telegram yang sama.", status_code=409)
-            normalized_parts: list[dict[str, Any]] = []
-            for item in raw_parts:
-                part_name = str(item.get("part_name") or "")
-                message_id = item.get("channel_message_id")
-                size = item.get("file_size")
-                digest = str(item.get("sha256") or "").lower()
-                if (
-                    not re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", part_name)
-                    or ".7z" not in part_name.lower()
-                    or type(message_id) is not int
-                    or message_id < 1
-                    or type(size) is not int
-                    or size < 1
-                    or not re.fullmatch(r"[a-f0-9]{64}", digest)
-                    or str(item.get("status") or "") != "active"
-                ):
-                    raise DomainError("BACKUP_PART_METADATA_INVALID", "Metadata part backup tidak lengkap atau tidak aktif.", status_code=409)
-                normalized_parts.append({
-                    "part_name": part_name,
-                    "channel_message_id": message_id,
-                    "file_size": size,
-                    "sha256": digest,
-                    "status": "active",
-                })
             from tme3bot.channel_ref import channel_tdl_ref
 
-            channel_ref = channel_tdl_ref(str(next(iter(channel_ids))))
+            if channel_ids:
+                channel_ref = channel_tdl_ref(str(next(iter(channel_ids))))
+            else:
+                settings = {}
+                getter = getattr(
+                    getattr(self, "runtime_settings_store", None),
+                    "get_values",
+                    None,
+                )
+                if callable(getter):
+                    try:
+                        try:
+                            settings = getter("backend", include_secrets=False)
+                        except TypeError:
+                            settings = getter("backend")
+                    except Exception:
+                        settings = {}
+                configured_channel = (
+                    settings.get("backup_channel")
+                    or settings.get("backup_channel_ref")
+                    or settings.get("backup_channel_id")
+                ) if isinstance(settings, dict) else ""
+                channel_ref = channel_tdl_ref(str(configured_channel or ""))
             if not channel_ref:
                 raise DomainError("BACKUP_CHANNEL_INVALID", "Referensi channel backup tidak dapat dipakai TDL.", status_code=409)
             return {
@@ -768,7 +768,10 @@ class ControlPlane:
                     "started_at": str(run.get("started_at") or ""),
                     "status": str(run.get("status") or ""),
                 },
-                "parts": normalized_parts,
+                # The worker discovers this run's part names and message IDs
+                # from `chat export --with-content`. Catalog rows are optional
+                # hints only; stale IDs/checksums/status must not block a run.
+                "parts": [],
                 "channel_ref": channel_ref,
             }
 
@@ -2355,7 +2358,7 @@ class ControlPlane:
             return {
                 "run_id": str(payload.get("run_id") or ""),
                 "node_name": str(payload.get("node_name") or ""),
-                "part_count": len(payload.get("parts") or []),
+                "part_discovery": "tdl_channel_caption_scan",
             }
         if kind == "tts":
             text = str(payload.get("text") or "")

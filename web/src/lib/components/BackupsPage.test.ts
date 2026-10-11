@@ -47,6 +47,14 @@ describe('BackupsPage TDL diagnosis', () => {
         result: { value: { report: {
           worker: 'remote-2', profile: 'default', run_id: 'full-run-id-for-test', status: 'verified',
           part_count: 2, reason_codes: [], canary_evidence_status: 'ready_for_operator_review',
+          checksum_validation: 'unavailable', checksums_match: null,
+          download: {
+            source: 'tdl_export_json_with_content',
+            matched_parts: [
+              { name: 'backup-remote-2.7z.001', message_id: 733 },
+              { name: 'backup-remote-2.7z.002', message_id: 734 },
+            ],
+          },
           tdl_diagnostics: { ready: true, identity_match: true },
         } } },
       };
@@ -98,6 +106,9 @@ describe('BackupsPage TDL diagnosis', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
     await screen.findByText('Arsip terverifikasi');
     expect(screen.getByText('Sesi TDL lolos; bukti siap ditinjau untuk canary.')).toBeTruthy();
+    expect(screen.getByText(/Checksum katalog tidak tersedia/)).toBeTruthy();
+    await fireEvent.click(screen.getByText('Lihat part dan message ID yang diunduh'));
+    expect(screen.getByText('733')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Salin JSON' })).toBeTruthy();
     await fireEvent.click(screen.getByText('Lihat JSON canary lengkap'));
     expect(screen.getByText(/"canary_evidence_status"/)).toBeTruthy();

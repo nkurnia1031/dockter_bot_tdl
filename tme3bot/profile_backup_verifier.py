@@ -55,6 +55,7 @@ def verify_profile_backup(
         "archive_created_at": None,
         "part_count": 0,
         "checksums_match": False,
+        "checksum_validation": "not_checked",
         "integrity": "not_checked",
         "decryption": "not_checked",
         "sessions": [
@@ -91,9 +92,18 @@ def verify_profile_backup(
         report["backup_started_at"] = _safe_label(str(run.get("started_at") or "")) or None
         if str(run.get("status") or "") != "complete":
             raise _VerificationFailure("BACKUP_RUN_NOT_COMPLETE")
-        parts = _validate_parts(Path(parts_dir), rows)
+        parts, verified_checksum_count = _validate_parts(Path(parts_dir), rows)
         report["part_count"] = len(parts)
-        report["checksums_match"] = True
+        report["checksums_match"] = (
+            True if verified_checksum_count == len(parts) else None
+        )
+        report["checksum_validation"] = (
+            "verified"
+            if verified_checksum_count == len(parts)
+            else "partial"
+            if verified_checksum_count
+            else "unavailable"
+        )
         if supplied_catalog:
             password = str(password or "")
             if not password:
@@ -207,33 +217,42 @@ def _read_catalog(database: Path, run_id: str, node_name: str) -> tuple[dict[str
     return dict(run_row), [dict(row) for row in rows]
 
 
-def _validate_parts(parts_dir: Path, rows: list[dict[str, Any]]) -> list[Path]:
+def _validate_parts(
+    parts_dir: Path, rows: list[dict[str, Any]]
+) -> tuple[list[Path], int]:
     if parts_dir.is_symlink() or not parts_dir.is_dir():
         raise _VerificationFailure("BACKUP_PARTS_DIRECTORY_INVALID")
-    expected: list[tuple[str, int, str]] = []
+    expected: list[tuple[str, int | None, str | None]] = []
     for row in rows:
         name = str(row.get("part_name") or "")
         size = row.get("file_size")
         digest = str(row.get("sha256") or "").lower()
-        if not _safe_part_name(name) or not isinstance(size, int) or size < 1 or not re.fullmatch(r"[a-f0-9]{64}", digest):
-            raise _VerificationFailure("BACKUP_CATALOG_CHECKSUM_MISSING")
-        if str(row.get("status") or "") != "active":
-            raise _VerificationFailure("BACKUP_PART_NOT_ACTIVE")
-        expected.append((name, size, digest))
+        if not _safe_part_name(name):
+            raise _VerificationFailure("BACKUP_CATALOG_INVALID")
+        expected_size = size if type(size) is int and size > 0 else None
+        expected_digest = digest if re.fullmatch(r"[a-f0-9]{64}", digest) else None
+        expected.append((name, expected_size, expected_digest))
+    if not expected:
+        raise _VerificationFailure("BACKUP_PARTS_EMPTY")
     expected.sort(key=lambda item: item[0])
     if len({item[0] for item in expected}) != len(expected):
         raise _VerificationFailure("BACKUP_CATALOG_INVALID")
     paths: list[Path] = []
+    verified_checksum_count = 0
     for name, expected_size, expected_digest in expected:
         path = parts_dir / name
         if path.is_symlink() or not path.is_file():
             raise _VerificationFailure("BACKUP_PART_MISSING")
         digest, size = _hash_file(path)
-        if size != expected_size or digest != expected_digest:
+        if expected_size is not None and size != expected_size:
             raise _VerificationFailure("BACKUP_PART_CHECKSUM_MISMATCH")
+        if expected_digest is not None and digest != expected_digest:
+            raise _VerificationFailure("BACKUP_PART_CHECKSUM_MISMATCH")
+        if expected_digest is not None:
+            verified_checksum_count += 1
         paths.append(path)
     _validate_part_sequence(paths)
-    return paths
+    return paths, verified_checksum_count
 
 
 def _hash_file(path: Path) -> tuple[str, int]:
@@ -444,7 +463,7 @@ def _safe_part_name(value: str) -> bool:
     return (
         bool(value)
         and Path(value).name == value
-        and bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", value))
+        and bool(re.fullmatch(r"[A-Za-z0-9_.+-]{1,200}", value))
         and ".7z" in value.lower()
     )
 
