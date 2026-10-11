@@ -20,6 +20,10 @@ membaca `.env.worker` untuk interpolasi `PROFILE_ROOT` pada mount `/data`;
 `env_file` milik service baru dimuat setelah interpolasi Compose, jadi tidak
 cukup hanya mengandalkan `env_file` tersebut. Gunakan opsi env yang sama untuk
 perintah `ps`, `exec`, atau perintah Compose lain pada deployment ini.
+Field `worker` pada hasil diagnosis berasal dari `BACKUP_NODE_NAME` di env
+worker, bukan dari nama host yang dideteksi otomatis. Nilai itu juga menjadi
+label node backup. Cocokkan dengan nama worker dan node backup yang benar
+sebelum memakai hasilnya; jangan mengedit JSON hasil untuk mengganti label.
 
 ```bash
 docker compose --env-file .env.worker -f docker-compose.worker.yml exec -T worker python3 - <<'PY'
@@ -30,12 +34,16 @@ import urllib.request
 port = os.environ.get("WORKER_PORT", "8080")
 token = os.environ.get("WORKER_API_TOKEN", "")
 profile = "default"
+expected_worker = "remote-1"  # ganti dengan nama worker yang sedang diperiksa
 request = urllib.request.Request(
     f"http://127.0.0.1:{port}/internal/v1/profiles/{profile}/tdl-diagnostics",
     headers={"Authorization": f"Bearer {token}"},
 )
 with urllib.request.urlopen(request, timeout=130) as response:
-    print(json.dumps(json.loads(response.read()), sort_keys=True))
+    result = json.loads(response.read())
+if result.get("worker") != expected_worker:
+    raise SystemExit("Nama worker hasil diagnosis tidak cocok; periksa BACKUP_NODE_NAME.")
+print(json.dumps(result, sort_keys=True))
 PY
 ```
 
@@ -52,12 +60,16 @@ import urllib.request
 port = os.environ.get("WORKER_PORT", "8080")
 token = os.environ.get("WORKER_API_TOKEN", "")
 profile = "default"
+expected_worker = "local"  # ganti dengan nama worker yang sedang diperiksa
 request = urllib.request.Request(
     f"http://127.0.0.1:{port}/internal/v1/profiles/{profile}/tdl-diagnostics",
     headers={"Authorization": f"Bearer {token}"},
 )
 with urllib.request.urlopen(request, timeout=130) as response:
-    print(json.dumps(json.loads(response.read()), sort_keys=True))
+    result = json.loads(response.read())
+if result.get("worker") != expected_worker:
+    raise SystemExit("Nama worker hasil diagnosis tidak cocok; periksa BACKUP_NODE_NAME.")
+print(json.dumps(result, sort_keys=True))
 PY
 ```
 
@@ -100,7 +112,10 @@ docker compose --env-file .env -f docker-compose.gateway.yml exec -T backend \
 
 `.env` menyediakan nilai host untuk interpolasi Compose. Service `backend`
 sendiri tetap memuat `.env.backend` melalui `env_file`; jangan menaruh password
-backup pada command line atau menampilkan isi file env.
+backup pada command line atau menampilkan isi file env. Ganti `RUN_ID`, worker,
+dan direktori contoh dengan satu run backup nyata. Nilai `--worker` harus cocok
+dengan label worker pada JSON diagnosis dan node backup di katalog. Jika salah
+satu tidak cocok, verifier akan berhenti sebelum menyatakan arsip valid.
 
 Jika menjalankan verifier dari environment lokal, pasang dependensi opsional
 dengan `python -m pip install -r requirements-verifier.txt`, lalu berikan
