@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -11,6 +12,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tme3bot.media import has_downloadable_media
+
+try:
+    import pwd
+except ModuleNotFoundError:  # pragma: no cover - Windows local test environment
+    pwd = None
 
 
 _SCAN_LAST_MESSAGES = 1000
@@ -84,6 +90,7 @@ def download_backup_parts(
     downloaded: list[DownloadedBackupPart] = []
     with tempfile.TemporaryDirectory(prefix="backup-channel-") as raw_temp:
         work = Path(raw_temp)
+        _prepare_tdl_path(work, client)
         export_path = work / "channel-messages.json"
         if progress is not None:
             progress("scanning", 0, 0, "")
@@ -156,9 +163,12 @@ def download_backup_parts(
                 single_message_export.write_text(
                     json.dumps(payload, ensure_ascii=False), encoding="utf-8"
                 )
+                _prepare_tdl_path(single_message_export, client)
                 if progress is not None:
                     progress("downloading", index, len(selected), part_name, message_id)
                 client.download(single_message_export, download_dir)
+            except BackupChannelDownloadError:
+                raise
             except Exception:
                 raise BackupChannelDownloadError("BACKUP_CHANNEL_DOWNLOAD_FAILED") from None
 
@@ -183,6 +193,23 @@ def download_backup_parts(
             if progress is not None:
                 progress("downloaded", index, len(selected), part_name, message_id)
     return downloaded
+
+
+def _prepare_tdl_path(path: Path, client: Any) -> None:
+    """Make a worker-created temporary path accessible to TDL's run-as user."""
+    username = str(getattr(client, "run_as_user", None) or "").strip()
+    if not username:
+        return
+    if pwd is None or not hasattr(os, "geteuid") or not hasattr(os, "chown"):
+        raise BackupChannelDownloadError("BACKUP_TDL_WORKSPACE_PERMISSION_FAILED")
+    try:
+        account = pwd.getpwnam(username)
+        if os.geteuid() != account.pw_uid:
+            os.chown(path, account.pw_uid, account.pw_gid)
+    except (AttributeError, KeyError, OSError):
+        raise BackupChannelDownloadError(
+            "BACKUP_TDL_WORKSPACE_PERMISSION_FAILED"
+        ) from None
 
 
 def _backup_caption_metadata(message: dict[str, Any]) -> tuple[str, str, str] | None:
