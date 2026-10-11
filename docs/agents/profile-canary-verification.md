@@ -14,10 +14,15 @@ GET /internal/v1/profiles/{profile}/tdl-diagnostics
 ```
 
 Endpoint memakai autentikasi worker yang sudah ada. Jalankan dari host worker
-melalui container lokal agar token tetap berada di environment container:
+melalui container lokal agar token tetap berada di environment container.
+Jalankan perintah dari root repository. Pada VPS worker mandiri, Compose perlu
+membaca `.env.worker` untuk interpolasi `PROFILE_ROOT` pada mount `/data`;
+`env_file` milik service baru dimuat setelah interpolasi Compose, jadi tidak
+cukup hanya mengandalkan `env_file` tersebut. Gunakan opsi env yang sama untuk
+perintah `ps`, `exec`, atau perintah Compose lain pada deployment ini.
 
 ```bash
-docker compose -f docker-compose.worker.yml exec -T worker python3 - <<'PY'
+docker compose --env-file .env.worker -f docker-compose.worker.yml exec -T worker python3 - <<'PY'
 import json
 import os
 import urllib.request
@@ -34,11 +39,33 @@ with urllib.request.urlopen(request, timeout=130) as response:
 PY
 ```
 
-Untuk worker gateway, gunakan compose file dan service `worker-local` yang
-sesuai. Ganti `profile` untuk setiap profil yang sedang diinventarisasi. Output
-memuat worker, profil, waktu, status `root` dan `user1`, hasil kecocokan
-identitas, serta kode alasan. Nilai Telegram ID, path, dan output TDL tidak
-dikembalikan.
+Untuk worker gateway, gunakan konfigurasi host `.env` dan service
+`worker-local`; Compose memuat `.env.worker.local` ke container melalui
+`env_file` service. Contoh command-nya:
+
+```bash
+docker compose --env-file .env -f docker-compose.gateway.yml exec -T worker-local python3 - <<'PY'
+import json
+import os
+import urllib.request
+
+port = os.environ.get("WORKER_PORT", "8080")
+token = os.environ.get("WORKER_API_TOKEN", "")
+profile = "default"
+request = urllib.request.Request(
+    f"http://127.0.0.1:{port}/internal/v1/profiles/{profile}/tdl-diagnostics",
+    headers={"Authorization": f"Bearer {token}"},
+)
+with urllib.request.urlopen(request, timeout=130) as response:
+    print(json.dumps(json.loads(response.read()), sort_keys=True))
+PY
+```
+
+Ganti `profile` untuk setiap profil yang sedang diinventarisasi. Pada kedua
+contoh, token dibaca dari environment container dan tidak perlu disalin ke
+command. Output memuat worker, profil, waktu, status `root` dan `user1`, hasil
+kecocokan identitas, serta kode alasan. Nilai Telegram ID, path, dan output TDL
+tidak dikembalikan.
 
 Pemeriksaan mengambil lock export lalu download secara non-blocking, sama
 seperti operasi profil. Jika salah satu sesi sibuk hasilnya
@@ -62,7 +89,7 @@ password sebagai argumen.
 Contoh setelah image gateway yang memuat verifier dideploy:
 
 ```bash
-docker compose -f docker-compose.gateway.yml exec -T backend \
+docker compose --env-file .env -f docker-compose.gateway.yml exec -T backend \
   python3 -m tools.verify_profile_backup \
   --run-id RUN_ID \
   --worker remote-1 \
@@ -70,6 +97,10 @@ docker compose -f docker-compose.gateway.yml exec -T backend \
   --parts-dir /workspace/profile-backups/RUN_ID-remote-1 \
   --tdl-diagnostics-json /workspace/profile-backups/RUN_ID-remote-1/tdl-diagnostics.json
 ```
+
+`.env` menyediakan nilai host untuk interpolasi Compose. Service `backend`
+sendiri tetap memuat `.env.backend` melalui `env_file`; jangan menaruh password
+backup pada command line atau menampilkan isi file env.
 
 Jika menjalankan verifier dari environment lokal, pasang dependensi opsional
 dengan `python -m pip install -r requirements-verifier.txt`, lalu berikan

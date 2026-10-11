@@ -28,6 +28,7 @@ _TDL_ACCESS_ERROR_MESSAGES = {
     "TDL_SESSION_UNREADABLE": "Worker tidak dapat membaca database sesi TDL export profil ini.",
     "TDL_SESSION_UNAVAILABLE": "Sesi TDL export profil ini tidak tersedia untuk diuji.",
     "TDL_ACCESS_MARKER_PERMISSION_FAILED": "Worker tidak dapat menyiapkan file uji untuk user TDL.",
+    "TDL_SESSION_UNAUTHORIZED": "Sesi TDL untuk profil ini belum terotorisasi. Periksa atau login ulang sesi export pada worker.",
     "CHAT_WRITE_FORBIDDEN": "Telegram menolak pengiriman karena akun tidak diizinkan mengirim ke tujuan.",
     "CHAT_ADMIN_REQUIRED": "Telegram mensyaratkan hak admin untuk mengirim ke tujuan.",
     "USER_BANNED_IN_CHANNEL": "Akun diblokir dari channel tujuan.",
@@ -40,6 +41,29 @@ _TDL_ACCESS_ERROR_MESSAGES = {
 
 class TdlAccessMarkerPermissionError(RuntimeError):
     """Raised when the configured TDL process cannot read its test marker."""
+
+
+def _tdl_access_error_code(exc: BaseException) -> str:
+    denial = tdl_write_denial_code(exc)
+    if denial:
+        return denial
+
+    sources = [str(exc)]
+    for name in ("stdout", "stderr"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str):
+            sources.append(value)
+    details = "\n".join(sources).upper()
+    authentication_errors = (
+        "NOT AUTHORIZED",
+        "PLEASE LOGIN FIRST",
+        "AUTH_KEY_UNREGISTERED",
+        "AUTH_KEY_INVALID",
+        "SESSION_REVOKED",
+    )
+    if any(marker in details for marker in authentication_errors):
+        return "TDL_SESSION_UNAUTHORIZED"
+    return "VERIFICATION_FAILED"
 
 
 def _prepare_tdl_access_marker(marker: Path, user: str | None) -> None:
@@ -206,8 +230,7 @@ class TdlAccessExecutorMixin:
                         "TDL_ACCESS_MARKER_PERMISSION_FAILED"
                     ]
                 except Exception as exc:
-                    denial = tdl_write_denial_code(exc)
-                    outcome["error_code"] = denial or "VERIFICATION_FAILED"
+                    outcome["error_code"] = _tdl_access_error_code(exc)
                     outcome["error_message"] = _TDL_ACCESS_ERROR_MESSAGES.get(
                         str(outcome["error_code"]),
                         _TDL_ACCESS_ERROR_MESSAGES["VERIFICATION_FAILED"],

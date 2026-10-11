@@ -10,7 +10,10 @@ from unittest.mock import call, patch
 
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.tdl import TDLCommandError, tdl_write_denial_code
-from tme3bot.worker.executor_tdl_access import TdlAccessExecutorMixin
+from tme3bot.worker.executor_tdl_access import (
+    TdlAccessExecutorMixin,
+    _tdl_access_error_code,
+)
 
 
 class TdlAccessStoreTests(unittest.TestCase):
@@ -67,14 +70,28 @@ class TdlWriteDenialTests(unittest.TestCase):
         self.assertEqual(tdl_write_denial_code(denied), "CHAT_WRITE_FORBIDDEN")
         self.assertIsNone(tdl_write_denial_code(timeout))
 
+    def test_tdl_authentication_failure_is_reported_as_session_not_authorized(self):
+        error = TDLCommandError(
+            ["tdl", "up"], 1, "", "- not authorized. please login first"
+        )
+        self.assertEqual(_tdl_access_error_code(error), "TDL_SESSION_UNAUTHORIZED")
+
+    def test_unclassified_errors_remain_generic_and_do_not_trigger_fallback(self):
+        error = TDLCommandError(["tdl", "up"], 1, "", "connection reset")
+        self.assertIsNone(tdl_write_denial_code(error))
+        self.assertEqual(_tdl_access_error_code(error), "VERIFICATION_FAILED")
+
 
 class _FakeTdlClient:
-    def __init__(self, fail=False):
+    def __init__(self, fail=False, error=None):
         self.fail = fail
+        self.error = error
         self.uploads = []
 
     def upload(self, marker, target, caption):
         self.uploads.append((Path(marker).name, target, caption))
+        if self.error is not None:
+            raise self.error
         if self.fail:
             raise TDLCommandError(["tdl", "up"], 1, "", "CHAT_WRITE_FORBIDDEN")
 
@@ -108,6 +125,26 @@ class _VerifyExecutor(TdlAccessExecutorMixin):
 
 
 class TdlAccessWorkerTests(unittest.TestCase):
+    def test_tdl_authentication_error_is_visible_as_a_session_failure(self):
+        executor = _VerifyExecutor()
+        executor.clients["default"] = _FakeTdlClient(
+            error=TDLCommandError(
+                ["tdl", "up"], 1, "", "- not authorized. please login first"
+            )
+        )
+
+        with patch(
+            "tme3bot.worker.executor_tdl_access.request_json",
+            return_value={"purpose": "storage", "target": "-100123"},
+        ):
+            result = executor._tdl_access_verify(
+                {"job_id": "job-1", "worker": "local", "payload": {"purpose": "storage"}}
+            )
+
+        failed = next(item for item in result["profiles"] if item["profile"] == "default")
+        self.assertEqual(failed["error_code"], "TDL_SESSION_UNAUTHORIZED")
+        self.assertIn("login ulang", failed["error_message"])
+
     def test_marker_permissions_are_private_and_owned_by_the_tdl_user(self):
         from tme3bot.worker.executor_tdl_access import _prepare_tdl_access_marker
 
