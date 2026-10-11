@@ -164,6 +164,8 @@ def download_backup_parts(
                     json.dumps(payload, ensure_ascii=False), encoding="utf-8"
                 )
                 _prepare_tdl_path(single_message_export, client)
+                download_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                _prepare_tdl_path(download_dir, client)
                 if progress is not None:
                     progress("downloading", index, len(selected), part_name, message_id)
                 client.download(single_message_export, download_dir)
