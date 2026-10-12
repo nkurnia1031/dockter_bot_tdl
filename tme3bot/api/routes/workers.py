@@ -280,6 +280,9 @@ def register_workers(app, context, *, current_actor):
             status = "waiting_worker"
         profiles = {}
         raw_profiles = snapshot.get("profiles")
+        backend_error_code = str(snapshot.get("backend_error_code") or "")
+        if not re.fullmatch(r"[A-Z0-9_-]{1,64}", backend_error_code):
+            backend_error_code = ""
         for profile, raw in raw_profiles.items() if isinstance(raw_profiles, dict) else []:
             profile_name = str(profile).strip().lower()
             if not re.fullmatch(r"[a-z0-9_-]{1,48}", profile_name) or not isinstance(raw, dict):
@@ -299,6 +302,8 @@ def register_workers(app, context, *, current_actor):
             "worker": name,
             "status": status,
             "backend_available": snapshot.get("backend_available") if isinstance(snapshot.get("backend_available"), bool) else None,
+            "backend_error_code": backend_error_code,
+            "startup_checked": snapshot.get("startup_checked") if isinstance(snapshot.get("startup_checked"), bool) else None,
             "last_checked_at": str(snapshot.get("last_checked_at") or "")[:64],
             "profiles": profiles,
         }

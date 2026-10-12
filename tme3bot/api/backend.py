@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import logging
+import re
 import secrets
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -719,8 +720,87 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 "online": online_by_name.get(name, False),
                 "secure": secure,
             })
+        profile_items = provisioner.profiles(actor.telegram_user_id)
+        sync_reader = getattr(context.worker_dispatcher, "profile_sync_status", None)
+        sync_targets = sorted({
+            str(distribution.get("worker") or "")
+            for profile in profile_items
+            for distribution in profile.get("workers", [])
+            if isinstance(distribution, dict) and str(distribution.get("worker") or "")
+        })
+
+        def live_sync(name: str) -> tuple[str, dict[str, Any], str]:
+            if not callable(sync_reader):
+                return name, {}, "WORKER_UPDATE_REQUIRED"
+            try:
+                value = sync_reader(name)
+                if isinstance(value, dict):
+                    return name, value, ""
+                return name, {}, "WORKER_STATUS_INVALID"
+            except Exception as exc:
+                code = "WORKER_UPDATE_REQUIRED" if getattr(exc, "status", None) == 404 else "WORKER_UNAVAILABLE"
+                return name, {}, code
+
+        live_by_worker: dict[str, tuple[dict[str, Any], str]] = {}
+        if sync_targets:
+            with ThreadPoolExecutor(max_workers=min(8, len(sync_targets))) as executor:
+                for name, snapshot, error_code in executor.map(live_sync, sync_targets):
+                    live_by_worker[name] = (snapshot, error_code)
+
+        allowed_runtime_statuses = {"ready", "sync_pending", "waiting_worker", "not_assigned"}
+        for profile in profile_items:
+            profile_name = str(profile.get("name") or "")
+            for distribution in profile.get("workers", []):
+                if not isinstance(distribution, dict):
+                    continue
+                worker_name = str(distribution.get("worker") or "")
+                ack_status = str(distribution.get("status") or "waiting")
+                ack_revision = distribution.get("desired_revision")
+                distribution["vault_ack_status"] = ack_status
+                distribution["vault_ack_installed_revision"] = distribution.get("installed_revision")
+
+                snapshot, transport_error = live_by_worker.get(worker_name, ({}, "WORKER_UNAVAILABLE"))
+                runtime_error = transport_error
+                runtime_profile = (snapshot.get("profiles") or {}).get(profile_name) if isinstance(snapshot.get("profiles"), dict) else None
+                if runtime_error:
+                    runtime_status = "worker_update_required" if runtime_error == "WORKER_UPDATE_REQUIRED" else "worker_unavailable"
+                elif snapshot.get("startup_checked") is None:
+                    runtime_status = "worker_update_required"
+                    runtime_error = "WORKER_UPDATE_REQUIRED"
+                elif snapshot.get("backend_available") is not True:
+                    runtime_status = "waiting_worker"
+                    runtime_error = str(snapshot.get("backend_error_code") or "PROFILE_BACKEND_UNAVAILABLE")
+                elif snapshot.get("startup_checked") is not True:
+                    runtime_status = "sync_pending"
+                    runtime_error = "PROFILE_STARTUP_CHECK_PENDING"
+                elif not isinstance(runtime_profile, dict):
+                    runtime_status = "waiting_worker"
+                    runtime_error = str(snapshot.get("backend_error_code") or "PROFILE_RUNTIME_PROFILE_MISSING")
+                else:
+                    runtime_status = str(runtime_profile.get("status") or "sync_pending")
+                    if runtime_status not in allowed_runtime_statuses:
+                        runtime_status = "sync_pending"
+                    runtime_error = str(runtime_profile.get("error_code") or "")
+                    runtime_desired = runtime_profile.get("desired_revision")
+                    runtime_installed = runtime_profile.get("installed_revision")
+                    distribution["runtime_desired_revision"] = runtime_desired
+                    distribution["runtime_installed_revision"] = runtime_installed
+                    if runtime_status == "ready" and (
+                        runtime_desired != ack_revision or runtime_installed != ack_revision
+                    ):
+                        runtime_status = "sync_pending"
+                        runtime_error = "PROFILE_REVISION_MISMATCH"
+
+                if not re.fullmatch(r"[A-Z0-9_-]{1,64}", runtime_error):
+                    runtime_error = ""
+                distribution["runtime_status"] = runtime_status
+                distribution["runtime_error_code"] = runtime_error
+                if ack_status == "ready":
+                    distribution["status"] = runtime_status
+                else:
+                    distribution["status"] = ack_status
         return {
-            "items": provisioner.profiles(actor.telegram_user_id),
+            "items": profile_items,
             "workers": workers,
         }
 

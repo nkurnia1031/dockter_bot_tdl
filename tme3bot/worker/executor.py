@@ -186,6 +186,7 @@ class WorkerJobExecutor(
             install_bundle=self.install_profile_bundle,
             commit_bundle=self.commit_profile_bundle,
             rollback_bundle=self.rollback_profile_bundle,
+            diagnose_installed_tdl=self.diagnose_profile_tdl,
         )
         self.command_runner.register_operation_handler(
             "profile.sync", self._run_profile_sync_operation
@@ -2226,7 +2227,7 @@ class WorkerJobExecutor(
         )
         if quick_mode:
             # The two TDL sessions are independent: export uses user1/.tdl,
-            # while the next phase uses root/.tdl.  Do not keep the export
+            # while the next phase uses root/.tdl. Do not keep the export
             # queue reservation while this job downloads or compresses.
             self._release_quick_export_lane(command)
             if stage_root is not None:

@@ -61,6 +61,7 @@ class ProfileSyncClient:
         install_bundle: Callable[[str, int, bytes, str], Any],
         commit_bundle: Callable[[str, str], bool],
         rollback_bundle: Callable[[str, str], bool],
+        diagnose_installed_tdl: Callable[[str], dict[str, Any]] | None = None,
         request: Callable[[str, str, bytes | None], tuple[bytes, Any]] | None = None,
     ) -> None:
         self.config = config
@@ -69,6 +70,7 @@ class ProfileSyncClient:
         self.install_bundle = install_bundle
         self.commit_bundle = commit_bundle
         self.rollback_bundle = rollback_bundle
+        self.diagnose_installed_tdl = diagnose_installed_tdl
         self._request_override = request
         self.path = Path(config.state_file).parent / "profile-sync.json"
         self._condition = threading.Condition(threading.RLock())
@@ -201,6 +203,8 @@ class ProfileSyncClient:
         }
         return {
             "backend_available": state.get("backend_available"),
+            "backend_error_code": _safe_code(state.get("backend_error_code")),
+            "startup_checked": self._startup_checked,
             "status": (
                 "disabled"
                 if not self.enabled
@@ -461,6 +465,7 @@ class ProfileSyncClient:
             previous_managed = set(self._state.get("managed_profiles", []))
             managed = sorted(previous_managed | current_profiles)
             self._state["backend_available"] = True
+            self._state["backend_error_code"] = ""
             self._state["managed_profiles"] = managed
             self._state["last_checked_at"] = now
             rows = self._state.setdefault("profiles", {})
@@ -624,6 +629,12 @@ class ProfileSyncClient:
                 profile, _positive_int(previous.get("telegram_user_id")) or None
             )
             if installed_identity is not False:
+                try:
+                    self._verify_runtime_tdl(profile)
+                except ProfileSyncError as exc:
+                    if emit:
+                        emit("session_validation", "failed", exc.code)
+                    raise
                 self._set_profile(
                     profile,
                     status="sync_pending",
@@ -683,6 +694,12 @@ class ProfileSyncClient:
             installed_identity = self.session_manager.verify_installed(profile, user_id)
             if installed_identity is False or int(installed_identity) != user_id:
                 raise ProfileSyncError("PROFILE_INSTALL_VALIDATION_FAILED")
+            try:
+                self._verify_runtime_tdl(profile)
+            except ProfileSyncError as exc:
+                if emit:
+                    emit("session_validation", "failed", exc.code)
+                raise
             if emit:
                 emit("session_validation", "succeeded", "")
                 emit("session_commit", "running", "")
@@ -710,6 +727,22 @@ class ProfileSyncClient:
         if emit:
             emit("completed", "succeeded" if accepted else "failed", "" if accepted else "PROFILE_ACK_PENDING")
         return accepted
+
+    def _verify_runtime_tdl(self, profile: str) -> None:
+        diagnose = self.diagnose_installed_tdl
+        if not callable(diagnose):
+            raise ProfileSyncError("PROFILE_TDL_DIAGNOSTIC_UNAVAILABLE")
+        try:
+            result = diagnose(profile)
+        except Exception:
+            raise ProfileSyncError("PROFILE_TDL_DIAGNOSTIC_FAILED") from None
+        if not isinstance(result, dict) or result.get("ready") is not True:
+            reasons = result.get("reason_codes") if isinstance(result, dict) else None
+            reason = next(
+                (_safe_code(item) for item in reasons if _safe_code(item)),
+                "PROFILE_SESSION_TDL_INVALID",
+            ) if isinstance(reasons, list) else "PROFILE_SESSION_TDL_INVALID"
+            raise ProfileSyncError(reason)
 
     def report_external_event(
         self,
@@ -897,7 +930,11 @@ class ProfileSyncClient:
         except urllib.error.HTTPError as exc:
             # Do not retain backend response bodies: they may include internal
             # paths or diagnostic detail, and a redirect must never move tokens.
-            code = "PROFILE_BACKEND_REJECTED" if exc.code < 500 else "BACKEND_UNAVAILABLE"
+            code = {
+                401: "PROFILE_BACKEND_UNAUTHORIZED",
+                403: "PROFILE_BACKEND_FORBIDDEN",
+                426: "PROFILE_TRANSFER_REQUIRES_HTTPS",
+            }.get(exc.code, "PROFILE_BACKEND_REJECTED" if exc.code < 500 else "BACKEND_UNAVAILABLE")
             raise ProfileSyncError(code) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             raise ProfileSyncError("BACKEND_UNAVAILABLE") from None
@@ -939,6 +976,7 @@ class ProfileSyncClient:
         safe_code = _safe_code(code)
         with self._condition:
             self._state["backend_available"] = False
+            self._state["backend_error_code"] = safe_code
             self._state["last_checked_at"] = _now()
             for name in self._state.get("managed_profiles", []):
                 self._state.setdefault("profiles", {}).setdefault(name, {}).update(
@@ -982,6 +1020,7 @@ class ProfileSyncClient:
         managed = managed if isinstance(managed, list) else []
         return {
             "backend_available": raw.get("backend_available") if isinstance(raw.get("backend_available"), bool) else None,
+            "backend_error_code": _safe_code(raw.get("backend_error_code")),
             "last_checked_at": str(raw.get("last_checked_at") or "")[:64],
             "managed_profiles": sorted({name for item in managed if (name := normalize_profile_name(str(item)))}),
             "profiles": safe_rows,

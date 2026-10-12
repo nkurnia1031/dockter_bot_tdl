@@ -203,8 +203,12 @@ class WorkerHttpDispatcher:
     def cancel_profile_login(self, worker: str, operation_id: str) -> None:
         self._profile_json(worker, "DELETE", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}")
 
-    def profile_sync_status(self, worker: str) -> dict[str, Any]:
-        return self._profile_json(worker, "GET", "/internal/v1/profile-sync")
+    def profile_sync_status(self, worker: str, *, timeout: float = 4) -> dict[str, Any]:
+        # This snapshot is read by the profiles page; an offline worker must
+        # not hold the page request for the generic 90-second provisioning timeout.
+        return self._profile_json(
+            worker, "GET", "/internal/v1/profile-sync", timeout=timeout
+        )
 
     def profile_local_inventory(self, worker: str) -> dict[str, Any]:
         return self._profile_json(worker, "GET", "/internal/v1/profiles/local", timeout=20)

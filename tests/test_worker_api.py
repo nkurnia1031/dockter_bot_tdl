@@ -28,7 +28,12 @@ class FakeExecutor:
         self.profile_sync_commits = []
         self.profile_sync_requests = []
         self.profile_sync_cancellations = []
-        self.profile_sync_snapshot = {"status": "ready", "backend_available": True, "profiles": {}}
+        self.profile_sync_snapshot = {
+            "status": "ready",
+            "backend_available": True,
+            "startup_checked": True,
+            "profiles": {},
+        }
         self.profile_tdl_diagnostics = {
             "ready": True,
             "identity_match": True,
@@ -283,6 +288,7 @@ class WorkerApiTests(unittest.TestCase):
         status = self.client.get("/internal/v1/profile-sync", headers=headers)
         self.assertEqual(status.status_code, 200)
         self.assertEqual(status.json()["status"], "ready")
+        self.assertTrue(status.json()["startup_checked"])
 
         denied_request = self.client.post(
             "/internal/v1/profile-sync", json={"profile": "irang"}

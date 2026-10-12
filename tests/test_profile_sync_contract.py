@@ -51,6 +51,7 @@ class ProfileSyncContractTests(unittest.TestCase):
             return {"accepted": True, "status": "cancelled", "profile": profile}
 
         self.context = SimpleNamespace(
+            config=SimpleNamespace(),
             profile_provisioner=SimpleNamespace(
                 store=self.store,
                 profile_manager=SimpleNamespace(profile_registry=self.profile_registry),
@@ -238,14 +239,14 @@ class ProfileSyncContractTests(unittest.TestCase):
         self.assertEqual(mismatch.json()["reason"], "metadata_mismatch")
         self.assertFalse(self.store.distribution_ready("novel", "worker-a"))
 
-        plaintext = TestClient(self.app, base_url="http://gateway.example")
+        ordinary_worker_request = TestClient(self.app, base_url="http://gateway.example")
         try:
-            response = plaintext.get(
+            response = ordinary_worker_request.get(
                 "/internal/v1/profile-manifest", headers=self.headers("worker-a")
             )
         finally:
-            plaintext.close()
-        self.assertEqual(response.status_code, 426)
+            ordinary_worker_request.close()
+        self.assertEqual(response.status_code, 200, response.text)
 
     def test_manual_sync_operation_sets_manifest_request_without_exposing_bundle(self):
         actor = Actor(telegram_user_id=9, profile="novel")

@@ -1,9 +1,11 @@
 import hashlib
 import io
 import json
+import urllib.error
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +136,7 @@ class WorkerProfileSyncTests(unittest.TestCase):
             install_bundle=install,
             commit_bundle=lambda _profile, _operation: True,
             rollback_bundle=rollback,
+            diagnose_installed_tdl=lambda _profile: {"ready": True, "reason_codes": []},
             request=transport,
         )
         return client, transport
@@ -192,6 +195,44 @@ class WorkerProfileSyncTests(unittest.TestCase):
         client.sync_now(mode="repair", profile="irang")
         self.assertEqual(len(self.installs), 2)
         self.assertEqual(len(transport.bundle_requests), 2)
+
+    def test_same_revision_is_not_acked_ready_when_readonly_tdl_check_fails(self):
+        content = bundle_for()
+        entry = manifest_row("irang", 7, content)
+        client, transport = self.make_client([entry], {("irang", 7): content})
+        client.sync_now()
+        transport.acks.clear()
+        client.diagnose_installed_tdl = lambda _profile: {
+            "ready": False,
+            "reason_codes": ["PROFILE_ROOT_SESSION_TDL_INVALID"],
+        }
+
+        result = client.sync_now(mode="check")
+
+        self.assertEqual(result["status"], "sync_pending")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(transport.acks, [])
+        self.assertEqual(
+            client.snapshot()["profiles"]["irang"]["error_code"],
+            "PROFILE_ROOT_SESSION_TDL_INVALID",
+        )
+
+    def test_sync_fails_closed_when_readonly_tdl_check_is_unavailable(self):
+        content = bundle_for()
+        entry = manifest_row("irang", 7, content)
+        client, transport = self.make_client([entry], {("irang", 7): content})
+        client.diagnose_installed_tdl = None
+
+        result = client.sync_now()
+
+        self.assertEqual(result["status"], "sync_pending")
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(transport.acks, [])
+        self.assertEqual(self.sessions.installed.get("irang"), None)
+        self.assertEqual(
+            client.snapshot()["profiles"]["irang"]["error_code"],
+            "PROFILE_TDL_DIAGNOSTIC_UNAVAILABLE",
+        )
 
     def test_previous_ready_snapshot_is_gated_until_this_startup_checks_backend(self):
         content = bundle_for()
@@ -253,6 +294,38 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertEqual(client.snapshot()["profiles"]["irang"]["status"], "waiting_worker")
         self.assertFalse(client.profile_ready("irang"))
         self.assertFalse(client.wait_until_ready("irang", cancelled=lambda: True))
+
+    def test_manifest_failure_before_first_profile_is_loaded_keeps_global_error_code(self):
+        client, transport = self.make_client([], {})
+        transport.fail = ProfileSyncError("PROFILE_TRANSFER_REQUIRES_HTTPS")
+
+        result = client.sync_now()
+
+        self.assertEqual(result["status"], "waiting_worker")
+        snapshot = client.snapshot()
+        self.assertEqual(snapshot["status"], "waiting_worker")
+        self.assertEqual(
+            snapshot["backend_error_code"], "PROFILE_TRANSFER_REQUIRES_HTTPS"
+        )
+
+    def test_backend_http_status_426_is_preserved_as_safe_sync_error(self):
+        client, _ = self.make_client([], {})
+        client._request_override = None
+
+        class RejectingOpener:
+            def open(self, *_args, **_kwargs):
+                raise urllib.error.HTTPError(
+                    "https://backend.example/internal/v1/profile-manifest",
+                    426,
+                    "Upgrade Required",
+                    {},
+                    None,
+                )
+
+        with patch("tme3bot.worker.profile_sync.build_opener", return_value=RejectingOpener()):
+            with self.assertRaises(ProfileSyncError) as raised:
+                client._request("GET", "/internal/v1/profile-manifest", None)
+        self.assertEqual(raised.exception.code, "PROFILE_TRANSFER_REQUIRES_HTTPS")
 
     def test_wait_reports_unchanged_backend_reason_only_once(self):
         client, _ = self.make_client([], {})

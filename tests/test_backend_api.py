@@ -67,6 +67,7 @@ class FakeDispatcher:
         self.profile_sync_snapshot = {
             "status": "waiting_worker",
             "backend_available": False,
+            "backend_error_code": "PROFILE_TRANSFER_REQUIRES_HTTPS",
             "last_checked_at": "2026-10-10T00:00:00Z",
             "profiles": {
                 "default": {
@@ -698,9 +699,122 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["status"], "waiting_worker")
         self.assertEqual(response.json()["profiles"]["default"]["error_code"], "BACKEND_UNAVAILABLE")
+        self.assertEqual(
+            response.json()["backend_error_code"], "PROFILE_TRANSFER_REQUIRES_HTTPS"
+        )
         self.assertNotIn("bundle_sha256", response.text)
         self.assertNotIn("private-hash", response.text)
         self.assertNotIn("queued_requests", response.json())
+
+    def test_profile_management_does_not_call_vault_ack_ready_runtime_ready(self):
+        headers = self.login()
+        provisioner = FakeProfileProvisioner()
+        provisioner.profiles = lambda actor_user_id=None: [{
+            "name": "default",
+            "active": True,
+            "status": "active",
+            "vault": True,
+            "workers": [{
+                "worker": "local",
+                "status": "ready",
+                "desired_revision": 4,
+                "installed_revision": 4,
+            }],
+        }]
+        self.context.profile_provisioner = provisioner
+        self.dispatcher.profile_sync_snapshot = {
+            "status": "waiting_worker",
+            "backend_available": False,
+            "startup_checked": True,
+            "backend_error_code": "PROFILE_TRANSFER_REQUIRES_HTTPS",
+            "profiles": {},
+        }
+
+        response = self.client.get("/api/v1/profiles/management", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        worker_status = response.json()["items"][0]["workers"][0]
+        self.assertEqual(worker_status["vault_ack_status"], "ready")
+        self.assertEqual(worker_status["runtime_status"], "waiting_worker")
+        self.assertEqual(worker_status["runtime_error_code"], "PROFILE_TRANSFER_REQUIRES_HTTPS")
+        self.assertEqual(worker_status["status"], "waiting_worker")
+
+    def test_profile_management_hides_cached_ready_until_this_startup_sync_check_finishes(self):
+        headers = self.login()
+        provisioner = FakeProfileProvisioner()
+        provisioner.profiles = lambda actor_user_id=None: [{
+            "name": "default",
+            "active": True,
+            "status": "active",
+            "vault": True,
+            "workers": [{
+                "worker": "local",
+                "status": "ready",
+                "desired_revision": 4,
+                "installed_revision": 4,
+            }],
+        }]
+        self.context.profile_provisioner = provisioner
+        self.dispatcher.profile_sync_snapshot = {
+            "status": "sync_pending",
+            "backend_available": True,
+            "startup_checked": False,
+            "profiles": {
+                "default": {
+                    "status": "ready",
+                    "desired_revision": 4,
+                    "installed_revision": 4,
+                }
+            },
+        }
+
+        response = self.client.get("/api/v1/profiles/management", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        worker_status = response.json()["items"][0]["workers"][0]
+        self.assertEqual(worker_status["vault_ack_status"], "ready")
+        self.assertEqual(worker_status["runtime_status"], "sync_pending")
+        self.assertEqual(worker_status["runtime_error_code"], "PROFILE_STARTUP_CHECK_PENDING")
+        self.assertEqual(worker_status["status"], "sync_pending")
+
+    def test_profile_management_does_not_trust_cached_ready_without_live_backend_confirmation(self):
+        headers = self.login()
+        provisioner = FakeProfileProvisioner()
+        provisioner.profiles = lambda actor_user_id=None: [{
+            "name": "default",
+            "active": True,
+            "status": "active",
+            "vault": True,
+            "workers": [{
+                "worker": "local",
+                "status": "ready",
+                "desired_revision": 4,
+                "installed_revision": 4,
+            }],
+        }]
+        self.context.profile_provisioner = provisioner
+        self.dispatcher.profile_sync_snapshot = {
+            "status": "ready",
+            "startup_checked": True,
+            # A cached profile row is not proof that the backend manifest was
+            # reached during this worker's latest live sync check.
+            "profiles": {
+                "default": {
+                    "status": "ready",
+                    "desired_revision": 4,
+                    "installed_revision": 4,
+                }
+            },
+        }
+
+        response = self.client.get("/api/v1/profiles/management", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        worker_status = response.json()["items"][0]["workers"][0]
+        self.assertEqual(worker_status["vault_ack_status"], "ready")
+        self.assertEqual(worker_status["runtime_status"], "waiting_worker")
+        self.assertEqual(worker_status["runtime_error_code"], "PROFILE_BACKEND_UNAVAILABLE")
+        self.assertEqual(worker_status["status"], "waiting_worker")
 
     def test_local_profile_scan_requires_actor_and_returns_selected_worker_snapshot(self):
         calls = []

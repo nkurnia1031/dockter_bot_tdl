@@ -4,7 +4,7 @@ import hmac
 import re
 from typing import Any
 
-from fastapi import Depends, Header, Request
+from fastapi import Depends, Header
 from fastapi.responses import StreamingResponse
 
 from tme3bot.application.operations import PreparedOperation
@@ -21,13 +21,6 @@ _SYNC_PHASES = {
     "worker_unreachable", "completed", "cancelled",
 }
 _SYNC_STATUSES = {"queued", "running", "succeeded", "failed", "waiting", "cancelled"}
-_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "backend", "worker-local", "testserver"}
-
-
-def _worker_transport_is_secure(request: Request) -> bool:
-    if request.url.scheme == "https":
-        return True
-    return str(request.url.hostname or "").lower() in _LOCAL_HOSTS
 
 
 def _worker_identity(context, worker_name: str, worker_token: str) -> str:
@@ -85,16 +78,13 @@ def _complete_sync_operation(context, request: dict[str, Any], *, succeeded: boo
 
 def register_profile_sync(app, context, *, require_internal, current_actor) -> None:
     def authenticated_worker(
-        request: Request,
         worker_name: str = Header(..., alias="X-Worker-Name", min_length=1, max_length=48),
         worker_token: str = Header(..., alias="X-Worker-Token", min_length=1, max_length=512),
     ) -> str:
-        if not _worker_transport_is_secure(request):
-            raise DomainError(
-                "PROFILE_TRANSFER_REQUIRES_HTTPS",
-                "Sinkronisasi profil worker remote wajib memakai HTTPS.",
-                status_code=426,
-            )
+        # TLS may terminate at the reverse proxy, so ASGI can see HTTP even
+        # when the worker used the HTTPS origin. The worker client enforces
+        # HTTPS for remote backend URLs and refuses redirects; keep server-side
+        # authorization here based on the internal and unique worker tokens.
         return _worker_identity(context, worker_name, worker_token)
 
     @app.get(
