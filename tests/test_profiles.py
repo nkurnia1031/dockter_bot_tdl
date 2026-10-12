@@ -1,5 +1,9 @@
+import os
+import subprocess
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from unittest.mock import patch
 from pathlib import Path
@@ -36,8 +40,6 @@ class ProfileTests(unittest.TestCase):
             export_failed_dir=root / "exports" / "failed",
             state_file=root / "state.json",
             legacy_max_json=root / "max.json",
-            tdl_export_user="user1",
-            tdl_download_user="root",
             tdl_export_home=root / "user1",
             tdl_download_home=root / "root",
             tdl_export_storage=root / "user1" / ".tdl",
@@ -49,6 +51,26 @@ class ProfileTests(unittest.TestCase):
             temp_root=root / "tmp",
             log_level="INFO",
         )
+
+    def test_legacy_tdl_user_environment_variables_are_ignored(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "APP_ROLE": "worker",
+                    "TDL_EXPORT_USER": "legacy-export-user",
+                    "TDL_DOWNLOAD_USER": "legacy-download-user",
+                },
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            config = AppConfig.from_env()
+
+        self.assertFalse(hasattr(config, "tdl_export_user"))
+        self.assertFalse(hasattr(config, "tdl_download_user"))
+        self.assertEqual(config.tdl_export_home, Path("/data/user1"))
+        self.assertEqual(config.tdl_download_home, Path("/data/root"))
 
     def test_default_profile_keeps_legacy_single_profile_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -200,6 +222,69 @@ class ProfileTests(unittest.TestCase):
                 runtime.export_tdl_client.storage_root,
                 runtime.download_tdl_client.storage_root,
             )
+            self.assertEqual(runtime.export_tdl_client.home, root / "user1")
+            self.assertEqual(runtime.download_tdl_client.home, root / "root")
+            self.assertEqual(runtime.export_tdl_client.namespace, "default")
+            self.assertEqual(runtime.download_tdl_client.namespace, "default")
+
+    def test_export_and_download_run_in_parallel_with_distinct_storage_and_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runtime = build_profile_runtime("default", self.make_config(root))
+            export_path = root / "exports" / "parallel.json"
+            commands: dict[str, tuple[list[str], dict[str, str]]] = {}
+            both_commands_started = threading.Barrier(2)
+            commands_lock = threading.Lock()
+
+            class ParallelRunner:
+                def __init__(self, name: str) -> None:
+                    self.name = name
+
+                def run(self, command, *, env=None, **_kwargs):
+                    with commands_lock:
+                        commands[self.name] = (list(command), dict(env or {}))
+                    both_commands_started.wait(timeout=5)
+                    if self.name == "export":
+                        output_path = Path(command[command.index("-o") + 1])
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        output_path.write_text('{"messages": []}', encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, "", "")
+
+            runtime.export_tdl_client.runner = ParallelRunner("export")
+            runtime.download_tdl_client.runner = ParallelRunner("download")
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                export = pool.submit(
+                    runtime.export_tdl_client.export_messages,
+                    "@source",
+                    1,
+                    export_path,
+                )
+                download = pool.submit(
+                    runtime.download_tdl_client.download,
+                    export_path,
+                    root / "downloads",
+                )
+                export.result(timeout=10)
+                download.result(timeout=10)
+
+            self.assertEqual(set(commands), {"export", "download"})
+            export_command, export_env = commands["export"]
+            download_command, download_env = commands["download"]
+            self.assertEqual(export_command[0], "tdl")
+            self.assertEqual(download_command[0], "tdl")
+            self.assertNotIn("runuser", export_command)
+            self.assertNotIn("runuser", download_command)
+            self.assertEqual(
+                export_command[export_command.index("--storage") + 1],
+                f"type=bolt,path={root / 'user1' / '.tdl' / 'data'}",
+            )
+            self.assertEqual(
+                download_command[download_command.index("--storage") + 1],
+                f"type=bolt,path={root / 'root' / '.tdl' / 'data'}",
+            )
+            self.assertEqual(export_env["HOME"], str(root / "user1"))
+            self.assertEqual(download_env["HOME"], str(root / "root"))
 
     def test_tdl_session_diagnostic_reports_safe_reasons_for_each_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

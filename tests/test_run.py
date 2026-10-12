@@ -358,6 +358,31 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(run.worker_service(remote), "worker")
         self.assertEqual(run.shell_service(remote), "worker")
 
+    def test_write_profile_identity_uses_export_lane_without_runuser(self):
+        with patch.object(run, "run_compose") as run_compose, patch("builtins.print"):
+            run.write_profile_identity(
+                {"LEAVE_HELPER_BINARY": "/usr/local/bin/tdl-leave"}, "default"
+            )
+
+        command = run_compose.call_args.args[0]
+        self.assertEqual(
+            command[:4],
+            ["exec", "-T", "worker-local", "/usr/local/bin/tdl-leave"],
+        )
+        self.assertNotIn("runuser", command)
+        self.assertEqual(command[command.index("--storage") + 1], "/data/user1/.tdl/data")
+        self.assertEqual(command[command.index("--namespace") + 1], "default")
+
+    def test_profile_setup_preserves_both_lane_directories_without_user_chown(self):
+        with patch.object(run, "run_compose") as run_compose:
+            run.ensure_container_profile_dirs({}, "default")
+
+        command = run_compose.call_args.args[0]
+        self.assertIn("/data/root/.tdl", command[-1])
+        self.assertIn("/data/user1/.tdl", command[-1])
+        self.assertNotIn("chown", command[-1])
+        self.assertNotIn("runuser", command[-1])
+
     def test_prepare_tdl_build_asset_copies_configured_linux_binary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             project = Path(temp_dir)

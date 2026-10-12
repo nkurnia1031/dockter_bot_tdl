@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import tempfile
 from pathlib import Path
 from urllib.parse import quote
@@ -27,7 +26,7 @@ _TDL_ACCESS_ERROR_MESSAGES = {
     "TDL_SESSION_DATABASE_INVALID": "Database sesi TDL export profil ini bukan file yang valid.",
     "TDL_SESSION_UNREADABLE": "Worker tidak dapat membaca database sesi TDL export profil ini.",
     "TDL_SESSION_UNAVAILABLE": "Sesi TDL export profil ini tidak tersedia untuk diuji.",
-    "TDL_ACCESS_MARKER_PERMISSION_FAILED": "Worker tidak dapat menyiapkan file uji untuk user TDL.",
+    "TDL_ACCESS_MARKER_PERMISSION_FAILED": "Worker tidak dapat menyiapkan file uji TDL.",
     "TDL_SESSION_UNAUTHORIZED": "Sesi TDL untuk profil ini belum terotorisasi. Periksa atau login ulang sesi export pada worker.",
     "CHAT_WRITE_FORBIDDEN": "Telegram menolak pengiriman karena akun tidak diizinkan mengirim ke tujuan.",
     "CHAT_ADMIN_REQUIRED": "Telegram mensyaratkan hak admin untuk mengirim ke tujuan.",
@@ -66,19 +65,11 @@ def _tdl_access_error_code(exc: BaseException) -> str:
     return "VERIFICATION_FAILED"
 
 
-def _prepare_tdl_access_marker(marker: Path, user: str | None) -> None:
-    """Keep the test marker private while making it readable by the TDL user."""
+def _prepare_tdl_access_marker(marker: Path) -> None:
+    """Keep the test marker private for the root-run TDL process."""
     try:
         marker.parent.chmod(0o700)
         marker.chmod(0o600)
-        if not user or user == "root" or os.name != "posix" or os.geteuid() != 0:
-            return
-
-        import pwd
-
-        account = pwd.getpwnam(user)
-        os.chown(marker.parent, account.pw_uid, account.pw_gid)
-        os.chown(marker, account.pw_uid, account.pw_gid)
     except (AttributeError, ImportError, KeyError, OSError):
         raise TdlAccessMarkerPermissionError(
             "TDL_ACCESS_MARKER_PERMISSION_FAILED"
@@ -213,10 +204,7 @@ class TdlAccessExecutorMixin:
                             "Pesan uji akses TDL. Pesan ini dapat dihapus manual setelah verifikasi.",
                             encoding="utf-8",
                         )
-                        _prepare_tdl_access_marker(
-                            marker,
-                            getattr(runtime.export_tdl_client, "run_as_user", None),
-                        )
+                        _prepare_tdl_access_marker(marker)
                         runtime.export_tdl_client.upload(
                             marker,
                             destination,

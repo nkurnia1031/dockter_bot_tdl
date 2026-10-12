@@ -31,8 +31,6 @@ class AppConfig:
     export_failed_dir: Path
     state_file: Path
     legacy_max_json: Path
-    tdl_export_user: str
-    tdl_download_user: str
     tdl_export_home: Path
     tdl_download_home: Path
     tdl_export_storage: Path
@@ -183,8 +181,6 @@ class AppConfig:
         state_file = Path(os.getenv("STATE_FILE", "/data/state.json"))
         legacy_max_json = Path(os.getenv("LEGACY_MAX_JSON", "/data/max.json"))
 
-        tdl_export_user = os.getenv("TDL_EXPORT_USER", "user1").strip() or "user1"
-        tdl_download_user = os.getenv("TDL_DOWNLOAD_USER", "root").strip() or "root"
         tdl_export_home = Path(os.getenv("TDL_EXPORT_HOME", "/data/user1"))
         tdl_download_home = Path(os.getenv("TDL_DOWNLOAD_HOME", "/data/root"))
         tdl_export_storage = Path(
@@ -280,8 +276,6 @@ class AppConfig:
             export_failed_dir=export_failed_dir,
             state_file=state_file,
             legacy_max_json=legacy_max_json,
-            tdl_export_user=tdl_export_user,
-            tdl_download_user=tdl_download_user,
             tdl_export_home=tdl_export_home,
             tdl_download_home=tdl_download_home,
             tdl_export_storage=tdl_export_storage,

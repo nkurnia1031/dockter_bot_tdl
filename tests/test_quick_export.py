@@ -385,7 +385,6 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
 
             class StorageClient:
                 output_callback = None
-                run_as_user = "storage-user"
 
                 def export_messages(self, channel, start_id, target, **kwargs):
                     name = "photo-without-original-name.jpg" if int(start_id) == 102 else "batch.7z.001"
@@ -453,7 +452,7 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
             self.assertEqual(result["drive_found"], 1)
             self.assertTrue(result["staging_cleaned"])
             self.assertFalse(stage.exists())
-            ensure_writable.assert_called_once_with(stage / ".quickmode-verify", "storage-user")
+            ensure_writable.assert_called_once_with(stage / ".quickmode-verify")
 
     def test_four_photos_without_videos_do_not_invoke_video_processing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

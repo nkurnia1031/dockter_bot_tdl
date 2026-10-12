@@ -644,7 +644,6 @@ class TDLClient:
         namespace: str,
         runner: SubprocessRunner | None = None,
         debug: bool = False,
-        run_as_user: str | None = None,
         home: Path | None = None,
         log_prefix: str = "tdl",
         stall_timeout_seconds: int = 0,
@@ -658,7 +657,6 @@ class TDLClient:
         self.namespace = namespace
         self.runner = runner or SubprocessRunner()
         self.debug = debug
-        self.run_as_user = run_as_user
         self.home = home
         self.log_prefix = log_prefix
         self.stall_timeout_seconds = stall_timeout_seconds
@@ -697,7 +695,7 @@ class TDLClient:
         export_args.extend(["-o", str(export_path)])
         if with_content:
             export_args.append("--with-content")
-        command = self._wrap_command(self._base_command() + export_args)
+        command = self._base_command() + export_args
         result = self.runner.run(
             command,
             env=self._command_env(),
@@ -745,7 +743,7 @@ class TDLClient:
         privately and the subprocess logger is silenced for this command.
         """
         requested = normalize_tdl_chat_ref(chat_ref)
-        command = self._wrap_command(self._base_command() + ["chat", "ls", "-o", "json"])
+        command = self._base_command() + ["chat", "ls", "-o", "json"]
         try:
             result = self.runner.run(
                 command,
@@ -829,20 +827,17 @@ class TDLClient:
         self, export_path: Path, download_dir: Path
     ) -> subprocess.CompletedProcess[str]:
         download_dir.mkdir(parents=True, exist_ok=True)
-        command = self._wrap_command(
-            self._base_command()
-            + [
-                "dl",
-                "-f",
-                str(export_path),
-                "-d",
-                str(download_dir),
-                "--template",
-                "{{ .MessageID }}_{{.FileName}}",
-                "--continue",
-                "--skip-same",
-            ]
-        )
+        command = self._base_command() + [
+            "dl",
+            "-f",
+            str(export_path),
+            "-d",
+            str(download_dir),
+            "--template",
+            "{{ .MessageID }}_{{.FileName}}",
+            "--continue",
+            "--skip-same",
+        ]
         result = self.runner.run(
             command,
             env=self._command_env(),
@@ -859,20 +854,17 @@ class TDLClient:
         self, url: str, download_dir: Path
     ) -> subprocess.CompletedProcess[str]:
         download_dir.mkdir(parents=True, exist_ok=True)
-        command = self._wrap_command(
-            self._base_command()
-            + [
-                "dl",
-                "-u",
-                url,
-                "-d",
-                str(download_dir),
-                "--template",
-                "{{.FileName}}",
-                "--continue",
-                "--skip-same",
-            ]
-        )
+        command = self._base_command() + [
+            "dl",
+            "-u",
+            url,
+            "-d",
+            str(download_dir),
+            "--template",
+            "{{.FileName}}",
+            "--continue",
+            "--skip-same",
+        ]
         result = self.runner.run(
             command,
             env=self._command_env(),
@@ -913,13 +905,11 @@ class TDLClient:
                 handle.write(json.dumps(str(caption), ensure_ascii=False))
                 handle.write("\n")
                 caption_path = Path(handle.name)
-            # Upload sessions may run through `runuser -u user1`.
-            caption_path.chmod(0o644)
             upload_args = ["up", "-p", str(file_path), "-c", chat_ref]
             if as_photo:
                 upload_args.append("--photo")
             upload_args.extend(["--caption", str(caption_path)])
-            command = self._wrap_command(self._base_command() + upload_args)
+            command = self._base_command() + upload_args
             if status_callback is not None:
                 status_callback("uploading")
             result = self.runner.run(
@@ -981,12 +971,6 @@ class TDLClient:
                     mode="w", suffix=".json", prefix="tme3bot-upload-resolve-", delete=False
                 ) as handle:
                     export_path = Path(handle.name)
-                # The resolver can run TDL through ``runuser -u user1``. A
-                # NamedTemporaryFile belongs to root and defaults to 0600, so
-                # user1 could not overwrite it with the exported JSON.
-                # /tmp itself is sticky; making this one random output file
-                # writable is limited to the short lookup window.
-                export_path.chmod(0o666)
                 exported = self.export_messages(
                     chat_ref,
                     start_id,
@@ -1054,11 +1038,6 @@ class TDLClient:
         env.setdefault("TDL_TERMINAL_COLUMNS", "300")
         env.setdefault("TDL_TERMINAL_ROWS", "40")
         return env
-
-    def _wrap_command(self, command: list[str]) -> list[str]:
-        if not self.run_as_user or self.run_as_user == "root":
-            return command
-        return ["runuser", "-u", self.run_as_user, "--"] + command
 
     @staticmethod
     def _ensure_success(

@@ -99,9 +99,7 @@ class ProfileSessionManager:
             storage_root = directory / "session" / ".tdl"
             storage_root.mkdir(parents=True, exist_ok=True)
             self._set_private_tree(directory)
-            self._chown_user1(directory)
             command = [
-                "runuser", "-u", str(self.config.tdl_export_user), "--",
                 "tdl", "--storage", f"type=bolt,path={storage_root / 'data'}",
                 "-n", str(self.config.tdl_export_namespace), "login", "-T", method,
             ]
@@ -210,7 +208,6 @@ class ProfileSessionManager:
             directory = Path(temporary)
             session_root = directory / ".tdl"
             self._write_files(session_root, files)
-            self._chown_user1(directory)
             return self._whoami(session_root)
 
     def install_bundle(
@@ -334,7 +331,6 @@ class ProfileSessionManager:
                 identity_path.chmod(0o600)
             except OSError:
                 pass
-            self._chown_user1(profile_root / "user1")
             if on_stage:
                 on_stage("session_validation")
             return {"profile": normalized, "ready": True}
@@ -536,21 +532,19 @@ class ProfileSessionManager:
             (
                 "root",
                 Path(resolved_config.tdl_download_storage),
-                str(resolved_config.tdl_download_user),
                 str(resolved_config.tdl_download_namespace),
                 Path(resolved_config.tdl_download_home),
             ),
             (
                 "user1",
                 Path(resolved_config.tdl_export_storage),
-                str(resolved_config.tdl_export_user),
                 str(resolved_config.tdl_export_namespace),
                 Path(resolved_config.tdl_export_home),
             ),
         )
-        for name, storage_root, user, namespace, home in specifications:
+        for name, storage_root, namespace, home in specifications:
             user_id, code = self._diagnose_one_tdl_session(
-                profile_root, name, storage_root, user, namespace, home
+                profile_root, name, storage_root, namespace, home
             )
             identity_ids.append(user_id)
             matches_metadata = user_id is not None and metadata_id is not None and user_id == metadata_id
@@ -607,11 +601,9 @@ class ProfileSessionManager:
             raise ValueError("Backup session selection is invalid.")
         resolved = build_profile_config(self.config, normalized)
         if lane == "root":
-            user = str(resolved.tdl_download_user)
             namespace = str(resolved.tdl_download_namespace)
             home = Path(resolved.tdl_download_home)
         else:
-            user = str(resolved.tdl_export_user)
             namespace = str(resolved.tdl_export_namespace)
             home = Path(resolved.tdl_export_home)
         storage = Path(storage_root)
@@ -627,14 +619,13 @@ class ProfileSessionManager:
             or database_file.stat().st_size <= 0
         ):
             raise ValueError("Extracted TDL session database is missing or unsafe.")
-        return self._run_whoami(storage, user=user, namespace=namespace, home=home)
+        return self._run_whoami(storage, namespace=namespace, home=home)
 
     def _diagnose_one_tdl_session(
         self,
         profile_root: Path,
         name: str,
         storage_root: Path,
-        user: str,
         namespace: str,
         home: Path,
     ) -> tuple[int | None, str]:
@@ -662,36 +653,33 @@ class ProfileSessionManager:
 
         try:
             user_id = self._run_whoami(
-                storage_root, user=user, namespace=namespace, home=home
+                storage_root, namespace=namespace, home=home
             )
         except ValueError:
             return None, f"PROFILE_{name.upper()}_SESSION_TDL_INVALID"
         return user_id, "OK"
 
     def _run_whoami(
-        self, storage_root: Path, *, user: str, namespace: str, home: Path
+        self, storage_root: Path, *, namespace: str, home: Path
     ) -> int:
         helper = str(getattr(self.config, "leave_helper_binary", "/usr/local/bin/tdl-leave"))
         with tempfile.TemporaryDirectory(prefix="tdl-diagnostic-") as raw_directory:
             private_directory = Path(raw_directory)
             self._set_private_tree(private_directory)
-            self._chown(private_directory, user)
             # tdl-leave opens Bolt for writes even in --whoami mode. Use a
             # private copy so the live session database remains untouched.
             snapshot_storage = private_directory / "session-data"
             snapshot_storage.mkdir(mode=0o700)
             self._set_private_tree(snapshot_storage)
-            self._chown(snapshot_storage, user)
             snapshot_database = snapshot_storage / namespace
             shutil.copyfile(storage_root / "data" / namespace, snapshot_database)
             try:
                 snapshot_database.chmod(0o600)
             except OSError:
                 pass
-            self._chown(snapshot_database, user)
             identity_file = private_directory / "identity.json"
             command = [
-                "runuser", "-u", user, "--", helper,
+                helper,
                 "--storage", str(snapshot_storage),
                 "--namespace", namespace,
                 "--whoami", "--identity-file", str(identity_file),
@@ -772,7 +760,6 @@ class ProfileSessionManager:
     def _whoami(self, storage_root: Path) -> int:
         return self._run_whoami(
             storage_root,
-            user=str(self.config.tdl_export_user),
             namespace=str(self.config.tdl_export_namespace),
             home=Path(self.config.tdl_export_home),
         )
@@ -881,31 +868,6 @@ class ProfileSessionManager:
             destination = root.joinpath(*path.parts)
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(data)
-
-    @staticmethod
-    def _chown_user1(path: Path) -> None:
-        if os.name != "posix" or os.geteuid() != 0:
-            return
-        try:
-            import pwd
-
-            account = pwd.getpwnam("user1")
-            for item in [path, *path.rglob("*")]:
-                os.chown(item, account.pw_uid, account.pw_gid)
-        except (KeyError, OSError):
-            pass
-
-    @staticmethod
-    def _chown(path: Path, username: str) -> None:
-        if os.name != "posix" or os.geteuid() != 0 or username == "root":
-            return
-        try:
-            import pwd
-
-            account = pwd.getpwnam(username)
-            os.chown(path, account.pw_uid, account.pw_gid)
-        except (KeyError, OSError):
-            pass
 
     @staticmethod
     def _set_private_tree(path: Path) -> None:

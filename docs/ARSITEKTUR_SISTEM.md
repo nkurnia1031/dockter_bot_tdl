@@ -183,7 +183,7 @@ Detail konfigurasi dan rollout ada di [runbook TTS Novel](TTS_NOVEL_RUNBOOK.md).
 |---|---|---|
 | Job, event, antrean, autentikasi, katalog export dan storage | SQLite backend, `/data/storage.db` | Menyimpan lifecycle job dan progress yang dibaca UI. |
 | Identity, profile, source, route worker, label, dan pengaturan | File JSON di `/data` | Credential dan token tidak boleh ditulis ke log atau dikirim ke Web. |
-| Sesi TDL | Volume `/data` pada masing-masing worker | `user1` untuk export/leave; `root` untuk download. Sesi tidak disalin ke worker lain. |
+| Sesi TDL | Volume `/data` pada masing-masing worker | Semua proses TDL berjalan sebagai root. Lane Export memakai `user1/.tdl`; lane Download memakai `root/.tdl`. Nama folder adalah label historis, dan dua database tetap terpisah. |
 | File kerja dan staging | Workspace worker, `/workspace` | Operasi berjalan pada filesystem worker yang dipilih. |
 
 Backend menentukan profile dari identity user dan memeriksa hak akses setiap

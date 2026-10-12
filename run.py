@@ -827,7 +827,7 @@ def write_profile_identity(env: dict[str, str], profile_name: str | None) -> Non
     identity_file = f"{profile_root}/identity.json"
     namespace = env.get("TDL_EXPORT_NAMESPACE", "default").strip() or "default"
     command = [
-        "exec", "-T", worker_service(env), "runuser", "-u", "user1", "--",
+        "exec", "-T", worker_service(env),
         env.get("LEAVE_HELPER_BINARY", "/usr/local/bin/tdl-leave"),
         "--storage", storage, "--namespace", namespace,
         "--whoami", "--identity-file", identity_file,
@@ -1565,8 +1565,7 @@ def ensure_container_profile_dirs(env: dict[str, str], profile: str) -> None:
         command = (
             "mkdir -p /data/.config /data/root/.tdl /data/user1/.tdl /data/download /data/download/berlabel /data/download/biasa "
             "/data/exports/pending /data/exports/processing /data/exports/done "
-            "/data/exports/failed /data/tmp "
-            "&& chown -R user1:user1 /data/user1 /data/exports/pending /data/tmp"
+            "/data/exports/failed /data/tmp"
         )
     else:
         command = (
@@ -1579,9 +1578,6 @@ def ensure_container_profile_dirs(env: dict[str, str], profile: str) -> None:
             f"/data/profiles/{profile}/exports/processing "
             f"/data/profiles/{profile}/exports/done "
             f"/data/profiles/{profile}/exports/failed "
-            f"/data/profiles/{profile}/tmp "
-            f"&& chown -R user1:user1 /data/profiles/{profile}/user1 "
-            f"/data/profiles/{profile}/exports/pending "
             f"/data/profiles/{profile}/tmp"
         )
     run_compose(["exec", worker_service(env), "bash", "-lc", command], env)

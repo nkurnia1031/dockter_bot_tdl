@@ -48,9 +48,8 @@ utility_settings.json
 *.db
 .config/rclone.conf
 **/.config/rclone.conf
-graphify-out/cost.json
-graphify-out/cache/
-graphify-out/.graphify_root
+# Graphify outputs are generated locally and can be rebuilt with `graphify update .`.
+graphify-out/
 output.zip
 worker_routes.json
 workers.json

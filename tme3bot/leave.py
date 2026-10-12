@@ -37,8 +37,6 @@ class LeaveService:
         ]
         for chat_ref in chat_refs:
             command.extend(("--chat", chat_ref))
-        if self.config.tdl_export_user != "root":
-            command = ["runuser", "-u", self.config.tdl_export_user, "--"] + command
         env = dict(os.environ)
         env["HOME"] = str(self.config.tdl_export_home)
         env["TDL_FORCE_PTY"] = "0"

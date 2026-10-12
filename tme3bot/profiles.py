@@ -8,11 +8,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
-try:
-    import pwd
-except ModuleNotFoundError:  # pragma: no cover - Windows local test environment
-    pwd = None
-
 from tme3bot.config import AppConfig
 from tme3bot.application.ports import ProfileStateStore, SourceRepository
 from tme3bot.names import normalize_profile_name
@@ -558,7 +553,6 @@ def build_profile_runtime(
         storage_root=config.tdl_export_storage,
         namespace=config.tdl_export_namespace,
         debug=config.log_level == "DEBUG",
-        run_as_user=config.tdl_export_user,
         home=config.tdl_export_home,
         log_prefix=f"tdl-export:{profile_name}",
         stall_timeout_seconds=config.tdl_export_stall_timeout_seconds,
@@ -567,7 +561,6 @@ def build_profile_runtime(
         storage_root=config.tdl_download_storage,
         namespace=config.tdl_download_namespace,
         debug=config.log_level == "DEBUG",
-        run_as_user=config.tdl_download_user,
         home=config.tdl_download_home,
         log_prefix=f"tdl-download:{profile_name}",
         stall_timeout_seconds=config.tdl_download_stall_timeout_seconds,
@@ -641,45 +634,13 @@ def ensure_profile_runtime_dirs(config: AppConfig) -> None:
         config.tdl_download_home,
         config.tdl_download_storage,
     ]
-    export_owned_paths = [
+    additional_paths = [
         config.tdl_export_home,
         config.tdl_export_storage,
         config.temp_root,
         config.export_pending_dir,
     ]
-    for path in root_owned_paths + export_owned_paths:
+    for path in root_owned_paths + additional_paths:
         path.mkdir(parents=True, exist_ok=True)
     (config.tdl_export_storage / "log").mkdir(parents=True, exist_ok=True)
     (config.tdl_download_storage / "log").mkdir(parents=True, exist_ok=True)
-    chown_paths(
-        export_owned_paths + [config.tdl_export_storage / "log"], config.tdl_export_user
-    )
-
-
-def chown_paths(paths: list[object], username: str) -> None:
-    if username == "root" or os.name == "nt" or pwd is None:
-        return
-    try:
-        user_info = pwd.getpwnam(username)
-    except KeyError:
-        LOGGER.warning("User %s tidak ditemukan; skip chown runtime dirs", username)
-        return
-    for raw_path in paths:
-        chown_tree(os.fspath(raw_path), user_info.pw_uid, user_info.pw_gid, username)
-
-
-def chown_tree(path: str, uid: int, gid: int, username: str) -> None:
-    try:
-        os.chown(path, uid, gid)
-    except PermissionError:
-        LOGGER.warning("Tidak bisa chown %s ke %s", path, username)
-        return
-    if not os.path.isdir(path):
-        return
-    for dirpath, dirnames, filenames in os.walk(path):
-        for name in dirnames + filenames:
-            child = os.path.join(dirpath, name)
-            try:
-                os.chown(child, uid, gid)
-            except PermissionError:
-                LOGGER.warning("Tidak bisa chown %s ke %s", child, username)

@@ -18,8 +18,8 @@ def make_config(root: Path) -> AppConfig:
         default_profile="default", tme3_host="t.me3", download_root=root / "download",
         export_pending_dir=root / "exports/pending", export_processing_dir=root / "exports/processing",
         export_done_dir=root / "exports/done", export_failed_dir=root / "exports/failed",
-        state_file=root / "state.json", legacy_max_json=root / "max.json", tdl_export_user="user1",
-        tdl_download_user="root", tdl_export_home=root / "user1", tdl_download_home=root / "root",
+        state_file=root / "state.json", legacy_max_json=root / "max.json",
+        tdl_export_home=root / "user1", tdl_download_home=root / "root",
         tdl_export_storage=root / "user1/.tdl", tdl_download_storage=root / "root/.tdl",
         tdl_export_namespace="default", tdl_download_namespace="default",
         tdl_export_stall_timeout_seconds=300, tdl_download_stall_timeout_seconds=1800,
@@ -29,6 +29,12 @@ def make_config(root: Path) -> AppConfig:
 
 
 class BackupServiceTests(unittest.TestCase):
+    def test_runtime_snapshot_does_not_include_removed_tdl_user_settings(self):
+        from tme3bot.backup_service import RUNTIME_ENV_KEYS
+
+        self.assertNotIn("TDL_EXPORT_USER", RUNTIME_ENV_KEYS)
+        self.assertNotIn("TDL_DOWNLOAD_USER", RUNTIME_ENV_KEYS)
+
     def test_worker_backup_omits_legacy_business_state_and_snapshots_command_journal(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

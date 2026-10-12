@@ -350,31 +350,12 @@ def _clone_tree(source: Path, destination: Path) -> None:
         shutil.copytree(source, destination, dirs_exist_ok=True)
 
 
-def _chown_tree(path: Path, username: str | None) -> None:
-    if not username or username == "root" or os.name == "nt":
-        return
-    try:
-        import pwd
-
-        info = pwd.getpwnam(username)
-    except (ImportError, KeyError):
-        return
-    for current, directories, files in os.walk(path):
-        for name in [current, *directories, *files]:
-            try:
-                os.chown(name, info.pw_uid, info.pw_gid)
-            except OSError:
-                continue
-
-
 def ensure_quick_tdl_client(
     stage_root: Path,
     *,
     mode: str,
     source_storage: Path | None,
-    source_home: Path | None,
     namespace: str,
-    run_as_user: str | None,
     stall_timeout_seconds: int = 0,
     progress_callback=None,
     output_callback=None,
@@ -387,11 +368,9 @@ def ensure_quick_tdl_client(
     if not storage_root.exists() or not any(storage_root.iterdir()):
         _clone_tree(Path(source_storage) if source_storage else Path(), storage_root)
     mode_root.mkdir(parents=True, exist_ok=True)
-    _chown_tree(mode_root, run_as_user)
     return TDLClient(
         storage_root=storage_root,
         namespace=namespace,
-        run_as_user=run_as_user,
         home=mode_root,
         log_prefix=f"tdl-quick-{mode}:{Path(stage_root).name}",
         stall_timeout_seconds=stall_timeout_seconds,
@@ -400,9 +379,9 @@ def ensure_quick_tdl_client(
     )
 
 
-def ensure_quick_stage_writable(stage_root: Path, username: str | None) -> None:
+def ensure_quick_stage_writable(stage_root: Path) -> None:
+    """Create worker-owned staging directories for root-run TDL processes."""
     Path(stage_root).mkdir(parents=True, exist_ok=True)
-    _chown_tree(Path(stage_root), username)
 
 
 def visual_media(root: Path) -> tuple[list[Path], list[Path]]:

@@ -42,7 +42,7 @@ RUN apt-get update \
         unar \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --home-dir /home/user1 --shell /usr/sbin/nologin user1
+USER root
 
 COPY requirements.txt /tmp/tme3bot-requirements.txt
 RUN python3 -m pip install --no-cache-dir -r /tmp/tme3bot-requirements.txt \
@@ -79,4 +79,7 @@ RUN set -eu; \
     tdl version; \
     tdl-leave --help >/dev/null 2>&1 || true
 
-RUN mkdir -p /data/.config /data/root /data/user1 /data/download /data/exports /data/tmp
+RUN test "$(id -u)" = "0" \
+    && ! id user1 >/dev/null 2>&1 \
+    && tdl version >/dev/null \
+    && mkdir -p /data/.config /data/root /data/user1 /data/download /data/exports /data/tmp

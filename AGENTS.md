@@ -92,9 +92,11 @@ git diff --check
 ```
 
 Untuk pertanyaan arsitektur atau relasi file, jalankan `graphify query ...`
-lebih dahulu jika `graphify-out/graph.json` tersedia. Setelah mengubah source,
-jalankan `graphify update .`. File di `graphify-out/` boleh berubah sebagai
-hasil graphify; jangan mengeditnya manual untuk memperbaiki kode aplikasi.
+lebih dahulu jika `graphify-out/graph.json` tersedia. Jika graph belum ada dan
+berguna untuk pertanyaan tersebut, buat secara lokal dengan `graphify update .`.
+Setelah mengubah source, jalankan `graphify update .` untuk memperbarui konteks
+lokal. Seluruh `graphify-out/` diabaikan Git; jangan stage atau commit outputnya
+dan jangan mengeditnya manual untuk memperbaiki kode aplikasi.
 
 Jangan menampilkan nilai rahasia dari `.env`, `.env.backend`, `.env.worker`,
 `workers.json`, token GHCR/GitHub, token internal, cookie secret, password
@@ -113,7 +115,7 @@ nama key dan status configured/missing.
 - `domain/`, `application/`, dan `infrastructure/` menerapkan ports/adapters,
   job state machine, repository, auth bot challenge, dan worker strategy.
 - `profiles.py` menentukan runtime profile dan authorization dari `identity.json`.
-- Sesi `user1` dipakai export dan leave; sesi `root` dipakai download. Jangan gabungkan folder `.tdl`.
+- Seluruh proses TDL worker berjalan sebagai root. Lane Export/leave memakai HOME `/data/user1` dan storage `user1/.tdl`; lane Download memakai HOME `/data/root` dan storage `root/.tdl`. Nama folder adalah label historis, bukan akun Linux. Jangan gabungkan folder `.tdl`.
 - `service.py` mengorkestrasi export/download; `tdl.py` menjalankan subprocess dan menangani output ANSI/PTY.
 - `application/control_plane.py` mengorkestrasi command/query dan lifecycle job.
 - `worker/executor.py` menangani export/download/leave, utility, storage, dan
@@ -222,14 +224,14 @@ memiliki field `enabled` dianggap aktif. Error admission yang diharapkan adalah
 Profile default memakai `/data`; profile tambahan memakai `/data/profiles/<name>`.
 
 ```text
-<profile>/root/.tdl/       sesi download
-<profile>/user1/.tdl/      sesi export/leave
+<profile>/root/.tdl/       sesi lane Download
+<profile>/user1/.tdl/      sesi lane Export/leave
 <profile>/identity.json    telegram_user_id/tdl_user_id
 <profile>/state.json       source dan last_id
 <profile>/exports/         pending/processing/done/failed
 ```
 
-`python3 run.py identity <profile>` membaca sesi `user1` tanpa login ulang dan membuat identity.
+`python3 run.py identity <profile>` membaca sesi lane Export (`user1/.tdl`) tanpa login ulang dan membuat identity.
 
 ## Queue Rules
 
@@ -372,16 +374,16 @@ Pertahankan Python 3.10/Ubuntu 22.04 compatibility, gunakan `apply_patch`, tamba
 
 ## graphify
 
-This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+This project can generate a local knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships. The generated directory is ignored by Git.
 
 When the user types `/graphify`, use the installed graphify skill or instructions before doing anything else.
 
 Rules:
-- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
-- Dirty graphify-out/ files are expected after hooks or incremental updates; dirty graph files are not a reason to skip graphify. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. If it does not exist and graph traversal would help, generate it locally with `graphify update .` first. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- Graphify outputs are local generated files. Never stage or commit graphify-out/; regenerate it as needed. Only skip graphify if the task is about stale or incorrect graph output, or the user explicitly says not to use it.
 - If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
-- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
+- After modifying code, run `graphify update .` to keep the local graph current (AST-only, no API cost). Leave its ignored output out of Git.
 
 ## Agent skills
 

@@ -5,33 +5,41 @@ Istilah ini menjelaskan profil Telegram lokal dan vault yang dipakai aplikasi se
 ## Profil
 
 **Profil lokal**:
-Sesi TDL yang dimiliki satu worker dan tetap tersedia sebagai sumber lokal.
-_Avoid_: profil worker sebagai istilah untuk identitas akun.
+Salinan sesi TDL yang berada pada worker dan dibuka oleh proses TDL di worker tersebut. Setiap worker memerlukan salinan lokalnya sendiri.
+_Avoid_: sumber kebenaran profil.
 
 **Profil vault**:
-Profil bersama yang dikelola backend dan dapat dipasang sebagai salinan terpisah pada worker.
-_Avoid_: profil lokal yang disinkronkan.
+Bundle profil kanonis yang dikelola backend untuk didistribusikan ke worker. Setelah lolos pemeriksaan, bundle dipasang sebagai sesi lokal yang digunakan TDL pada worker.
+_Avoid_: sumber sesi terpisah yang dipilih saat job dijalankan.
 
 **Pasangan sesi**:
-Dua sesi TDL `root` dan `user1` milik satu profil; keduanya harus menunjukkan identitas Telegram yang sama.
-_Avoid_: satu sesi profil.
+Dua storage TDL terpisah milik satu profil, masing-masing untuk lane Download dan Export; keduanya harus menunjukkan identitas Telegram yang sama.
+_Avoid_: satu sesi profil, dua pengguna Linux.
+
+**Lane TDL**:
+Storage sesi TDL yang dipakai oleh kelas pekerjaan tertentu. Lane Download dan Export dipisahkan agar operasi paralel tidak membuka database Bolt yang sama.
+_Avoid_: pengguna TDL.
+
+**Identitas proses TDL**:
+Akun sistem operasi yang menjalankan proses TDL; identitas ini terpisah dari akun Telegram yang tersimpan di storage sesi.
+_Avoid_: identitas profil, pengguna Telegram.
 
 **Identitas profil**:
-Satu ID numerik Telegram yang berlaku bagi seluruh pasangan sesi dan menentukan pemetaan actor sesuai sumber aktif.
+Satu ID numerik Telegram yang berlaku bagi seluruh pasangan sesi dan menentukan akun serta pemetaan actor profil.
 _Avoid_: identitas folder, identitas worker.
 
-**Sumber aktif**:
-Pilihan profil lokal atau vault yang digunakan untuk satu pasangan worker dan profil; identitas sumber aktif menentukan pemetaan actor profil.
-_Avoid_: profil tersinkron.
+**Kesiapan profil worker**:
+Status apakah salinan lokal profil pada satu worker lolos pemeriksaan TDL dan cocok dengan identitas profil. Kesiapan dicatat per worker dan tidak menunggu worker lain.
+_Avoid_: kesiapan seluruh worker.
 
 **Revision vault**:
-Versi tertentu dari profil vault yang disimpan backend dan diuji pada worker.
+Versi tertentu dari bundle kanonis di backend yang didistribusikan dan diperiksa pada setiap worker.
 _Avoid_: status sync.
 
-**Siap digunakan**:
-Sumber profil yang kedua sesi TDL-nya lolos pemeriksaan dan identitasnya cocok dengan identitas profil.
-_Avoid_: ACK siap.
+**State export bersama**:
+Daftar channel dan last message ID yang disimpan backend per profil dan channel. Semua worker memakai state yang sama saat export.
+_Avoid_: salinan state per worker.
 
-**Fallback**:
-Peralihan otomatis dari vault ke profil lokal sebelum perintah TDL dimulai, hanya ketika identitas kedua sumber sama.
-_Avoid_: retry dengan profil lain.
+**Rollback sesi**:
+Pemulihan sesi lokal sebelumnya jika bundle baru gagal dipasang atau diuji. Sesi lama hanya boleh dipakai bila masih lolos pemeriksaan TDL dan identitasnya cocok.
+_Avoid_: fallback ke sumber profil lain.

@@ -25,8 +25,6 @@ def make_config(root: Path) -> AppConfig:
         export_failed_dir=root / "data/exports/failed",
         state_file=root / "data/state.json",
         legacy_max_json=root / "data/max.json",
-        tdl_export_user="user1",
-        tdl_download_user="root",
         tdl_export_home=root / "data/user1",
         tdl_download_home=root / "data/root",
         tdl_export_storage=root / "data/user1/.tdl",
@@ -89,6 +87,43 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
         serialized = json.dumps(result)
         self.assertNotIn("424242", serialized)
         self.assertNotIn("/data", serialized)
+
+    def test_login_starts_tdl_as_root_with_export_lane_home_and_storage(self):
+        class FakePty:
+            @staticmethod
+            def fork():
+                return 0, 123
+
+        class ChildExit(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as raw:
+            config = make_config(Path(raw))
+            manager = ProfileSessionManager(config)
+            with (
+                patch("tme3bot.worker.profile_sessions.pty", FakePty()),
+                patch(
+                    "tme3bot.worker.profile_sessions.os.execvpe",
+                    side_effect=OSError("test handoff"),
+                ) as execvpe,
+                patch(
+                    "tme3bot.worker.profile_sessions.os._exit",
+                    side_effect=ChildExit,
+                ),
+                self.assertRaises(ChildExit),
+            ):
+                manager.start("login-root-test", "qr")
+
+            command, env = execvpe.call_args.args[1:3]
+            self.assertEqual(command[0], "tdl")
+            self.assertNotIn("runuser", command)
+            self.assertEqual(command[command.index("-n") + 1], "export-ns")
+            self.assertIn("login", command)
+            self.assertEqual(env["HOME"], str(config.tdl_export_home))
+            self.assertIn(
+                f"type=bolt,path={manager.login_root / 'login-root-test' / 'session' / '.tdl' / 'data'}",
+                command,
+            )
 
     def test_local_profile_inventory_omits_uninitialized_default_placeholder(self):
         class Manager:
@@ -156,7 +191,8 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(commands), 2)
             root_command, root_cwd, root_home, root_timeout = commands[0]
             export_command, export_cwd, export_home, export_timeout = commands[1]
-            self.assertEqual(root_command[:4], ["runuser", "-u", "root", "--"])
+            self.assertEqual(root_command[0], "/usr/local/bin/tdl-leave")
+            self.assertNotIn("runuser", root_command)
             self.assertEqual(
                 Path(root_command[root_command.index("--storage") + 1]),
                 snapshot_databases[0][0].parent,
@@ -173,7 +209,8 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             self.assertEqual(root_cwd, config.tdl_download_home)
             self.assertEqual(root_home, str(config.tdl_download_home))
             self.assertEqual(root_timeout, 60)
-            self.assertEqual(export_command[:4], ["runuser", "-u", "user1", "--"])
+            self.assertEqual(export_command[0], "/usr/local/bin/tdl-leave")
+            self.assertNotIn("runuser", export_command)
             self.assertEqual(
                 Path(export_command[export_command.index("--storage") + 1]),
                 snapshot_databases[1][0].parent,
@@ -236,8 +273,10 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             self.assertEqual(len(commands), 2)
             self.assertEqual(commands[0][commands[0].index("--namespace") + 1], "download-ns")
             self.assertEqual(commands[1][commands[1].index("--namespace") + 1], "export-ns")
-            self.assertEqual(commands[0][1:3], ["-u", "root"])
-            self.assertEqual(commands[1][1:3], ["-u", "user1"])
+            self.assertEqual(commands[0][0], "/usr/local/bin/tdl-leave")
+            self.assertEqual(commands[1][0], "/usr/local/bin/tdl-leave")
+            self.assertNotIn("runuser", commands[0])
+            self.assertNotIn("runuser", commands[1])
             self.assertEqual((download_storage / "data/download-ns").read_bytes(), b"download session backup")
             self.assertEqual((export_storage / "data/export-ns").read_bytes(), b"export session backup")
 
@@ -277,7 +316,8 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
                 result = manager.diagnose_tdl_sessions("default")
             self.assertEqual(run.call_count, 1)
             command = run.call_args.args[0]
-            self.assertEqual(command[:4], ["runuser", "-u", "user1", "--"])
+            self.assertEqual(command[0], "/usr/local/bin/tdl-leave")
+            self.assertNotIn("runuser", command)
             self.assertFalse(bolt_file.exists())
             self.assertFalse(result["ready"])
             self.assertIn("PROFILE_ROOT_SESSION_DATABASE_MISSING", result["reason_codes"])

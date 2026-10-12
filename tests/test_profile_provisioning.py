@@ -35,8 +35,6 @@ def make_config(root: Path) -> AppConfig:
         export_failed_dir=root / "exports" / "failed",
         state_file=root / "state.json",
         legacy_max_json=root / "max.json",
-        tdl_export_user="user1",
-        tdl_download_user="root",
         tdl_export_home=root / "user1",
         tdl_download_home=root / "root",
         tdl_export_storage=root / "user1" / ".tdl",

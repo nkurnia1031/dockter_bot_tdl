@@ -287,16 +287,13 @@ class QuickModeExecutorMixin:
         if config is None:
             return getattr(runtime, f"{mode}_tdl_client")
         source_storage = getattr(config, f"tdl_{mode}_storage", None)
-        source_home = getattr(config, f"tdl_{mode}_home", None)
         if not source_storage or not Path(source_storage).is_dir():
             return getattr(runtime, f"{mode}_tdl_client")
         return ensure_quick_tdl_client(
             stage_root,
             mode=mode,
             source_storage=Path(source_storage),
-            source_home=Path(source_home) if source_home else None,
             namespace=str(getattr(config, f"tdl_{mode}_namespace", "default")),
-            run_as_user=getattr(config, f"tdl_{mode}_user", None),
             stall_timeout_seconds=int(
                 getattr(config, f"tdl_{mode}_stall_timeout_seconds", 0)
             ),
@@ -319,10 +316,7 @@ class QuickModeExecutorMixin:
         workspace = self._quick_workspace(self.config)
         stage_root = migrate_legacy_quick_stage(workspace, stage_job_id)
         stage_root.mkdir(parents=True, exist_ok=True)
-        ensure_quick_stage_writable(
-            stage_root,
-            getattr(getattr(runtime, "config", None), "tdl_export_user", None),
-        )
+        ensure_quick_stage_writable(stage_root)
         requested_phase = str(
             retry.get("resume_phase")
             or payload.get("quick_phase")
@@ -1321,13 +1315,7 @@ class QuickModeExecutorMixin:
                     raise QuickModeError("Storage channel belum dikonfigurasi.")
                 verify_root = stage_root / ".quickmode-verify"
                 verify_root.mkdir(mode=0o770, parents=True, exist_ok=True)
-                storage_user = getattr(client, "run_as_user", None) or getattr(
-                    storage_runtime.config, "tdl_export_user", None
-                )
-                # The executor may run as root while TDL storage runs as
-                # user1. Make only this disposable directory writable by the
-                # TDL user; never chown the stage's cloned sessions.
-                ensure_quick_stage_writable(verify_root, storage_user)
+                ensure_quick_stage_writable(verify_root)
                 try:
                     verify_root.chmod(0o770)
                 except OSError:

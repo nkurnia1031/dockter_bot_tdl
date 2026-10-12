@@ -18,6 +18,7 @@ from tme3bot.tdl import (
     is_nonsemantic_tdl_output_line,
     parse_tdl_progress_line,
 )
+from tme3bot.worker.quick_export import ensure_quick_tdl_client
 
 
 class FakeRunner:
@@ -271,7 +272,7 @@ class TDLClientTests(unittest.TestCase):
             self.assertIn(f"type=bolt,path={root / 'export' / 'data'}", command)
             self.assertIn("export", command)
 
-    def test_can_wrap_export_command_as_linux_user(self) -> None:
+    def test_export_keeps_lane_home_and_storage_without_switching_linux_user(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             runner = FakeRunner("empty")
@@ -279,15 +280,42 @@ class TDLClientTests(unittest.TestCase):
                 root / "user1" / ".tdl",
                 "default",
                 runner=runner,
-                run_as_user="user1",
                 home=root / "user1",
             )
             client.export_messages("@bot", 1, root / "out.json")
 
             command = runner.commands[0]
-            self.assertEqual(command[:4], ["runuser", "-u", "user1", "--"])
+            self.assertEqual(command[0], "tdl")
+            self.assertNotIn("runuser", command)
             self.assertIn(f"type=bolt,path={root / 'user1' / '.tdl' / 'data'}", command)
+            self.assertEqual(command[command.index("-n") + 1], "default")
             self.assertEqual(runner.envs[0]["HOME"], str(root / "user1"))
+
+    def test_quick_mode_uses_separate_lane_storage_and_root_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_storage = root / "data" / "user1" / ".tdl"
+            database = source_storage / "data" / "default"
+            database.parent.mkdir(parents=True)
+            database.write_bytes(b"export-session")
+            stage = root / "quickmode" / "job"
+
+            client = ensure_quick_tdl_client(
+                stage,
+                mode="export",
+                source_storage=source_storage,
+                namespace="default",
+            )
+
+            self.assertEqual(client.home, stage / ".tdl" / "export-home")
+            self.assertEqual(
+                client.storage_root,
+                stage / ".tdl" / "export-home" / ".tdl",
+            )
+            self.assertNotEqual(client.storage_root, source_storage)
+            self.assertEqual(client._base_command()[0], "tdl")
+            self.assertEqual(client._command_env()["HOME"], str(client.home))
+            self.assertNotIn("run_as_user", vars(client))
 
     def test_parses_tdl_progress_line(self) -> None:
         progress = parse_tdl_progress_line("3/12 sample.mp4 45.5% 1.2MiB/s", "stdout")
@@ -387,6 +415,8 @@ class TDLClientTests(unittest.TestCase):
             )
         self.assertEqual(result.message_id, 987)
         command = runner.commands[0]
+        self.assertEqual(command[0], "tdl")
+        self.assertNotIn("runuser", command)
         self.assertEqual(command[command.index("up") : command.index("up") + 7], [
             "up", "-p", str(source), "-c", "-100123", "--caption", command[-1]
         ])
