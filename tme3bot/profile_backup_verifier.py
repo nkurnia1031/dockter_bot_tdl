@@ -34,15 +34,19 @@ def verify_profile_backup(
     settings_file: Path | None = None,
     tdl_diagnostics: Any | None = None,
     archive_factory: Callable[[Path, str], Any] | None = None,
+    session_tester: Callable[[Path, str, str], int] | None = None,
     run_record: dict[str, Any] | None = None,
     part_records: list[dict[str, Any]] | None = None,
     password: str | None = None,
 ) -> dict[str, Any]:
-    """Verify part checksums, 7z password/integrity and profile session entries.
+    """Extract a downloaded backup and test the selected profile sessions.
 
     The utility-settings password is held in process memory and is never included
-    in the report. No member other than the manifest is extracted, and it is
-    extracted only into an automatically removed private temporary directory.
+    in the report. Only the manifest, profile identity, and selected profile's
+    TDL session files are extracted into an automatically removed private
+    temporary directory. Each extracted session is tested through the worker's
+    TDL identity helper; the separate archive.test() preflight is intentionally
+    not used.
     """
     normalized = normalize_profile_name(profile)
     checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -59,8 +63,8 @@ def verify_profile_backup(
         "integrity": "not_checked",
         "decryption": "not_checked",
         "sessions": [
-            {"name": "root", "included": False},
-            {"name": "user1", "included": False},
+            {"name": "root", "included": False, "content_test": "not_run", "tdl_test": "not_run", "identity_match": False},
+            {"name": "user1", "included": False, "content_test": "not_run", "tdl_test": "not_run", "identity_match": False},
         ],
         "tdl_diagnostics": None,
         "canary_evidence_status": "tdl_not_attached",
@@ -112,13 +116,16 @@ def verify_profile_backup(
             assert settings_file is not None
             password = _read_backup_password(Path(settings_file))
         factory = archive_factory or _load_py7zr_factory()
+        if session_tester is None:
+            raise _VerificationFailure("BACKUP_TDL_SESSION_TEST_UNAVAILABLE")
 
         with tempfile.TemporaryDirectory(prefix="profile-backup-verify-") as raw_temp:
             temp_root = Path(raw_temp)
             if os.name == "posix":
                 temp_root.chmod(0o700)
             archive_path = _join_parts(parts, temp_root)
-            archive_names: list[str] = []
+            extraction_root = temp_root / "extracted"
+            extraction_root.mkdir(mode=0o700)
             try:
                 with factory(archive_path, password) as archive:
                     names = _archive_names(archive)
@@ -128,25 +135,28 @@ def verify_profile_backup(
                         raise _VerificationFailure("BACKUP_MANIFEST_MISSING")
                     if not bool(archive.needs_password()):
                         raise _VerificationFailure("BACKUP_ARCHIVE_NOT_ENCRYPTED")
-                    tested = archive.test()
-                    if tested is not True:
-                        report["integrity"] = "unverified"
-                        raise _VerificationFailure("BACKUP_ARCHIVE_INTEGRITY_FAILED")
-                    report["integrity"] = "verified"
-                    report["decryption"] = "verified"
-            except _VerificationFailure:
+                    expected_root, expected_user1 = _expected_session_prefixes(normalized)
+                    identity_entry = _expected_identity_entry(normalized)
+                    targets = _selected_extract_targets(
+                        names,
+                        expected_root=expected_root,
+                        expected_user1=expected_user1,
+                        identity_entry=identity_entry,
+                    )
+                    archive.extract(path=extraction_root, targets=targets)
+            except _VerificationFailure as exc:
+                if exc.code == "BACKUP_ARCHIVE_INTEGRITY_FAILED":
+                    raise _VerificationFailure("BACKUP_ARCHIVE_EXTRACTION_FAILED") from None
                 raise
             except Exception as exc:
-                raise _archive_failure(exc) from None
+                failure = _archive_failure(exc)
+                if failure.code == "BACKUP_ARCHIVE_INTEGRITY_FAILED":
+                    failure = _VerificationFailure("BACKUP_ARCHIVE_EXTRACTION_FAILED")
+                raise failure from None
+            report["integrity"] = "extraction_verified"
+            report["decryption"] = "verified"
 
-            manifest_dir = temp_root / "manifest"
-            manifest_dir.mkdir(mode=0o700)
-            try:
-                with factory(archive_path, password) as archive:
-                    archive.extract(path=manifest_dir, targets=["backup-manifest.json"])
-            except Exception as exc:
-                raise _archive_failure(exc) from None
-            manifest_path = manifest_dir / "backup-manifest.json"
+            manifest_path = extraction_root / "backup-manifest.json"
             if manifest_path.is_symlink() or not manifest_path.is_file():
                 raise _VerificationFailure("BACKUP_MANIFEST_MISSING")
             if manifest_path.stat().st_size > 2 * 1024 * 1024:
@@ -161,22 +171,54 @@ def verify_profile_backup(
             if not isinstance(included, list):
                 raise _VerificationFailure("BACKUP_MANIFEST_INVALID")
             safe_entries = [_safe_archive_path(item) for item in included]
-            expected_root, expected_user1 = _expected_session_prefixes(normalized)
-            session_results = [
-                {
-                    "name": "root",
-                    "included": _has_bolt_session(safe_entries, expected_root)
-                    and _has_bolt_session(archive_names, expected_root),
-                },
-                {
-                    "name": "user1",
-                    "included": _has_bolt_session(safe_entries, expected_user1)
-                    and _has_bolt_session(archive_names, expected_user1),
-                },
-            ]
+            if identity_entry not in safe_entries or identity_entry not in archive_names:
+                raise _VerificationFailure("BACKUP_PROFILE_IDENTITY_MISSING")
+            identity_path = extraction_root / Path(*PurePosixPath(identity_entry).parts)
+            if identity_path.is_symlink() or not identity_path.is_file() or identity_path.stat().st_size > 64 * 1024:
+                raise _VerificationFailure("BACKUP_PROFILE_IDENTITY_INVALID")
+            try:
+                identity_payload = json.loads(identity_path.read_text(encoding="utf-8"))
+                expected_user_id = int(
+                    identity_payload.get("telegram_user_id", identity_payload.get("tdl_user_id"))
+                ) if isinstance(identity_payload, dict) else 0
+            except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                raise _VerificationFailure("BACKUP_PROFILE_IDENTITY_INVALID") from None
+            if expected_user_id < 1:
+                raise _VerificationFailure("BACKUP_PROFILE_IDENTITY_INVALID")
+
+            session_specs = (
+                ("root", expected_root),
+                ("user1", expected_user1),
+            )
+            session_results: list[dict[str, Any]] = []
+            for lane, prefix in session_specs:
+                included_in_manifest = _has_bolt_session(safe_entries, prefix)
+                included_in_archive = _has_bolt_session(archive_names, prefix)
+                storage_relative = prefix[: -len("data/")].rstrip("/")
+                storage_root = extraction_root / Path(*PurePosixPath(storage_relative).parts)
+                included_after_extract = _has_extracted_bolt_session(storage_root)
+                result: dict[str, Any] = {
+                    "name": lane,
+                    "included": included_in_manifest and included_in_archive and included_after_extract,
+                    "content_test": "passed" if included_in_manifest and included_in_archive and included_after_extract else "failed",
+                    "tdl_test": "not_run",
+                    "identity_match": False,
+                }
+                if result["included"]:
+                    try:
+                        extracted_user_id = int(session_tester(storage_root, lane, normalized))
+                        result["tdl_test"] = "passed"
+                        result["identity_match"] = extracted_user_id == expected_user_id
+                    except Exception:
+                        result["tdl_test"] = "failed"
+                session_results.append(result)
             report["sessions"] = session_results
             if not all(item["included"] for item in session_results):
                 raise _VerificationFailure("BACKUP_PROFILE_SESSIONS_INCOMPLETE")
+            if not all(item["tdl_test"] == "passed" for item in session_results):
+                raise _VerificationFailure("BACKUP_PROFILE_SESSION_TDL_FAILED")
+            if not all(item["identity_match"] for item in session_results):
+                raise _VerificationFailure("BACKUP_PROFILE_SESSION_IDENTITY_MISMATCH")
 
         report["status"] = "verified"
         report["reason_codes"] = []
@@ -384,6 +426,48 @@ def _expected_session_prefixes(profile: str) -> tuple[str, str]:
     return base + "root/.tdl/data/", base + "user1/.tdl/data/"
 
 
+def _expected_identity_entry(profile: str) -> str:
+    return "data/identity.json" if profile == "default" else f"data/profiles/{profile}/identity.json"
+
+
+def _selected_extract_targets(
+    names: list[str], *, expected_root: str, expected_user1: str, identity_entry: str
+) -> list[str]:
+    selected: list[str] = []
+    for name in names:
+        safe_name = _safe_archive_path(name)
+        if (
+            safe_name == "backup-manifest.json"
+            or safe_name == identity_entry
+            or safe_name == expected_root[:-1]
+            or safe_name.startswith(expected_root)
+            or safe_name == expected_user1[:-1]
+            or safe_name.startswith(expected_user1)
+        ):
+            selected.append(name)
+    normalized = {_safe_archive_path(name) for name in selected}
+    if "backup-manifest.json" not in normalized:
+        raise _VerificationFailure("BACKUP_MANIFEST_MISSING")
+    if identity_entry not in normalized:
+        raise _VerificationFailure("BACKUP_PROFILE_IDENTITY_MISSING")
+    return selected
+
+
+def _has_extracted_bolt_session(storage_root: Path) -> bool:
+    data_root = storage_root / "data"
+    if storage_root.is_symlink() or data_root.is_symlink() or not data_root.is_dir():
+        return False
+    try:
+        for item in data_root.iterdir():
+            if item.is_symlink():
+                return False
+            if item.is_file() and item.stat().st_size > 0:
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def _sanitize_tdl_diagnostics(payload: Any, worker: str, profile: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise _VerificationFailure("TDL_DIAGNOSTIC_INPUT_INVALID")
@@ -452,7 +536,7 @@ def _archive_failure(exc: BaseException) -> _VerificationFailure:
         return _VerificationFailure("BACKUP_PASSWORD_OR_HEADER_INVALID")
     if "path" in name or "symlink" in name:
         return _VerificationFailure("BACKUP_ARCHIVE_UNSAFE_ENTRY")
-    return _VerificationFailure("BACKUP_ARCHIVE_INTEGRITY_FAILED")
+    return _VerificationFailure("BACKUP_ARCHIVE_EXTRACTION_FAILED")
 
 
 def _valid_identifier(value: str) -> bool:
@@ -479,7 +563,7 @@ def _fail(report: dict[str, Any], code: str) -> dict[str, Any]:
         report["decryption"] = "failed"
     elif code == "BACKUP_ARCHIVE_NOT_ENCRYPTED":
         report["decryption"] = "not_encrypted"
-    elif code == "BACKUP_ARCHIVE_INTEGRITY_FAILED":
+    elif code in {"BACKUP_ARCHIVE_INTEGRITY_FAILED", "BACKUP_ARCHIVE_EXTRACTION_FAILED"}:
         report["integrity"] = "failed"
     if report.get("tdl_diagnostics") is None:
         report["canary_evidence_status"] = "tdl_not_attached"

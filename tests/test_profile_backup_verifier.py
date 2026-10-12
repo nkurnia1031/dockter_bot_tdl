@@ -18,10 +18,13 @@ class FakeArchive:
         self.manifest = manifest
         self.names = names or [
             "backup-manifest.json",
+            "data/identity.json",
             "data/root/.tdl/data/default",
             "data/user1/.tdl/data/default",
         ]
         self.fail = fail
+        self.test_calls = 0
+        self.extract_targets = []
 
     def __enter__(self):
         if self.fail:
@@ -41,11 +44,21 @@ class FakeArchive:
         return True
 
     def test(self):
-        return True
+        self.test_calls += 1
+        return False
 
     def extract(self, *, path, targets):
-        assert targets == ["backup-manifest.json"]
-        Path(path, "backup-manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
+        self.extract_targets = list(targets)
+        destination = Path(path)
+        for name in targets:
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if name == "backup-manifest.json":
+                target.write_text(json.dumps(self.manifest), encoding="utf-8")
+            elif name == "data/identity.json":
+                target.write_text(json.dumps({"telegram_user_id": 123456}), encoding="utf-8")
+            else:
+                target.write_bytes(b"non-empty extracted TDL database")
 
 
 class WrongPasswordError(Exception):
@@ -65,6 +78,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.password = "private-backup-password"
         self.part_data = b"encrypted multipart archive fixture"
         self.part_name = "backup-remote.7z.001"
+        self.archive_instances = []
         (self.parts_dir / self.part_name).write_bytes(self.part_data)
         self.settings.write_text(json.dumps({"compress_password": self.password}), encoding="utf-8")
         connection = sqlite3.connect(self.database)
@@ -96,20 +110,32 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             "node_name": self.worker,
             "created_at": "2026-10-11T01:00:00+00:00",
             "included": [
+                "data/identity.json",
                 "data/root/.tdl/data/default",
                 "data/user1/.tdl/data/default",
             ],
         }
 
+    @staticmethod
+    def _fake_session_tester(storage_root, lane, profile):
+        del profile
+        namespace = "default"
+        database = storage_root / "data" / namespace
+        if not database.is_file() or database.stat().st_size <= 0:
+            raise ValueError(f"missing {lane} session")
+        return 123456
+
     def tearDown(self):
         self.temp.cleanup()
 
-    def verify(self, *, manifest=None, names=None, fail=None):
+    def verify(self, *, manifest=None, names=None, fail=None, session_tester=None):
         made_archives = []
 
         def factory(path, password):
             made_archives.append(Path(path).parent)
-            return FakeArchive(path, password, manifest or self.manifest, names, fail=fail)
+            archive = FakeArchive(path, password, manifest or self.manifest, names, fail=fail)
+            self.archive_instances.append(archive)
+            return archive
 
         report = verify_profile_backup(
             run_id=self.run_id,
@@ -119,6 +145,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             catalog_db=self.database,
             settings_file=self.settings,
             archive_factory=factory,
+            session_tester=session_tester or self._fake_session_tester,
         )
         return report, made_archives
 
@@ -126,9 +153,12 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         report, temporary_dirs = self.verify()
         self.assertEqual(report["status"], "verified")
         self.assertTrue(report["checksums_match"])
-        self.assertEqual(report["integrity"], "verified")
+        self.assertEqual(report["integrity"], "extraction_verified")
         self.assertEqual(report["decryption"], "verified")
         self.assertTrue(all(item["included"] for item in report["sessions"]))
+        self.assertTrue(all(item["tdl_test"] == "passed" for item in report["sessions"]))
+        self.assertTrue(all(archive.test_calls == 0 for archive in self.archive_instances))
+        self.assertTrue(all("data/root/.tdl/data/default" in archive.extract_targets for archive in self.archive_instances))
         self.assertNotIn(self.password, json.dumps(report))
         self.assertNotIn(str(self.parts_dir), json.dumps(report))
         self.assertNotIn(self.part_name, json.dumps(report))
@@ -160,6 +190,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             ],
             password=self.password,
             archive_factory=factory,
+            session_tester=self._fake_session_tester,
         )
 
         self.assertEqual(report["status"], "verified")
@@ -187,6 +218,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             part_records=[{"part_name": timestamped_part_name, "status": "metadata_missing"}],
             password=self.password,
             archive_factory=factory,
+            session_tester=self._fake_session_tester,
         )
 
         self.assertEqual(report["status"], "verified")
@@ -207,8 +239,22 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.assertEqual(report["reason_codes"], ["BACKUP_PASSWORD_INVALID"])
         self.assertNotIn(self.password, json.dumps(report))
 
+    def test_extract_failure_is_reported_as_extraction_failure(self):
+        report, _ = self.verify(fail=RuntimeError)
+        self.assertEqual(report["reason_codes"], ["BACKUP_ARCHIVE_EXTRACTION_FAILED"])
+        self.assertEqual(report["integrity"], "failed")
+        self.assertEqual(report["decryption"], "not_checked")
+
+    def test_extracted_sessions_must_pass_tdl_identity_and_match_archived_identity(self):
+        report, _ = self.verify(
+            session_tester=lambda storage_root, lane, profile: 654321,
+        )
+        self.assertEqual(report["reason_codes"], ["BACKUP_PROFILE_SESSION_IDENTITY_MISMATCH"])
+        self.assertTrue(all(item["tdl_test"] == "passed" for item in report["sessions"]))
+        self.assertTrue(all(not item["identity_match"] for item in report["sessions"]))
+
     def test_missing_profile_session_entry_fails_verification(self):
-        manifest = {**self.manifest, "included": ["data/root/.tdl/data/default"]}
+        manifest = {**self.manifest, "included": ["data/identity.json", "data/root/.tdl/data/default"]}
         report, _ = self.verify(manifest=manifest)
         self.assertEqual(report["reason_codes"], ["BACKUP_PROFILE_SESSIONS_INCOMPLETE"])
         self.assertFalse(report["sessions"][1]["included"])
@@ -217,6 +263,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         report, _ = self.verify(
             names=[
                 "backup-manifest.json",
+                "data/identity.json",
                 "data/root/.tdl/data/default",
             ]
         )
@@ -250,6 +297,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             settings_file=self.settings,
             tdl_diagnostics=diagnostics,
             archive_factory=archive_factory,
+            session_tester=self._fake_session_tester,
         )
         self.assertEqual(report["status"], "verified")
         self.assertEqual(report["canary_evidence_status"], "ready_for_operator_review")
@@ -266,6 +314,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             settings_file=self.settings,
             tdl_diagnostics=wrong_worker,
             archive_factory=archive_factory,
+            session_tester=self._fake_session_tester,
         )
         self.assertEqual(mismatch["reason_codes"], ["TDL_DIAGNOSTIC_SELECTION_MISMATCH"])
 
@@ -275,6 +324,8 @@ class ProfileBackupVerifierTests(unittest.TestCase):
 
         manifest_file = self.root / "backup-manifest.json"
         manifest_file.write_text(json.dumps(self.manifest), encoding="utf-8")
+        identity_file = self.root / "identity.json"
+        identity_file.write_text(json.dumps({"telegram_user_id": 123456}), encoding="utf-8")
         root_session = self.root / "root-session"
         user1_session = self.root / "user1-session"
         root_session.parent.mkdir(exist_ok=True)
@@ -289,6 +340,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             header_encryption=True,
         ) as archive:
             archive.write(manifest_file, "backup-manifest.json")
+            archive.write(identity_file, "data/identity.json")
             archive.write(root_session, "data/root/.tdl/data/default")
             archive.write(user1_session, "data/user1/.tdl/data/default")
         archive_bytes = archive_file.read_bytes()
@@ -316,10 +368,11 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             parts_dir=self.parts_dir,
             catalog_db=self.database,
             settings_file=self.settings,
+            session_tester=self._fake_session_tester,
         )
         self.assertEqual(report["status"], "verified", report)
         self.assertTrue(report["checksums_match"])
-        self.assertEqual(report["integrity"], "verified")
+        self.assertEqual(report["integrity"], "extraction_verified")
         self.assertEqual(report["decryption"], "verified")
         self.assertEqual(report["part_count"], 2)
         self.assertNotIn(self.password, json.dumps(report))
@@ -332,6 +385,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             parts_dir=self.parts_dir,
             catalog_db=self.database,
             settings_file=self.settings,
+            session_tester=self._fake_session_tester,
         )
         self.assertEqual(wrong_password["reason_codes"], ["BACKUP_PASSWORD_OR_HEADER_INVALID"])
         self.assertEqual(wrong_password["decryption"], "failed")

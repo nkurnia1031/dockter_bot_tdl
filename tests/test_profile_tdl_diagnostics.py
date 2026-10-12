@@ -208,6 +208,39 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("424242", json.dumps(result))
             self.assertNotIn(str(profile_root), json.dumps(result))
 
+    def test_backup_session_tester_checks_each_extracted_lane_with_its_namespace(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = make_config(root)
+            manager = ProfileSessionManager(config)
+            extracted = root / "extracted"
+            download_storage = extracted / "data/root/.tdl"
+            export_storage = extracted / "data/user1/.tdl"
+            (download_storage / "data").mkdir(parents=True)
+            (export_storage / "data").mkdir(parents=True)
+            (download_storage / "data/download-ns").write_bytes(b"download session backup")
+            (export_storage / "data/export-ns").write_bytes(b"export session backup")
+            commands = []
+
+            def fake_run(command, **_kwargs):
+                commands.append(command)
+                identity_file = Path(command[command.index("--identity-file") + 1])
+                identity_file.write_text(json.dumps({"telegram_user_id": 424242}), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch("tme3bot.worker.profile_sessions.subprocess.run", side_effect=fake_run):
+                download_id = manager.test_backup_session(download_storage, "root", "default")
+                export_id = manager.test_backup_session(export_storage, "user1", "default")
+
+            self.assertEqual((download_id, export_id), (424242, 424242))
+            self.assertEqual(len(commands), 2)
+            self.assertEqual(commands[0][commands[0].index("--namespace") + 1], "download-ns")
+            self.assertEqual(commands[1][commands[1].index("--namespace") + 1], "export-ns")
+            self.assertEqual(commands[0][1:3], ["-u", "root"])
+            self.assertEqual(commands[1][1:3], ["-u", "user1"])
+            self.assertEqual((download_storage / "data/download-ns").read_bytes(), b"download session backup")
+            self.assertEqual((export_storage / "data/export-ns").read_bytes(), b"export session backup")
+
     def test_tdl_diagnosis_reports_mismatch_without_exposing_ids(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

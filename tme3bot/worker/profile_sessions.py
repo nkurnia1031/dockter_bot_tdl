@@ -600,6 +600,35 @@ class ProfileSessionManager:
         except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             return None, "PROFILE_IDENTITY_INVALID"
 
+    def test_backup_session(self, storage_root: Path, lane: str, profile: str) -> int:
+        """Run the TDL identity check against one extracted backup session."""
+        normalized = normalize_profile_name(profile)
+        if not normalized or lane not in {"root", "user1"}:
+            raise ValueError("Backup session selection is invalid.")
+        resolved = build_profile_config(self.config, normalized)
+        if lane == "root":
+            user = str(resolved.tdl_download_user)
+            namespace = str(resolved.tdl_download_namespace)
+            home = Path(resolved.tdl_download_home)
+        else:
+            user = str(resolved.tdl_export_user)
+            namespace = str(resolved.tdl_export_namespace)
+            home = Path(resolved.tdl_export_home)
+        storage = Path(storage_root)
+        data_root = storage / "data"
+        database_file = data_root / namespace
+        if (
+            storage.is_symlink()
+            or data_root.is_symlink()
+            or database_file.is_symlink()
+            or not storage.is_dir()
+            or not data_root.is_dir()
+            or not database_file.is_file()
+            or database_file.stat().st_size <= 0
+        ):
+            raise ValueError("Extracted TDL session database is missing or unsafe.")
+        return self._run_whoami(storage, user=user, namespace=namespace, home=home)
+
     def _diagnose_one_tdl_session(
         self,
         profile_root: Path,

@@ -197,7 +197,7 @@ class BackupVerificationExecutorMixin:
 
             reporter.report(
                 phase="verifying_archive",
-                message="Memeriksa checksum, password, integritas, dan sesi di arsip",
+                message="Mengekstrak arsip dan menguji isi sesi TDL",
                 overall={"current": len(downloaded_files), "total": len(downloaded_files), "unit": "parts"},
                 indeterminate=True,
                 force=True,
@@ -208,6 +208,7 @@ class BackupVerificationExecutorMixin:
                 profile=profile,
                 parts_dir=parts_dir,
                 tdl_diagnostics=diagnostics,
+                session_tester=self._profile_sessions.test_backup_session,
                 run_record=run_record,
                 part_records=verification_parts,
                 password=password,
@@ -229,9 +230,9 @@ class BackupVerificationExecutorMixin:
         reporter.report(
             phase="completed",
             message=(
-                "Arsip backup lolos verifikasi"
+                "Sesi TDL hasil ekstraksi berhasil diuji"
                 if report.get("status") == "verified"
-                else "Pemeriksaan selesai; lihat kode alasan pada laporan JSON"
+                else "Ekstraksi atau pengujian sesi gagal; lihat kode alasan pada laporan JSON"
             ),
             overall={
                 "current": int(report.get("part_count") or 0),
