@@ -327,6 +327,51 @@ class WorkerProfileSyncTests(unittest.TestCase):
                 client._request("GET", "/internal/v1/profile-manifest", None)
         self.assertEqual(raised.exception.code, "PROFILE_TRANSFER_REQUIRES_HTTPS")
 
+    def test_backend_http_status_409_is_preserved_for_identity_diagnosis(self):
+        client, _ = self.make_client([], {})
+        client._request_override = None
+
+        class RejectingOpener:
+            def open(self, *_args, **_kwargs):
+                raise urllib.error.HTTPError(
+                    "https://backend.example/internal/v1/profile-manifest",
+                    409,
+                    "Conflict",
+                    {},
+                    None,
+                )
+
+        with patch("tme3bot.worker.profile_sync.build_opener", return_value=RejectingOpener()):
+            with self.assertRaises(ProfileSyncError) as raised:
+                client._request("GET", "/internal/v1/profile-manifest", None)
+        self.assertEqual(raised.exception.code, "PROFILE_BACKEND_HTTP_409")
+
+    def test_backend_safe_error_code_is_preserved_without_exposing_message(self):
+        client, _ = self.make_client([], {})
+        client._request_override = None
+        body = json.dumps({
+            "error": {
+                "code": "WORKER_IDENTITY_AMBIGUOUS",
+                "message": "Sensitive backend detail must not be retained.",
+            }
+        }).encode()
+
+        class RejectingOpener:
+            def open(self, *_args, **_kwargs):
+                raise urllib.error.HTTPError(
+                    "https://backend.example/internal/v1/profile-manifest",
+                    409,
+                    "Conflict",
+                    {},
+                    io.BytesIO(body),
+                )
+
+        with patch("tme3bot.worker.profile_sync.build_opener", return_value=RejectingOpener()):
+            with self.assertRaises(ProfileSyncError) as raised:
+                client._request("GET", "/internal/v1/profile-manifest", None)
+        self.assertEqual(raised.exception.code, "WORKER_IDENTITY_AMBIGUOUS")
+        self.assertNotIn("Sensitive", str(raised.exception))
+
     def test_wait_reports_unchanged_backend_reason_only_once(self):
         client, _ = self.make_client([], {})
         client._startup_checked = True

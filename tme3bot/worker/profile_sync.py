@@ -928,13 +928,33 @@ class ProfileSyncClient:
                     raise ProfileSyncError("PROFILE_RESPONSE_TOO_LARGE")
                 return body, response.headers
         except urllib.error.HTTPError as exc:
-            # Do not retain backend response bodies: they may include internal
-            # paths or diagnostic detail, and a redirect must never move tokens.
+            # Preserve only the machine-readable error code. Never retain the
+            # backend message/body, which may contain paths or other details.
             code = {
                 401: "PROFILE_BACKEND_UNAUTHORIZED",
                 403: "PROFILE_BACKEND_FORBIDDEN",
                 426: "PROFILE_TRANSFER_REQUIRES_HTTPS",
-            }.get(exc.code, "PROFILE_BACKEND_REJECTED" if exc.code < 500 else "BACKEND_UNAVAILABLE")
+            }.get(exc.code)
+            if code is None:
+                if 400 <= exc.code < 500:
+                    try:
+                        body = exc.read(4096)
+                        payload = json.loads(body)
+                        error = payload.get("error") if isinstance(payload, dict) else None
+                        candidate = error.get("code") if isinstance(error, dict) else None
+                        if isinstance(candidate, str) and re.fullmatch(
+                            r"[A-Z][A-Z0-9_-]{0,63}", candidate
+                        ):
+                            code = candidate
+                    except Exception:
+                        pass
+                    finally:
+                        if getattr(exc, "fp", None) is not None:
+                            exc.close()
+                    if code is None:
+                        code = f"PROFILE_BACKEND_HTTP_{exc.code}"
+                else:
+                    code = "PROFILE_BACKEND_REJECTED" if exc.code < 500 else "BACKEND_UNAVAILABLE"
             raise ProfileSyncError(code) from None
         except (urllib.error.URLError, TimeoutError, OSError, ValueError):
             raise ProfileSyncError("BACKEND_UNAVAILABLE") from None

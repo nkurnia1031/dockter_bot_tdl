@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, post } from '$lib/api';
-  import { CircleAlert, RefreshCw, ShieldCheck, UserRoundPlus } from '@lucide/svelte';
+  import { CircleAlert, KeyRound, RefreshCw, ShieldCheck, UserRoundPlus } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; selected?: boolean };
   type ProfileCheck = { name: 'identity' | 'root_session' | 'user1_session'; ready: boolean; code: string };
@@ -115,7 +115,7 @@
     <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Profil lokal</h1>
     <p class="muted mt-2">Pilih worker lalu scan untuk melihat profil TDL lokal pada worker tersebut.</p>
   </div>
-  <div class="page-icon"><UserRoundPlus size={23}/></div>
+  <div class="flex items-center gap-2"><a class="button secondary" href="/profiles/vault/"><KeyRound size={16}/>Kelola Vault</a><div class="page-icon"><UserRoundPlus size={23}/></div></div>
 </header>
 
 {#if failure}

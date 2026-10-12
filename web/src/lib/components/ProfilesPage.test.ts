@@ -37,6 +37,7 @@ describe('ProfilesPage', () => {
 
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'remote-2' });
+    expect(screen.getByRole('link', { name: /Kelola Vault/ }).getAttribute('href')).toBe('/profiles/vault/');
     expect(requests.some((item) => item.url.includes('/profiles/scan'))).toBe(false);
 
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
