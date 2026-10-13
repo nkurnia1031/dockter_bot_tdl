@@ -13,12 +13,28 @@ Bundle profil kanonis yang dikelola backend untuk didistribusikan ke worker. Set
 _Avoid_: sumber sesi terpisah yang dipilih saat job dijalankan.
 
 **Pasangan sesi**:
-Dua storage TDL terpisah milik satu profil, masing-masing untuk lane Download dan Export; keduanya harus menunjukkan identitas Telegram yang sama.
+Dua storage utama profil, masing-masing untuk lane Download dan Export; keduanya menunjukkan identitas Telegram yang sama. Pasangan ini tidak mencakup lane Upload.
 _Avoid_: satu sesi profil, dua pengguna Linux.
 
 **Lane TDL**:
-Storage sesi TDL yang dipakai oleh kelas pekerjaan tertentu. Lane Download dan Export dipisahkan agar operasi paralel tidak membuka database Bolt yang sama.
+Storage sesi TDL yang dipakai oleh kelas pekerjaan tertentu. Lane Download, Export, dan Upload dipisahkan agar operasi paralel tidak membuka database Bolt yang sama.
 _Avoid_: pengguna TDL.
+
+**Lane Upload**:
+Storage sesi khusus untuk mengirim file Storage. Lane ini terpisah dari lane Export dan Download, tetapi memakai identitas Telegram profil yang sama.
+_Avoid_: sesi Storage bersama, storage Export.
+
+**Bukti akses kirim**:
+Hasil pemeriksaan bahwa satu profil pada satu worker dapat mengirim ke tujuan tertentu. Bukti berlaku sampai izin atau sesi gagal, tujuan berubah, atau sesi yang diuji berubah.
+_Avoid_: kesiapan worker, verifikasi setiap job.
+
+**Hasil upload ambigu**:
+Upload sudah mulai dikirim tetapi worker tidak dapat memastikan apakah Telegram menerimanya. File tidak boleh dikirim ulang sebelum rekonsiliasi.
+_Avoid_: upload gagal, aman untuk retry.
+
+**Rekonsiliasi upload**:
+Pemeriksaan chat tujuan dengan ekspor TDL berisi caption untuk menentukan hasil upload ambigu. Caption yang cocok berarti terkirim; ekspor sukses tanpa kecocokan berarti aman untuk retry.
+_Avoid_: retry otomatis tanpa pemeriksaan.
 
 **Identitas proses TDL**:
 Akun sistem operasi yang menjalankan proses TDL; identitas ini terpisah dari akun Telegram yang tersimpan di storage sesi.
