@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, post } from '$lib/api';
+  import { profileDiagnosticLabel } from '$lib/tdl-lanes';
   import { CircleAlert, KeyRound, RefreshCw, ShieldCheck, UserRoundPlus } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; selected?: boolean };
-  type ProfileCheck = { name: 'identity' | 'root_session' | 'user1_session'; ready: boolean; code: string };
+  type ProfileCheck = { name: string; ready: boolean; code: string };
   type LocalProfile = { name: string; ready: boolean; reason_codes: string[]; checks: ProfileCheck[] };
   type Inventory = { worker: string; checked_at: string; items: LocalProfile[] };
 
@@ -16,20 +17,14 @@
   let failure = $state('');
   let notice = $state('');
 
-  const checkLabels: Record<ProfileCheck['name'], string> = {
-    identity: 'Identitas',
-    root_session: 'root',
-    user1_session: 'user1'
-  };
-
   const codeMessages: Record<string, string> = {
     PROFILE_IDENTITY_MISSING: 'File identitas tidak ditemukan.',
     PROFILE_IDENTITY_INVALID: 'Identitas profil tidak valid.',
     PROFILE_IDENTITY_UNSAFE: 'File identitas menggunakan path yang tidak aman.',
-    PROFILE_ROOT_SESSION_MISSING: 'Sesi root tidak ditemukan.',
-    PROFILE_USER1_SESSION_MISSING: 'Sesi user1 tidak ditemukan.',
-    PROFILE_ROOT_SESSION_EMPTY: 'Data sesi root kosong.',
-    PROFILE_USER1_SESSION_EMPTY: 'Data sesi user1 kosong.',
+    PROFILE_ROOT_SESSION_MISSING: 'Sesi lane Download tidak ditemukan.',
+    PROFILE_USER1_SESSION_MISSING: 'Sesi lane Export tidak ditemukan.',
+    PROFILE_ROOT_SESSION_EMPTY: 'Data sesi lane Download kosong.',
+    PROFILE_USER1_SESSION_EMPTY: 'Data sesi lane Export kosong.',
     PROFILE_SESSION_UNSAFE: 'Sesi berisi path yang tidak aman.',
     PROFILE_SESSION_UNREADABLE: 'Data sesi tidak dapat dibaca.',
     PROFILE_SESSION_BUSY: 'Sesi sedang dipakai job.',
@@ -182,7 +177,7 @@
             <div class="mt-3 grid gap-2 sm:grid-cols-3">
               {#each profile.checks as check (check.name)}
                 <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3">
-                  <p class="text-sm font-bold">{checkLabels[check.name]} · {check.ready ? 'Siap' : 'Gagal'}</p>
+                  <p class="text-sm font-bold">{profileDiagnosticLabel(check.name)} · {check.ready ? 'Siap' : 'Gagal'}</p>
                   {#if !check.ready}<p class="muted mt-1 text-xs">{codeMessage(check.code)}</p>{/if}
                 </div>
               {/each}

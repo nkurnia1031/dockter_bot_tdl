@@ -27,7 +27,8 @@ describe('ProfilesPage', () => {
             name: 'irang', ready: true, reason_codes: [], checks: [
               { name: 'identity', ready: true, code: 'OK' },
               { name: 'root_session', ready: true, code: 'OK' },
-              { name: 'user1_session', ready: true, code: 'OK' }
+              { name: 'user1_session', ready: true, code: 'OK' },
+              { name: 'future_session', ready: true, code: 'OK' }
             ]
           }]
         }), { status: 200 });
@@ -44,8 +45,9 @@ describe('ProfilesPage', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
 
     expect(await screen.findByText('irang')).toBeTruthy();
-    expect(screen.getByText(/root.*Siap/)).toBeTruthy();
-    expect(screen.getByText(/user1.*Siap/)).toBeTruthy();
+    expect(screen.getByText(/Download.*Siap/)).toBeTruthy();
+    expect(screen.getByText(/Export.*Siap/)).toBeTruthy();
+    expect(screen.getByText(/future_session.*Siap/)).toBeTruthy();
     expect(screen.getByText(/Hasil scan.*remote-2/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /Adopsi/ })).toBeNull();
     expect(requests).toContainEqual({ url: '/api/v1/workers/remote-2/profiles/scan', method: 'POST' });

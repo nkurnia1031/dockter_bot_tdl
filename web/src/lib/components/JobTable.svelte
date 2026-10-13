@@ -5,6 +5,7 @@
   import { api, post } from '$lib/api';
   import { formatBytes, formatDate, jobMessage, resultEntries, textValue } from '$lib/presentation';
   import { formatDuration, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
+  import { operatorTdlLogText } from '$lib/tdl-lanes';
   import JobProgressCard from './JobProgressCard.svelte';
 
   type Job = Record<string, any>;
@@ -49,7 +50,24 @@
   }));
   const historyJobs = $derived(jobs.filter((job) => !active(job)));
   const newestFirst = (items: JobEvent[]) => [...items].sort((left, right) => Number(right.sequence || 0) - Number(left.sequence || 0));
-  const milestones = $derived(newestFirst(events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type))));
+  const operatorEvent = (event: JobEvent): JobEvent => {
+    const result = event.result && typeof event.result === 'object'
+      ? { ...event.result }
+      : event.result;
+    if (Array.isArray(result?.command)) result.command = result.command.map(operatorTdlLogText);
+    if (Array.isArray(result?.output_tail)) result.output_tail = result.output_tail.map(operatorTdlLogText);
+    return {
+      ...event,
+      result,
+      progress: event.progress && typeof event.progress === 'object'
+        ? { ...event.progress, message: operatorTdlLogText(String(event.progress.message || '')) }
+        : event.progress,
+      error: event.error && typeof event.error === 'object'
+        ? { ...event.error, message: operatorTdlLogText(String(event.error.message || '')) }
+        : event.error
+    };
+  };
+  const milestones = $derived(newestFirst(events.filter((event) => !['log.snapshot', 'progress.snapshot'].includes(event.event_type))).map(operatorEvent));
   const latestSnapshot = $derived(newestFirst(events.filter((event) => event.event_type === 'log.snapshot' && Array.isArray(event.result?.log?.lines)))[0]);
   const liveLogLines = $derived(liveLog?.log?.lines);
   const rawLogLines = $derived(Array.isArray(liveLogLines) && liveLogLines.length ? liveLogLines : latestSnapshot?.result?.log?.lines || []);
@@ -209,7 +227,7 @@
     const position = batch?.index ? `JSON ${batch.index}/${batch.total || '?'} ${batch.name || ''}` : '';
     const media = item?.index ? `File ${item.index}/${item.total || '?'} ${item.name || ''}` : '';
     const detail = [position, media, event.progress?.message || event.error?.message || event.result?.status].filter(Boolean).join(' · ');
-    return `#${event.sequence} [${event.status}] ${event.event_type}: ${textValue(detail, 'Event tercatat')}`;
+    return operatorTdlLogText(`#${event.sequence} [${event.status}] ${event.event_type}: ${textValue(detail, 'Event tercatat')}`);
   };
   const informativeEvents = $derived(newestFirst(events.filter((event) =>
     event.event_type.startsWith('download.')
@@ -219,7 +237,7 @@
   const displayLogLines = $derived([
     ...informativeEvents,
     ...(informativeEvents.length && logLines.length ? ['──────── raw worker output ────────'] : []),
-    ...logLines
+    ...logLines.map(operatorTdlLogText)
   ]);
   onMount(() => {
     mounted = true;

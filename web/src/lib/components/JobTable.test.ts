@@ -48,6 +48,38 @@ describe('JobTable', () => {
     expect(await screen.findByText('Unduh JSON verifikasi')).toBeTruthy();
   });
 
+  it('uses Download and Export labels in operator worker logs without changing the raw API record', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const job = {
+      id: 'export-log-1', kind: 'export', status: 'failed', profile: 'default', worker: 'local',
+      created_at: '2026-10-13T00:00:00Z', updated_at: '2026-10-13T00:00:01Z'
+    };
+    const rawCommand = 'tdl --storage type=bolt,path=/data/user1/.tdl/data -n default chat export';
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [job] }), { status: 200 });
+      if (url.endsWith('/jobs/export-log-1')) return new Response(JSON.stringify(job), { status: 200 });
+      if (url.endsWith('/log-snapshot')) return new Response(JSON.stringify({ log: { lines: [rawCommand], order: 'oldest_first' } }), { status: 200 });
+      if (url.endsWith('/events?after_sequence=0')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'export', view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Log' }));
+
+    const log = await screen.findByText(/tdl --storage/);
+    expect(log.textContent).toContain('Export');
+    expect(log.textContent).not.toContain('/data/user1/.tdl');
+    expect(rawCommand).toContain('/data/user1/.tdl');
+  });
+
   it('filters Quick Mode globally and retries a failed attempt', async () => {
     const calls: { url: string; method?: string }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {

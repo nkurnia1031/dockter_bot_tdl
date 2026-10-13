@@ -111,14 +111,29 @@ describe('BackupsPage TDL diagnosis', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
     await screen.findByText(/Arsip terverifikasi/);
     expect(screen.getByText('Sesi TDL lolos; bukti siap ditinjau untuk canary.')).toBeTruthy();
-    expect(screen.getByText('Sesi root · TDL lolos')).toBeTruthy();
-    expect(screen.getByText('Sesi user1 · TDL lolos')).toBeTruthy();
+    expect(screen.getByText('Sesi Download · TDL lolos')).toBeTruthy();
+    expect(screen.getByText('Sesi Export · TDL lolos')).toBeTruthy();
     expect(screen.getByText(/Checksum katalog tidak tersedia/)).toBeTruthy();
     await fireEvent.click(screen.getByText('Lihat part dan message ID yang diunduh'));
     expect(screen.getByText('733')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Salin JSON' })).toBeTruthy();
     await fireEvent.click(screen.getByText('Lihat JSON canary lengkap'));
     expect(screen.getByText(/"canary_evidence_status"/)).toBeTruthy();
+  });
+
+  it('shows lane labels in TDL diagnosis while keeping raw diagnostic identifiers', async () => {
+    render(BackupsPage);
+
+    const worker = (await screen.findAllByLabelText('Worker'))[0];
+    await waitFor(() => expect((worker as HTMLSelectElement).options.length).toBe(3));
+    await fireEvent.change(worker, { target: { value: 'remote-2' } });
+    await fireEvent.change((await screen.findAllByLabelText('Profil'))[0], { target: { value: 'default' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Buat JSON diagnosis' }));
+
+    expect(await screen.findByText('Download · Siap')).toBeTruthy();
+    expect(screen.getByText('Export · Gagal')).toBeTruthy();
+    expect(screen.getByText(/"name": "root"/)).toBeTruthy();
+    expect(screen.getByText(/"name": "user1"/)).toBeTruthy();
   });
 
   it('distinguishes a completed verification job from an archive that failed verification', async () => {
