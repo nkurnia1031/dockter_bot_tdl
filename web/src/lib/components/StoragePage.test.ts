@@ -3,6 +3,19 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import StoragePage from './StoragePage.svelte';
 import { session } from '../session.svelte';
 
+function stubStorageFile() {
+  vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+    const url = new URL(String(input), 'https://ui.test');
+    if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({
+      current_folder: null, breadcrumbs: [], folders: [],
+      items: [{id:9,display_name:'report.pdf',original_name:'report.pdf',file_size:10,status:'active'}],
+      total_folders: 0, total_items: 1,
+    }), {status:200});
+    if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}), {status:200});
+    return new Response(JSON.stringify({items:[]}), {status:200});
+  }));
+}
+
 describe('Storage file manager', () => {
   afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.clear(); });
 
@@ -80,5 +93,56 @@ describe('Storage file manager', () => {
     expect(screen.getByText(/Profil default dilewati/)).toBeTruthy();
     expect(screen.getByText(/0 profil dapat mengirim dari 1/)).toBeTruthy();
     expect(screen.getByText(/tidak dijalankan karena sesi/i)).toBeTruthy();
+  }, 15000);
+
+  it('closes file details from the close button, backdrop, and Escape', async () => {
+    stubStorageFile();
+    render(StoragePage);
+
+    const fileButton = await screen.findByRole('button', {name:/^report\.pdf/});
+    await fireEvent.click(fileButton);
+    let dialog = await screen.findByRole('dialog', {name:'Detail file'});
+    const closeButton = screen.getByRole('button', {name:'Tutup detail file'});
+    expect(closeButton.parentElement?.className).toContain('sticky');
+    expect(closeButton.parentElement?.className).toContain('top-0');
+    expect(document.activeElement).toBe(closeButton);
+
+    await fireEvent.click(dialog);
+    expect(screen.getByRole('dialog', {name:'Detail file'})).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', {name:'Kirim Telegram'}));
+    expect(await screen.findByText('report.pdf dikirim ke Telegram.')).toBeTruthy();
+    expect(screen.getByRole('dialog', {name:'Detail file'})).toBeTruthy();
+    await fireEvent.click(closeButton);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(fileButton);
+
+    await fireEvent.click(fileButton);
+    dialog = await screen.findByRole('dialog', {name:'Detail file'});
+    const backdrop = screen.getByRole('button', {name:'Tutup detail file melalui latar'});
+    await fireEvent.click(backdrop);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(fileButton);
+
+    await fireEvent.click(fileButton);
+    dialog = await screen.findByRole('dialog', {name:'Detail file'});
+    await fireEvent.keyDown(dialog, {key:'Escape'});
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(fileButton);
+  }, 15000);
+
+  it('keeps keyboard focus inside the Storage detail dialog', async () => {
+    stubStorageFile();
+    render(StoragePage);
+
+    await fireEvent.click(await screen.findByRole('button', {name:/^report\.pdf/}));
+    const dialog = await screen.findByRole('dialog', {name:'Detail file'});
+    const closeButton = screen.getByRole('button', {name:'Tutup detail file'});
+    await fireEvent.keyDown(closeButton, {key:'Tab', shiftKey:true});
+
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(screen.getByRole('button', {name:'Pindahkan ke Trash'}));
+
+    await fireEvent.keyDown(document.activeElement!, {key:'Tab'});
+    expect(document.activeElement).toBe(closeButton);
   }, 15000);
 });

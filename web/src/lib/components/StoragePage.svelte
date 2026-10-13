@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { Modal } from 'flowbite-svelte';
   import { api, patch, post, remove } from '$lib/api';
   import { formatBytes, formatDate } from '$lib/presentation';
@@ -51,6 +51,9 @@
   let editItem = $state<Item|null>(null);
   let editFolder = $state<FolderEntry|null>(null);
   let detail = $state<Item|null>(null);
+  let detailPanel = $state<HTMLElement | undefined>(undefined);
+  let detailCloseButton = $state<HTMLButtonElement | undefined>(undefined);
+  let detailTrigger: HTMLElement | null = null;
   let confirmAction = $state<'trash'|'purge'|null>(null);
   let newFolderName = $state('');
   let destinationId = $state<number|null>(null);
@@ -75,6 +78,48 @@
   const storageTdlAccessReady = $derived(tdlAccessReady && tdlAccessWorker === worker);
   const isTrash = $derived(scope === 'trash');
   const currentName = $derived(data.current_folder?.name || (scope === 'trash' ? 'Recycle Bin' : scope === 'recent' ? 'Recent' : scope === 'global' ? 'All Files' : 'My Drive'));
+
+  function openDetail(item: Item, trigger: HTMLElement) {
+    detailTrigger = trigger;
+    detail = item;
+    void tick().then(() => detailCloseButton?.focus());
+  }
+  function closeDetail() {
+    const trigger = detailTrigger;
+    detail = null;
+    void tick().then(() => {
+      if (trigger?.isConnected) trigger.focus();
+      detailTrigger = null;
+    });
+  }
+  function handleDetailKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      closeDetail();
+      return;
+    }
+    if (event.key !== 'Tab' || !detailPanel) return;
+
+    const focusable = Array.from(detailPanel.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )).filter((element) => element.getAttribute('aria-hidden') !== 'true');
+    if (!focusable.length) {
+      event.preventDefault();
+      detailPanel.focus();
+      return;
+    }
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && (active === first || active === detailPanel || !detailPanel.contains(active))) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || active === detailPanel || !detailPanel.contains(active))) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   function urlFolder() {
     const value = new URLSearchParams(location.search).get('folder');
@@ -386,10 +431,10 @@
               {@const Icon=iconFor(item)}
               <article class:selected={selectedItems.includes(item.id)} class="storage-tile group" draggable="true" ondragstart={(e)=>drag(e,'item',item.id)}>
                 <button class="absolute left-3 top-3 size-4 rounded border" class:bg-violet-600={selectedItems.includes(item.id)} onclick={() => toggleItem(item.id)} aria-label="Pilih file"></button>
-                <button class="w-full pt-5 text-left" onclick={() => detail=item}>
+                <button class="w-full pt-5 text-left" onclick={(event) => openDetail(item, event.currentTarget)}>
                   <Icon class="mb-4 text-violet-500 transition-transform group-hover:-translate-y-1" size={40}/><b class="block truncate">{item.display_name}</b><span class="muted mt-1 block text-xs">{formatBytes(item.file_size)} · {formatDate(item.uploaded_at)}</span>
                 </button>
-                <button class="absolute right-2 top-2 button ghost !p-2" onclick={() => detail=item}><MoreVertical size={16}/></button>
+                <button class="absolute right-2 top-2 button ghost !p-2" aria-label={`Detail ${item.display_name}`} onclick={(event) => openDetail(item, event.currentTarget)}><MoreVertical size={16}/></button>
               </article>
             {/each}
           </div>
@@ -403,7 +448,7 @@
             {#each data.items as item}
               {@const Icon=iconFor(item)}
               <div class="storage-row" role="listitem" draggable="true" ondragstart={(e)=>drag(e,'item',item.id)}>
-                <input type="checkbox" checked={selectedItems.includes(item.id)} onchange={() => toggleItem(item.id)}/><button class="flex min-w-0 flex-1 items-center gap-3 text-left" onclick={() => detail=item}><Icon class="shrink-0 text-violet-500" size={23}/><span class="min-w-0"><b class="block truncate">{item.display_name}</b><small class="muted block truncate">{item.original_name}</small></span></button><span class="muted hidden w-24 text-right text-xs sm:block">{formatBytes(item.file_size)}</span><span class="muted hidden w-32 text-right text-xs md:block">{formatDate(item.uploaded_at)}</span><button class="button ghost" onclick={() => detail=item}><MoreVertical size={16}/></button>
+                <input type="checkbox" checked={selectedItems.includes(item.id)} onchange={() => toggleItem(item.id)}/><button class="flex min-w-0 flex-1 items-center gap-3 text-left" onclick={(event) => openDetail(item, event.currentTarget)}><Icon class="shrink-0 text-violet-500" size={23}/><span class="min-w-0"><b class="block truncate">{item.display_name}</b><small class="muted block truncate">{item.original_name}</small></span></button><span class="muted hidden w-24 text-right text-xs sm:block">{formatBytes(item.file_size)}</span><span class="muted hidden w-32 text-right text-xs md:block">{formatDate(item.uploaded_at)}</span><button class="button ghost" aria-label={`Detail ${item.display_name}`} onclick={(event) => openDetail(item, event.currentTarget)}><MoreVertical size={16}/></button>
               </div>
             {/each}
           </div>
@@ -418,13 +463,14 @@
 
 {#if detail}
   {@const DetailIcon=iconFor(detail)}
-  <div class="fixed inset-0 z-40 bg-black/25">
-    <aside class="absolute inset-y-0 right-0 w-full max-w-md overflow-auto border-l border-[var(--line)] bg-[var(--panel)] p-6 shadow-2xl">
-      <div class="flex items-center justify-between"><h2 class="text-xl font-black">Detail file</h2><button class="button ghost" onclick={() => detail=null}><X size={18}/></button></div>
+  <div class="fixed inset-0 z-40">
+    <button type="button" class="absolute inset-0 cursor-default bg-black/25 p-0" aria-label="Tutup detail file melalui latar" onclick={closeDetail}></button>
+    <dialog open bind:this={detailPanel} aria-modal="true" aria-labelledby="storage-detail-title" tabindex="-1" onkeydown={handleDetailKeydown} class="absolute inset-y-0 right-0 m-0 w-full max-w-md overflow-auto border-0 border-l border-solid border-[var(--line)] bg-[var(--panel)] p-6 shadow-2xl">
+      <div class="sticky top-0 -mx-6 -mt-6 z-10 flex items-center justify-between border-b border-[var(--line)] bg-[var(--panel)] px-6 py-4"><h2 id="storage-detail-title" class="text-xl font-black">Detail file</h2><button bind:this={detailCloseButton} type="button" class="button ghost" aria-label="Tutup detail file" onclick={closeDetail}><X size={18}/></button></div>
       <div class="my-8 text-center"><DetailIcon class="mx-auto text-violet-500" size={68}/><h3 class="mt-4 break-words text-lg font-black">{detail.display_name}</h3><p class="muted mt-1 text-sm">{detail.original_name}</p></div>
       <dl class="grid grid-cols-[110px_1fr] gap-y-3 text-sm"><dt class="muted">Lokasi</dt><dd>{detail.folder||'My Drive'}</dd><dt class="muted">Ukuran</dt><dd>{formatBytes(detail.file_size)}</dd><dt class="muted">Keywords</dt><dd>{detail.keywords||'-'}</dd><dt class="muted">Uploader</dt><dd>{detail.owner_profile||'-'}</dd><dt class="muted">Upload</dt><dd>{formatDate(detail.uploaded_at)}</dd><dt class="muted">Caption</dt><dd>{detail.caption_sync_status||'synced'}</dd></dl>
       <div class="mt-8 grid grid-cols-2 gap-2"><button class="button" onclick={() => deliver(detail!)}><Send size={15}/>Kirim Telegram</button><button class="button secondary" onclick={() => copyFileCode(detail!)}><Copy size={15}/>Salin kode file</button><button class="button secondary" onclick={() => beginItemEdit(detail!)}><Pencil size={15}/>Rename / keyword</button><button class="button secondary" onclick={() => {selectedItems=[detail!.id];detail=null;startMove()}}><FolderInput size={15}/>Move</button><button class="button danger col-span-2" onclick={() => {selectedItems=[detail!.id];detail=null;confirmAction=isTrash?'purge':'trash'}}><Trash2 size={15}/>{isTrash?'Purge permanen':'Pindahkan ke Trash'}</button></div>
-    </aside>
+    </dialog>
   </div>
 {/if}
 
