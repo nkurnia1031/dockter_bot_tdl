@@ -133,6 +133,20 @@ dijalankan. Backend dan worker lain tetap aktif. Simpan snapshot pada media
 backup yang disetujui, terpisah dari volume `/data`. Arsip memuat sesi Telegram;
 batasi akses seluruh direktori snapshot ke operator berwenang.
 
+Jika perintah gagal setelah `docker compose stop` tetapi sebelum `Snapshot siap`,
+jangan lakukan cutover dan jangan gunakan arsip parsial. Periksa kode keluar dan
+log privat, lalu pulihkan worker lama dengan menjalankan perintah berikut dari
+shell yang sama dengan blok di atas:
+
+```bash
+docker compose --env-file "$ENV_FILE" -f "$COMPOSE_FILE" start "$SERVICE"
+```
+
+Tunggu sampai worker sehat sebelum membuka admission kembali. Arsip parsial
+tetap perlakukan sebagai data sesi sensitif; jangan hapus sampai operator
+memastikan snapshot valid atau artefak itu tidak diperlukan untuk diagnosis.
+Setelah worker pulih, tutup admission dan drain ulang sebelum mengulang snapshot.
+
 Pastikan arsip, checksum, daftar path, metadata owner/mode, referensi image lama,
 dan file compare tersedia. `source-compare.log` harus kosong. Perintah membuat
 metadata dan daftar path, bukan isi database sesi.
@@ -224,7 +238,11 @@ lain di `/data`.
    Pastikan juga anggota arsip hanya berada di bawah lane default atau
    `profiles/<nama>/{root,user1}/.tdl` sebelum ekstraksi.
 5. Ekstrak ke staging privat di volume yang sama, lalu bandingkan ekstrak dengan
-   arsip dan pastikan semua path terdaftar tersedia:
+   arsip dan pastikan semua path terdaftar tersedia. Langkah ini membuat
+   `.tdl-restore.*` di bawah `/data`; langkah berikutnya membuat
+   `.tdl-after-cutover-*` di lokasi yang sama. Keduanya dapat berisi database
+   sesi lengkap. Lindungi sebagai data sensitif, pastikan ruang disk cukup, dan
+   pertahankan sampai rollback diterima:
 
    ```bash
    RESTORE_STAGE="$(mktemp -d "$DATA_ROOT/.tdl-restore.XXXXXX")"
