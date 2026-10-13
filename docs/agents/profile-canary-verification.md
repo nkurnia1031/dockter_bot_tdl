@@ -5,6 +5,10 @@ profil-worker untuk canary vault. Perintah di sini hanya membaca sesi dan
 arsip; tidak mengadopsi, memasang, atau memulihkan sesi. Jangan mengirim hasil
 diagnosis yang belum lolos ke issue sebagai bukti kesiapan.
 
+Sebelum cutover proses TDL, ikuti [runbook snapshot, canary, dan rollback
+storage TDL](tdl-cutover-snapshot-and-rollback.md). Dokumen ini melengkapi
+runbook itu dengan diagnosis sesi dan verifikasi arsip backup.
+
 ## Diagnosis sesi pada worker
 
 Worker menyediakan endpoint internal read-only:
