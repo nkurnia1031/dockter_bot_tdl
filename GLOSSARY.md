@@ -9,15 +9,23 @@ Sesi TDL yang berada pada worker dan digunakan job pada worker tersebut. Setiap 
 _Avoid_: bundle distribusi, sumber distribusi.
 
 **Bundle vault**:
-Arsip profil terenkripsi yang disimpan backend untuk mendistribusikan profil baru atau mengganti profil bernama sama di worker. Job tetap memakai profil lokal worker; menghapus bundle vault tidak menghapus profil lokal.
+Arsip profil terenkripsi yang disimpan backend sebagai sumber untuk distribusi yang dimulai operator. Job tetap memakai profil lokal worker; menghapus bundle vault tidak menghapus profil lokal.
 _Avoid_: sesi aktif worker, sumber sesi job.
+
+**Adopsi profil**:
+Operasi eksplisit yang menyalin profil lokal dari worker terpilih ke bundle terenkripsi di vault. Adopsi tidak memasang profil ke worker lain.
+_Avoid_: sinkronisasi otomatis, distribusi.
+
+**Distribusi profil**:
+Operasi eksplisit yang memasang bundle vault ke profil lokal pada seluruh worker terdaftar dalam satu job. Kemajuan dicatat per worker; worker offline menunggu sampai dapat dijangkau.
+_Avoid_: sinkronisasi startup, adopsi.
 
 **Hapus bundle vault**:
 Menghapus arsip distribusi dari backend tanpa mengubah profil lokal yang sudah terpasang pada worker.
 _Avoid_: hapus profil lokal, sinkronisasi penghapusan ke worker.
 
 **Hapus profil lokal**:
-Menghapus profil dan data di dalam folder profil pada worker yang dipilih. Ini terpisah dari penghapusan bundle vault.
+Menghapus profil dan data di dalam folder profil pada worker yang dipilih. Ini terpisah dari penghapusan bundle vault dan tidak memasang ulang profil sampai operator memulai distribusi.
 _Avoid_: hapus bundle vault.
 
 **Pasangan sesi**:
@@ -57,7 +65,7 @@ Status apakah salinan lokal profil pada satu worker lolos pemeriksaan TDL dan co
 _Avoid_: kesiapan seluruh worker.
 
 **Revision vault**:
-Versi tertentu dari bundle kanonis di backend yang didistribusikan dan diperiksa pada setiap worker.
+Versi tertentu dari bundle kanonis di backend yang hanya dipasang ke worker melalui operasi distribusi eksplisit.
 _Avoid_: status sync.
 
 **State export bersama**:
