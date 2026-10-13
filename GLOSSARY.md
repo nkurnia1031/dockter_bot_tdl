@@ -5,12 +5,20 @@ Istilah ini menjelaskan profil Telegram lokal dan vault yang dipakai aplikasi se
 ## Profil
 
 **Profil lokal**:
-Salinan sesi TDL yang berada pada worker dan dibuka oleh proses TDL di worker tersebut. Setiap worker memerlukan salinan lokalnya sendiri.
-_Avoid_: sumber kebenaran profil.
+Sesi TDL yang berada pada worker dan digunakan job pada worker tersebut. Setiap worker memiliki salinan lokalnya sendiri.
+_Avoid_: bundle distribusi, sumber distribusi.
 
-**Profil vault**:
-Bundle profil kanonis yang dikelola backend untuk didistribusikan ke worker. Setelah lolos pemeriksaan, bundle dipasang sebagai sesi lokal yang digunakan TDL pada worker.
-_Avoid_: sumber sesi terpisah yang dipilih saat job dijalankan.
+**Bundle vault**:
+Arsip profil terenkripsi yang disimpan backend untuk mendistribusikan profil baru atau mengganti profil bernama sama di worker. Job tetap memakai profil lokal worker; menghapus bundle vault tidak menghapus profil lokal.
+_Avoid_: sesi aktif worker, sumber sesi job.
+
+**Hapus bundle vault**:
+Menghapus arsip distribusi dari backend tanpa mengubah profil lokal yang sudah terpasang pada worker.
+_Avoid_: hapus profil lokal, sinkronisasi penghapusan ke worker.
+
+**Hapus profil lokal**:
+Menghapus profil dan data di dalam folder profil pada worker yang dipilih. Ini terpisah dari penghapusan bundle vault.
+_Avoid_: hapus bundle vault.
 
 **Pasangan sesi**:
 Dua storage utama profil, masing-masing untuk lane Download dan Export; keduanya menunjukkan identitas Telegram yang sama. Pasangan ini tidak mencakup lane Upload.
