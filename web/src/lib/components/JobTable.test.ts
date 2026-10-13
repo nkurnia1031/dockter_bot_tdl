@@ -76,7 +76,8 @@ describe('JobTable', () => {
 
     const log = await screen.findByText(/tdl --storage/);
     expect(log.textContent).toContain('Export');
-    expect(log.textContent).not.toContain('/data/user1/.tdl');
+    expect(log.textContent).toContain('[lane Export]');
+    expect(log.textContent).toContain('/data/user1/.tdl/data');
     expect(rawCommand).toContain('/data/user1/.tdl');
   });
 

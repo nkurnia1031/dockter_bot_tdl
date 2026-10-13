@@ -22,7 +22,12 @@ export function profileDiagnosticLabel(identifier: string): string {
 }
 
 export function operatorTdlLogText(value: string): string {
-  return value
-    .replace(/(^|[\\/])root(?=[\\/]\.tdl(?:[\\/]|$))/g, '$1Download')
-    .replace(/(^|[\\/])user1(?=[\\/]\.tdl(?:[\\/]|$))/g, '$1Export');
+  const lanes = new Set<string>();
+  const storagePath = /(?:^|[\\/])(root|user1)(?=[\\/]\.tdl(?:[\\/]|$))/g;
+
+  for (const match of value.matchAll(storagePath)) {
+    lanes.add(tdlLaneLabel(match[1]));
+  }
+
+  return lanes.size > 0 ? `[lane ${[...lanes].join(', ')}] ${value}` : value;
 }
