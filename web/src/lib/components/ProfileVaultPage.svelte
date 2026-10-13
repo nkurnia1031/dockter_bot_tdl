@@ -42,6 +42,8 @@
       const httpStatus = item.runtime_error_code.match(/^PROFILE_BACKEND_HTTP_(\d{3})$/)?.[1];
       if (httpStatus) return `Worker menerima penolakan manifest dari backend (HTTP ${httpStatus}; ${item.runtime_error_code}).`;
       if (item.runtime_error_code === 'WORKER_IDENTITY_AMBIGUOUS') return 'Token worker dipakai bersama. Setiap worker harus memiliki token internal yang unik.';
+      if (item.runtime_error_code === 'WORKER_UNAUTHORIZED') return 'WORKER_API_TOKEN pada worker tidak cocok dengan token worker di registry backend. Pulihkan token yang terdaftar, lalu rotasi dari halaman Workers.';
+      if (item.runtime_error_code === 'INTERNAL_UNAUTHORIZED') return 'BACKEND_INTERNAL_TOKEN pada worker tidak cocok dengan token internal backend.';
       if (item.runtime_error_code === 'PROFILE_BACKEND_UNAUTHORIZED') return 'Backend tidak menerima token internal worker.';
       if (item.runtime_error_code === 'PROFILE_BACKEND_FORBIDDEN') return 'Backend menolak identitas worker.';
       if (item.runtime_error_code === 'PROFILE_TRANSFER_REQUIRES_HTTPS') return 'Worker perlu memakai URL backend HTTPS.';

@@ -187,6 +187,7 @@ class WorkerJobExecutor(
             commit_bundle=self.commit_profile_bundle,
             rollback_bundle=self.rollback_profile_bundle,
             diagnose_installed_tdl=self.diagnose_profile_tdl,
+            worker_token_provider=self.runtime_settings.worker_api_token,
         )
         self.command_runner.register_operation_handler(
             "profile.sync", self._run_profile_sync_operation

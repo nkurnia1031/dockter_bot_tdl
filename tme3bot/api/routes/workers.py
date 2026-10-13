@@ -96,6 +96,16 @@ def _safe_local_profile_inventory(payload, *, worker: str) -> dict:
         "items": safe_items,
     }
 
+
+def _ensure_unique_worker_token(context, *, name: str, token: str) -> None:
+    for registered_name, record in context.worker_registry.list().items():
+        if registered_name != name and str(record.get("token") or "") == token:
+            raise DomainError(
+                "WORKER_TOKEN_DUPLICATE",
+                "Token API worker harus unik untuk setiap worker.",
+                status_code=409,
+            )
+
 def register_workers(app, context, *, current_actor):
 
     @app.get("/api/v1/workers", response_model=WorkerListResponse)
@@ -177,6 +187,7 @@ def register_workers(app, context, *, current_actor):
     @app.post("/api/v1/workers", response_model=ObjectResponse)
     def add_worker(body: WorkerRequest, actor=Depends(current_actor)):
         del actor
+        _ensure_unique_worker_token(context, name=body.name.strip().lower(), token=body.token)
         name = context.worker_registry.upsert(
             body.name, body.url, body.token, enabled=body.enabled
         )
@@ -193,8 +204,13 @@ def register_workers(app, context, *, current_actor):
                 "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
             )
         new_token = str(body.token or "").strip()
+        if new_token:
+            _ensure_unique_worker_token(context, name=str(name).strip().lower(), token=new_token)
         same_endpoint = body.url.rstrip("/") == str(current.get("url") or "").rstrip("/")
-        if new_token and same_endpoint and new_token != str(current.get("token") or ""):
+        rotated_token = bool(
+            new_token and same_endpoint and new_token != str(current.get("token") or "")
+        )
+        if rotated_token:
             update_settings = getattr(context.worker_dispatcher, "update_worker_settings", None)
             if not callable(update_settings):
                 raise DomainError(
@@ -223,11 +239,21 @@ def register_workers(app, context, *, current_actor):
                     status_code=502,
                 ) from exc
         token = new_token or str(current.get("token") or "")
-        return {
-            "name": context.worker_registry.upsert(
-                name, body.url, token, enabled=body.enabled
-            )
-        }
+        updated_name = context.worker_registry.upsert(
+            name, body.url, token, enabled=body.enabled
+        )
+        if rotated_token:
+            # The worker's vault client must recheck its manifest using the
+            # newly rotated runtime token after the registry commit.
+            request_profile_sync = getattr(context.worker_dispatcher, "request_profile_sync", None)
+            if callable(request_profile_sync):
+                try:
+                    request_profile_sync(updated_name, mode="check")
+                except Exception:
+                    # Token rotation is already committed. The worker's own
+                    # retry loop will refresh the vault status if this nudge fails.
+                    pass
+        return {"name": updated_name}
 
     @app.patch("/api/v1/workers/{name}", response_model=ObjectResponse)
     def set_worker_enabled(

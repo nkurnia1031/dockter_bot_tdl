@@ -24,6 +24,12 @@ describe('ProfileVaultPage', () => {
               vault_ack_status: 'ready', vault_ack_installed_revision: 1,
               runtime_status: 'waiting_worker', runtime_error_code: 'WORKER_IDENTITY_AMBIGUOUS'
             }]
+          }, {
+            name: 'irang', active: true, status: 'waiting_worker', vault: true,
+            workers: [{ worker: 'remote-1', status: 'waiting_worker', runtime_status: 'waiting_worker', runtime_error_code: 'WORKER_UNAUTHORIZED' }]
+          }, {
+            name: 'storage', active: true, status: 'waiting_worker', vault: true,
+            workers: [{ worker: 'remote-1', status: 'waiting_worker', runtime_status: 'waiting_worker', runtime_error_code: 'INTERNAL_UNAUTHORIZED' }]
           }]
         }), { status: 200 });
       }
@@ -33,9 +39,11 @@ describe('ProfileVaultPage', () => {
     render(ProfileVaultPage);
 
     expect(await screen.findByText(/Token worker dipakai bersama/)).toBeTruthy();
+    expect(screen.getByText(/WORKER_API_TOKEN pada worker tidak cocok/)).toBeTruthy();
+    expect(screen.getByText(/BACKEND_INTERNAL_TOKEN pada worker tidak cocok/)).toBeTruthy();
     expect(screen.getByText(/Vault ACK: Siap/)).toBeTruthy();
-    expect(screen.getByText(/Runtime worker: Menunggu/)).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Buka log JSON' }).getAttribute('href'))
+    expect(screen.getAllByText(/Runtime worker: Menunggu/)).toHaveLength(3);
+    expect(screen.getAllByRole('link', { name: 'Buka log JSON' })[0].getAttribute('href'))
       .toBe('/api/v1/profiles/default/workers/remote-1/sync-logs?limit=500');
     expect(screen.queryByRole('button', { name: /Adopsi|Sebarkan|login TDL/i })).toBeNull();
     expect(requests).toEqual(['/api/v1/profiles/management']);

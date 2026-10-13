@@ -1624,6 +1624,22 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn(secret, response.text)
         self.assertEqual(self.workers.get("local")["token"], secret)
         self.assertTrue(self.dispatcher.runtime_settings["worker_api_token_configured"])
+        self.assertIn(("local", None, "check"), self.dispatcher.profile_sync_requests)
+
+    def test_worker_api_token_rotation_rejects_token_used_by_another_worker(self):
+        headers = self.login()
+        duplicate = "another-worker-token-long-enough"
+        self.workers.upsert("remote-1", "http://remote-worker", duplicate)
+
+        response = self.client.put(
+            "/api/v1/workers/local",
+            headers=headers,
+            json={"url": "http://worker", "token": duplicate},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "WORKER_TOKEN_DUPLICATE")
+        self.assertNotEqual(self.workers.get("local")["token"], duplicate)
 
     def insert_storage_item(self):
         return self.catalog.insert_item(

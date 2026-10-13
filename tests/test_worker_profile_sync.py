@@ -372,6 +372,88 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "WORKER_IDENTITY_AMBIGUOUS")
         self.assertNotIn("Sensitive", str(raised.exception))
 
+    def test_backend_worker_unauthorized_code_is_not_misreported_as_internal_token_error(self):
+        client, _ = self.make_client([], {})
+        client._request_override = None
+        body = json.dumps({"error": {"code": "WORKER_UNAUTHORIZED", "message": "redacted"}}).encode()
+
+        class RejectingOpener:
+            def open(self, *_args, **_kwargs):
+                raise urllib.error.HTTPError(
+                    "https://backend.example/internal/v1/profile-manifest",
+                    401,
+                    "Unauthorized",
+                    {},
+                    io.BytesIO(body),
+                )
+
+        with patch("tme3bot.worker.profile_sync.build_opener", return_value=RejectingOpener()):
+            with self.assertRaises(ProfileSyncError) as raised:
+                client._request("GET", "/internal/v1/profile-manifest", None)
+        self.assertEqual(raised.exception.code, "WORKER_UNAUTHORIZED")
+
+    def test_profile_sync_uses_worker_token_after_runtime_rotation(self):
+        runtime_token = ["old-shared-token"]
+        config = SimpleNamespace(
+            state_file=self.config.state_file,
+            backend_api_url="https://backend.example",
+            backend_internal_token="internal-token",
+            backup_node_name="worker-a",
+            # This is the startup ENV value and does not change during Web rotation.
+            worker_api_token="old-shared-token",
+        )
+        client = ProfileSyncClient(
+            config,
+            SimpleNamespace(local_profile_identities=lambda: []),
+            self.sessions,
+            install_bundle=lambda *_args: None,
+            commit_bundle=lambda *_args: True,
+            rollback_bundle=lambda *_args: True,
+            worker_token_provider=lambda: runtime_token[0],
+        )
+        request_tokens = []
+
+        class Response:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit):
+                return b'{"profiles": []}'
+
+        class SwitchingOpener:
+            def open(self, request, **_kwargs):
+                headers = {key.lower(): value for key, value in request.header_items()}
+                token = headers.get("x-worker-token", "")
+                request_tokens.append(token)
+                if token != "rotated-unique-token":
+                    body = json.dumps({"error": {"code": "WORKER_IDENTITY_AMBIGUOUS"}}).encode()
+                    raise urllib.error.HTTPError(
+                        "https://backend.example/internal/v1/profile-manifest",
+                        409,
+                        "Conflict",
+                        {},
+                        io.BytesIO(body),
+                    )
+                return Response()
+
+        with patch("tme3bot.worker.profile_sync.build_opener", return_value=SwitchingOpener()):
+            first = client._sync(mode="check", profile=None)
+            self.assertEqual(first["status"], "waiting_worker")
+            self.assertEqual(client._state["backend_error_code"], "WORKER_IDENTITY_AMBIGUOUS")
+
+            runtime_token[0] = "rotated-unique-token"
+            second = client._sync(mode="check", profile=None)
+
+        self.assertEqual(second["status"], "ready")
+        self.assertTrue(client._state["backend_available"])
+        self.assertEqual(client._state["backend_error_code"], "")
+        self.assertEqual(request_tokens, ["old-shared-token", "rotated-unique-token"])
+
     def test_wait_reports_unchanged_backend_reason_only_once(self):
         client, _ = self.make_client([], {})
         client._startup_checked = True

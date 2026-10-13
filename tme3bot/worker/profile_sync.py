@@ -63,6 +63,7 @@ class ProfileSyncClient:
         rollback_bundle: Callable[[str, str], bool],
         diagnose_installed_tdl: Callable[[str], dict[str, Any]] | None = None,
         request: Callable[[str, str, bytes | None], tuple[bytes, Any]] | None = None,
+        worker_token_provider: Callable[[], str] | None = None,
     ) -> None:
         self.config = config
         self.profile_manager = profile_manager
@@ -72,6 +73,7 @@ class ProfileSyncClient:
         self.rollback_bundle = rollback_bundle
         self.diagnose_installed_tdl = diagnose_installed_tdl
         self._request_override = request
+        self._worker_token_provider = worker_token_provider
         self.path = Path(config.state_file).parent / "profile-sync.json"
         self._condition = threading.Condition(threading.RLock())
         self._sync_lock = threading.Lock()
@@ -94,9 +96,15 @@ class ProfileSyncClient:
             base_url
             and getattr(self.config, "backend_internal_token", "")
             and getattr(self.config, "backup_node_name", "")
-            and getattr(self.config, "worker_api_token", "")
+            and self._worker_api_token()
             and _secure_backend_url(base_url)
         )
+
+    def _worker_api_token(self) -> str:
+        provider = self._worker_token_provider
+        if callable(provider):
+            return str(provider() or "")
+        return str(getattr(self.config, "worker_api_token", "") or "")
 
     def start(self) -> None:
         """Start one background pull on worker startup without blocking API boot."""
@@ -903,7 +911,7 @@ class ProfileSyncClient:
         base_url = str(getattr(self.config, "backend_api_url", "") or "").rstrip("/")
         internal_token = str(getattr(self.config, "backend_internal_token", "") or "")
         worker_name = str(getattr(self.config, "backup_node_name", "") or "").strip()
-        worker_token = str(getattr(self.config, "worker_api_token", "") or "")
+        worker_token = self._worker_api_token()
         if not base_url or not internal_token or not worker_name or not worker_token:
             raise ProfileSyncError("WORKER_IDENTITY_NOT_CONFIGURED")
         if not _secure_backend_url(base_url):
@@ -931,7 +939,6 @@ class ProfileSyncClient:
             # Preserve only the machine-readable error code. Never retain the
             # backend message/body, which may contain paths or other details.
             code = {
-                401: "PROFILE_BACKEND_UNAUTHORIZED",
                 403: "PROFILE_BACKEND_FORBIDDEN",
                 426: "PROFILE_TRANSFER_REQUIRES_HTTPS",
             }.get(exc.code)
@@ -952,7 +959,11 @@ class ProfileSyncClient:
                         if getattr(exc, "fp", None) is not None:
                             exc.close()
                     if code is None:
-                        code = f"PROFILE_BACKEND_HTTP_{exc.code}"
+                        code = (
+                            "PROFILE_BACKEND_UNAUTHORIZED"
+                            if exc.code == 401
+                            else f"PROFILE_BACKEND_HTTP_{exc.code}"
+                        )
                 else:
                     code = "PROFILE_BACKEND_REJECTED" if exc.code < 500 else "BACKEND_UNAVAILABLE"
             raise ProfileSyncError(code) from None
