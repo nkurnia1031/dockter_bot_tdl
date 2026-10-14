@@ -12,6 +12,7 @@ from tme3bot.tdl import (
     SubprocessRunner,
     TDLClient,
     TDLCommandError,
+    TDLDataError,
     TDLStalledError,
     clean_tdl_output_line,
     decode_process_output,
@@ -53,6 +54,10 @@ class FakeRunner:
             if output_path.exists():
                 self.export_output_modes.append(output_path.stat().st_mode & 0o777)
             payload = {"messages": []}
+            if self.mode == "time_export":
+                payload = {"messages": [{"id": 7, "caption": "exact caption"}]}
+            if self.mode == "incomplete_time_export":
+                payload = {"messages": [{"id": 7, "file_name": "sample.txt"}]}
             if self.mode in {"success", "download_failure"}:
                 payload = {
                     "messages": [
@@ -240,6 +245,26 @@ class TDLClientTests(unittest.TestCase):
             self.assertIn("chat", command)
             self.assertIn("export", command)
             self.assertEqual(command[command.index("-i") + 1], "100,500")
+
+    def test_time_export_uses_unix_range_with_content_and_requires_complete_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = FakeRunner("time_export")
+            client = TDLClient(root / "upload", "upload", runner=runner)
+
+            result = client.export_messages_by_time("-100123", 100, 200, root / "messages.json")
+
+            command = runner.commands[0]
+            self.assertEqual(command[command.index("-T") + 1], "time")
+            self.assertEqual(command[command.index("-i") + 1], "100,200")
+            self.assertIn("--with-content", command)
+            self.assertEqual(result.messages[0]["caption"], "exact caption")
+
+            incomplete = TDLClient(
+                root / "upload", "upload", runner=FakeRunner("incomplete_time_export")
+            )
+            with self.assertRaisesRegex(TDLDataError, "complete message content"):
+                incomplete.export_messages_by_time("-100123", 100, 200, root / "incomplete.json")
 
     def test_export_failure_raises(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

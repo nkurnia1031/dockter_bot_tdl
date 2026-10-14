@@ -23,12 +23,15 @@ class RuntimeProfileManager:
         return list(self.profiles)
 
     def tdl_session_available(self, profile, purpose="export"):
-        del purpose
-        return (self.root / str(profile) / ".tdl" / "data").is_file()
+        lane = "upload/.tdl" if purpose == "storage" else ".tdl"
+        return (self.root / str(profile) / lane / "data").is_file()
 
     def profiles_with_tdl_session(self, purpose="export"):
-        del purpose
-        return [profile for profile in self.profiles if self.tdl_session_available(profile)]
+        return [
+            profile
+            for profile in self.profiles
+            if self.tdl_session_available(profile, purpose)
+        ]
 
 
 class WorkerRuntimeSettingsTests(unittest.TestCase):
@@ -174,12 +177,18 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
             session_path = root / "default" / ".tdl"
             session_path.mkdir(parents=True)
             (session_path / "data").write_bytes(b"tdl-session")
+            upload_path = root / "default" / "upload" / ".tdl"
+            upload_path.mkdir(parents=True)
+            (upload_path / "data").write_bytes(b"upload-session")
             manager = RuntimeProfileManager(root, ["default", "archive"])
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
             executor.config = SimpleNamespace(
                 state_file=root / "state.json", worker_storage_profile="archive"
             )
             executor.profile_manager = manager
+            executor.upload_lane_preparer = SimpleNamespace(
+                status=lambda _profile: {"status": "ready"}
+            )
             executor.runtime_settings = WorkerRuntimeSettings(
                 root / "worker_settings.json", default_storage_profile="archive"
             )
@@ -202,7 +211,7 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
     def test_profile_cannot_change_while_storage_job_is_running(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            session = root / "default" / ".tdl"
+            session = root / "default" / "upload" / ".tdl"
             session.mkdir(parents=True)
             (session / "data").write_bytes(b"tdl-session")
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
@@ -210,6 +219,9 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
                 state_file=root / "state.json", worker_storage_profile="default"
             )
             executor.profile_manager = RuntimeProfileManager(root, ["default"])
+            executor.upload_lane_preparer = SimpleNamespace(
+                status=lambda _profile: {"status": "ready"}
+            )
             executor.runtime_settings = WorkerRuntimeSettings(
                 root / "worker_settings.json", default_storage_profile="default"
             )
@@ -226,7 +238,7 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
     def test_profile_cannot_change_during_quickmode_before_quick_lane_is_marked(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            session = root / "default" / ".tdl"
+            session = root / "default" / "upload" / ".tdl"
             session.mkdir(parents=True)
             (session / "data").write_bytes(b"tdl-session")
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
@@ -234,6 +246,9 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
                 state_file=root / "state.json", worker_storage_profile="default"
             )
             executor.profile_manager = RuntimeProfileManager(root, ["default"])
+            executor.upload_lane_preparer = SimpleNamespace(
+                status=lambda _profile: {"status": "ready"}
+            )
             executor.runtime_settings = WorkerRuntimeSettings(
                 root / "worker_settings.json", default_storage_profile="default"
             )

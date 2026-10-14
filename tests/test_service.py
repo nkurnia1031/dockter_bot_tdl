@@ -122,19 +122,19 @@ class ServiceTests(unittest.TestCase):
             )
             service = ExportService(config, store, client)
 
-            result = service.export_from_url("https://t.me3/c/@bot/3/1langs")
+            result = service.export_from_url("https://t.me3/c/@testbot/3/1langs")
 
             self.assertEqual(result.status, "exported")
-            self.assertEqual(client.export_calls[0][0:2], ("@bot", 3))
+            self.assertEqual(client.export_calls[0][0:2], ("@testbot", 3))
             self.assertTrue(result.export_path.exists())
             self.assertEqual(result.export_path.parent, config.export_pending_dir)
             self.assertRegex(
-                result.export_path.name, r"^1langs_\d{8}T\d{6}Z_bot\.json$"
+                result.export_path.name, r"^1langs_\d{8}T\d{6}Z_testbot\.json$"
             )
-            self.assertEqual(store.get_source("@bot").last_id, 9)
-            self.assertEqual(store.get_source("@bot").label, "1langs")
-            self.assertFalse(store.get_source("@bot").warmup_done)
-            self.assertEqual(store.get_source("@bot").warmup_url, "https://t.me/bot/8")
+            self.assertEqual(store.get_source("@testbot").last_id, 9)
+            self.assertEqual(store.get_source("@testbot").label, "1langs")
+            self.assertFalse(store.get_source("@testbot").warmup_done)
+            self.assertEqual(store.get_source("@testbot").warmup_url, "https://t.me/testbot/8")
 
     def test_shared_cursor_export_skips_worker_state_reads_and_writes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -194,12 +194,12 @@ class ServiceTests(unittest.TestCase):
             )
             service = ExportService(config, store, client)
 
-            result = service.export_from_url("https://t.me3/c/@bot/3")
+            result = service.export_from_url("https://t.me3/c/@testbot/3")
 
-            self.assertRegex(result.export_path.name, r"^\d{8}T\d{6}Z_bot\.json$")
-            self.assertIsNone(store.get_source("@bot").label)
-            self.assertTrue(store.get_source("@bot").warmup_done)
-            self.assertIsNone(store.get_source("@bot").warmup_url)
+            self.assertRegex(result.export_path.name, r"^\d{8}T\d{6}Z_testbot\.json$")
+            self.assertIsNone(store.get_source("@testbot").label)
+            self.assertTrue(store.get_source("@testbot").warmup_done)
+            self.assertIsNone(store.get_source("@testbot").warmup_url)
 
     def test_known_chat_uses_global_last_id_but_accepts_new_label(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -207,7 +207,7 @@ class ServiceTests(unittest.TestCase):
             config = self.make_config(root)
             store = StateStore(config.state_file, config.legacy_max_json)
             store.load()
-            store.upsert_source("@bot", "saved-label", 20)
+            store.upsert_source("@testbot", "saved-label", 20)
             client = FakeExportTDLClient(
                 ExportResult(
                     export_path=root / "ignored.json",
@@ -219,15 +219,15 @@ class ServiceTests(unittest.TestCase):
             )
             service = ExportService(config, store, client)
 
-            result = service.export_from_url("https://t.me3/c/@bot/3/new-label")
+            result = service.export_from_url("https://t.me3/c/@testbot/3/new-label")
 
-            self.assertEqual(client.export_calls[0][0:2], ("@bot", 21))
+            self.assertEqual(client.export_calls[0][0:2], ("@testbot", 21))
             self.assertIsNone(result.warning)
             self.assertRegex(
-                result.export_path.name, r"^new-label_\d{8}T\d{6}Z_bot\.json$"
+                result.export_path.name, r"^new-label_\d{8}T\d{6}Z_testbot\.json$"
             )
-            self.assertEqual(store.get_source("@bot").label, "new-label")
-            self.assertEqual(store.get_source("@bot").last_id, 24)
+            self.assertEqual(store.get_source("@testbot").label, "new-label")
+            self.assertEqual(store.get_source("@testbot").last_id, 24)
 
     def test_direct_url_can_override_start_id_without_moving_state_backward(
         self,
@@ -273,7 +273,7 @@ class ServiceTests(unittest.TestCase):
             )
 
             result = ExportService(config, store, client).export_from_url(
-                "https://t.me/c/@bot/100",
+                "https://t.me/c/1234567890/100",
                 export_start_id=100,
                 export_end_id=500,
             )
@@ -342,7 +342,7 @@ class ServiceTests(unittest.TestCase):
                 )
             )
             ExportService(config, store, export_client).export_from_url(
-                "https://t.me3/c/@bot/3/1langs"
+                "https://t.me3/c/@testbot/3/1langs"
             )
             download_client = FakeDownloadTDLClient()
             service = BatchDownloadService(config, store, download_client)
@@ -351,7 +351,7 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(result.success_count, 1)
             self.assertEqual(
-                download_client.download_url_calls[0][0], "https://t.me/bot/9"
+                download_client.download_url_calls[0][0], "https://t.me/testbot/9"
             )
             self.assertEqual(
                 download_client.download_calls[0][1],
@@ -360,7 +360,7 @@ class ServiceTests(unittest.TestCase):
                 / download_client.download_calls[0][0].stem,
             )
             self.assertEqual(list(config.download_root.glob("**/__warmup")), [])
-            self.assertTrue(store.get_source("@bot").warmup_done)
+            self.assertTrue(store.get_source("@testbot").warmup_done)
 
     def test_download_chat_id_invalid_forces_warmup_then_retries_once(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

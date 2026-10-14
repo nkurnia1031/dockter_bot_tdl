@@ -3,6 +3,7 @@ import unittest
 from datetime import timedelta
 from pathlib import Path
 
+from tme3bot.api.backend import job_dict
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
@@ -58,7 +59,19 @@ class FakeDispatcher:
         return self.resume_result
 
     def capabilities(self, worker):
-        return {"tts": worker == "tts-ready", "capabilities": ["tts"] if worker == "tts-ready" else []}
+        fingerprints = {
+            "default": "a" * 64,
+            "archive": "b" * 64,
+            "other": "c" * 64,
+        }
+        return {
+            "tts": worker == "tts-ready",
+            "capabilities": ["tts"] if worker == "tts-ready" else [],
+            "profiles": list(fingerprints),
+            "export_profiles": list(fingerprints),
+            "available_storage_profiles": list(fingerprints),
+            "storage_upload_fingerprints": fingerprints,
+        }
 
 
 class FakeBackupCatalog:
@@ -130,6 +143,59 @@ class ControlPlaneTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def authorize_quick_mode_storage(
+        self, control=None, dispatcher=None, workers=("local",)
+    ):
+        control = control or self.control
+        dispatcher = dispatcher or self.dispatcher
+        store = SqliteTdlAccessStore(
+            Path(self.temp.name) / f"quick-storage-access-{id(control)}.db"
+        )
+        control.tdl_access_store = store
+        control.tdl_access_target_resolver = lambda purpose: (
+            "-100123" if purpose == "storage" else ""
+        )
+        control.runtime_settings_store = FakeJobSecretStore()
+        for worker in workers:
+            capabilities = dispatcher.capabilities(worker)
+            fingerprints = capabilities["storage_upload_fingerprints"]
+            inventory_hash = store.inventory_fingerprint(
+                capabilities["available_storage_profiles"], fingerprints
+            )
+            store.replace_results(
+                worker,
+                "storage",
+                store.destination_fingerprint("-100123"),
+                inventory_hash,
+                [
+                    {"profile": profile, "ready": True}
+                    for profile in capabilities["available_storage_profiles"]
+                ],
+                session_fingerprints=fingerprints,
+            )
+
+    def test_quick_mode_pins_verified_storage_target_and_hides_fingerprints(self):
+        self.authorize_quick_mode_storage()
+
+        job = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/3", "quick_mode": True},
+        )
+
+        worker_payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(worker_payload["_quick_storage_tdl_access_target"], "-100123")
+        self.assertEqual(
+            worker_payload["_quick_storage_sender_profiles"],
+            ["archive", "default", "other"],
+        )
+        self.assertEqual(
+            worker_payload["_quick_storage_sender_session_fingerprints"]["default"],
+            "a" * 64,
+        )
+        self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
+        self.assertNotIn("-100123", str(job.payload))
+
     def configure_tdl_access(self, control, dispatcher, registry, purposes=("tts", "storage")):
         store = SqliteTdlAccessStore(Path(self.temp.name) / f"tdl-access-{id(control)}.db")
         control.tdl_access_store = store
@@ -137,16 +203,22 @@ class ControlPlaneTests(unittest.TestCase):
         control.runtime_settings_store = FakeJobSecretStore()
         for worker in registry.names():
             response = dispatcher.capabilities(worker)
-            profiles = response.get("export_profiles") or response.get("available_storage_profiles") or response.get("profiles") or []
-            destination_hash = store.destination_fingerprint("123456789")
-            inventory_hash = store.inventory_fingerprint(profiles)
             for purpose in purposes:
+                if purpose == "storage":
+                    profiles = response.get("available_storage_profiles") or []
+                    fingerprints = response.get("storage_upload_fingerprints") or {}
+                else:
+                    profiles = response.get("export_profiles") or response.get("profiles") or []
+                    fingerprints = None
+                destination_hash = store.destination_fingerprint("123456789")
+                inventory_hash = store.inventory_fingerprint(profiles, fingerprints)
                 store.replace_results(
                     worker,
                     purpose,
                     destination_hash,
                     inventory_hash,
                     [{"profile": profile, "ready": True} for profile in profiles],
+                    session_fingerprints=fingerprints,
                 )
         return store
 
@@ -544,8 +616,10 @@ class ControlPlaneTests(unittest.TestCase):
         )
         dispatcher = FakeDispatcher()
         dispatcher.capabilities = lambda _worker: {
-            "profiles": ["default", "archive"],
-            "export_profiles": ["default", "archive"],
+            "profiles": ["default"],
+            "export_profiles": ["default"],
+            "available_storage_profiles": ["default", "archive"],
+            "storage_upload_fingerprints": {"default": "a" * 64, "archive": "b" * 64},
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
         store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-sender.db")
@@ -553,10 +627,12 @@ class ControlPlaneTests(unittest.TestCase):
         control.tdl_access_target_resolver = lambda purpose: "-100123" if purpose == "storage" else ""
         control.runtime_settings_store = FakeJobSecretStore()
         destination_hash = store.destination_fingerprint("-100123")
-        inventory_hash = store.inventory_fingerprint(["default", "archive"])
+        fingerprints = {"default": "a" * 64, "archive": "b" * 64}
+        inventory_hash = store.inventory_fingerprint(["default", "archive"], fingerprints)
         store.replace_results(
             "local", "storage", destination_hash, inventory_hash,
             [{"profile": "archive", "ready": True}],
+            session_fingerprints=fingerprints,
         )
 
         job = control.submit_job(
@@ -569,9 +645,198 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(job.profile, "default")
         self.assertEqual(command["profile"], "archive")
         self.assertEqual(command["payload"]["tdl_access_target"], "-100123")
+        self.assertEqual(
+            command["payload"]["_tdl_sender_session_fingerprints"],
+            {"archive": fingerprints["archive"]},
+        )
+        self.assertNotIn("_tdl_sender_session_fingerprints", job.payload)
         self.assertEqual(job.payload["sender_profile"], "archive")
 
+    def test_storage_retry_submits_only_confirmed_not_sent_files(self):
+        fingerprints = {"default": "a" * 64, "archive": "b" * 64}
+        self.dispatcher.capabilities = lambda _worker: {
+            "profiles": ["default", "archive"],
+            "export_profiles": ["default", "archive"],
+            "available_storage_profiles": ["default", "archive"],
+            "storage_upload_fingerprints": fingerprints,
+        }
+        store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-retry.db")
+        self.control.tdl_access_store = store
+        self.control.tdl_access_target_resolver = lambda _purpose: "-100123"
+        self.control.runtime_settings_store = FakeJobSecretStore()
+        inventory_hash = store.inventory_fingerprint(list(fingerprints), fingerprints)
+        store.replace_results(
+            "local",
+            "storage",
+            store.destination_fingerprint("-100123"),
+            inventory_hash,
+            [{"profile": profile, "ready": True} for profile in fingerprints],
+            session_fingerprints=fingerprints,
+        )
+        original = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/source"},
+            worker="local",
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=original.id,
+                sequence=2,
+                status=JobStatus.FAILED,
+                event_type="storage.batch_completed",
+                result={
+                    "value": {
+                        "outcome": "partial_failure",
+                        "items": [
+                            {
+                                "path": "subdir/safe.txt",
+                                "status": "failed",
+                                "retryable": True,
+                                "attempt": 1,
+                            },
+                            {
+                                "path": "ambiguous.txt",
+                                "status": "needs_reconciliation",
+                                "retryable": False,
+                                "attempt": 1,
+                            },
+                            {
+                                "path": "../outside.txt",
+                                "status": "failed",
+                                "retryable": True,
+                                "attempt": 1,
+                            },
+                        ],
+                    }
+                },
+            )
+        )
+
+        retry = self.control.retry_job(self.actor, original.id)
+
+        self.assertNotEqual(retry.id, original.id)
+        self.assertEqual(retry.worker, original.worker)
+        retry_payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(retry_payload["_storage_retry_paths"], ["subdir/safe.txt"])
+        self.assertEqual(retry_payload["_storage_file_attempts"], {"subdir/safe.txt": 1})
+        self.assertNotIn("ambiguous.txt", retry_payload["_storage_retry_paths"])
+        self.assertEqual(self.jobs.get(original.id).status, JobStatus.FAILED)
+
+    def test_storage_rejects_profiles_without_a_fingerprinted_upload_lane_before_job_creation(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "storage-unfingerprinted-workers.json",
+            {"local": "http://worker-local"},
+            {"local": "worker-token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "profiles": ["default"],
+            "export_profiles": ["default"],
+            "available_storage_profiles": ["default"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-unfingerprinted.db")
+        control.tdl_access_store = store
+        control.tdl_access_target_resolver = lambda _purpose: "-100123"
+        control.runtime_settings_store = FakeJobSecretStore()
+
+        with self.assertRaises(DomainError) as error:
+            control.submit_job(
+                self.actor,
+                "storage_upload",
+                {"folder_path": "/workspace/source"},
+                worker="local",
+            )
+
+        self.assertEqual(error.exception.code, "TDL_ACCESS_NOT_VERIFIED")
+        self.assertEqual(self.jobs.count(kind="storage_upload"), 0)
+        self.assertEqual(dispatcher.commands, [])
+
+    def test_storage_permission_denial_revokes_only_the_rejected_profile_proof(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "storage-denial-workers.json",
+            {"local": "http://worker-local"},
+            {"local": "worker-token"},
+        )
+        fingerprints = {"default": "a" * 64, "archive": "b" * 64}
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "profiles": ["default"],
+            "export_profiles": ["default"],
+            "available_storage_profiles": ["default", "archive"],
+            "storage_upload_fingerprints": fingerprints,
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-denial.db")
+        control.tdl_access_store = store
+        control.tdl_access_target_resolver = lambda _purpose: "-100123"
+        control.runtime_settings_store = FakeJobSecretStore()
+        destination = store.destination_fingerprint("-100123")
+        inventory = store.inventory_fingerprint(list(fingerprints), fingerprints)
+        store.replace_results(
+            "local",
+            "storage",
+            destination,
+            inventory,
+            [
+                {"profile": "default", "ready": True},
+                {"profile": "archive", "ready": True},
+            ],
+            session_fingerprints=fingerprints,
+        )
+        job = control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/source"},
+            worker="local",
+        )
+
+        control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="tdl_access.profile_denied",
+                result={"profile": "default", "error_code": "CHAT_WRITE_FORBIDDEN"},
+            )
+        )
+
+        status = control.tdl_access_verification_status("local", "storage")
+        self.assertEqual(status["verified_profiles"], ["archive"])
+
+    def test_storage_rejects_profiles_without_a_fingerprinted_upload_lane_before_job_creation(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "storage-unfingerprinted-workers.json",
+            {"local": "http://worker-local"},
+            {"local": "worker-token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "profiles": ["default"],
+            "export_profiles": ["default"],
+            "available_storage_profiles": ["default"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-unfingerprinted.db")
+        control.tdl_access_store = store
+        control.tdl_access_target_resolver = lambda _purpose: "-100123"
+        control.runtime_settings_store = FakeJobSecretStore()
+
+        with self.assertRaises(DomainError) as error:
+            control.submit_job(
+                self.actor,
+                "storage_upload",
+                {"folder_path": "/workspace/source"},
+                worker="local",
+            )
+
+        self.assertEqual(error.exception.code, "TDL_ACCESS_NOT_VERIFIED")
+        self.assertEqual(self.jobs.count(kind="storage_upload"), 0)
+        self.assertEqual(dispatcher.commands, [])
+
     def test_quick_mode_other_profile_can_fill_worker_slot_behind_blocked_profile_queue(self):
+        self.authorize_quick_mode_storage()
         first = self.control.submit_job(
             self.actor,
             "export",
@@ -604,6 +869,7 @@ class ControlPlaneTests(unittest.TestCase):
         )
 
     def test_export_modes_queue_on_one_worker_but_run_on_different_workers(self):
+        self.authorize_quick_mode_storage(workers=("local", "remote-1"))
         normal = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2"}, worker="local"
         )
@@ -656,6 +922,14 @@ class ControlPlaneTests(unittest.TestCase):
         dispatcher.capabilities = lambda _worker: {
             "contract_version": 1,
             "capabilities": [CAP_SHARED_EXPORT_CURSOR],
+            "profiles": ["default", "archive", "other"],
+            "export_profiles": ["default", "archive", "other"],
+            "available_storage_profiles": ["default", "archive", "other"],
+            "storage_upload_fingerprints": {
+                "default": "a" * 64,
+                "archive": "b" * 64,
+                "other": "c" * 64,
+            },
         }
         control = ControlPlane(
             self.jobs,
@@ -663,6 +937,7 @@ class ControlPlaneTests(unittest.TestCase):
             self.profiles,
             export_cursor_service=cursor,
         )
+        self.authorize_quick_mode_storage(control, dispatcher)
         first = control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2", "quick_mode": True}
         )
@@ -905,6 +1180,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(second.id).status.value, "cancelled")
 
     def test_terminate_quick_mode_filter_does_not_touch_normal_export(self):
+        self.authorize_quick_mode_storage()
         normal = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2"}
         )
@@ -924,6 +1200,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(normal.id).status.value, "dispatched")
 
     def test_retry_quick_mode_reuses_id_and_keeps_snapshot_and_stage(self):
+        self.authorize_quick_mode_storage()
         original = self.control.submit_job(
             self.actor,
             "export",
@@ -970,6 +1247,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(original.id).status.value, "dispatched")
 
     def test_retry_succeeded_starts_a_new_quick_operation_from_exporting(self):
+        self.authorize_quick_mode_storage()
         original = self.control.submit_job(
             self.actor,
             "export",
@@ -1085,6 +1363,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(metadata["end_id"], 500)
 
     def test_quick_json_ready_releases_export_lane_for_next_quick_job(self):
+        self.authorize_quick_mode_storage()
         first = self.control.submit_job(
             self.actor,
             "export",
@@ -1110,6 +1389,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(second.id).status.value, "dispatched")
 
     def test_quick_mode_limit_is_per_worker_and_resume_rejoins_fifo_with_checkpoint(self):
+        self.authorize_quick_mode_storage()
         first = self.control.submit_job(
             self.actor,
             "export",
@@ -1152,6 +1432,105 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(resumed_payload["quick_retry"]["stage_job_id"], first.id)
         self.assertEqual(resumed_payload["quick_retry"]["resume_phase"], "auto")
         self.assertEqual(len(self.dispatcher.commands), 4)
+
+    def _create_ambiguous_storage_upload(self):
+        self.control.runtime_settings_store = FakeJobSecretStore()
+        source = Job(
+            id="storage-source-reconcile",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"folder_path": "/workspace/storage", "keywords": "backup"},
+            result={"value": {"items": [
+                {
+                    "path": "matched.txt", "name": "matched.txt",
+                    "status": "needs_reconciliation", "attempt": 1,
+                    "profile": "default", "retryable": False,
+                },
+                {
+                    "path": "safe.txt", "name": "safe.txt",
+                    "status": "needs_reconciliation", "attempt": 2,
+                    "profile": "archive", "retryable": False,
+                },
+            ]}},
+            created_at=utc_now() - timedelta(minutes=2),
+        )
+        self.jobs.create_with_private_values(
+            source,
+            {
+                "tdl_storage_chat_ref": b"-100123",
+                "tdl_sender_session_fingerprints": (
+                    b'{"default":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+                    b'"archive":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+                ),
+            },
+        )
+        return source
+
+    def test_storage_reconciliation_uses_private_original_snapshot_and_deduplicates_active_jobs(self):
+        source = self._create_ambiguous_storage_upload()
+
+        reconciliation = self.control.reconcile_storage_upload(self.actor, source.id)
+        self.assertEqual(reconciliation.kind, "storage_reconcile")
+        self.assertEqual(reconciliation.payload, {"source_job_id": source.id})
+        command = self.dispatcher.commands[-1]
+        payload = command["payload"]
+        self.assertEqual(payload["tdl_access_target"], "-100123")
+        self.assertEqual(payload["start_timestamp"], int(source.created_at.timestamp()))
+        self.assertNotIn("-100123", repr(reconciliation.payload))
+        self.assertNotIn("matched.txt", repr(reconciliation.payload))
+        self.assertEqual(payload["_tdl_sender_session_fingerprints"]["default"], "a" * 64)
+
+        count = len(self.dispatcher.commands)
+        duplicate = self.control.reconcile_storage_upload(self.actor, source.id)
+        self.assertEqual(duplicate.id, reconciliation.id)
+        self.assertEqual(len(self.dispatcher.commands), count)
+
+    def test_reconciled_success_is_not_retried_and_only_zero_match_file_uses_original_destination(self):
+        source = self._create_ambiguous_storage_upload()
+        reconciliation = self.control.reconcile_storage_upload(self.actor, source.id)
+        next_sequence = max(
+            event.sequence for event in self.jobs.events(reconciliation.id)
+        ) + 1
+        self.control.append_worker_event(
+            JobEvent(reconciliation.id, next_sequence, JobStatus.RUNNING, "started")
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                reconciliation.id,
+                next_sequence + 1,
+                JobStatus.SUCCEEDED,
+                "storage.reconciliation_completed",
+                result={"value": {
+                    "source_job_id": source.id,
+                    "items": [
+                        {
+                            "index": 0, "name": "matched.txt", "profile": "default",
+                            "status": "succeeded", "match_count": 1, "retryable": False,
+                        },
+                        {
+                            "index": 1, "name": "safe.txt", "profile": "archive",
+                            "status": "failed", "match_count": 0, "retryable": True,
+                        },
+                    ],
+                }},
+            )
+        )
+        updated = self.jobs.get(source.id)
+        items = updated.result["value"]["items"]
+        self.assertEqual(items[0]["status"], "succeeded")
+        self.assertFalse(items[0]["retryable"])
+        self.assertEqual(items[1]["status"], "failed")
+        self.assertTrue(items[1]["retryable"])
+        self.assertTrue(job_dict(updated)["retryable"])
+
+        retry = self.control.retry_job(self.actor, source.id)
+        retry_command = self.dispatcher.commands[-1]
+        self.assertEqual(retry.kind, "storage_upload")
+        self.assertEqual(retry_command["payload"]["_storage_retry_paths"], ["safe.txt"])
+        self.assertEqual(retry_command["payload"]["tdl_access_target"], "-100123")
 
 
 if __name__ == "__main__":

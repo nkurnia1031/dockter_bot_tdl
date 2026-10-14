@@ -162,6 +162,14 @@ def job_dict(job: Job) -> dict[str, Any]:
     result_value = job.result.get("value", job.result) if isinstance(job.result, dict) else {}
     if not isinstance(result_value, dict):
         result_value = {}
+    storage_items = result_value.get("items")
+    storage_items = storage_items if isinstance(storage_items, list) else []
+    storage_retryable = job.kind == "storage_upload" and job.status.terminal and any(
+        isinstance(item, dict)
+        and item.get("status") in {"failed", "pending"}
+        and item.get("retryable") is True
+        for item in storage_items
+    )
     export_start_id = job.progress.get("export_start_id")
     if export_start_id is None:
         export_start_id = result_value.get("export_start_id", result_value.get("start_id"))
@@ -201,7 +209,7 @@ def job_dict(job: Job) -> dict[str, Any]:
         "error": job.error,
         "archived_at": job.archived_at.isoformat() if job.archived_at else None,
         "queue_position": job.progress.get("position"),
-        "retryable": job.kind == "export" and job.status.terminal,
+        "retryable": (job.kind == "export" and job.status.terminal) or storage_retryable,
         "retry_of": retry_meta.get("retry_of"),
         "retry_phase": retry_meta.get("retry_phase"),
         "export_start_id": export_start_id,
@@ -1102,6 +1110,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         browser_actor_dict=browser_actor_dict,
     )
     from tme3bot.api.routes.operations import register_operations
+    from tme3bot.api.routes.profile_local_delete import (
+        advance_profile_local_delete_cancel,
+        advance_profile_local_delete_command,
+        prepare_profile_local_delete,
+        register_profile_local_delete,
+    )
     operations = context.operation_service
     if (
         operations is not None
@@ -1148,22 +1162,34 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         def advance_accepted_operation(command):
             if command.get("kind") == "profile.sync":
                 return advance_profile_sync_command(command, context)
+            if command.get("kind") == "profile.local_delete":
+                return advance_profile_local_delete_command(command, context)
             return advance_background_job(command)
 
         def advance_retry_operation(command):
             if command.get("kind") == "profile.sync":
                 return advance_profile_sync_command(command, context)
+            if command.get("kind") == "profile.local_delete":
+                return advance_profile_local_delete_command(command, context)
             return advance_background_job(command)
 
         def advance_cancel_operation(command):
             if command.get("kind") == "profile.sync":
                 return advance_profile_sync_cancel(command, context)
+            if command.get("kind") == "profile.local_delete":
+                return advance_profile_local_delete_cancel(command, context)
             return context.control_plane.advance_durable_cancel(command)
 
         operations.register_handler("job.submit", prepare_background_job)
         operations.register_handler(
             "profile.sync",
             lambda actor, target, input_data: prepare_profile_sync_operation(
+                context, actor, target, input_data
+            ),
+        )
+        operations.register_handler(
+            "profile.local_delete",
+            lambda actor, target, input_data: prepare_profile_local_delete(
                 context, actor, target, input_data
             ),
         )
@@ -1181,6 +1207,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         operations,
         current_actor=current_actor,
     )
+    register_profile_local_delete(app, context, current_actor=current_actor)
     from tme3bot.api.routes.queue import register_queue
     register_queue(app, context, require_internal=require_internal)
     # Queue advancement is an authenticated control-plane endpoint, not part

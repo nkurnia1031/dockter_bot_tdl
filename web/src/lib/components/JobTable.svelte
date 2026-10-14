@@ -26,6 +26,7 @@
   let toastOpen = $state(false);
   let toastMessage = $state('');
   let retrying = $state<Record<string, boolean>>({});
+  let reconciling = $state<Record<string, boolean>>({});
   let jobActionPending = $state<Record<string, boolean>>({});
   let lastRefreshed = $state<Date | null>(null);
   let mounted = false;
@@ -92,7 +93,6 @@
     const previousActiveIds = new Set(jobs.filter(active).map((job) => String(job.id)));
     try {
       const params = new URLSearchParams({ limit: '30', scope });
-      if (kind) params.set('kind', kind);
       if (profile) params.set('profile', profile);
       if (worker) params.set('worker', worker);
       if (view === 'active') {
@@ -103,17 +103,24 @@
         params.set('status', status);
       }
       if (quickMode) params.set('quick_mode', 'true');
-      const query = `/jobs?${params.toString()}`;
+      const kinds = kind === 'storage_upload' ? ['storage_upload', 'storage_reconcile'] : kind ? [kind] : [''];
+      const jobRequests = kinds.map((selectedKind) => {
+        const selectedParams = new URLSearchParams(params);
+        if (selectedKind) selectedParams.set('kind', selectedKind);
+        return api<{items:Job[]}>(`/jobs?${selectedParams.toString()}`);
+      });
       const metricsParams = new URLSearchParams({ scope });
       if (profile) metricsParams.set('profile', profile);
       if (worker) metricsParams.set('worker', worker);
-      const [jobResponse, nextMetrics] = await Promise.all([
-        api<{items:Job[]}>(query),
+      const [jobResponses, nextMetrics] = await Promise.all([
+        Promise.all(jobRequests),
         view === 'history'
           ? Promise.resolve(null)
           : api<Record<string, any>>(`/jobs/metrics?${metricsParams.toString()}`).catch(() => null)
       ]);
-      const next = jobResponse.items || [];
+      const next = jobResponses.flatMap((response) => response.items || [])
+        .sort((left, right) => Date.parse(String(right.created_at || '')) - Date.parse(String(left.created_at || '')))
+        .slice(0, 30);
       if (request !== loadGeneration) return;
       jobs = next;
       monitorMetrics = nextMetrics;
@@ -154,6 +161,10 @@
   async function openReport(job: Job) { selected = job; events = []; liveLog = null; detailTab = 'summary'; reportOpen = true; await loadEvents(); }
   async function openLog(job: Job) { selected = job; events = []; liveLog = null; logOpen = true; await loadEvents(); }
   function requestTerminate(target: 'one'|'all', job?: Job) { if (job) selected = job; confirmTarget = target; confirmOpen = true; }
+  function hasAmbiguousStorageFiles(job: Job): boolean {
+    const items = job.result?.value?.items || job.result?.items;
+    return Array.isArray(items) && items.some((item) => item?.status === 'needs_reconciliation');
+  }
   async function terminate() {
     try {
       if (confirmTarget === 'all') {
@@ -172,13 +183,17 @@
   async function retry(job: Job) {
     const quick = Boolean(job.payload?.quick_mode);
     const tts = job.kind === 'tts';
-    if (job.status === 'succeeded' && !window.confirm(tts ? 'Kirim ulang audio TTS ke chat tujuan?' : quick ? 'Jalankan ulang Quick Mode dari export awal?' : 'Jalankan ulang export dari awal?')) return;
+    const storage = job.kind === 'storage_upload';
+    const confirmation = storage
+      ? 'Retry hanya mengirim file yang dipastikan belum diterima Telegram. File dengan hasil ambigu tidak ikut dikirim. Lanjutkan?'
+      : tts ? 'Kirim ulang audio TTS ke chat tujuan?' : quick ? 'Jalankan ulang Quick Mode dari export awal?' : 'Jalankan ulang export dari awal?';
+    if ((storage || job.status === 'succeeded') && !window.confirm(confirmation)) return;
     retrying = { ...retrying, [job.id]: true };
     try {
       await post(tts ? `/tts/jobs/${encodeURIComponent(job.id)}/retry` : `/jobs/${encodeURIComponent(job.id)}/retry`);
       toastMessage = job.status === 'succeeded'
-        ? (tts ? 'Kirim ulang TTS masuk antrean.' : quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
-        : (tts ? 'Retry TTS masuk antrean.' : quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
+        ? (storage ? 'Retry upload Storage masuk antrean.' : tts ? 'Kirim ulang TTS masuk antrean.' : quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
+        : (storage ? 'Retry upload Storage masuk antrean.' : tts ? 'Retry TTS masuk antrean.' : quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
       toastOpen = true;
       await load();
     } catch (cause) {
@@ -187,6 +202,21 @@
       const next = { ...retrying };
       delete next[job.id];
       retrying = next;
+    }
+  }
+  async function reconcile(job: Job) {
+    reconciling = { ...reconciling, [job.id]: true };
+    try {
+      await post(`/jobs/${encodeURIComponent(job.id)}/reconcile`);
+      toastMessage = 'Rekonsiliasi caption Storage masuk antrean.';
+      toastOpen = true;
+      await load();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Rekonsiliasi Storage gagal dibuat.';
+    } finally {
+      const next = { ...reconciling };
+      delete next[job.id];
+      reconciling = next;
     }
   }
   async function togglePause(job: Job) {
@@ -326,7 +356,7 @@
             {#if job.id}
               <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
             {/if}
-            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind.replaceAll('_',' ')}</b>
+            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind === 'storage_reconcile' ? 'Storage reconcile' : job.kind.replaceAll('_',' ')}</b>
             {#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}
             {#if stageId}
               <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {String(stageId).slice(0, 8)}</span>
@@ -340,8 +370,14 @@
           <small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small>
           <button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button>
           <button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>
+          {#if job.kind === 'storage_upload' && ['failed','cancelled'].includes(job.status) && hasAmbiguousStorageFiles(job)}
+            <button class="button secondary" onclick={() => reconcile(job)} disabled={reconciling[job.id]}><RefreshCw size={15} class={reconciling[job.id] ? 'animate-spin' : ''}/>Rekonsiliasi</button>
+          {/if}
           {#if retryable && ['export','tts'].includes(job.kind) && ['failed','cancelled','succeeded'].includes(job.status)}
             <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>{job.status === 'succeeded' ? 'Jalankan lagi' : 'Retry'}</button>
+          {/if}
+          {#if retryable && job.kind === 'storage_upload' && job.retryable && ['failed','cancelled'].includes(job.status)}
+            <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>Retry file aman</button>
           {/if}
         </div>
       </article>
@@ -360,6 +396,57 @@
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'raw' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'raw'}>Raw JSON</button>
       </div>
       {#if detailTab === 'summary'}
+        {#if selected.kind === 'storage_upload' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
+          {@const storageItems = selected.result?.value?.items || selected.result?.items || []}
+          <section class="record-card mb-4">
+            <h3 class="font-bold">Hasil per file</h3>
+            <div class="mt-2 space-y-2">
+              {#each storageItems as item, index (item.path || index)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{item.name || item.path || `File ${index + 1}`}</b>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'needs_reconciliation' || item.status === 'failed' ? 'failed' : 'queued'}`}>{item.status || 'unknown'}</span>
+                    {#if item.profile}<span class="muted text-xs">Upload {item.profile}</span>{/if}
+                    <span class="muted text-xs">Percobaan {item.attempt || 0}</span>
+                    {#if item.retryable}<span class="text-xs font-semibold text-amber-700">Bisa diulang dengan aman</span>{/if}
+                  </div>
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                  {#if item.attempts?.length}
+                    <details class="mt-2">
+                      <summary class="muted cursor-pointer text-xs">Riwayat percobaan ({item.attempts.length})</summary>
+                      <ul class="mt-1 space-y-1 text-xs">
+                        {#each item.attempts as attempt}
+                          <li>{attempt.attempt} · {attempt.profile || 'tanpa lane'} · {attempt.status}{#if attempt.error_code} · {attempt.error_code}{/if}</li>
+                        {/each}
+                      </ul>
+                    </details>
+                  {/if}
+                </article>
+              {/each}
+            </div>
+          </section>
+        {/if}
+        {#if selected.kind === 'storage_reconcile' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
+          {@const reconciliationItems = selected.result?.value?.items || selected.result?.items || []}
+          <section class="record-card mb-4">
+            <h3 class="font-bold">Hasil rekonsiliasi caption</h3>
+            <p class="muted mt-1 text-sm">Job sumber: #{String(selected.payload?.source_job_id || '').slice(0, 8)} · tidak menampilkan caption atau path lokal.</p>
+            <div class="mt-2 space-y-2">
+              {#each reconciliationItems as item, index (item.index ?? index)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{item.name || `File ${index + 1}`}</b>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'needs_reconciliation' ? 'failed' : 'queued'}`}>{item.status || 'unknown'}</span>
+                    {#if item.profile}<span class="muted text-xs">Upload {item.profile}</span>{/if}
+                    <span class="muted text-xs">Caption cocok: {item.match_count || 0}</span>
+                    {#if item.retryable}<span class="text-xs font-semibold text-amber-700">Aman untuk Retry</span>{/if}
+                  </div>
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                </article>
+              {/each}
+            </div>
+          </section>
+        {/if}
         {#if active(selected) && selectedProgress}
           <div class="mb-4 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-3.5 sm:p-4">
             <div class="mb-2 flex justify-between gap-2 text-xs">

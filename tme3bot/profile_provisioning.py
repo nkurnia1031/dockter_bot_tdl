@@ -1004,7 +1004,7 @@ class ProfileProvisioningStore:
             )
             db.execute(
                 "UPDATE profile_distributions SET desired_revision=?, "
-                "status=CASE WHEN installed_revision=desired_revision AND installed_sha256=(SELECT bundle_sha256 FROM profile_sessions WHERE profile=?) THEN status ELSE 'waiting' END, "
+                "status=CASE WHEN status='removed_locally' THEN 'waiting' WHEN installed_revision=desired_revision AND installed_sha256=(SELECT bundle_sha256 FROM profile_sessions WHERE profile=?) THEN status ELSE 'waiting' END, "
                 "error=NULL,sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
                 (int(revision), str(profile), now, str(profile), str(worker)),
             )
@@ -1275,6 +1275,48 @@ class ProfileProvisioningStore:
             ).fetchall()
         return [(str(row["profile"]), str(row["worker"]), row["provisioning_id"]) for row in rows]
 
+    def begin_distribution_install(self, profile: str, worker: str) -> bool:
+        """Claim one pending install so a concurrent local deletion can see it."""
+        with self._lock, self._db() as db:
+            cursor = db.execute(
+                "UPDATE profile_distributions SET status='installing',error=NULL,updated_at=? "
+                "WHERE profile=? AND worker=? AND status IN ('waiting','failed')",
+                (_now(), str(profile), str(worker)),
+            )
+            return cursor.rowcount == 1
+
+    def distribution_install_active(self, profile: str, worker: str) -> bool:
+        with self._db() as db:
+            row = db.execute(
+                "SELECT 1 FROM profile_distributions WHERE profile=? AND worker=? AND status='installing'",
+                (str(profile), str(worker)),
+            ).fetchone()
+        return row is not None
+
+    def mark_local_profile_deleted(self, profile: str, worker: str) -> None:
+        """Suspend prior automatic installs after an operator removes a local copy."""
+        now = _now()
+        with self._lock, self._db() as db:
+            db.execute(
+                "UPDATE profile_distributions SET status='removed_locally',error=NULL,sync_requested=0,updated_at=? "
+                "WHERE profile=? AND worker=?",
+                (now, str(profile), str(worker)),
+            )
+            db.execute(
+                "UPDATE profile_sync_requests SET status='cancelled',updated_at=? "
+                "WHERE profile=? AND worker=? AND status='pending'",
+                (now, str(profile), str(worker)),
+            )
+
+    def recover_interrupted_distributions(self) -> int:
+        """Return installs left in-flight by a stopped backend to the retry queue."""
+        with self._lock, self._db() as db:
+            cursor = db.execute(
+                "UPDATE profile_distributions SET status='waiting',error=NULL,updated_at=? WHERE status='installing'",
+                (_now(),),
+            )
+            return int(cursor.rowcount)
+
     def add_worker_for_active_profiles(self, worker: str) -> None:
         now = _now()
         with self._db() as db:
@@ -1310,7 +1352,7 @@ class ProfileProvisioningStore:
             if row is None:
                 raise KeyError(operation_id)
             if str(row["status"]) == "active":
-                db.execute("UPDATE profile_distributions SET status='waiting',error=NULL,updated_at=? WHERE profile=? AND status IN ('waiting','failed')", (_now(), row["profile"]))
+                db.execute("UPDATE profile_distributions SET status='waiting',error=NULL,updated_at=? WHERE profile=? AND status IN ('waiting','failed','removed_locally')", (_now(), row["profile"]))
             elif row["status"] == "distributing":
                 db.execute("UPDATE profile_distributions SET status='waiting',error=NULL,updated_at=? WHERE provisioning_id=?", (_now(), operation_id))
             elif str(row["source"]) == "adoption" and str(row["status"]) == "failed":
@@ -1344,6 +1386,7 @@ class ProfileProvisioningService:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self.store.recover_interrupted_distributions()
         self._wake.set()
         self._thread = threading.Thread(target=self._loop, name="profile-provisioning", daemon=True)
         self._thread.start()
@@ -1552,12 +1595,25 @@ class ProfileProvisioningService:
         for name in self.worker_registry.names():
             self.store.add_worker_for_active_profiles(name)
         for profile, worker, operation_id in self.store.waiting_distributions():
+            profile_registry = getattr(self.profile_manager, "profile_registry", None)
+            deleting = getattr(profile_registry, "local_deletion_active", None)
+            if callable(deleting) and deleting(profile, worker):
+                continue
+            # The queue can be snapshotted before a delete completes. Claiming
+            # only a still-pending row prevents that stale snapshot from
+            # reinstalling a profile marked removed_locally in the meantime.
+            if not self.store.begin_distribution_install(profile, worker):
+                continue
             pair = self.store.bundle(profile)
             if pair is None:
+                self.store.update_distribution(profile, worker, "failed", "Vault revision tidak tersedia.", operation_id)
                 continue
             user_id, bundle = pair
             desired = self.store.desired_revision(profile)
             if desired is None:
+                self.store.update_distribution(
+                    profile, worker, "failed", "Vault revision tidak tersedia.", operation_id
+                )
                 continue
             revision = int(desired["revision"])
             sync_run_id = uuid.uuid4().hex

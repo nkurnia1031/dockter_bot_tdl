@@ -57,6 +57,7 @@ _JOB_SECRET_KEYS = frozenset(
         "telegram_tts_chat_id",
         "tdl_access_target",
         "tdl_storage_chat_ref",
+        "tdl_sender_session_fingerprints",
         "backup_archive_password",
     }
 )

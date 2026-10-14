@@ -147,6 +147,14 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     jobs = SqliteJobRepository(config.storage_db_file)
     tdl_access_store = SqliteTdlAccessStore(config.storage_db_file)
     operation_store = SqliteOperationStore(jobs)
+    recover_profile_deletions = getattr(
+        profiles.profile_registry, "recover_local_deletions", None
+    )
+    active_profile_deletions = getattr(
+        operation_store, "active_profile_local_deletions", None
+    )
+    if callable(recover_profile_deletions) and callable(active_profile_deletions):
+        recover_profile_deletions(active_profile_deletions())
     operation_service = OperationsService(operation_store)
     queue_command_service = QueueCommandService(operation_store)
     queue_publisher = (

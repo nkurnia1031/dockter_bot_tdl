@@ -78,6 +78,39 @@ class WorkerCommandStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_worker_commands_ready
                     ON worker_commands(status, created_at);
+                CREATE TABLE IF NOT EXISTS worker_storage_upload_items (
+                    command_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    profile TEXT NOT NULL DEFAULT '',
+                    retryable INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT,
+                    error_message TEXT,
+                    message_id INTEGER,
+                    caption TEXT NOT NULL DEFAULT '',
+                    result_json TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(command_id, relative_path),
+                    FOREIGN KEY(command_id) REFERENCES worker_commands(command_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS worker_storage_upload_attempts (
+                    command_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    attempt INTEGER NOT NULL,
+                    profile TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    retryable INTEGER NOT NULL DEFAULT 0,
+                    error_code TEXT,
+                    error_message TEXT,
+                    message_id INTEGER,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(command_id, relative_path, attempt),
+                    FOREIGN KEY(command_id) REFERENCES worker_commands(command_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_worker_storage_upload_items_status
+                    ON worker_storage_upload_items(command_id, status);
                 CREATE TABLE IF NOT EXISTS worker_event_sequences (
                     job_id TEXT PRIMARY KEY,
                     last_sequence INTEGER NOT NULL
@@ -99,6 +132,15 @@ class WorkerCommandStore:
                     ON worker_event_outbox(status, available_at, id);
                 """
             )
+            upload_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(worker_storage_upload_items)").fetchall()
+            }
+            if "caption" not in upload_columns:
+                db.execute(
+                    "ALTER TABLE worker_storage_upload_items "
+                    "ADD COLUMN caption TEXT NOT NULL DEFAULT ''"
+                )
 
     @staticmethod
     def _validate_envelope(envelope: Any) -> tuple[str, str | None, str | None, int, str]:
@@ -286,6 +328,198 @@ class WorkerCommandStore:
             only_from=("claimed", "queued", "running", "cancelling", "accepted"),
         )
 
+    def record_storage_upload_item(
+        self,
+        command_id: str,
+        relative_path: str,
+        *,
+        file_name: str,
+        status: str,
+        attempt: int = 0,
+        profile: str = "",
+        retryable: bool = False,
+        error_code: str = "",
+        error_message: str = "",
+        message_id: int | None = None,
+        caption: str | None = None,
+        result_item: dict[str, Any] | None = None,
+    ) -> None:
+        """Persist one Storage file outcome and its latest lane attempt."""
+        selected_command = str(command_id or "").strip()
+        selected_path = str(relative_path or "").replace("\\", "/").strip()
+        parts = selected_path.split("/")
+        if (
+            not selected_command
+            or not selected_path
+            or selected_path.startswith("/")
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError("Storage upload checkpoint requires a safe relative file path.")
+        if status not in {
+            "pending", "sending", "resolving", "accepted", "succeeded",
+            "failed", "needs_reconciliation",
+        }:
+            raise ValueError("Unknown Storage upload item status")
+        selected_attempt = max(0, int(attempt))
+        selected_profile = str(profile or "").strip().lower()[:80]
+        selected_code = str(error_code or "").strip().upper()[:100]
+        selected_error = str(error_message or "").strip()[:500]
+        selected_name = str(file_name or "").strip()[:255]
+        selected_caption = str(caption)[:1024] if caption is not None else None
+        selected_result = _dump(result_item) if isinstance(result_item, dict) else None
+        now = _now()
+        with self._lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if selected_attempt > 0 and selected_profile:
+                db.execute(
+                    "INSERT INTO worker_storage_upload_attempts "
+                    "(command_id,relative_path,attempt,profile,status,retryable,error_code,error_message,message_id,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(command_id,relative_path,attempt) DO UPDATE SET "
+                    "profile=excluded.profile,status=excluded.status,retryable=excluded.retryable,"
+                    "error_code=excluded.error_code,error_message=excluded.error_message,"
+                    "message_id=excluded.message_id,updated_at=excluded.updated_at",
+                    (
+                        selected_command, selected_path, selected_attempt, selected_profile,
+                        status, int(bool(retryable)), selected_code or None,
+                        selected_error or None, message_id, now,
+                    ),
+                )
+            db.execute(
+                "INSERT INTO worker_storage_upload_items "
+                "(command_id,relative_path,file_name,status,attempt,profile,retryable,error_code,error_message,message_id,caption,result_json,updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(command_id,relative_path) DO UPDATE SET "
+                "file_name=excluded.file_name,status=excluded.status,attempt=excluded.attempt,"
+                "profile=excluded.profile,retryable=excluded.retryable,error_code=excluded.error_code,"
+                "error_message=excluded.error_message,message_id=excluded.message_id,"
+                "caption=COALESCE(NULLIF(excluded.caption,''),worker_storage_upload_items.caption),"
+                "result_json=COALESCE(excluded.result_json,worker_storage_upload_items.result_json),"
+                "updated_at=excluded.updated_at",
+                (
+                    selected_command, selected_path, selected_name, status, selected_attempt,
+                    selected_profile, int(bool(retryable)), selected_code or None,
+                    selected_error or None, message_id, selected_caption or "", selected_result, now,
+                ),
+            )
+            db.commit()
+
+    def storage_upload_items(self, command_id: str) -> list[dict[str, Any]]:
+        selected_command = str(command_id or "").strip()
+        if not selected_command:
+            return []
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT * FROM worker_storage_upload_items WHERE command_id=? "
+                "ORDER BY relative_path",
+                (selected_command,),
+            ).fetchall()
+            attempts = db.execute(
+                "SELECT relative_path,attempt,profile,status,retryable,error_code,error_message,message_id "
+                "FROM worker_storage_upload_attempts WHERE command_id=? ORDER BY relative_path,attempt",
+                (selected_command,),
+            ).fetchall()
+        attempts_by_path: dict[str, list[dict[str, Any]]] = {}
+        for row in attempts:
+            attempts_by_path.setdefault(str(row["relative_path"]), []).append(
+                {
+                    "attempt": int(row["attempt"]),
+                    "profile": str(row["profile"] or ""),
+                    "status": str(row["status"]),
+                    "retryable": bool(row["retryable"]),
+                    "error_code": str(row["error_code"] or ""),
+                    "error_message": str(row["error_message"] or ""),
+                    "message_id": row["message_id"],
+                }
+            )
+        result = []
+        for row in rows:
+            result_item = None
+            if row["result_json"]:
+                try:
+                    decoded = json.loads(row["result_json"])
+                    result_item = decoded if isinstance(decoded, dict) else None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result_item = None
+            result.append(
+                {
+                    "path": str(row["relative_path"]),
+                    "name": str(row["file_name"]),
+                    "status": str(row["status"]),
+                    "attempt": int(row["attempt"]),
+                    "profile": str(row["profile"] or ""),
+                    "retryable": bool(row["retryable"]),
+                    "error_code": str(row["error_code"] or ""),
+                    "error": str(row["error_message"] or ""),
+                    "message_id": row["message_id"],
+                    "caption": str(row["caption"] or ""),
+                    "uploaded_item": result_item,
+                    "attempts": attempts_by_path.get(str(row["relative_path"]), []),
+                }
+            )
+        return result
+
+    def storage_upload_items_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Load the durable upload checkpoint for a source job ID."""
+        selected_job = str(job_id or "").strip()
+        if not selected_job:
+            return None
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT command_id,payload FROM worker_commands WHERE job_id=? "
+                "ORDER BY attempt DESC,updated_at DESC",
+                (selected_job,),
+            ).fetchall()
+        for row in rows:
+            try:
+                envelope = json.loads(row["payload"])
+                job = envelope.get("job") if isinstance(envelope, dict) else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(job, dict) and str(job.get("kind") or "") == "storage_upload":
+                command_id = str(row["command_id"])
+                return {
+                    "command_id": command_id,
+                    "items": self.storage_upload_items(command_id),
+                }
+        return None
+
+    def list_storage_reconciliation_commands(self) -> list[dict[str, Any]]:
+        """Return unreported interrupted Storage commands for startup recovery."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT command_id,job_id,attempt,dispatch_token,payload FROM worker_commands "
+                "WHERE status='needs_reconciliation' AND phase='needs_reconciliation' AND job_id IS NOT NULL "
+                "ORDER BY updated_at,command_id"
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                envelope = json.loads(row["payload"])
+                job = envelope.get("job") if isinstance(envelope, dict) else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                job = None
+            if isinstance(job, dict) and str(job.get("kind") or "") == "storage_upload":
+                result.append(
+                    {
+                        "command_id": str(row["command_id"]),
+                        "job_id": str(row["job_id"]),
+                        "attempt": int(row["attempt"]),
+                        "dispatch_token": str(row["dispatch_token"]),
+                        "worker": str(job.get("worker") or ""),
+                    }
+                )
+        return result
+
+    def mark_storage_reconciliation_reported(self, command_id: str) -> bool:
+        with self._db() as db:
+            changed = db.execute(
+                "UPDATE worker_commands SET phase='reconciliation_reported',updated_at=? "
+                "WHERE command_id=? AND status='needs_reconciliation' AND phase='needs_reconciliation'",
+                (_now(), str(command_id)),
+            ).rowcount
+        return bool(changed)
+
     def request_cancel_by_job(self, job_id: str) -> dict[str, Any] | None:
         with self._lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -350,6 +584,22 @@ class WorkerCommandStore:
                     "UPDATE worker_commands SET status=?,phase=?,updated_at=? WHERE command_id=?",
                     (next_status, next_phase, now, row["command_id"]),
                 )
+                if (
+                    not safe_resume
+                    and str(job.get("kind") or "") == "storage_upload"
+                ):
+                    db.execute(
+                        "UPDATE worker_storage_upload_attempts SET status='needs_reconciliation',retryable=0,"
+                        "error_code='STORAGE_UPLOAD_INTERRUPTED',error_message='Hasil pengiriman terputus dan perlu rekonsiliasi.',updated_at=? "
+                        "WHERE command_id=? AND status IN ('sending','resolving','accepted')",
+                        (now, row["command_id"]),
+                    )
+                    db.execute(
+                        "UPDATE worker_storage_upload_items SET status='needs_reconciliation',retryable=0,"
+                        "error_code='STORAGE_UPLOAD_INTERRUPTED',error_message='Hasil pengiriman terputus dan perlu rekonsiliasi.',updated_at=? "
+                        "WHERE command_id=? AND status IN ('sending','resolving','accepted')",
+                        (now, row["command_id"]),
+                    )
                 if safe_resume:
                     accepted += 1
                 else:

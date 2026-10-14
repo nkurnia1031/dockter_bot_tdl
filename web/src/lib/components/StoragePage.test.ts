@@ -72,13 +72,14 @@ describe('Storage file manager', () => {
         status: 'succeeded',
         progress: { message: 'Profil default dilewati (TDL_SESSION_DIRECTORY_MISSING); perintah TDL tidak dijalankan.' },
         result: { value: {
+          session: 'upload',
           command_template: 'tdl --storage type=bolt,path=<session-database> -n <export-namespace> up -p <temporary-test-file> -c <configured-destination> --caption <temporary-caption-file>',
           summary: { total: 1, tested: 0, ready: 0, failed: 1 },
-          profiles: [{ profile: 'default', ready: false, session_status: 'unavailable', command_attempted: false, error_code: 'TDL_SESSION_DIRECTORY_MISSING', error_message: 'Folder sesi export profil ini tidak ditemukan pada worker.' }],
+          profiles: [{ profile: 'default', ready: false, session: 'upload', session_status: 'unavailable', command_attempted: false, error_code: 'TDL_SESSION_DIRECTORY_MISSING', error_message: 'Folder lane Upload profil ini belum tersedia pada worker.' }],
         } },
       }), { status: 200 });
       if (url.pathname.endsWith('/tdl-access/verification')) return new Response(JSON.stringify({
-        worker: 'local', ready: false, profiles: [],
+        worker: 'local', purpose: 'storage', session: 'upload', ready: false, profiles: [],
       }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
@@ -88,7 +89,8 @@ describe('Storage file manager', () => {
     await fireEvent.click(await screen.findByRole('button', { name: 'Verifikasi akses TDL' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Muat status' }));
 
-    expect(await screen.findByText(/Folder sesi export profil ini tidak ditemukan/)).toBeTruthy();
+    expect(await screen.findByText(/Folder lane Upload profil ini belum tersedia/)).toBeTruthy();
+    expect(screen.getByText('Lane yang diuji: Upload.')).toBeTruthy();
     expect(screen.getByText(/tdl --storage type=bolt,path=<session-database>/)).toBeTruthy();
     expect(screen.getByText(/Profil default dilewati/)).toBeTruthy();
     expect(screen.getByText(/0 profil dapat mengirim dari 1/)).toBeTruthy();

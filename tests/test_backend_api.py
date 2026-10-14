@@ -1,6 +1,8 @@
+import hashlib
 import tempfile
 import unittest
 import base64
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -8,11 +10,11 @@ from fastapi.testclient import TestClient
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from tme3bot.api.backend import BackendContext, create_backend_app
+from tme3bot.api.backend import BackendContext, create_backend_app, job_dict
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService, PreparedOperation
-from tme3bot.domain.models import Actor, JobEvent, JobStatus
+from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.domain.worker_contract import CAP_DURABLE_COMMANDS_V1, CAP_SAFELINK_RESOLVE
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
@@ -49,6 +51,48 @@ class FakeProfiles:
         return ["default", "archive"]
 
 
+class JobDictionaryTests(unittest.TestCase):
+    def test_storage_retryable_requires_a_terminal_job_and_safe_file(self):
+        base = {
+            "id": "storage-job",
+            "kind": "storage_upload",
+            "profile": "default",
+            "actor_user_id": 42,
+            "worker": "local",
+            "payload": {},
+            "result": {
+                "value": {
+                    "items": [
+                        {"status": "failed", "retryable": True},
+                        {"status": "needs_reconciliation", "retryable": False},
+                    ]
+                }
+            },
+        }
+
+        active = Job(status=JobStatus.RUNNING, **base)
+        terminal = Job(status=JobStatus.FAILED, **base)
+        cancelled = Job(status=JobStatus.CANCELLED, **base)
+        ambiguous_only = Job(
+            status=JobStatus.FAILED,
+            **{
+                **base,
+                "result": {
+                    "value": {
+                        "items": [
+                            {"status": "needs_reconciliation", "retryable": False}
+                        ]
+                    }
+                },
+            },
+        )
+
+        self.assertFalse(job_dict(active)["retryable"])
+        self.assertTrue(job_dict(terminal)["retryable"])
+        self.assertTrue(job_dict(cancelled)["retryable"])
+        self.assertFalse(job_dict(ambiguous_only)["retryable"])
+
+
 class FakeDispatcher:
     def __init__(self):
         self.commands = []
@@ -63,6 +107,7 @@ class FakeDispatcher:
             ],
         }
         self.tts_recoveries = []
+        self.storage_fingerprint_overrides = {}
         self.profile_sync_requests = []
         self.profile_sync_snapshot = {
             "status": "waiting_worker",
@@ -127,6 +172,13 @@ class FakeDispatcher:
         # still follows helper health, while Storage and other TDL jobs can
         # use the same local session inventory without a TTS helper.
         profiles = list(health.get("available_profiles") or [])
+        storage_fingerprints = {
+            profile: self.storage_fingerprint_overrides.get(
+                profile,
+                hashlib.sha256(f"upload-session:{profile}".encode("utf-8")).hexdigest(),
+            )
+            for profile in profiles
+        }
         return {
             "tts": self.tts_ready,
             "capabilities": ["tts"] if self.tts_ready else [],
@@ -134,6 +186,7 @@ class FakeDispatcher:
             "profiles": profiles,
             "export_profiles": profiles,
             "available_storage_profiles": profiles,
+            "storage_upload_fingerprints": storage_fingerprints,
             "tts_health": health,
         }
 
@@ -467,16 +520,44 @@ class BackendApiTests(unittest.TestCase):
         self.client = TestClient(create_backend_app(context))
 
     def seed_tdl_access(self, worker="local", purpose="tts", profiles=None):
-        profiles = list(profiles if profiles is not None else self.dispatcher.capabilities(worker).get("export_profiles", []))
+        capabilities = self.dispatcher.capabilities(worker)
+        if purpose == "storage":
+            profiles = list(profiles if profiles is not None else capabilities.get("available_storage_profiles", []))
+            session_fingerprints = capabilities.get("storage_upload_fingerprints", {})
+        else:
+            profiles = list(profiles if profiles is not None else capabilities.get("export_profiles", []))
+            session_fingerprints = None
         store = self.control.tdl_access_store
         destination = "123456789" if purpose == "tts" else "123"
         store.replace_results(
             worker,
             purpose,
             store.destination_fingerprint(destination),
-            store.inventory_fingerprint(profiles),
+            store.inventory_fingerprint(profiles, session_fingerprints),
             [{"profile": profile, "ready": True} for profile in profiles],
+            session_fingerprints=session_fingerprints,
         )
+
+    def local_profile_delete_client(self, inventories):
+        self.dispatcher.local_profile_deletes = []
+        self.dispatcher.profile_local_inventory = lambda worker: dict(inventories[worker])
+
+        def delete_local_profile(worker, profile):
+            self.dispatcher.local_profile_deletes = getattr(
+                self.dispatcher, "local_profile_deletes", []
+            )
+            self.dispatcher.local_profile_deletes.append((worker, profile))
+            inventory = inventories[worker]
+            inventory["items"] = [
+                item for item in inventory.get("items", [])
+                if item.get("name") != profile
+            ]
+            return {"profile": profile, "deleted": True, "already_absent": False}
+
+        self.dispatcher.delete_local_profile = delete_local_profile
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        return TestClient(create_backend_app(self.context))
 
     def tearDown(self):
         self.temp.cleanup()
@@ -818,7 +899,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_local_profile_scan_requires_actor_and_returns_selected_worker_snapshot(self):
         calls = []
-        self.dispatcher.profile_local_inventory = lambda worker: calls.append(worker) or {
+        self.dispatcher.scan_local_profiles = lambda worker: calls.append(worker) or {
             "items": [
                 {
                     "name": "irang",
@@ -829,6 +910,13 @@ class BackendApiTests(unittest.TestCase):
                         {"name": "root_session", "ready": True, "code": "OK"},
                         {"name": "user1_session", "ready": True, "code": "OK"},
                     ],
+                    "upload_lane": {
+                        "status": "running",
+                        "phase": "validating_upload",
+                        "progress": 70,
+                        "code": "OK",
+                        "updated_at": "2026-10-14T00:00:00+00:00",
+                    },
                 }
             ]
         }
@@ -846,14 +934,39 @@ class BackendApiTests(unittest.TestCase):
         self.assertTrue(body["checked_at"])
         self.assertEqual(body["items"][0]["name"], "irang")
         self.assertTrue(body["items"][0]["ready"])
+        self.assertEqual(body["items"][0]["upload_lane"]["phase"], "validating_upload")
+        self.assertEqual(body["items"][0]["upload_lane"]["progress"], 70)
         self.assertNotIn("/data", response.text)
         self.assertNotIn("telegram_user_id", response.text)
+
+        self.dispatcher.profile_local_inventory = lambda worker: calls.append(f"snapshot:{worker}") or {
+            "items": [{
+                "name": "irang",
+                "ready": True,
+                "reason_codes": [],
+                "checks": [
+                    {"name": "identity", "ready": True, "code": "OK"},
+                    {"name": "root_session", "ready": True, "code": "OK"},
+                    {"name": "user1_session", "ready": True, "code": "OK"},
+                ],
+                "upload_lane": {
+                    "status": "ready", "phase": "ready", "progress": 100,
+                    "code": "OK", "updated_at": "2026-10-14T00:00:00+00:00"
+                },
+            }]
+        }
+        status_response = self.client.get(
+            "/api/v1/workers/local/profiles/local", headers=self.login(42)
+        )
+        self.assertEqual(status_response.status_code, 200, status_response.text)
+        self.assertEqual(status_response.json()["items"][0]["upload_lane"]["status"], "ready")
+        self.assertEqual(calls[-1], "snapshot:local")
 
         missing = self.client.post(
             "/api/v1/workers/not-registered/profiles/scan", headers=self.login(42)
         )
         self.assertEqual(missing.status_code, 404)
-        self.assertEqual(calls, ["local"])
+        self.assertEqual(calls, ["local", "snapshot:local"])
 
     def test_local_profile_scan_distinguishes_timeout_offline_and_worker_api_failure(self):
         from tme3bot.infrastructure.http_client import JsonHttpError
@@ -870,11 +983,153 @@ class BackendApiTests(unittest.TestCase):
                 def fail(_worker, current=error):
                     raise current
 
-                self.dispatcher.profile_local_inventory = fail
+                self.dispatcher.scan_local_profiles = fail
                 response = client.post("/api/v1/workers/local/profiles/scan", headers=auth)
                 self.assertEqual(response.status_code, expected_status, response.text)
                 self.assertEqual(response.json()["error"]["code"], expected_code)
                 self.assertNotIn("private worker detail", response.text)
+
+    def test_local_profile_delete_rejects_default_and_any_active_profile_job(self):
+        inventories = {"local": {"worker": "local", "items": [
+            {"name": "default"}, {"name": "archive"}
+        ]}}
+        client = self.local_profile_delete_client(inventories)
+        auth = self.login(42)
+
+        default = client.delete(
+            "/api/v1/workers/local/profiles/local/default",
+            headers={**auth, "Idempotency-Key": "delete-default-profile"},
+        )
+        self.assertEqual(default.status_code, 409, default.text)
+        self.assertEqual(default.json()["error"]["code"], "PROFILE_DEFAULT_PROTECTED")
+        self.assertEqual(self.dispatcher.local_profile_deletes, [])
+
+        self.control.submit_job(
+            self.control.actor(42), "export", {"url": "https://t.me/c/1/2"},
+            profile="archive", worker="local",
+        )
+        active = client.delete(
+            "/api/v1/workers/local/profiles/local/archive",
+            headers={**auth, "Idempotency-Key": "delete-active-profile"},
+        )
+        self.assertEqual(active.status_code, 409, active.text)
+        self.assertEqual(active.json()["error"]["code"], "PROFILE_JOB_ACTIVE")
+        self.assertEqual(self.dispatcher.local_profile_deletes, [])
+
+    def test_local_profile_delete_holds_admission_and_removes_identity_after_last_copy(self):
+        from tme3bot.api.routes.profile_local_delete import advance_profile_local_delete_command
+
+        inventories = {"local": {"worker": "local", "items": [
+            {"name": "default"}, {"name": "archive"}
+        ]}}
+        self.profiles.profile_registry.register("archive", 900)
+        client = self.local_profile_delete_client(inventories)
+        auth = self.login(42)
+
+        response = client.delete(
+            "/api/v1/workers/local/profiles/local/archive",
+            headers={**auth, "Idempotency-Key": "delete-archive-last-copy"},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        body = response.json()
+        self.assertEqual(body["kind"], "profile.local_delete")
+        self.assertEqual(body["status"], "queued")
+        self.assertTrue(self.profiles.profile_registry.local_deletion_active("archive", "local"))
+
+        with self.assertRaises(DomainError) as blocked:
+            self.control.submit_job(
+                self.control.actor(42), "export", {"url": "https://t.me/c/1/2"},
+                profile="archive", worker="local",
+            )
+        self.assertEqual(getattr(blocked.exception, "code", ""), "PROFILE_DELETION_IN_PROGRESS")
+
+        operation_id = body["operation_id"]
+        private = self.operation_service.store.get_private_payload(operation_id)
+        result = advance_profile_local_delete_command(
+            {"operation_id": operation_id, "kind": "profile.local_delete", "private_payload": private},
+            self.context,
+        )
+        self.assertEqual(result["status"], "accepted")
+        completed = self.operation_service.get(self.control.actor(42), operation_id)
+        self.assertEqual(completed.status.value, "succeeded")
+        self.assertEqual(completed.progress["identity_mapping_status"], "removed")
+        self.assertFalse(self.profiles.profile_registry.local_deletion_active("archive", "local"))
+        self.assertIsNone(self.profiles.profile_registry.profile_for_user(900))
+        self.assertIn("archive", self.profiles.profile_registry.names())
+        self.assertEqual(self.dispatcher.local_profile_deletes, [("local", "archive")])
+
+    def test_local_profile_delete_keeps_mapping_when_other_worker_inventory_is_stale_then_rechecks(self):
+        from tme3bot.api.routes.profile_local_delete import (
+            advance_profile_local_delete_command,
+            reconcile_pending_identity_cleanups,
+        )
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        inventories = {
+            "local": {"worker": "local", "items": [{"name": "archive"}]},
+            "remote-1": {"worker": "remote-1", "items": []},
+        }
+        self.workers.upsert("remote-1", "https://worker.example", "remote-token")
+        self.profiles.profile_registry.register("archive", 901)
+        client = self.local_profile_delete_client(inventories)
+
+        def inventory(worker):
+            if worker == "remote-1":
+                raise JsonHttpError(503, "worker unavailable", kind="network")
+            return dict(inventories[worker])
+
+        self.dispatcher.profile_local_inventory = inventory
+        response = client.delete(
+            "/api/v1/workers/local/profiles/local/archive",
+            headers={**self.login(42), "Idempotency-Key": "delete-stale-inventory"},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["operation_id"]
+        private = self.operation_service.store.get_private_payload(operation_id)
+        advance_profile_local_delete_command(
+            {"operation_id": operation_id, "private_payload": private}, self.context
+        )
+
+        completed = self.operation_service.get(self.control.actor(42), operation_id)
+        self.assertEqual(completed.status.value, "succeeded")
+        self.assertEqual(completed.progress["identity_mapping_status"], "pending_recheck")
+        self.assertEqual(self.profiles.profile_registry.profile_for_user(901), "archive")
+        self.assertEqual(
+            self.profiles.profile_registry.pending_identity_cleanups()[0]["profile"],
+            "archive",
+        )
+
+        self.dispatcher.profile_local_inventory = lambda worker: dict(inventories[worker])
+        reconciled = reconcile_pending_identity_cleanups(self.context)
+        self.assertEqual(reconciled, [])
+        self.assertIsNone(self.profiles.profile_registry.profile_for_user(901))
+
+    def test_local_profile_delete_keeps_identity_while_another_worker_has_a_copy(self):
+        from tme3bot.api.routes.profile_local_delete import advance_profile_local_delete_command
+
+        inventories = {
+            "local": {"worker": "local", "items": [{"name": "archive"}]},
+            "remote-1": {"worker": "remote-1", "items": [{"name": "archive"}]},
+        }
+        self.workers.upsert("remote-1", "https://worker.example", "remote-token")
+        self.profiles.profile_registry.register("archive", 902)
+        client = self.local_profile_delete_client(inventories)
+        response = client.delete(
+            "/api/v1/workers/local/profiles/local/archive",
+            headers={**self.login(42), "Idempotency-Key": "delete-with-remote-copy"},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["operation_id"]
+        private = self.operation_service.store.get_private_payload(operation_id)
+        advance_profile_local_delete_command(
+            {"operation_id": operation_id, "private_payload": private}, self.context
+        )
+
+        completed = self.operation_service.get(self.control.actor(42), operation_id)
+        self.assertEqual(completed.status.value, "succeeded")
+        self.assertEqual(completed.progress["identity_mapping_status"], "local_copy_remaining")
+        self.assertEqual(self.profiles.profile_registry.profile_for_user(902), "archive")
+        self.assertEqual(self.profiles.profile_registry.pending_identity_cleanups(), [])
 
     def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
         self.context.queue_publisher = object()
@@ -2133,6 +2388,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(rejected.json()["error"]["code"], "STORAGE_PROFILE_UNAVAILABLE")
 
         self.dispatcher.storage_available = True
+        self.seed_tdl_access(worker="local", purpose="storage")
         created = self.client.post(
             "/api/v1/exports",
             headers=headers,
@@ -2169,6 +2425,52 @@ class BackendApiTests(unittest.TestCase):
             command["payload"]["rclone_destination"], "googledrive:backup"
         )
 
+    def test_storage_reconciliation_endpoint_uses_original_private_destination(self):
+        headers = self.login()
+        created_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+        source = Job(
+            id="api-storage-reconcile-source",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"folder_path": "/workspace/biasa"},
+            result={"value": {"items": [
+                {
+                    "path": "ambiguous.txt", "name": "ambiguous.txt",
+                    "status": "needs_reconciliation", "attempt": 1,
+                    "profile": "default", "retryable": False,
+                }
+            ]}},
+            created_at=created_at,
+        )
+        fingerprints = self.dispatcher.capabilities("local")["storage_upload_fingerprints"]
+        private_values = {
+            "tdl_storage_chat_ref": self.context.runtime_settings_store.encrypt_job_secret(
+                source.id, "tdl_storage_chat_ref", "-1009876543210"
+            ),
+            "tdl_sender_session_fingerprints": self.context.runtime_settings_store.encrypt_job_secret(
+                source.id,
+                "tdl_sender_session_fingerprints",
+                json.dumps({"default": fingerprints["default"]}),
+            ),
+        }
+        self.jobs.create_with_private_values(source, private_values)
+
+        response = self.client.post(
+            f"/api/v1/jobs/{source.id}/reconcile",
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["kind"], "storage_reconcile")
+        self.assertEqual(response.json()["payload"], {"source_job_id": source.id})
+        self.assertNotIn("-1009876543210", response.text)
+        command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["payload"]["tdl_access_target"], "-1009876543210")
+        self.assertEqual(command["payload"]["start_timestamp"], int(created_at.timestamp()))
+
     def test_terminate_all_active_jobs_endpoint_handles_stale_jobs(self):
         headers = self.login()
         created = self.client.post(
@@ -2192,6 +2494,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_quick_manager_filters_terminate_and_retries_without_exposing_password(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         quick = self.client.post(
             "/api/v1/exports",
             headers=headers,
@@ -2246,6 +2549,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_quick_staging_scan_merges_orphan_and_recovery_creates_job_on_origin_worker(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         self.dispatcher.quick_scan["local"] = {
             "worker": "local",
             "items": [{
@@ -2296,6 +2600,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_quick_staging_delete_rejects_stage_with_active_backend_job(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         active = self.control.submit_job(
             Actor(42, "default"),
             "export",
@@ -2339,6 +2644,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_quick_mode_limit_pause_and_resume_api_preserve_worker_fifo(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         saved = self.client.put(
             "/api/v1/quick-mode/limits/local",
             headers=headers,
@@ -2404,6 +2710,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_quickmode_staging_excludes_backend_jobs_without_physical_folder(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         # Create a quick mode export job in the database
         job_res = self.client.post(
             "/api/v1/exports",
@@ -2425,6 +2732,7 @@ class BackendApiTests(unittest.TestCase):
 
     def test_quickmode_recover_honors_resume_phase_and_blocks_active_job(self):
         headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="storage")
         # 1. Create a job that is active
         active_res = self.client.post(
             "/api/v1/exports",
@@ -2831,6 +3139,21 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertFalse(stale.json()["ready"])
         self.assertEqual(stale.json()["verified_profiles"], [])
+
+    def test_storage_status_invalidates_only_the_profile_with_a_changed_upload_session(self):
+        self.dispatcher.tts_health_result["available_profiles"] = ["default", "archive"]
+        self.seed_tdl_access("local", "storage", ["default", "archive"])
+        self.dispatcher.storage_fingerprint_overrides["default"] = "f" * 64
+
+        status = self.client.get(
+            "/api/v1/tdl-access/verification?purpose=storage&worker=local",
+            headers=self.login(42),
+        )
+
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["ready"])
+        self.assertEqual(status.json()["session"], "upload")
+        self.assertEqual(status.json()["verified_profiles"], ["archive"])
 
     def test_tts_worker_diagnostics_are_complete_and_logs_are_authenticated_json(self):
         headers = self.login()

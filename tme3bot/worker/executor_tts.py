@@ -63,7 +63,8 @@ class TtsExecutorMixin:
     def tts_health(self) -> dict[str, Any]:
         pipeline = self._tts_pipeline()
         health = pipeline.diagnostics()
-        available_profiles = self.available_storage_profiles()
+        available = getattr(self, "available_export_profiles", None)
+        available_profiles = available() if callable(available) else self.available_storage_profiles()
         helpers = health.get("helpers")
         helpers_ready = bool(health.get("helpers_ready")) and isinstance(helpers, list) and len(helpers) == 3 and all(
             isinstance(item, dict) and item.get("status") == "ready" for item in helpers

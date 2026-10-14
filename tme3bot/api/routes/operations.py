@@ -71,7 +71,15 @@ def register_operations(app, operations, *, current_actor) -> None:
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
     ):
-        operation, _ = _require_operations().cancel(actor, operation_id, idempotency_key)
+        service = _require_operations()
+        current = service.get(actor, operation_id)
+        if current.kind == "profile.local_delete" and not current.status.terminal:
+            raise DomainError(
+                "PROFILE_DELETE_NOT_CANCELLABLE",
+                "Penghapusan profil yang sudah tercatat tidak dapat dibatalkan dengan aman.",
+                status_code=409,
+            )
+        operation, _ = service.cancel(actor, operation_id, idempotency_key)
         return _public(operation, status_url=f"/api/v1/operations/{operation_id}")
 
     @app.post("/api/v1/operations/{operation_id}/retry", status_code=202, response_model=OperationResponse)

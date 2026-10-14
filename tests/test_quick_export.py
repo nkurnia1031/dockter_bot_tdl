@@ -402,7 +402,9 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
             storage_runtime = SimpleNamespace(
                 config=storage_config,
                 export_tdl_client=StorageClient(),
+                upload_tdl_client=StorageClient(),
                 export_operation_lock=threading.RLock(),
+                upload_operation_lock=threading.RLock(),
             )
 
             class Profiles:
@@ -442,6 +444,10 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
             )
             publisher = SimpleNamespace(emit=lambda *args, **kwargs: None)
             executor = self.make_executor(config, Profiles(), publisher)
+            executor.upload_lane_preparer = SimpleNamespace(
+                status=lambda _profile: {"status": "ready"},
+                session_fingerprint=lambda _profile: "a" * 64,
+            )
             with patch("tme3bot.worker.executor_quickmode.RcloneRunner", VerifyRclone), patch(
                 "tme3bot.worker.executor_quickmode.ensure_quick_stage_writable"
             ) as ensure_writable:
@@ -1149,8 +1155,10 @@ class QuickPipelineTests(WorkerExecutorTestCase):
             )
             storage_runtime = SimpleNamespace(
                 config=runtime_config,
-                export_tdl_client=upload_client,
+                export_tdl_client=UploadClient(),
+                upload_tdl_client=upload_client,
                 export_operation_lock=threading.RLock(),
+                upload_operation_lock=threading.RLock(),
             )
 
             class Profiles:
@@ -1166,6 +1174,10 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                 worker_storage_profile="storage",
             )
             executor = self.make_executor(config, Profiles(), publisher)
+            executor.upload_lane_preparer = SimpleNamespace(
+                status=lambda _profile: {"status": "ready"},
+                session_fingerprint=lambda _profile: "a" * 64,
+            )
             export_result = ExportJobResult(
                 status="exported",
                 chat_ref="@source",
@@ -1188,6 +1200,11 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                         "compress_size": "55m",
                         "compress_password": "snapshot-secret",
                         "rclone_destination": "googledrive:backup",
+                    },
+                    "_quick_storage_tdl_access_target": "-100123",
+                    "_quick_storage_sender_profiles": ["storage"],
+                    "_quick_storage_sender_session_fingerprints": {
+                        "storage": "a" * 64,
                     },
                 },
             }
@@ -1266,6 +1283,7 @@ class QuickPipelineTests(WorkerExecutorTestCase):
             )
             self.assertEqual(FakeRcloneRunner.instances[0].destination, "googledrive:backup")
             self.assertEqual(len(upload_client.calls), 2)
+            self.assertEqual(storage_runtime.export_tdl_client.calls, [])
             self.assertEqual(
                 {call["path"].name for call in upload_client.calls},
                 {"batch.7z.001", "batch.png"},

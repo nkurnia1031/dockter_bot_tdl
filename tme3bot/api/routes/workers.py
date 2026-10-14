@@ -21,6 +21,9 @@ from tme3bot.names import normalize_profile_name
 from tme3bot.profile_diagnostics import (
     PROFILE_LOCAL_DIAGNOSTIC_CHECKS,
     PROFILE_LOCAL_DIAGNOSTIC_CODES,
+    PROFILE_UPLOAD_LANE_CODES,
+    PROFILE_UPLOAD_LANE_PHASES,
+    PROFILE_UPLOAD_LANE_STATUSES,
 )
 from tme3bot.worker_registry import WORKER_NAME_RE
 
@@ -83,11 +86,50 @@ def _safe_local_profile_inventory(payload, *, worker: str) -> dict:
         ready = raw.get("ready") is True and not reason_codes
         if not ready and not reason_codes:
             reason_codes.append("PROFILE_SESSION_UNAVAILABLE")
+        raw_upload = raw.get("upload_lane")
+        if raw_upload is None:
+            upload_lane = {
+                "status": "pending",
+                "phase": "not_started",
+                "progress": 0,
+                "code": "WORKER_UPDATE_REQUIRED",
+                "updated_at": "",
+            }
+        elif not isinstance(raw_upload, dict):
+            raise DomainError(
+                "PROFILE_INVENTORY_INVALID",
+                "Worker mengembalikan status lane Upload yang tidak valid.",
+                status_code=502,
+            )
+        else:
+            status = str(raw_upload.get("status") or "pending")
+            phase = str(raw_upload.get("phase") or "not_started")
+            code = str(raw_upload.get("code") or "PROFILE_UPLOAD_PREPARATION_FAILED")
+            progress = raw_upload.get("progress", 0)
+            if (
+                status not in PROFILE_UPLOAD_LANE_STATUSES
+                or phase not in PROFILE_UPLOAD_LANE_PHASES
+                or code not in PROFILE_UPLOAD_LANE_CODES
+                or type(progress) is not int
+            ):
+                raise DomainError(
+                    "PROFILE_INVENTORY_INVALID",
+                    "Worker mengembalikan status lane Upload yang tidak valid.",
+                    status_code=502,
+                )
+            upload_lane = {
+                "status": status,
+                "phase": phase,
+                "progress": max(0, min(100, progress)),
+                "code": code,
+                "updated_at": str(raw_upload.get("updated_at") or "")[:40],
+            }
         safe_items.append({
             "name": name,
             "ready": ready,
             "reason_codes": reason_codes,
             "checks": checks,
+            "upload_lane": upload_lane,
         })
 
     return {
@@ -95,6 +137,62 @@ def _safe_local_profile_inventory(payload, *, worker: str) -> dict:
         "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "items": safe_items,
     }
+
+
+def _read_profile_inventory(context, worker: str, *, start_upload_prep: bool) -> dict:
+    method_name = "scan_local_profiles" if start_upload_prep else "profile_local_inventory"
+    scan = getattr(context.worker_dispatcher, method_name, None)
+    if not callable(scan):
+        raise DomainError(
+            "WORKER_UPDATE_REQUIRED",
+            "Backend belum mendukung scan profil lokal worker.",
+            status_code=409,
+        )
+    try:
+        result = scan(worker)
+    except JsonHttpError as exc:
+        if exc.status == 404:
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                f"Worker {worker} perlu diperbarui untuk scan profil lokal.",
+                status_code=409,
+            ) from exc
+        if exc.kind == "timeout" or exc.status == 504:
+            raise DomainError(
+                "WORKER_TIMEOUT",
+                f"Scan profil pada worker {worker} melewati batas waktu. Coba Scan lagi.",
+                status_code=504,
+            ) from exc
+        if exc.kind == "network":
+            raise DomainError(
+                "WORKER_UNAVAILABLE",
+                f"Worker {worker} sedang offline atau tidak dapat dijangkau.",
+                status_code=503,
+            ) from exc
+        raise DomainError(
+            "WORKER_SCAN_FAILED",
+            f"Worker {worker} gagal memproses scan profil lokal. Periksa versi worker dan coba lagi.",
+            status_code=502,
+        ) from exc
+    except RuntimeError as exc:
+        if "hanya diizinkan melalui HTTPS" in str(exc):
+            raise DomainError(
+                "WORKER_TRANSPORT_INSECURE",
+                "Scan worker remote memerlukan koneksi HTTPS.",
+                status_code=409,
+            ) from exc
+        raise DomainError(
+            "WORKER_SCAN_FAILED",
+            f"Worker {worker} gagal memproses scan profil lokal. Coba lagi atau periksa log worker.",
+            status_code=502,
+        ) from None
+    except Exception:
+        raise DomainError(
+            "WORKER_UNAVAILABLE",
+            f"Worker {worker} tidak dapat dihubungi untuk scan profil lokal.",
+            status_code=503,
+        ) from None
+    return _safe_local_profile_inventory(result, worker=worker)
 
 
 def _ensure_unique_worker_token(context, *, name: str, token: str) -> None:
@@ -123,66 +221,39 @@ def register_workers(app, context, *, current_actor):
             ]
         }
 
-    @app.post("/api/v1/workers/{name}/profiles/scan")
-    def scan_local_profiles(name: str, actor=Depends(current_actor)):
+    def _local_profiles_for_worker(name: str, actor, *, start_upload_prep: bool):
         del actor
         worker = str(name or "").strip().lower()
         if not WORKER_NAME_RE.fullmatch(worker):
             raise DomainError("WORKER_NAME_INVALID", "Nama worker tidak valid.", status_code=422)
         if context.worker_registry.get(worker) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
-        scan = getattr(context.worker_dispatcher, "profile_local_inventory", None)
-        if not callable(scan):
-            raise DomainError(
-                "WORKER_UPDATE_REQUIRED",
-                "Backend belum mendukung scan profil lokal worker.",
-                status_code=409,
+        inventory = _read_profile_inventory(
+            context, worker, start_upload_prep=start_upload_prep
+        )
+        default_profile = str(
+            getattr(context.profile_manager, "default_profile", "default") or "default"
+        )
+        for item in inventory.get("items", []):
+            item["deletable"] = item.get("name") != default_profile
+        if start_upload_prep:
+            from tme3bot.api.routes.profile_local_delete import (
+                reconcile_pending_identity_cleanups,
             )
-        try:
-            result = scan(worker)
-        except JsonHttpError as exc:
-            if exc.status == 404:
-                raise DomainError(
-                    "WORKER_UPDATE_REQUIRED",
-                    f"Worker {worker} perlu diperbarui untuk scan profil lokal.",
-                    status_code=409,
-                ) from exc
-            if exc.kind == "timeout" or exc.status == 504:
-                raise DomainError(
-                    "WORKER_TIMEOUT",
-                    f"Scan profil pada worker {worker} melewati batas waktu. Coba Scan lagi.",
-                    status_code=504,
-                ) from exc
-            if exc.kind == "network":
-                raise DomainError(
-                    "WORKER_UNAVAILABLE",
-                    f"Worker {worker} sedang offline atau tidak dapat dijangkau.",
-                    status_code=503,
-                ) from exc
-            raise DomainError(
-                "WORKER_SCAN_FAILED",
-                f"Worker {worker} gagal memproses scan profil lokal. Periksa versi worker dan coba lagi.",
-                status_code=502,
-            ) from exc
-        except RuntimeError as exc:
-            if "hanya diizinkan melalui HTTPS" in str(exc):
-                raise DomainError(
-                    "WORKER_TRANSPORT_INSECURE",
-                    "Scan worker remote memerlukan koneksi HTTPS.",
-                    status_code=409,
-                ) from exc
-            raise DomainError(
-                "WORKER_SCAN_FAILED",
-                f"Worker {worker} gagal memproses scan profil lokal. Coba lagi atau periksa log worker.",
-                status_code=502,
-            ) from None
-        except Exception:
-            raise DomainError(
-                "WORKER_UNAVAILABLE",
-                f"Worker {worker} tidak dapat dihubungi untuk scan profil lokal.",
-                status_code=503,
-            ) from None
-        return _safe_local_profile_inventory(result, worker=worker)
+
+            reconcile_pending_identity_cleanups(context)
+        profile_registry = getattr(context.profile_manager, "profile_registry", None)
+        pending = getattr(profile_registry, "pending_identity_cleanups", None)
+        inventory["pending_identity_cleanup"] = pending() if callable(pending) else []
+        return inventory
+
+    @app.post("/api/v1/workers/{name}/profiles/scan")
+    def scan_local_profiles(name: str, actor=Depends(current_actor)):
+        return _local_profiles_for_worker(name, actor, start_upload_prep=True)
+
+    @app.get("/api/v1/workers/{name}/profiles/local")
+    def local_profiles_status(name: str, actor=Depends(current_actor)):
+        return _local_profiles_for_worker(name, actor, start_upload_prep=False)
 
     @app.post("/api/v1/workers", response_model=ObjectResponse)
     def add_worker(body: WorkerRequest, actor=Depends(current_actor)):

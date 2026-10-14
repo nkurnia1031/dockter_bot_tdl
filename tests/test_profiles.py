@@ -291,15 +291,18 @@ class ProfileTests(unittest.TestCase):
             root = Path(temp_dir)
             config = replace(self.make_config(root), app_role="worker")
             manager = ProfileManager(config)
-            ready_db = root / "user1" / ".tdl" / "data" / "default"
+            export_db = root / "user1" / ".tdl" / "data" / "default"
+            export_db.parent.mkdir(parents=True)
+            export_db.write_bytes(b"export bolt")
+            ready_db = root / "upload" / ".tdl" / "data" / "default"
             ready_db.parent.mkdir(parents=True)
             ready_db.write_bytes(b"bolt")
             archive_db = (
-                root / "profiles" / "archive" / "user1" / ".tdl" / "data" / "default"
+                root / "profiles" / "archive" / "upload" / ".tdl" / "data" / "default"
             )
             archive_db.parent.mkdir(parents=True)
             archive_db.write_bytes(b"archive bolt")
-            empty_db = root / "profiles" / "empty" / "user1" / ".tdl" / "data"
+            empty_db = root / "profiles" / "empty" / "upload" / ".tdl" / "data"
             empty_db.mkdir(parents=True)
             (empty_db / "default").write_bytes(b"")
 
@@ -316,6 +319,28 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(
                 manager.profiles_with_tdl_session("storage"), ["archive", "default"]
             )
+            self.assertTrue(manager.tdl_session_available("default", "export"))
+
+    def test_profile_runtime_has_an_independent_upload_client_and_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(self.make_config(root), app_role="worker")
+            locks = (threading.RLock(), threading.RLock())
+            upload_lock = threading.RLock()
+
+            runtime = build_profile_runtime(
+                "default",
+                config,
+                state_store=StateStore(config.state_file, config.legacy_max_json),
+                operation_locks=locks,
+                upload_operation_lock=upload_lock,
+            )
+
+            self.assertEqual(runtime.upload_tdl_client.storage_root, root / "upload" / ".tdl")
+            self.assertEqual(runtime.upload_tdl_client.home, root / "upload")
+            self.assertIs(runtime.upload_operation_lock, upload_lock)
+            self.assertIsNot(runtime.upload_tdl_client, runtime.export_tdl_client)
+            self.assertIs(runtime.export_operation_lock, locks[0])
 
     def test_profile_registry_rejects_one_telegram_identity_on_two_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -323,6 +348,31 @@ class ProfileTests(unittest.TestCase):
             registry.register("one", 99)
             with self.assertRaises(ValueError):
                 registry.register("two", 99)
+
+    def test_profile_registry_persists_local_deletion_admission_and_rechecks_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "profiles.json"
+            registry = ProfileRegistry(path, "default")
+            registry.register("archive", 99)
+
+            self.assertTrue(registry.begin_local_deletion("archive", "remote-1", "a" * 64))
+            self.assertFalse(registry.begin_local_deletion("archive", "remote-1", "b" * 64))
+            self.assertTrue(registry.local_deletion_active("archive", "remote-1"))
+
+            reopened = ProfileRegistry(path, "default")
+            self.assertTrue(reopened.local_deletion_active("archive", "remote-1"))
+            self.assertFalse(reopened.finish_local_deletion("archive", "remote-1", "b" * 64))
+            self.assertTrue(reopened.finish_local_deletion("archive", "remote-1", "a" * 64))
+            reopened.mark_identity_cleanup_pending("archive", "remote-1")
+
+            after_restart = ProfileRegistry(path, "default")
+            self.assertEqual(after_restart.pending_identity_cleanups()[0]["profile"], "archive")
+            self.assertEqual(after_restart.pending_identity_cleanups()[0]["deleted_worker"], "remote-1")
+            self.assertEqual(after_restart.profile_for_user(99), "archive")
+            self.assertTrue(after_restart.remove_identity("archive"))
+            self.assertIsNone(after_restart.profile_for_user(99))
+            self.assertIn("archive", after_restart.names())
+            self.assertEqual(after_restart.pending_identity_cleanups(), [])
 
     def test_app_config_uses_container_profile_root_not_compose_host_path(self) -> None:
         with patch.dict(

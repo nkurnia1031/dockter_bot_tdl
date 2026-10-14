@@ -648,6 +648,10 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
     def retry_job(job_id: str, actor=Depends(current_actor)):
         return job_dict(context.control_plane.retry_job(actor, job_id))
 
+    @app.post("/api/v1/jobs/{job_id}/reconcile", response_model=JobResponse)
+    def reconcile_storage_upload(job_id: str, actor=Depends(current_actor)):
+        return job_dict(context.control_plane.reconcile_storage_upload(actor, job_id))
+
     @app.post("/api/v1/jobs/{job_id}/archive", response_model=JobResponse)
     def archive_job(job_id: str, actor=Depends(current_actor)):
         _owned_job(context, actor, job_id)

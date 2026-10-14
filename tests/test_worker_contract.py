@@ -87,6 +87,14 @@ class WorkerContractTests(unittest.TestCase):
                     self.assertEqual(raised.exception.kind, expected_kind)
                     self.assertNotIn("private detail", str(raised.exception))
 
+    def test_profile_scan_dispatch_starts_upload_lane_preparation(self):
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+        with patch.object(dispatcher, "_profile_json", return_value={"items": []}) as profile_json:
+            dispatcher.scan_local_profiles("remote")
+        profile_json.assert_called_once_with(
+            "remote", "POST", "/internal/v1/profiles/local/scan", timeout=20
+        )
+
     def test_resolver_readiness_uses_private_http_addon_health(self):
         executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
         with patch("tme3bot.worker.resolver_client.resolver_addon_ready", return_value=True) as ready:

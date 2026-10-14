@@ -28,6 +28,7 @@ class FakeExecutor:
         self.profile_sync_commits = []
         self.profile_sync_requests = []
         self.profile_sync_cancellations = []
+        self.local_profile_deletes = []
         self.profile_sync_snapshot = {
             "status": "ready",
             "backend_available": True,
@@ -74,6 +75,10 @@ class FakeExecutor:
     def cancel_profile_sync(self, profile, mode="check"):
         self.profile_sync_cancellations.append((profile, mode))
         return {"accepted": True, "status": "cancelling", "profile": profile}
+
+    def delete_local_profile(self, profile):
+        self.local_profile_deletes.append(profile)
+        return {"profile": profile, "deleted": True, "already_absent": False}
 
     def durable_commands_ready(self):
         return self.durable_ready
@@ -369,6 +374,40 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(accepted.json(), expected)
         self.assertNotIn("/data", accepted.text)
         self.assertNotIn("telegram_user_id", accepted.text)
+
+    def test_local_profile_scan_requires_worker_token_and_starts_upload_preparation(self):
+        calls = []
+        self.executor.local_profile_inventory = lambda **kwargs: calls.append(kwargs) or {"items": []}
+
+        denied = self.client.post("/internal/v1/profiles/local/scan")
+        self.assertEqual(denied.status_code, 401)
+
+        accepted = self.client.post(
+            "/internal/v1/profiles/local/scan",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(calls, [{"prepare_upload": True}])
+
+    def test_local_profile_delete_requires_worker_token_and_accepts_only_profile_slug(self):
+        denied = self.client.delete("/internal/v1/profiles/archive/local")
+        self.assertEqual(denied.status_code, 401)
+
+        headers = {"Authorization": "Bearer worker-secret"}
+        accepted = self.client.delete(
+            "/internal/v1/profiles/archive/local", headers=headers
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json(), {
+            "profile": "archive", "deleted": True, "already_absent": False
+        })
+        self.assertEqual(self.executor.local_profile_deletes, ["archive"])
+
+        invalid = self.client.delete(
+            "/internal/v1/profiles/%2E%2E%2Foutside/local", headers=headers
+        )
+        self.assertNotEqual(invalid.status_code, 200)
+        self.assertEqual(self.executor.local_profile_deletes, ["archive"])
 
     def test_durable_command_endpoints_require_auth_and_ready_journal(self):
         envelope = {

@@ -90,7 +90,7 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("Dockerfile.resolver.dockerignore", build.INCLUDE_ROOTS)
         self.assertEqual(service["build"]["dockerfile"], "Dockerfile.resolver")
         self.assertEqual(service["build"]["target"], "resolver")
-        self.assertIn('CMD ["python", "-m", "tme3bot.worker.resolver_addon"]', dockerfile)
+        self.assertIn('CMD ["python", "-m", "tme3bot.resolver_addon"]', dockerfile)
         self.assertNotIn("command", service)
         self.assertEqual(service["expose"], ["8091"])
         self.assertNotIn("ports", service)

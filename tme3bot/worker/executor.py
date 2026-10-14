@@ -34,6 +34,7 @@ from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
 from tme3bot.storage_catalog import build_storage_caption
 from tme3bot.tdl import ProcessStalledError, TDLClient, TDLStalledError
+from tme3bot.tdl_access_fingerprint import normalize_session_fingerprints
 from tme3bot.tdl_output import is_tdl_telemetry_line
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
 from tme3bot.worker.quick_export import (
@@ -55,6 +56,7 @@ from tme3bot.worker.quick_export import (
 from tme3bot.worker.runtime_settings import WorkerRuntimeSettings
 from tme3bot.worker.profile_sessions import ProfileSessionManager
 from tme3bot.worker.profile_sync import ProfileSyncClient, ProfileSyncError
+from tme3bot.worker.upload_lane import UploadLanePreparer
 from tme3bot.worker.command_runner import WorkerCommandRunner
 from tme3bot.worker.command_store import WorkerCommandStore
 
@@ -135,6 +137,13 @@ class WorkerJobExecutor(
         self.profile_manager = profile_manager
         self.publisher = publisher
         self._profile_sessions = ProfileSessionManager(config)
+        self.upload_lane_preparer = UploadLanePreparer(
+            profile_manager=profile_manager,
+            session_checker=lambda storage, namespace, home: self._profile_sessions.test_profile_session(
+                storage, namespace=namespace, home=home
+            ),
+            state_path=config.state_file.parent / "upload-lanes.json",
+        )
         self.runtime_settings = WorkerRuntimeSettings(
             config.state_file.parent / "worker_settings.json",
             default_storage_profile=getattr(config, "worker_storage_profile", "storage"),
@@ -207,13 +216,128 @@ class WorkerJobExecutor(
         )
 
     def start(self) -> None:
-        if self.profile_sync.enabled:
-            self.sync_profiles()
+        # Vault bundles are distributed only by an explicit operator action.
+        # Startup prepares the derived local Upload lane without replacing any
+        # local profile session from the vault.
+        self.prepare_upload_lanes()
         self._recover_legacy_quick_stages()
         self.publisher.attach_outbox(self.command_store)
         self._jobs.start()
         self.publisher.start_sender()
         self.command_runner.start()
+        self._publish_storage_upload_recoveries()
+
+    def _publish_storage_upload_recoveries(self) -> None:
+        """Report durable per-file states for Storage commands interrupted by a restart."""
+        store = getattr(self, "command_store", None)
+        publisher = getattr(self, "publisher", None)
+        list_commands = getattr(store, "list_storage_reconciliation_commands", None)
+        if not callable(list_commands) or publisher is None:
+            return
+        for command in list_commands():
+            command_id = str(command.get("command_id") or "")
+            job_id = str(command.get("job_id") or "")
+            if not command_id or not job_id:
+                continue
+            try:
+                worker = str(command.get("worker") or "")
+                publisher.bind_command(
+                    job_id,
+                    command_id,
+                    int(command.get("attempt") or 1),
+                    str(command.get("dispatch_token") or ""),
+                )
+                if worker:
+                    publisher.bind_job_worker(job_id, worker)
+                raw_items = store.storage_upload_items(command_id)
+                items = [
+                    {
+                        key: item.get(key)
+                        for key in (
+                            "path", "name", "status", "attempt", "profile", "retryable",
+                            "error_code", "error", "message_id", "attempts",
+                        )
+                    }
+                    for item in raw_items
+                ]
+                for item in raw_items:
+                    uploaded_item = item.get("uploaded_item")
+                    if item.get("status") == "succeeded" and isinstance(uploaded_item, dict):
+                        publisher.emit(
+                            job_id,
+                            "running",
+                            "storage.item_uploaded",
+                            result={"item": uploaded_item},
+                        )
+                succeeded = sum(item.get("status") == "succeeded" for item in items)
+                incomplete = any(
+                    item.get("status") in {"pending", "failed", "needs_reconciliation"}
+                    for item in items
+                )
+                ambiguous = any(
+                    item.get("status") == "needs_reconciliation" for item in items
+                )
+                retryable = any(
+                    item.get("retryable") is True
+                    and item.get("status") in {"pending", "failed"}
+                    for item in items
+                )
+                if items and not incomplete:
+                    outcome = "succeeded"
+                    message = "Upload Storage pulih dari checkpoint; semua file sudah terkonfirmasi."
+                    event_status = "succeeded"
+                    error = None
+                else:
+                    outcome = (
+                        "needs_reconciliation"
+                        if ambiguous and not succeeded
+                        else "partial_failure"
+                        if succeeded
+                        else "failed"
+                    )
+                    message = "Worker terhenti saat upload; file ambigu tidak dikirim ulang otomatis."
+                    event_status = "failed"
+                    error = {
+                        "code": "STORAGE_UPLOAD_INTERRUPTED",
+                        "message": message,
+                    }
+                result = {
+                    "outcome": outcome,
+                    "total": len(items),
+                    "succeeded": succeeded,
+                    "failed": [
+                        item for item in items
+                        if item.get("status") in {"failed", "needs_reconciliation"}
+                    ],
+                    "items": items,
+                    "retryable": retryable,
+                    "interrupted": True,
+                }
+                publisher.emit(
+                    job_id,
+                    event_status,
+                    "storage.batch_interrupted",
+                    progress={
+                        "phase": outcome,
+                        "message": message,
+                        "overall": {"current": succeeded, "total": len(items), "unit": "files"},
+                        "counters": {
+                            "succeeded": succeeded,
+                            "failed": sum(
+                                item.get("status") in {"failed", "needs_reconciliation"}
+                                for item in items
+                            ),
+                        },
+                        "indeterminate": False,
+                    },
+                    result={"value": result},
+                    error=error,
+                )
+                store.mark_storage_reconciliation_reported(command_id)
+            except Exception:
+                LOGGER.exception(
+                    "Could not report recovered Storage upload command %s", command_id
+                )
 
     def durable_commands_ready(self) -> bool:
         return bool(
@@ -283,7 +407,17 @@ class WorkerJobExecutor(
     def profile_sync_status(self) -> dict[str, Any]:
         return self.profile_sync.snapshot()
 
-    def local_profile_inventory(self) -> dict[str, Any]:
+    def prepare_upload_lanes(self) -> None:
+        """Queue idempotent Upload lane checks for all profiles on this worker."""
+        list_local = getattr(self.profile_manager, "local_profiles", None)
+        if not callable(list_local):
+            return
+        for raw_name in list_local():
+            profile = normalize_profile_name(str(raw_name or ""))
+            if profile:
+                self.upload_lane_preparer.ensure(profile)
+
+    def local_profile_inventory(self, *, prepare_upload: bool = False) -> dict[str, Any]:
         """Return a safe summary of the local profiles actually present on this worker."""
         list_local = getattr(self.profile_manager, "local_profiles", None)
         if not callable(list_local):
@@ -342,6 +476,11 @@ class WorkerJobExecutor(
                 })
                 for name in ("identity", "root_session", "user1_session")
             ]
+            if prepare_upload:
+                preparer = getattr(self, "upload_lane_preparer", None)
+                ensure = getattr(preparer, "ensure", None)
+                if callable(ensure):
+                    ensure(profile)
             if profile == normalize_profile_name(
                 str(getattr(getattr(self, "config", None), "default_profile", "default") or "default")
             ) and {
@@ -363,8 +502,22 @@ class WorkerJobExecutor(
                 "ready": bool(diagnostic.get("ready")) and not reasons,
                 "reason_codes": reasons,
                 "checks": safe_checks,
+                "upload_lane": self._upload_lane_status(profile),
             })
         return {"items": items}
+
+    def _upload_lane_status(self, profile: str) -> dict[str, Any]:
+        preparer = getattr(self, "upload_lane_preparer", None)
+        status = getattr(preparer, "status", None)
+        if callable(status):
+            return status(profile)
+        return {
+            "status": "pending",
+            "phase": "not_started",
+            "progress": 0,
+            "code": "PROFILE_UPLOAD_PREPARATION_INTERRUPTED",
+            "updated_at": "",
+        }
 
     def request_profile_sync(self, profile: str | None = None, mode: str = "check") -> dict[str, Any]:
         return self.profile_sync.request_sync(profile=profile, mode=mode)
@@ -402,6 +555,39 @@ class WorkerJobExecutor(
     def cancel_profile_login(self, operation_id: str) -> bool:
         return self._profile_sessions.cancel(operation_id)
 
+    @contextmanager
+    def _profile_session_locks(self, profile: str, *, blocking: bool = True):
+        lock_getter = getattr(self.profile_manager, "profile_operation_locks", None)
+        if callable(lock_getter):
+            locks = list(lock_getter(profile))
+        else:
+            runtime = self.profile_manager.runtime(profile)
+            locks = [runtime.export_operation_lock, runtime.download_operation_lock]
+        upload_lock_getter = getattr(
+            self.profile_manager, "profile_upload_operation_lock", None
+        )
+        if callable(upload_lock_getter):
+            locks.append(upload_lock_getter(profile))
+        else:
+            cached_runtime = getattr(self.profile_manager, "cached_runtime", None)
+            runtime = cached_runtime(profile) if callable(cached_runtime) else None
+            if runtime is not None:
+                locks.append(runtime.upload_operation_lock)
+        held = []
+        try:
+            for lock in locks:
+                if not lock.acquire(blocking=blocking):
+                    raise DomainError(
+                        "PROFILE_SESSION_BUSY",
+                        "Sesi profil sedang dipakai; tidak ada data yang dihapus.",
+                        status_code=409,
+                    )
+                held.append(lock)
+            yield
+        finally:
+            for lock in reversed(held):
+                lock.release()
+
     def install_profile_bundle(
         self,
         profile: str,
@@ -412,7 +598,6 @@ class WorkerJobExecutor(
         sync_run_id: str = "",
         sync_revision: int = 0,
     ) -> dict[str, Any]:
-        runtime = self.profile_manager.runtime(profile)
         sequence = 0
 
         def report(phase: str, status: str, code: str = "") -> None:
@@ -437,21 +622,20 @@ class WorkerJobExecutor(
         # new commands out until the replacement has completed.
         report("session_install", "running")
         try:
-            with runtime.export_operation_lock:
-                with runtime.download_operation_lock:
-                    stage_callback = None
-                    if sync_run_id:
-                        stage_callback = lambda phase: report(phase, "succeeded")
-                    result = self._profile_sessions.install_bundle(
-                        profile,
-                        telegram_user_id,
-                        bundle,
-                        operation_id,
-                        **({"on_stage": stage_callback} if stage_callback else {}),
-                    )
-                    refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
-                    if callable(refresh):
-                        refresh(profile)
+            with self._profile_session_locks(profile):
+                stage_callback = None
+                if sync_run_id:
+                    stage_callback = lambda phase: report(phase, "succeeded")
+                result = self._profile_sessions.install_bundle(
+                    profile,
+                    telegram_user_id,
+                    bundle,
+                    operation_id,
+                    **({"on_stage": stage_callback} if stage_callback else {}),
+                )
+                refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
+                if callable(refresh):
+                    refresh(profile)
             report("session_install", "succeeded")
             return result
         except Exception as exc:
@@ -484,27 +668,60 @@ class WorkerJobExecutor(
                 LOGGER.debug("Could not report profile bundle commit progress")
 
         report(5, "running")
-        committed = self._profile_sessions.commit_bundle(profile, operation_id)
+        with self._profile_session_locks(profile):
+            committed = self._profile_sessions.commit_bundle(profile, operation_id)
         report(6, "succeeded" if committed else "failed", "" if committed else "PROFILE_INSTALL_COMMIT_FAILED")
         return committed
 
     def rollback_profile_bundle(self, profile: str, operation_id: str) -> bool:
-        runtime = self.profile_manager.runtime(profile)
-        with runtime.export_operation_lock:
-            with runtime.download_operation_lock:
-                restored = self._profile_sessions.rollback_bundle(profile, operation_id)
-                refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
-                if restored and callable(refresh):
-                    refresh(profile)
-                return restored
+        with self._profile_session_locks(profile):
+            restored = self._profile_sessions.rollback_bundle(profile, operation_id)
+            refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
+            if restored and callable(refresh):
+                refresh(profile)
+            return restored
+
+    def delete_local_profile(self, profile: str) -> dict[str, Any]:
+        normalized = normalize_profile_name(profile)
+        if not normalized or str(profile or "").strip().lower() != normalized:
+            raise DomainError(
+                "PROFILE_NAME_INVALID", "Nama profil lokal tidak valid.", status_code=422
+            )
+        if normalized == normalize_profile_name(
+            str(getattr(self.config, "default_profile", "default") or "default")
+        ):
+            raise DomainError(
+                "PROFILE_DEFAULT_PROTECTED", "Profil default tidak dapat dihapus.", status_code=409
+            )
+        preparer = self.upload_lane_preparer
+        reserve = getattr(preparer, "reserve_profile_deletion", None)
+        reserved = bool(reserve(normalized)) if callable(reserve) else False
+        if callable(reserve) and not reserved:
+            raise DomainError(
+                "PROFILE_SESSION_BUSY",
+                "Sesi profil sedang dipakai; tidak ada data yang dihapus.",
+                status_code=409,
+            )
+        deleted = False
+        try:
+            with self._profile_session_locks(normalized, blocking=False):
+                result = self._profile_sessions.delete_local_profile(normalized)
+                deleted = bool(result.get("deleted"))
+                if deleted:
+                    forget = getattr(self.profile_manager, "forget_profile_runtime", None)
+                    if callable(forget):
+                        forget(normalized)
+                return result
+        finally:
+            release = getattr(preparer, "release_profile_deletion", None)
+            if callable(release) and reserved:
+                release(normalized, deleted=deleted)
 
     def export_profile_bundle(self, profile: str) -> tuple[int, bytes]:
-        runtime = self.profile_manager.runtime(profile)
         # Take a consistent snapshot while TDL commands are not changing its
-        # Bolt databases. Keep the same lock order as profile installation.
-        with runtime.export_operation_lock:
-            with runtime.download_operation_lock:
-                return self._profile_sessions.export_bundle(profile)
+        # Bolt databases. The shared helper acquires each stable lane lock once.
+        with self._profile_session_locks(profile):
+            return self._profile_sessions.export_bundle(profile)
 
     def diagnose_profile_export(self, profile: str) -> dict[str, Any]:
         cached_runtime = getattr(self.profile_manager, "cached_runtime", None)
@@ -790,19 +1007,28 @@ class WorkerJobExecutor(
                     interrupt("quick utility", utility_runner.cancel_current)
                 if rclone_runner is not None:
                     interrupt("quick rclone", rclone_runner.cancel_current)
-        elif kind == "storage_upload":
-            try:
-                storage_runtime = self.profile_manager.runtime(
-                    self.storage_profile()
+        elif kind in {"storage_upload", "storage_reconcile"}:
+            if kind == "storage_upload":
+                try:
+                    storage_runtime = self.profile_manager.runtime(self.storage_profile())
+                except Exception:
+                    storage_runtime = None
+                interrupt(
+                    "storage upload",
+                    getattr(getattr(storage_runtime, "export_tdl_client", None), "interrupt_current", None),
                 )
-            except Exception:
-                storage_runtime = None
-            interrupt(
-                "storage upload",
-                getattr(getattr(storage_runtime, "export_tdl_client", None), "interrupt_current", None),
-            )
-            if rclone_runner is not None:
-                interrupt("storage rclone", rclone_runner.cancel_current)
+                if rclone_runner is not None:
+                    interrupt("storage rclone", rclone_runner.cancel_current)
+            else:
+                for sender_profile in self.available_storage_profiles():
+                    try:
+                        sender_runtime = self.profile_manager.runtime(str(sender_profile))
+                    except Exception:
+                        sender_runtime = None
+                    interrupt(
+                        f"Storage reconcile {sender_profile}",
+                        getattr(getattr(sender_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                    )
         elif kind == "leave":
             interrupt(
                 "leave",
@@ -819,7 +1045,7 @@ class WorkerJobExecutor(
         return bool(
             cancelled
             or quick_active
-            or kind in {"export", "backup_node", "backup_verify", "tts", "safelink_resolve"}
+            or kind in {"export", "backup_node", "backup_verify", "tts", "safelink_resolve", "storage_reconcile"}
         )
 
     def pause(self, job_id: str) -> bool:
@@ -927,12 +1153,14 @@ class WorkerJobExecutor(
                 runtime = self.profile_manager.runtime(active[0])
             except Exception:
                 runtime = None
-            try:
-                storage_profile = self.storage_profile()
-                storage_runtime = self.profile_manager.runtime(storage_profile)
-                clients.append(getattr(storage_runtime, "export_tdl_client", None))
-            except Exception:
-                pass
+            kind = str(command.get("kind") or "") if command else ""
+            payload = command.get("payload") if command else {}
+            purpose = str(payload.get("purpose") or "") if isinstance(payload, dict) else ""
+            if runtime is not None:
+                if kind == "storage_upload" or (kind == "tdl_access_verify" and purpose == "storage"):
+                    clients.append(getattr(runtime, "upload_tdl_client", None))
+                elif kind in {"tdl_access_verify", "tts"}:
+                    clients.append(getattr(runtime, "export_tdl_client", None))
             if command and command.get("kind") == "leave" and runtime is not None:
                 clients.append(getattr(getattr(runtime, "leave_service", None), "runner", None))
         seen: set[int] = set()
@@ -955,10 +1183,10 @@ class WorkerJobExecutor(
 
     def capabilities(self) -> dict[str, Any]:
         """Return non-secret worker capabilities for backend target checks."""
-        export_profiles = self.available_storage_profiles()
+        export_profiles = self.available_export_profiles()
         download_profiles = self.available_download_profiles()
         profiles = export_profiles
-        storage_profiles_available = export_profiles
+        storage_profiles_available = self.available_storage_profiles()
         profile_sync_manager = getattr(self, "profile_sync", None)
         snapshot = getattr(profile_sync_manager, "snapshot", None)
         profile_sync = snapshot() if callable(snapshot) else {
@@ -968,6 +1196,9 @@ class WorkerJobExecutor(
         }
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
+        storage_session_fingerprints = self.available_storage_session_fingerprints(
+            storage_profiles_available
+        )
         tts_ready = False
         tts_health: dict[str, Any] = {
             "helpers_ready": False,
@@ -996,6 +1227,7 @@ class WorkerJobExecutor(
             "storage_profile": storage_profile,
             "storage_profile_available": storage_available,
             "available_storage_profiles": storage_profiles_available,
+            "storage_upload_fingerprints": storage_session_fingerprints,
             "workspace": Path(getattr(self.config, "utility_workspace_root", "/workspace")).is_dir(),
             "tts": tts_ready,
             "tts_profiles": tts_profiles,
@@ -1011,11 +1243,57 @@ class WorkerJobExecutor(
     def storage_profile(self) -> str:
         return self.runtime_settings.storage_profile()
 
-    def available_storage_profiles(self) -> list[str]:
+    def available_export_profiles(self) -> list[str]:
         list_profiles = getattr(self.profile_manager, "profiles_with_tdl_session", None)
         if callable(list_profiles):
             return [str(item) for item in list_profiles("export")]
         return []
+
+    def available_storage_profiles(self) -> list[str]:
+        list_profiles = getattr(self.profile_manager, "profiles_with_tdl_session", None)
+        if callable(list_profiles):
+            candidates = list_profiles("storage")
+        else:
+            list_local = getattr(self.profile_manager, "list_profiles", None)
+            candidates = list_local() if callable(list_local) else []
+        return [
+            profile
+            for profile in dict.fromkeys(str(item).strip().lower() for item in candidates if str(item).strip())
+            if self._upload_lane_ready(profile)
+        ]
+
+    def available_storage_session_fingerprints(
+        self, profiles: list[str] | None = None
+    ) -> dict[str, str]:
+        """Expose opaque generation hashes for ready Upload lanes only."""
+        selected = profiles if profiles is not None else self.available_storage_profiles()
+        preparer = getattr(self, "upload_lane_preparer", None)
+        fingerprint_method = getattr(preparer, "session_fingerprint", None)
+        if not callable(fingerprint_method):
+            return {}
+        raw: dict[str, str] = {}
+        for profile in selected:
+            normalized = str(profile or "").strip().lower()
+            if not normalized:
+                continue
+            try:
+                fingerprint = fingerprint_method(normalized)
+            except Exception:
+                continue
+            if isinstance(fingerprint, str):
+                raw[normalized] = fingerprint
+        return normalize_session_fingerprints(raw)
+
+    def _upload_lane_ready(self, profile: str) -> bool:
+        preparer = getattr(self, "upload_lane_preparer", None)
+        status_method = getattr(preparer, "status", None)
+        if not callable(status_method):
+            return False
+        status = status_method(profile)
+        if not isinstance(status, dict) or status.get("status") != "ready":
+            return False
+        session_available = getattr(self.profile_manager, "tdl_session_available", None)
+        return not callable(session_available) or session_available(profile, "storage") is True
 
     def available_download_profiles(self) -> list[str]:
         list_profiles = getattr(self.profile_manager, "profiles_with_tdl_session", None)
@@ -1221,11 +1499,14 @@ class WorkerJobExecutor(
                     keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
-        elif kind == "storage_upload":
-            keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
+        elif kind in {"storage_upload", "storage_reconcile"}:
+            keys = {
+                f"worker:{worker}:kind:storage_upload",
+                f"worker:{worker}:tdl:storage",
+            }
             sender_profiles = (command.get("payload") or {}).get("_tdl_sender_profiles") or [profile]
             for sender_profile in sender_profiles:
-                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         elif kind == "tts":
             # Lock every verified fallback profile because only explicit
             # pre-send permission denials may move this job to another one.
@@ -1234,9 +1515,11 @@ class WorkerJobExecutor(
                 keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
         elif kind == "tdl_access_verify":
             keys = {f"worker:{worker}:kind:tdl_access_verify"}
-            candidate_profiles = (command.get("payload") or {}).get("candidate_profiles") or self.profile_manager.list_profiles()
+            payload = command.get("payload") or {}
+            candidate_profiles = payload.get("candidate_profiles") or self.profile_manager.list_profiles()
+            lane = "upload" if str(payload.get("purpose") or "") == "storage" else "export"
             for candidate_profile in candidate_profiles:
-                keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:export")
+                keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:{lane}")
         elif kind == "backup_verify":
             keys = {
                 f"worker:{worker}:kind:backup_verify",
@@ -1313,10 +1596,16 @@ class WorkerJobExecutor(
             "leave": "export",
             "download": "download",
             "download_clear_failed": "download",
-            "storage_upload": "export",
             "tts": "export",
             "backup_verify": "export",
         }.get(kind)
+        if kind == "storage_upload":
+            if profile in self.available_storage_profiles():
+                return
+            raise RuntimeError(
+                f"STORAGE_PROFILE_UNAVAILABLE: lane Upload profil {profile or '(kosong)'} "
+                "belum siap pada worker ini. Jalankan scan profil lalu coba lagi."
+            )
         if purpose is None:
             return
         profile = str(command.get("profile") or "")
@@ -1479,21 +1768,66 @@ class WorkerJobExecutor(
                         **({"staging_path": staging_path, "staging_cleaned": False} if staging_path else {}),
                         "finished_at": utc_now().isoformat(),
                     },
+                    **(
+                        {"result": {"value": json_value(result)}}
+                        if kind in {"storage_upload", "storage_reconcile"} and isinstance(result, dict)
+                        else {}
+                    ),
                     error={"code": "JOB_TERMINATED", "message": self._cancel_error(command)},
                 )
                 command_terminal_status = "cancelled"
             else:
-                self.publisher.emit(
-                    job_id,
-                    "succeeded",
-                    "completed",
-                    progress={
-                        "phase": "completed",
-                        "finished_at": utc_now().isoformat(),
-                    },
-                    result={"value": json_value(result)},
+                storage_outcome = (
+                    str(result.get("outcome") or "")
+                    if kind in {"storage_upload", "storage_reconcile"} and isinstance(result, dict)
+                    else ""
                 )
-                command_terminal_status = "succeeded"
+                if storage_outcome and storage_outcome != "succeeded":
+                    error_code = (
+                        "STORAGE_UPLOAD_RECONCILIATION_REQUIRED"
+                        if storage_outcome == "needs_reconciliation"
+                        else "STORAGE_UPLOAD_PARTIAL"
+                        if storage_outcome == "partial_failure"
+                        else "STORAGE_UPLOAD_FAILED"
+                    )
+                    error_message = {
+                        "STORAGE_UPLOAD_RECONCILIATION_REQUIRED": "Sebagian hasil upload belum dapat dipastikan dan perlu rekonsiliasi.",
+                        "STORAGE_UPLOAD_PARTIAL": "Sebagian file gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
+                        "STORAGE_UPLOAD_FAILED": "Semua file upload gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
+                    }[error_code]
+                    if kind == "storage_reconcile":
+                        error_code = "STORAGE_RECONCILIATION_INCOMPLETE"
+                        error_message = "Sebagian file tetap ambigu; hasil ekspor tidak membuktikan file aman untuk Retry."
+                    self.publisher.emit(
+                        job_id,
+                        "failed",
+                        "storage.reconciliation_completed" if kind == "storage_reconcile" else "storage.batch_completed",
+                        progress={
+                            "phase": storage_outcome,
+                            "message": error_message,
+                            "finished_at": utc_now().isoformat(),
+                            "overall": {
+                                "current": int(result.get("succeeded") or 0),
+                                "total": int(result.get("total") or 0),
+                                "unit": "files",
+                            },
+                        },
+                        result={"value": json_value(result)},
+                        error={"code": error_code, "message": error_message},
+                    )
+                    command_terminal_status = "failed"
+                else:
+                    self.publisher.emit(
+                        job_id,
+                        "succeeded",
+                        "completed",
+                        progress={
+                            "phase": "completed",
+                            "finished_at": utc_now().isoformat(),
+                        },
+                        result={"value": json_value(result)},
+                    )
+                    command_terminal_status = "succeeded"
         except Exception as exc:
             LOGGER.exception("Job %s (%s) failed", job_id, kind)
             self._append_job_log(f"[job failed: {exc}]")
@@ -1782,6 +2116,7 @@ class WorkerJobExecutor(
             "artifact_delete": self._artifact_delete,
             "utility": self._utility,
             "storage_upload": self._storage_upload,
+            "storage_reconcile": self._storage_reconcile,
             "backup_node": self._backup,
             "backup_verify": self._backup_verify,
             "tts": self._tts,

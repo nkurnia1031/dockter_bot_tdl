@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tme3bot.config import AppConfig
+from tme3bot.domain.models import DomainError
 from tme3bot.profile_provisioning import (
     ProfileProvisioningService,
     ProfileProvisioningStore,
@@ -140,6 +141,98 @@ class MutableWorkerRegistry(FakeWorkerRegistry):
 
 
 class ProfileProvisioningTests(unittest.TestCase):
+    def test_local_profile_delete_removes_the_complete_validated_tree_and_protects_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = make_config(root)
+            manager = ProfileSessionManager(config)
+            profile_root = root / "profiles" / "archive"
+            files = [
+                profile_root / "identity.json",
+                profile_root / "state.json",
+                profile_root / "exports" / "done" / "export.json",
+                profile_root / "root" / ".tdl" / "data" / "default",
+                profile_root / "user1" / ".tdl" / "data" / "default",
+                profile_root / "upload" / ".tdl" / "data" / "default",
+                profile_root / "other" / "nested.bin",
+            ]
+            for path in files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"profile-data")
+            vault_bundle = root / "vault" / "archive.bundle"
+            vault_bundle.parent.mkdir()
+            vault_bundle.write_bytes(b"vault-data")
+
+            result = manager.delete_local_profile("archive")
+
+            self.assertEqual(result, {"profile": "archive", "deleted": True, "already_absent": False})
+            self.assertFalse(profile_root.exists())
+            self.assertEqual(vault_bundle.read_bytes(), b"vault-data")
+
+            default_file = root / "root" / "default-only"
+            default_file.parent.mkdir(parents=True)
+            default_file.write_bytes(b"default-data")
+            with self.assertRaises(DomainError) as protected:
+                manager.delete_local_profile("default")
+            self.assertEqual(protected.exception.code, "PROFILE_DEFAULT_PROTECTED")
+            self.assertEqual(default_file.read_bytes(), b"default-data")
+
+            with self.assertRaises(DomainError) as invalid:
+                manager.delete_local_profile("../archive")
+            self.assertEqual(invalid.exception.code, "PROFILE_NAME_INVALID")
+
+    def test_local_delete_suspends_old_distribution_until_explicit_retry(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = FakeProfileManager(root)
+            workers = MutableWorkerRegistry()
+            workers.workers.pop("remote-offline")
+            dispatcher = FakeProfileDispatcher()
+            dispatcher.online.clear()
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            service = ProfileProvisioningService(store, manager, workers, dispatcher)
+
+            operation = service.upload("archive", "local", single_session_zip(), 42)
+            service.process_once()
+            self.assertEqual(store.provisioning(operation)["workers"][0]["status"], "waiting")
+            dispatcher.online.add("local")
+            token = "a" * 64
+            self.assertTrue(manager.profile_registry.begin_local_deletion("archive", "local", token))
+
+            # A background scan while deletion holds admission cannot install.
+            service.process_once()
+            self.assertNotIn(("archive", "local"), dispatcher.installed)
+            self.assertTrue(manager.profile_registry.finish_local_deletion("archive", "local", token))
+
+            # Simulate a scan snapshot taken before the successful delete. The
+            # compare-and-set claim must reject that stale row.
+            stale_rows = store.waiting_distributions()
+            self.assertEqual(stale_rows, [("archive", "local", operation)])
+            store.mark_local_profile_deleted("archive", "local")
+            self.assertFalse(store.begin_distribution_install(*stale_rows[0][:2]))
+            service.process_once()
+            self.assertNotIn(("archive", "local"), dispatcher.installed)
+
+            # Only an explicit operator retry moves removed_locally back to the
+            # distribution queue.
+            service.retry(operation, 42)
+            service.process_once()
+            self.assertIn(("archive", "local"), dispatcher.installed)
+
+    def test_interrupted_distribution_claim_is_requeued_for_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            service = ProfileProvisioningService(
+                store, FakeProfileManager(root), MutableWorkerRegistry(), FakeProfileDispatcher()
+            )
+            operation = service.upload("archive", "local", single_session_zip(), 42)
+            store.begin_distribution_install("archive", "local")
+
+            self.assertEqual(store.recover_interrupted_distributions(), 1)
+            self.assertFalse(store.distribution_install_active("archive", "local"))
+            self.assertIn(("archive", "local", operation), store.waiting_distributions())
+
     def test_legacy_profile_export_diagnosis_checks_both_sessions_without_exposing_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

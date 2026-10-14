@@ -125,6 +125,49 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get("tts-synthesis")["phase"], "recovered")
         self.assertEqual(self.store.get("tts-delivery")["status"], "needs_reconciliation")
 
+    def test_storage_upload_recovery_keeps_completed_and_pending_items_without_replaying_inflight(self):
+        envelope = job_envelope("storage-command", "storage-job", attempt=3)
+        envelope["job"]["kind"] = "storage_upload"
+        self.store.accept(envelope)
+        self.store.set_status("storage-command", "running", only_from=("accepted",))
+        self.store.record_storage_upload_item(
+            "storage-command", "ambiguous.txt", file_name="ambiguous.txt",
+            status="sending", attempt=2, profile="archive",
+            caption="storage/archive/ambiguous.txt",
+        )
+        self.store.record_storage_upload_item(
+            "storage-command", "done.txt", file_name="done.txt",
+            status="succeeded", attempt=1, profile="default", message_id=44,
+            result_item={"upload_id": "upload-done", "channel_message_id": 44},
+        )
+        self.store.record_storage_upload_item(
+            "storage-command", "waiting.txt", file_name="waiting.txt",
+            status="pending", attempt=0, retryable=True,
+        )
+
+        recovered = WorkerCommandStore(self.path)
+        report = recovered.recover_startup()
+        items = {item["path"]: item for item in recovered.storage_upload_items("storage-command")}
+
+        self.assertEqual(report["needs_reconciliation"], 1)
+        self.assertEqual(items["ambiguous.txt"]["status"], "needs_reconciliation")
+        self.assertFalse(items["ambiguous.txt"]["retryable"])
+        self.assertEqual(items["ambiguous.txt"]["profile"], "archive")
+        self.assertEqual(items["ambiguous.txt"]["attempt"], 2)
+        self.assertEqual(items["ambiguous.txt"]["caption"], "storage/archive/ambiguous.txt")
+        self.assertEqual(items["done.txt"]["status"], "succeeded")
+        self.assertEqual(items["done.txt"]["uploaded_item"]["upload_id"], "upload-done")
+        self.assertEqual(items["waiting.txt"]["status"], "pending")
+        self.assertTrue(items["waiting.txt"]["retryable"])
+        commands = recovered.list_storage_reconciliation_commands()
+        self.assertEqual(commands[0]["job_id"], "storage-job")
+        self.assertEqual(commands[0]["attempt"], 3)
+        durable_job_items = recovered.storage_upload_items_for_job("storage-job")
+        self.assertIsNotNone(durable_job_items)
+        self.assertEqual(durable_job_items["items"][0]["caption"], "storage/archive/ambiguous.txt")
+        self.assertTrue(recovered.mark_storage_reconciliation_reported("storage-command"))
+        self.assertEqual(recovered.list_storage_reconciliation_commands(), [])
+
     def test_event_sequence_and_payload_survive_retry_and_restart(self):
         self.store.seed_sequence("job-event", 8)
         sequence = self.store.append_event(

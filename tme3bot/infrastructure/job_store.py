@@ -1530,6 +1530,20 @@ class SqliteJobRepository:
                 True,
             )
 
+    def update_result(self, job_id: str, result: dict[str, Any]) -> Job:
+        """Update a terminal job's result without changing its lifecycle state."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._db() as db:
+            db.execute(
+                "UPDATE jobs SET result=?,updated_at=? WHERE id=?",
+                (_dump(result), now, str(job_id)),
+            )
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (str(job_id),)).fetchone()
+        job = self._job(row)
+        if job is None:
+            raise KeyError(f"Unknown job: {job_id}")
+        return job
+
     def events(self, job_id: str, *, after_sequence: int = 0) -> list[JobEvent]:
         with self._db() as db:
             rows = db.execute(

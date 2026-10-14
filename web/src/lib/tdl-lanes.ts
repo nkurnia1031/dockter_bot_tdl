@@ -6,7 +6,8 @@ const sessionLaneLabels: Record<string, string> = {
 const diagnosticLaneLabels: Record<string, string> = {
   identity: 'Identitas',
   root_session: 'Download',
-  user1_session: 'Export'
+  user1_session: 'Export',
+  upload_lane: 'Upload'
 };
 
 export function tdlLaneLabel(identifier: string): string {

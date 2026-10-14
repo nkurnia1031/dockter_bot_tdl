@@ -316,6 +316,15 @@ def prepare_profile_sync_operation(context, actor, target, input_data) -> Prepar
     if set(input_data or {}) - {"mode"} or mode not in {"check", "repair"}:
         raise DomainError("PROFILE_SYNC_MODE_INVALID", "Mode pemulihan profil tidak valid.", status_code=422)
     context.control_plane.require_profile(actor, profile)
+    profile_manager = getattr(context, "profile_manager", None)
+    profile_registry = getattr(profile_manager, "profile_registry", None)
+    deleting = getattr(profile_registry, "local_deletion_active", None)
+    if callable(deleting) and deleting(profile, worker):
+        raise DomainError(
+            "PROFILE_DELETION_IN_PROGRESS",
+            f"Profil {profile} sedang dihapus dari worker {worker}; sinkronisasi baru ditahan.",
+            status_code=409,
+        )
     provisioner = context.profile_provisioner
     if provisioner is None or provisioner.store.desired_revision(profile) is None:
         raise DomainError("PROFILE_NOT_VAULTED", "Profil belum memiliki revision di vault.", status_code=409)

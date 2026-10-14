@@ -29,8 +29,8 @@
     folders:FolderEntry[]; items:Item[]; total_folders:number; total_items:number
   };
   type AccessOperation = { operation_id:string; status:string; phase:string; job_id?:string|null; worker:string };
-  type AccessProfile = { profile:string; ready:boolean; error_code?:string|null; error_message?:string|null; session_status?:string; command_attempted?:boolean; checked_at?:string };
-  type AccessJob = { progress?:{message?:string|null}; result?:{value?:{profiles?:AccessProfile[];command_template?:string;summary?:{total:number;tested:number;ready:number;failed:number}}} };
+  type AccessProfile = { profile:string; ready:boolean; error_code?:string|null; error_message?:string|null; session?:'upload'|'export'; session_status?:string; command_attempted?:boolean; checked_at?:string };
+  type AccessJob = { progress?:{message?:string|null}; result?:{value?:{session?:'upload'|'export';profiles?:AccessProfile[];command_template?:string;summary?:{total:number;tested:number;ready:number;failed:number}}} };
 
   let folderId = $state<number|null>(null);
   let scope = $state<'current'|'global'|'recent'|'trash'>('current');
@@ -72,6 +72,7 @@
   let tdlAccessError = $state('');
   let tdlAccessProgress = $state('');
   let tdlAccessCommand = $state('');
+  let tdlAccessSession = $state<'upload'|'export'|''>('');
   let tdlAccessSummary = $state<{total:number;tested:number;ready:number;failed:number}|null>(null);
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
@@ -203,12 +204,13 @@
     if (!workspaceFolders[0]) return;
     if (!verified || verified.worker !== worker) { message = 'Verifikasi worker terlebih dahulu.'; return; }
     try {
-      const access = await api<{worker:string;ready:boolean;profiles:AccessProfile[]}>(
+      const access = await api<{worker:string;ready:boolean;session?:'upload'|'export';profiles:AccessProfile[]}>(
         `/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker)}`
       );
       tdlAccessProfiles = access.profiles || [];
       tdlAccessReady = access.ready;
       tdlAccessWorker = access.worker;
+      tdlAccessSession = access.session || 'upload';
       if (!access.ready) {
         message = 'Verifikasi akses kirim TDL untuk worker ini terlebih dahulu.';
         return;
@@ -234,6 +236,7 @@
     tdlAccessReady = false;
     tdlAccessProgress = '';
     tdlAccessCommand = '';
+    tdlAccessSession = '';
     tdlAccessSummary = null;
     tdlAccessLoading = true;
     try {
@@ -265,17 +268,19 @@
             hasOperationResult = true;
             tdlAccessProfiles = result.profiles || [];
             tdlAccessCommand = result.command_template || '';
+            tdlAccessSession = result.session || 'upload';
             tdlAccessSummary = result.summary || null;
           }
         }
       }
       if (worker) {
-        const current = await api<{worker:string;ready:boolean;profiles:AccessProfile[]}>(
+        const current = await api<{worker:string;ready:boolean;session?:'upload'|'export';profiles:AccessProfile[]}>(
           `/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker)}`
         );
         if (!hasOperationResult) tdlAccessProfiles = current.profiles || [];
         tdlAccessReady = current.ready;
         tdlAccessWorker = current.worker;
+        tdlAccessSession = current.session || 'upload';
       } else {
         tdlAccessReady = false;
         tdlAccessWorker = '';
@@ -345,12 +350,13 @@
 <div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified /></div>
 
 <section class="card mt-4 p-4 sm:p-5">
-  <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Akses kirim Storage</h2><p class="muted mt-1 text-sm">Profil pengirim diuji ke tujuan Storage yang tersimpan. Setiap profil yang diuji meninggalkan satu pesan penanda di chat.</p></div><div class="flex gap-2"><button class="button secondary" onclick={verifyStorageTdlAccess} disabled={!worker || tdlAccessLoading}><Send size={15}/>{tdlAccessLoading ? 'Memulai...' : 'Verifikasi akses TDL'}</button><button class="button secondary" onclick={refreshStorageTdlAccess} disabled={!worker || tdlAccessLoading}><RefreshCw size={15}/>{tdlAccessLoading ? 'Memuat...' : 'Muat status'}</button></div></div>
+  <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Akses kirim Storage</h2><p class="muted mt-1 text-sm">Profil pengirim diuji melalui lane Upload ke tujuan Storage yang tersimpan. Setiap profil yang diuji meninggalkan satu pesan penanda di chat.</p></div><div class="flex gap-2"><button class="button secondary" onclick={verifyStorageTdlAccess} disabled={!worker || tdlAccessLoading}><Send size={15}/>{tdlAccessLoading ? 'Memulai...' : 'Verifikasi akses TDL'}</button><button class="button secondary" onclick={refreshStorageTdlAccess} disabled={!worker || tdlAccessLoading}><RefreshCw size={15}/>{tdlAccessLoading ? 'Memuat...' : 'Muat status'}</button></div></div>
+  {#if tdlAccessSession}<p class="muted mt-2 text-xs">Lane yang diuji: {tdlAccessSession === 'upload' ? 'Upload' : 'Export'}.</p>{/if}
   {#if tdlAccessOperation}<p class="muted mt-3 text-xs">Operation {tdlAccessOperation.status} · tahap {tdlAccessOperation.phase} · worker {tdlAccessOperation.worker}. Status diperbarui saat tombol Muat status ditekan.</p>{/if}
   {#if tdlAccessProgress}<p role="status" class="mt-2 text-sm">{tdlAccessProgress}</p>{/if}
   {#if tdlAccessSummary}<p class="muted mt-2 text-xs">{tdlAccessSummary.ready} profil dapat mengirim dari {tdlAccessSummary.total} · {tdlAccessSummary.tested} perintah TDL dijalankan · {tdlAccessSummary.failed} gagal atau dilewati.</p>{/if}
   {#if tdlAccessCommand}<details class="mt-2 text-xs"><summary class="cursor-pointer font-semibold">Lihat bentuk perintah TDL</summary><code class="mt-2 block overflow-x-auto rounded-lg bg-[var(--surface-soft)] p-2">{tdlAccessCommand}</code><span class="muted mt-1 block">Nilai tujuan chat, path sesi, dan nama file sementara disamarkan.</span></details>{/if}
-  {#if tdlAccessProfiles.length}<ul class="mt-2 grid gap-2 text-sm sm:grid-cols-2">{#each tdlAccessProfiles as item}<li class="rounded-lg border border-[var(--line)] p-2"><div><b>{item.profile}</b> · {item.ready ? 'dapat mengirim' : `gagal (${item.error_code || 'VERIFICATION_FAILED'})`}</div>{#if !item.ready && item.error_message}<p class="mt-1 text-rose-700 dark:text-rose-300">{item.error_message}</p>{/if}{#if item.command_attempted === false}<span class="muted block text-xs">Perintah TDL tidak dijalankan karena sesi tidak tersedia.</span>{:else if item.command_attempted === true}<span class="muted block text-xs">Perintah TDL dijalankan dengan lane Export profil ini.</span>{/if}</li>{/each}</ul>{:else}<p class="muted mt-2 text-sm">Belum ada hasil pemeriksaan profil. Tekan Muat status untuk mengambil hasil terbaru.</p>{/if}
+  {#if tdlAccessProfiles.length}<ul class="mt-2 grid gap-2 text-sm sm:grid-cols-2">{#each tdlAccessProfiles as item}<li class="rounded-lg border border-[var(--line)] p-2"><div><b>{item.profile}</b> · {item.ready ? 'dapat mengirim' : `gagal (${item.error_code || 'VERIFICATION_FAILED'})`}</div>{#if !item.ready && item.error_message}<p class="mt-1 text-rose-700 dark:text-rose-300">{item.error_message}</p>{/if}{#if item.command_attempted === false}<span class="muted block text-xs">Perintah TDL tidak dijalankan karena sesi tidak tersedia.</span>{:else if item.command_attempted === true}<span class="muted block text-xs">Perintah TDL dijalankan dengan lane {item.session === 'upload' || (!item.session && tdlAccessSession === 'upload') ? 'Upload' : 'Export'} profil ini.</span>{/if}</li>{/each}</ul>{:else}<p class="muted mt-2 text-sm">Belum ada hasil pemeriksaan profil. Tekan Muat status untuk mengambil hasil terbaru.</p>{/if}
   {#if tdlAccessError}<p role="alert" class="mt-2 text-sm text-rose-600">{tdlAccessError}</p>{/if}
 </section>
 
@@ -459,7 +465,7 @@
   </div>
 </section>
 
-<JobTable kind="storage_upload" title="Transfer upload"/>
+<JobTable kind="storage_upload" title="Transfer upload" retryable={true}/>
 
 {#if detail}
   {@const DetailIcon=iconFor(detail)}

@@ -101,8 +101,17 @@ def build_execution_plan(
         keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
         sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
         for sender_profile in sender_profiles:
-            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
+            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         lane = "tdl-storage"
+    elif kind == "storage_reconcile":
+        keys = {
+            f"worker:{worker}:kind:storage_reconcile",
+            f"worker:{worker}:tdl:storage",
+        }
+        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+        for sender_profile in sender_profiles:
+            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+        lane = "tdl-storage-reconcile"
     elif kind == "tts":
         # Keep one end-to-end TTS job per worker, including Telegram delivery.
         # Different workers remain independent and can each use three routes.
@@ -114,8 +123,9 @@ def build_execution_plan(
     elif kind == "tdl_access_verify":
         keys = {f"worker:{worker}:kind:tdl_access_verify"}
         candidate_profiles = payload.get("candidate_profiles") or profiles
+        lane = "upload" if str(payload.get("purpose") or "") == "storage" else "export"
         for candidate_profile in candidate_profiles:
-            keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:export")
+            keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:{lane}")
         lane = "tdl-access-verification"
     elif kind == "safelink_resolve":
         # The HTTP resolver addon exposes one active resolution slot per worker.
@@ -175,5 +185,9 @@ def build_execution_plan(
             else f"profile:{profile}:worker:{worker}:kind:{kind}"
         ),
         lane=lane,
-        priority=0 if payload.get("priority") == "next" else 100,
+        priority=(
+            0
+            if kind != "storage_upload" and payload.get("priority") == "next"
+            else 100
+        ),
     )

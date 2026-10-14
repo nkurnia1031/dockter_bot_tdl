@@ -1,21 +1,37 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { api, post } from '$lib/api';
   import { profileDiagnosticLabel } from '$lib/tdl-lanes';
-  import { CircleAlert, KeyRound, RefreshCw, ShieldCheck, UserRoundPlus } from '@lucide/svelte';
+  import { CircleAlert, KeyRound, RefreshCw, ShieldCheck, Trash2, UserRoundPlus } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; selected?: boolean };
   type ProfileCheck = { name: string; ready: boolean; code: string };
-  type LocalProfile = { name: string; ready: boolean; reason_codes: string[]; checks: ProfileCheck[] };
-  type Inventory = { worker: string; checked_at: string; items: LocalProfile[] };
+  type UploadLane = { status: string; phase: string; progress: number; code: string; updated_at: string };
+  type LocalProfile = { name: string; ready: boolean; deletable?: boolean; reason_codes: string[]; checks: ProfileCheck[]; upload_lane: UploadLane };
+  type IdentityCleanup = { profile: string; status: string; deleted_worker: string; updated_at: string };
+  type Inventory = { worker: string; checked_at: string; items: LocalProfile[]; pending_identity_cleanup?: IdentityCleanup[] };
+  type DeleteOperation = {
+    operation_id: string;
+    kind: string;
+    target: { profile?: string; worker?: string };
+    status: string;
+    phase: string;
+    progress: Record<string, unknown>;
+    error?: { code?: string; message?: string } | null;
+    created_at: string;
+  };
 
   let workers = $state<Worker[]>([]);
   let selectedWorker = $state('');
   let inventory = $state<Inventory | null>(null);
+  let deleteOperations = $state<DeleteOperation[]>([]);
   let loadingWorkers = $state(false);
   let scanning = $state(false);
   let failure = $state('');
   let notice = $state('');
+  let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  let progressRequestActive = false;
+  let progressGeneration = 0;
 
   const codeMessages: Record<string, string> = {
     PROFILE_IDENTITY_MISSING: 'File identitas tidak ditemukan.',
@@ -28,7 +44,32 @@
     PROFILE_SESSION_UNSAFE: 'Sesi berisi path yang tidak aman.',
     PROFILE_SESSION_UNREADABLE: 'Data sesi tidak dapat dibaca.',
     PROFILE_SESSION_BUSY: 'Sesi sedang dipakai job.',
-    PROFILE_SESSION_UNAVAILABLE: 'Pemeriksaan sesi tidak tersedia.'
+    PROFILE_SESSION_UNAVAILABLE: 'Pemeriksaan sesi tidak tersedia.',
+    PROFILE_EXPORT_SESSION_MISSING: 'Sesi Export tidak ditemukan.',
+    PROFILE_EXPORT_SESSION_UNSAFE: 'Sesi Export memiliki file yang tidak aman.',
+    PROFILE_EXPORT_SESSION_INVALID: 'TDL tidak dapat memakai sesi Export.',
+    PROFILE_EXPORT_IDENTITY_MISMATCH: 'Identitas sesi Export tidak cocok dengan profil.',
+    PROFILE_UPLOAD_LANE_UNSAFE: 'Folder lane Upload tidak aman.',
+    PROFILE_UPLOAD_SESSION_INVALID: 'TDL tidak dapat memakai salinan sesi Upload.',
+    PROFILE_UPLOAD_IDENTITY_MISMATCH: 'Identitas sesi Upload tidak cocok dengan profil.',
+    PROFILE_DEFAULT_PROTECTED: 'Profil default tidak dapat dihapus.',
+    PROFILE_ROOT_UNSAFE: 'Folder profil menggunakan path yang tidak aman; tidak ada data dihapus.',
+    PROFILE_DELETE_FAILED: 'Penghapusan gagal. Periksa worker dan scan kembali sebelum mencoba lagi.',
+    PROFILE_UPLOAD_PREPARATION_FAILED: 'Worker gagal menyiapkan lane Upload. Tekan Scan untuk mencoba lagi.',
+    PROFILE_UPLOAD_PREPARATION_INTERRUPTED: 'Pemeriksaan lane Upload belum selesai. Tekan Scan untuk mencoba lagi.',
+    WORKER_UPDATE_REQUIRED: 'Worker perlu diperbarui untuk menyiapkan lane Upload.'
+  };
+
+  const uploadPhaseLabels: Record<string, string> = {
+    not_started: 'Belum diperiksa',
+    queued: 'Dalam antrean',
+    waiting_idle: 'Menunggu semua job TDL selesai',
+    validating_source: 'Memeriksa sesi Export',
+    copying: 'Menyalin sesi ke lane Upload',
+    validating_upload: 'Memvalidasi sesi Upload',
+    installing: 'Memasang lane Upload',
+    ready: 'Siap',
+    failed: 'Gagal'
   };
 
   function codeMessage(code: string) {
@@ -58,13 +99,16 @@
   }
 
   function selectWorker(value: string) {
+    stopProgressRefresh();
     selectedWorker = value;
     inventory = null;
+    deleteOperations = [];
     failure = '';
     notice = '';
   }
 
   function refreshWorkers() {
+    stopProgressRefresh();
     inventory = null;
     failure = '';
     notice = selectedWorker
@@ -75,20 +119,28 @@
 
   async function scanProfiles() {
     if (!selectedWorker || scanning) return;
+    stopProgressRefresh();
+    const worker = selectedWorker;
+    const generation = progressGeneration;
     scanning = true;
     failure = '';
     notice = '';
     inventory = null;
     try {
-      inventory = await post<Inventory>(
-        `/workers/${encodeURIComponent(selectedWorker)}/profiles/scan`
+      const result = await post<Inventory>(
+        `/workers/${encodeURIComponent(worker)}/profiles/scan`
       );
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
+      inventory = result;
+      await refreshDeleteOperations(worker, generation);
+      scheduleProgressRefresh();
     } catch (cause) {
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
       const error = cause as { code?: string; message?: string };
       if (error.code === 'WORKER_UNAVAILABLE') {
-        failure = `Worker ${selectedWorker} sedang offline atau tidak dapat dijangkau. Coba Scan lagi setelah worker tersedia.`;
+        failure = `Worker ${worker} sedang offline atau tidak dapat dijangkau. Coba Scan lagi setelah worker tersedia.`;
       } else if (error.code === 'WORKER_UPDATE_REQUIRED') {
-        failure = `Worker ${selectedWorker} perlu diperbarui agar scan profil lokal tersedia.`;
+        failure = `Worker ${worker} perlu diperbarui agar scan profil lokal tersedia.`;
       } else {
         failure = error.message || 'Scan profil lokal gagal. Coba lagi.';
       }
@@ -97,9 +149,128 @@
     }
   }
 
+  function stopProgressRefresh() {
+    progressGeneration += 1;
+    if (progressTimer !== undefined) clearTimeout(progressTimer);
+    progressTimer = undefined;
+  }
+
+  function scheduleProgressRefresh() {
+    stopProgressRefresh();
+    if (!inventory?.items.some((profile) => profile.upload_lane?.status === 'running') && !deleteOperations.some(isDeleteActive)) return;
+    progressTimer = setTimeout(() => void refreshProgress(), 1500);
+  }
+
+  function isDeleteActive(operation: DeleteOperation) {
+    return ['queued', 'running', 'waiting_worker', 'paused', 'cancelling'].includes(operation.status);
+  }
+
+  function deletionIsActive(profile: string) {
+    return deleteOperations.some((operation) => operation.target.worker === selectedWorker
+      && operation.target.profile === profile && isDeleteActive(operation));
+  }
+
+  async function refreshDeleteOperations(worker: string, generation = progressGeneration) {
+    try {
+      const result = await api<{ items: DeleteOperation[] }>('/operations?limit=100');
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
+      const previous = deleteOperations;
+      deleteOperations = (Array.isArray(result.items) ? result.items : [])
+        .filter((operation) => operation.kind === 'profile.local_delete' && operation.target.worker === worker)
+        .sort((left, right) => right.created_at.localeCompare(left.created_at))
+        .slice(0, 10);
+      const completed = deleteOperations.filter((operation) => operation.status === 'succeeded'
+        && previous.some((before) => before.operation_id === operation.operation_id && isDeleteActive(before)));
+      for (const operation of completed) {
+        const profile = String(operation.target.profile || '');
+        if (inventory && inventory.worker === worker && profile) {
+          inventory = { ...inventory, items: inventory.items.filter((item) => item.name !== profile) };
+        }
+      }
+    } catch {
+      // Inventory remains useful even if operation history is temporarily unavailable.
+    }
+  }
+
+  function deleteStatusLabel(status: string) {
+    return ({
+      queued: 'Menunggu diproses',
+      running: 'Sedang menghapus',
+      waiting_worker: 'Menunggu worker online',
+      succeeded: 'Berhasil',
+      failed: 'Gagal',
+      cancelled: 'Dibatalkan'
+    } as Record<string, string>)[status] || status;
+  }
+
+  function identityCleanupLabel(status: unknown) {
+    return ({
+      removed: 'Mapping identitas dihapus setelah semua worker terverifikasi.',
+      local_copy_remaining: 'Mapping identitas dipertahankan karena masih ada salinan di worker lain.',
+      pending_recheck: 'Mapping identitas dipertahankan; inventaris worker lain menunggu pemeriksaan ulang.'
+    } as Record<string, string>)[String(status || '')] || '';
+  }
+
+  function newIdempotencyKey() {
+    return globalThis.crypto?.randomUUID?.()
+      || `profile-delete-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
+  async function deleteProfile(profile: LocalProfile) {
+    const worker = selectedWorker;
+    if (!worker || !profile.deletable || deletionIsActive(profile.name)) return;
+    if (typeof window !== 'undefined' && !window.confirm(`Hapus seluruh data profil "${profile.name}" dari worker "${worker}"? Bundle Vault tidak ikut dihapus.`)) return;
+    failure = '';
+    notice = '';
+    try {
+      const operation = await api<DeleteOperation>(
+        `/workers/${encodeURIComponent(worker)}/profiles/local/${encodeURIComponent(profile.name)}`,
+        { method: 'DELETE', headers: { 'Idempotency-Key': newIdempotencyKey() } }
+      );
+      deleteOperations = [operation, ...deleteOperations.filter((item) => item.operation_id !== operation.operation_id)];
+      notice = `Penghapusan profil ${profile.name} pada worker ${worker} tercatat dan dapat dipantau setelah halaman dibuka ulang.`;
+      scheduleProgressRefresh();
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Penghapusan profil ${profile.name} gagal.`;
+    }
+  }
+
+  async function refreshProgress() {
+    if (!selectedWorker || !inventory || scanning) return;
+    if (progressRequestActive) {
+      progressTimer = setTimeout(() => void refreshProgress(), 250);
+      return;
+    }
+    const worker = selectedWorker;
+    const generation = progressGeneration;
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+      progressTimer = setTimeout(() => void refreshProgress(), 4000);
+      return;
+    }
+    progressRequestActive = true;
+    try {
+      const result = await api<Inventory>(`/workers/${encodeURIComponent(worker)}/profiles/local`);
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
+      inventory = result;
+      await refreshDeleteOperations(worker, generation);
+      failure = '';
+      scheduleProgressRefresh();
+    } catch (cause) {
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
+      failure = cause instanceof Error
+        ? `${cause.message} Status lane Upload berhenti diperbarui; tekan Scan untuk mencoba lagi.`
+        : 'Status lane Upload tidak dapat dimuat. Tekan Scan untuk mencoba lagi.';
+      stopProgressRefresh();
+    } finally {
+      progressRequestActive = false;
+    }
+  }
+
   onMount(() => {
     void loadWorkers();
   });
+
+  onDestroy(stopProgressRefresh);
 </script>
 
 <svelte:head><title>Profil lokal · tme3</title></svelte:head>
@@ -145,12 +316,42 @@
   </div>
   <p class="muted mt-3 flex items-start gap-2 text-xs">
     <ShieldCheck size={15} class="mt-0.5 shrink-0"/>
-    Scan membaca snapshot lokal worker setelah tombol ditekan. Hasil tidak diperbarui otomatis; scan ulang untuk memeriksa kondisi terbaru.
+    Scan memeriksa profil lokal dan menyiapkan lane Upload terpisah dari sesi Export. Penyiapan menunggu job TDL selesai dan dapat dipantau sampai siap.
   </p>
   {#if notice}
     <p class="mt-3 text-sm text-violet-700 dark:text-violet-200" role="status">{notice}</p>
   {/if}
+  {#if inventory?.pending_identity_cleanup?.length}
+    <div class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100" role="status">
+      {#each inventory.pending_identity_cleanup as item (item.profile)}
+        <p>Mapping identitas profil {item.profile} menunggu pemeriksaan ulang semua worker setelah penghapusan pada {item.deleted_worker}.</p>
+      {/each}
+    </div>
+  {/if}
 </section>
+
+{#if selectedWorker && deleteOperations.length}
+  <section class="card mt-5 p-5 sm:p-6" aria-label="Operasi penghapusan profil">
+    <h2 class="font-extrabold">Operasi penghapusan · {selectedWorker}</h2>
+    <div class="mt-3 grid gap-2">
+      {#each deleteOperations as operation (operation.operation_id)}
+        {@const mappingMessage = identityCleanupLabel(operation.progress?.identity_mapping_status)}
+        <article class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3" aria-label={`Penghapusan ${operation.target.profile || 'profil'}`}>
+          <div class="flex flex-wrap items-center justify-between gap-2 text-sm">
+            <span class="font-bold">{operation.target.profile}</span>
+            <span class={operation.status === 'failed' ? 'font-bold text-rose-600' : operation.status === 'succeeded' ? 'font-bold text-emerald-600' : 'muted font-bold'}>{deleteStatusLabel(operation.status)}</span>
+          </div>
+          {#if operation.status === 'failed'}
+            <p class="mt-1 text-xs text-rose-600">{codeMessage(String(operation.progress?.reason_code || operation.error?.code || 'PROFILE_DELETE_FAILED'))}</p>
+          {/if}
+          {#if mappingMessage}
+            <p class="muted mt-1 text-xs">{mappingMessage}</p>
+          {/if}
+        </article>
+      {/each}
+    </div>
+  </section>
+{/if}
 
 {#if inventory}
   <section class="card mt-5 p-5 sm:p-6" aria-label="Hasil scan profil lokal">
@@ -170,9 +371,16 @@
           <article class="rounded-2xl border border-[var(--line)] bg-[var(--panel-strong)] p-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <h3 class="font-extrabold">{profile.name}</h3>
-              <span class={profile.ready ? 'text-sm font-bold text-emerald-600' : 'text-sm font-bold text-rose-600'}>
-                {profile.ready ? 'Sesi tersedia' : 'Perlu diperiksa'}
-              </span>
+              <div class="flex items-center gap-2">
+                <span class={profile.ready ? 'text-sm font-bold text-emerald-600' : 'text-sm font-bold text-rose-600'}>
+                  {profile.ready ? 'Sesi tersedia' : 'Perlu diperiksa'}
+                </span>
+                {#if profile.deletable}
+                  <button class="button secondary" onclick={() => deleteProfile(profile)} disabled={deletionIsActive(profile.name)} aria-label={`Hapus profil ${profile.name} dari ${selectedWorker}`}>
+                    <Trash2 size={15}/>{deletionIsActive(profile.name) ? 'Menghapus...' : 'Hapus profil'}
+                  </button>
+                {/if}
+              </div>
             </div>
             <div class="mt-3 grid gap-2 sm:grid-cols-3">
               {#each profile.checks as check (check.name)}
@@ -185,6 +393,24 @@
             {#if profile.reason_codes.length}
               <p class="mt-3 text-xs text-rose-600">Kode: {profile.reason_codes.join(', ')}</p>
             {/if}
+            <section class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3" aria-label={`Lane Upload ${profile.name}`}>
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <p class="text-sm font-bold">Lane Upload</p>
+                <span class={profile.upload_lane?.status === 'ready' ? 'text-sm font-bold text-emerald-600' : profile.upload_lane?.status === 'failed' ? 'text-sm font-bold text-rose-600' : 'muted text-sm font-bold'}>
+                  {profile.upload_lane?.status === 'ready' ? 'Siap' : profile.upload_lane?.status === 'failed' ? 'Gagal' : profile.upload_lane?.status === 'running' ? `${profile.upload_lane.progress}%` : 'Menunggu scan'}
+                </span>
+              </div>
+              {#if profile.upload_lane?.status === 'running'}
+                <progress class="mt-2 h-2 w-full accent-violet-500" max="100" value={profile.upload_lane.progress} aria-label={`Progress lane Upload ${profile.name}`}></progress>
+                <p class="muted mt-1 text-xs">{uploadPhaseLabels[profile.upload_lane.phase] || profile.upload_lane.phase}</p>
+              {:else if profile.upload_lane?.status === 'failed'}
+                <p class="mt-1 text-xs text-rose-600">{codeMessage(profile.upload_lane.code)}</p>
+              {:else if profile.upload_lane?.status === 'pending'}
+                <p class="muted mt-1 text-xs">{codeMessage(profile.upload_lane.code)}</p>
+              {:else if profile.upload_lane?.status === 'ready'}
+                <p class="muted mt-1 text-xs">Sesi Upload terpisah sudah tervalidasi dan cocok dengan identitas profil.</p>
+              {/if}
+            </section>
           </article>
         {/each}
       </div>

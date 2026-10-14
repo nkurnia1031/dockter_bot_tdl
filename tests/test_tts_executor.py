@@ -81,6 +81,13 @@ class _Executor(TtsExecutorMixin):
     def available_storage_profiles(self):
         return ["default"]
 
+    def available_storage_session_fingerprints(self, profiles=None):
+        del profiles
+        return {}
+
+    def available_export_profiles(self):
+        return ["default"]
+
     def available_download_profiles(self):
         return ["default"]
 

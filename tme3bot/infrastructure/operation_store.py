@@ -275,6 +275,23 @@ class SqliteOperationStore:
             row = db.execute("SELECT id FROM operations WHERE job_id=? ORDER BY created_at DESC LIMIT 1", (job_id,)).fetchone()
             return self._get_in_transaction(db, str(row["id"])) if row else None
 
+    def active_profile_local_deletions(self) -> set[tuple[str, str]]:
+        with self.jobs._db() as db:
+            rows = db.execute(
+                "SELECT target_json FROM operations WHERE kind='profile.local_delete' "
+                "AND status NOT IN ('succeeded', 'failed', 'cancelled')"
+            ).fetchall()
+        pairs: set[tuple[str, str]] = set()
+        for row in rows:
+            target = _load(row["target_json"], {})
+            if not isinstance(target, dict):
+                continue
+            profile = str(target.get("profile") or "").strip().lower()
+            worker = str(target.get("worker") or "").strip().lower()
+            if profile and worker:
+                pairs.add((profile, worker))
+        return pairs
+
     def list_for_actor(
         self, actor_user_id: int, *, status: str | None, offset: int, limit: int
     ) -> tuple[list[Operation], bool]:

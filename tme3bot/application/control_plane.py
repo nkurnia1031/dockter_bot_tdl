@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import secrets
+import json
 import uuid
 import logging
 import re
@@ -27,6 +28,10 @@ from tme3bot.domain.worker_contract import (
     require_worker_contract,
 )
 from tme3bot.chat_refs import normalize_tdl_chat_ref
+from tme3bot.tdl_access_fingerprint import (
+    normalize_profiles,
+    normalize_session_fingerprints,
+)
 from tme3bot.url_parser import parse_tme3_url
 from tme3bot.utility import DEFAULT_UTILITY_SETTINGS
 from tme3bot.safelink import normalize_shortlink_url
@@ -141,6 +146,42 @@ class ControlPlane:
             )
         return selected_profile, selected_worker
 
+    def _assert_profile_admission(
+        self,
+        kind: str,
+        profile: str,
+        worker: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        if kind not in {
+            "export", "leave", "download", "download_clear_failed",
+            "storage_upload", "storage_reconcile", "tts",
+            "tdl_access_verify", "backup_verify", "backup_node",
+        }:
+            return
+        registry = getattr(self.profile_manager, "profile_registry", None)
+        check = getattr(registry, "local_deletion_active", None)
+        if not callable(check):
+            return
+        values = payload if isinstance(payload, dict) else {}
+        candidates = [profile]
+        if kind in {"storage_upload", "storage_reconcile", "tts"}:
+            candidates = values.get("_tdl_sender_profiles") or candidates
+        elif kind == "tdl_access_verify":
+            candidates = values.get("candidate_profiles") or candidates
+        elif kind == "backup_node":
+            list_profiles = getattr(self.profile_manager, "list_profiles", None)
+            candidates = list_profiles() if callable(list_profiles) else candidates
+        for candidate in candidates:
+            normalized = str(candidate or "").strip().lower()
+            if normalized and check(normalized, worker):
+                raise DomainError(
+                    "PROFILE_DELETION_IN_PROGRESS",
+                    f"Profil {normalized} sedang dihapus dari worker {worker}; job TDL baru ditahan.",
+                    status_code=409,
+                    details={"profile": normalized, "worker": worker},
+                )
+
     def submit_job(
         self,
         actor: Actor,
@@ -165,9 +206,8 @@ class ControlPlane:
             if not target_chat:
                 raise DomainError("TTS_CHAT_UNAVAILABLE", "Chat tujuan TTS belum dikonfigurasi.", status_code=503)
             selected_worker = self._select_tts_worker(worker, destination=target_chat)
-            sender_profiles = self._tdl_access_candidates(selected_worker, "tts", target_chat)
-            execution_profile = self.choose_tdl_sender_profile(
-                selected_worker, "tts", destination=target_chat
+            execution_profile, sender_profiles, _session_fingerprints = self._tdl_access_sender_options(
+                selected_worker, "tts", target_chat
             )
             internal_payload.update(
                 _tdl_sender_profile=execution_profile,
@@ -178,23 +218,102 @@ class ControlPlane:
             _, selected_worker = self.resolve_target(
                 actor, profile=owner_profile, worker=worker
             )
-            target_chat = self._tdl_access_target("storage")
-            if not target_chat:
-                raise DomainError("TDL_ACCESS_TARGET_UNAVAILABLE", "Tujuan TDL Storage belum dikonfigurasi.", status_code=503)
-            sender_profiles = self._tdl_access_candidates(selected_worker, "storage", target_chat)
-            execution_profile = self.choose_tdl_sender_profile(
-                selected_worker, "storage", destination=target_chat
-            )
+            retry_source_id = str(internal_payload.get("_storage_retry_of") or "").strip()
+            retry_source = self.jobs.get(retry_source_id) if retry_source_id else None
+            if retry_source_id:
+                if (
+                    retry_source is None
+                    or retry_source.kind != "storage_upload"
+                    or retry_source.actor_user_id != actor.telegram_user_id
+                    or retry_source.profile != owner_profile
+                    or retry_source.worker != selected_worker
+                ):
+                    raise DomainError(
+                        "STORAGE_RETRY_SOURCE_INVALID",
+                        "Snapshot tujuan upload asli tidak dapat digunakan untuk Retry.",
+                        status_code=409,
+                    )
+                target_chat = str(
+                    self.private_job_value(retry_source.id, "tdl_storage_chat_ref") or ""
+                ).strip()
+                try:
+                    session_fingerprints = normalize_session_fingerprints(
+                        json.loads(
+                            self.private_job_value(
+                                retry_source.id, "tdl_sender_session_fingerprints"
+                            ) or "{}"
+                        )
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    session_fingerprints = {}
+                sender_profiles = list(session_fingerprints)
+                if not target_chat or not sender_profiles:
+                    raise DomainError(
+                        "STORAGE_RETRY_SNAPSHOT_UNAVAILABLE",
+                        "Snapshot tujuan atau sesi upload asli tidak tersedia.",
+                        status_code=409,
+                    )
+                execution_profile = sender_profiles[0]
+            else:
+                target_chat = self._tdl_access_target("storage")
+                if not target_chat:
+                    raise DomainError("TDL_ACCESS_TARGET_UNAVAILABLE", "Tujuan TDL Storage belum dikonfigurasi.", status_code=503)
+                execution_profile, sender_profiles, session_fingerprints = self._tdl_access_sender_options(
+                    selected_worker, "storage", target_chat
+                )
             internal_payload.update(
                 _tdl_sender_profile=execution_profile,
                 _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
+                _tdl_sender_session_fingerprints={
+                    profile: session_fingerprints[profile]
+                    for profile in sender_profiles
+                    if profile in session_fingerprints
+                },
             )
             private_values["tdl_storage_chat_ref"] = target_chat
+            private_values["tdl_sender_session_fingerprints"] = json.dumps(
+                internal_payload["_tdl_sender_session_fingerprints"],
+                separators=(",", ":"),
+            )
+        elif kind == "storage_reconcile":
+            _, selected_worker = self.resolve_target(
+                actor, profile=owner_profile, worker=worker
+            )
+            sender_profiles = [
+                str(item).strip().lower()
+                for item in internal_payload.get("_tdl_sender_profiles", [])
+                if str(item).strip()
+            ]
+            internal_payload["_tdl_sender_profiles"] = list(dict.fromkeys(sender_profiles))
+            internal_payload["_tdl_sender_profile"] = (
+                internal_payload["_tdl_sender_profiles"][0]
+                if internal_payload["_tdl_sender_profiles"]
+                else owner_profile
+            )
+            if not private_values.get("tdl_storage_chat_ref") or not private_values.get(
+                "tdl_sender_session_fingerprints"
+            ):
+                raise DomainError(
+                    "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
+                    "Snapshot tujuan dan sesi upload untuk rekonsiliasi tidak tersedia.",
+                    status_code=409,
+                )
         else:
             owner_profile, selected_worker = self.resolve_target(
                 actor, profile=owner_profile, worker=worker
             )
             execution_profile = owner_profile
+        if kind == "export" and bool(internal_payload.get("quick_mode")):
+            target_chat, session_fingerprints = self._quick_storage_access_snapshot(
+                selected_worker
+            )
+            private_values["tdl_storage_chat_ref"] = target_chat
+            private_values["tdl_sender_session_fingerprints"] = json.dumps(
+                session_fingerprints, separators=(",", ":")
+            )
+        self._assert_profile_admission(
+            kind, execution_profile, selected_worker, internal_payload
+        )
         if kind == "export" and self._shared_export_cursor_enabled():
             self._require_shared_export_cursor_worker(selected_worker)
         available_profiles = ()
@@ -401,6 +520,11 @@ class ControlPlane:
         payload = self._prepare_durable_payload(
             actor, kind, payload, owner_profile, selected_worker
         )
+        quick_storage_snapshot = None
+        if kind == "export" and bool(payload.get("quick_mode")):
+            quick_storage_snapshot = self._quick_storage_access_snapshot(
+                selected_worker
+            )
 
         private_job_values: dict[str, bytes] = {}
         if kind in {"tts", "storage_upload"}:
@@ -412,16 +536,19 @@ class ControlPlane:
                     f"Tujuan TDL {purpose} belum dikonfigurasi.",
                     status_code=503,
                 )
-            sender_profiles = self._tdl_access_candidates(
+            execution_profile, sender_profiles, session_fingerprints = self._tdl_access_sender_options(
                 selected_worker, purpose, destination
-            )
-            execution_profile = self.choose_tdl_sender_profile(
-                selected_worker, purpose, destination=destination
             )
             payload.update(
                 _tdl_sender_profile=execution_profile,
                 _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
             )
+            if purpose == "storage":
+                payload["_tdl_sender_session_fingerprints"] = {
+                    profile: session_fingerprints[profile]
+                    for profile in sender_profiles
+                    if profile in session_fingerprints
+                }
         elif kind == "tdl_access_verify":
             purpose = str(payload.get("purpose") or "")
             destination = self._tdl_access_target(purpose)
@@ -435,6 +562,10 @@ class ControlPlane:
                     f"Tujuan TDL {purpose} belum dikonfigurasi.",
                     status_code=503,
                 )
+
+        self._assert_profile_admission(
+            kind, execution_profile, selected_worker, payload
+        )
 
         job_id = str(uuid.uuid4())
         if kind == "export" and bool(payload.get("quick_mode")):
@@ -503,8 +634,23 @@ class ControlPlane:
             purpose = "tts" if kind == "tts" else "storage"
             destination = self._tdl_access_target(purpose)
             private_key = "telegram_tts_chat_id" if purpose == "tts" else "tdl_storage_chat_ref"
+            private_values = {private_key: destination}
+            if purpose == "storage":
+                private_values["tdl_sender_session_fingerprints"] = json.dumps(
+                    payload.get("_tdl_sender_session_fingerprints") or {},
+                    separators=(",", ":"),
+                )
+            private_job_values = self._encrypt_private_job_values(job_id, private_values)
+        elif quick_storage_snapshot is not None:
+            destination, session_fingerprints = quick_storage_snapshot
             private_job_values = self._encrypt_private_job_values(
-                job_id, {private_key: destination}
+                job_id,
+                {
+                    "tdl_storage_chat_ref": destination,
+                    "tdl_sender_session_fingerprints": json.dumps(
+                        session_fingerprints, separators=(",", ":")
+                    ),
+                },
             )
         return PreparedOperation(
             profile=owner_profile,
@@ -825,25 +971,111 @@ class ControlPlane:
     def _tdl_access_candidates(
         self, worker: str, purpose: str, destination: str
     ) -> list[str]:
+        context = self._tdl_access_worker_context(worker, purpose, destination)
+        return context[0] if context is not None else []
+
+    def _tdl_access_worker_context(
+        self, worker: str, purpose: str, destination: str
+    ) -> tuple[list[str], dict[str, str] | None, str, str] | None:
         store = self.tdl_access_store
         checker = getattr(self.dispatcher, "capabilities", None)
         if store is None or not callable(checker) or not destination:
-            return []
+            return None
         try:
             capabilities = checker(worker)
         except Exception:
-            return []
+            return None
         if not isinstance(capabilities, dict):
-            return []
+            return None
+        profiles, session_fingerprints = self._tdl_access_inventory(capabilities, purpose)
+        destination_hash = store.destination_fingerprint(destination)
+        inventory_hash = store.inventory_fingerprint(profiles, session_fingerprints)
+        candidates = store.verified_profiles(
+            worker,
+            purpose,
+            destination_hash,
+            inventory_hash,
+            session_fingerprints=session_fingerprints,
+        )
+        return candidates, session_fingerprints, destination_hash, inventory_hash
+
+    def _tdl_access_sender_options(
+        self, worker: str, purpose: str, destination: str
+    ) -> tuple[str, list[str], dict[str, str] | None]:
+        store = self.tdl_access_store
+        if not destination or store is None:
+            raise DomainError(
+                "TDL_ACCESS_NOT_VERIFIED",
+                "Verifikasi akses kirim TDL untuk worker dan tujuan ini terlebih dahulu.",
+                status_code=409,
+            )
+        context = self._tdl_access_worker_context(worker, purpose, destination)
+        if context is None:
+            raise DomainError(
+                "WORKER_OFFLINE",
+                f"Worker {worker} tidak dapat diperiksa.",
+                status_code=503,
+            )
+        candidates, session_fingerprints, destination_hash, inventory_hash = context
+        selected = store.choose_next(
+            worker,
+            purpose,
+            destination_hash,
+            inventory_hash,
+            session_fingerprints=session_fingerprints,
+        )
+        if selected:
+            return selected, candidates, session_fingerprints
+        raise DomainError(
+            "TDL_ACCESS_NOT_VERIFIED",
+            "Belum ada profil di worker ini yang terverifikasi dapat mengirim ke tujuan. Jalankan verifikasi akses TDL.",
+            status_code=409,
+            details={"worker": worker, "purpose": purpose},
+        )
+
+    def _quick_storage_access_snapshot(self, worker: str) -> tuple[str, dict[str, str]]:
+        """Pin Quick Mode's Telegram upload target and verified Upload lanes."""
+        destination = self._tdl_access_target("storage")
+        if not destination:
+            raise DomainError(
+                "TDL_ACCESS_TARGET_UNAVAILABLE",
+                "Tujuan TDL Storage belum dikonfigurasi.",
+                status_code=503,
+            )
+        _selected, profiles, fingerprints = self._tdl_access_sender_options(
+            worker, "storage", destination
+        )
+        normalized = normalize_session_fingerprints(fingerprints)
+        selected_fingerprints = {
+            profile: normalized[profile]
+            for profile in profiles
+            if profile in normalized
+        }
+        if not selected_fingerprints:
+            raise DomainError(
+                "TDL_ACCESS_NOT_VERIFIED",
+                "Belum ada sesi Upload terverifikasi untuk Quick Mode.",
+                status_code=409,
+                details={"worker": worker, "purpose": "storage"},
+            )
+        return destination, selected_fingerprints
+
+    def _tdl_access_inventory(
+        self, capabilities: dict[str, Any], purpose: str
+    ) -> tuple[list[str], dict[str, str] | None]:
+        if purpose == "storage":
+            profiles = normalize_profiles(capabilities.get("available_storage_profiles"))
+            fingerprints = normalize_session_fingerprints(
+                capabilities.get("storage_upload_fingerprints")
+            )
+            return [profile for profile in profiles if profile in fingerprints], fingerprints
+
         raw_profiles = capabilities.get("export_profiles")
         if not isinstance(raw_profiles, list):
             raw_profiles = capabilities.get("available_storage_profiles")
         if not isinstance(raw_profiles, list):
             raw_profiles = capabilities.get("profiles", [])
-        profiles = sorted({str(item).strip().lower() for item in raw_profiles if str(item).strip()})
-        destination_hash = store.destination_fingerprint(destination)
-        inventory_hash = store.inventory_fingerprint(profiles)
-        return store.verified_profiles(worker, purpose, destination_hash, inventory_hash)
+        return normalize_profiles(raw_profiles), None
 
     def tdl_access_verification_status(self, worker: str, purpose: str) -> dict[str, Any]:
         purpose = str(purpose or "").strip().lower()
@@ -859,18 +1091,22 @@ class ControlPlane:
         except Exception as exc:
             raise DomainError("WORKER_OFFLINE", f"Worker {worker} tidak dapat diperiksa.", status_code=503) from exc
         capabilities = capabilities if isinstance(capabilities, dict) else {}
-        raw_profiles = capabilities.get("export_profiles")
-        if not isinstance(raw_profiles, list):
-            raw_profiles = capabilities.get("available_storage_profiles")
-        if not isinstance(raw_profiles, list):
-            raw_profiles = capabilities.get("profiles", [])
-        profiles = sorted({str(item).strip().lower() for item in raw_profiles if str(item).strip()})
+        profiles, session_fingerprints = self._tdl_access_inventory(capabilities, purpose)
         destination_hash = self.tdl_access_store.destination_fingerprint(target)
-        inventory_hash = self.tdl_access_store.inventory_fingerprint(profiles)
-        results = self.tdl_access_store.snapshot(worker, purpose, destination_hash, inventory_hash)
+        inventory_hash = self.tdl_access_store.inventory_fingerprint(
+            profiles, session_fingerprints
+        )
+        results = self.tdl_access_store.snapshot(
+            worker,
+            purpose,
+            destination_hash,
+            inventory_hash,
+            session_fingerprints=session_fingerprints,
+        )
         return {
             "worker": worker,
             "purpose": purpose,
+            "session": "upload" if purpose == "storage" else "export",
             "verified_profiles": [str(item["profile"]) for item in results if item["ready"]],
             "profiles": results,
             "inventory_hash": inventory_hash,
@@ -881,36 +1117,10 @@ class ControlPlane:
         self, worker: str, purpose: str, *, destination: str | None = None
     ) -> str:
         target = str(destination or self._tdl_access_target(purpose)).strip()
-        store = self.tdl_access_store
-        if not target or store is None:
-            raise DomainError(
-                "TDL_ACCESS_NOT_VERIFIED",
-                "Verifikasi akses kirim TDL untuk worker dan tujuan ini terlebih dahulu.",
-                status_code=409,
-            )
-        checker = getattr(self.dispatcher, "capabilities", None)
-        try:
-            capabilities = checker(worker) if callable(checker) else {}
-        except Exception as exc:
-            raise DomainError("WORKER_OFFLINE", f"Worker {worker} tidak dapat diperiksa.", status_code=503) from exc
-        capabilities = capabilities if isinstance(capabilities, dict) else {}
-        raw_profiles = capabilities.get("export_profiles")
-        if not isinstance(raw_profiles, list):
-            raw_profiles = capabilities.get("available_storage_profiles")
-        if not isinstance(raw_profiles, list):
-            raw_profiles = capabilities.get("profiles", [])
-        profiles = sorted({str(item).strip().lower() for item in raw_profiles if str(item).strip()})
-        destination_hash = store.destination_fingerprint(target)
-        inventory_hash = store.inventory_fingerprint(profiles)
-        selected = store.choose_next(worker, purpose, destination_hash, inventory_hash)
-        if selected:
-            return selected
-        raise DomainError(
-            "TDL_ACCESS_NOT_VERIFIED",
-            "Belum ada profil di worker ini yang terverifikasi dapat mengirim ke tujuan. Jalankan verifikasi akses TDL.",
-            status_code=409,
-            details={"worker": worker, "purpose": purpose},
+        selected, _candidates, _fingerprints = self._tdl_access_sender_options(
+            worker, purpose, target
         )
+        return selected
 
     def _encrypt_private_job_values(
         self, job_id: str, values: dict[str, str]
@@ -926,7 +1136,7 @@ class ControlPlane:
             )
         result: dict[str, bytes] = {}
         for key, value in values.items():
-            if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref", "backup_archive_password"} or not isinstance(value, str) or not value.strip():
+            if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref", "tdl_sender_session_fingerprints", "backup_archive_password"} or not isinstance(value, str) or not value.strip():
                 raise DomainError(
                     "JOB_PRIVATE_VALUE_INVALID",
                     "Snapshot privat job tidak valid.",
@@ -1372,20 +1582,47 @@ class ControlPlane:
         if kind == "backup_verify":
             password = self.private_job_value(job_id, "backup_archive_password")
             return {**payload, **({"password": password} if password else {})}
-        if kind in {"tts", "storage_upload"}:
+        if kind in {"tts", "storage_upload", "storage_reconcile"}:
             key = "telegram_tts_chat_id" if kind == "tts" else "tdl_storage_chat_ref"
             target = self.private_job_value(job_id, key)
-            if target:
-                return {**payload, "tdl_access_target": target}
-            return payload
+            result = {**payload, **({"tdl_access_target": target} if target else {})}
+            if kind in {"storage_upload", "storage_reconcile"}:
+                raw_fingerprints = self.private_job_value(
+                    job_id, "tdl_sender_session_fingerprints"
+                )
+                try:
+                    fingerprints = normalize_session_fingerprints(
+                        json.loads(raw_fingerprints or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    fingerprints = {}
+                result["_tdl_sender_session_fingerprints"] = fingerprints
+            return result
         if kind != "export":
             return payload
+        result = dict(payload)
+        if bool(payload.get("quick_mode")):
+            target = self.private_job_value(job_id, "tdl_storage_chat_ref")
+            try:
+                raw_fingerprints = self.private_job_value(
+                    job_id, "tdl_sender_session_fingerprints"
+                )
+                fingerprints = normalize_session_fingerprints(
+                    json.loads(raw_fingerprints or "{}")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                fingerprints = {}
+            result.update(
+                _quick_storage_tdl_access_target=target or "",
+                _quick_storage_sender_profiles=list(fingerprints),
+                _quick_storage_sender_session_fingerprints=fingerprints,
+            )
         cursor_active = self._shared_export_cursor_enabled()
         if not cursor_active and self.export_cursor_service is not None:
             cursor_active = self.export_cursor_service.job_has_active_lease(job_id)
         if not cursor_active:
-            return payload
-        return {**payload, "_shared_export_cursor": True}
+            return result
+        return {**result, "_shared_export_cursor": True}
 
     def start_scheduler(self) -> None:
         """Resume queued commands after backend restart or terminal events."""
@@ -1978,6 +2215,51 @@ class ControlPlane:
                 "Job masih aktif dan belum dapat diulang.",
                 status_code=409,
             )
+        if original.kind == "storage_upload":
+            result_value = (
+                original.result.get("value", original.result)
+                if isinstance(original.result, dict)
+                else {}
+            )
+            file_items = result_value.get("items") if isinstance(result_value, dict) else []
+            file_items = file_items if isinstance(file_items, list) else []
+            retry_paths: dict[str, int] = {}
+            for item in file_items:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("status") not in {"failed", "pending"} or item.get("retryable") is not True:
+                    continue
+                raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+                path = PurePosixPath(raw_path)
+                if (
+                    not raw_path
+                    or path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in path.parts)
+                    or path.as_posix() != raw_path
+                ):
+                    continue
+                try:
+                    retry_paths[raw_path] = max(0, int(item.get("attempt") or 0))
+                except (TypeError, ValueError):
+                    retry_paths[raw_path] = 0
+            if not retry_paths:
+                raise DomainError(
+                    "STORAGE_RETRY_UNAVAILABLE",
+                    "Tidak ada file yang dipastikan belum diterima Telegram. File ambigu harus direkonsiliasi sebelum Retry.",
+                    status_code=409,
+                )
+            payload = deepcopy(original.payload)
+            payload["batch_id"] = str(uuid.uuid4())
+            payload["_storage_retry_paths"] = sorted(retry_paths)
+            payload["_storage_file_attempts"] = retry_paths
+            payload["_storage_retry_of"] = original.id
+            return self.submit_job(
+                actor,
+                "storage_upload",
+                payload,
+                profile=original.profile,
+                worker=original.worker,
+            )
         if original.kind != "export":
             raise DomainError(
                 "EXPORT_REQUIRED",
@@ -2277,6 +2559,130 @@ class ControlPlane:
         # running process.
         return self.jobs.get(job.id) or job
 
+    def reconcile_storage_upload(self, actor: Actor, job_id: str) -> Job:
+        """Queue a read-only caption scan for ambiguous files in one upload job."""
+        original = self.jobs.get(job_id)
+        if original is None:
+            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+        self.require_profile(actor, original.profile)
+        if original.kind != "storage_upload":
+            raise DomainError(
+                "STORAGE_UPLOAD_REQUIRED",
+                "Rekonsiliasi hanya tersedia untuk upload Storage.",
+                status_code=409,
+            )
+        if not original.status.terminal:
+            raise DomainError(
+                "JOB_NOT_TERMINAL",
+                "Upload masih aktif dan belum dapat direkonsiliasi.",
+                status_code=409,
+            )
+        current_result = original.result if isinstance(original.result, dict) else {}
+        result_value = current_result.get("value", current_result)
+        result_value = result_value if isinstance(result_value, dict) else {}
+        source_items = result_value.get("items")
+        source_items = source_items if isinstance(source_items, list) else []
+        ambiguous: list[dict[str, Any]] = []
+        profiles: list[str] = []
+        for index, item in enumerate(source_items):
+            if not isinstance(item, dict) or item.get("status") != "needs_reconciliation":
+                continue
+            raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+            path = PurePosixPath(raw_path)
+            if (
+                not raw_path
+                or path.is_absolute()
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.as_posix() != raw_path
+            ):
+                raise DomainError(
+                    "STORAGE_RECONCILIATION_ITEM_INVALID",
+                    "Checkpoint file untuk rekonsiliasi tidak valid.",
+                    status_code=409,
+                )
+            profile_name = str(item.get("profile") or "").strip().lower()
+            if profile_name:
+                profiles.append(profile_name)
+            ambiguous.append({
+                "index": index,
+                "path": raw_path,
+                "name": str(item.get("name") or path.name)[:255],
+                "profile": profile_name,
+            })
+        if not ambiguous:
+            raise DomainError(
+                "STORAGE_RECONCILIATION_UNAVAILABLE",
+                "Tidak ada file ambigu yang menunggu rekonsiliasi.",
+                status_code=409,
+            )
+
+        for candidate in self.jobs.list(
+            actor_user_id=actor.telegram_user_id,
+            profile=original.profile,
+            kind="storage_reconcile",
+            archived=False,
+            offset=0,
+            limit=1000,
+        ):
+            if (
+                not candidate.status.terminal
+                and candidate.worker == original.worker
+                and str(candidate.payload.get("source_job_id") or "") == original.id
+            ):
+                return candidate
+
+        target_chat = str(
+            self.private_job_value(original.id, "tdl_storage_chat_ref") or ""
+        ).strip()
+        raw_fingerprints = self.private_job_value(
+            original.id, "tdl_sender_session_fingerprints"
+        )
+        try:
+            fingerprints = normalize_session_fingerprints(
+                json.loads(raw_fingerprints or "{}")
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            fingerprints = {}
+        profiles = [
+            profile for profile in dict.fromkeys(profiles)
+            if fingerprints.get(profile)
+        ]
+        if not target_chat or not profiles:
+            raise DomainError(
+                "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
+                "Snapshot tujuan atau sesi upload untuk rekonsiliasi tidak tersedia.",
+                status_code=409,
+            )
+
+        created_at = original.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        start_timestamp = max(0, int(created_at.timestamp()))
+        end_timestamp = max(start_timestamp, int(datetime.now(timezone.utc).timestamp()))
+        payload = {
+            "source_job_id": original.id,
+            "start_timestamp": start_timestamp,
+            "end_timestamp": end_timestamp,
+            "_storage_reconcile_items": ambiguous,
+            "_tdl_sender_profile": profiles[0],
+            "_tdl_sender_profiles": profiles,
+        }
+        private_values = {
+            "tdl_storage_chat_ref": target_chat,
+            "tdl_sender_session_fingerprints": json.dumps(
+                {profile: fingerprints[profile] for profile in profiles},
+                separators=(",", ":"),
+            ),
+        }
+        return self.submit_job(
+            actor,
+            "storage_reconcile",
+            payload,
+            profile=original.profile,
+            worker=original.worker,
+            private_job_values=private_values,
+        )
+
     def pause_job(self, actor: Actor, job_id: str) -> Job:
         job = self.jobs.get(job_id)
         if job is None:
@@ -2352,6 +2758,8 @@ class ControlPlane:
     def _redacted_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:
         if kind == "safelink_resolve":
             return {"submitted": True}
+        if kind == "storage_reconcile":
+            return {"source_job_id": str(payload.get("source_job_id") or "")}
         if kind == "tdl_access_verify":
             return {"purpose": str(payload.get("purpose") or "")}
         if kind == "backup_verify":
@@ -2380,7 +2788,12 @@ class ControlPlane:
             return dict(payload)
         if kind == "export" and not bool(payload.get("quick_mode")):
             return dict(payload)
-        return _redact_secrets(payload)
+        public_payload = {
+            key: value
+            for key, value in payload.items()
+            if not str(key).startswith("_quick_storage_")
+        }
+        return _redact_secrets(public_payload)
 
     def _cancel_tts_deliveries(self, job_id: str) -> None:
         cancel = getattr(self.jobs, "cancel_tts_deliveries", None)
@@ -2391,6 +2804,8 @@ class ControlPlane:
         result = event.result or {}
         if isinstance(result, dict) and isinstance(result.get("value"), dict):
             result = result["value"]
+        if job.kind == "storage_reconcile" and event.status.terminal and isinstance(result, dict):
+            self._apply_storage_reconciliation_result(job, result)
         if job.kind == "tdl_access_verify" and event.status == JobStatus.SUCCEEDED:
             store = self.tdl_access_store
             command = self.jobs.command_payload(job.id)
@@ -2400,7 +2815,30 @@ class ControlPlane:
             destination_hash = str(payload.get("destination_hash") or "")
             inventory_hash = str(result.get("inventory_hash") or "")
             profiles = result.get("profiles")
-            if store is not None and purpose and destination_hash and inventory_hash and isinstance(profiles, list):
+            session_fingerprints = (
+                normalize_session_fingerprints(result.get("session_fingerprints"))
+                if purpose == "storage"
+                else None
+            )
+            inventory_matches = (
+                purpose != "storage"
+                or (
+                    session_fingerprints is not None
+                    and store is not None
+                    and store.inventory_fingerprint(
+                        list(session_fingerprints), session_fingerprints
+                    )
+                    == inventory_hash
+                )
+            )
+            if (
+                store is not None
+                and purpose
+                and destination_hash
+                and inventory_hash
+                and isinstance(profiles, list)
+                and inventory_matches
+            ):
                 try:
                     store.replace_results(
                         job.worker,
@@ -2408,11 +2846,46 @@ class ControlPlane:
                         destination_hash,
                         inventory_hash,
                         profiles,
+                        session_fingerprints=session_fingerprints,
                     )
                 except Exception:
                     logging.getLogger(__name__).exception(
                         "Could not persist TDL access verification for job %s", job.id
                     )
+        if (
+            job.kind == "storage_upload"
+            and event.event_type == "tdl_access.profile_denied"
+            and self.tdl_access_store is not None
+        ):
+            profile = normalize_profiles([result.get("profile")])
+            try:
+                raw_fingerprints = json.loads(
+                    self.private_job_value(job.id, "tdl_sender_session_fingerprints") or "{}"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_fingerprints = {}
+            fingerprints = normalize_session_fingerprints(raw_fingerprints)
+            target = str(
+                self.private_job_value(job.id, "tdl_storage_chat_ref")
+                or ""
+            ).strip()
+            error_code = str(result.get("error_code") or "").strip().upper()
+            if profile and target and fingerprints.get(profile[0]):
+                try:
+                    self.tdl_access_store.invalidate_profile(
+                        job.worker,
+                        self.tdl_access_store.destination_fingerprint(target),
+                        profile[0],
+                        fingerprints[profile[0]],
+                        error_code,
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Could not invalidate TDL access proof for job %s profile %s",
+                        job.id,
+                        profile[0],
+                    )
+
         if event.event_type == "storage.folder_discovered" and self.storage_catalog is not None:
             relative_path = str(result.get("relative_path", "")).strip()
             if relative_path:
@@ -2516,6 +2989,80 @@ class ControlPlane:
                     "failed",
                     str((event.error or {}).get("message", "backup gagal")),
                 )
+
+    def _apply_storage_reconciliation_result(
+        self, reconciliation_job: Job, result: dict[str, Any]
+    ) -> None:
+        source_job_id = str(result.get("source_job_id") or "").strip()
+        source = self.jobs.get(source_job_id) if source_job_id else None
+        if (
+            source is None
+            or source.kind != "storage_upload"
+            or source.actor_user_id != reconciliation_job.actor_user_id
+            or source.profile != reconciliation_job.profile
+            or source.worker != reconciliation_job.worker
+            or not source.status.terminal
+            or str(reconciliation_job.payload.get("source_job_id") or "") != source.id
+        ):
+            return
+        source_result = source.result if isinstance(source.result, dict) else {}
+        wrapped = isinstance(source_result.get("value"), dict)
+        value = source_result.get("value", source_result)
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            return
+        updated_items = [dict(item) if isinstance(item, dict) else item for item in value["items"]]
+        seen: set[int] = set()
+        for evidence in result.get("items", []) if isinstance(result.get("items"), list) else []:
+            if not isinstance(evidence, dict):
+                continue
+            try:
+                index = int(evidence.get("index"))
+                match_count = max(0, int(evidence.get("match_count") or 0))
+            except (TypeError, ValueError):
+                continue
+            if index in seen or index < 0 or index >= len(updated_items):
+                continue
+            seen.add(index)
+            current = updated_items[index]
+            if not isinstance(current, dict) or current.get("status") != "needs_reconciliation":
+                continue
+            if str(current.get("name") or "") != str(evidence.get("name") or ""):
+                continue
+            state = str(evidence.get("status") or "")
+            if state == "succeeded" and match_count > 0:
+                retryable = False
+            elif state == "failed" and match_count == 0 and evidence.get("retryable") is True:
+                retryable = True
+            else:
+                state = "needs_reconciliation"
+                retryable = False
+            current.update(
+                status=state,
+                retryable=retryable,
+                reconciliation={
+                    "job_id": reconciliation_job.id,
+                    "status": state,
+                    "match_count": match_count,
+                },
+            )
+            error = str(evidence.get("error") or "")[:500]
+            error_code = str(evidence.get("error_code") or "")[:100]
+            if error:
+                current["error"] = error
+            else:
+                current.pop("error", None)
+            if error_code:
+                current["error_code"] = error_code
+            else:
+                current.pop("error_code", None)
+            updated_items[index] = current
+        if not seen:
+            return
+        value["items"] = updated_items
+        next_result = {**source_result, **({"value": value} if wrapped else value)}
+        updater = getattr(self.jobs, "update_result", None)
+        if callable(updater):
+            updater(source.id, next_result)
 
 
 def _elapsed_since(timestamp: str, now: datetime) -> float:

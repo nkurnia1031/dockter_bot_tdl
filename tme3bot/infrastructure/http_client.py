@@ -213,6 +213,20 @@ class WorkerHttpDispatcher:
     def profile_local_inventory(self, worker: str) -> dict[str, Any]:
         return self._profile_json(worker, "GET", "/internal/v1/profiles/local", timeout=20)
 
+    def scan_local_profiles(self, worker: str) -> dict[str, Any]:
+        return self._profile_json(
+            worker, "POST", "/internal/v1/profiles/local/scan", timeout=20
+        )
+
+    def delete_local_profile(self, worker: str, profile: str) -> dict[str, Any]:
+        normalized = str(profile or "").strip().lower()
+        return self._profile_json(
+            worker,
+            "DELETE",
+            f"/internal/v1/profiles/{quote(normalized, safe='')}/local",
+            timeout=45,
+        )
+
     def request_profile_sync(
         self, worker: str, *, profile: str | None = None, mode: str = "check"
     ) -> dict[str, Any]:

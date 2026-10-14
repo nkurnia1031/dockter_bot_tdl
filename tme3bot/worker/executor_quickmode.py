@@ -1051,6 +1051,7 @@ class QuickModeExecutorMixin:
                 )
                 upload_command = {
                     **command,
+                    "profile": self.storage_profile(),
                     "kind": "storage_upload",
                     "payload": {
                         "folder_path": str(stage_root),
@@ -1065,6 +1066,15 @@ class QuickModeExecutorMixin:
                         "caption": caption,
                         "caption_override": True,
                         "keywords": "",
+                        "tdl_access_target": payload.get(
+                            "_quick_storage_tdl_access_target"
+                        ),
+                        "_tdl_sender_profiles": payload.get(
+                            "_quick_storage_sender_profiles", []
+                        ),
+                        "_tdl_sender_session_fingerprints": payload.get(
+                            "_quick_storage_sender_session_fingerprints", {}
+                        ),
                     },
                 }
                 quick_settings = payload.get("quick_settings") or {}
@@ -1306,10 +1316,10 @@ class QuickModeExecutorMixin:
             storage_profile = self.storage_profile()
             verify_root: Path | None = None
             try:
-                if storage_profile not in self.profile_manager.list_profiles():
-                    raise QuickModeError("Profile storage worker tidak tersedia.")
+                if storage_profile not in self.available_storage_profiles():
+                    raise QuickModeError("Lane Upload profil Storage belum siap pada worker.")
                 storage_runtime = self.profile_manager.runtime(storage_profile)
-                client = storage_runtime.export_tdl_client
+                client = storage_runtime.upload_tdl_client
                 channel_ref = str(getattr(storage_runtime.config, "storage_channel_ref", "") or "")
                 if not channel_ref:
                     raise QuickModeError("Storage channel belum dikonfigurasi.")
@@ -1325,7 +1335,7 @@ class QuickModeExecutorMixin:
                         exc_info=True,
                     )
                 fallback_messages: list[dict[str, Any]] | None = None
-                with storage_runtime.export_operation_lock:
+                with storage_runtime.upload_operation_lock:
                     with self._capture_tdl_output(client, log_callback=verify_log):
                         for name in expected_names:
                             item = known_items.get(name)

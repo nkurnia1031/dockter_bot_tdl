@@ -100,6 +100,90 @@ describe('JobTable', () => {
     expect(calls.some((call) => call.url.endsWith('/retry') && call.method === 'POST')).toBe(true);
   });
 
+  it('shows per-file Storage outcomes and retries only after safe-file confirmation', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const calls: { url: string; method?: string }[] = [];
+    const job = {
+      id: 'storage-1', kind: 'storage_upload', status: 'failed', profile: 'default', worker: 'local',
+      created_at: '2026-10-14T00:00:00Z', updated_at: '2026-10-14T00:00:01Z', retryable: true,
+      result: { value: { outcome: 'partial_failure', items: [
+        { path: 'safe.txt', name: 'safe.txt', status: 'failed', attempt: 1, retryable: true, error: 'File gagal sebelum dikirim.' },
+        { path: 'ambiguous.txt', name: 'ambiguous.txt', status: 'needs_reconciliation', attempt: 2, profile: 'archive', retryable: false, error: 'Hasil belum pasti.' },
+      ] } }
+    };
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method });
+      if (url.includes('/jobs?')) {
+        const query = new URL(url, 'http://localhost').searchParams;
+        return new Response(JSON.stringify({ items: query.get('kind') === 'storage_upload' ? [job] : [] }), { status: 200 });
+      }
+      if (url.endsWith('/jobs/storage-1')) return new Response(JSON.stringify(job), { status: 200 });
+      if (url.endsWith('/events?after_sequence=0') || url.endsWith('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.endsWith('/retry')) return new Response(JSON.stringify({ id: 'storage-2', status: 'queued' }), { status: 200 });
+      if (url.endsWith('/reconcile')) return new Response(JSON.stringify({ id: 'reconcile-1', status: 'queued' }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'storage_upload', retryable: true, view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Retry file aman' }));
+
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('File dengan hasil ambigu tidak ikut dikirim'));
+    expect(calls.some((call) => call.url.endsWith('/jobs/storage-1/retry') && call.method === 'POST')).toBe(true);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Rekonsiliasi' }));
+    expect(calls.some((call) => call.url.endsWith('/jobs/storage-1/reconcile') && call.method === 'POST')).toBe(true);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+    expect(await screen.findByText('Hasil per file')).toBeTruthy();
+    expect(screen.getByText('safe.txt')).toBeTruthy();
+    expect(screen.getByText('ambiguous.txt')).toBeTruthy();
+    expect(screen.getByText('needs_reconciliation')).toBeTruthy();
+  });
+
+  it('lists and reopens safe Storage reconciliation results without exposing caption or path', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const reconciliation = {
+      id: 'reconcile-1', kind: 'storage_reconcile', status: 'succeeded', profile: 'default', worker: 'local',
+      payload: { source_job_id: 'storage-1' }, created_at: '2026-10-15T00:00:00Z', updated_at: '2026-10-15T00:00:01Z',
+      result: { value: { items: [
+        { index: 0, name: 'archive.zip', profile: 'archive', status: 'succeeded', match_count: 1, retryable: false, error: 'Caption ditemukan.' },
+        { index: 1, name: 'missing.zip', profile: 'default', status: 'failed', match_count: 0, retryable: true, error: 'Aman untuk Retry.' },
+      ] } }
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) {
+        const query = new URL(url, 'http://localhost').searchParams;
+        return new Response(JSON.stringify({ items: query.get('kind') === 'storage_reconcile' ? [reconciliation] : [] }), { status: 200 });
+      }
+      if (url.endsWith('/jobs/reconcile-1')) return new Response(JSON.stringify(reconciliation), { status: 200 });
+      if (url.includes('/events') || url.includes('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    const { container } = render(JobTable, { kind: 'storage_upload', view: 'history' });
+    expect(await screen.findByText('Storage reconcile')).toBeTruthy();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+    expect(await screen.findByText('Hasil rekonsiliasi caption')).toBeTruthy();
+    expect(screen.getByText('archive.zip')).toBeTruthy();
+    expect(screen.getByText('Caption cocok: 1')).toBeTruthy();
+    expect(container.textContent).not.toContain('/workspace/');
+  });
+
   it('uses a live active monitor query separate from terminal history', async () => {
     const urls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {

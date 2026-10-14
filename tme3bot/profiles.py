@@ -34,11 +34,13 @@ class ProfileRuntime:
     download_progress: DownloadProgressTracker
     export_tdl_client: TDLClient
     download_tdl_client: TDLClient
+    upload_tdl_client: TDLClient
     export_service: ExportService
     download_service: BatchDownloadService
     leave_service: LeaveService
     export_operation_lock: threading.RLock
     download_operation_lock: threading.RLock
+    upload_operation_lock: threading.RLock
 
 
 class ProfileSelectionStore:
@@ -113,6 +115,7 @@ class ProfileManager:
         self._lock = threading.RLock()
         self._runtimes: dict[str, ProfileRuntime] = {}
         self._operation_locks: dict[str, tuple[threading.RLock, threading.RLock]] = {}
+        self._upload_operation_locks: dict[str, threading.RLock] = {}
         self.source_repository = source_repository
         self.source_state_store_factory = source_state_store_factory
         self._state_stores: dict[str, ProfileStateStore] = {}
@@ -307,6 +310,7 @@ class ProfileManager:
                 profile_config,
                 state_store=profile_state_store,
                 operation_locks=self.profile_operation_locks(normalized),
+                upload_operation_lock=self.profile_upload_operation_lock(normalized),
             )
             self._runtimes[normalized] = runtime
             return runtime
@@ -322,6 +326,16 @@ class ProfileManager:
                 locks = (threading.RLock(), threading.RLock())
                 self._operation_locks[normalized] = locks
             return locks
+
+    def profile_upload_operation_lock(self, profile_name: str) -> threading.RLock:
+        """Return the stable lock for the profile's dedicated Upload lane."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        with self._lock:
+            lock = self._upload_operation_locks.get(normalized)
+            if lock is None:
+                lock = threading.RLock()
+                self._upload_operation_locks[normalized] = lock
+            return lock
 
     def session_config(self, profile_name: str) -> AppConfig:
         """Resolve the actual TDL session paths without loading state or creating files."""
@@ -360,6 +374,18 @@ class ProfileManager:
             runtime.export_tdl_client.home = export_storage.parent
             runtime.download_tdl_client.storage_root = Path(profile_config.tdl_download_storage)
             runtime.download_tdl_client.home = Path(profile_config.tdl_download_home)
+            runtime.upload_tdl_client.storage_root = self.upload_tdl_storage_path(normalized)
+            runtime.upload_tdl_client.home = runtime.upload_tdl_client.storage_root.parent
+
+    def forget_profile_runtime(self, profile_name: str) -> None:
+        """Discard cached worker objects after a complete local profile removal."""
+        normalized = normalize_profile_name(profile_name)
+        if not normalized or normalized == self.default_profile:
+            return
+        with self._lock:
+            self._runtimes.pop(normalized, None)
+            self._state_stores.pop(normalized, None)
+            self._state_store_modes.pop(normalized, None)
 
     def export_tdl_storage_path(self, profile_name: str) -> Path:
         """Resolve the session path, including a legacy default-profile location."""
@@ -383,6 +409,12 @@ class ProfileManager:
             return legacy
         return configured
 
+    def upload_tdl_storage_path(self, profile_name: str) -> Path:
+        """Resolve the dedicated Storage upload session path for one profile."""
+        normalized = normalize_profile_name(profile_name) or self.default_profile
+        profile_config = self.session_config(normalized)
+        return Path(profile_config.profile_root) / "upload" / ".tdl"
+
     def tdl_session_available(self, profile_name: str, purpose: str = "export") -> bool:
         """Check an initialized local TDL session without creating runtime files."""
         return self.tdl_session_diagnostic(profile_name, purpose)["available"] is True
@@ -394,16 +426,15 @@ class ProfileManager:
         normalized = normalize_profile_name(profile_name) or self.default_profile
         config = build_profile_config(self.base_config, normalized)
         purpose = str(purpose or "export").strip().lower()
-        storage_root = (
-            self.export_tdl_storage_path(normalized)
-            if purpose in {"export", "storage", "tts", "leave"}
-            else Path(config.tdl_download_storage)
-        )
-        namespace = (
-            config.tdl_export_namespace
-            if purpose in {"export", "storage", "tts", "leave"}
-            else config.tdl_download_namespace
-        )
+        if purpose == "storage":
+            storage_root = self.upload_tdl_storage_path(normalized)
+            namespace = config.tdl_export_namespace
+        elif purpose in {"export", "tts", "leave"}:
+            storage_root = self.export_tdl_storage_path(normalized)
+            namespace = config.tdl_export_namespace
+        else:
+            storage_root = Path(config.tdl_download_storage)
+            namespace = config.tdl_download_namespace
         error_code = _tdl_session_database_error(storage_root, namespace)
         return {
             "profile": normalized,
@@ -536,6 +567,7 @@ def build_profile_runtime(
     *,
     state_store: ProfileStateStore | None = None,
     operation_locks: tuple[threading.RLock, threading.RLock] | None = None,
+    upload_operation_lock: threading.RLock | None = None,
 ) -> ProfileRuntime:
     if state_store is None and config.app_role == "worker":
         # Workers must use the gateway API.  A local state.json here would
@@ -566,12 +598,22 @@ def build_profile_runtime(
         stall_timeout_seconds=config.tdl_download_stall_timeout_seconds,
         progress_callback=download_progress.update_tdl_progress,
     )
+    upload_storage = Path(config.profile_root) / "upload" / ".tdl"
+    upload_tdl_client = TDLClient(
+        storage_root=upload_storage,
+        namespace=config.tdl_export_namespace,
+        debug=config.log_level == "DEBUG",
+        home=upload_storage.parent,
+        log_prefix=f"tdl-upload:{profile_name}",
+        stall_timeout_seconds=config.tdl_export_stall_timeout_seconds,
+    )
     export_service = ExportService(config, state_store, export_tdl_client)
     download_service = BatchDownloadService(
         config, state_store, download_tdl_client, progress_tracker=download_progress
     )
     leave_service = LeaveService(config)
     locks = operation_locks or (threading.RLock(), threading.RLock())
+    upload_lock = upload_operation_lock or threading.RLock()
     return ProfileRuntime(
         name=profile_name,
         config=config,
@@ -579,11 +621,13 @@ def build_profile_runtime(
         download_progress=download_progress,
         export_tdl_client=export_tdl_client,
         download_tdl_client=download_tdl_client,
+        upload_tdl_client=upload_tdl_client,
         export_service=export_service,
         download_service=download_service,
         leave_service=leave_service,
         export_operation_lock=locks[0],
         download_operation_lock=locks[1],
+        upload_operation_lock=upload_lock,
     )
 
 

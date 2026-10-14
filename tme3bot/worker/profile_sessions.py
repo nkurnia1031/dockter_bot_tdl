@@ -22,6 +22,7 @@ try:
 except ImportError:  # pragma: no cover - TDL workers run on Linux.
     pty = None  # type: ignore[assignment]
 
+from tme3bot.domain.models import DomainError
 from tme3bot.names import normalize_profile_name
 from tme3bot.profile_provisioning import (
     MAX_PROFILE_BUNDLE_BYTES,
@@ -402,6 +403,80 @@ class ProfileSessionManager:
                 pass
         return True
 
+    def delete_local_profile(self, profile: str) -> dict[str, Any]:
+        """Remove one non-default profile folder derived from its validated slug."""
+        raw = str(profile or "").strip().lower()
+        normalized = normalize_profile_name(raw)
+        if not normalized or raw != normalized:
+            raise DomainError(
+                "PROFILE_NAME_INVALID",
+                "Nama profil lokal tidak valid.",
+                status_code=422,
+            )
+        if normalized == normalize_profile_name(self.config.default_profile):
+            raise DomainError(
+                "PROFILE_DEFAULT_PROTECTED",
+                "Profil default tidak dapat dihapus.",
+                status_code=409,
+            )
+
+        profiles_root = Path(self.config.profiles_root)
+        if profiles_root.is_symlink():
+            raise DomainError(
+                "PROFILE_ROOT_UNSAFE",
+                "Root profil worker tidak aman; tidak ada data yang dihapus.",
+                status_code=409,
+            )
+        expected = profiles_root / normalized
+        configured = Path(build_profile_config(self.config, normalized).profile_root)
+        if configured != expected or expected.name != normalized:
+            raise DomainError(
+                "PROFILE_ROOT_UNSAFE",
+                "Target profil worker tidak cocok dengan nama profil.",
+                status_code=409,
+            )
+        if expected.is_symlink():
+            raise DomainError(
+                "PROFILE_ROOT_UNSAFE",
+                "Direktori profil worker tidak aman; tidak ada data yang dihapus.",
+                status_code=409,
+            )
+        if not expected.exists():
+            return {"profile": normalized, "deleted": True, "already_absent": True}
+        if not expected.is_dir() or expected.resolve().parent != profiles_root.resolve():
+            raise DomainError(
+                "PROFILE_ROOT_UNSAFE",
+                "Direktori profil worker tidak aman; tidak ada data yang dihapus.",
+                status_code=409,
+            )
+
+        # Do not let a profile tree redirect recursive deletion outside its root.
+        try:
+            for current, directories, files in os.walk(expected, followlinks=False):
+                base = Path(current)
+                if any((base / child).is_symlink() for child in (*directories, *files)):
+                    raise DomainError(
+                        "PROFILE_ROOT_UNSAFE",
+                        "Direktori profil berisi link filesystem; tidak ada data yang dihapus.",
+                        status_code=409,
+                    )
+        except OSError as exc:
+            raise DomainError(
+                "PROFILE_DELETE_FAILED",
+                "Direktori profil worker tidak dapat diperiksa dengan aman.",
+                status_code=409,
+            ) from exc
+
+        try:
+            shutil.rmtree(expected)
+        except OSError as exc:
+            raise DomainError(
+                "PROFILE_DELETE_FAILED",
+                "Profil lokal gagal dihapus; periksa worker lalu coba Scan kembali.",
+                status_code=409,
+            ) from exc
+        return {"profile": normalized, "deleted": True, "already_absent": False}
+
     def _backup_directory(self, profile: str, operation_id: str) -> Path:
         profile_root = Path(build_profile_config(self.config, profile).profile_root)
         current = profile_root / ".profile-provisioning-backups" / operation_id / profile
@@ -620,6 +695,27 @@ class ProfileSessionManager:
         ):
             raise ValueError("Extracted TDL session database is missing or unsafe.")
         return self._run_whoami(storage, namespace=namespace, home=home)
+
+    def test_profile_session(
+        self, storage_root: Path, *, namespace: str, home: Path
+    ) -> int:
+        """Validate one isolated profile lane without opening its live Bolt DB."""
+        storage = Path(storage_root)
+        data_root = storage / "data"
+        database_file = data_root / str(namespace)
+        if (
+            storage.is_symlink()
+            or data_root.is_symlink()
+            or database_file.is_symlink()
+            or not storage.is_dir()
+            or not data_root.is_dir()
+            or not database_file.is_file()
+            or database_file.stat().st_size <= 0
+        ):
+            raise ValueError("TDL session database is missing or unsafe.")
+        return self._run_whoami(
+            storage, namespace=str(namespace), home=Path(home)
+        )
 
     def _diagnose_one_tdl_session(
         self,

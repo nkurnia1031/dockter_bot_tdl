@@ -153,6 +153,45 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             "Worker tidak dapat membaca inventaris profil lokal.",
         )
 
+    @app.post("/internal/v1/profiles/local/scan", dependencies=[Depends(authorize)])
+    def scan_local_profiles():
+        inventory = getattr(context.executor, "local_profile_inventory", None)
+        if not callable(inventory):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung scan profil lokal.",
+                status_code=404,
+            )
+        return profile_operation(
+            lambda: inventory(prepare_upload=True),
+            "PROFILE_INVENTORY_FAILED",
+            "Worker tidak dapat memulai pemeriksaan profil lokal.",
+        )
+
+    @app.delete(
+        "/internal/v1/profiles/{profile}/local",
+        dependencies=[Depends(authorize)],
+    )
+    def delete_local_profile(profile: str):
+        raw = str(profile or "").strip().lower()
+        normalized = normalize_profile_name(raw)
+        if not normalized or raw != normalized:
+            raise DomainError(
+                "PROFILE_NAME_INVALID", "Nama profil lokal tidak valid.", status_code=422
+            )
+        delete = getattr(context.executor, "delete_local_profile", None)
+        if not callable(delete):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung penghapusan profil lokal.",
+                status_code=409,
+            )
+        return profile_operation(
+            lambda: delete(normalized),
+            "PROFILE_DELETE_FAILED",
+            "Worker gagal menghapus profil lokal.",
+        )
+
     @app.post("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
     def request_profile_sync(body: dict[str, Any]):
         if set(body) - {"profile", "mode"}:

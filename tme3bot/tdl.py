@@ -55,6 +55,20 @@ _TDL_WRITE_DENIAL_CODES = (
     "CHAT_RESTRICTED",
     "USER_RESTRICTED",
 )
+_TDL_SESSION_DENIAL_MARKERS = (
+    "NOT AUTHORIZED",
+    "PLEASE LOGIN FIRST",
+    "AUTH_KEY_UNREGISTERED",
+    "AUTH_KEY_INVALID",
+    "SESSION_REVOKED",
+)
+_TDL_SESSION_DENIAL_MARKERS = (
+    "NOT AUTHORIZED",
+    "PLEASE LOGIN FIRST",
+    "AUTH_KEY_UNREGISTERED",
+    "AUTH_KEY_INVALID",
+    "SESSION_REVOKED",
+)
 
 
 def tdl_write_denial_code(exc: BaseException) -> str | None:
@@ -68,6 +82,32 @@ def tdl_write_denial_code(exc: BaseException) -> str | None:
     for code in _TDL_WRITE_DENIAL_CODES:
         if code in text:
             return code
+    return None
+
+
+def tdl_session_denial_code(exc: BaseException) -> str | None:
+    """Return a stable code only for explicit TDL authentication failures."""
+    sources = [str(exc)]
+    for name in ("stdout", "stderr"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str):
+            sources.append(value)
+    text = "\n".join(sources).upper()
+    if any(marker in text for marker in _TDL_SESSION_DENIAL_MARKERS):
+        return "TDL_SESSION_UNAUTHORIZED"
+    return None
+
+
+def tdl_session_denial_code(exc: BaseException) -> str | None:
+    """Return a stable code only for explicit TDL authentication failures."""
+    sources = [str(exc)]
+    for name in ("stdout", "stderr"):
+        value = getattr(exc, name, None)
+        if isinstance(value, str):
+            sources.append(value)
+    text = "\n".join(sources).upper()
+    if any(marker in text for marker in _TDL_SESSION_DENIAL_MARKERS):
+        return "TDL_SESSION_UNAUTHORIZED"
     return None
 
 
@@ -695,6 +735,47 @@ class TDLClient:
         export_args.extend(["-o", str(export_path)])
         if with_content:
             export_args.append("--with-content")
+        return self._export_messages(export_path, export_args)
+
+    def export_messages_by_time(
+        self,
+        chat_ref: str,
+        start_timestamp: int,
+        end_timestamp: int,
+        export_path: Path,
+        *,
+        with_content: bool = True,
+    ) -> ExportResult:
+        """Export a chat in a Unix-time range, requiring message content.
+
+        Storage upload reconciliation uses this read-only export to compare
+        the exact captions Telegram accepted. A successful but structurally
+        incomplete export must not make an ambiguous file retryable.
+        """
+        try:
+            start = int(start_timestamp)
+            end = int(end_timestamp)
+        except (TypeError, ValueError):
+            raise ValueError("TDL export timestamps must be integers") from None
+        if start < 0 or end < start:
+            raise ValueError("TDL export time range is invalid")
+        if not with_content:
+            raise ValueError("Time-range reconciliation exports require message content")
+        export_args = [
+            "chat", "export", "-c", chat_ref,
+            "-T", "time", "-i", f"{start},{end}",
+            "-o", str(export_path), "--with-content",
+        ]
+        return self._export_messages(export_path, export_args, require_content=True)
+
+    def _export_messages(
+        self,
+        export_path: Path,
+        export_args: list[str],
+        *,
+        require_content: bool = False,
+    ) -> ExportResult:
+        export_path.parent.mkdir(parents=True, exist_ok=True)
         command = self._base_command() + export_args
         result = self.runner.run(
             command,
@@ -712,12 +793,22 @@ class TDLClient:
 
         payload = json.loads(export_path.read_text(encoding="utf-8"))
         messages_raw = payload.get("messages", [])
+        if require_content and "messages" not in payload:
+            raise TDLDataError("TDL export does not contain a messages array.")
         if not isinstance(messages_raw, list):
             raise TDLDataError(
                 "Format export tidak valid: 'messages' harus berupa array."
             )
 
         messages = [message for message in messages_raw if isinstance(message, dict)]
+        if require_content and (
+            len(messages) != len(messages_raw)
+            or any(
+                not any(key in message for key in ("caption", "content", "message", "text"))
+                for message in messages
+            )
+        ):
+            raise TDLDataError("TDL export does not contain complete message content.")
         max_message_id = max(
             (
                 message.get("id")

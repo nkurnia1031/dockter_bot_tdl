@@ -163,6 +163,109 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             ["PROFILE_SESSION_BUSY"] * 3,
         )
 
+    def test_local_profile_scan_starts_upload_preparation_and_exposes_safe_progress(self):
+        class Manager:
+            def local_profiles(self):
+                return ["irang"]
+
+        class Preparer:
+            def __init__(self):
+                self.started = []
+
+            def ensure(self, profile):
+                self.started.append(profile)
+
+            def status(self, _profile):
+                return {
+                    "status": "running",
+                    "phase": "validating_upload",
+                    "progress": 70,
+                    "code": "OK",
+                    "updated_at": "2026-10-14T00:00:00+00:00",
+                }
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = Manager()
+        executor.upload_lane_preparer = Preparer()
+        executor.diagnose_profile_export = lambda _profile: {
+            "ready": True,
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+        }
+
+        snapshot = executor.local_profile_inventory()
+        self.assertEqual(executor.upload_lane_preparer.started, [])
+        self.assertEqual(snapshot["items"][0]["upload_lane"]["status"], "running")
+
+        result = executor.local_profile_inventory(prepare_upload=True)
+
+        self.assertEqual(executor.upload_lane_preparer.started, ["irang"])
+        self.assertEqual(result["items"][0]["upload_lane"]["phase"], "validating_upload")
+        serialized = json.dumps(result)
+        self.assertNotIn("/data", serialized)
+        self.assertNotIn("telegram_user_id", serialized)
+
+    def test_worker_startup_prepares_every_local_profile_on_that_worker(self):
+        class Manager:
+            def local_profiles(self):
+                return ["default", "irang", "storage"]
+
+        class Preparer:
+            def __init__(self):
+                self.profiles = []
+
+            def ensure(self, profile):
+                self.profiles.append(profile)
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = Manager()
+        executor.upload_lane_preparer = Preparer()
+
+        executor.prepare_upload_lanes()
+
+        self.assertEqual(executor.upload_lane_preparer.profiles, ["default", "irang", "storage"])
+
+    def test_worker_startup_does_not_automatically_pull_vault_profiles(self):
+        calls = []
+
+        class Publisher:
+            def attach_outbox(self, _store):
+                calls.append("attach_outbox")
+
+            def start_sender(self):
+                calls.append("start_sender")
+
+        class Jobs:
+            def start(self):
+                calls.append("start_jobs")
+
+        class Runner:
+            def start(self):
+                calls.append("start_commands")
+
+        class VaultSync:
+            def start(self):
+                raise AssertionError("vault distribution must be explicit")
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.prepare_upload_lanes = lambda: calls.append("prepare_upload")
+        executor._recover_legacy_quick_stages = lambda: calls.append("recover_quick")
+        executor.publisher = Publisher()
+        executor.command_store = object()
+        executor._jobs = Jobs()
+        executor.command_runner = Runner()
+        executor.profile_sync = VaultSync()
+
+        executor.start()
+
+        self.assertEqual(calls, [
+            "prepare_upload", "recover_quick", "attach_outbox", "start_jobs",
+            "start_sender", "start_commands",
+        ])
+
     def test_tdl_diagnosis_checks_each_session_with_its_own_runtime_config(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -279,6 +382,39 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("runuser", commands[1])
             self.assertEqual((download_storage / "data/download-ns").read_bytes(), b"download session backup")
             self.assertEqual((export_storage / "data/export-ns").read_bytes(), b"export session backup")
+
+    def test_upload_lane_session_check_uses_private_snapshot_and_preserves_candidate(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = make_config(root)
+            candidate = root / "candidate" / ".tdl"
+            database = candidate / "data" / "export-ns"
+            database.parent.mkdir(parents=True)
+            database.write_bytes(b"upload candidate")
+            manager = ProfileSessionManager(config)
+            command_seen = []
+
+            def fake_run(command, **_kwargs):
+                command_seen.append(command)
+                copied = Path(command[command.index("--storage") + 1]) / "export-ns"
+                self.assertEqual(copied.read_bytes(), b"upload candidate")
+                identity_file = Path(command[command.index("--identity-file") + 1])
+                identity_file.write_text(json.dumps({"telegram_user_id": 424242}), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch("tme3bot.worker.profile_sessions.subprocess.run", side_effect=fake_run):
+                user_id = manager.test_profile_session(
+                    candidate, namespace="export-ns", home=root / "candidate"
+                )
+
+            self.assertEqual(user_id, 424242)
+            self.assertEqual(len(command_seen), 1)
+            self.assertNotIn("runuser", command_seen[0])
+            self.assertNotEqual(
+                Path(command_seen[0][command_seen[0].index("--storage") + 1]),
+                candidate / "data",
+            )
+            self.assertEqual(database.read_bytes(), b"upload candidate")
 
     def test_tdl_diagnosis_reports_mismatch_without_exposing_ids(self):
         with tempfile.TemporaryDirectory() as raw:
