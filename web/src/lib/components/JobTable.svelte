@@ -84,6 +84,11 @@
     return d.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   }
 
+  function ttsTitle(job: Job): string {
+    const title = job.payload?.title;
+    return typeof title === 'string' && title.trim() ? title.trim() : 'Judul tidak tersedia';
+  }
+
   function workerStatusLabel(status: string): string {
     return ({ busy: 'sibuk', stale: 'heartbeat terlambat', paused: 'dijeda', queued: 'antre', idle: 'idle', disabled: 'nonaktif' } as Record<string, string>)[status] || status;
   }
@@ -352,6 +357,9 @@
       {@const stageId = job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null)}
       <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
         <div class="min-w-0">
+          {#if job.kind === 'tts'}
+            <h3 class="mb-1 break-words text-base font-bold leading-snug text-slate-900 dark:text-slate-100" style="overflow-wrap:anywhere" title={ttsTitle(job)}>{ttsTitle(job)}</h3>
+          {/if}
           <div class="flex flex-wrap items-center gap-2">
             {#if job.id}
               <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>

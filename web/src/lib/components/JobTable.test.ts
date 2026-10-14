@@ -100,6 +100,30 @@ describe('JobTable', () => {
     expect(calls.some((call) => call.url.endsWith('/retry') && call.method === 'POST')).toBe(true);
   });
 
+  it('shows TTS titles and a legacy fallback directly in history rows', async () => {
+    const jobs = [
+      {
+        id: 'tts-with-title', kind: 'tts', status: 'succeeded', worker: 'local',
+        payload: { title: 'Narasi: Ringkasan Perjalanan' }, updated_at: '2026-10-15T00:00:00Z'
+      },
+      {
+        id: 'tts-without-title', kind: 'tts', status: 'failed', worker: 'remote-1',
+        payload: {}, updated_at: '2026-10-14T00:00:00Z'
+      }
+    ];
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: jobs }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'tts', view: 'history' });
+
+    expect(await screen.findByRole('heading', { name: 'Narasi: Ringkasan Perjalanan' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Judul tidak tersedia' })).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: 'Report' })).toHaveLength(2);
+  });
+
   it('shows per-file Storage outcomes and retries only after safe-file confirmation', async () => {
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
       configurable: true,
