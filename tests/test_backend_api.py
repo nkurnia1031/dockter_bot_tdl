@@ -2189,6 +2189,56 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(logged_out.status_code, 200)
         self.assertEqual(self.client.get("/api/v1/me").status_code, 401)
 
+    def test_browser_remember_me_persists_cookie_and_session_until_logout(self):
+        challenge = self.client.post(
+            "/api/v1/auth/browser/challenge", json={"remember_me": True}
+        )
+        self.assertEqual(challenge.status_code, 200)
+        body = challenge.json()
+        stored_challenge = self.auth_repository.challenge_by_id(body["challenge_id"])
+        self.assertEqual(stored_challenge["remember_me"], 1)
+        code = body["verification_uri"].split("login_", 1)[1]
+        approved = self.client.post(
+            f"/internal/v1/auth/telegram/challenges/{code}/approve",
+            headers={"Authorization": "Bearer frontend"},
+            json={"telegram_user_id": 42},
+        )
+        self.assertEqual(approved.status_code, 200)
+
+        session = self.client.get("/api/v1/auth/browser/challenge")
+        self.assertEqual(session.status_code, 200)
+        self.assertTrue(session.json()["authenticated"])
+        refresh_cookie = next(
+            value for value in session.headers.get_list("set-cookie")
+            if value.startswith("tme3_refresh=")
+        )
+        self.assertIn("Max-Age=2147483647", refresh_cookie)
+        self.assertNotIn("refresh_token", session.text)
+
+        claims = self.auth.decode_access(self.client.cookies.get("tme3_access"))
+        with self.auth_repository._db() as db:
+            db.execute(
+                "UPDATE auth_sessions SET expires_at = ? WHERE id = ?",
+                ("2000-01-01T00:00:00+00:00", claims["sid"]),
+            )
+        csrf = self.client.cookies.get("tme3_csrf")
+        refreshed = self.client.post(
+            "/api/v1/auth/browser/refresh", headers={"X-CSRF-Token": csrf}
+        )
+        self.assertEqual(refreshed.status_code, 200)
+        self.assertTrue(any(
+            value.startswith("tme3_refresh=") and "Max-Age=2147483647" in value
+            for value in refreshed.headers.get_list("set-cookie")
+        ))
+
+        csrf = self.client.cookies.get("tme3_csrf")
+        logged_out = self.client.post(
+            "/api/v1/auth/browser/logout", headers={"X-CSRF-Token": csrf}
+        )
+        self.assertEqual(logged_out.status_code, 200)
+        self.assertTrue(logged_out.json()["revoked"])
+        self.assertEqual(self.client.get("/api/v1/me").status_code, 401)
+
     def test_submit_job_and_worker_events_are_json_only(self):
         headers = self.login()
         response = self.client.post(

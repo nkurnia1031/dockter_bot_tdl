@@ -30,6 +30,7 @@ class TokenPair:
     refresh_token: str
     token_type: str
     expires_in: int
+    remember_me: bool = False
 
 
 class SqliteAuthRepository:
@@ -68,7 +69,8 @@ class SqliteAuthRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     approved_at TEXT,
-                    consumed_at TEXT
+                    consumed_at TEXT,
+                    remember_me INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE INDEX IF NOT EXISTS auth_challenges_code
                     ON auth_challenges(code);
@@ -79,7 +81,8 @@ class SqliteAuthRepository:
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     last_used_at TEXT NOT NULL,
-                    revoked_at TEXT
+                    revoked_at TEXT,
+                    remember_me INTEGER NOT NULL DEFAULT 0
                 );
                 """
             )
@@ -93,6 +96,18 @@ class SqliteAuthRepository:
                 )
             if "device_id" not in columns:
                 db.execute("ALTER TABLE auth_sessions ADD COLUMN device_id TEXT")
+            if "remember_me" not in columns:
+                db.execute(
+                    "ALTER TABLE auth_sessions ADD COLUMN remember_me INTEGER NOT NULL DEFAULT 0"
+                )
+            challenge_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(auth_challenges)").fetchall()
+            }
+            if "remember_me" not in challenge_columns:
+                db.execute(
+                    "ALTER TABLE auth_challenges ADD COLUMN remember_me INTEGER NOT NULL DEFAULT 0"
+                )
             db.executescript(
                 """
                 CREATE INDEX IF NOT EXISTS auth_sessions_user
@@ -335,15 +350,16 @@ class SqliteAuthRepository:
             return session_id, user_id, "created"
 
     def create_challenge(
-        self, challenge_id: str, code: str, poll_token_hash: str, expires_at: datetime
+        self, challenge_id: str, code: str, poll_token_hash: str, expires_at: datetime,
+        remember_me: bool = False,
     ) -> None:
         now = _now().isoformat()
         with self._db() as db:
             db.execute(
                 """
                 INSERT INTO auth_challenges(
-                    id, code, poll_token_hash, status, created_at, expires_at
-                ) VALUES(?, ?, ?, ?, ?, ?)
+                    id, code, poll_token_hash, status, created_at, expires_at, remember_me
+                ) VALUES(?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     challenge_id,
@@ -352,6 +368,7 @@ class SqliteAuthRepository:
                     AuthChallengeStatus.PENDING.value,
                     now,
                     expires_at.isoformat(),
+                    int(remember_me),
                 ),
             )
 
@@ -427,6 +444,7 @@ class SqliteAuthRepository:
         telegram_user_id: int,
         refresh_token_hash: str,
         expires_at: datetime,
+        remember_me: bool = False,
     ) -> str:
         session_id = str(uuid.uuid4())
         now = _now().isoformat()
@@ -442,8 +460,8 @@ class SqliteAuthRepository:
                 """
                 INSERT INTO auth_sessions(
                     id, telegram_user_id, refresh_token_hash, created_at,
-                    expires_at, last_used_at, session_kind, device_id
-                ) VALUES(?, ?, ?, ?, ?, ?, 'telegram', NULL)
+                    expires_at, last_used_at, session_kind, device_id, remember_me
+                ) VALUES(?, ?, ?, ?, ?, ?, 'telegram', NULL, ?)
                 """,
                 (
                     session_id,
@@ -452,6 +470,7 @@ class SqliteAuthRepository:
                     now,
                     expires_at.isoformat(),
                     now,
+                    int(remember_me),
                 ),
             )
         return session_id
@@ -463,7 +482,8 @@ class SqliteAuthRepository:
             row = db.execute(
                 """
                 SELECT s.* FROM auth_sessions s LEFT JOIN auth_devices d ON d.id = s.device_id
-                WHERE s.refresh_token_hash = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+                WHERE s.refresh_token_hash = ? AND s.revoked_at IS NULL
+                  AND (s.remember_me = 1 OR s.expires_at > ?)
                   AND (s.session_kind != 'device' OR (d.id IS NOT NULL AND d.revoked_at IS NULL))
                 """,
                 (refresh_token_hash, _now().isoformat()),
@@ -475,7 +495,8 @@ class SqliteAuthRepository:
             row = db.execute(
                 """
                 SELECT s.* FROM auth_sessions s LEFT JOIN auth_devices d ON d.id = s.device_id
-                WHERE s.id = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+                WHERE s.id = ? AND s.revoked_at IS NULL
+                  AND (s.remember_me = 1 OR s.expires_at > ?)
                   AND (s.session_kind != 'device' OR (d.id IS NOT NULL AND d.revoked_at IS NULL))
                 """,
                 (session_id, _now().isoformat()),
@@ -530,13 +551,13 @@ class BotAuthService:
         self.refresh_days = max(1, int(refresh_days))
         self.challenge_minutes = max(1, int(challenge_minutes))
 
-    def create_challenge(self) -> dict[str, Any]:
+    def create_challenge(self, *, remember_me: bool = False) -> dict[str, Any]:
         challenge_id = str(uuid.uuid4())
         code = secrets.token_urlsafe(18)
         poll_token = secrets.token_urlsafe(32)
         expires_at = _now() + timedelta(minutes=self.challenge_minutes)
         self.repository.create_challenge(
-            challenge_id, code, _hash_secret(poll_token), expires_at
+            challenge_id, code, _hash_secret(poll_token), expires_at, remember_me
         )
         return {
             "challenge_id": challenge_id,
@@ -592,7 +613,10 @@ class BotAuthService:
                 "Challenge login sudah digunakan.",
                 status_code=409,
             )
-        return self._new_web_session(int(challenge["telegram_user_id"]))
+        return self._new_web_session(
+            int(challenge["telegram_user_id"]),
+            remember_me=bool(challenge.get("remember_me", 0)),
+        )
 
     def service_exchange(self, telegram_user_id: int) -> dict[str, Any]:
         actor = self.actor_resolver(int(telegram_user_id))
@@ -640,6 +664,7 @@ class BotAuthService:
             refresh_token=new_refresh,
             token_type="bearer",
             expires_in=self.access_seconds,
+            remember_me=bool(session.get("remember_me", 0)),
         )
 
     def logout(self, refresh_token: str) -> bool:
@@ -675,13 +700,22 @@ class BotAuthService:
                 raise DomainError("SESSION_REVOKED", "Jenis sesi tidak valid.", status_code=401)
         return payload
 
-    def _new_web_session(self, telegram_user_id: int) -> TokenPair:
+    def _new_web_session(
+        self, telegram_user_id: int, *, remember_me: bool = False
+    ) -> TokenPair:
         actor = self.actor_resolver(telegram_user_id)
         refresh = secrets.token_urlsafe(48)
+        now = _now()
+        expires_at = (
+            datetime.max.replace(tzinfo=timezone.utc)
+            if remember_me
+            else now + timedelta(days=self.refresh_days)
+        )
         session_id = self.repository.create_single_session(
             telegram_user_id,
             _hash_secret(refresh),
-            _now() + timedelta(days=self.refresh_days),
+            expires_at,
+            remember_me=remember_me,
         )
         return TokenPair(
             access_token=self._access_token(
@@ -690,6 +724,7 @@ class BotAuthService:
             refresh_token=refresh,
             token_type="bearer",
             expires_in=self.access_seconds,
+            remember_me=remember_me,
         )
 
     def new_device_web_session(

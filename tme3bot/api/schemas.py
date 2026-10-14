@@ -40,6 +40,10 @@ class BrowserChallengeResponse(ApiResponse):
     interval: int
 
 
+class BrowserChallengeRequest(BaseModel):
+    remember_me: bool = False
+
+
 class BrowserSessionResponse(ApiResponse):
     authenticated: bool
     actor: ActorResponse | None = None
@@ -85,6 +89,7 @@ class TokenPairResponse(ApiResponse):
     refresh_token: str
     token_type: str
     expires_in: int
+    remember_me: bool = False
 
 
 class LogoutResponse(ApiResponse):

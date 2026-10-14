@@ -21,6 +21,7 @@ from tme3bot.api.schemas import (
     ActorResponse,
     ApproveChallengeRequest,
     BatchSourcesRequest,
+    BrowserChallengeRequest,
     BrowserChallengeResponse,
     BrowserProfileRequest,
     BrowserSessionResponse,
@@ -76,6 +77,7 @@ from tme3bot.utility import utility_setting_specs
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
+_REMEMBER_ME_COOKIE_MAX_AGE = 2_147_483_647
 
 
 @dataclass
@@ -390,8 +392,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     def _set_session(response: Response, pair: Any) -> None:
         _set_cookie(response, "tme3_access", str(pair.access_token), max_age=int(pair.expires_in))
-        _set_cookie(response, "tme3_refresh", str(pair.refresh_token), max_age=int(getattr(context.auth, "refresh_days", 30)) * 86400)
-        _set_cookie(response, "tme3_csrf", secrets.token_urlsafe(24), max_age=int(getattr(context.auth, "refresh_days", 30)) * 86400, http_only=False)
+        refresh_max_age = (
+            _REMEMBER_ME_COOKIE_MAX_AGE
+            if bool(getattr(pair, "remember_me", False))
+            else int(getattr(context.auth, "refresh_days", 30)) * 86400
+        )
+        _set_cookie(response, "tme3_refresh", str(pair.refresh_token), max_age=refresh_max_age)
+        _set_cookie(response, "tme3_csrf", secrets.token_urlsafe(24), max_age=refresh_max_age, http_only=False)
 
     def _clear_session(response: Response) -> None:
         for name in ("tme3_access", "tme3_refresh", "tme3_profile", "tme3_challenge", "tme3_poll"):
@@ -569,9 +576,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         "/api/v1/auth/browser/challenge",
         response_model=BrowserChallengeResponse,
     )
-    def browser_challenge(response: Response):
+    def browser_challenge(
+        response: Response,
+        body: BrowserChallengeRequest = BrowserChallengeRequest(),
+    ):
         """Start a Telegram login without exposing the poll credential to JS."""
-        challenge = context.auth.create_challenge()
+        challenge = context.auth.create_challenge(remember_me=body.remember_me)
         _set_cookie(response, "tme3_challenge", str(challenge["challenge_id"]), max_age=300)
         _set_cookie(response, "tme3_poll", str(challenge["poll_token"]), max_age=300)
         if not response.headers.get("set-cookie") or "tme3_csrf" not in response.headers.get("set-cookie", ""):

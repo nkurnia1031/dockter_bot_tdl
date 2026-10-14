@@ -41,7 +41,13 @@ export const session = {
   async restore() {
     const request = ++generation;
     try {
-      const restored = await api<Session>('/auth/browser/session');
+      let restored: Session;
+      try {
+        restored = await api<Session>('/auth/browser/session');
+      } catch (cause) {
+        if ((cause as { status?: number })?.status !== 401) throw cause;
+        restored = await api<Session>('/auth/browser/refresh', { method: 'POST' });
+      }
       const restoredWorkers = restored.authenticated
         ? await loadWorkers(restored.actor?.worker_route)
         : [];
@@ -56,7 +62,9 @@ export const session = {
       if (request === generation) loading = false;
     }
   },
-  async startLogin() { challenge = await post('/auth/browser/challenge'); },
+  async startLogin(rememberMe = false) {
+    challenge = await post('/auth/browser/challenge', { remember_me: rememberMe });
+  },
   async pollLogin() {
     const next = await api<Session>('/auth/browser/challenge');
     current = next;
