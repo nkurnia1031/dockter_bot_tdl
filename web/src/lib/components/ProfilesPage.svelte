@@ -231,6 +231,16 @@
       notice = `Penghapusan profil ${profile.name} pada worker ${worker} tercatat dan dapat dipantau setelah halaman dibuka ulang.`;
       scheduleProgressRefresh();
     } catch (cause) {
+      const error = cause as { code?: string; message?: string };
+      if (
+        error.code === 'PROFILE_NOT_IN_LOCAL_SCAN'
+        && selectedWorker === worker
+        && inventory?.worker === worker
+      ) {
+        inventory = { ...inventory, items: inventory.items.filter((item) => item.name !== profile.name) };
+        notice = `Profil ${profile.name} tidak ditemukan pada scan terbaru worker ${worker}; entri dihapus dari daftar lokal. Tidak ada file yang dihapus.`;
+        return;
+      }
       failure = cause instanceof Error ? cause.message : `Penghapusan profil ${profile.name} gagal.`;
     }
   }

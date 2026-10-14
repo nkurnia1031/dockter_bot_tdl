@@ -270,6 +270,79 @@ describe('ProfilesPage', () => {
     expect(screen.getByText('Mapping identitas dihapus setelah semua worker terverifikasi.')).toBeTruthy();
   });
 
+  it('removes a stale local row when the fresh worker inventory confirms the profile is absent', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url.endsWith('/profiles/scan')) {
+        return new Response(JSON.stringify({
+          worker: 'local', checked_at: '2026-10-15T00:00:00+00:00', items: [
+            { name: 'archive', deletable: true, ready: false, reason_codes: [], checks: [], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' } }
+          ], pending_identity_cleanup: []
+        }), { status: 200 });
+      }
+      if (url === '/api/v1/operations?limit=100') return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.endsWith('/profiles/local/archive') && method === 'DELETE') {
+        return new Response(JSON.stringify({
+          error: { code: 'PROFILE_NOT_IN_LOCAL_SCAN', message: 'Profil archive tidak ditemukan pada hasil scan terbaru worker local.' }
+        }), { status: 404 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    await screen.findByRole('option', { name: 'local' });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    expect(await screen.findByRole('heading', { name: 'archive' })).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Hapus profil archive dari local' }));
+
+    expect((await screen.findByRole('status')).textContent).toMatch(/tidak ditemukan.*dihapus dari daftar lokal/i);
+    expect(screen.queryByRole('heading', { name: 'archive' })).toBeNull();
+    expect(screen.queryByRole('region', { name: 'Operasi penghapusan profil' })).toBeNull();
+  });
+
+  it('keeps the local row when the worker inventory is unavailable during delete preflight', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url.endsWith('/profiles/scan')) {
+        return new Response(JSON.stringify({
+          worker: 'local', checked_at: '2026-10-15T00:00:00+00:00', items: [
+            { name: 'archive', deletable: true, ready: false, reason_codes: [], checks: [], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' } }
+          ], pending_identity_cleanup: []
+        }), { status: 200 });
+      }
+      if (url === '/api/v1/operations?limit=100') return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.endsWith('/profiles/local/archive') && method === 'DELETE') {
+        return new Response(JSON.stringify({
+          error: { code: 'WORKER_UNAVAILABLE', message: 'Inventaris profil worker local tidak dapat dipastikan; tidak ada data yang dihapus.' }
+        }), { status: 503 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    await screen.findByRole('option', { name: 'local' });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    expect(await screen.findByRole('heading', { name: 'archive' })).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Hapus profil archive dari local' }));
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/Inventaris profil worker local tidak dapat dipastikan/);
+    expect(screen.getByRole('heading', { name: 'archive' })).toBeTruthy();
+  });
+
   it('restores a pending deletion operation after a new page scan', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);

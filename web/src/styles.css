@@ -110,8 +110,10 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .terminal { border: 1px solid #202a3e; border-radius: .85rem; background: #0b1020; color: #d8e3ff; font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
 .page-icon { display: grid; width: 3rem; height: 3rem; place-items: center; border-radius: 1rem; background: var(--brand-soft); color: var(--brand); }
 
-dialog[open] { max-width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); }
-dialog[open] > div { max-height: calc(100dvh - 1rem); }
+@layer base {
+  :where(dialog[open]) { max-width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); }
+  :where(dialog[open]) > div { max-height: calc(100dvh - 1rem); }
+}
 
 @keyframes page-enter { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) {
