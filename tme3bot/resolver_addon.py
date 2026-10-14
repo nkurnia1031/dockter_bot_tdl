@@ -1,4 +1,4 @@
-"""Private HTTP addon that resolves supported shortlinks over HTTP."""
+"""Private HTTP addon process for resolving supported shortlinks."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import queue
 import threading
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 

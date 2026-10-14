@@ -7,12 +7,23 @@ from unittest.mock import patch
 import httpx
 from fastapi.testclient import TestClient
 
-from tme3bot.worker import resolver_addon
+from tme3bot import resolver_addon
 from tme3bot.worker.resolver_client import resolve_with_addon
 from tme3bot.worker.safelink_resolver import SafelinkCancelled
 
 
 class ResolverAddonTests(unittest.TestCase):
+    def test_busy_addon_returns_conflict_without_starting_another_resolver(self):
+        resolver_addon._RESOLVE_LOCK.acquire()
+        try:
+            with TestClient(resolver_addon.app, raise_server_exceptions=False) as client:
+                response = client.post("/resolve", json={"url": "https://pndk.to/example"})
+        finally:
+            resolver_addon._RESOLVE_LOCK.release()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json(), {"detail": "resolver_busy"})
+
     def test_addon_streams_progress_and_result_without_auth_setup(self):
         def fake_resolve(url, *, on_progress, is_cancelled):
             self.assertEqual(url, "https://pndk.to/example")
