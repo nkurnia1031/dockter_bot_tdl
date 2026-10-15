@@ -1016,10 +1016,12 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(active.json()["error"]["code"], "PROFILE_JOB_ACTIVE")
         self.assertEqual(self.dispatcher.local_profile_deletes, [])
 
-    def test_local_profile_delete_holds_admission_and_removes_identity_after_last_copy(self):
+    def test_local_profile_delete_accepts_raw_inventory_and_removes_identity_after_last_copy(self):
         from tme3bot.api.routes.profile_local_delete import advance_profile_local_delete_command
 
-        inventories = {"local": {"worker": "local", "items": [
+        # WorkerHttpDispatcher returns the worker's raw contract, which carries
+        # items but does not echo the backend's selected worker name.
+        inventories = {"local": {"items": [
             {"name": "default"}, {"name": "archive"}
         ]}}
         self.profiles.profile_registry.register("archive", 900)
@@ -1057,6 +1059,21 @@ class BackendApiTests(unittest.TestCase):
         self.assertIsNone(self.profiles.profile_registry.profile_for_user(900))
         self.assertIn("archive", self.profiles.profile_registry.names())
         self.assertEqual(self.dispatcher.local_profile_deletes, [("local", "archive")])
+
+    def test_local_profile_delete_rejects_inventory_echo_from_another_worker(self):
+        inventories = {"local": {"worker": "remote-1", "items": [
+            {"name": "archive"}
+        ]}}
+        client = self.local_profile_delete_client(inventories)
+
+        response = client.delete(
+            "/api/v1/workers/local/profiles/local/archive",
+            headers={**self.login(42), "Idempotency-Key": "delete-wrong-worker-inventory"},
+        )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["error"]["code"], "WORKER_UNAVAILABLE")
+        self.assertEqual(self.dispatcher.local_profile_deletes, [])
 
     def test_local_profile_delete_keeps_mapping_when_other_worker_inventory_is_stale_then_rechecks(self):
         from tme3bot.api.routes.profile_local_delete import (

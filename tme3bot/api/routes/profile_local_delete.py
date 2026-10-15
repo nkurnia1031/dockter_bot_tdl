@@ -41,7 +41,12 @@ def _profile_registry(context):
 
 def _inventory_names(dispatcher, worker: str) -> set[str]:
     inventory = dispatcher.profile_local_inventory(worker)
-    if not isinstance(inventory, dict) or str(inventory.get("worker") or "").strip().lower() != worker:
+    # The worker's raw inventory contract returns only items; public routes add
+    # the selected worker name when shaping the response for the Web UI.
+    if not isinstance(inventory, dict) or (
+        "worker" in inventory
+        and str(inventory.get("worker") or "").strip().lower() != worker
+    ):
         raise ValueError("inventory_worker_mismatch")
     items = inventory.get("items")
     if not isinstance(items, list):
