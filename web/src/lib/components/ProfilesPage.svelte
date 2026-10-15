@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { api, post } from '$lib/api';
+import { api, post, remove } from '$lib/api';
+import { session } from '$lib/session.svelte';
   import { profileDiagnosticLabel } from '$lib/tdl-lanes';
-  import { CircleAlert, KeyRound, RefreshCw, ShieldCheck, Trash2, UserRoundPlus } from '@lucide/svelte';
+import { CircleAlert, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, Upload, UserRoundPlus, X } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; selected?: boolean };
+type ProvisioningWorker = { name: string; enabled: boolean; online: boolean; secure: boolean };
   type ProfileCheck = { name: string; ready: boolean; code: string };
   type UploadLane = { status: string; phase: string; progress: number; code: string; updated_at: string };
   type LocalProfile = { name: string; ready: boolean; deletable?: boolean; reason_codes: string[]; checks: ProfileCheck[]; upload_lane: UploadLane };
@@ -12,6 +14,16 @@
   type Inventory = { worker: string; checked_at: string; items: LocalProfile[]; pending_identity_cleanup?: IdentityCleanup[] };
   type VaultProfile = { name: string; vault: boolean; status: string; source?: string; operation_id?: string; error?: string };
   type AdoptionOperation = { id: string; status: string; error?: string };
+type ProvisioningOperation = {
+  id: string;
+  profile: string;
+  status: string;
+  source: string;
+  bootstrap_worker?: string;
+  error?: string;
+  workers: { worker: string; status: string; error?: string }[];
+  login?: { status: string; step?: string; qr_text?: string; error?: string };
+};
   type DeleteOperation = {
     operation_id: string;
     kind: string;
@@ -25,6 +37,18 @@
 
   let workers = $state<Worker[]>([]);
   let selectedWorker = $state('');
+let provisioningWorkers = $state<ProvisioningWorker[]>([]);
+let provisioningWorker = $state('');
+let profileName = $state('');
+let provisioningMode = $state<'upload' | 'login'>('upload');
+let loginMethod = $state<'qr' | 'code'>('qr');
+let loginPhone = $state('');
+let loginInput = $state('');
+let profileArchive = $state<File | null>(null);
+let provisioningOperation = $state<ProvisioningOperation | null>(null);
+let provisioningLoading = $state(false);
+let provisioningFailure = $state('');
+let provisioningNotice = $state('');
   let inventory = $state<Inventory | null>(null);
   let vaultProfiles = $state<VaultProfile[]>([]);
   let vaultStatusLoaded = $state(false);
@@ -34,9 +58,12 @@
   let deleteOperations = $state<DeleteOperation[]>([]);
   let loadingWorkers = $state(false);
   let scanning = $state(false);
+let savingProvisioning = $state(false);
   let failure = $state('');
   let notice = $state('');
   let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  let provisioningTimer: ReturnType<typeof setTimeout> | undefined;
+  let provisioningRequestActive = false;
   let progressRequestActive = false;
   let progressGeneration = 0;
 
@@ -79,6 +106,19 @@
     failed: 'Gagal'
   };
 
+const availableProvisioningWorkers = $derived(
+  provisioningWorkers.filter((worker) => worker.online && worker.secure)
+);
+
+const provisioningStatusLabels: Record<string, string> = {
+  authenticating: 'Menunggu login TDL',
+  validating: 'Memvalidasi sesi',
+  distributing: 'Memasang sesi pada worker terpilih',
+  active: 'Profil aktif',
+  failed: 'Gagal',
+  cancelled: 'Dibatalkan'
+};
+
   function codeMessage(code: string) {
     return codeMessages[code] || code;
   }
@@ -87,6 +127,162 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
   }
+
+function setProvisioningWorkers(items: ProvisioningWorker[]) {
+  provisioningWorkers = Array.isArray(items) ? items : [];
+  const available = provisioningWorkers.filter((worker) => worker.online && worker.secure);
+  if (!available.some((worker) => worker.name === provisioningWorker)) {
+    provisioningWorker = available[0]?.name || '';
+  }
+}
+
+async function loadProvisioningWorkers() {
+  provisioningLoading = true;
+  provisioningFailure = '';
+  try {
+    const result = await api<{ workers?: ProvisioningWorker[] }>('/profiles/management');
+    setProvisioningWorkers(result.workers || []);
+  } catch (cause) {
+    provisioningFailure = cause instanceof Error
+      ? cause.message
+      : 'Worker aman untuk menambah profil belum dapat dimuat.';
+  } finally {
+    provisioningLoading = false;
+  }
+}
+
+function scheduleProvisioningRefresh(id: string) {
+  if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);
+  provisioningTimer = undefined;
+  if (!provisioningOperation || provisioningOperation.id !== id
+    || ['active', 'failed', 'cancelled'].includes(provisioningOperation.status)) return;
+  provisioningTimer = setTimeout(() => void refreshProvisioningOperation(id), 1500);
+}
+
+async function refreshProvisioningOperation(id: string) {
+  if (provisioningRequestActive) return;
+  provisioningRequestActive = true;
+  try {
+    const previousStatus = provisioningOperation?.status;
+    const current = await api<ProvisioningOperation>(`/profiles/provisionings/${encodeURIComponent(id)}`);
+    if (provisioningOperation?.id !== id) return;
+    provisioningOperation = current;
+    provisioningFailure = '';
+    if (current.status === 'active' && previousStatus !== 'active') {
+      provisioningNotice = `Profil ${current.profile} aktif pada worker terpilih; sesi tidak disimpan di Vault.`;
+      session.restore();
+      profileName = '';
+      loginPhone = '';
+      loginInput = '';
+      profileArchive = null;
+    }
+  } catch (cause) {
+    if (provisioningOperation?.id === id) {
+      provisioningFailure = cause instanceof Error ? cause.message : 'Status penambahan profil gagal dimuat.';
+    }
+  } finally {
+    provisioningRequestActive = false;
+    scheduleProvisioningRefresh(id);
+  }
+}
+
+async function submitProfileArchive() {
+  if (!profileArchive || !profileName.trim() || !provisioningWorker || savingProvisioning) return;
+  savingProvisioning = true;
+  provisioningFailure = '';
+  provisioningNotice = '';
+  try {
+    const query = new URLSearchParams({ name: profileName.trim(), worker: provisioningWorker, local_only: 'true' });
+    const result = await api<{ id: string; status: string }>(`/profiles/provisionings/upload?${query}`, {
+      method: 'POST',
+      body: profileArchive,
+      headers: { 'content-type': 'application/zip' }
+    });
+    provisioningOperation = {
+      id: result.id,
+      profile: profileName.trim(),
+      status: result.status,
+      source: 'upload',
+      bootstrap_worker: provisioningWorker,
+      workers: []
+    };
+    provisioningNotice = `Sesi valid. Pemasangan dimulai pada worker ${provisioningWorker}.`;
+    await refreshProvisioningOperation(result.id);
+  } catch (cause) {
+    provisioningFailure = cause instanceof Error ? cause.message : 'Upload sesi gagal.';
+  } finally {
+    savingProvisioning = false;
+  }
+}
+
+async function startProfileLogin() {
+  if (!profileName.trim() || !provisioningWorker || savingProvisioning
+    || (loginMethod === 'code' && !loginPhone.trim())) return;
+  savingProvisioning = true;
+  provisioningFailure = '';
+  provisioningNotice = '';
+  try {
+    const result = await post<{ id: string; status: string }>('/profiles/provisionings/login', {
+      name: profileName.trim(),
+      worker: provisioningWorker,
+      method: loginMethod,
+      phone: loginMethod === 'code' ? loginPhone.trim() : '',
+      local_only: true
+    });
+    provisioningOperation = {
+      id: result.id,
+      profile: profileName.trim(),
+      status: result.status,
+      source: 'login',
+      bootstrap_worker: provisioningWorker,
+      workers: []
+    };
+    provisioningNotice = loginMethod === 'qr'
+      ? 'QR sedang disiapkan pada worker.'
+      : 'Menunggu kode verifikasi Telegram.';
+    await refreshProvisioningOperation(result.id);
+  } catch (cause) {
+    provisioningFailure = cause instanceof Error ? cause.message : 'Login TDL gagal dimulai.';
+  } finally {
+    savingProvisioning = false;
+  }
+}
+
+async function submitLoginInput() {
+  if (!provisioningOperation || !loginInput.trim() || savingProvisioning) return;
+  const field = provisioningOperation.login?.step === 'password' ? 'password' : 'code';
+  savingProvisioning = true;
+  provisioningFailure = '';
+  try {
+    await post(`/profiles/provisionings/${encodeURIComponent(provisioningOperation.id)}/input`, {
+      field,
+      value: loginInput
+    });
+    loginInput = '';
+    await refreshProvisioningOperation(provisioningOperation.id);
+  } catch (cause) {
+    provisioningFailure = cause instanceof Error ? cause.message : 'Input login gagal dikirim.';
+  } finally {
+    savingProvisioning = false;
+  }
+}
+
+async function cancelProfileProvisioning() {
+  if (!provisioningOperation || savingProvisioning) return;
+  savingProvisioning = true;
+  provisioningFailure = '';
+  try {
+    await remove(`/profiles/provisionings/${encodeURIComponent(provisioningOperation.id)}`);
+    if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);
+    provisioningTimer = undefined;
+    provisioningOperation = null;
+    provisioningNotice = 'Penambahan profil dibatalkan.';
+  } catch (cause) {
+    provisioningFailure = cause instanceof Error ? cause.message : 'Penambahan profil tidak dapat dibatalkan.';
+  } finally {
+    savingProvisioning = false;
+  }
+}
 
   async function loadWorkers() {
     loadingWorkers = true;
@@ -204,9 +400,10 @@
 
   async function refreshVaultProfiles(worker: string, generation = progressGeneration) {
     try {
-      const result = await api<{ items: VaultProfile[] }>('/profiles/management');
+    const result = await api<{ items: VaultProfile[]; workers?: ProvisioningWorker[] }>('/profiles/management');
       if (generation !== progressGeneration || selectedWorker !== worker) return;
       vaultProfiles = Array.isArray(result.items) ? result.items : [];
+    if (Array.isArray(result.workers)) setProvisioningWorkers(result.workers);
       vaultStatusLoaded = true;
       vaultStatusFailure = '';
       const operations: Record<string, AdoptionOperation> = {};
@@ -389,9 +586,13 @@
 
   onMount(() => {
     void loadWorkers();
+  void loadProvisioningWorkers();
   });
 
-  onDestroy(stopProgressRefresh);
+  onDestroy(() => {
+    stopProgressRefresh();
+    if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);
+  });
 </script>
 
 <svelte:head><title>Profil lokal · tme3</title></svelte:head>
@@ -410,6 +611,121 @@
     <CircleAlert size={17} class="mt-0.5 shrink-0"/>{failure}
   </div>
 {/if}
+
+<section class="card mt-7 p-5 sm:p-6" aria-labelledby="profile-create-title">
+  <div class="flex items-center gap-3">
+    <div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={19}/></div>
+    <div>
+      <h2 id="profile-create-title" class="font-extrabold">Tambah profil local</h2>
+      <p class="muted text-sm">Upload sesi atau login TDL. Sesi hanya dipasang pada worker yang dipilih dan tidak disimpan di Vault.</p>
+    </div>
+  </div>
+
+  <div class="mt-5 grid gap-4 lg:grid-cols-2">
+    <label class="block text-sm font-bold">
+      Nama profil
+      <input class="field mt-2" bind:value={profileName} maxlength="48" autocomplete="off" placeholder="contoh: irang"/>
+    </label>
+    <label class="block text-sm font-bold">
+      Worker untuk menyiapkan sesi
+      <select class="field mt-2" aria-label="Worker untuk menyiapkan sesi" bind:value={provisioningWorker} disabled={provisioningLoading || savingProvisioning}>
+        <option value="">Pilih worker online</option>
+        {#each availableProvisioningWorkers as worker (worker.name)}
+          <option value={worker.name}>{worker.name}{worker.enabled ? '' : ' · nonaktif untuk job baru'}</option>
+        {/each}
+      </select>
+    </label>
+  </div>
+
+  {#if availableProvisioningWorkers.length === 0}
+    <p class="muted mt-3 rounded-xl border border-amber-300/40 bg-amber-50 p-3 text-sm dark:bg-amber-950/30">
+      {provisioningLoading
+        ? 'Memeriksa worker yang online dan aman...'
+        : 'Tidak ada worker online dengan transport aman. Worker remote perlu URL HTTPS.'}
+      <button class="button secondary ml-2 !px-3 !py-2" onclick={loadProvisioningWorkers} disabled={provisioningLoading}>Muat ulang</button>
+    </p>
+  {/if}
+
+  <div class="mt-4 grid grid-cols-2 gap-2 rounded-xl bg-[var(--panel-strong)] p-1">
+    <button class:active={provisioningMode === 'upload'} class="rounded-lg px-3 py-2 text-sm font-bold" onclick={() => provisioningMode = 'upload'}><Upload size={15} class="mr-1 inline"/>Upload ZIP</button>
+    <button class:active={provisioningMode === 'login'} class="rounded-lg px-3 py-2 text-sm font-bold" onclick={() => provisioningMode = 'login'}><KeyRound size={15} class="mr-1 inline"/>Login TDL</button>
+  </div>
+
+  {#if provisioningMode === 'upload'}
+    <div class="mt-4 space-y-3">
+      <label class="block text-sm font-bold">
+        ZIP berisi folder <code>.tdl/</code>
+        <input class="field mt-2" type="file" accept=".zip,application/zip" onchange={(event) => profileArchive = (event.currentTarget as HTMLInputElement).files?.[0] || null}/>
+      </label>
+      <p class="muted text-xs">Maksimum 128 MiB. Sesi dipasang terpisah pada lane Download dan Export di worker terpilih.</p>
+      <button class="button w-full sm:w-auto" onclick={submitProfileArchive} disabled={savingProvisioning || !profileArchive || !profileName.trim() || !provisioningWorker}>
+        <Upload size={16}/>{savingProvisioning ? 'Memvalidasi...' : 'Validasi dan simpan lokal'}
+      </button>
+    </div>
+  {:else}
+    <div class="mt-4 space-y-3">
+      <div class="grid grid-cols-2 gap-2">
+        <button class:active={loginMethod === 'qr'} class="button secondary justify-center" onclick={() => loginMethod = 'qr'}>QR</button>
+        <button class:active={loginMethod === 'code'} class="button secondary justify-center" onclick={() => loginMethod = 'code'}>Nomor dan kode</button>
+      </div>
+      {#if loginMethod === 'code'}
+        <label class="block text-sm font-bold">Nomor telepon Telegram<input class="field mt-2" bind:value={loginPhone} type="tel" autocomplete="tel" placeholder="+62..."/></label>
+      {/if}
+      <button class="button w-full sm:w-auto" onclick={startProfileLogin} disabled={savingProvisioning || !profileName.trim() || !provisioningWorker || (loginMethod === 'code' && !loginPhone.trim())}>
+        <KeyRound size={16}/>{savingProvisioning ? 'Menyiapkan...' : 'Mulai login TDL'}
+      </button>
+    </div>
+  {/if}
+
+  {#if provisioningNotice}<p class="mt-3 text-sm text-violet-700 dark:text-violet-200" role="status">{provisioningNotice}</p>{/if}
+  {#if provisioningFailure}<p class="mt-3 text-sm text-rose-600" role="alert">{provisioningFailure}</p>{/if}
+
+  {#if provisioningOperation}
+    <article class="mt-5 rounded-2xl border border-violet-300/50 bg-violet-50/50 p-4 dark:bg-violet-950/20" aria-label={`Penambahan profil ${provisioningOperation.profile}`}>
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <p class="text-xs font-bold uppercase tracking-wider text-violet-600">Profil {provisioningOperation.profile}{#if provisioningOperation.bootstrap_worker} · {provisioningOperation.bootstrap_worker}{/if}</p>
+          <p class="mt-1 font-bold">{provisioningStatusLabels[provisioningOperation.status] || provisioningOperation.status}</p>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <a class="button secondary !px-3 !py-2" href={`/api/v1/profiles/provisionings/${encodeURIComponent(provisioningOperation.id)}/logs?limit=500`} target="_blank" rel="noreferrer">Log JSON</a>
+          <button class="button secondary !px-3 !py-2" onclick={() => refreshProvisioningOperation(provisioningOperation!.id)} disabled={savingProvisioning} aria-label="Perbarui status penambahan profil"><RefreshCw size={15}/>Perbarui status</button>
+          {#if provisioningOperation.status !== 'active' && provisioningOperation.status !== 'cancelled'}
+            <button class="button secondary !px-3 !py-2" onclick={cancelProfileProvisioning} disabled={savingProvisioning}><X size={15}/>Batalkan</button>
+          {/if}
+        </div>
+      </div>
+      {#if provisioningOperation.login && provisioningOperation.status === 'authenticating'}
+        <div class="mt-4 space-y-3">
+          {#if provisioningOperation.login.step === 'qr'}
+            <p class="muted text-sm">Pindai QR dengan Telegram pada perangkat yang ingin ditambahkan.</p>
+            <pre class="qr-screen overflow-x-auto rounded-xl bg-slate-950 p-4 text-center font-mono text-[9px] leading-[.85] text-white">{provisioningOperation.login.qr_text || 'Menunggu QR dari worker...'}</pre>
+          {:else if provisioningOperation.login.step === 'code' || provisioningOperation.login.step === 'password'}
+            <label class="block text-sm font-bold">
+              {provisioningOperation.login.step === 'password' ? 'Password 2FA' : 'Kode Telegram'}
+              <input class="field mt-2" bind:value={loginInput} type={provisioningOperation.login.step === 'password' ? 'password' : 'text'} autocomplete="one-time-code"/>
+            </label>
+            <button class="button" onclick={submitLoginInput} disabled={savingProvisioning || !loginInput.trim()}>
+              {provisioningOperation.login.step === 'password' ? 'Kirim password 2FA' : 'Kirim kode'}
+            </button>
+          {:else}
+            <p class="muted text-sm">Menunggu prompt login dari worker...</p>
+          {/if}
+          {#if provisioningOperation.login.error}<p class="text-sm text-rose-600">{provisioningOperation.login.error}</p>{/if}
+        </div>
+      {/if}
+      {#if provisioningOperation.status === 'validating'}<p class="muted mt-3 text-sm">Worker sedang memvalidasi sesi. Perbarui status untuk melihat hasilnya.</p>{/if}
+      {#if provisioningOperation.error}<p class="mt-3 text-sm text-rose-600">{provisioningOperation.error}</p>{/if}
+      {#if provisioningOperation.workers.length}
+        <div class="mt-3 grid gap-2 sm:grid-cols-2">
+          {#each provisioningOperation.workers as worker (worker.worker)}
+            <p class="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-2 text-sm">{worker.worker} · {worker.status}{#if worker.error}: {worker.error}{/if}</p>
+          {/each}
+        </div>
+      {/if}
+    </article>
+  {/if}
+</section>
 
 <section class="card mt-7 p-5 sm:p-6" aria-labelledby="local-profiles-target">
   <div class="flex flex-wrap items-end gap-3">

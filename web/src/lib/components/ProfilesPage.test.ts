@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import ProfilesPage from './ProfilesPage.svelte';
 
 describe('ProfilesPage', () => {
@@ -8,6 +8,96 @@ describe('ProfilesPage', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it('starts a new profile login from the profile menu and displays the QR prompt', async () => {
+    const requests: { url: string; method: string; body?: string }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined });
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true, selected: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/management') {
+        return new Response(JSON.stringify({ items: [], workers: [
+          { name: 'local', enabled: true, online: true, secure: true }
+        ] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/provisionings/login' && method === 'POST') {
+        return new Response(JSON.stringify({ id: 'login-1', status: 'authenticating' }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/provisionings/login-1') {
+        return new Response(JSON.stringify({
+          id: 'login-1', profile: 'new-profile', source: 'login', status: 'authenticating', workers: [],
+          login: { status: 'waiting', step: 'qr', qr_text: 'LOCAL-QR-CONTENT' }
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const provisioningWorker = screen.getByRole('combobox', { name: 'Worker untuk menyiapkan sesi' });
+    await waitFor(() => expect(provisioningWorker.querySelector('option[value="local"]')).toBeTruthy());
+    await fireEvent.input(await screen.findByRole('textbox', { name: 'Nama profil' }), { target: { value: 'new-profile' } });
+    await fireEvent.change(provisioningWorker, { target: { value: 'local' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Login TDL' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Mulai login TDL' }));
+
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/provisionings/login',
+      method: 'POST',
+      body: JSON.stringify({ name: 'new-profile', worker: 'local', method: 'qr', phone: '', local_only: true })
+    });
+    expect(await screen.findByText('LOCAL-QR-CONTENT')).toBeTruthy();
+    expect(screen.getByText('Pindai QR dengan Telegram pada perangkat yang ingin ditambahkan.')).toBeTruthy();
+  });
+
+  it('uploads a new profile only to the selected worker', async () => {
+    const requests: { url: string; method: string }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method });
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true, selected: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/management') {
+        return new Response(JSON.stringify({ items: [], workers: [
+          { name: 'local', enabled: true, online: true, secure: true }
+        ] }), { status: 200 });
+      }
+      if (url.startsWith('/api/v1/profiles/provisionings/upload?') && method === 'POST') {
+        return new Response(JSON.stringify({ id: 'upload-1', status: 'distributing' }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/provisionings/upload-1') {
+        return new Response(JSON.stringify({
+          id: 'upload-1', profile: 'archive-profile', source: 'local_upload', status: 'distributing',
+          workers: [{ worker: 'local', status: 'installing' }]
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    const { container } = render(ProfilesPage);
+
+    const provisioningWorker = screen.getByRole('combobox', { name: 'Worker untuk menyiapkan sesi' });
+    await waitFor(() => expect(provisioningWorker.querySelector('option[value="local"]')).toBeTruthy());
+    await fireEvent.input(await screen.findByRole('textbox', { name: 'Nama profil' }), { target: { value: 'archive-profile' } });
+    await fireEvent.change(provisioningWorker, { target: { value: 'local' } });
+    const archiveInput = container.querySelector('input[type="file"]');
+    expect(archiveInput).toBeTruthy();
+    await fireEvent.change(archiveInput!, {
+      target: { files: [new File(['session'], 'profile.zip', { type: 'application/zip' })] }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Validasi dan simpan lokal' }));
+
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/provisionings/upload?name=archive-profile&worker=local&local_only=true',
+      method: 'POST'
+    });
+    expect(await screen.findByText('Memasang sesi pada worker terpilih')).toBeTruthy();
   });
 
   it('scans local profiles only after selecting a worker and pressing Scan', async () => {

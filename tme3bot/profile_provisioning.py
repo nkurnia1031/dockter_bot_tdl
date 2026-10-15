@@ -25,6 +25,7 @@ from tme3bot.names import normalize_profile_name
 
 MAX_SESSION_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_PROFILE_BUNDLE_BYTES = 300 * 1024 * 1024
+LOCAL_ONLY_PROVISIONING_SOURCES = frozenset({"local_upload", "local_login"})
 _PROFILE_LOGIN_TTL_SECONDS = 15 * 60
 _PHONE_RE = re.compile(r"^[+0-9(). -]{4,32}$")
 
@@ -807,6 +808,40 @@ class ProfileProvisioningStore:
             db.execute("DELETE FROM profile_sessions WHERE profile=?", (str(profile),))
         return True
 
+    def discard_local_provisioning_bundle(self, profile: str, operation_id: str) -> bool:
+        """Discard temporary encrypted staging after a local-only install succeeds."""
+        with self._lock, self._db() as db:
+            operation = db.execute(
+                "SELECT source,status FROM profile_provisionings WHERE id=? AND profile=?",
+                (str(operation_id), str(profile)),
+            ).fetchone()
+            if operation is None or str(operation["source"]) not in LOCAL_ONLY_PROVISIONING_SOURCES:
+                return False
+            if str(operation["status"]) != "active":
+                return False
+            pending = db.execute(
+                "SELECT 1 FROM profile_distributions WHERE profile=? AND provisioning_id=? AND status!='ready' LIMIT 1",
+                (str(profile), str(operation_id)),
+            ).fetchone()
+            if pending is not None:
+                return False
+            db.execute("DELETE FROM profile_session_revisions WHERE profile=?", (str(profile),))
+            db.execute("DELETE FROM profile_sessions WHERE profile=?", (str(profile),))
+        return True
+
+    def completed_local_provisioning_staging(self) -> list[dict[str, Any]]:
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT p.id,p.profile,s.telegram_user_id FROM profile_provisionings p "
+                "JOIN profile_sessions s ON s.profile=p.profile "
+                "WHERE p.source IN ('local_upload','local_login') AND p.status='active' "
+                "ORDER BY p.updated_at"
+            ).fetchall()
+        return [
+            {"id": str(row["id"]), "profile": str(row["profile"]), "telegram_user_id": int(row["telegram_user_id"])}
+            for row in rows
+        ]
+
     def bundle(self, profile: str) -> tuple[int, bytes] | None:
         with self._db() as db:
             row = db.execute(
@@ -1352,7 +1387,8 @@ class ProfileProvisioningStore:
         now = _now()
         with self._db() as db:
             rows = db.execute(
-                "SELECT profile,desired_revision FROM profile_sessions WHERE active=1 OR source!='adoption'"
+                "SELECT profile,desired_revision FROM profile_sessions "
+                "WHERE (active=1 OR source!='adoption') AND source NOT IN ('local_upload','local_login')"
             ).fetchall()
             for row in rows:
                 db.execute(
@@ -1418,6 +1454,7 @@ class ProfileProvisioningService:
         if self._thread is not None:
             return
         self.store.recover_interrupted_distributions()
+        self._recover_completed_local_provisioning()
         self._wake.set()
         self._thread = threading.Thread(target=self._loop, name="profile-provisioning", daemon=True)
         self._thread.start()
@@ -1445,6 +1482,40 @@ class ProfileProvisioningService:
             self._process_once()
         finally:
             self._processing_lock.release()
+
+    def _recover_completed_local_provisioning(self) -> None:
+        """Finish cleanup if a restart interrupted a confirmed local install."""
+        for operation in self.store.completed_local_provisioning_staging():
+            operation_id = str(operation["id"])
+            profile = str(operation["profile"])
+            info = self.store.provisioning(operation_id) or {}
+            for item in info.get("workers", []):
+                if str(item.get("status") or "") != "ready":
+                    continue
+                try:
+                    self.dispatcher.commit_profile_bundle(
+                        str(item["worker"]), profile, operation_id
+                    )
+                except Exception:
+                    pass
+            try:
+                self._register_local_profile(
+                    profile,
+                    int(operation["telegram_user_id"]),
+                    str(info.get("bootstrap_worker") or ""),
+                )
+            except Exception:
+                continue
+            self.store.discard_local_provisioning_bundle(profile, operation_id)
+
+    def _register_local_profile(self, profile: str, user_id: int, worker: str) -> None:
+        """Register identity and default routing for a one-worker profile."""
+        set_worker_route = getattr(self.profile_manager, "set_worker_route", None)
+        if not callable(set_worker_route):
+            raise RuntimeError("Profile manager tidak mendukung route worker per profil.")
+        with self._lock:
+            self.profile_manager.profile_registry.register(profile, user_id)
+            set_worker_route(profile, worker)
 
     def _complete_login(self, operation_id: str) -> None:
         info = self.store.provisioning(operation_id)
@@ -1617,6 +1688,7 @@ class ProfileProvisioningService:
             )
 
     def _process_once(self) -> None:
+        self._recover_completed_local_provisioning()
         for operation in self.store.pending_operations():
             if operation["status"] == "validating":
                 try:
@@ -1763,9 +1835,20 @@ class ProfileProvisioningService:
                     item["status"] == "ready" for item in info["workers"]
                 ):
                     profile_name, user_id = self.store.mark_active(operation_id)
-                    self._operation_log(operation_id, "distribution_complete", "PROFILE_DISTRIBUTED")
+                    local_only = str(info.get("source") or "") in LOCAL_ONLY_PROVISIONING_SOURCES
+                    self._operation_log(
+                        operation_id,
+                        "local_install_complete" if local_only else "distribution_complete",
+                        "LOCAL_PROFILE_INSTALLED" if local_only else "PROFILE_DISTRIBUTED",
+                        worker=str(info.get("bootstrap_worker") or "") if local_only else None,
+                    )
                     with self._lock:
-                        self.profile_manager.profile_registry.register_vaulted(profile_name, user_id)
+                        if local_only:
+                            self._register_local_profile(
+                                profile_name, user_id, str(info.get("bootstrap_worker") or "")
+                            )
+                        else:
+                            self.profile_manager.profile_registry.register_vaulted(profile_name, user_id)
                     for item in info["workers"]:
                         commit_run_id = uuid.uuid4().hex
                         current_revision = self.store.desired_revision(profile_name)
@@ -1812,12 +1895,18 @@ class ProfileProvisioningService:
                             # Installation was already confirmed. A later
                             # idempotent sync can clean up a stale backup.
                             pass
+                    if local_only:
+                        self.store.discard_local_provisioning_bundle(profile_name, operation_id)
 
     def ready(self, profile: str, worker: str) -> bool:
         return self.store.distribution_ready(profile, worker)
 
     def profiles(self, actor_user_id: int | None = None) -> list[dict[str, Any]]:
-        managed = {item["name"]: item for item in self.store.list_profiles()}
+        managed = {
+            item["name"]: item
+            for item in self.store.list_profiles()
+            if str(item.get("source") or "") not in LOCAL_ONLY_PROVISIONING_SOURCES
+        }
         operations = self.store.all_provisionings()
         latest_operations: list[dict[str, Any]] = []
         seen_operations: set[str] = set()
@@ -1857,6 +1946,17 @@ class ProfileProvisioningService:
                 current = next(item for item in output if item["name"] == name)
                 if operation["updated_at"] >= current.get("updated_at", ""):
                     if actor_user_id is None or int(operation.get("actor_user_id", -1)) == int(actor_user_id):
+                        if str(operation.get("source") or "") in LOCAL_ONLY_PROVISIONING_SOURCES:
+                            details = self.store.provisioning(str(operation["id"])) or {}
+                            current.update({
+                                "source": str(operation["source"]),
+                                "status": str(operation["status"]),
+                                "vault": False,
+                                "operation_id": str(operation["id"]),
+                                "bootstrap_worker": str(details.get("bootstrap_worker") or ""),
+                                "workers": details.get("workers", []),
+                            })
+                            continue
                         if (
                             str(operation.get("source")) == "adoption"
                             and str(operation.get("status")) == "stored"
@@ -1897,33 +1997,56 @@ class ProfileProvisioningService:
             known.add(name)
         return output
 
-    def _validate_new(self, name: str, bootstrap_worker: str) -> str:
+    def _validate_new(self, name: str, bootstrap_worker: str, *, local_only: bool = False) -> str:
         requested = str(name or "").strip().lower()
         profile = normalize_profile_name(name)
         if not profile or profile != requested or profile == self.profile_manager.default_profile:
             raise ValueError("Nama profil tidak valid atau merupakan profil default.")
         if profile in self.profile_manager.list_profiles():
             raise FileExistsError("Nama profil sudah terdaftar.")
-        if self.worker_registry.get(bootstrap_worker) is None:
+        worker = self.worker_registry.get(bootstrap_worker)
+        if worker is None:
             raise KeyError(bootstrap_worker)
+        if local_only and not profile_transfer_is_secure(str(worker.get("url") or "")):
+            raise ValueError("Worker remote harus memakai URL HTTPS untuk menerima sesi.")
         if not self.worker_registry.names():
             raise RuntimeError("Belum ada worker terdaftar untuk menyiapkan profil.")
         return profile
 
-    def upload(self, name: str, worker: str, data: bytes, actor_user_id: int) -> str:
-        profile = self._validate_new(name, worker)
+    def _ensure_local_profile_absent(self, profile: str, worker: str) -> None:
+        inventory_reader = getattr(self.dispatcher, "profile_local_inventory", None)
+        if not callable(inventory_reader):
+            raise RuntimeError("Worker belum dapat memastikan inventaris profil lokal.")
+        inventory = inventory_reader(worker)
+        items = inventory.get("items") if isinstance(inventory, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("Inventaris profil lokal worker tidak dapat dipastikan.")
+        if any(
+            isinstance(item, dict)
+            and str(item.get("name") or "").strip().lower() == profile
+            for item in items
+        ):
+            raise FileExistsError("Nama profil sudah ada pada worker terpilih.")
+
+    def upload(
+        self, name: str, worker: str, data: bytes, actor_user_id: int, *, local_only: bool = False
+    ) -> str:
+        profile = self._validate_new(name, worker, local_only=local_only)
         session = extract_single_session(data)
         user_id = int(self.dispatcher.validate_profile_session(worker, data))
         if self.profile_manager.profile_registry.profile_for_user(user_id) is not None:
             raise ValueError("Akun Telegram tersebut sudah terdaftar pada profil lain.")
         with self._lock:
-            profile = self._validate_new(profile, worker)
+            profile = self._validate_new(profile, worker, local_only=local_only)
+            if local_only:
+                self._ensure_local_profile_absent(profile, worker)
             if self.profile_manager.profile_registry.profile_for_user(user_id) is not None:
                 raise ValueError("Akun Telegram tersebut sudah terdaftar pada profil lain.")
-            targets = self.worker_registry.names()
+            targets = [worker] if local_only else self.worker_registry.names()
             if not targets:
                 raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
-            operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source="upload", target_workers=targets)
+            source = "local_upload" if local_only else "upload"
+            operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source=source, target_workers=targets)
             try:
                 self.store.store_bundle(operation_id, user_id, build_profile_bundle(session, user_id))
             except Exception:
@@ -1932,8 +2055,11 @@ class ProfileProvisioningService:
         self._wake.set()
         return operation_id
 
-    def start_login(self, name: str, worker: str, method: str, phone: str | None, actor_user_id: int) -> str:
-        profile = self._validate_new(name, worker)
+    def start_login(
+        self, name: str, worker: str, method: str, phone: str | None, actor_user_id: int,
+        *, local_only: bool = False,
+    ) -> str:
+        profile = self._validate_new(name, worker, local_only=local_only)
         selected_method = method.strip().lower()
         if selected_method not in {"qr", "code"}:
             raise ValueError("Metode login harus qr atau code.")
@@ -1944,11 +2070,14 @@ class ProfileProvisioningService:
         else:
             phone_value = ""
         with self._lock:
-            profile = self._validate_new(profile, worker)
-            targets = self.worker_registry.names()
+            profile = self._validate_new(profile, worker, local_only=local_only)
+            if local_only:
+                self._ensure_local_profile_absent(profile, worker)
+            targets = [worker] if local_only else self.worker_registry.names()
             if not targets:
                 raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
-            operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source="login", method=selected_method, target_workers=targets)
+            source = "local_login" if local_only else "login"
+            operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source=source, method=selected_method, target_workers=targets)
         try:
             self.dispatcher.start_profile_login(worker, operation_id, selected_method, phone_value)
         except Exception:

@@ -76,9 +76,14 @@ class FakeProfileManager:
     def __init__(self, root: Path):
         self.default_profile = "default"
         self.profile_registry = ProfileRegistry(root / "profiles.json", "default")
+        self.worker_routes = {}
 
     def list_profiles(self):
         return self.profile_registry.names()
+
+    def set_worker_route(self, profile, worker):
+        self.worker_routes[profile] = worker
+        return worker
 
 
 class FakeProfileDispatcher:
@@ -98,6 +103,9 @@ class FakeProfileDispatcher:
                 {"name": "user1_session", "ready": True, "code": "PROFILE_USER1_SESSION_READY"},
             ],
         }
+
+    def profile_local_inventory(self, worker):
+        return {"worker": worker, "items": []}
 
     def validate_profile_session(self, worker, data):
         return 987654
@@ -141,6 +149,67 @@ class MutableWorkerRegistry(FakeWorkerRegistry):
 
 
 class ProfileProvisioningTests(unittest.TestCase):
+    def test_local_profile_upload_installs_only_on_selected_worker_and_discards_vault_staging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = FakeProfileManager(root)
+            workers = MutableWorkerRegistry()
+            workers.workers["local"]["url"] = "http://127.0.0.1:8080"
+            dispatcher = FakeProfileDispatcher()
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            service = ProfileProvisioningService(store, manager, workers, dispatcher)
+
+            operation_id = service.upload(
+                "archive", "local", single_session_zip(), 42, local_only=True
+            )
+            queued = store.provisioning(operation_id)
+            self.assertEqual(queued["source"], "local_upload")
+            self.assertEqual([item["worker"] for item in queued["workers"]], ["local"])
+
+            service.process_once()
+
+            completed = store.provisioning(operation_id)
+            self.assertEqual(completed["status"], "active")
+            self.assertEqual([item["worker"] for item in completed["workers"]], ["local"])
+            self.assertEqual(set(dispatcher.installed), {("archive", "local")})
+            self.assertEqual(manager.profile_registry.profile_for_user(987654), "archive")
+            self.assertEqual(manager.worker_routes["archive"], "local")
+            self.assertFalse(store.is_vaulted("archive"))
+            local_profiles = service.profiles(42)
+            archive = next(item for item in local_profiles if item["name"] == "archive")
+            self.assertFalse(archive["vault"])
+            self.assertEqual(archive["source"], "local_upload")
+
+    def test_local_profile_login_installs_only_on_selected_worker_without_keeping_vault_bundle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = FakeProfileManager(root)
+            workers = MutableWorkerRegistry()
+            dispatcher = FakeProfileDispatcher()
+            dispatcher.login_state_value = {"status": "ready"}
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            service = ProfileProvisioningService(store, manager, workers, dispatcher)
+
+            operation_id = service.start_login(
+                "login-profile", "local", "qr", "", 42, local_only=True
+            )
+            self.assertEqual(
+                [item["worker"] for item in store.provisioning(operation_id)["workers"]],
+                ["local"],
+            )
+            state = service.operation(operation_id, 42)
+            self.assertEqual(state["status"], "validating")
+
+            service.process_once()
+
+            completed = store.provisioning(operation_id)
+            self.assertEqual(completed["status"], "active")
+            self.assertEqual([item["worker"] for item in completed["workers"]], ["local"])
+            self.assertEqual(set(dispatcher.installed), {("login-profile", "local")})
+            self.assertEqual(manager.profile_registry.profile_for_user(987654), "login-profile")
+            self.assertEqual(manager.worker_routes["login-profile"], "local")
+            self.assertFalse(store.is_vaulted("login-profile"))
+
     def test_local_profile_delete_removes_the_complete_validated_tree_and_protects_default(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

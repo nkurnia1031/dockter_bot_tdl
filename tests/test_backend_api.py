@@ -334,12 +334,12 @@ class FakeProfileProvisioner:
         del actor_user_id
         return [{"name": "default", "active": True, "status": "legacy", "vault": False, "workers": []}]
 
-    def upload(self, name, worker, data, actor_user_id):
-        self.uploaded = (name, worker, data, actor_user_id)
+    def upload(self, name, worker, data, actor_user_id, *, local_only=False):
+        self.uploaded = (name, worker, data, actor_user_id, local_only)
         return "operation-upload"
 
-    def start_login(self, name, worker, method, phone, actor_user_id):
-        self.login = (name, worker, method, phone, actor_user_id)
+    def start_login(self, name, worker, method, phone, actor_user_id, *, local_only=False):
+        self.login = (name, worker, method, phone, actor_user_id, local_only)
         return "operation-login"
 
     def operation(self, operation_id, actor_user_id):
@@ -1432,23 +1432,25 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(denied.status_code, 401)
 
         uploaded = self.client.post(
-            "/api/v1/profiles/provisionings/upload?name=novel&worker=local",
+            "/api/v1/profiles/provisionings/upload?name=novel&worker=local&local_only=true",
             content=b"session-zip",
             headers={**headers, "content-type": "application/zip"},
         )
         self.assertEqual(uploaded.status_code, 200)
         self.assertEqual(uploaded.json(), {"id": "operation-upload", "status": "distributing"})
         self.assertEqual(provisioner.uploaded[:3], ("novel", "local", b"session-zip"))
+        self.assertTrue(provisioner.uploaded[4])
 
         secret_phone = "+62 812 0000 9999"
         started = self.client.post(
             "/api/v1/profiles/provisionings/login",
             headers=headers,
-            json={"name": "novel", "worker": "local", "method": "code", "phone": secret_phone},
+            json={"name": "novel", "worker": "local", "method": "code", "phone": secret_phone, "local_only": True},
         )
         self.assertEqual(started.status_code, 200)
         self.assertNotIn(secret_phone, started.text)
         self.assertEqual(provisioner.login[3], secret_phone)
+        self.assertTrue(provisioner.login[5])
 
         state = self.client.get(
             "/api/v1/profiles/provisionings/operation-login", headers=headers

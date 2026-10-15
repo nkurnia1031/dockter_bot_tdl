@@ -744,7 +744,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             str(distribution.get("worker") or "")
             for profile in profile_items
             for distribution in profile.get("workers", [])
-            if isinstance(distribution, dict) and str(distribution.get("worker") or "")
+            if not str(profile.get("source") or "").startswith("local_")
+            and isinstance(distribution, dict)
+            and str(distribution.get("worker") or "")
         })
 
         def live_sync(name: str) -> tuple[str, dict[str, Any], str]:
@@ -767,6 +769,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
         allowed_runtime_statuses = {"ready", "sync_pending", "waiting_worker", "not_assigned"}
         for profile in profile_items:
+            if str(profile.get("source") or "").startswith("local_"):
+                continue
             profile_name = str(profile.get("name") or "")
             for distribution in profile.get("workers", []):
                 if not isinstance(distribution, dict):
@@ -827,6 +831,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         request: Request,
         name: str = Query(..., min_length=1, max_length=48),
         worker: str = Query(..., min_length=1, max_length=48),
+        local_only: bool = Query(False),
         actor=Depends(current_actor),
     ):
         provisioner = context.profile_provisioner
@@ -840,7 +845,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 raise DomainError("PROFILE_ARCHIVE_TOO_LARGE", "ZIP sesi melebihi batas 128 MiB.", status_code=413)
             chunks.append(chunk)
         try:
-            operation_id = provisioner.upload(name, worker, b"".join(chunks), actor.telegram_user_id)
+            operation_id = provisioner.upload(
+                name, worker, b"".join(chunks), actor.telegram_user_id, local_only=local_only
+            )
         except FileExistsError as exc:
             raise DomainError("PROFILE_EXISTS", str(exc), status_code=409) from exc
         except KeyError as exc:
@@ -856,6 +863,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         provisioner = context.profile_provisioner
         if provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        local_only = body.get("local_only", False)
+        if not isinstance(local_only, bool):
+            raise DomainError("PROFILE_SCOPE_INVALID", "Lingkup penyimpanan profil tidak valid.", status_code=422)
         try:
             operation_id = provisioner.start_login(
                 str(body.get("name") or ""),
@@ -863,6 +873,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 str(body.get("method") or ""),
                 str(body.get("phone") or ""),
                 actor.telegram_user_id,
+                local_only=local_only,
             )
         except FileExistsError as exc:
             raise DomainError("PROFILE_EXISTS", str(exc), status_code=409) from exc
