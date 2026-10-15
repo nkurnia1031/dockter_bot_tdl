@@ -52,13 +52,56 @@ describe('ProfilesPage', () => {
     expect(screen.getByText(/future_session.*Siap/)).toBeTruthy();
     expect(screen.getByRole('region', { name: 'Lane Upload irang' }).textContent).toMatch(/Lane Upload.*Siap/s);
     expect(screen.getByText(/Hasil scan.*remote-2/)).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Adopsi/ })).toBeNull();
+    expect(await screen.findByRole('button', { name: 'Adopsi profil irang dari remote-2 ke Vault' })).toBeTruthy();
     expect(requests).toContainEqual({ url: '/api/v1/workers/remote-2/profiles/scan', method: 'POST' });
 
     await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang worker' }));
     expect((await screen.findByRole('status')).textContent).toMatch(/hasil scan sebelumnya dihapus/i);
     expect(screen.queryByText('irang')).toBeNull();
     expect(requests.filter((item) => item.url.includes('/profiles/scan'))).toHaveLength(1);
+  });
+
+  it('adopts a verified local profile into Vault without triggering distribution', async () => {
+    const requests: { url: string; method: string; body?: string }[] = [];
+    const confirmation = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method, body: init?.body ? String(init.body) : undefined });
+      if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      if (url.endsWith('/profiles/scan')) return new Response(JSON.stringify({
+        worker: 'local', checked_at: '2026-10-15T00:00:00+00:00', items: [{
+          name: 'archive', ready: true, deletable: true, reason_codes: [], checks: [
+            { name: 'identity', ready: true, code: 'OK' },
+            { name: 'root_session', ready: true, code: 'OK' },
+            { name: 'user1_session', ready: true, code: 'OK' }
+          ], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' }
+        }], pending_identity_cleanup: []
+      }), { status: 200 });
+      if (url === '/api/v1/operations?limit=100') return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url === '/api/v1/profiles/management') return new Response(JSON.stringify({ items: [
+        { name: 'archive', vault: false, status: 'legacy' }
+      ] }), { status: 200 });
+      if (url === '/api/v1/profiles/archive/adopt' && method === 'POST') return new Response(JSON.stringify({ id: 'adopt-1', status: 'validating' }), { status: 200 });
+      if (url === '/api/v1/profiles/provisionings/adopt-1') return new Response(JSON.stringify({
+        id: 'adopt-1', profile: 'archive', source: 'adoption', status: 'stored', error: '', workers: []
+      }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    await screen.findByRole('option', { name: 'local' });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Adopsi profil archive dari local ke Vault' }));
+
+    expect(confirmation).toHaveBeenCalledWith(expect.stringContaining('worker lain tidak akan diubah'));
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/archive/adopt', method: 'POST', body: JSON.stringify({ worker: 'local' })
+    });
+    expect(await screen.findByText('Bundle tersimpan di Vault; belum didistribusikan')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Adopsi profil archive dari local ke Vault' })).toBeNull();
+    expect(requests.some((request) => /sync|distribut|install_profile_bundle/i.test(request.url))).toBe(false);
   });
 
   it('shows worker failure and retries only after the operator presses Scan again', async () => {

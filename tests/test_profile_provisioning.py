@@ -560,7 +560,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 store.store_bundle(operation, 456, bundle)
             self.assertIsNone(store.bundle("novel"))
 
-    def test_default_profile_can_be_adopted_and_distributed(self):
+    def test_default_profile_can_be_adopted_into_vault_without_distribution(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = ProfileProvisioningStore(root / "storage.db", root / "vault")
@@ -570,6 +570,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 FakeWorkerRegistry(),
                 FakeProfileDispatcher(),
             )
+            dispatcher = service.dispatcher
 
             default_profile = next(
                 item for item in service.profiles() if item["name"] == "default"
@@ -590,11 +591,24 @@ class ProfileProvisioningTests(unittest.TestCase):
                 self.assertEqual(archive.read("root/.tdl/data/default"), b"vault-session")
                 self.assertEqual(archive.read("user1/.tdl/data/default"), b"vault-session")
             info = store.provisioning(operation)
-            self.assertEqual(info["status"], "distributing")
-            self.assertEqual(
-                {item["worker"] for item in info["workers"]},
-                {"local", "remote-offline"},
+            self.assertEqual(info["status"], "stored")
+            self.assertEqual(info["workers"], [])
+            self.assertEqual(dispatcher.installed, {})
+            self.assertEqual(service.profiles(actor_user_id=42)[0]["status"], "stored")
+
+            busy_operation = store.begin(
+                profile="default", actor_user_id=42, bootstrap_worker="local",
+                source="upload", target_workers=["local"],
             )
+            with self.assertRaisesRegex(ValueError, "masih berjalan"):
+                service.delete_vault_bundle("default", 42)
+            store.fail(busy_operation, "test cleanup")
+
+            deleted = service.delete_vault_bundle("default", 42)
+            self.assertEqual(deleted["local_copies_unchanged"], True)
+            self.assertIsNone(store.bundle("default"))
+            self.assertEqual(service.profile_manager.profile_registry.profile_for_user(987654), "default")
+            self.assertEqual(service.profiles()[0]["vault"], False)
 
     def test_adoption_source_diagnostics_and_operation_logs_are_json_safe_and_actor_scoped(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -614,7 +628,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             owner_logs = store.provisioning_logs(operation_id, 42)
             self.assertTrue(owner_logs)
             self.assertIsNone(store.provisioning_logs(operation_id, 43))
-            self.assertIn("TARGET_INSTALL_READY", {item["code"] for item in owner_logs})
+            self.assertIn("BUNDLE_STORED", {item["code"] for item in owner_logs})
 
             store.append_diagnostic_log(
                 category="profile_export",
@@ -651,8 +665,9 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertEqual(store.provisioning(operation_id)["bootstrap_worker"], "local")
             self.assertEqual(store.provisioning(operation_id)["status"], "validating")
             service.process_once()
-            self.assertEqual(store.provisioning(operation_id)["status"], "distributing")
+            self.assertEqual(store.provisioning(operation_id)["status"], "stored")
             self.assertIsNotNone(store.bundle("default"))
+            self.assertEqual(store.provisioning(operation_id)["workers"], [])
 
     def test_profile_names_must_not_be_silently_rewritten(self):
         with tempfile.TemporaryDirectory() as temporary:

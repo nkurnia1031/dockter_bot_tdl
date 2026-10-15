@@ -51,4 +51,29 @@ describe('ProfileVaultPage', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang status Vault' }));
     expect(requests).toEqual(['/api/v1/profiles/management', '/api/v1/profiles/management']);
   });
+
+  it('deletes only the Vault bundle after explicit confirmation', async () => {
+    const requests: { url: string; method: string }[] = [];
+    const confirmation = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method });
+      if (url === '/api/v1/profiles/management') return new Response(JSON.stringify({
+        workers: [], items: [{ name: 'archive', active: true, status: 'active', vault: true, workers: [] }]
+      }), { status: 200 });
+      if (url === '/api/v1/profiles/archive/vault' && method === 'DELETE') return new Response(JSON.stringify({
+        deleted: true, profile: 'archive', local_copies_unchanged: true
+      }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfileVaultPage);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Hapus bundle archive dari Vault' }));
+
+    expect(confirmation).toHaveBeenCalledWith(expect.stringContaining('Sesi pada worker lokal tidak akan dihapus'));
+    expect(requests).toContainEqual({ url: '/api/v1/profiles/archive/vault', method: 'DELETE' });
+    expect(await screen.findByText('Bundle archive dihapus dari Vault. Sesi worker lokal tetap utuh.')).toBeTruthy();
+    expect(screen.getByText('Belum ada profil yang tersimpan di Vault.')).toBeTruthy();
+  });
 });

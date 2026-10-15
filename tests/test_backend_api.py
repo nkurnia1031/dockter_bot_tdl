@@ -327,6 +327,7 @@ class FakeProfileProvisioner:
     def __init__(self):
         self.uploaded = None
         self.login = None
+        self.delete_vault_call = None
         self.store = FakeDiagnosticStore()
 
     def profiles(self, actor_user_id=None):
@@ -379,6 +380,10 @@ class FakeProfileProvisioner:
     def adopt(self, profile, worker, actor_user_id):
         self.adopt_call = (profile, worker, actor_user_id)
         return "operation-adopt"
+
+    def delete_vault_bundle(self, profile, actor_user_id):
+        self.delete_vault_call = (profile, actor_user_id)
+        return {"deleted": True, "profile": profile, "local_copies_unchanged": True}
 
 
 class FakeDiagnosticStore:
@@ -1483,6 +1488,24 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(logs.status_code, 200, logs.text)
         self.assertEqual(logs.json()["items"][0]["worker"], "local")
         self.assertEqual(logs.json()["items"][0]["code"], "PROFILE_SOURCE_READY")
+
+    def test_vault_bundle_delete_requires_authentication_and_preserves_local_copy_contract(self):
+        headers = self.login()
+        provisioner = FakeProfileProvisioner()
+        self.context.profile_provisioner = provisioner
+
+        denied = self.client.delete("/api/v1/profiles/default/vault")
+        self.assertEqual(denied.status_code, 401)
+
+        response = self.client.delete("/api/v1/profiles/default/vault", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "deleted": True,
+            "profile": "default",
+            "local_copies_unchanged": True,
+        })
+        self.assertEqual(provisioner.delete_vault_call, ("default", 42))
 
     def test_profile_management_uses_fast_worker_health_check(self):
         headers = self.login()

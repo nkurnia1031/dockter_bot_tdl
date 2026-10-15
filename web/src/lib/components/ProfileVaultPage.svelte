@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
-  import { CircleAlert, RefreshCw, ShieldCheck } from '@lucide/svelte';
+  import { CircleAlert, RefreshCw, ShieldCheck, Trash2 } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; online: boolean; secure: boolean };
   type WorkerState = {
@@ -24,11 +24,13 @@
   let workers = $state<Worker[]>([]);
   let loading = $state(false);
   let failure = $state('');
+  let notice = $state('');
   let checkedAt = $state('');
+  let deletingProfile = $state('');
 
   const workerByName = $derived(new Map(workers.map((worker) => [worker.name, worker])));
   const statusLabel = (status: string) => ({
-    ready: 'Siap', waiting: 'Menunggu', waiting_worker: 'Menunggu worker', sync_pending: 'Belum tersinkron',
+    ready: 'Siap', stored: 'Tersimpan di Vault', waiting: 'Menunggu', waiting_worker: 'Menunggu worker', sync_pending: 'Belum tersinkron',
     not_assigned: 'Belum ditugaskan', worker_unavailable: 'Worker tidak terjangkau', worker_update_required: 'Perlu diperbarui',
     failed: 'Gagal', unavailable: 'Tidak tersedia'
   } as Record<string, string>)[status] || status || 'Belum diperiksa';
@@ -77,6 +79,25 @@
     }
   }
 
+  async function deleteBundle(profile: Profile) {
+    if (deletingProfile) return;
+    if (typeof window !== 'undefined' && !window.confirm(`Hapus bundle terenkripsi "${profile.name}" dari Vault? Sesi pada worker lokal tidak akan dihapus atau diubah.`)) return;
+    deletingProfile = profile.name;
+    failure = '';
+    notice = '';
+    try {
+      await api(`/profiles/${encodeURIComponent(profile.name)}/vault`, { method: 'DELETE' });
+      profiles = profiles.map((item) => item.name === profile.name
+        ? { ...item, vault: false, status: 'legacy', workers: [], error: undefined }
+        : item);
+      notice = `Bundle ${profile.name} dihapus dari Vault. Sesi worker lokal tetap utuh.`;
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Bundle ${profile.name} gagal dihapus dari Vault.`;
+    } finally {
+      deletingProfile = '';
+    }
+  }
+
   onMount(() => { void load(); });
 </script>
 
@@ -101,6 +122,9 @@
     <CircleAlert size={17} class="mt-0.5 shrink-0"/>{failure}
   </div>
 {/if}
+{#if notice}
+  <p class="mt-5 text-sm text-violet-700 dark:text-violet-200" role="status">{notice}</p>
+{/if}
 
 <section class="card mt-6 p-5 sm:p-6" aria-label="Status Vault">
   <div class="flex flex-wrap items-center justify-between gap-3">
@@ -123,7 +147,12 @@
           <article class="rounded-2xl border border-[var(--line)] bg-[var(--panel-strong)] p-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <h3 class="font-extrabold">{profile.name}</h3>
-              <span class="badge">{statusLabel(profile.status)}</span>
+              <div class="flex items-center gap-2">
+                <span class="badge">{statusLabel(profile.status)}</span>
+                <button class="button secondary" onclick={() => deleteBundle(profile)} disabled={Boolean(deletingProfile)} aria-label={`Hapus bundle ${profile.name} dari Vault`}>
+                  <Trash2 size={15}/>{deletingProfile === profile.name ? 'Menghapus...' : 'Hapus dari Vault'}
+                </button>
+              </div>
             </div>
             {#if profile.error}<p class="mt-2 text-sm text-rose-600">{profile.error}</p>{/if}
             {#if profile.workers.length === 0}
@@ -153,5 +182,5 @@
     {/if}
   {/if}
 
-  <p class="muted mt-5 flex items-start gap-2 text-xs"><ShieldCheck size={15} class="mt-0.5 shrink-0 text-emerald-600"/>Pemeriksaan status tidak mengubah sesi. Upload, adopsi, atau distribusi Vault belum tersedia di sini sampai transfer bundle melalui channel backup siap.</p>
+  <p class="muted mt-5 flex items-start gap-2 text-xs"><ShieldCheck size={15} class="mt-0.5 shrink-0 text-emerald-600"/>Menghapus bundle hanya mengosongkan Vault; sesi pada worker lokal tetap ada. Adopsi dimulai dari card Profil lokal, sedangkan distribusi adalah operasi terpisah.</p>
 </section>

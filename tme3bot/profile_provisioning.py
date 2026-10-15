@@ -760,21 +760,52 @@ class ProfileProvisioningStore:
                 )
             except sqlite3.IntegrityError as exc:
                 raise FileExistsError("Akun Telegram tersebut sudah terdaftar pada profil lain.") from exc
-            db.execute(
-                "UPDATE profile_distributions SET status='waiting',error=NULL,desired_revision=?,installed_revision=NULL,installed_sha256=NULL,installed_telegram_user_id=NULL,sync_requested=0,updated_at=? WHERE profile=?",
-                (revision, now, profile),
-            )
+            is_adoption = str(row["source"]) == "adoption"
+            if not is_adoption:
+                db.execute(
+                    "UPDATE profile_distributions SET status='waiting',error=NULL,desired_revision=?,installed_revision=NULL,installed_sha256=NULL,installed_telegram_user_id=NULL,sync_requested=0,updated_at=? WHERE profile=?",
+                    (revision, now, profile),
+                )
             db.execute(
                 "DELETE FROM profile_legacy_candidates WHERE profile=?", (profile,)
             )
+            if not is_adoption:
+                db.execute(
+                    "UPDATE profile_sync_requests SET desired_revision=?,status='pending',updated_at=? WHERE profile=? AND status='pending'",
+                    (revision, now, profile),
+                )
             db.execute(
-                "UPDATE profile_sync_requests SET desired_revision=?,status='pending',updated_at=? WHERE profile=? AND status='pending'",
-                (revision, now, profile),
+                "UPDATE profile_provisionings SET telegram_user_id=?,status=?,error=NULL,updated_at=? WHERE id=?",
+                (int(user_id), "stored" if is_adoption else "distributing", now, operation_id),
             )
-            db.execute(
-                "UPDATE profile_provisionings SET telegram_user_id=?,status='distributing',error=NULL,updated_at=? WHERE id=?",
-                (int(user_id), now, operation_id),
-            )
+
+    def delete_bundle(self, profile: str) -> bool:
+        """Remove only the encrypted Vault copy; worker-local sessions are untouched."""
+        with self._lock, self._db() as db:
+            exists = db.execute(
+                "SELECT 1 FROM profile_sessions WHERE profile=?", (str(profile),)
+            ).fetchone()
+            if exists is None:
+                return False
+            active = db.execute(
+                "SELECT 1 FROM profile_provisionings WHERE profile=? "
+                "AND status IN ('authenticating','validating','distributing') LIMIT 1",
+                (str(profile),),
+            ).fetchone()
+            installing = db.execute(
+                "SELECT 1 FROM profile_distributions WHERE profile=? AND status='installing' LIMIT 1",
+                (str(profile),),
+            ).fetchone()
+            pending_sync = db.execute(
+                "SELECT 1 FROM profile_sync_requests WHERE profile=? AND status='pending' LIMIT 1",
+                (str(profile),),
+            ).fetchone()
+            if active or installing or pending_sync:
+                raise ValueError("Operasi Vault profil masih berjalan.")
+            db.execute("DELETE FROM profile_distributions WHERE profile=?", (str(profile),))
+            db.execute("DELETE FROM profile_session_revisions WHERE profile=?", (str(profile),))
+            db.execute("DELETE FROM profile_sessions WHERE profile=?", (str(profile),))
+        return True
 
     def bundle(self, profile: str) -> tuple[int, bytes] | None:
         with self._db() as db:
@@ -1321,7 +1352,7 @@ class ProfileProvisioningStore:
         now = _now()
         with self._db() as db:
             rows = db.execute(
-                "SELECT profile,desired_revision FROM profile_sessions"
+                "SELECT profile,desired_revision FROM profile_sessions WHERE active=1 OR source!='adoption'"
             ).fetchall()
             for row in rows:
                 db.execute(
@@ -1334,8 +1365,8 @@ class ProfileProvisioningStore:
         if info is None:
             raise KeyError(operation_id)
         with self._lock, self._db() as db:
-            if info["status"] == "active":
-                raise ValueError("Provisioning yang sudah aktif tidak dapat dibatalkan.")
+            if info["status"] in {"active", "stored"}:
+                raise ValueError("Provisioning yang sudah selesai tidak dapat dibatalkan.")
             rows = db.execute(
                 "SELECT profile,worker,status FROM profile_distributions WHERE provisioning_id=?",
                 (operation_id,),
@@ -1544,12 +1575,16 @@ class ProfileProvisioningService:
             if registered_id is not None and registered_id != profile:
                 raise FileExistsError("DUPLICATE_TELEGRAM_IDENTITY")
             self.store.store_bundle(operation_id, int(user_id), bundle)
+            registry = getattr(self.profile_manager, "profile_registry", None)
+            register_vaulted = getattr(registry, "register_vaulted", None)
+            if callable(register_vaulted):
+                register_vaulted(profile, int(user_id))
             self._operation_log(
                 operation_id,
-                "bundle_stored",
+                "bundle_stored_without_distribution",
                 "BUNDLE_STORED",
                 worker=worker,
-                details={"bundle_size_bytes": len(bundle), "target_count": len(info["workers"])},
+                details={"bundle_size_bytes": len(bundle), "target_count": 0},
             )
         except FileExistsError:
             code, message = self._export_error("DUPLICATE_TELEGRAM_IDENTITY")
@@ -1805,7 +1840,16 @@ class ProfileProvisioningService:
                     "workers": [],
                 })
             else:
-                output.append({**item, "status": "active" if item["active"] else "distributing", "vault": True})
+                is_stored_adoption = (
+                    str(item.get("source") or "") == "adoption"
+                    and not item.get("active")
+                    and not item.get("workers")
+                )
+                output.append({
+                    **item,
+                    "status": "stored" if is_stored_adoption else ("active" if item["active"] else "distributing"),
+                    "vault": True,
+                })
         known = {item["name"] for item in output}
         for operation in latest_operations:
             name = str(operation["profile"])
@@ -1813,7 +1857,15 @@ class ProfileProvisioningService:
                 current = next(item for item in output if item["name"] == name)
                 if operation["updated_at"] >= current.get("updated_at", ""):
                     if actor_user_id is None or int(operation.get("actor_user_id", -1)) == int(actor_user_id):
+                        if (
+                            str(operation.get("source")) == "adoption"
+                            and str(operation.get("status")) == "stored"
+                            and not current.get("vault")
+                        ):
+                            continue
                         current["operation_id"] = str(operation["id"])
+                        if str(operation.get("source")) == "adoption" and str(operation.get("status")) == "stored" and current.get("vault"):
+                            current["status"] = "stored"
                         if str(operation.get("source")) == "adoption" and not current.get("vault"):
                             details = self.store.provisioning(str(operation["id"])) or {}
                             current.update({
@@ -1966,20 +2018,37 @@ class ProfileProvisioningService:
         with self._lock:
             if self.store.bundle(profile) is not None:
                 raise FileExistsError("Profil sudah tersimpan di vault.")
-            targets = self.worker_registry.names()
-            if not targets:
-                raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
             operation_id = self.store.begin(
                 profile=profile,
                 actor_user_id=actor_user_id,
                 bootstrap_worker=worker,
                 source="adoption",
-                target_workers=targets,
+                target_workers=[],
                 status="validating",
             )
         self._operation_log(operation_id, "adoption_queued", "ADOPTION_QUEUED", worker=worker)
         self._wake.set()
         return operation_id
+
+    def delete_vault_bundle(self, profile: str, actor_user_id: int) -> dict[str, Any]:
+        selected_profile = normalize_profile_name(profile)
+        if not selected_profile:
+            raise ValueError("Nama profil tidak valid.")
+        if not self.store.delete_bundle(selected_profile):
+            raise KeyError(selected_profile)
+        self.store.append_diagnostic_log(
+            category="profile_operation",
+            actor_user_id=int(actor_user_id),
+            profile=selected_profile,
+            event_type="vault_bundle_deleted",
+            code="VAULT_BUNDLE_DELETED",
+            details={"local_copies_unchanged": True},
+        )
+        return {
+            "deleted": True,
+            "profile": selected_profile,
+            "local_copies_unchanged": True,
+        }
 
     def diagnose_adoption(self, profile: str, worker: str, actor_user_id: int) -> dict[str, Any]:
         selected_profile = normalize_profile_name(profile)

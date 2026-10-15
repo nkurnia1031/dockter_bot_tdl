@@ -980,6 +980,18 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker sumber tidak dapat mengekspor sesi profil.", status_code=503) from exc
         return {"id": operation_id, "status": "validating"}
 
+    @app.delete("/api/v1/profiles/{profile}/vault")
+    def delete_vault_profile(profile: str, actor=Depends(current_actor)):
+        provisioner = context.profile_provisioner
+        if provisioner is None:
+            raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        try:
+            return provisioner.delete_vault_bundle(profile, actor.telegram_user_id)
+        except KeyError as exc:
+            raise DomainError("PROFILE_NOT_IN_VAULT", "Bundle profil tidak ditemukan di Vault.", status_code=404) from exc
+        except ValueError as exc:
+            raise DomainError("PROFILE_VAULT_BUSY", str(exc), status_code=409) from exc
+
     @app.post("/api/v1/profiles/{profile}/adoption-diagnostics")
     def diagnose_profile_adoption(profile: str, body: dict[str, Any], actor=Depends(current_actor)):
         provisioner = context.profile_provisioner

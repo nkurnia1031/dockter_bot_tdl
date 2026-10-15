@@ -10,6 +10,8 @@
   type LocalProfile = { name: string; ready: boolean; deletable?: boolean; reason_codes: string[]; checks: ProfileCheck[]; upload_lane: UploadLane };
   type IdentityCleanup = { profile: string; status: string; deleted_worker: string; updated_at: string };
   type Inventory = { worker: string; checked_at: string; items: LocalProfile[]; pending_identity_cleanup?: IdentityCleanup[] };
+  type VaultProfile = { name: string; vault: boolean; status: string; source?: string; operation_id?: string; error?: string };
+  type AdoptionOperation = { id: string; status: string; error?: string };
   type DeleteOperation = {
     operation_id: string;
     kind: string;
@@ -24,6 +26,11 @@
   let workers = $state<Worker[]>([]);
   let selectedWorker = $state('');
   let inventory = $state<Inventory | null>(null);
+  let vaultProfiles = $state<VaultProfile[]>([]);
+  let vaultStatusLoaded = $state(false);
+  let vaultStatusFailure = $state('');
+  let adoptionOperations = $state<Record<string, AdoptionOperation>>({});
+  let adoptingProfiles = $state<string[]>([]);
   let deleteOperations = $state<DeleteOperation[]>([]);
   let loadingWorkers = $state(false);
   let scanning = $state(false);
@@ -103,6 +110,11 @@
     selectedWorker = value;
     inventory = null;
     deleteOperations = [];
+    vaultProfiles = [];
+    vaultStatusLoaded = false;
+    vaultStatusFailure = '';
+    adoptionOperations = {};
+    adoptingProfiles = [];
     failure = '';
     notice = '';
   }
@@ -133,6 +145,7 @@
       if (generation !== progressGeneration || selectedWorker !== worker) return;
       inventory = result;
       await refreshDeleteOperations(worker, generation);
+      await refreshVaultProfiles(worker, generation);
       scheduleProgressRefresh();
     } catch (cause) {
       if (generation !== progressGeneration || selectedWorker !== worker) return;
@@ -157,12 +170,104 @@
 
   function scheduleProgressRefresh() {
     stopProgressRefresh();
-    if (!inventory?.items.some((profile) => profile.upload_lane?.status === 'running') && !deleteOperations.some(isDeleteActive)) return;
+    if (!inventory?.items.some((profile) => profile.upload_lane?.status === 'running')
+      && !deleteOperations.some(isDeleteActive)
+      && !Object.values(adoptionOperations).some(isAdoptionActive)) return;
     progressTimer = setTimeout(() => void refreshProgress(), 1500);
   }
 
   function isDeleteActive(operation: DeleteOperation) {
     return ['queued', 'running', 'waiting_worker', 'paused', 'cancelling'].includes(operation.status);
+  }
+
+  function isAdoptionActive(operation: AdoptionOperation) {
+    return ['validating', 'distributing'].includes(operation.status);
+  }
+
+  function adoptionStatusLabel(status: string) {
+    return ({
+      validating: 'Memeriksa dan menyimpan bundle terenkripsi ke Vault',
+      stored: 'Bundle tersimpan di Vault; belum didistribusikan',
+      failed: 'Adopsi gagal',
+      cancelled: 'Adopsi dibatalkan'
+    } as Record<string, string>)[status] || status;
+  }
+
+  function isVaulted(profile: string) {
+    return vaultProfiles.some((item) => item.name === profile && item.vault);
+  }
+
+  function adoptionIsActive(profile: string) {
+    const operation = adoptionOperations[profile];
+    return adoptingProfiles.includes(profile) || Boolean(operation && isAdoptionActive(operation));
+  }
+
+  async function refreshVaultProfiles(worker: string, generation = progressGeneration) {
+    try {
+      const result = await api<{ items: VaultProfile[] }>('/profiles/management');
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
+      vaultProfiles = Array.isArray(result.items) ? result.items : [];
+      vaultStatusLoaded = true;
+      vaultStatusFailure = '';
+      const operations: Record<string, AdoptionOperation> = {};
+      for (const item of vaultProfiles) {
+        if (item.source === 'adoption' && item.operation_id && ['validating', 'distributing', 'stored', 'failed', 'cancelled'].includes(item.status)) {
+          operations[item.name] = { id: item.operation_id, status: item.status, error: item.error };
+        }
+      }
+      adoptionOperations = { ...adoptionOperations, ...operations };
+    } catch (cause) {
+      if (generation !== progressGeneration || selectedWorker !== worker) return;
+      vaultStatusLoaded = false;
+      vaultStatusFailure = cause instanceof Error ? cause.message : 'Status Vault belum dapat dimuat.';
+    }
+  }
+
+  async function refreshAdoptionOperations() {
+    const active = Object.entries(adoptionOperations).filter(([, operation]) => isAdoptionActive(operation));
+    if (!active.length) return;
+    const results = await Promise.allSettled(active.map(async ([profile, operation]) => {
+      const current = await api<{ id: string; status: string; error?: string }>(`/profiles/provisionings/${encodeURIComponent(operation.id)}`);
+      return { profile, id: current.id, status: current.status, error: current.error };
+    }));
+    const next = { ...adoptionOperations };
+    for (const result of results) {
+      if (result.status !== 'fulfilled') continue;
+      const operation = result.value;
+      next[operation.profile] = { id: operation.id, status: operation.status, error: operation.error };
+      if (operation.status === 'stored') {
+        vaultProfiles = [
+          ...vaultProfiles.filter((item) => item.name !== operation.profile),
+          { name: operation.profile, vault: true, status: 'stored', source: 'adoption', operation_id: operation.id }
+        ];
+        notice = `Profil ${operation.profile} tersimpan di Vault. Tidak ada worker lain yang diubah.`;
+      }
+    }
+    adoptionOperations = next;
+  }
+
+  async function adoptProfile(profile: LocalProfile) {
+    const worker = selectedWorker;
+    if (!worker || !profile.ready || !vaultStatusLoaded || isVaulted(profile.name) || adoptionIsActive(profile.name)) return;
+    if (typeof window !== 'undefined' && !window.confirm(`Adopsi profil "${profile.name}" dari worker "${worker}" ke Vault? Ini hanya menyimpan bundle terenkripsi; sesi worker lain tidak akan diubah.`)) return;
+    adoptingProfiles = [...adoptingProfiles, profile.name];
+    failure = '';
+    notice = '';
+    try {
+      const operation = await post<{ id: string; status: string }>(
+        `/profiles/${encodeURIComponent(profile.name)}/adopt`, { worker }
+      );
+      adoptionOperations = { ...adoptionOperations, [profile.name]: { id: operation.id, status: operation.status } };
+      notice = `Adopsi ${profile.name} dimulai dari worker ${worker}. Bundle hanya disimpan di Vault.`;
+      await refreshAdoptionOperations();
+      scheduleProgressRefresh();
+    } catch (cause) {
+      const error = cause as { code?: string; message?: string };
+      failure = error.message || `Adopsi profil ${profile.name} gagal.`;
+      if (error.code === 'PROFILE_ALREADY_VAULTED') await refreshVaultProfiles(worker);
+    } finally {
+      adoptingProfiles = adoptingProfiles.filter((name) => name !== profile.name);
+    }
   }
 
   function deletionIsActive(profile: string) {
@@ -257,12 +362,18 @@
       progressTimer = setTimeout(() => void refreshProgress(), 4000);
       return;
     }
+    const refreshLocalInventory = inventory.items.some((profile) => profile.upload_lane?.status === 'running')
+      || deleteOperations.some(isDeleteActive);
     progressRequestActive = true;
     try {
-      const result = await api<Inventory>(`/workers/${encodeURIComponent(worker)}/profiles/local`);
+      if (refreshLocalInventory) {
+        const result = await api<Inventory>(`/workers/${encodeURIComponent(worker)}/profiles/local`);
+        if (generation !== progressGeneration || selectedWorker !== worker) return;
+        inventory = result;
+        await refreshDeleteOperations(worker, generation);
+      }
+      await refreshAdoptionOperations();
       if (generation !== progressGeneration || selectedWorker !== worker) return;
-      inventory = result;
-      await refreshDeleteOperations(worker, generation);
       failure = '';
       scheduleProgressRefresh();
     } catch (cause) {
@@ -331,6 +442,9 @@
   {#if notice}
     <p class="mt-3 text-sm text-violet-700 dark:text-violet-200" role="status">{notice}</p>
   {/if}
+  {#if vaultStatusFailure}
+    <p class="muted mt-3 text-xs" role="status">Status Vault gagal dimuat; tombol adopsi disembunyikan agar profil yang sudah tersimpan tidak dikirim ulang.</p>
+  {/if}
   {#if inventory?.pending_identity_cleanup?.length}
     <div class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-100" role="status">
       {#each inventory.pending_identity_cleanup as item (item.profile)}
@@ -385,6 +499,15 @@
                 <span class={profile.ready ? 'text-sm font-bold text-emerald-600' : 'text-sm font-bold text-rose-600'}>
                   {profile.ready ? 'Sesi tersedia' : 'Perlu diperiksa'}
                 </span>
+                {#if profile.ready && vaultStatusLoaded}
+                  {#if isVaulted(profile.name)}
+                    <span class="badge">Sudah di Vault</span>
+                  {:else}
+                    <button class="button secondary" onclick={() => adoptProfile(profile)} disabled={adoptionIsActive(profile.name)} aria-label={`Adopsi profil ${profile.name} dari ${selectedWorker} ke Vault`}>
+                      <KeyRound size={15}/>{adoptionIsActive(profile.name) ? 'Menyimpan...' : 'Adopsi ke Vault'}
+                    </button>
+                  {/if}
+                {/if}
                 {#if profile.deletable}
                   <button class="button secondary" onclick={() => deleteProfile(profile)} disabled={deletionIsActive(profile.name)} aria-label={`Hapus profil ${profile.name} dari ${selectedWorker}`}>
                     <Trash2 size={15}/>{deletionIsActive(profile.name) ? 'Menghapus...' : 'Hapus profil'}
@@ -402,6 +525,9 @@
             </div>
             {#if profile.reason_codes.length}
               <p class="mt-3 text-xs text-rose-600">Kode: {profile.reason_codes.join(', ')}</p>
+            {/if}
+            {#if adoptionOperations[profile.name]}
+              <p class="mt-3 text-xs" role="status">{adoptionStatusLabel(adoptionOperations[profile.name].status)}{#if adoptionOperations[profile.name].error}: {adoptionOperations[profile.name].error}{/if}</p>
             {/if}
             <section class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3" aria-label={`Lane Upload ${profile.name}`}>
               <div class="flex flex-wrap items-center justify-between gap-2">
