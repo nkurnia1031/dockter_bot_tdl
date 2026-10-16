@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
+from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.executor_storage import StorageExecutorMixin
 
 
@@ -119,6 +120,22 @@ class _StorageUploader(StorageExecutorMixin):
 
 
 class StorageUploadLaneTests(unittest.TestCase):
+    def test_storage_upload_session_guard_reads_the_selected_profile(self):
+        executor = object.__new__(WorkerJobExecutor)
+        executor.available_storage_profiles = lambda: ["remote_profile"]
+
+        executor._require_local_job_session(
+            {"kind": "storage_upload", "profile": "remote_profile"}
+        )
+
+        executor.available_storage_profiles = lambda: []
+        with self.assertRaisesRegex(
+            RuntimeError, "STORAGE_PROFILE_UNAVAILABLE.*remote_profile"
+        ):
+            executor._require_local_job_session(
+                {"kind": "storage_upload", "profile": "remote_profile"}
+            )
+
     def _workspace(self, root: Path) -> Path:
         workspace = root / "folder"
         workspace.mkdir()

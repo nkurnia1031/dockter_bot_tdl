@@ -1599,6 +1599,7 @@ class WorkerJobExecutor(
             "tts": "export",
             "backup_verify": "export",
         }.get(kind)
+        profile = str(command.get("profile") or "")
         if kind == "storage_upload":
             if profile in self.available_storage_profiles():
                 return
@@ -1608,7 +1609,6 @@ class WorkerJobExecutor(
             )
         if purpose is None:
             return
-        profile = str(command.get("profile") or "")
         checker = getattr(self.profile_manager, "tdl_session_available", None)
         if callable(checker) and checker(profile, purpose):
             return
