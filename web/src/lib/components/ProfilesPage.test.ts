@@ -2,6 +2,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import ProfilesPage from './ProfilesPage.svelte';
 
+function scanResponse(worker: string, checked_at: string, items: unknown[]) {
+  return new Response(JSON.stringify({
+    checked_at,
+    workers: [{ name: worker, status: 'success', checked_at, error_code: '' }],
+    inventories: [{ worker, checked_at, items }]
+  }), { status: 200 });
+}
+
 describe('ProfilesPage', () => {
   afterEach(() => {
     cleanup();
@@ -100,7 +108,7 @@ describe('ProfilesPage', () => {
     expect(await screen.findByText('Memasang sesi pada worker terpilih')).toBeTruthy();
   });
 
-  it('scans local profiles only after selecting a worker and pressing Scan', async () => {
+  it('scans every worker without a selection and shows partial results from the saved catalog', async () => {
     const requests: { url: string; method: string }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
@@ -112,9 +120,14 @@ describe('ProfilesPage', () => {
           { name: 'remote-2', enabled: true, selected: false }
         ] }), { status: 200 });
       }
-      if (url === '/api/v1/workers/remote-2/profiles/scan' && method === 'POST') {
+      if (url === '/api/v1/profiles/local/scan' && method === 'POST') {
         return new Response(JSON.stringify({
-          worker: 'remote-2', checked_at: '2026-10-12T05:00:00+00:00', items: [{
+          checked_at: '2026-10-12T05:00:00+00:00',
+          workers: [
+            { name: 'local', status: 'failed', checked_at: '2026-10-12T05:00:00+00:00', error_code: 'WORKER_UNAVAILABLE' },
+            { name: 'remote-2', status: 'success', checked_at: '2026-10-12T05:00:00+00:00', error_code: '' }
+          ],
+          inventories: [{ worker: 'remote-2', checked_at: '2026-10-12T05:00:00+00:00', items: [{
             name: 'irang', ready: true, reason_codes: [], checks: [
               { name: 'identity', ready: true, code: 'OK' },
               { name: 'root_session', ready: true, code: 'OK' },
@@ -122,7 +135,7 @@ describe('ProfilesPage', () => {
               { name: 'future_session', ready: true, code: 'OK' }
             ],
             upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '2026-10-12T05:00:00+00:00' }
-          }]
+          }] }]
         }), { status: 200 });
       }
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -131,10 +144,17 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'remote-2' });
     expect(screen.getByRole('link', { name: /Kelola Vault/ }).getAttribute('href')).toBe('/profiles/vault/');
-    expect(requests.some((item) => item.url.includes('/profiles/scan'))).toBe(false);
+    expect(requests.some((item) => item.url.endsWith('/profiles/local/scan'))).toBe(false);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
+
+    expect(await screen.findByRole('region', { name: 'Status scan semua worker' })).toBeTruthy();
+    const statuses = screen.getByRole('region', { name: 'Status scan semua worker' }).textContent || '';
+    expect(statuses).toMatch(/local.*Gagal/);
+    expect(statuses).toMatch(/remote-2.*Berhasil/);
+    expect(requests).toContainEqual({ url: '/api/v1/profiles/local/scan', method: 'POST' });
 
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
 
     expect(await screen.findByText('irang')).toBeTruthy();
     expect(screen.getByText(/Download.*Siap/)).toBeTruthy();
@@ -143,12 +163,12 @@ describe('ProfilesPage', () => {
     expect(screen.getByRole('region', { name: 'Lane Upload irang' }).textContent).toMatch(/Lane Upload.*Siap/s);
     expect(screen.getByText(/Hasil scan.*remote-2/)).toBeTruthy();
     expect(await screen.findByRole('button', { name: 'Adopsi profil irang dari remote-2 ke Vault' })).toBeTruthy();
-    expect(requests).toContainEqual({ url: '/api/v1/workers/remote-2/profiles/scan', method: 'POST' });
+    expect(requests.some((item) => item.url === '/api/v1/workers/remote-2/profiles/scan')).toBe(false);
 
     await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang worker' }));
-    expect((await screen.findByRole('status')).textContent).toMatch(/hasil scan sebelumnya dihapus/i);
-    expect(screen.queryByText('irang')).toBeNull();
-    expect(requests.filter((item) => item.url.includes('/profiles/scan'))).toHaveLength(1);
+    expect((await screen.findByRole('status')).textContent).toMatch(/katalog tetap memakai hasil Scan terakhir/i);
+    expect(screen.getByText('irang')).toBeTruthy();
+    expect(requests.filter((item) => item.url.endsWith('/profiles/local/scan'))).toHaveLength(1);
   });
 
   it('adopts a verified local profile into Vault without triggering distribution', async () => {
@@ -159,15 +179,15 @@ describe('ProfilesPage', () => {
       const method = (init?.method || 'GET').toUpperCase();
       requests.push({ url, method, body: init?.body ? String(init.body) : undefined });
       if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
-      if (url.endsWith('/profiles/scan')) return new Response(JSON.stringify({
-        worker: 'local', checked_at: '2026-10-15T00:00:00+00:00', items: [{
+      if (url === '/api/v1/profiles/local/scan') return scanResponse(
+        'local', '2026-10-15T00:00:00+00:00', [{
           name: 'archive', ready: true, deletable: true, reason_codes: [], checks: [
             { name: 'identity', ready: true, code: 'OK' },
             { name: 'root_session', ready: true, code: 'OK' },
             { name: 'user1_session', ready: true, code: 'OK' }
           ], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' }
-        }], pending_identity_cleanup: []
-      }), { status: 200 });
+        }]
+      );
       if (url === '/api/v1/operations?limit=100') return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (url === '/api/v1/profiles/management') return new Response(JSON.stringify({ items: [
         { name: 'archive', vault: false, status: 'legacy' }
@@ -182,7 +202,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'local' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Adopsi profil archive dari local ke Vault' }));
 
     expect(confirmation).toHaveBeenCalledWith(expect.stringContaining('worker lain tidak akan diubah'));
@@ -203,16 +223,16 @@ describe('ProfilesPage', () => {
       if (url === '/api/v1/workers') {
         return new Response(JSON.stringify({ items: [{ name: 'remote-1', enabled: true }] }), { status: 200 });
       }
-      if (url === '/api/v1/workers/remote-1/profiles/scan') {
+      if (url === '/api/v1/profiles/local/scan') {
         scans += 1;
         if (scans === 1) {
           return new Response(JSON.stringify({
-            error: { code: 'WORKER_UNAVAILABLE', message: 'Worker remote-1 tidak dapat dihubungi.' }
-          }), { status: 503 });
+            checked_at: '2026-10-12T05:10:00+00:00',
+            workers: [{ name: 'remote-1', status: 'failed', checked_at: '2026-10-12T05:10:00+00:00', error_code: 'WORKER_UNAVAILABLE' }],
+            inventories: []
+          }), { status: 200 });
         }
-        return new Response(JSON.stringify({
-          worker: 'remote-1', checked_at: '2026-10-12T05:10:00+00:00', items: []
-        }), { status: 200 });
+        return scanResponse('remote-1', '2026-10-12T05:10:00+00:00', []);
       }
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
@@ -220,14 +240,14 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'remote-1' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-1' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
 
-    expect((await screen.findByRole('alert')).textContent).toMatch(/Worker remote-1 sedang offline/);
+    expect((await screen.findByRole('region', { name: 'Status scan semua worker' })).textContent).toMatch(/remote-1.*Gagal/);
     expect(scans).toBe(1);
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     expect(await screen.findByText(/Worker ini tidak memiliki profil lokal/)).toBeTruthy();
     expect(scans).toBe(2);
-    expect(requests.filter((item) => item.includes('/profiles/scan'))).toHaveLength(2);
+    expect(requests.filter((item) => item.includes('/profiles/local/scan'))).toHaveLength(2);
   });
 
   it('refreshes Upload progress only while its preparation is running', async () => {
@@ -239,7 +259,7 @@ describe('ProfilesPage', () => {
       if (url === '/api/v1/workers') {
         return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
       }
-      if (url.endsWith('/profiles/scan')) {
+      if (url === '/api/v1/profiles/local/scan') {
         return new Response(JSON.stringify({
           worker: 'local', checked_at: '2026-10-14T00:00:00+00:00', items: [{
             name: 'default', ready: true, reason_codes: [], checks: [
@@ -251,7 +271,10 @@ describe('ProfilesPage', () => {
           }]
         }), { status: 200 });
       }
-      if (url.endsWith('/profiles/local')) {
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({ checked_at: '', workers: [], inventories: [] }), { status: 200 });
+      }
+      if (url === '/api/v1/workers/local/profiles/local') {
         return new Response(JSON.stringify({
           worker: 'local', checked_at: '2026-10-14T00:00:02+00:00', items: [{
             name: 'default', ready: true, reason_codes: [], checks: [
@@ -269,14 +292,14 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'local' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     const lane = await screen.findByRole('region', { name: 'Lane Upload default' });
     expect(lane.textContent).toMatch(/70%/);
     expect(lane.textContent).toMatch(/Memvalidasi sesi Upload/);
 
     expect(await screen.findByText('Sesi Upload terpisah sudah tervalidasi dan cocok dengan identitas profil.', {}, { timeout: 3000 })).toBeTruthy();
     expect(requests).toContain('GET /api/v1/workers/local/profiles/local');
-    expect(requests.filter((request) => request.endsWith('/profiles/local'))).toHaveLength(1);
+    expect(requests.filter((request) => request.startsWith('GET /api/v1/workers/') && request.endsWith('/profiles/local'))).toHaveLength(1);
   });
 
   it('ignores a delayed progress response after selecting another worker', async () => {
@@ -312,7 +335,7 @@ describe('ProfilesPage', () => {
           { name: 'remote-2', enabled: true }
         ] }), { status: 200 });
       }
-      if (url.endsWith('/profiles/scan')) {
+      if (url === '/api/v1/profiles/local/scan') {
         return new Response(JSON.stringify({
           worker: 'local', checked_at: '2026-10-14T00:00:00+00:00', items: [{
             name: 'default', ready: true, reason_codes: [], checks: [],
@@ -320,7 +343,10 @@ describe('ProfilesPage', () => {
           }]
         }), { status: 200 });
       }
-      if (url.endsWith('/profiles/local')) {
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({ checked_at: '', workers: [], inventories: [] }), { status: 200 });
+      }
+      if (url === '/api/v1/workers/local/profiles/local') {
         markOldWorkerRequestStarted?.();
         return oldWorkerStatus.then((response) => {
           finishOldWorkerRequest?.();
@@ -334,7 +360,7 @@ describe('ProfilesPage', () => {
     await screen.findByRole('option', { name: 'remote-2' });
     vi.stubGlobal('setTimeout', setTimeoutMock);
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     expect((await screen.findByRole('region', { name: 'Lane Upload default' })).textContent).toMatch(/35%/);
 
     runProgressRefresh?.();
@@ -364,7 +390,7 @@ describe('ProfilesPage', () => {
       if (url === '/api/v1/workers') {
         return new Response(JSON.stringify({ items: [{ name: 'remote-2', enabled: true }] }), { status: 200 });
       }
-      if (url.endsWith('/profiles/scan')) {
+      if (url === '/api/v1/profiles/local/scan') {
         return new Response(JSON.stringify({
           worker: 'remote-2', checked_at: '2026-10-14T00:00:00+00:00', items: [
             { name: 'default', deletable: false, ready: true, reason_codes: [], checks: [], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' } },
@@ -388,7 +414,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'remote-2' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
 
     expect(await screen.findByText('archive')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Hapus profil default dari remote-2' })).toBeNull();
@@ -411,7 +437,7 @@ describe('ProfilesPage', () => {
       if (url === '/api/v1/workers') {
         return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
       }
-      if (url.endsWith('/profiles/scan')) {
+      if (url === '/api/v1/profiles/local/scan') {
         return new Response(JSON.stringify({
           worker: 'local', checked_at: '2026-10-15T00:00:00+00:00', items: [
             { name: 'archive', deletable: true, ready: false, reason_codes: [], checks: [], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' } }
@@ -430,7 +456,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'local' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     expect(await screen.findByRole('heading', { name: 'archive' })).toBeTruthy();
 
     await fireEvent.click(screen.getByRole('button', { name: 'Hapus profil archive dari local' }));
@@ -448,7 +474,7 @@ describe('ProfilesPage', () => {
       if (url === '/api/v1/workers') {
         return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
       }
-      if (url.endsWith('/profiles/scan')) {
+      if (url === '/api/v1/profiles/local/scan') {
         return new Response(JSON.stringify({
           worker: 'local', checked_at: '2026-10-15T00:00:00+00:00', items: [
             { name: 'archive', deletable: true, ready: false, reason_codes: [], checks: [], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' } }
@@ -467,7 +493,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'local' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     expect(await screen.findByRole('heading', { name: 'archive' })).toBeTruthy();
 
     await fireEvent.click(screen.getByRole('button', { name: 'Hapus profil archive dari local' }));
@@ -480,7 +506,7 @@ describe('ProfilesPage', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);
       if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
-      if (url.endsWith('/profiles/scan')) return new Response(JSON.stringify({
+      if (url === '/api/v1/profiles/local/scan') return new Response(JSON.stringify({
         worker: 'local', checked_at: '2026-10-14T00:00:00+00:00', items: [
           { name: 'archive', deletable: true, ready: true, reason_codes: [], checks: [], upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' } }
         ], pending_identity_cleanup: []
@@ -496,7 +522,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
     await screen.findByRole('option', { name: 'local' });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
 
     expect(await screen.findByText('Menunggu worker online')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Hapus profil archive dari local' }).hasAttribute('disabled')).toBe(true);

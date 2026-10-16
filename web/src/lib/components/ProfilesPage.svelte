@@ -12,6 +12,8 @@ type ProvisioningWorker = { name: string; enabled: boolean; online: boolean; sec
   type LocalProfile = { name: string; ready: boolean; deletable?: boolean; reason_codes: string[]; checks: ProfileCheck[]; upload_lane: UploadLane };
   type IdentityCleanup = { profile: string; status: string; deleted_worker: string; updated_at: string };
   type Inventory = { worker: string; checked_at: string; items: LocalProfile[]; pending_identity_cleanup?: IdentityCleanup[] };
+  type ScanWorker = { name: string; status: 'success' | 'failed' | 'disabled'; checked_at: string; error_code: string };
+  type LocalProfileCatalog = { checked_at: string; workers: ScanWorker[]; inventories: Inventory[] };
   type VaultProfile = { name: string; vault: boolean; status: string; source?: string; operation_id?: string; error?: string };
   type AdoptionOperation = { id: string; status: string; error?: string };
 type ProvisioningOperation = {
@@ -50,6 +52,8 @@ let provisioningLoading = $state(false);
 let provisioningFailure = $state('');
 let provisioningNotice = $state('');
   let inventory = $state<Inventory | null>(null);
+  let profileCatalog = $state<LocalProfileCatalog | null>(null);
+  let catalogFailure = $state('');
   let vaultProfiles = $state<VaultProfile[]>([]);
   let vaultStatusLoaded = $state(false);
   let vaultStatusFailure = $state('');
@@ -66,6 +70,7 @@ let savingProvisioning = $state(false);
   let provisioningRequestActive = false;
   let progressRequestActive = false;
   let progressGeneration = 0;
+  let catalogGeneration = 0;
 
   const codeMessages: Record<string, string> = {
     PROFILE_IDENTITY_MISSING: 'File identitas tidak ditemukan.',
@@ -91,7 +96,10 @@ let savingProvisioning = $state(false);
     PROFILE_DELETE_FAILED: 'Penghapusan gagal. Periksa worker dan scan kembali sebelum mencoba lagi.',
     PROFILE_UPLOAD_PREPARATION_FAILED: 'Worker gagal menyiapkan lane Upload. Tekan Scan untuk mencoba lagi.',
     PROFILE_UPLOAD_PREPARATION_INTERRUPTED: 'Pemeriksaan lane Upload belum selesai. Tekan Scan untuk mencoba lagi.',
-    WORKER_UPDATE_REQUIRED: 'Worker perlu diperbarui untuk menyiapkan lane Upload.'
+    WORKER_UNAVAILABLE: 'Worker offline atau tidak dapat dijangkau.',
+    WORKER_TIMEOUT: 'Worker melewati batas waktu pemeriksaan.',
+    WORKER_UPDATE_REQUIRED: 'Worker perlu diperbarui untuk membaca inventaris profil.',
+    WORKER_SCAN_FAILED: 'Worker gagal membaca inventaris profil.'
   };
 
   const uploadPhaseLabels: Record<string, string> = {
@@ -126,6 +134,52 @@ const provisioningStatusLabels: Record<string, string> = {
   function checkedAt(value: string) {
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+  }
+
+  function workerScanLabel(worker: ScanWorker) {
+    if (worker.status === 'success') {
+      const count = profileCatalog?.inventories.find((item) => item.worker === worker.name)?.items.length || 0;
+      return `Berhasil · ${count} profil`;
+    }
+    if (worker.status === 'disabled') return 'Nonaktif · tidak dipindai';
+    return `Gagal · ${codeMessage(worker.error_code || 'WORKER_SCAN_FAILED')}`;
+  }
+
+  function normalizeProfileCatalog(value: unknown): LocalProfileCatalog {
+    const payload = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+    if (Array.isArray(payload.workers) && Array.isArray(payload.inventories)) {
+      return {
+        checked_at: String(payload.checked_at || ''),
+        workers: payload.workers as ScanWorker[],
+        inventories: payload.inventories as Inventory[]
+      };
+    }
+    // Older worker snapshots are accepted while a mixed-version deployment rolls forward.
+    if (typeof payload.worker === 'string' && Array.isArray(payload.items)) {
+      const checked_at = String(payload.checked_at || '');
+      const worker = payload.worker;
+      return {
+        checked_at,
+        workers: [{ name: worker, status: 'success', checked_at, error_code: '' }],
+        inventories: [{ worker, checked_at, items: payload.items as LocalProfile[] }]
+      };
+    }
+    return { checked_at: '', workers: [], inventories: [] };
+  }
+
+  async function loadProfileCatalog() {
+    const generation = catalogGeneration;
+    catalogFailure = '';
+    try {
+      const result = normalizeProfileCatalog(await api<unknown>('/profiles/local'));
+      if (generation !== catalogGeneration) return;
+      profileCatalog = result;
+      if (selectedWorker) {
+        inventory = profileCatalog.inventories.find((item) => item.worker === selectedWorker) || null;
+      }
+    } catch (cause) {
+      catalogFailure = cause instanceof Error ? cause.message : 'Katalog profil lokal gagal dimuat.';
+    }
   }
 
 function setProvisioningWorkers(items: ProvisioningWorker[]) {
@@ -293,6 +347,8 @@ async function cancelProfileProvisioning() {
       if (selectedWorker && !workers.some((worker) => worker.name === selectedWorker)) {
         selectedWorker = '';
         inventory = null;
+      } else if (selectedWorker) {
+        inventory = profileCatalog?.inventories.find((item) => item.worker === selectedWorker) || null;
       }
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Daftar worker gagal dimuat.';
@@ -304,7 +360,7 @@ async function cancelProfileProvisioning() {
   function selectWorker(value: string) {
     stopProgressRefresh();
     selectedWorker = value;
-    inventory = null;
+    inventory = profileCatalog?.inventories.find((item) => item.worker === value) || null;
     deleteOperations = [];
     vaultProfiles = [];
     vaultStatusLoaded = false;
@@ -313,46 +369,50 @@ async function cancelProfileProvisioning() {
     adoptingProfiles = [];
     failure = '';
     notice = '';
+    if (value && inventory) {
+      scheduleProgressRefresh();
+      const generation = progressGeneration;
+      void refreshDeleteOperations(value, generation);
+      void refreshVaultProfiles(value, generation);
+    }
   }
 
   function refreshWorkers() {
     stopProgressRefresh();
-    inventory = null;
     failure = '';
-    notice = selectedWorker
-      ? 'Daftar worker diperbarui. Hasil scan sebelumnya dihapus; tekan Scan untuk memeriksa ulang.'
-      : '';
+    notice = 'Daftar worker diperbarui. Katalog tetap memakai hasil Scan terakhir; tekan Scan untuk memperbaruinya.';
     void loadWorkers();
   }
 
   async function scanProfiles() {
-    if (!selectedWorker || scanning) return;
+    if (scanning) return;
     stopProgressRefresh();
-    const worker = selectedWorker;
+    catalogGeneration += 1;
     const generation = progressGeneration;
     scanning = true;
     failure = '';
     notice = '';
-    inventory = null;
     try {
-      const result = await post<Inventory>(
-        `/workers/${encodeURIComponent(worker)}/profiles/scan`
-      );
-      if (generation !== progressGeneration || selectedWorker !== worker) return;
-      inventory = result;
-      await refreshDeleteOperations(worker, generation);
-      await refreshVaultProfiles(worker, generation);
-      scheduleProgressRefresh();
-    } catch (cause) {
-      if (generation !== progressGeneration || selectedWorker !== worker) return;
-      const error = cause as { code?: string; message?: string };
-      if (error.code === 'WORKER_UNAVAILABLE') {
-        failure = `Worker ${worker} sedang offline atau tidak dapat dijangkau. Coba Scan lagi setelah worker tersedia.`;
-      } else if (error.code === 'WORKER_UPDATE_REQUIRED') {
-        failure = `Worker ${worker} perlu diperbarui agar scan profil lokal tersedia.`;
-      } else {
-        failure = error.message || 'Scan profil lokal gagal. Coba lagi.';
+      const result = normalizeProfileCatalog(await post<unknown>('/profiles/local/scan'));
+      if (generation !== progressGeneration) return;
+      profileCatalog = result;
+      inventory = selectedWorker
+        ? profileCatalog.inventories.find((item) => item.worker === selectedWorker) || null
+        : null;
+      catalogFailure = '';
+      const successful = profileCatalog.workers.filter((worker) => worker.status === 'success').length;
+      const failed = profileCatalog.workers.filter((worker) => worker.status === 'failed').length;
+      const disabled = profileCatalog.workers.filter((worker) => worker.status === 'disabled').length;
+      notice = `Scan selesai: ${successful} worker berhasil, ${failed} gagal, ${disabled} nonaktif.`;
+      if (selectedWorker && inventory) {
+        await refreshDeleteOperations(selectedWorker, generation);
+        await refreshVaultProfiles(selectedWorker, generation);
+        scheduleProgressRefresh();
       }
+    } catch (cause) {
+      if (generation !== progressGeneration) return;
+      const error = cause as { code?: string; message?: string };
+      failure = error.message || 'Scan profil lokal semua worker gagal. Katalog sebelumnya dipertahankan.';
     } finally {
       scanning = false;
     }
@@ -586,6 +646,7 @@ async function cancelProfileProvisioning() {
 
   onMount(() => {
     void loadWorkers();
+    void loadProfileCatalog();
   void loadProvisioningWorkers();
   });
 
@@ -601,7 +662,7 @@ async function cancelProfileProvisioning() {
   <div>
     <p class="eyebrow">SESI WORKER</p>
     <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Profil lokal</h1>
-    <p class="muted mt-2">Pilih worker lalu scan untuk melihat profil TDL lokal pada worker tersebut.</p>
+    <p class="muted mt-2">Scan memeriksa semua worker aktif. Pilih worker setelahnya untuk melihat profil TDL lokal dan aksi khusus worker.</p>
   </div>
   <div class="flex items-center gap-2"><a class="button secondary" href="/profiles/vault/"><KeyRound size={16}/>Kelola Vault</a><div class="page-icon"><UserRoundPlus size={23}/></div></div>
 </header>
@@ -730,7 +791,7 @@ async function cancelProfileProvisioning() {
 <section class="card mt-7 p-5 sm:p-6" aria-labelledby="local-profiles-target">
   <div class="flex flex-wrap items-end gap-3">
     <label id="local-profiles-target" class="min-w-56 flex-1 text-sm font-bold">
-      Worker
+      Worker untuk rincian dan aksi
       <select
         class="field mt-2"
         aria-label="Worker"
@@ -738,7 +799,7 @@ async function cancelProfileProvisioning() {
         onchange={(event) => selectWorker(event.currentTarget.value)}
         disabled={loadingWorkers || scanning}
       >
-        <option value="">Pilih worker</option>
+      <option value="">Pilih worker untuk rincian</option>
         {#each workers as worker (worker.name)}
           <option value={worker.name}>{worker.name}{worker.enabled ? '' : ' · nonaktif untuk job baru'}</option>
         {/each}
@@ -747,14 +808,35 @@ async function cancelProfileProvisioning() {
     <button class="button secondary" onclick={refreshWorkers} disabled={loadingWorkers || scanning} aria-label="Muat ulang worker">
       <RefreshCw size={16}/>{loadingWorkers ? 'Memuat...' : 'Muat ulang worker'}
     </button>
-    <button class="button" onclick={scanProfiles} disabled={!selectedWorker || scanning || loadingWorkers}>
-      <RefreshCw size={16}/>{scanning ? 'Memindai...' : 'Scan'}
+    <button class="button" onclick={scanProfiles} disabled={scanning || loadingWorkers}>
+      <RefreshCw size={16}/>{scanning ? 'Memindai semua worker...' : 'Scan semua worker'}
     </button>
   </div>
   <p class="muted mt-3 flex items-start gap-2 text-xs">
     <ShieldCheck size={15} class="mt-0.5 shrink-0"/>
-    Scan memeriksa profil lokal dan menyiapkan lane Upload terpisah dari sesi Export. Penyiapan menunggu job TDL selesai dan dapat dipantau sampai siap.
+    Scan membaca inventaris profil pada semua worker aktif tanpa memilih worker terlebih dahulu atau memulai penyiapan lane Upload. Katalog berubah hanya saat Scan dijalankan; pilih worker setelahnya untuk melihat rincian dan aksi.
   </p>
+  {#if catalogFailure}
+    <p class="mt-3 text-sm text-rose-600" role="alert">{catalogFailure}</p>
+  {/if}
+  {#if profileCatalog?.checked_at}
+    <section class="mt-4 rounded-xl border border-[var(--line)] p-3" aria-label="Status scan semua worker">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-sm font-extrabold">Status scan terakhir</h2>
+        <span class="muted text-xs">{checkedAt(profileCatalog.checked_at)}</span>
+      </div>
+      <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {#each profileCatalog.workers as worker (worker.name)}
+          <div class="flex items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Status scan ${worker.name}`}>
+            <span class="font-bold">{worker.name}</span>
+            <span class={worker.status === 'success' ? 'font-bold text-emerald-600' : worker.status === 'failed' ? 'font-bold text-rose-600' : 'muted font-bold'}>{workerScanLabel(worker)}</span>
+          </div>
+        {/each}
+      </div>
+    </section>
+  {:else}
+    <p class="muted mt-3 text-xs" role="status">Belum ada katalog hasil scan tersimpan.</p>
+  {/if}
   {#if notice}
     <p class="mt-3 text-sm text-violet-700 dark:text-violet-200" role="status">{notice}</p>
   {/if}
@@ -871,11 +953,19 @@ async function cancelProfileProvisioning() {
 {:else}
   <section class="card muted mt-5 p-6 text-center" aria-live="polite">
     {#if scanning}
-      Memindai profil lokal pada {selectedWorker}...
+      Memindai profil lokal pada semua worker aktif...
+    {:else if profileCatalog?.checked_at && selectedWorker}
+      {#if profileCatalog.workers.find((worker) => worker.name === selectedWorker)?.status === 'failed'}
+        Worker {selectedWorker} gagal dipindai. Worker ini dikeluarkan dari katalog hasil; worker sukses tetap tersedia.
+      {:else}
+        Tidak ada inventaris sukses untuk worker {selectedWorker} pada Scan terakhir.
+      {/if}
+    {:else if profileCatalog?.checked_at}
+      Pilih worker untuk melihat rincian profil dari Scan terakhir.
     {:else if selectedWorker}
-      Tekan Scan untuk memeriksa profil lokal pada {selectedWorker}.
+      Tekan Scan semua worker untuk memeriksa profil lokal.
     {:else}
-      Pilih worker untuk memulai.
+      Tekan Scan semua worker untuk memeriksa profil lokal tanpa memilih worker terlebih dahulu.
     {/if}
   </section>
 {/if}

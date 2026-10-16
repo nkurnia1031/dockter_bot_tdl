@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from fastapi import Depends
@@ -206,6 +207,132 @@ def _ensure_unique_worker_token(context, *, name: str, token: str) -> None:
 
 def register_workers(app, context, *, current_actor):
 
+    def _profile_catalog_response(snapshot: dict) -> dict:
+        raw_workers = snapshot.get("workers") if isinstance(snapshot, dict) else None
+        raw_inventories = snapshot.get("inventories") if isinstance(snapshot, dict) else None
+        if not isinstance(raw_workers, list) or not isinstance(raw_inventories, list):
+            return {"checked_at": "", "workers": [], "inventories": []}
+        workers = []
+        successful: set[str] = set()
+        for raw in raw_workers:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip().lower()
+            status = str(raw.get("status") or "")
+            if not WORKER_NAME_RE.fullmatch(name) or status not in {"success", "failed", "disabled"}:
+                continue
+            error_code = str(raw.get("error_code") or "")
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", error_code):
+                error_code = ""
+            workers.append({
+                "name": name,
+                "status": status,
+                "checked_at": str(raw.get("checked_at") or "")[:40],
+                "error_code": error_code if status == "failed" else "",
+            })
+            if status == "success":
+                successful.add(name)
+
+        default_profile = str(
+            getattr(context.profile_manager, "default_profile", "default") or "default"
+        )
+        inventories = []
+        seen = set()
+        profile_workers: dict[str, set[str]] = {}
+        for raw in raw_inventories:
+            if not isinstance(raw, dict):
+                continue
+            worker = str(raw.get("worker") or "").strip().lower()
+            if worker not in successful or worker in seen:
+                continue
+            safe = _safe_local_profile_inventory({"items": raw.get("items")}, worker=worker)
+            safe["checked_at"] = str(raw.get("checked_at") or "")[:40]
+            for item in safe["items"]:
+                item["deletable"] = item.get("name") != default_profile
+                if item.get("ready") is True:
+                    profile_workers.setdefault(item["name"], set()).add(worker)
+            inventories.append(safe)
+            seen.add(worker)
+        profiles = [
+            {
+                "name": name,
+                "workers": sorted(owners),
+                "exclusive_worker": next(iter(owners)) if len(owners) == 1 else "",
+            }
+            for name, owners in sorted(profile_workers.items())
+        ]
+        return {
+            "checked_at": str(snapshot.get("checked_at") or "")[:40],
+            "workers": workers,
+            "inventories": inventories,
+            "profiles": profiles,
+        }
+
+    def _scan_profile_worker(name: str) -> tuple[str, dict | None, str]:
+        try:
+            inventory = _read_profile_inventory(
+                context, name, start_upload_prep=False
+            )
+            return name, inventory, ""
+        except DomainError as exc:
+            code = exc.code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", exc.code) else "WORKER_SCAN_FAILED"
+            return name, None, code
+        except Exception:
+            return name, None, "WORKER_UNAVAILABLE"
+
+    def _perform_profile_catalog_scan(store) -> dict:
+        records = context.worker_registry.list()
+        workers = []
+        scan_names = []
+        for raw_name, record in sorted(records.items()):
+            name = str(raw_name or "").strip().lower()
+            if not WORKER_NAME_RE.fullmatch(name):
+                continue
+            if not bool(record.get("enabled", True)):
+                workers.append({
+                    "name": name,
+                    "status": "disabled",
+                    "checked_at": "",
+                    "error_code": "",
+                })
+            else:
+                scan_names.append(name)
+
+        results = {}
+        if scan_names:
+            with ThreadPoolExecutor(max_workers=min(8, len(scan_names))) as executor:
+                for name, inventory, error_code in executor.map(
+                    _scan_profile_worker, scan_names
+                ):
+                    results[name] = (inventory, error_code)
+
+        inventories = []
+        for name in scan_names:
+            inventory, error_code = results[name]
+            if inventory is None:
+                workers.append({
+                    "name": name,
+                    "status": "failed",
+                    "checked_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+                    "error_code": error_code or "WORKER_SCAN_FAILED",
+                })
+                continue
+            workers.append({
+                "name": name,
+                "status": "success",
+                "checked_at": inventory["checked_at"],
+                "error_code": "",
+            })
+            inventories.append(inventory)
+
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        snapshot = store.replace_scan(
+            checked_at=checked_at,
+            workers=sorted(workers, key=lambda item: item["name"]),
+            inventories=inventories,
+        )
+        return _profile_catalog_response(snapshot)
+
     @app.get("/api/v1/workers", response_model=WorkerListResponse)
     def list_workers(actor=Depends(current_actor)):
         return {
@@ -220,6 +347,32 @@ def register_workers(app, context, *, current_actor):
                 for name, value in context.worker_registry.list().items()
             ]
         }
+
+    @app.get("/api/v1/profiles/local")
+    def local_profile_catalog(actor=Depends(current_actor)):
+        del actor
+        store = getattr(context, "local_profile_catalog", None)
+        if store is None or not callable(getattr(store, "snapshot", None)):
+            raise DomainError(
+                "PROFILE_CATALOG_UNAVAILABLE",
+                "Katalog profil lokal belum tersedia.",
+                status_code=503,
+            )
+        return _profile_catalog_response(store.snapshot())
+
+    @app.post("/api/v1/profiles/local/scan")
+    def scan_all_local_profiles(actor=Depends(current_actor)):
+        del actor
+        store = getattr(context, "local_profile_catalog", None)
+        if not callable(getattr(store, "replace_scan", None)):
+            raise DomainError(
+                "PROFILE_CATALOG_UNAVAILABLE",
+                "Katalog profil lokal belum tersedia.",
+                status_code=503,
+            )
+
+        with store.scan_lock:
+            return _perform_profile_catalog_scan(store)
 
     def _local_profiles_for_worker(name: str, actor, *, start_upload_prep: bool):
         del actor

@@ -18,6 +18,7 @@ from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.queue_transport import (
     QueueCommandService,
@@ -108,6 +109,9 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         config.state_file.parent / "workers.json",
         bootstrap_endpoints,
         bootstrap_tokens,
+    )
+    local_profile_catalog = LocalProfileCatalog(
+        config.state_file.parent / "local_profile_catalog.json"
     )
     source_repository = SqliteSourceRepository(config.storage_db_file)
     profile_vault = ProfileProvisioningStore(
@@ -296,6 +300,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         operation_service=operation_service,
         queue_command_service=queue_command_service,
         queue_publisher=queue_publisher,
+        local_profile_catalog=local_profile_catalog,
     )
     return context, scheduler
 

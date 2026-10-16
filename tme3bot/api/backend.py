@@ -105,6 +105,7 @@ class BackendContext:
     operation_service: Any = None
     queue_command_service: Any = None
     queue_publisher: Any = None
+    local_profile_catalog: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:

@@ -20,6 +20,7 @@ from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
@@ -419,6 +420,7 @@ class BackendApiTests(unittest.TestCase):
         self.catalog = StorageCatalog(db)
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
+        self.local_profile_catalog = LocalProfileCatalog(root / "local-profile-catalog.json")
         self.bot = FakeTelegramBot()
         self.control = ControlPlane(
             self.jobs,
@@ -513,6 +515,7 @@ class BackendApiTests(unittest.TestCase):
                 root / "settings.json", desired_store=runtime_settings_store
             ),
             worker_dispatcher=self.dispatcher,
+            local_profile_catalog=self.local_profile_catalog,
             bot=self.bot,
             runtime_settings=runtime_settings,
             runtime_settings_store=runtime_settings_store,
@@ -993,6 +996,95 @@ class BackendApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, expected_status, response.text)
                 self.assertEqual(response.json()["error"]["code"], expected_code)
                 self.assertNotIn("private worker detail", response.text)
+
+    def test_cross_worker_profile_scan_persists_successful_workers_and_drops_failed_inventory(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test",
+            "token": "remote-secret",
+            "enabled": True,
+        }
+        self.workers.values["remote-2"] = {
+            "url": "https://remote-2.example.test",
+            "token": "remote-secret-2",
+            "enabled": False,
+        }
+        self.local_profile_catalog.replace_scan(
+            checked_at="2026-10-15T00:00:00+00:00",
+            workers=[{"name": "remote-1", "status": "success", "checked_at": "old"}],
+            inventories=[{
+                "worker": "remote-1", "checked_at": "old", "items": [{"name": "stale"}]
+            }],
+        )
+        calls = []
+
+        def inventory(worker):
+            calls.append(worker)
+            if worker == "remote-1":
+                raise JsonHttpError(503, "private worker detail", kind="network")
+            return {"items": [
+                {
+                    "name": "default",
+                    "ready": True,
+                    "reason_codes": [],
+                    "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": True, "code": "OK"},
+                    ],
+                    "upload_lane": {"status": "ready", "phase": "ready", "progress": 100, "code": "OK"},
+                    "telegram_user_id": 42,
+                    "path": "/data/private",
+                    "secret": "must-not-leak",
+                },
+                {
+                    "name": "incomplete",
+                    "ready": False,
+                    "reason_codes": ["PROFILE_USER1_SESSION_MISSING"],
+                    "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": False, "code": "PROFILE_USER1_SESSION_MISSING"},
+                    ],
+                },
+            ]}
+
+        self.dispatcher.profile_local_inventory = inventory
+        self.dispatcher.scan_local_profiles = lambda _worker: self.fail(
+            "cross-worker scan must not start Upload lane preparation"
+        )
+        auth = self.login(42)
+        denied = self.client.post("/api/v1/profiles/local/scan")
+        self.assertEqual(denied.status_code, 401)
+
+        response = self.client.post("/api/v1/profiles/local/scan", headers=auth)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertCountEqual(calls, ["local", "remote-1"])
+        self.assertEqual(
+            [(item["name"], item["status"]) for item in body["workers"]],
+            [("local", "success"), ("remote-1", "failed"), ("remote-2", "disabled")],
+        )
+        self.assertEqual(body["workers"][1]["error_code"], "WORKER_UNAVAILABLE")
+        self.assertEqual([item["worker"] for item in body["inventories"]], ["local"])
+        self.assertEqual(
+            [item["name"] for item in body["inventories"][0]["items"]],
+            ["default", "incomplete"],
+        )
+        self.assertEqual(body["profiles"], [
+            {"name": "default", "workers": ["local"], "exclusive_worker": "local"},
+        ])
+        self.assertNotIn("telegram_user_id", response.text)
+        self.assertNotIn("/data", response.text)
+        self.assertNotIn("must-not-leak", response.text)
+
+        before_read = list(calls)
+        read = self.client.get("/api/v1/profiles/local", headers=auth)
+        self.assertEqual(read.status_code, 200, read.text)
+        self.assertEqual(read.json(), body)
+        self.assertEqual(calls, before_read)
+        self.assertNotIn("stale", read.text)
 
     def test_local_profile_delete_rejects_default_and_any_active_profile_job(self):
         inventories = {"local": {"worker": "local", "items": [
