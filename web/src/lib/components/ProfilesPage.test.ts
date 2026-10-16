@@ -244,6 +244,10 @@ describe('ProfilesPage', () => {
 
     expect((await screen.findByRole('region', { name: 'Status scan semua worker' })).textContent).toMatch(/remote-1.*Gagal/);
     expect(scans).toBe(1);
+    await waitFor(() => {
+      const scanButton = screen.getByRole('button', { name: 'Scan semua worker' });
+      expect((scanButton as HTMLButtonElement).disabled).toBe(false);
+    });
     await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     expect(await screen.findByText(/Worker ini tidak memiliki profil lokal/)).toBeTruthy();
     expect(scans).toBe(2);
