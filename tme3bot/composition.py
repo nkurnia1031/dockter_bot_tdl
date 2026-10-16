@@ -15,6 +15,7 @@ from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
+from tme3bot.infrastructure.activity_journal import ActivityJournalStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
@@ -149,6 +150,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
+    activity_journal = ActivityJournalStore(config.storage_db_file)
     tdl_access_store = SqliteTdlAccessStore(config.storage_db_file)
     operation_store = SqliteOperationStore(jobs)
     recover_profile_deletions = getattr(
@@ -301,6 +303,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         queue_command_service=queue_command_service,
         queue_publisher=queue_publisher,
         local_profile_catalog=local_profile_catalog,
+        activity_journal=activity_journal,
     )
     return context, scheduler
 

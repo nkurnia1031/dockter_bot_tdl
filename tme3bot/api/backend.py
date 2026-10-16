@@ -6,6 +6,7 @@ import hmac
 import logging
 import re
 import secrets
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -16,6 +17,7 @@ from fastapi import Depends, FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
 
 from tme3bot.api.schemas import (
     ActorResponse,
@@ -106,6 +108,7 @@ class BackendContext:
     queue_command_service: Any = None
     queue_publisher: Any = None
     local_profile_catalog: Any = None
+    activity_journal: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -143,6 +146,8 @@ def _error(
     status_code: int,
     details: dict[str, Any] | None = None,
 ) -> JSONResponse:
+    if re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", str(code or "")):
+        request.state.activity_error_code = str(code)
     return JSONResponse(
         status_code=status_code,
         content={
@@ -257,10 +262,97 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
-        request.state.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request.state.request_id
-        return response
+        supplied_request_id = request.headers.get("X-Request-ID", "")
+        try:
+            request_id = str(uuid.UUID(supplied_request_id))
+        except (TypeError, ValueError, AttributeError):
+            request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        occurred_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        response = None
+        status_code = 500
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception:
+            request.state.activity_error_code = getattr(
+                request.state, "activity_error_code", "INTERNAL_ERROR"
+            )
+            raise
+        finally:
+            if response is not None:
+                response.headers["X-Request-ID"] = request.state.request_id
+            path = request.url.path
+            should_record = (
+                path.startswith("/api/v1/")
+                and path not in {
+                    "/api/v1/openapi.json",
+                    "/api/v1/docs",
+                    "/api/v1/docs/oauth2-redirect",
+                }
+                and not path.startswith(("/api/v1/assets/", "/api/v1/static/"))
+                and path.rsplit("/", 1)[-1].lower()
+                not in {"health", "healthz", "ready", "readyz", "readiness"}
+            )
+            journal = getattr(context, "activity_journal", None)
+            if should_record and callable(getattr(journal, "record", None)):
+                route = getattr(request.scope.get("route"), "path", "")
+                route = route if str(route).startswith("/api/v1/") else "/api/v1/{unmatched}"
+                path_params = request.scope.get("path_params")
+                path_params = path_params if isinstance(path_params, dict) else {}
+                query_params = request.query_params
+
+                def safe_target_value(value, *, kind: str) -> str:
+                    candidate = str(value or "").strip().lower()
+                    if kind in {"profile", "worker"}:
+                        return candidate if re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", candidate) else ""
+                    try:
+                        return str(uuid.UUID(candidate))
+                    except (TypeError, ValueError, AttributeError):
+                        return ""
+
+                profile = safe_target_value(
+                    path_params.get("profile") or query_params.get("profile")
+                    or getattr(request.state, "activity_profile", ""),
+                    kind="profile",
+                )
+                worker = safe_target_value(
+                    path_params.get("worker") or query_params.get("worker")
+                    or (
+                        path_params.get("name")
+                        if "/workers/{name}" in str(route)
+                        else ""
+                    ),
+                    kind="worker",
+                )
+                operation_id = safe_target_value(
+                    path_params.get("operation_id") or query_params.get("operation_id"),
+                    kind="uuid",
+                )
+                job_id = safe_target_value(
+                    path_params.get("job_id") or query_params.get("job_id"),
+                    kind="uuid",
+                )
+                try:
+                    await run_in_threadpool(
+                        journal.record,
+                        occurred_at=occurred_at,
+                        request_id=request_id,
+                        method=request.method,
+                        route=str(route),
+                        status_code=status_code,
+                        duration_ms=int((time.perf_counter() - started) * 1000),
+                        actor_user_id=getattr(request.state, "activity_actor_user_id", None),
+                        profile=profile,
+                        worker=worker,
+                        operation_id=operation_id,
+                        job_id=job_id,
+                        error_code=getattr(request.state, "activity_error_code", ""),
+                    )
+                except Exception as exc:
+                    LOGGER.warning("Activity journal write failed (%s)", type(exc).__name__)
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
@@ -284,6 +376,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             or request.url.path.startswith("/api/v1/profiles/provisionings")
             or request.url.path.startswith("/api/v1/auth/devices")
             or request.url.path.startswith("/api/v1/auth/device/")
+            or request.url.path == "/api/v1/activity"
         )
         if sensitive_request:
             # Pydantic versions that include rejected input in error details
@@ -436,8 +529,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 raise DomainError(
                     "PROFILE_NOT_FOUND", "Profile tidak ditemukan.", status_code=404
                 )
-            return Actor(actor.telegram_user_id, selected_profile)
-        return actor
+            resolved_actor = Actor(actor.telegram_user_id, selected_profile)
+        else:
+            resolved_actor = actor
+        request.state.activity_actor_user_id = resolved_actor.telegram_user_id
+        request.state.activity_profile = resolved_actor.profile
+        return resolved_actor
 
     def browser_actor_dict(actor: Actor) -> dict[str, Any]:
         return {
@@ -1241,6 +1338,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         operations,
         current_actor=current_actor,
     )
+    from tme3bot.api.routes.activity import register_activity
+    register_activity(app, context.activity_journal, current_actor=current_actor)
     register_profile_local_delete(app, context, current_actor=current_actor)
     from tme3bot.api.routes.queue import register_queue
     register_queue(app, context, require_internal=require_internal)

@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import base64
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.domain.worker_contract import CAP_DURABLE_COMMANDS_V1, CAP_SAFELINK_RESOLVE
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
+from tme3bot.infrastructure.activity_journal import ActivityJournalStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
@@ -421,6 +423,7 @@ class BackendApiTests(unittest.TestCase):
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
         self.local_profile_catalog = LocalProfileCatalog(root / "local-profile-catalog.json")
+        self.activity_journal = ActivityJournalStore(db)
         self.bot = FakeTelegramBot()
         self.control = ControlPlane(
             self.jobs,
@@ -516,6 +519,7 @@ class BackendApiTests(unittest.TestCase):
             ),
             worker_dispatcher=self.dispatcher,
             local_profile_catalog=self.local_profile_catalog,
+            activity_journal=self.activity_journal,
             bot=self.bot,
             runtime_settings=runtime_settings,
             runtime_settings_store=runtime_settings_store,
@@ -525,7 +529,8 @@ class BackendApiTests(unittest.TestCase):
             operation_service=self.operation_service,
         )
         self.context = context
-        self.client = TestClient(create_backend_app(context))
+        self.app = create_backend_app(context)
+        self.client = TestClient(self.app)
 
     def seed_tdl_access(self, worker="local", purpose="tts", profiles=None):
         capabilities = self.dispatcher.capabilities(worker)
@@ -568,6 +573,7 @@ class BackendApiTests(unittest.TestCase):
         return TestClient(create_backend_app(self.context))
 
     def tearDown(self):
+        self.client.close()
         self.temp.cleanup()
 
     def login(self, user_id=42):
@@ -2539,6 +2545,101 @@ class BackendApiTests(unittest.TestCase):
         payload = response.json()["error"]
         self.assertEqual(payload["code"], "TOKEN_REQUIRED")
         self.assertTrue(payload["request_id"])
+
+    def test_activity_journal_captures_public_metadata_and_redacts_request_content(self):
+        async def echo_body(body: dict):
+            return {"echo": body}
+
+        def fail_with_private_detail():
+            raise DomainError(
+                "ACTIVITY_TEST_FAILURE", "Detail internal yang tidak dicatat.", status_code=503
+            )
+
+        self.app.add_api_route(
+            "/api/v1/test/activity-echo", echo_body, methods=["POST"], include_in_schema=False
+        )
+        self.app.add_api_route(
+            "/api/v1/test/activity-fail", fail_with_private_detail, methods=["GET"], include_in_schema=False
+        )
+        headers = self.login()
+        sentinels = [
+            "ACTIVITY_BODY_SENTINEL",
+            "ACTIVITY_HEADER_SENTINEL",
+            "ACTIVITY_COOKIE_SENTINEL",
+            "ACTIVITY_QUERY_SENTINEL",
+            "ACTIVITY_REQUEST_ID_SENTINEL",
+        ]
+        self.client.cookies.set("sensitive-cookie", "ACTIVITY_COOKIE_SENTINEL")
+        echoed = self.client.post(
+            "/api/v1/test/activity-echo?unused=ACTIVITY_QUERY_SENTINEL",
+            headers={
+                **headers,
+                "X-Sensitive": "ACTIVITY_HEADER_SENTINEL",
+                "X-Request-ID": "ACTIVITY_REQUEST_ID_SENTINEL",
+            },
+            json={"value": "ACTIVITY_BODY_SENTINEL"},
+        )
+        self.assertEqual(echoed.status_code, 200)
+        self.assertEqual(echoed.json()["echo"]["value"], sentinels[0])
+
+        success = self.client.get("/api/v1/workers", headers=headers)
+        denied = self.client.get("/api/v1/me")
+        invalid = self.client.get(
+            "/api/v1/diagnostics/tts/logs?limit=not-an-integer", headers=headers
+        )
+        try:
+            failed = self.client.get("/api/v1/test/activity-fail", headers=headers)
+        except BaseException:
+            failed = None
+        health = self.client.get("/healthz")
+        internal = self.client.get(
+            "/internal/v1/capabilities",
+            headers={"Authorization": "Bearer internal"},
+        )
+        self.assertEqual(success.status_code, 200)
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(invalid.status_code, 422)
+        self.assertIsNotNone(failed)
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual(health.status_code, 200)
+        self.assertNotIn(internal.status_code, {500})
+
+        response = self.client.get("/api/v1/activity?limit=200", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        entries = response.json()["items"]
+        by_route = {item["route"]: item for item in entries}
+        self.assertEqual(by_route["/api/v1/workers"]["status_code"], 200)
+        self.assertEqual(by_route["/api/v1/workers"]["actor_user_id"], 42)
+        self.assertEqual(by_route["/api/v1/workers"]["profile"], "default")
+        self.assertEqual(by_route["/api/v1/me"]["error_code"], "TOKEN_REQUIRED")
+        self.assertEqual(by_route["/api/v1/diagnostics/tts/logs"]["error_code"], "VALIDATION_ERROR")
+        self.assertEqual(by_route["/api/v1/test/activity-fail"]["error_code"], "ACTIVITY_TEST_FAILURE")
+        self.assertEqual(by_route["/api/v1/test/activity-echo"]["request_id"] != sentinels[4], True)
+        self.assertEqual(response.json()["retention_days"], 90)
+        self.assertFalse(any("/internal/v1/" in item["route"] for item in entries))
+        self.assertFalse(any(item["route"] == "/healthz" for item in entries))
+        for item in entries:
+            self.assertNotIn("body", item)
+            self.assertNotIn("response", item)
+            self.assertNotIn("headers", item)
+            self.assertNotIn("cookies", item)
+
+        page = self.client.get("/api/v1/activity?limit=1&method=POST", headers=headers)
+        self.assertEqual(page.status_code, 200)
+        self.assertTrue(page.json()["next_cursor"])
+        filtered = self.client.get(
+            "/api/v1/activity?method=GET&status_code=401&route=%2Fapi%2Fv1%2Fme",
+            headers=headers,
+        )
+        self.assertEqual(filtered.status_code, 200)
+        self.assertTrue(all(item["status_code"] == 401 for item in filtered.json()["items"]))
+
+        with sqlite3.connect(self.activity_journal.path) as db:
+            stored = repr(db.execute("SELECT * FROM api_activity").fetchall())
+        activity_response = self.client.get("/api/v1/activity?limit=200", headers=headers)
+        journal_payload = activity_response.text + stored
+        for sentinel in sentinels:
+            self.assertNotIn(sentinel, journal_payload)
 
     def test_utility_settings_explain_allowed_values_without_exposing_password(self):
         headers = self.login()
