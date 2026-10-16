@@ -772,6 +772,23 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertIn("profile.sync", client.get("/api/v1/capabilities").json()["operations"]["supported_kinds"])
         operation_id = response.json()["operation_id"]
+        progress = client.get(
+            f"/api/v1/operations/{operation_id}/events", headers=self.login(42)
+        )
+        self.assertEqual(progress.status_code, 200, progress.text)
+        self.assertEqual(progress.json()["items"][0]["phase"], "queued")
+        self.assertEqual(progress.json()["items"][0]["code"], "PROFILE_SYNC_QUEUED")
+        self.assertEqual(
+            client.get(f"/api/v1/operations/{operation_id}/events").status_code,
+            401,
+        )
+        repeated = client.post(
+            "/api/v1/operations",
+            headers={**self.login(42), "Idempotency-Key": "profile-sync-default-local"},
+            json={"kind": "profile.sync", "target": {"profile": "default", "worker": "local"}, "input": {}},
+        )
+        self.assertEqual(repeated.status_code, 202)
+        self.assertEqual(repeated.json()["operation_id"], operation_id)
         private = self.operation_service.store.get_private_payload(operation_id)
         self.assertNotIn("bundle", private)
         command = {
@@ -787,13 +804,42 @@ class BackendApiTests(unittest.TestCase):
         )
 
         revision = vault.desired_revision("default")
+        worker_headers = {
+            "Authorization": "Bearer internal",
+            "X-Worker-Name": "local",
+            "X-Worker-Token": "secret",
+        }
+        worker_event = {
+            "profile": "default",
+            "run_id": "worker-run-123",
+            "sequence": 1,
+            "revision": revision["revision"],
+            "phase": "session_install",
+            "status": "running",
+            "details": {"entry_count": 2, "password": "must-not-be-stored"},
+        }
+        event_response = client.post(
+            "/internal/v1/profile-sync/events",
+            headers=worker_headers,
+            json=worker_event,
+        )
+        self.assertEqual(event_response.status_code, 200, event_response.text)
+        duplicate_response = client.post(
+            "/internal/v1/profile-sync/events",
+            headers=worker_headers,
+            json=worker_event,
+        )
+        self.assertTrue(duplicate_response.json()["duplicate"])
+        events = client.get(
+            f"/api/v1/operations/{operation_id}/events", headers=self.login(42)
+        ).json()["items"]
+        install_events = [item for item in events if item["phase"] == "session_install"]
+        self.assertEqual(len(install_events), 1)
+        self.assertNotIn("password", repr(install_events))
+
         acknowledged = client.post(
             "/internal/v1/profiles/default/ack",
-            headers={
-                "Authorization": "Bearer internal",
-                "X-Worker-Name": "local",
-                "X-Worker-Token": "secret",
-            },
+            headers=worker_headers,
             json={
                 "revision": revision["revision"],
                 "bundle_sha256": revision["bundle_sha256"],
@@ -805,6 +851,56 @@ class BackendApiTests(unittest.TestCase):
             self.operation_service.get(self.control.actor(42), operation_id).status.value,
             "succeeded",
         )
+        progress = client.get(
+            f"/api/v1/operations/{operation_id}/events", headers=self.login(42)
+        )
+        self.assertTrue(any(
+            item["phase"] == "completed" and item["status"] == "succeeded"
+            for item in progress.json()["items"]
+        ))
+
+        failed_response = client.post(
+            "/api/v1/operations",
+            headers={**self.login(42), "Idempotency-Key": "profile-sync-default-local-failed"},
+            json={
+                "kind": "profile.sync",
+                "target": {"profile": "default", "worker": "local"},
+                "input": {"mode": "repair"},
+            },
+        )
+        self.assertEqual(failed_response.status_code, 202, failed_response.text)
+        failed_id = failed_response.json()["operation_id"]
+        failed_command = {
+            "operation_id": failed_id,
+            "kind": "profile.sync",
+            "private_payload": self.operation_service.store.get_private_payload(failed_id),
+        }
+        self.assertEqual(advance_profile_sync_command(failed_command, self.context)["status"], "accepted")
+        failed_event = client.post(
+            "/internal/v1/profile-sync/events",
+            headers=worker_headers,
+            json={
+                "profile": "default",
+                "run_id": "worker-fail-123",
+                "sequence": 1,
+                "revision": revision["revision"],
+                "phase": "completed",
+                "status": "failed",
+                "code": "PROFILE_SESSION_TDL_INVALID",
+            },
+        )
+        self.assertEqual(failed_event.status_code, 200, failed_event.text)
+        self.assertEqual(
+            self.operation_service.get(self.control.actor(42), failed_id).status.value,
+            "failed",
+        )
+        failed_progress = client.get(
+            f"/api/v1/operations/{failed_id}/events", headers=self.login(42)
+        ).json()["items"]
+        self.assertTrue(any(
+            item["phase"] == "completed" and item["status"] == "failed"
+            for item in failed_progress
+        ))
         client.close()
 
     def test_worker_profile_sync_status_is_authenticated_and_redacted(self):

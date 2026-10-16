@@ -13,7 +13,7 @@ from tme3bot.api.schemas import (
 from tme3bot.domain.models import DomainError
 
 
-def register_operations(app, operations, *, current_actor) -> None:
+def register_operations(app, operations, *, current_actor, profile_sync_store=None) -> None:
     def _require_operations():
         if operations is None:
             raise DomainError(
@@ -49,6 +49,32 @@ def register_operations(app, operations, *, current_actor) -> None:
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
+        if operation.kind == "profile.sync" and profile_sync_store is not None:
+            profile = str(operation.target.get("profile") or "")
+            worker = str(operation.target.get("worker") or "")
+            revision = operation.target.get("desired_revision")
+            details = {"desired_revision": revision} if type(revision) is int else None
+            profile_sync_store.append_profile_sync_log(
+                profile=profile,
+                worker=worker,
+                run_id=operation.id,
+                revision=revision if type(revision) is int else None,
+                phase="queued",
+                status="queued",
+                code="PROFILE_SYNC_QUEUED",
+                details=details,
+            )
+            profile_sync_store.append_profile_sync_operation_event(
+                operation_id=operation.id,
+                profile=profile,
+                worker=worker,
+                run_id=operation.id,
+                revision=revision if type(revision) is int else None,
+                phase="queued",
+                status="queued",
+                code="PROFILE_SYNC_QUEUED",
+                details=details,
+            )
         request.state.activity_operation_id = operation.id
         status_url = f"/api/v1/operations/{operation.id}"
         response.headers["Location"] = status_url
@@ -68,6 +94,20 @@ def register_operations(app, operations, *, current_actor) -> None:
     @app.get("/api/v1/operations/{operation_id}", response_model=OperationResponse)
     def get_operation(operation_id: str, actor=Depends(current_actor)):
         return _public(_require_operations().get(actor, operation_id))
+
+    @app.get("/api/v1/operations/{operation_id}/events")
+    def get_operation_events(
+        operation_id: str,
+        after_id: int = Query(default=0, ge=0),
+        limit: int = Query(default=100, ge=1, le=500),
+        actor=Depends(current_actor),
+    ):
+        operation = _require_operations().get(actor, operation_id)
+        if operation.kind != "profile.sync" or profile_sync_store is None:
+            raise DomainError("OPERATION_EVENTS_UNAVAILABLE", "Riwayat event operasi ini tidak tersedia.", status_code=404)
+        return profile_sync_store.profile_sync_operation_events(
+            operation.id, after_id=after_id, limit=limit
+        )
 
     @app.post("/api/v1/operations/{operation_id}/cancel", status_code=202, response_model=OperationResponse)
     def cancel_operation(

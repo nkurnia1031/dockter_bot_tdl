@@ -348,6 +348,28 @@ class ProfileProvisioningStore:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_logs_server_event
                     ON profile_sync_logs(worker,run_id,phase,status,code)
                     WHERE sequence IS NULL;
+                CREATE TABLE IF NOT EXISTS profile_sync_operation_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_id TEXT NOT NULL,
+                    profile TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    sequence INTEGER,
+                    revision INTEGER,
+                    phase TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    code TEXT NOT NULL,
+                    details_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_profile_sync_operation_events_operation
+                    ON profile_sync_operation_events(operation_id,id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_operation_events_worker_event
+                    ON profile_sync_operation_events(operation_id,worker,run_id,sequence)
+                    WHERE sequence IS NOT NULL;
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_operation_events_server_event
+                    ON profile_sync_operation_events(operation_id,worker,run_id,phase,status,code)
+                    WHERE sequence IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_profile_provisionings_status
                     ON profile_provisionings(status, updated_at);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sessions_user_id
@@ -566,6 +588,92 @@ class ProfileProvisioningStore:
             )
             return int(cursor.lastrowid) if cursor.rowcount else None
 
+    def append_profile_sync_operation_event(
+        self,
+        *,
+        operation_id: str,
+        profile: str,
+        worker: str,
+        run_id: str,
+        phase: str,
+        status: str,
+        code: str = "",
+        revision: int | None = None,
+        sequence: int | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> int | None:
+        safe_details = self._safe_profile_sync_details(details)
+        now = _now()
+        with self._lock, self._db() as db:
+            cursor = db.execute(
+                "INSERT OR IGNORE INTO profile_sync_operation_events "
+                "(operation_id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(operation_id)[:64], str(profile)[:48], str(worker)[:48], str(run_id)[:64],
+                    int(sequence) if sequence is not None else None,
+                    int(revision) if revision is not None else None,
+                    re.sub(r"[^a-z0-9_-]", "", str(phase).lower())[:64] or "event",
+                    str(status)[:24],
+                    re.sub(r"[^A-Z0-9_-]", "", str(code).upper())[:64],
+                    json.dumps(safe_details, separators=(",", ":")), now,
+                ),
+            )
+            db.execute(
+                "DELETE FROM profile_sync_operation_events WHERE id NOT IN "
+                "(SELECT id FROM profile_sync_operation_events ORDER BY id DESC LIMIT 50000)"
+            )
+            return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def profile_sync_operation_events(
+        self, operation_id: str, *, after_id: int = 0, limit: int = 100
+    ) -> dict[str, Any]:
+        safe_limit = min(500, max(1, int(limit)))
+        with self._db() as db:
+            latest = db.execute(
+                "SELECT status FROM profile_sync_operation_events WHERE operation_id=? ORDER BY id DESC LIMIT 1",
+                (str(operation_id),),
+            ).fetchone()
+            if int(after_id) <= 0:
+                rows = db.execute(
+                    "SELECT id,operation_id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
+                    "FROM profile_sync_operation_events WHERE operation_id=? ORDER BY id LIMIT ?",
+                    (str(operation_id), safe_limit),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    "SELECT id,operation_id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
+                    "FROM profile_sync_operation_events WHERE operation_id=? AND id>? ORDER BY id LIMIT ?",
+                    (str(operation_id), int(after_id), safe_limit),
+                ).fetchall()
+        items = []
+        for row in rows:
+            try:
+                details = json.loads(str(row["details_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                details = {}
+            items.append({
+                "id": int(row["id"]),
+                "operation_id": str(row["operation_id"]),
+                "profile": str(row["profile"]),
+                "worker": str(row["worker"]),
+                "run_id": str(row["run_id"]),
+                "sequence": int(row["sequence"]) if row["sequence"] is not None else None,
+                "revision": int(row["revision"]) if row["revision"] is not None else None,
+                "phase": str(row["phase"]),
+                "status": str(row["status"]),
+                "code": str(row["code"]),
+                "details": details if isinstance(details, dict) else {},
+                "created_at": str(row["created_at"]),
+            })
+        last_id = items[-1]["id"] if items else max(0, int(after_id))
+        latest_status = str(latest["status"]) if latest else ""
+        return {
+            "items": items,
+            "next_after_id": last_id,
+            "active": latest_status in {"queued", "running", "waiting"},
+        }
+
     def profile_sync_logs(
         self, profile: str, worker: str, *, after_id: int = 0, limit: int = 100
     ) -> dict[str, Any]:
@@ -614,7 +722,7 @@ class ProfileProvisioningStore:
             "next_after_id": last_id,
             "latest_run_id": str(latest["run_id"]) if latest else None,
             "latest_status": latest_status or None,
-            "active": latest_status in {"queued", "running"},
+            "active": latest_status in {"queued", "running", "waiting"},
         }
 
     @staticmethod
@@ -995,7 +1103,12 @@ class ProfileProvisioningStore:
             if assignment is None or expected is None:
                 return {"accepted": False, "reason": "not_assigned"}
             desired = int(assignment["desired_revision"] or 0)
-            stale = desired != int(revision)
+            current_revision = db.execute(
+                "SELECT desired_revision FROM profile_sessions WHERE profile=?",
+                (str(profile),),
+            ).fetchone()
+            latest_desired = int(current_revision[0]) if current_revision else desired
+            stale = desired != int(revision) or latest_desired != int(revision)
             metadata_matches = (
                 str(expected["bundle_sha256"]) == str(bundle_sha256)
                 and int(expected["telegram_user_id"]) == int(telegram_user_id)
@@ -1029,13 +1142,10 @@ class ProfileProvisioningStore:
                     "UPDATE profile_distributions SET status='ready',error=NULL,installed_revision=?,installed_sha256=?,installed_telegram_user_id=?,sync_requested=0,updated_at=? WHERE profile=? AND worker=?",
                     (int(revision), str(bundle_sha256), int(telegram_user_id), now, str(profile), str(worker)),
                 )
-            current_revision = db.execute(
-                "SELECT desired_revision FROM profile_sessions WHERE profile=?", (str(profile),)
-            ).fetchone()
             return {
                 "accepted": not stale and not bool(error_code),
                 "reason": "stale_revision" if stale else ("install_failed" if error_code else "installed"),
-                "desired_revision": int(current_revision[0]) if current_revision else desired,
+                "desired_revision": latest_desired,
             }
 
     def distribution_provisioning_id(self, profile: str, worker: str) -> str | None:

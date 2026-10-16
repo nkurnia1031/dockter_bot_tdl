@@ -29,6 +29,14 @@ _SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _SUPPORTED_FORMAT = 1
 _MAX_QUEUED_SYNC_REQUESTS = 32
+_MAX_PENDING_SYNC_EVENTS = 10000
+_SYNC_EVENT_PHASES = {
+    "queued", "manifest_fetch", "revision_compare", "bundle_download",
+    "bundle_validation", "session_validation", "session_install", "session_commit",
+    "acknowledgement", "worker_unreachable", "completed", "cancelled",
+}
+_SYNC_EVENT_STATUSES = {"queued", "running", "succeeded", "failed", "waiting", "cancelled"}
+_SYNC_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
 
 class _RejectRedirects(HTTPRedirectHandler):
@@ -76,6 +84,7 @@ class ProfileSyncClient:
         self._worker_token_provider = worker_token_provider
         self.path = Path(config.state_file).parent / "profile-sync.json"
         self._condition = threading.Condition(threading.RLock())
+        self._event_outbox_lock = threading.Lock()
         self._sync_lock = threading.Lock()
         self._requests: queue.Queue[tuple[str | None, str]] = queue.Queue()
         self._queued: set[tuple[str | None, str]] = set()
@@ -409,6 +418,7 @@ class ProfileSyncClient:
         profile: str | None,
         cancelled: Callable[[str], bool] | None = None,
     ) -> dict[str, Any]:
+        self._flush_sync_event_outbox()
         is_cancelled = cancelled or (lambda _profile: False)
         self._last_failed_profiles = ()
         run_id = uuid.uuid4().hex
@@ -803,15 +813,99 @@ class ProfileSyncClient:
                 if key in {"desired_revision", "installed_revision", "bundle_bytes", "entry_count", "attempt"}
                 and type(value) is int
             }
-        try:
-            self._request(
-                "POST",
-                "/internal/v1/profile-sync/events",
-                json.dumps(payload, separators=(",", ":")).encode("utf-8"),
-                timeout=3,
-            )
-        except Exception as exc:
-            LOGGER.debug("Could not report profile sync event (%s)", type(exc).__name__)
+        safe_payload = self._safe_sync_event(payload)
+        if safe_payload is None:
+            LOGGER.warning("Skipped an invalid profile sync event")
+            return
+        with self._event_outbox_lock:
+            self._flush_sync_event_outbox_locked()
+            identity = self._sync_event_identity(safe_payload)
+            with self._condition:
+                pending = self._state.setdefault("pending_sync_events", [])
+                if not any(self._sync_event_identity(item) == identity for item in pending):
+                    if len(pending) >= _MAX_PENDING_SYNC_EVENTS:
+                        LOGGER.error("Profile sync event outbox is full; event was not recorded")
+                        return
+                    pending.append(safe_payload)
+                    self._save_locked()
+            self._flush_sync_event_outbox_locked()
+
+    def _flush_sync_event_outbox(self) -> None:
+        with self._event_outbox_lock:
+            self._flush_sync_event_outbox_locked()
+
+    def _flush_sync_event_outbox_locked(self) -> None:
+        while True:
+            with self._condition:
+                pending = self._state.setdefault("pending_sync_events", [])
+                event = dict(pending[0]) if pending else None
+            if event is None:
+                return
+            try:
+                response, _ = self._request(
+                    "POST",
+                    "/internal/v1/profile-sync/events",
+                    json.dumps(event, separators=(",", ":")).encode("utf-8"),
+                    timeout=3,
+                )
+                result = json.loads(response.decode("utf-8"))
+                if not isinstance(result, dict) or result.get("accepted") is not True:
+                    return
+            except Exception as exc:
+                LOGGER.debug("Could not report profile sync event (%s)", type(exc).__name__)
+                return
+            identity = self._sync_event_identity(event)
+            with self._condition:
+                pending = self._state.setdefault("pending_sync_events", [])
+                self._state["pending_sync_events"] = [
+                    item for item in pending
+                    if self._sync_event_identity(item) != identity
+                ]
+                self._save_locked()
+
+    @staticmethod
+    def _sync_event_identity(event: dict[str, Any]) -> tuple[str, str, int]:
+        return (str(event.get("profile") or ""), str(event.get("run_id") or ""), int(event.get("sequence") or 0))
+
+    @staticmethod
+    def _safe_sync_event(event: dict[str, Any]) -> dict[str, Any] | None:
+        profile = normalize_profile_name(str(event.get("profile") or ""))
+        run_id = str(event.get("run_id") or "")
+        sequence = event.get("sequence")
+        revision = event.get("revision")
+        phase = str(event.get("phase") or "")
+        status = str(event.get("status") or "")
+        if (
+            not profile
+            or not _SYNC_RUN_ID_RE.fullmatch(run_id)
+            or type(sequence) is not int or sequence < 1
+            or type(revision) is not int or revision < 1
+            or phase not in _SYNC_EVENT_PHASES
+            or status not in _SYNC_EVENT_STATUSES
+        ):
+            return None
+        safe: dict[str, Any] = {
+            "profile": profile,
+            "run_id": run_id,
+            "sequence": sequence,
+            "revision": revision,
+            "phase": phase,
+            "status": status,
+        }
+        code = _safe_code(event.get("code"))
+        if code:
+            safe["code"] = code
+        details = event.get("details")
+        if isinstance(details, dict):
+            safe_details = {
+                key: max(0, min(2**31 - 1, int(value)))
+                for key, value in details.items()
+                if key in {"desired_revision", "installed_revision", "bundle_bytes", "entry_count", "attempt"}
+                and type(value) is int
+            }
+            if safe_details:
+                safe["details"] = safe_details
+        return safe
 
     def _sync_cancelled(self, profile: str, mode: str) -> bool:
         with self._condition:
@@ -1049,12 +1143,30 @@ class ProfileSyncClient:
             }
         managed = raw.get("managed_profiles")
         managed = managed if isinstance(managed, list) else []
+        pending_events = raw.get("pending_sync_events")
+        pending_events = pending_events if isinstance(pending_events, list) else []
+        safe_pending_events = []
+        seen_events = set()
+        for item in pending_events:
+            if not isinstance(item, dict):
+                continue
+            safe_event = self._safe_sync_event(item)
+            if safe_event is None:
+                continue
+            identity = self._sync_event_identity(safe_event)
+            if identity in seen_events:
+                continue
+            seen_events.add(identity)
+            safe_pending_events.append(safe_event)
+            if len(safe_pending_events) >= _MAX_PENDING_SYNC_EVENTS:
+                break
         return {
             "backend_available": raw.get("backend_available") if isinstance(raw.get("backend_available"), bool) else None,
             "backend_error_code": _safe_code(raw.get("backend_error_code")),
             "last_checked_at": str(raw.get("last_checked_at") or "")[:64],
             "managed_profiles": sorted({name for item in managed if (name := normalize_profile_name(str(item)))}),
             "profiles": safe_rows,
+            "pending_sync_events": safe_pending_events,
         }
 
     def _save_locked(self) -> None:

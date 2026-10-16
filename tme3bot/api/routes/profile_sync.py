@@ -47,6 +47,13 @@ def _worker_identity(context, worker_name: str, worker_token: str) -> str:
 
 
 def _complete_sync_operation(context, request: dict[str, Any], *, succeeded: bool, revision: int) -> None:
+    _ensure_operation_terminal_event(
+        context,
+        request,
+        revision=revision,
+        status="succeeded" if succeeded else "failed",
+        code="PROFILE_SYNC_INSTALLED" if succeeded else "PROFILE_SYNC_FAILED",
+    )
     service = context.operation_service
     if service is None:
         return
@@ -73,6 +80,67 @@ def _complete_sync_operation(context, request: dict[str, Any], *, succeeded: boo
         status=target_status,
         phase="installed" if succeeded else "install_failed",
         safe_progress={"worker": operation.target.get("worker", ""), "installed_revision": int(revision)},
+    )
+
+
+def _append_operation_sync_event(
+    context,
+    request: dict[str, Any],
+    *,
+    run_id: str,
+    sequence: int | None,
+    revision: int,
+    phase: str,
+    status: str,
+    code: str = "",
+    details: dict[str, Any] | None = None,
+) -> None:
+    provisioner = context.profile_provisioner
+    if provisioner is None:
+        return
+    provisioner.store.append_profile_sync_operation_event(
+        operation_id=str(request.get("operation_id") or ""),
+        profile=str(request.get("profile") or ""),
+        worker=str(request.get("worker") or ""),
+        run_id=run_id,
+        sequence=sequence,
+        revision=revision,
+        phase=phase,
+        status=status,
+        code=code,
+        details=details,
+    )
+
+
+def _ensure_operation_terminal_event(
+    context,
+    request: dict[str, Any],
+    *,
+    revision: int,
+    status: str,
+    code: str,
+) -> None:
+    provisioner = context.profile_provisioner
+    if provisioner is None:
+        return
+    operation_id = str(request.get("operation_id") or "")
+    existing = provisioner.store.profile_sync_operation_events(operation_id, limit=500)
+    if any(
+        item.get("phase") in {"completed", "cancelled"}
+        and item.get("status") in {"succeeded", "failed", "cancelled"}
+        for item in existing.get("items", [])
+    ):
+        return
+    _append_operation_sync_event(
+        context,
+        request,
+        run_id=operation_id,
+        sequence=None,
+        revision=revision,
+        phase="completed" if status != "cancelled" else "cancelled",
+        status=status,
+        code=code,
+        details={"installed_revision": revision} if status == "succeeded" else None,
     )
 
 
@@ -154,6 +222,18 @@ def register_profile_sync(app, context, *, require_internal, current_actor) -> N
             code=code,
             details=details,
         )
+        for sync_request in provisioner.store.sync_requests(profile, worker, revision):
+            _append_operation_sync_event(
+                context,
+                {**sync_request, "profile": profile, "worker": worker},
+                run_id=run_id,
+                sequence=sequence,
+                revision=revision,
+                phase=phase,
+                status=status,
+                code=code,
+                details=details,
+            )
         desired = provisioner.store.desired_revision(profile)
         if (
             status == "failed"
@@ -172,7 +252,7 @@ def register_profile_sync(app, context, *, require_internal, current_actor) -> N
             ):
                 _complete_sync_operation(
                     context,
-                    sync_request,
+                    {**sync_request, "profile": profile, "worker": worker},
                     succeeded=False,
                     revision=revision,
                 )
@@ -300,7 +380,7 @@ def register_profile_sync(app, context, *, require_internal, current_actor) -> N
             for sync_request in requests:
                 _complete_sync_operation(
                     context,
-                    sync_request,
+                    {**sync_request, "profile": profile, "worker": worker},
                     succeeded=bool(result["accepted"]),
                     revision=revision,
                 )
@@ -364,6 +444,25 @@ def advance_profile_sync_command(command: dict[str, Any], context) -> dict[str, 
     provisioner = context.profile_provisioner
     revision = provisioner.store.desired_revision(profile) if provisioner else None
     if not operation_id or not profile or not worker or not actor_user_id or revision is None:
+        if operation_id and profile and worker and provisioner is not None:
+            target_revision = int(payload.get("desired_revision") or 1)
+            request = {"operation_id": operation_id, "profile": profile, "worker": worker}
+            provisioner.store.append_profile_sync_log(
+                profile=profile,
+                worker=worker,
+                run_id=operation_id,
+                revision=target_revision,
+                phase="completed",
+                status="failed",
+                code="PROFILE_SYNC_UNAVAILABLE",
+            )
+            _ensure_operation_terminal_event(
+                context,
+                request,
+                revision=target_revision,
+                status="failed",
+                code="PROFILE_SYNC_UNAVAILABLE",
+            )
         return {"status": "terminal", "reason": "profile_unavailable"}
     try:
         provisioner.store.add_worker_for_active_profiles(worker)
@@ -382,6 +481,17 @@ def advance_profile_sync_command(command: dict[str, Any], context) -> dict[str, 
         profile=profile,
         worker=worker,
         run_id=run_id,
+        revision=int(revision["revision"]),
+        phase="queued",
+        status="queued",
+        code="PROFILE_SYNC_QUEUED",
+        details={"desired_revision": int(revision["revision"])},
+    )
+    _append_operation_sync_event(
+        context,
+        {"operation_id": operation_id, "profile": profile, "worker": worker},
+        run_id=run_id,
+        sequence=None,
         revision=int(revision["revision"]),
         phase="queued",
         status="queued",
@@ -414,6 +524,16 @@ def advance_profile_sync_command(command: dict[str, Any], context) -> dict[str, 
                 status="waiting",
                 code="WORKER_UNAVAILABLE",
             )
+            _append_operation_sync_event(
+                context,
+                {"operation_id": operation_id, "profile": profile, "worker": worker},
+                run_id=run_id,
+                sequence=None,
+                revision=int(revision["revision"]),
+                phase="worker_unreachable",
+                status="waiting",
+                code="WORKER_UNAVAILABLE",
+            )
             # Keep the durable operation waiting. The outbox retries this
             # command, and the Web can show the worker's current diagnostic.
             return {"status": "retry", "reason": "worker_sync_unavailable"}
@@ -421,6 +541,16 @@ def advance_profile_sync_command(command: dict[str, Any], context) -> dict[str, 
             profile=profile,
             worker=worker,
             run_id=run_id,
+            revision=int(revision["revision"]),
+            phase="queued",
+            status="running",
+            code="WORKER_SYNC_REQUESTED",
+        )
+        _append_operation_sync_event(
+            context,
+            {"operation_id": operation_id, "profile": profile, "worker": worker},
+            run_id=run_id,
+            sequence=None,
             revision=int(revision["revision"]),
             phase="queued",
             status="running",
@@ -445,6 +575,16 @@ def advance_profile_sync_cancel(command: dict[str, Any], context) -> dict[str, s
             profile=str(sync_request["profile"]),
             worker=str(sync_request["worker"]),
             run_id=operation_id if _RUN_ID_RE.fullmatch(operation_id) else re.sub(r"[^A-Za-z0-9_-]", "", operation_id)[:64],
+            revision=int(sync_request["desired_revision"]),
+            phase="cancelled",
+            status="cancelled",
+            code="PROFILE_SYNC_CANCELLED",
+        )
+        _append_operation_sync_event(
+            context,
+            {"operation_id": operation_id, **sync_request},
+            run_id=operation_id,
+            sequence=None,
             revision=int(sync_request["desired_revision"]),
             phase="cancelled",
             status="cancelled",
@@ -487,4 +627,20 @@ def advance_profile_sync_cancel(command: dict[str, Any], context) -> dict[str, s
                     "worker_sync_cancel": worker_cancel_status,
                 },
             )
+    if sync_request is not None:
+        terminal_request = {"operation_id": operation_id, **sync_request}
+    else:
+        terminal_request = {
+            "operation_id": operation_id,
+            "profile": str(payload.get("profile") or ""),
+            "worker": str(payload.get("worker") or ""),
+        }
+    if terminal_request.get("profile") and terminal_request.get("worker"):
+        _ensure_operation_terminal_event(
+            context,
+            terminal_request,
+            revision=int((sync_request or payload).get("desired_revision") or 1),
+            status="cancelled",
+            code="PROFILE_SYNC_CANCELLED",
+        )
     return {"status": "terminal", "worker_sync_cancel": worker_cancel_status}

@@ -485,6 +485,37 @@ class WorkerProfileSyncTests(unittest.TestCase):
         )
         self.assertEqual(reports, ["waiting_worker"])
 
+    def test_profile_sync_event_outbox_replays_same_event_after_restart(self):
+        first_client, first_transport = self.make_client([], {})
+
+        def unavailable(_method, _path, _data, **_kwargs):
+            raise OSError("offline")
+
+        first_client._request = unavailable
+        first_client._report_sync_event(
+            run_id="worker-run-123",
+            sequence=1,
+            profile="irang",
+            revision=7,
+            phase="bundle_download",
+            status="running",
+            details={"bundle_bytes": 512, "password": 123},
+        )
+        persisted = json.loads(first_client.path.read_text(encoding="utf-8"))
+        self.assertEqual(len(persisted["pending_sync_events"]), 1)
+        self.assertNotIn("password", json.dumps(persisted["pending_sync_events"]))
+
+        restarted, replay_transport = self.make_client([], {})
+        restarted._flush_sync_event_outbox()
+        restarted._flush_sync_event_outbox()
+
+        self.assertEqual(len(first_transport.sync_events), 0)
+        self.assertEqual(len(replay_transport.sync_events), 1)
+        self.assertEqual(replay_transport.sync_events[0]["run_id"], "worker-run-123")
+        self.assertEqual(replay_transport.sync_events[0]["sequence"], 1)
+        self.assertEqual(replay_transport.sync_events[0]["details"], {"bundle_bytes": 512})
+        self.assertEqual(restarted._state["pending_sync_events"], [])
+
     def test_cancel_queued_profile_sync_skips_the_request(self):
         client, transport = self.make_client([], {})
         key = ("irang", "check")

@@ -1341,6 +1341,11 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         app,
         operations,
         current_actor=current_actor,
+        profile_sync_store=(
+            context.profile_provisioner.store
+            if context.profile_provisioner is not None
+            else None
+        ),
     )
     from tme3bot.api.routes.activity import register_activity
     register_activity(

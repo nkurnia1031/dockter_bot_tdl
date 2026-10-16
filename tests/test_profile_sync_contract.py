@@ -171,6 +171,9 @@ class ProfileSyncContractTests(unittest.TestCase):
         )
         replacement = build_profile_bundle({"data/default": b"replacement"}, 10001)
         self.store.store_bundle(second_id, 10001, replacement)
+        self.store.update_distribution(
+            "novel", "worker-a", "waiting", provisioning_id=second_id
+        )
 
         stale = self.secure_client.post(
             "/internal/v1/profiles/novel/ack",
@@ -273,6 +276,11 @@ class ProfileSyncContractTests(unittest.TestCase):
         self.assertEqual(cancelled["worker_sync_cancel"], "cancelled")
         self.assertEqual(self.worker_sync_cancellations, [("worker-b", "novel", "check")])
         self.assertFalse(self.store.profile_manifest("worker-b")[0]["sync_requested"])
+        progress = self.store.profile_sync_operation_events("sync-op-1")
+        self.assertTrue(any(
+            item["phase"] == "cancelled" and item["status"] == "cancelled"
+            for item in progress["items"]
+        ))
 
     def test_worker_sync_events_are_idempotent_and_actor_readable_as_json(self):
         body = {

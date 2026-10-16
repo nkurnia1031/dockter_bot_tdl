@@ -875,6 +875,56 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertGreater(len(dispatcher.committed), committed_before_retry)
             self.assertIn(("remote-offline", "novel", operation), dispatcher.committed)
 
+    def test_profile_sync_operation_events_are_idempotent_paginated_and_redacted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            first = store.append_profile_sync_operation_event(
+                operation_id="operation-123",
+                profile="novel",
+                worker="remote-1",
+                run_id="worker-run-123",
+                sequence=1,
+                revision=3,
+                phase="bundle_download",
+                status="running",
+                code="",
+                details={"bundle_bytes": 128, "password": "must-not-persist"},
+            )
+            duplicate = store.append_profile_sync_operation_event(
+                operation_id="operation-123",
+                profile="novel",
+                worker="remote-1",
+                run_id="worker-run-123",
+                sequence=1,
+                revision=3,
+                phase="bundle_download",
+                status="running",
+            )
+            store.append_profile_sync_operation_event(
+                operation_id="operation-123",
+                profile="novel",
+                worker="remote-1",
+                run_id="worker-run-123",
+                sequence=2,
+                revision=3,
+                phase="completed",
+                status="succeeded",
+                code="PROFILE_SYNC_INSTALLED",
+            )
+
+            page = store.profile_sync_operation_events("operation-123", limit=1)
+            next_page = store.profile_sync_operation_events(
+                "operation-123", after_id=page["next_after_id"], limit=1
+            )
+
+            self.assertIsNotNone(first)
+            self.assertIsNone(duplicate)
+            self.assertEqual(page["items"][0]["sequence"], 1)
+            self.assertEqual(page["items"][0]["details"], {"bundle_bytes": 128})
+            self.assertEqual(next_page["items"][0]["status"], "succeeded")
+            self.assertFalse(next_page["active"])
+
 
 if __name__ == "__main__":
     unittest.main()

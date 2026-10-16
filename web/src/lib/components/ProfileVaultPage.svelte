@@ -19,6 +19,12 @@
   };
   type Profile = { name: string; status: string; vault: boolean; error?: string; workers: WorkerState[] };
   type Management = { items: Profile[]; workers: Worker[] };
+  type SyncEvent = {
+    id: number; run_id: string; sequence: number | null; revision: number | null;
+    phase: string; status: string; code: string; created_at: string;
+    details?: Record<string, number>;
+  };
+  type SyncHistory = { items: SyncEvent[]; active: boolean; next_after_id: number };
 
   let profiles = $state<Profile[]>([]);
   let workers = $state<Worker[]>([]);
@@ -27,13 +33,38 @@
   let notice = $state('');
   let checkedAt = $state('');
   let deletingProfile = $state('');
+  let syncHistories = $state<Record<string, SyncHistory>>({});
 
   const workerByName = $derived(new Map(workers.map((worker) => [worker.name, worker])));
   const statusLabel = (status: string) => ({
-    ready: 'Siap', stored: 'Tersimpan di Vault', waiting: 'Menunggu', waiting_worker: 'Menunggu worker', sync_pending: 'Belum tersinkron',
+    ready: 'Siap', stored: 'Tersimpan di Vault', queued: 'Dalam antrean', running: 'Berjalan', waiting: 'Menunggu', waiting_worker: 'Menunggu worker', sync_pending: 'Belum tersinkron',
+    succeeded: 'Selesai', cancelled: 'Dibatalkan',
     not_assigned: 'Belum ditugaskan', worker_unavailable: 'Worker tidak terjangkau', worker_update_required: 'Perlu diperbarui',
     failed: 'Gagal', unavailable: 'Tidak tersedia'
   } as Record<string, string>)[status] || status || 'Belum diperiksa';
+  const phaseLabel = (phase: string) => ({
+    queued: 'Antrean', manifest_fetch: 'Baca daftar profil', revision_compare: 'Bandingkan revision',
+    bundle_download: 'Unduh bundle', bundle_validation: 'Validasi bundle',
+    session_validation: 'Validasi sesi', session_install: 'Pasang sesi', session_commit: 'Simpan sesi',
+    acknowledgement: 'Konfirmasi ke Vault', worker_unreachable: 'Worker tidak terjangkau',
+    completed: 'Selesai', cancelled: 'Dibatalkan'
+  } as Record<string, string>)[phase] || phase;
+  const historyKey = (profile: string, worker: string) => `${profile}:${worker}`;
+
+  async function loadSyncHistories() {
+    const targets = profiles
+      .filter((profile) => profile.vault)
+      .flatMap((profile) => profile.workers.map((worker) => ({ profile: profile.name, worker: worker.worker })));
+    await Promise.all(targets.map(async ({ profile, worker }) => {
+      const key = historyKey(profile, worker);
+      try {
+        const result = await api<SyncHistory>(`/profiles/${encodeURIComponent(profile)}/workers/${encodeURIComponent(worker)}/sync-logs?limit=50`);
+        syncHistories = { ...syncHistories, [key]: result };
+      } catch {
+        syncHistories = { ...syncHistories, [key]: { items: [], active: false, next_after_id: 0 } };
+      }
+    }));
+  }
 
   function runtimeMessage(item: WorkerState, worker?: Worker) {
     if (item.runtime_status === 'ready' && item.runtime_installed_revision === item.desired_revision) {
@@ -72,6 +103,7 @@
       profiles = Array.isArray(result.items) ? result.items : [];
       workers = Array.isArray(result.workers) ? result.workers : [];
       checkedAt = new Date().toLocaleString();
+      await loadSyncHistories();
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Status Vault gagal dimuat.';
     } finally {
@@ -98,7 +130,13 @@
     }
   }
 
-  onMount(() => { void load(); });
+  onMount(() => {
+    void load();
+    const timer = window.setInterval(() => {
+      if (Object.values(syncHistories).some((history) => history.active)) void loadSyncHistories();
+    }, 3000);
+    return () => window.clearInterval(timer);
+  });
 </script>
 
 <svelte:head><title>Vault profil · tme3</title></svelte:head>
@@ -161,6 +199,7 @@
               <div class="mt-3 grid gap-2 lg:grid-cols-2">
                 {#each profile.workers as item (`${profile.name}:${item.worker}`)}
                   {@const worker = workerByName.get(item.worker)}
+                  {@const history = syncHistories[historyKey(profile.name, item.worker)]}
                   <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3">
                     <div class="flex flex-wrap items-center justify-between gap-2">
                       <b>{item.worker}</b>
@@ -171,6 +210,30 @@
                     <p class="muted mt-2 text-xs">Vault ACK: {statusLabel(item.vault_ack_status || item.status)} · revision {item.vault_ack_installed_revision ?? item.installed_revision ?? '-'} · Runtime worker: {statusLabel(item.runtime_status || item.status)} · revision {item.runtime_installed_revision ?? '-'}</p>
                     <p class="mt-2 text-sm">{runtimeMessage(item, worker)}</p>
                     {#if item.desired_revision}<p class="muted mt-1 text-xs">Revision tujuan: {item.desired_revision}</p>{/if}
+                    <div class="mt-3 border-t border-[var(--line)] pt-3" aria-label={`Riwayat progress ${profile.name} ${item.worker}`}>
+                      <div class="flex items-center justify-between gap-2">
+                        <h4 class="text-xs font-bold">Riwayat progress</h4>
+                        {#if history?.active}<span class="text-xs font-bold text-amber-600">Berjalan</span>{/if}
+                      </div>
+                      {#if !history}
+                        <p class="muted mt-2 text-xs">Memuat event...</p>
+                      {:else if history.items.length === 0}
+                        <p class="muted mt-2 text-xs">Belum ada event sinkronisasi.</p>
+                      {:else}
+                        <ol class="mt-2 space-y-2">
+                          {#each history.items.slice(-12).reverse() as event (event.id)}
+                            <li class="flex items-start justify-between gap-3 text-xs">
+                              <span>
+                                <b>{phaseLabel(event.phase)}</b>
+                                <span class="muted"> · {statusLabel(event.status)}</span>
+                                {#if event.code}<span class="muted block">{event.code}</span>{/if}
+                              </span>
+                              <time class="muted shrink-0" datetime={event.created_at}>{new Date(event.created_at).toLocaleString()}</time>
+                            </li>
+                          {/each}
+                        </ol>
+                      {/if}
+                    </div>
                     <a class="muted mt-2 inline-block text-xs underline" href={`/api/v1/profiles/${encodeURIComponent(profile.name)}/workers/${encodeURIComponent(item.worker)}/sync-logs?limit=500`} target="_blank" rel="noreferrer">Buka log JSON</a>
                   </div>
                 {/each}
