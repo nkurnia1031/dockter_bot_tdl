@@ -2,11 +2,16 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import ExportPage from './ExportPage.svelte';
 
+const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles: [
+  { name: 'default', workers: ['local'], exclusive_worker: 'local' }
+] }), { status: 200 });
+
 describe('ExportPage labels', () => {
   afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); sessionStorage.clear(); });
 
   it('renders label DTO text instead of object coercion', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      if (input.includes('/profiles/local')) return localProfileCatalogResponse();
       if (input.includes('/sources')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (input.includes('/labels')) return new Response(JSON.stringify({ items: [{ label: '1cans', updated_at: '2026-07-25T00:00:00Z' }] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -19,6 +24,7 @@ describe('ExportPage labels', () => {
   it('ignores malformed persisted export notices', async () => {
     sessionStorage.setItem('tme3-export-notices', JSON.stringify(['stale-job']));
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      if (input.includes('/profiles/local')) return localProfileCatalogResponse();
       if (input.includes('/jobs/stale-job')) return new Response(JSON.stringify({items: []}), { status: 200 });
       if (input.includes('/sources') || input.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -33,6 +39,7 @@ describe('ExportPage labels', () => {
     let status = 'queued';
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/context/verify')) {
         return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
       }
@@ -65,6 +72,7 @@ describe('ExportPage labels', () => {
     const requests:Record<string,unknown>[]=[];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/context/verify')) {
         return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
       }
@@ -101,6 +109,7 @@ describe('ExportPage labels', () => {
     let exportRequests=0;
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/context/verify')) {
         return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy' }), { status: 200 });
       }
@@ -140,6 +149,7 @@ describe('ExportPage labels', () => {
     const requests: {url:string; body:Record<string,unknown>}[]=[];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/context/verify')) {
         const body=JSON.parse(String(init?.body || '{}')) as Record<string,unknown>;
         requests.push({url, body});
@@ -170,6 +180,7 @@ describe('ExportPage labels', () => {
   it('applies the same 500ms cooldown to Quick Mode without waiting for JSON milestone', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/context/verify')) {
         const body=JSON.parse(String(init?.body || '{}')) as Record<string,unknown>;
         return new Response(JSON.stringify({ verified:true, purpose:'export', profile:'default', worker:'local', worker_health:'healthy', quick_mode:body.quick_mode === true }), {status:200});

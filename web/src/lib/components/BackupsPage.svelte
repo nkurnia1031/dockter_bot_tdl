@@ -4,15 +4,15 @@
   import { formatDate } from '$lib/presentation';
   import JobTable from './JobTable.svelte';
   import { tdlLaneLabel } from '$lib/tdl-lanes';
+  import { normalizeLocalProfileCatalog, profileOptionLabel, profileOptionsForWorker, type LocalProfileOption } from '$lib/profile-catalog';
   import { Archive, Clipboard, Download, Play, RefreshCw } from '@lucide/svelte';
   type Worker = { name: string; enabled?: boolean };
-  type Profile = { name: string };
   type TdlSession = { name: string; ready: boolean; code: string; identity_matches_metadata: boolean };
   type TdlDiagnostics = { worker: string; profile: string; checked_at: string; ready: boolean; identity_match: boolean; reason_codes: string[]; sessions: TdlSession[] };
   type BackupRun = { run_id: string; node_name: string; started_at?: string; status: string };
   let data = $state<any>({items:[]});
   let workers = $state<Worker[]>([]);
-  let profiles = $state<Profile[]>([]);
+  let profiles = $state<LocalProfileOption[]>([]);
   let diagnosticWorker = $state('');
   let diagnosticProfile = $state('');
   let diagnostics = $state<TdlDiagnostics | null>(null);
@@ -30,6 +30,10 @@
   const runsForSelectedWorker = $derived<BackupRun[]>(
     (data.items || []).filter((item: BackupRun) => item.node_name === diagnosticWorker && item.status === 'complete')
   );
+  const diagnosticWorkers = $derived(
+    workers.filter((worker) => profiles.some((profile) => profile.workers.includes(worker.name)))
+  );
+  const diagnosticProfiles = $derived(profileOptionsForWorker(profiles, diagnosticWorker));
   const verificationReport = $derived<any | null>(
     verificationJob?.result?.value?.report || verificationJob?.result?.report || null
   );
@@ -81,14 +85,36 @@
     try {
       const [workerResult, profileResult] = await Promise.all([
         api<{ items: Worker[] }>('/workers'),
-        api<{ items: Profile[] }>('/profiles'),
+        api<unknown>('/profiles/local'),
       ]);
       workers = workerResult.items || [];
-      profiles = profileResult.items || [];
-      diagnosticWorker = diagnosticWorker || workers[0]?.name || '';
-      diagnosticProfile = diagnosticProfile || profiles[0]?.name || '';
+      profiles = normalizeLocalProfileCatalog(profileResult);
+      const choices = workers.filter((worker) => profiles.some((profile) => profile.workers.includes(worker.name)));
+      diagnosticWorker = choices.some((worker) => worker.name === diagnosticWorker)
+        ? diagnosticWorker
+        : choices[0]?.name || '';
+      const profileChoices = profileOptionsForWorker(profiles, diagnosticWorker);
+      diagnosticProfile = profileChoices.some((profile) => profile.name === diagnosticProfile)
+        ? diagnosticProfile
+        : profileChoices[0]?.name || '';
     } catch (cause) {
       diagnosticChoicesFailure = cause instanceof Error ? cause.message : 'Daftar worker dan profil gagal dimuat.';
+    }
+  }
+  function changeDiagnosticWorker(value: string) {
+    diagnosticWorker = value;
+    if (!profileOptionsForWorker(profiles, value).some((profile) => profile.name === diagnosticProfile)) {
+      diagnosticProfile = profileOptionsForWorker(profiles, value)[0]?.name || '';
+    }
+  }
+  function changeDiagnosticProfile(value: string) {
+    diagnosticProfile = value;
+    const selected = profiles.find((profile) => profile.name === value);
+    if (!selected) return;
+    if (selected.exclusive_worker) {
+      diagnosticWorker = selected.exclusive_worker;
+    } else if (!selected.workers.includes(diagnosticWorker)) {
+      diagnosticWorker = selected.workers[0] || '';
     }
   }
   async function createDiagnostics() {
@@ -227,8 +253,8 @@
   <section class="mt-5 rounded-2xl border border-[var(--line)] p-4 sm:p-5" aria-labelledby="backup-diagnostics-title">
     <div><h2 id="backup-diagnostics-title" class="font-extrabold">Diagnosis dan verifikasi backup worker</h2><p class="muted mt-1 text-sm">Diagnosis TDL menjalankan pemeriksaan identitas pada lane Download dan Export tanpa mengubah sesi. Verifikasi mengekspor JSON channel dengan <code>--with-content</code>, mencocokkan caption berdasarkan worker, run, dan nama part, lalu mengunduh tiap file memakai message ID hasil pencocokan.</p></div>
     <div class="mt-4 grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
-      <label class="text-sm font-bold">Worker<select class="field mt-2" bind:value={diagnosticWorker} disabled={diagnosing}><option value="">Pilih worker</option>{#each workers as worker}<option value={worker.name}>{worker.name}{worker.enabled === false ? ' (nonaktif)' : ''}</option>{/each}</select></label>
-      <label class="text-sm font-bold">Profil<select class="field mt-2" bind:value={diagnosticProfile} disabled={diagnosing}><option value="">Pilih profil</option>{#each profiles as profile}<option value={profile.name}>{profile.name}</option>{/each}</select></label>
+      <label class="text-sm font-bold">Worker<select class="field mt-2" value={diagnosticWorker} onchange={(event) => changeDiagnosticWorker(event.currentTarget.value)} disabled={diagnosing}><option value="">Pilih worker</option>{#each diagnosticWorkers as worker}<option value={worker.name}>{worker.name}{worker.enabled === false ? ' (nonaktif)' : ''}</option>{/each}</select></label>
+      <label class="text-sm font-bold">Profil<select class="field mt-2" value={diagnosticProfile} onchange={(event) => changeDiagnosticProfile(event.currentTarget.value)} disabled={diagnosing}><option value="">Pilih profil</option>{#each diagnosticProfiles as profile}<option value={profile.name}>{profileOptionLabel(profile)}</option>{/each}</select></label>
       <button class="button" onclick={createDiagnostics} disabled={diagnosing || !diagnosticWorker || !diagnosticProfile}><RefreshCw size={15}/>{diagnosing ? 'Memeriksa sesi...' : 'Buat JSON diagnosis'}</button>
     </div>
     {#if diagnosticChoicesFailure}<p class="mt-3 rounded-xl bg-rose-950/50 p-3 text-sm text-rose-200" role="alert">{diagnosticChoicesFailure}<button class="ml-2 underline" onclick={loadDiagnosticChoices}>Muat ulang pilihan</button></p>{/if}

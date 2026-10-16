@@ -2,6 +2,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import QuickModePage from './QuickModePage.svelte';
 
+const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles: [
+  { name: 'default', workers: ['local'], exclusive_worker: 'local' }
+] }), { status: 200 });
+
 describe('QuickModePage', () => {
   afterEach(() => {
     cleanup();
@@ -13,6 +17,7 @@ describe('QuickModePage', () => {
     const calls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       calls.push(url);
       if (url.includes('/context/verify')) {
         const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
@@ -30,6 +35,8 @@ describe('QuickModePage', () => {
 
     render(QuickModePage);
     await screen.findByRole('button', { name: 'Tambah Quick Mode' });
+    const profileFilter = await screen.findByLabelText('Profile') as HTMLSelectElement;
+    await waitFor(() => expect([...profileFilter.options].map((option) => option.value)).toEqual(['', 'default']));
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     await screen.findByText('Target backend terverifikasi');
     await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
@@ -43,6 +50,7 @@ describe('QuickModePage', () => {
   it('hides physical staging actions while its backend job is active', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (url.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true')) {
         return new Response(JSON.stringify({ items: [{
@@ -92,6 +100,7 @@ describe('QuickModePage', () => {
     let deleted = false;
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (url.includes('/quick-mode/limits')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (url.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true')) {

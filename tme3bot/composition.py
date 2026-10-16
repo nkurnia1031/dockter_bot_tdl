@@ -207,6 +207,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         storage_catalog=catalog,
         export_catalog=export_catalog,
         worker_registry=registry,
+        local_profile_catalog=local_profile_catalog,
         profile_readiness=profile_provisioner.worker_ready,
         utility_folders=folders,
         utility_settings=settings,

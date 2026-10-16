@@ -1,9 +1,12 @@
 import { api, post, put } from './api';
+import { normalizeLocalProfileCatalog, type LocalProfileOption } from './profile-catalog';
 
 export type Session = { authenticated: boolean; actor?: { telegram_user_id: number; profile: string; worker_route: string }; profiles: string[] };
 export type SessionWorker = { name: string; url: string; enabled?: boolean; selected?: boolean };
 let current = $state<Session>({ authenticated: false, profiles: [] });
 let workers = $state<SessionWorker[]>([]);
+let profileCatalog = $state<LocalProfileOption[]>([]);
+let selectedTargetProfile = $state('');
 let loading = $state(true);
 let switching = $state(false);
 let contextRevision = $state(0);
@@ -16,6 +19,31 @@ const selectedWorkers = (items: SessionWorker[], route?: string) =>
 async function loadWorkers(route?: string): Promise<SessionWorker[]> {
   const response = await api<{items: SessionWorker[]}>('/workers');
   return selectedWorkers(response.items || [], route);
+}
+
+async function loadProfileCatalog(): Promise<LocalProfileOption[]> {
+  try {
+    return normalizeLocalProfileCatalog(await api<unknown>('/profiles/local'));
+  } catch {
+    return [];
+  }
+}
+
+function setTargetProfile(profile: string) {
+  if (!profileCatalog.some((item) => item.name === profile) || profile === selectedTargetProfile) return;
+  selectedTargetProfile = profile;
+  contextRevision += 1;
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('tme3:target-profile-changed', {
+      detail: { revision: contextRevision, profile }
+    }));
+  }
+}
+
+function fallbackTargetProfile(actorProfile?: string): string {
+  return profileCatalog.some((item) => item.name === actorProfile)
+    ? String(actorProfile)
+    : profileCatalog[0]?.name || '';
 }
 
 function contextChanged() {
@@ -34,6 +62,8 @@ function contextChanged() {
 export const session = {
   get current() { return current; },
   get workers() { return workers; },
+  get profileCatalog() { return profileCatalog; },
+  get selectedTargetProfile() { return selectedTargetProfile; },
   get loading() { return loading; },
   get switching() { return switching; },
   get contextRevision() { return contextRevision; },
@@ -48,16 +78,25 @@ export const session = {
         if ((cause as { status?: number })?.status !== 401) throw cause;
         restored = await api<Session>('/auth/browser/refresh', { method: 'POST' });
       }
-      const restoredWorkers = restored.authenticated
-        ? await loadWorkers(restored.actor?.worker_route)
-        : [];
+      const [restoredWorkers, restoredCatalog] = restored.authenticated
+        ? await Promise.all([
+            loadWorkers(restored.actor?.worker_route),
+            loadProfileCatalog()
+          ])
+        : [[], []] as [SessionWorker[], LocalProfileOption[]];
       if (request !== generation) return;
       current = restored;
       workers = restoredWorkers;
+      profileCatalog = restoredCatalog;
+      if (!profileCatalog.some((item) => item.name === selectedTargetProfile)) {
+        selectedTargetProfile = fallbackTargetProfile(restored.actor?.profile);
+      }
     } catch {
       if (request !== generation) return;
       current = { authenticated: false, profiles: [] };
       workers = [];
+      profileCatalog = [];
+      selectedTargetProfile = '';
     } finally {
       if (request === generation) loading = false;
     }
@@ -69,7 +108,13 @@ export const session = {
     const next = await api<Session>('/auth/browser/challenge');
     current = next;
     if (current.authenticated) {
-      workers = await loadWorkers(current.actor?.worker_route);
+      const [nextWorkers, nextCatalog] = await Promise.all([
+        loadWorkers(current.actor?.worker_route),
+        loadProfileCatalog()
+      ]);
+      workers = nextWorkers;
+      profileCatalog = nextCatalog;
+      selectedTargetProfile = fallbackTargetProfile(current.actor?.profile);
       challenge = null;
       contextChanged();
     }
@@ -88,6 +133,17 @@ export const session = {
     } finally {
       if (request === generation) switching = false;
     }
+  },
+  chooseTargetProfile(profile: string) {
+    setTargetProfile(profile);
+  },
+  async refreshProfileCatalog() {
+    const next = await loadProfileCatalog();
+    profileCatalog = next;
+    if (!profileCatalog.some((item) => item.name === selectedTargetProfile)) {
+      selectedTargetProfile = fallbackTargetProfile(current.actor?.profile);
+    }
+    return profileCatalog;
   },
   async chooseWorker(route: string) {
     if (switching || route === current.actor?.worker_route) return;
@@ -110,6 +166,8 @@ export const session = {
     await post('/auth/browser/logout');
     current = { authenticated: false, profiles: [] };
     workers = [];
+    profileCatalog = [];
+    selectedTargetProfile = '';
     challenge = null;
   }
 };

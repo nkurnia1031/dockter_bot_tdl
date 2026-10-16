@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { post } from '$lib/api';
   import { session } from '$lib/session.svelte';
+  import { chooseProfileWorker, profileOptionLabel } from '$lib/profile-catalog';
   import { CheckCircle2, RefreshCw, ShieldCheck, TriangleAlert } from '@lucide/svelte';
 
   type Verification = {
@@ -34,9 +36,39 @@
 
   let checking = $state(false);
   let error = $state('');
+  const selectedProfile = $derived(session.profileCatalog.find((item) => item.name === profile));
+  const workerOptions = $derived(
+    requireProfile && selectedProfile
+      ? session.workers.filter((item) => selectedProfile.workers.includes(item.name))
+      : session.workers
+  );
+
+  onMount(() => {
+    if (!requireProfile) return;
+    void session.refreshProfileCatalog();
+    const onTargetProfileChanged = (event: Event) => {
+      const selected = (event as CustomEvent<{ profile?: string }>).detail?.profile;
+      if (selected && selected !== profile) {
+        profile = selected;
+        invalidate();
+      }
+    };
+    window.addEventListener('tme3:target-profile-changed', onTargetProfileChanged);
+    return () => window.removeEventListener('tme3:target-profile-changed', onTargetProfileChanged);
+  });
 
   $effect(() => {
-    if (requireProfile && !profile) profile = session.current.actor?.profile || session.current.profiles[0] || 'default';
+    if (requireProfile && !profile) profile = session.selectedTargetProfile || session.profileCatalog[0]?.name || '';
+    if (requireProfile && profile) {
+      const choice = session.profileCatalog.find((item) => item.name === profile);
+      if (choice) {
+        worker = chooseProfileWorker(
+          choice,
+          worker,
+          session.workers.find((item) => item.enabled !== false)?.name || ''
+        );
+      }
+    }
     if (!worker) worker = session.workers.find((item) => item.enabled !== false)?.name || session.current.actor?.worker_route || 'local';
   });
 
@@ -70,14 +102,14 @@
       <label class="min-w-[10rem] flex-1 text-sm font-bold">Profile target
         <select class="field mt-2" bind:value={profile} onchange={invalidate} disabled={disabled || checking}>
           <option value="" disabled>Pilih profile</option>
-          {#each session.current.profiles as item}<option value={item}>{item}</option>{/each}
+          {#each session.profileCatalog as item}<option value={item.name}>{profileOptionLabel(item)}</option>{/each}
         </select>
       </label>
     {/if}
     <label class="min-w-[10rem] flex-1 text-sm font-bold">Worker target
       <select class="field mt-2" bind:value={worker} onchange={invalidate} disabled={disabled || checking}>
         <option value="" disabled>Pilih worker</option>
-        {#each session.workers as item}<option value={item.name} disabled={item.enabled === false}>{item.name}{item.enabled === false ? ' (nonaktif)' : ''}</option>{/each}
+        {#each workerOptions as item}<option value={item.name} disabled={item.enabled === false}>{item.name}{item.enabled === false ? ' (nonaktif)' : ''}</option>{/each}
       </select>
     </label>
     <button class="button secondary shrink-0" onclick={check} disabled={disabled || checking || !worker || (requireProfile && !profile)}>

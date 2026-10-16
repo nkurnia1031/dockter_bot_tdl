@@ -3,6 +3,7 @@
   import { api, post, put, remove } from '$lib/api';
   import { normalizeTdlChatRef } from '$lib/chatRef';
   import { session } from '$lib/session.svelte';
+  import { profileOptionLabel } from '$lib/profile-catalog';
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
@@ -465,7 +466,7 @@
     </div>
   </div>
   <div class="mt-4 grid gap-3 sm:grid-cols-3">
-    <label class="text-sm font-bold">Profile<select class="field mt-2" bind:value={filterProfile}><option value="">Semua profile</option>{#each session.current.profiles as item}<option value={item}>{item}</option>{/each}</select></label>
+    <label class="text-sm font-bold">Profile<select class="field mt-2" bind:value={filterProfile}><option value="">Semua profile</option>{#each session.profileCatalog as item}<option value={item.name}>{profileOptionLabel(item)}</option>{/each}</select></label>
     <label class="text-sm font-bold">Worker<select class="field mt-2" bind:value={filterWorker}><option value="">Semua worker</option>{#each session.workers as item}<option value={item.name}>{item.name}</option>{/each}</select></label>
     <label class="text-sm font-bold">Status<select class="field mt-2" bind:value={filterStatus}><option value="">Semua status</option>{#each statuses as item}<option value={item}>{item}</option>{/each}</select></label>
   </div>

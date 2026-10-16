@@ -143,6 +143,9 @@ def register_backups(app, context, *, current_actor, job_dict):
             raise DomainError("PROFILE_NAME_INVALID", "Nama profil tidak valid.", status_code=422)
         if context.worker_registry.get(worker) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        verify_pair = getattr(context.control_plane, "assert_profile_worker_verified", None)
+        if callable(verify_pair):
+            verify_pair(profile, worker)
         diagnose = getattr(context.worker_dispatcher, "profile_tdl_diagnostics", None)
         if not callable(diagnose):
             raise DomainError(

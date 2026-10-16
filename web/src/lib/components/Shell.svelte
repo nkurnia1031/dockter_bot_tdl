@@ -3,6 +3,7 @@
   import { page } from '$app/state';
   import { Drawer, Dropdown, DropdownItem, Sidebar, Toast, Tooltip } from 'flowbite-svelte';
   import { session } from '$lib/session.svelte';
+  import { profileOptionLabel } from '$lib/profile-catalog';
   import Login from './Login.svelte';
   import RequestIndicator from './RequestIndicator.svelte';
   import {
@@ -52,13 +53,8 @@
     localStorage.setItem('tme3-sidebar-collapsed', String(collapsed));
   }
 
-  async function chooseProfile(value: string) {
-    try {
-      await session.chooseProfile(value);
-    } catch (cause) {
-      contextError = cause instanceof Error ? cause.message : 'Profile gagal diganti.';
-      contextToast = true;
-    }
+  function chooseTargetProfile(value: string) {
+    session.chooseTargetProfile(value);
   }
 
   async function chooseWorker(value: string) {
@@ -135,15 +131,16 @@
             <button class="button secondary menu-trigger size-10 shrink-0 !rounded-xl !p-0 lg:hidden" onclick={() => mobileOpen = true} aria-label="Buka navigasi"><Menu size={19}/></button>
             <label class="flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-1.5">
               <Users class="shrink-0 text-violet-500" size={15}/>
-              <span class="sr-only">Profil aktif</span>
+              <span class="sr-only">Profil target default</span>
               <select
                 class="max-w-28 cursor-pointer truncate bg-transparent text-sm font-bold outline-none sm:max-w-36"
-                value={session.current.actor?.profile || ''}
-                onchange={(event) => chooseProfile(event.currentTarget.value)}
-                disabled={session.switching || session.current.profiles.length < 2}
-                aria-label="Profil aktif"
+                value={session.selectedTargetProfile}
+                onchange={(event) => chooseTargetProfile(event.currentTarget.value)}
+                disabled={session.profileCatalog.length < 2}
+                aria-label="Profil target default"
               >
-                {#each session.current.profiles as profile}<option value={profile}>{profile}</option>{/each}
+                {#if !session.profileCatalog.length}<option value="">Belum scan</option>{/if}
+                {#each session.profileCatalog as profile}<option value={profile.name}>{profileOptionLabel(profile)}</option>{/each}
               </select>
             </label>
             <div class="hidden min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 md:flex"><Server class="shrink-0 text-sky-500" size={15}/><div><p class="muted text-[.65rem] font-bold uppercase tracking-[.12em]">Target</p><span class="text-xs font-semibold text-[var(--muted)]">Dipilih per fitur</span></div></div>
@@ -157,7 +154,7 @@
             </Dropdown>
             <button id="actor-trigger" class="button secondary flex size-10 max-w-40 items-center justify-center gap-2 !rounded-xl !p-0 sm:h-10 sm:justify-start sm:!px-3" aria-label="Menu akun"><span class="grid size-6 place-items-center rounded-full bg-violet-100 text-xs font-bold text-violet-700 dark:bg-violet-900 dark:text-violet-200">{String(session.current.actor?.telegram_user_id || '?').slice(-2)}</span><span class="hidden truncate text-xs font-bold sm:block">{session.current.actor?.telegram_user_id}</span></button>
             <Dropdown bind:isOpen={actorMenuOpen} triggeredBy="#actor-trigger" placement="bottom-end" class="!z-50 !w-52 !rounded-xl !border-[var(--line)] !bg-[var(--panel-strong)] !p-1 !shadow-xl" simple>
-              <div class="border-b border-[var(--line)] px-3 py-2 text-xs"><p class="muted">Telegram user</p><b class="text-[var(--ink)]">{session.current.actor?.telegram_user_id}</b></div>
+              <div class="border-b border-[var(--line)] px-3 py-2 text-xs"><p class="muted">Telegram user</p><b class="text-[var(--ink)]">{session.current.actor?.telegram_user_id}</b><p class="muted mt-1">Identity profile: {session.current.actor?.profile || '-'}</p></div>
               <DropdownItem onclick={() => session.logout()} class="!mt-1 !rounded-lg !px-3 !py-2 !text-rose-600 hover:!bg-rose-50 dark:hover:!bg-rose-950"><LogOut size={15} class="mr-2 inline"/>Keluar</DropdownItem>
             </Dropdown>
           </div>

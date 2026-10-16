@@ -40,7 +40,10 @@ describe('BackupsPage TDL diagnosis', () => {
     apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/backups/status') return { enabled: true, items: [{ run_id: 'full-run-id-for-test', node_name: 'remote-2', status: 'complete' }] };
       if (path === '/workers') return { items: [{ name: 'local', enabled: true }, { name: 'remote-2', enabled: true }] };
-      if (path === '/profiles') return { items: [{ name: 'default' }, { name: 'irang' }] };
+      if (path === '/profiles/local') return { profiles: [
+        { name: 'default', workers: ['local', 'remote-2'], exclusive_worker: '' },
+        { name: 'remote-only', workers: ['remote-2'], exclusive_worker: 'remote-2' },
+      ] };
       if (path === '/backups/verify' && init?.method === 'POST') return { id: 'backup-verify-job', kind: 'backup_verify', worker: 'remote-2', profile: 'default', status: 'queued' };
       if (path === '/jobs/backup-verify-job') return {
         id: 'backup-verify-job', kind: 'backup_verify', worker: 'remote-2', profile: 'default', status: 'succeeded',
@@ -76,7 +79,10 @@ describe('BackupsPage TDL diagnosis', () => {
     const worker = (await screen.findAllByLabelText('Worker'))[0];
     await waitFor(() => expect((worker as HTMLSelectElement).options.length).toBe(3));
     await fireEvent.change(worker, { target: { value: 'remote-2' } });
-    await fireEvent.change((await screen.findAllByLabelText('Profil'))[0], { target: { value: 'default' } });
+    const profile = (await screen.findAllByLabelText('Profil'))[0] as HTMLSelectElement;
+    expect([...profile.options].map((option) => option.value)).toEqual(['', 'default', 'remote-only']);
+    expect(profile.innerHTML).not.toContain('irang');
+    await fireEvent.change(profile, { target: { value: 'default' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Buat JSON diagnosis' }));
 
     await screen.findByText('remote-2 / default · Ada sesi yang gagal');

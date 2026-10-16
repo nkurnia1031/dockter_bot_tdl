@@ -87,4 +87,36 @@ describe('browser profile and worker context', () => {
     expect(JSON.parse(String(challengeRequest?.body))).toEqual({ remember_me: true });
     expect(session.challenge?.verification_uri).toContain('login_code');
   });
+
+  it('loads profile choices from the verified catalog without changing actor identity', async () => {
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push(`${init?.method || 'GET'} ${url}`);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'identity-profile', worker_route: 'local' },
+        profiles: ['identity-profile', 'stale-identity-profile']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', url: 'http://worker-local' },
+        { name: 'remote-1', url: 'https://worker.example' }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({ profiles: [
+        { name: 'shared', workers: ['local', 'remote-1'], exclusive_worker: '' },
+        { name: 'remote-only', workers: ['remote-1'], exclusive_worker: 'remote-1' }
+      ] }), { status: 200 });
+      return new Response('{}', { status: 404 });
+    }));
+
+    await session.restore();
+    expect(session.profileCatalog.map((item) => item.name)).toEqual(['remote-only', 'shared']);
+    expect(session.selectedTargetProfile).toBe('remote-only');
+    session.chooseTargetProfile('shared');
+
+    expect(session.selectedTargetProfile).toBe('shared');
+    expect(session.current.actor?.profile).toBe('identity-profile');
+    expect(calls.some((call) => call.includes('/profiles/local/scan'))).toBe(false);
+    expect(calls.some((call) => call.includes('/auth/browser/profile'))).toBe(false);
+  });
 });

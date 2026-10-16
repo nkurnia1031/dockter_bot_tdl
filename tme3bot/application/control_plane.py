@@ -60,6 +60,7 @@ class ControlPlane:
         backup_coordinator=None,
         storage_delivery=None,
         profile_readiness=None,
+        local_profile_catalog=None,
         label_store=None,
         export_cursor_service=None,
         tdl_access_store=None,
@@ -79,6 +80,7 @@ class ControlPlane:
         self.backup_coordinator = backup_coordinator
         self.storage_delivery = storage_delivery
         self.profile_readiness = profile_readiness
+        self.local_profile_catalog = local_profile_catalog
         self.label_store = label_store
         self.export_cursor_service = export_cursor_service
         self.tdl_access_store = tdl_access_store
@@ -108,7 +110,7 @@ class ControlPlane:
         selected = profile or actor.profile
         available = getattr(self.profile_manager, "list_profiles", None)
         profiles = list(available()) if callable(available) else []
-        if profiles and selected not in profiles:
+        if profiles and selected not in profiles and not self.verified_profile_workers(selected):
             raise DomainError(
                 "PROFILE_NOT_FOUND",
                 "Profile target tidak ditemukan.",
@@ -116,12 +118,88 @@ class ControlPlane:
             )
         return selected
 
+    def verified_profile_workers(self, profile: str) -> set[str] | None:
+        """Return catalog owners, or None when catalog admission is not configured."""
+        store = self.local_profile_catalog
+        snapshot = getattr(store, "snapshot", None)
+        if not callable(snapshot):
+            return None
+        normalized = str(profile or "").strip().lower()
+        catalog = snapshot()
+        for item in catalog.get("profiles", []) if isinstance(catalog, dict) else []:
+            if not isinstance(item, dict) or str(item.get("name") or "").strip().lower() != normalized:
+                continue
+            raw_workers = item.get("workers")
+            if not isinstance(raw_workers, list):
+                return set()
+            return {
+                str(worker or "").strip().lower()
+                for worker in raw_workers
+                if str(worker or "").strip()
+            }
+        return set()
+
+    def verified_profiles_for_worker(self, worker: str) -> list[str] | None:
+        """Return verified catalog profiles for a worker, or None without a catalog."""
+        snapshot = getattr(self.local_profile_catalog, "snapshot", None)
+        if not callable(snapshot):
+            return None
+        normalized_worker = str(worker or "").strip().lower()
+        catalog = snapshot()
+        return sorted({
+            str(item.get("name") or "").strip().lower()
+            for item in (catalog.get("profiles", []) if isinstance(catalog, dict) else [])
+            if isinstance(item, dict)
+            and normalized_worker in {
+                str(owner or "").strip().lower()
+                for owner in (item.get("workers") or [])
+            }
+            and str(item.get("name") or "").strip()
+        })
+
+    def assert_profile_worker_verified(self, profile: str, worker: str) -> None:
+        owners = self.verified_profile_workers(profile)
+        if owners is None:
+            return
+        normalized_profile = str(profile or "").strip().lower()
+        normalized_worker = str(worker or "").strip().lower()
+        if not owners:
+            raise DomainError(
+                "PROFILE_NOT_VERIFIED",
+                f"Profil {normalized_profile} belum ada pada katalog profil terverifikasi. Jalankan Scan di halaman Profil.",
+                status_code=409,
+                details={"profile": normalized_profile},
+            )
+        if normalized_worker not in owners:
+            raise DomainError(
+                "PROFILE_WORKER_MISMATCH",
+                f"Profil {normalized_profile} tidak tersedia pada worker {normalized_worker} menurut katalog terverifikasi.",
+                status_code=409,
+                details={
+                    "profile": normalized_profile,
+                    "worker": normalized_worker,
+                    "available_workers": sorted(owners),
+                },
+            )
+
     def resolve_target(
         self, actor: Actor, *, profile: str | None = None, worker: str | None = None,
-        check_readiness: bool = False,
+        check_readiness: bool = False, validate_catalog: bool = True,
     ) -> tuple[str, str]:
         selected_profile = self.require_profile(actor, profile)
-        selected_worker = str(worker or self.profile_manager.worker_route(selected_profile)).strip().lower()
+        owners = (
+            self.verified_profile_workers(selected_profile)
+            if validate_catalog and profile is not None
+            else None
+        )
+        if owners is not None:
+            if not owners:
+                self.assert_profile_worker_verified(selected_profile, "")
+            routed = str(self.profile_manager.worker_route(selected_profile) or "").strip().lower()
+            selected_worker = str(worker or (routed if routed in owners else sorted(owners)[0])).strip().lower()
+            self.assert_profile_worker_verified(selected_profile, selected_worker)
+        else:
+            selected_worker = str(worker or self.profile_manager.worker_route(selected_profile)).strip().lower()
         if not selected_worker:
             raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih.", status_code=422)
         if self.worker_registry is not None:
@@ -156,13 +234,12 @@ class ControlPlane:
         if kind not in {
             "export", "leave", "download", "download_clear_failed",
             "storage_upload", "storage_reconcile", "tts",
-            "tdl_access_verify", "backup_verify", "backup_node",
+            "tdl_access_verify", "backup_verify", "artifact_inventory",
+            "artifact_delete", "backup_node",
         }:
             return
         registry = getattr(self.profile_manager, "profile_registry", None)
-        check = getattr(registry, "local_deletion_active", None)
-        if not callable(check):
-            return
+        check_deletion = getattr(registry, "local_deletion_active", None)
         values = payload if isinstance(payload, dict) else {}
         candidates = [profile]
         if kind in {"storage_upload", "storage_reconcile", "tts"}:
@@ -174,7 +251,14 @@ class ControlPlane:
             candidates = list_profiles() if callable(list_profiles) else candidates
         for candidate in candidates:
             normalized = str(candidate or "").strip().lower()
-            if normalized and check(normalized, worker):
+            if normalized and kind in {
+                "export", "leave", "download", "download_clear_failed",
+                "artifact_inventory", "artifact_delete",
+                "storage_upload", "storage_reconcile", "tts",
+                "tdl_access_verify", "backup_verify",
+            }:
+                self.assert_profile_worker_verified(normalized, worker)
+            if normalized and callable(check_deletion) and check_deletion(normalized, worker):
                 raise DomainError(
                     "PROFILE_DELETION_IN_PROGRESS",
                     f"Profil {normalized} sedang dihapus dari worker {worker}; job TDL baru ditahan.",
@@ -216,7 +300,7 @@ class ControlPlane:
             private_values["telegram_tts_chat_id"] = target_chat
         elif kind == "storage_upload":
             _, selected_worker = self.resolve_target(
-                actor, profile=owner_profile, worker=worker
+                actor, worker=worker
             )
             retry_source_id = str(internal_payload.get("_storage_retry_of") or "").strip()
             retry_source = self.jobs.get(retry_source_id) if retry_source_id else None
@@ -277,7 +361,7 @@ class ControlPlane:
             )
         elif kind == "storage_reconcile":
             _, selected_worker = self.resolve_target(
-                actor, profile=owner_profile, worker=worker
+                actor, worker=worker
             )
             sender_profiles = [
                 str(item).strip().lower()
@@ -300,7 +384,12 @@ class ControlPlane:
                 )
         else:
             owner_profile, selected_worker = self.resolve_target(
-                actor, profile=owner_profile, worker=worker
+                actor,
+                profile=owner_profile if kind in {
+                    "export", "leave", "download", "download_clear_failed",
+                    "artifact_inventory", "artifact_delete", "backup_verify",
+                } else None,
+                worker=worker,
             )
             execution_profile = owner_profile
         if kind == "export" and bool(internal_payload.get("quick_mode")):
@@ -506,14 +595,17 @@ class ControlPlane:
             if not str(target.get("worker") or "").strip():
                 raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk verifikasi akses TDL.", status_code=422)
             owner_profile, selected_worker = self.resolve_target(
-                actor, profile=owner_profile, worker=str(target.get("worker")), check_readiness=False
+                actor, worker=str(target.get("worker")), check_readiness=False
             )
         else:
             if not str(target.get("worker") or "").strip():
                 raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk job background.", status_code=422)
             owner_profile, selected_worker = self.resolve_target(
                 actor,
-                profile=owner_profile,
+                profile=owner_profile if kind in {
+                    "export", "leave", "download", "download_clear_failed",
+                    "artifact_inventory", "artifact_delete", "backup_verify",
+                } else None,
                 worker=str(target.get("worker")),
                 check_readiness=False,
             )
@@ -552,9 +644,12 @@ class ControlPlane:
         elif kind == "tdl_access_verify":
             purpose = str(payload.get("purpose") or "")
             destination = self._tdl_access_target(purpose)
-            profiles_for_lock = getattr(self.profile_manager, "list_profiles", None)
+            profiles_for_lock = self.verified_profiles_for_worker(selected_worker)
+            if profiles_for_lock is None:
+                list_profiles = getattr(self.profile_manager, "list_profiles", None)
+                profiles_for_lock = list_profiles() if callable(list_profiles) else []
             payload["candidate_profiles"] = sorted(
-                {str(item).strip().lower() for item in (profiles_for_lock() if callable(profiles_for_lock) else []) if str(item).strip()}
+                {str(item).strip().lower() for item in profiles_for_lock if str(item).strip()}
             )
             if not destination:
                 raise DomainError(

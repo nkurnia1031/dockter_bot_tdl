@@ -396,6 +396,7 @@ async function cancelProfileProvisioning() {
       const result = normalizeProfileCatalog(await post<unknown>('/profiles/local/scan'));
       if (generation !== progressGeneration) return;
       profileCatalog = result;
+      await session.refreshProfileCatalog();
       inventory = selectedWorker
         ? profileCatalog.inventories.find((item) => item.worker === selectedWorker) || null
         : null;

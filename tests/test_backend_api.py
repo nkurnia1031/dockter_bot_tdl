@@ -2208,6 +2208,31 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.json()["profile"], "archive")
         self.assertEqual(response.json()["worker"], "local")
 
+    def test_context_checker_rejects_profile_worker_pair_outside_verified_catalog(self):
+        headers = self.login()
+        self.workers.values["remote-1"] = {"url": "http://remote", "token": "secret"}
+        self.local_profile_catalog.replace_scan(
+            checked_at="2026-10-16T00:00:00Z",
+            workers=[
+                {"name": "local", "status": "success"},
+                {"name": "remote-1", "status": "success"},
+            ],
+            inventories=[
+                {"worker": "local", "items": [{"name": "default", "ready": True}]},
+                {"worker": "remote-1", "items": [{"name": "archive", "ready": True}]},
+            ],
+        )
+        self.control.local_profile_catalog = self.local_profile_catalog
+
+        response = self.client.post(
+            "/api/v1/context/verify", headers=headers,
+            json={"purpose": "export", "profile": "archive", "worker": "local"},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "PROFILE_WORKER_MISMATCH")
+        self.assertEqual(response.json()["error"]["details"]["available_workers"], ["remote-1"])
+
     def test_job_metrics_include_worker_activity_and_queue_wait(self):
         headers = self.login()
         for message_id in (20, 21):
