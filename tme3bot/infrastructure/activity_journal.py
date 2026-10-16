@@ -125,6 +125,10 @@ class ActivityJournalStore:
                     worker TEXT NOT NULL DEFAULT '',
                     operation_id TEXT NOT NULL DEFAULT '',
                     job_id TEXT NOT NULL DEFAULT '',
+                    activity_type TEXT NOT NULL DEFAULT 'request',
+                    operation_kind TEXT NOT NULL DEFAULT '',
+                    operation_status TEXT NOT NULL DEFAULT '',
+                    event_key TEXT NOT NULL DEFAULT '',
                     result_code TEXT NOT NULL DEFAULT '',
                     error_code TEXT NOT NULL DEFAULT ''
                 );
@@ -145,6 +149,22 @@ class ActivityJournalStore:
                 CREATE INDEX IF NOT EXISTS api_activity_operation
                     ON api_activity(operation_id);
                 """
+            )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(api_activity)").fetchall()
+            }
+            for name, definition in (
+                ("activity_type", "TEXT NOT NULL DEFAULT 'request'"),
+                ("operation_kind", "TEXT NOT NULL DEFAULT ''"),
+                ("operation_status", "TEXT NOT NULL DEFAULT ''"),
+                ("event_key", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE api_activity ADD COLUMN {name} {definition}")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS api_activity_event_key "
+                "ON api_activity(event_key) WHERE event_key <> ''"
             )
             db.commit()
 
@@ -173,6 +193,11 @@ class ActivityJournalStore:
         worker: str = "",
         operation_id: str = "",
         job_id: str = "",
+        activity_type: str = "request",
+        operation_kind: str = "",
+        operation_status: str = "",
+        event_key: str = "",
+        result_code: str = "",
         error_code: str = "",
     ) -> None:
         try:
@@ -211,20 +236,40 @@ class ActivityJournalStore:
         safe_worker = _safe_identifier(worker, _SAFE_WORKER_RE)
         safe_operation = _safe_uuid(operation_id) or ""
         safe_job = _safe_uuid(job_id) or ""
+        safe_activity_type = str(activity_type or "request").lower()
+        if safe_activity_type not in {"request", "operation"}:
+            safe_activity_type = "request"
+        safe_operation_kind = str(operation_kind or "").lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}\Z", safe_operation_kind):
+            safe_operation_kind = ""
+        safe_operation_status = str(operation_status or "").lower()
+        if safe_operation_status not in {
+            "queued", "running", "waiting_user", "waiting_worker", "paused",
+            "needs_reconciliation", "cancelling", "succeeded", "failed", "cancelled",
+        }:
+            safe_operation_status = ""
+        safe_event_key = _safe_uuid(event_key) or ""
         safe_error = str(error_code or "").upper()
-        if safe_status >= 400 and not _SAFE_ERROR_RE.fullmatch(safe_error):
+        if safe_activity_type == "operation":
+            if not _SAFE_ERROR_RE.fullmatch(safe_error):
+                safe_error = ""
+        elif safe_status >= 400 and not _SAFE_ERROR_RE.fullmatch(safe_error):
             safe_error = f"HTTP_{safe_status}"
         elif safe_status < 400:
             safe_error = ""
-        result_code = "SUCCESS" if safe_status < 400 else "ERROR"
+        safe_result = str(result_code or "").upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}\Z", safe_result):
+            safe_result = "SUCCESS" if safe_status < 400 else "ERROR"
 
         with self._lock, closing(self._connect()) as db:
             db.execute("DELETE FROM api_activity WHERE occurred_at < ?", (self._cutoff(),))
             db.execute(
-                """INSERT INTO api_activity(
+                """INSERT OR IGNORE INTO api_activity(
                     occurred_at, request_id, method, route, status_code, duration_ms,
-                    actor_user_id, profile, worker, operation_id, job_id, result_code, error_code
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    actor_user_id, profile, worker, operation_id, job_id,
+                    activity_type, operation_kind, operation_status, event_key,
+                    result_code, error_code
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     event_time,
                     safe_request_id,
@@ -237,11 +282,40 @@ class ActivityJournalStore:
                     safe_worker,
                     safe_operation,
                     safe_job,
-                    result_code,
+                    safe_activity_type,
+                    safe_operation_kind,
+                    safe_operation_status,
+                    safe_event_key,
+                    safe_result,
                     safe_error,
                 ),
             )
             db.commit()
+
+    def record_operation_event(self, event: dict[str, Any]) -> None:
+        """Append a deduplicated, metadata-only operation lifecycle event."""
+        event_id = _safe_uuid(event.get("event_id"))
+        if not event_id:
+            raise ValueError("ID event aktivitas operation tidak valid.")
+        self.record(
+            occurred_at=str(event.get("occurred_at") or ""),
+            request_id=str(event.get("request_id") or ""),
+            method="ASYNC",
+            route=str(event.get("route") or "/api/v1/operations"),
+            status_code=200,
+            duration_ms=0,
+            actor_user_id=event.get("actor_user_id"),
+            profile=str(event.get("profile") or ""),
+            worker=str(event.get("worker") or ""),
+            operation_id=str(event.get("operation_id") or ""),
+            job_id=str(event.get("job_id") or ""),
+            activity_type="operation",
+            operation_kind=str(event.get("operation_kind") or ""),
+            operation_status=str(event.get("operation_status") or ""),
+            event_key=event_id,
+            result_code=str(event.get("result_code") or ""),
+            error_code=str(event.get("error_code") or ""),
+        )
 
     def list_entries(
         self,
@@ -354,6 +428,9 @@ class ActivityJournalStore:
                 "worker": str(row["worker"] or ""),
                 "operation_id": str(row["operation_id"] or ""),
                 "job_id": str(row["job_id"] or ""),
+                "activity_type": str(row["activity_type"] or "request"),
+                "operation_kind": str(row["operation_kind"] or ""),
+                "operation_status": str(row["operation_status"] or ""),
                 "result_code": str(row["result_code"] or ""),
                 "error_code": str(row["error_code"] or ""),
             }

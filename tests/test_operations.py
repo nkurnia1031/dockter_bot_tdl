@@ -3,11 +3,13 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 from tme3bot.application.operations import OperationsService, PreparedOperation
 from tme3bot.domain.models import Actor, DomainError, Job, JobStatus
 from tme3bot.domain.operations import OperationStatus, ensure_operation_transition
+from tme3bot.infrastructure.activity_journal import ActivityJournalStore
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 
@@ -19,7 +21,8 @@ class OperationTests(unittest.TestCase):
         self.path = Path(self.temp.name) / "app.db"
         self.jobs = SqliteJobRepository(self.path)
         self.store = SqliteOperationStore(self.jobs)
-        self.service = OperationsService(self.store)
+        self.activity_journal = ActivityJournalStore(self.path)
+        self.service = OperationsService(self.store, activity_journal=self.activity_journal)
         self.actor = Actor(42, "default")
 
     def register_simple(self):
@@ -181,6 +184,79 @@ class OperationTests(unittest.TestCase):
         self.assertEqual(failed.error, {"code": "JOB_FAILED", "message": "Pekerjaan gagal."})
         with self.assertRaises(DomainError):
             ensure_operation_transition(failed.status, OperationStatus.RUNNING)
+
+    def test_terminal_activity_recovers_after_store_restart_and_keeps_origin_request(self):
+        expected = {
+            OperationStatus.SUCCEEDED: "OPERATION_SUCCEEDED",
+            OperationStatus.FAILED: "JOB_FAILED",
+            OperationStatus.CANCELLED: "OPERATION_CANCELLED",
+        }
+        submissions = []
+        for index, terminal_status in enumerate(expected, start=1):
+            request_id = str(uuid.uuid4())
+            self.service.register_handler(
+                f"test.terminal{index}",
+                lambda actor, target, input_data: PreparedOperation(
+                    profile=actor.profile,
+                    target={"profile": actor.profile, "worker": "local"},
+                    private_payload={"secret": "private terminal payload"},
+                ),
+            )
+            operation, _ = self.service.submit(
+                self.actor,
+                kind=f"test.terminal{index}",
+                target={},
+                input_data={},
+                idempotency_key=f"key-terminal-{index:04d}",
+                request_id=request_id,
+                request_route="/api/v1/operations",
+            )
+            submissions.append((operation.id, request_id, terminal_status))
+
+        operations = []
+        for operation_id, request_id, terminal_status in submissions:
+            current = self.store.get_for_actor(operation_id, self.actor.telegram_user_id)
+            self.assertIsNotNone(current)
+            expected_statuses = ["queued"]
+            if terminal_status == OperationStatus.SUCCEEDED:
+                current = self.store.transition_from_job(
+                    operation_id,
+                    expected_revision=current.revision,
+                    status=OperationStatus.RUNNING,
+                    phase="job_running",
+                    safe_progress={"job_status": "running"},
+                )
+                expected_statuses.append("running")
+            self.store.transition_from_job(
+                operation_id,
+                expected_revision=current.revision,
+                status=terminal_status,
+                phase=f"job_{terminal_status.value}",
+                safe_progress={"job_status": terminal_status.value},
+            )
+            operations.append((operation_id, request_id, terminal_status, expected_statuses))
+
+        # Simulate a process stopping after the state transaction wrote its
+        # durable activity outbox but before the journal received the events.
+        restarted_store = SqliteOperationStore(SqliteJobRepository(self.path))
+        restarted_service = OperationsService(
+            restarted_store, activity_journal=self.activity_journal
+        )
+        self.assertEqual(restarted_service.flush_activity_events(), 4)
+
+        for operation_id, request_id, terminal_status, expected_statuses in operations:
+            entries = self.activity_journal.list_entries(
+                request_id=request_id, operation_id=operation_id
+            )["items"]
+            operation_events = [item for item in entries if item["activity_type"] == "operation"]
+            operation_events.reverse()
+            self.assertEqual(
+                [item["operation_status"] for item in operation_events],
+                [*expected_statuses, terminal_status.value],
+            )
+            self.assertEqual(operation_events[-1]["result_code"], expected[terminal_status])
+            self.assertTrue(all(item["request_id"] == request_id for item in operation_events))
+            self.assertNotIn("private terminal payload", repr(operation_events))
 
 
 if __name__ == "__main__":

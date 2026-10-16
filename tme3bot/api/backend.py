@@ -331,6 +331,10 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     path_params.get("operation_id") or query_params.get("operation_id"),
                     kind="uuid",
                 )
+                operation_id = operation_id or safe_target_value(
+                    getattr(request.state, "activity_operation_id", ""),
+                    kind="uuid",
+                )
                 job_id = safe_target_value(
                     path_params.get("job_id") or query_params.get("job_id"),
                     kind="uuid",
@@ -1339,7 +1343,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         current_actor=current_actor,
     )
     from tme3bot.api.routes.activity import register_activity
-    register_activity(app, context.activity_journal, current_actor=current_actor)
+    register_activity(
+        app,
+        context.activity_journal,
+        current_actor=current_actor,
+        operations=context.operation_service,
+    )
     register_profile_local_delete(app, context, current_actor=current_actor)
     from tme3bot.api.routes.queue import register_queue
     register_queue(app, context, require_internal=require_internal)

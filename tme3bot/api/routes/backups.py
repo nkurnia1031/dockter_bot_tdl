@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 import uuid
 
-from fastapi import Depends, Header, Response
+from fastapi import Depends, Header, Request, Response
 from tme3bot.api.schemas import BackupRuntimeSettingsRequest, BackupVerificationRequest, ItemListResponse, ObjectResponse
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.domain.models import DomainError
@@ -102,6 +102,7 @@ def register_backups(app, context, *, current_actor, job_dict):
     @app.post("/api/v1/backups/verify", status_code=202)
     def submit_backup_verification(
         body: BackupVerificationRequest,
+        request: Request,
         response: Response,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
@@ -123,7 +124,10 @@ def register_backups(app, context, *, current_actor, job_dict):
             target={"profile": profile, "worker": worker},
             input_data={"job_kind": "backup_verify", "payload": {"run_id": body.run_id}},
             idempotency_key=idempotency_key,
+            request_id=request.state.request_id,
+            request_route=getattr(request.scope.get("route"), "path", ""),
         )
+        request.state.activity_operation_id = operation.id
         job = context.control_plane.jobs.get(str(operation.job_id or ""))
         if job is None:
             raise DomainError("JOB_NOT_FOUND", "Job verifikasi backup tidak ditemukan setelah diterima.", status_code=500)

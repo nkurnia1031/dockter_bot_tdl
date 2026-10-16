@@ -6,7 +6,7 @@ from tme3bot.domain.models import DomainError
 from tme3bot.infrastructure.activity_journal import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 
 
-def register_activity(app, journal, *, current_actor) -> None:
+def register_activity(app, journal, *, current_actor, operations=None) -> None:
     @app.get("/api/v1/activity")
     def list_activity(
         limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
@@ -35,6 +35,9 @@ def register_activity(app, journal, *, current_actor) -> None:
                 "Jurnal aktivitas belum tersedia.",
                 status_code=503,
             )
+        flush = getattr(operations, "flush_activity_events", None)
+        if callable(flush):
+            flush()
         result = journal.list_entries(
             limit=limit,
             cursor=cursor,

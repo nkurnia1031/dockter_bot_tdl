@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import Depends, Header, Query, Response
+from fastapi import Depends, Header, Query, Request, Response
 
 from tme3bot.api.schemas import OperationResponse, TdlAccessVerificationRequest
 from tme3bot.domain.models import DomainError
@@ -23,6 +23,7 @@ def register_tdl_access(app, context, *, current_actor, require_internal) -> Non
     )
     def submit_tdl_access_verification(
         body: TdlAccessVerificationRequest,
+        request: Request,
         response: Response,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
@@ -40,7 +41,10 @@ def register_tdl_access(app, context, *, current_actor, require_internal) -> Non
             target={"profile": actor.profile, "worker": body.worker},
             input_data={"job_kind": "tdl_access_verify", "payload": {"purpose": body.purpose}},
             idempotency_key=idempotency_key,
+            request_id=request.state.request_id,
+            request_route=getattr(request.scope.get("route"), "path", ""),
         )
+        request.state.activity_operation_id = operation.id
         status_url = f"/api/v1/operations/{operation.id}"
         response.headers["Location"] = status_url
         return operation.to_public(status_url=status_url)

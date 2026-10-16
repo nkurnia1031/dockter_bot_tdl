@@ -161,7 +161,10 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     )
     if callable(recover_profile_deletions) and callable(active_profile_deletions):
         recover_profile_deletions(active_profile_deletions())
-    operation_service = OperationsService(operation_store)
+    operation_service = OperationsService(
+        operation_store, activity_journal=activity_journal
+    )
+    operation_service.flush_activity_events()
     queue_command_service = QueueCommandService(operation_store)
     queue_publisher = (
         QueueOutboxPublisher(

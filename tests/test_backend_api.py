@@ -4,6 +4,7 @@ import unittest
 import base64
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -418,12 +419,14 @@ class BackendApiTests(unittest.TestCase):
         self.profiles.profile_registry = ProfileRegistry(root / "profiles.json", "default")
         self.dispatcher = FakeDispatcher()
         self.jobs = SqliteJobRepository(db)
-        self.operation_service = OperationsService(SqliteOperationStore(self.jobs))
         self.catalog = StorageCatalog(db)
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
         self.local_profile_catalog = LocalProfileCatalog(root / "local-profile-catalog.json")
         self.activity_journal = ActivityJournalStore(db)
+        self.operation_service = OperationsService(
+            SqliteOperationStore(self.jobs), activity_journal=self.activity_journal
+        )
         self.bot = FakeTelegramBot()
         self.control = ControlPlane(
             self.jobs,
@@ -610,9 +613,14 @@ class BackendApiTests(unittest.TestCase):
 
         self.operation_service.register_handler("test.echo", prepare)
         auth = self.login(42)
+        operation_request_id = str(uuid.uuid4())
         submitted = self.client.post(
             "/api/v1/operations",
-            headers={**auth, "Idempotency-Key": "operation-submit-1"},
+            headers={
+                **auth,
+                "Idempotency-Key": "operation-submit-1",
+                "X-Request-ID": operation_request_id,
+            },
             json={"kind": "test.echo", "target": {"worker": "ignored"}, "input": {"text": "private-operation-text"}},
         )
         self.assertEqual(submitted.status_code, 202)
@@ -622,6 +630,20 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("input", submitted.json())
         self.assertEqual(submitted.json()["status"], "queued")
         self.assertEqual(submitted.json()["revision"], 1)
+        correlated = self.client.get(
+            f"/api/v1/activity?request_id={operation_request_id}", headers=auth
+        )
+        self.assertEqual(correlated.status_code, 200, correlated.text)
+        correlated_items = correlated.json()["items"]
+        self.assertEqual(
+            {item["activity_type"] for item in correlated_items}, {"request", "operation"}
+        )
+        lifecycle = next(
+            item for item in correlated_items if item["activity_type"] == "operation"
+        )
+        self.assertEqual(lifecycle["operation_id"], operation_id)
+        self.assertEqual(lifecycle["operation_kind"], "test.echo")
+        self.assertEqual(lifecycle["operation_status"], "queued")
         repeated = self.client.post(
             "/api/v1/operations",
             headers={**auth, "Idempotency-Key": "operation-submit-1"},

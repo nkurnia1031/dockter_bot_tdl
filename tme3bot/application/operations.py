@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import Any, Mapping, Protocol
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.domain.operations import Operation, OperationStatus, ensure_operation_transition, utc_now
 from tme3bot.application.ports import OperationRepository
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -41,10 +44,35 @@ class OperationsService:
     MAX_REQUEST_BYTES = 1024 * 1024
     MAX_TARGET_BYTES = 16 * 1024
 
-    def __init__(self, store: OperationRepository, handlers: Mapping[str, OperationHandler] | None = None) -> None:
+    def __init__(
+        self,
+        store: OperationRepository,
+        handlers: Mapping[str, OperationHandler] | None = None,
+        *,
+        activity_journal=None,
+    ) -> None:
         self.store = store
         self._handlers = dict(handlers or {})
         self._command_handlers: dict[str, Any] = {}
+        self.activity_journal = activity_journal
+
+    def flush_activity_events(self, *, limit: int = 100) -> int:
+        """Deliver durable lifecycle events; the journal deduplicates retries."""
+        record_event = getattr(self.activity_journal, "record_operation_event", None)
+        pending = getattr(self.store, "pending_activity_events", None)
+        acknowledge = getattr(self.store, "acknowledge_activity_event", None)
+        if not callable(record_event) or not callable(pending) or not callable(acknowledge):
+            return 0
+        delivered = 0
+        try:
+            for event in pending(limit=limit):
+                record_event(event)
+                acknowledge(str(event.get("event_id") or ""))
+                delivered += 1
+        except Exception as exc:
+            # Keep the event pending for a later request or process restart.
+            LOGGER.warning("Operation activity delivery deferred (%s).", type(exc).__name__)
+        return delivered
 
     def register_command_handler(self, topic: str, handler) -> None:
         normalized = str(topic or "").strip().lower()
@@ -83,6 +111,7 @@ class OperationsService:
     def submit(
         self, actor: Actor, *, kind: str, target: dict[str, Any],
         input_data: dict[str, Any], idempotency_key: str,
+        request_id: str = "", request_route: str = "/api/v1/operations",
     ) -> tuple[Operation, bool]:
         normalized_kind = str(kind or "").strip().lower()
         if not re.fullmatch(r"[a-z][a-z0-9_.-]{0,63}", normalized_kind):
@@ -126,8 +155,10 @@ class OperationsService:
             phase=str(prepared.phase or "queued"), revision=1, attempt=1,
             job_id=prepared.job.id if prepared.job else None,
             created_at=now, updated_at=now,
+            request_id=self._safe_request_id(request_id),
+            request_route=self._safe_request_route(request_route),
         )
-        return self.store.create_submission(
+        result = self.store.create_submission(
             operation,
             private_payload=prepared.private_payload,
             request_sha256=payload_hash,
@@ -137,6 +168,24 @@ class OperationsService:
             command_payload=prepared.command_payload,
             private_job_values=prepared.private_job_values,
         )
+        self.flush_activity_events()
+        return result
+
+    @staticmethod
+    def _safe_request_id(value: str) -> str:
+        try:
+            return str(uuid.UUID(str(value)))
+        except (TypeError, ValueError, AttributeError):
+            return str(uuid.uuid4())
+
+    @staticmethod
+    def _safe_request_route(value: str) -> str:
+        route = str(value or "")
+        if route.startswith("/api/v1/") and len(route) <= 240 and re.fullmatch(
+            r"/[A-Za-z0-9_{}./:-]+\Z", route
+        ):
+            return route
+        return "/api/v1/operations"
 
     def get(self, actor: Actor, operation_id: str) -> Operation:
         operation = self.store.get_for_actor(operation_id, actor.telegram_user_id)
@@ -174,13 +223,15 @@ class OperationsService:
         if operation.status == OperationStatus.CANCELLING:
             return operation, False
         ensure_operation_transition(operation.status, OperationStatus.CANCELLING)
-        return self.store.apply_action(
+        result = self.store.apply_action(
             operation_id=operation_id, actor_user_id=actor.telegram_user_id,
             action="cancel", key_sha256=key_hash, payload_sha256=request_hash,
             expected_revision=operation.revision,
             target_status=OperationStatus.CANCELLING, phase="cancelling",
             topic="operation.cancel",
         )
+        self.flush_activity_events()
+        return result
 
     def retry(self, actor: Actor, operation_id: str, idempotency_key: str) -> tuple[Operation, bool]:
         key_hash = self._idempotency_hash(idempotency_key)
@@ -194,13 +245,15 @@ class OperationsService:
         if operation.status not in {OperationStatus.FAILED, OperationStatus.CANCELLED}:
             raise DomainError("OPERATION_NOT_RETRYABLE", "Hanya operation failed atau cancelled yang dapat diulang.", status_code=409)
         ensure_operation_transition(operation.status, OperationStatus.QUEUED, retry=True)
-        return self.store.apply_action(
+        result = self.store.apply_action(
             operation_id=operation_id, actor_user_id=actor.telegram_user_id,
             action="retry", key_sha256=key_hash, payload_sha256=request_hash,
             expected_revision=operation.revision,
             target_status=OperationStatus.QUEUED, phase="retry_queued",
             topic="operation.retry", retry=True,
         )
+        self.flush_activity_events()
+        return result
 
     def set_visibility(
         self, actor: Actor, operation_id: str, dismissed: bool, idempotency_key: str
@@ -239,7 +292,8 @@ class OperationsService:
             )
         except DomainError:
             # A late or out-of-order job event cannot move a cancelling or terminal operation backwards.
-            return
+            pass
+        self.flush_activity_events()
 
     def mark_waiting_worker_for_job(self, job_id: str) -> None:
         operation = self.store.get_by_job_id(str(job_id))

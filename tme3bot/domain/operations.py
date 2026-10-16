@@ -108,6 +108,8 @@ class Operation:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     dismissed: bool = False
+    request_id: str = ""
+    request_route: str = "/api/v1/operations"
 
     def to_public(self, *, status_url: str | None = None) -> dict[str, Any]:
         return {

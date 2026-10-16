@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import Depends, Header, Response
+from fastapi import Depends, Header, Request, Response
 
 from tme3bot.api.schemas import SafelinkJobRequest
 from tme3bot.domain.models import DomainError
@@ -10,6 +10,7 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
     @app.post("/api/v1/safelink/jobs", status_code=202)
     def submit_safelink_job(
         body: SafelinkJobRequest,
+        request: Request,
         response: Response,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
@@ -23,7 +24,10 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
             target={"profile": actor.profile},
             input_data={"job_kind": "safelink_resolve", "payload": {"url": body.url}},
             idempotency_key=idempotency_key,
+            request_id=request.state.request_id,
+            request_route=getattr(request.scope.get("route"), "path", ""),
         )
+        request.state.activity_operation_id = operation.id
         job = context.control_plane.jobs.get(str(operation.job_id or ""))
         if job is None:
             raise DomainError("JOB_NOT_FOUND", "Job resolver tidak ditemukan setelah diterima.", status_code=500)

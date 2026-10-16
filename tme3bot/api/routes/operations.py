@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import Depends, Header, Query, Response
+from fastapi import Depends, Header, Query, Request, Response
 
 from tme3bot.api.schemas import (
     OperationListResponse,
@@ -37,6 +37,7 @@ def register_operations(app, operations, *, current_actor) -> None:
     @app.post("/api/v1/operations", status_code=202, response_model=OperationResponse)
     def submit_operation(
         body: OperationSubmitRequest,
+        request: Request,
         response: Response,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
@@ -45,7 +46,10 @@ def register_operations(app, operations, *, current_actor) -> None:
         operation, _ = service.submit(
             actor, kind=body.kind, target=body.target, input_data=body.input,
             idempotency_key=idempotency_key,
+            request_id=request.state.request_id,
+            request_route=getattr(request.scope.get("route"), "path", ""),
         )
+        request.state.activity_operation_id = operation.id
         status_url = f"/api/v1/operations/{operation.id}"
         response.headers["Location"] = status_url
         return _public(operation, status_url=status_url)

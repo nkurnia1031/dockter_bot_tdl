@@ -69,7 +69,9 @@ class SqliteOperationStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT,
-                    finished_at TEXT
+                    finished_at TEXT,
+                    request_id TEXT NOT NULL DEFAULT '',
+                    request_route TEXT NOT NULL DEFAULT '/api/v1/operations'
                 );
                 CREATE INDEX IF NOT EXISTS operations_actor_created
                     ON operations(actor_user_id, created_at DESC, id DESC);
@@ -129,8 +131,29 @@ class SqliteOperationStore:
                     PRIMARY KEY(operation_id, actor_user_id),
                     FOREIGN KEY(operation_id) REFERENCES operations(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS operation_activity_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    event_key TEXT NOT NULL UNIQUE,
+                    operation_id TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    FOREIGN KEY(operation_id) REFERENCES operations(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS operation_activity_outbox_pending
+                    ON operation_activity_outbox(delivered_at, created_at);
                 """
             )
+            columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(operations)").fetchall()
+            }
+            if "request_id" not in columns:
+                db.execute("ALTER TABLE operations ADD COLUMN request_id TEXT NOT NULL DEFAULT ''")
+            if "request_route" not in columns:
+                db.execute(
+                    "ALTER TABLE operations ADD COLUMN request_route TEXT NOT NULL DEFAULT '/api/v1/operations'"
+                )
             db.commit()
         finally:
             db.close()
@@ -161,7 +184,80 @@ class SqliteOperationStore:
             started_at=_parse_datetime(row["started_at"]),
             finished_at=_parse_datetime(row["finished_at"]),
             dismissed=bool(dismissed),
+            request_id=str(row["request_id"] or ""),
+            request_route=str(row["request_route"] or "/api/v1/operations"),
         )
+
+    @staticmethod
+    def _enqueue_activity_event(
+        db: sqlite3.Connection, operation: Operation, *, occurred_at: str
+    ) -> None:
+        target = operation.target if isinstance(operation.target, dict) else {}
+        status = operation.status.value
+        error = operation.error if isinstance(operation.error, dict) else {}
+        result_code = str(error.get("code") or "") if status == "failed" else ""
+        if not result_code:
+            result_code = "OPERATION_" + status.upper()
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "event_key": f"{operation.id}:{operation.attempt}:{operation.revision}",
+            "occurred_at": occurred_at,
+            "request_id": operation.request_id,
+            "method": "ASYNC",
+            "route": operation.request_route,
+            "status_code": 200,
+            "duration_ms": 0,
+            "actor_user_id": operation.actor_user_id,
+            "profile": str(target.get("profile") or operation.profile),
+            "worker": str(target.get("worker") or ""),
+            "operation_id": operation.id,
+            "job_id": operation.job_id or "",
+            "operation_kind": operation.kind,
+            "operation_status": status,
+            "result_code": result_code,
+            "error_code": str(error.get("code") or "") if status == "failed" else "",
+        }
+        db.execute(
+            """INSERT OR IGNORE INTO operation_activity_outbox(
+                   event_id, event_key, operation_id, event_json, created_at
+               ) VALUES (?, ?, ?, ?, ?)""",
+            (
+                event["event_id"], event["event_key"], operation.id,
+                json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                occurred_at,
+            ),
+        )
+
+    def pending_activity_events(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        selected_limit = max(1, min(int(limit), 500))
+        with self.jobs._db() as db:
+            cutoff = (_now() - timedelta(days=90)).isoformat()
+            db.execute(
+                "DELETE FROM operation_activity_outbox "
+                "WHERE delivered_at IS NOT NULL AND created_at < ?",
+                (cutoff,),
+            )
+            rows = db.execute(
+                "SELECT event_id,event_json FROM operation_activity_outbox "
+                "WHERE delivered_at IS NULL ORDER BY created_at,event_id LIMIT ?",
+                (selected_limit,),
+            ).fetchall()
+        events = []
+        for row in rows:
+            value = _load(row["event_json"], {})
+            if isinstance(value, dict):
+                value["event_id"] = str(row["event_id"])
+                events.append(value)
+        return events
+
+    def acknowledge_activity_event(self, event_id: str) -> bool:
+        with self._transaction() as db:
+            cursor = db.execute(
+                "UPDATE operation_activity_outbox SET delivered_at=? "
+                "WHERE event_id=? AND delivered_at IS NULL",
+                (_now().isoformat(), str(event_id)),
+            )
+            return cursor.rowcount == 1
 
     def _get_in_transaction(
         self, db: sqlite3.Connection, operation_id: str, actor_user_id: int | None = None
@@ -233,8 +329,8 @@ class SqliteOperationStore:
                 """INSERT INTO operations(
                        id, kind, actor_user_id, profile, target_json, status, phase,
                        revision, attempt, progress_json, job_id, error_json,
-                       created_at, updated_at, started_at, finished_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       created_at, updated_at, started_at, finished_at, request_id, request_route
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     operation.id, operation.kind, operation.actor_user_id,
                     operation.profile, _dump(operation.target), operation.status.value,
@@ -244,6 +340,8 @@ class SqliteOperationStore:
                     now, operation.updated_at.isoformat(),
                     operation.started_at.isoformat() if operation.started_at else None,
                     operation.finished_at.isoformat() if operation.finished_at else None,
+                    operation.request_id,
+                    operation.request_route,
                 ),
             )
             db.execute(
@@ -259,6 +357,7 @@ class SqliteOperationStore:
                 (operation.id, operation.status.value, operation.job_id, now, now),
             )
             self._insert_outbox(db, operation.id, operation.attempt, "operation.accepted", {"operation_id": operation.id, "attempt": operation.attempt}, now)
+            self._enqueue_activity_event(db, operation, occurred_at=now)
             if job is not None:
                 assert execution_plan is not None and command_payload is not None
                 SqliteJobRepository.insert_prepared_job(
@@ -411,6 +510,8 @@ class SqliteOperationStore:
             self._insert_outbox(db, operation_id, attempt, topic, {"operation_id": operation_id, "attempt": attempt}, now)
             updated = self._get_in_transaction(db, operation_id, actor_user_id)
             assert updated is not None
+            if current.status != target_status:
+                self._enqueue_activity_event(db, updated, occurred_at=now)
             return updated, True
 
     @staticmethod
@@ -500,7 +601,10 @@ class SqliteOperationStore:
                 "UPDATE operation_attempts SET status=?, updated_at=?, error_code=? WHERE operation_id=? AND attempt=?",
                 (status.value, now, sanitized_error["code"] if sanitized_error else None, operation_id, current.attempt),
             )
-            return self._get_in_transaction(db, operation_id)
+            updated = self._get_in_transaction(db, operation_id)
+            if updated is not None and current.status != status:
+                self._enqueue_activity_event(db, updated, occurred_at=now)
+            return updated
 
     def claim_outbox(self, *, limit: int = 50, lease_seconds: int = 30) -> list[dict[str, Any]]:
         now = _now()

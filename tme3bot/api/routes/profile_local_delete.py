@@ -4,7 +4,7 @@ import hashlib
 import re
 from typing import Any
 
-from fastapi import Depends, Header
+from fastapi import Depends, Header, Request
 
 from tme3bot.application.operations import PreparedOperation
 from tme3bot.domain.models import DomainError
@@ -447,6 +447,7 @@ def register_profile_local_delete(app, context, *, current_actor) -> None:
     def delete_local_profile(
         worker: str,
         profile: str,
+        request: Request,
         actor=Depends(current_actor),
         idempotency_key: str = Header(
             ..., alias="Idempotency-Key", min_length=1, max_length=200
@@ -474,6 +475,8 @@ def register_profile_local_delete(app, context, *, current_actor) -> None:
                 target={"profile": selected_profile, "worker": worker_name},
                 input_data={"request_token": token},
                 idempotency_key=idempotency_key,
+                request_id=request.state.request_id,
+                request_route=getattr(request.scope.get("route"), "path", ""),
             )
         except Exception:
             # The reservation is token-scoped, so a failed first submission
@@ -482,4 +485,5 @@ def register_profile_local_delete(app, context, *, current_actor) -> None:
             if callable(finish):
                 finish(selected_profile, worker_name, token)
             raise
+        request.state.activity_operation_id = operation.id
         return operation.to_public(status_url=f"/api/v1/operations/{operation.id}")
