@@ -604,11 +604,16 @@ class WorkerJobExecutor(
             nonlocal sequence
             if not sync_run_id or sync_revision < 1:
                 return
-            sequence += 1
             try:
+                allocator = getattr(self.profile_sync, "next_external_event_sequence", None)
+                if callable(allocator):
+                    event_sequence = allocator(sync_run_id)
+                else:
+                    sequence += 1
+                    event_sequence = sequence
                 self.profile_sync.report_external_event(
                     run_id=sync_run_id,
-                    sequence=sequence,
+                    sequence=event_sequence,
                     profile=profile,
                     revision=sync_revision,
                     phase=phase,
@@ -625,7 +630,9 @@ class WorkerJobExecutor(
             with self._profile_session_locks(profile):
                 stage_callback = None
                 if sync_run_id:
-                    stage_callback = lambda phase: report(phase, "succeeded")
+                    stage_callback = lambda phase, status, code="": report(
+                        phase, status, code
+                    )
                 result = self._profile_sessions.install_bundle(
                     profile,
                     telegram_user_id,
@@ -651,10 +658,14 @@ class WorkerJobExecutor(
         sync_run_id: str = "",
         sync_revision: int = 0,
     ) -> bool:
-        def report(sequence: int, status: str, code: str = "") -> None:
+        def report(status: str, code: str = "") -> None:
             if not sync_run_id or sync_revision < 1:
                 return
             try:
+                allocator = getattr(self.profile_sync, "next_external_event_sequence", None)
+                sequence = allocator(sync_run_id) if callable(allocator) else 0
+                if sequence < 1:
+                    return
                 self.profile_sync.report_external_event(
                     run_id=sync_run_id,
                     sequence=sequence,
@@ -667,10 +678,15 @@ class WorkerJobExecutor(
             except Exception:
                 LOGGER.debug("Could not report profile bundle commit progress")
 
-        report(5, "running")
+        report("running")
         with self._profile_session_locks(profile):
             committed = self._profile_sessions.commit_bundle(profile, operation_id)
-        report(6, "succeeded" if committed else "failed", "" if committed else "PROFILE_INSTALL_COMMIT_FAILED")
+        if committed:
+            preparer = getattr(self, "upload_lane_preparer", None)
+            ensure_upload = getattr(preparer, "ensure", None)
+            if callable(ensure_upload):
+                ensure_upload(profile)
+        report("succeeded" if committed else "failed", "" if committed else "PROFILE_INSTALL_COMMIT_FAILED")
         return committed
 
     def rollback_profile_bundle(self, profile: str, operation_id: str) -> bool:
@@ -679,7 +695,7 @@ class WorkerJobExecutor(
             refresh = getattr(self.profile_manager, "refresh_profile_runtime", None)
             if restored and callable(refresh):
                 refresh(profile)
-            return restored
+        return restored
 
     def delete_local_profile(self, profile: str) -> dict[str, Any]:
         normalized = normalize_profile_name(profile)

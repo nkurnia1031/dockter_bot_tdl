@@ -30,10 +30,15 @@ _MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _SUPPORTED_FORMAT = 1
 _MAX_QUEUED_SYNC_REQUESTS = 32
 _MAX_PENDING_SYNC_EVENTS = 10000
+_MAX_EXTERNAL_EVENT_RUNS = 512
 _SYNC_EVENT_PHASES = {
     "queued", "manifest_fetch", "revision_compare", "bundle_download",
     "bundle_validation", "session_validation", "session_install", "session_commit",
     "acknowledgement", "worker_unreachable", "completed", "cancelled",
+    "download_staging", "download_validation", "download_install",
+    "export_staging", "export_validation", "export_install",
+    "upload_staging", "upload_validation", "upload_install",
+    "identity_install", "transaction_rollback", "installation_reused",
 }
 _SYNC_EVENT_STATUSES = {"queued", "running", "succeeded", "failed", "waiting", "cancelled"}
 _SYNC_RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
@@ -784,6 +789,21 @@ class ProfileSyncClient:
             code=code,
         )
 
+    def next_external_event_sequence(self, run_id: str) -> int:
+        """Allocate a durable sequence shared by install and commit requests."""
+        normalized = str(run_id or "")
+        if not _SYNC_RUN_ID_RE.fullmatch(normalized):
+            raise ValueError("ID run sinkronisasi profil tidak valid.")
+        with self._condition:
+            sequences = self._state.setdefault("external_event_sequences", {})
+            sequence = int(sequences.get(normalized, 0)) + 1
+            sequences.pop(normalized, None)
+            sequences[normalized] = sequence
+            while len(sequences) > _MAX_EXTERNAL_EVENT_RUNS:
+                sequences.pop(next(iter(sequences)))
+            self._save_locked()
+            return sequence
+
     def _report_sync_event(
         self,
         *,
@@ -1160,6 +1180,20 @@ class ProfileSyncClient:
             safe_pending_events.append(safe_event)
             if len(safe_pending_events) >= _MAX_PENDING_SYNC_EVENTS:
                 break
+        raw_sequences = raw.get("external_event_sequences")
+        raw_sequences = raw_sequences if isinstance(raw_sequences, dict) else {}
+        external_event_sequences: dict[str, int] = {}
+        for run_id, sequence in raw_sequences.items():
+            normalized_run = str(run_id or "")
+            if (
+                _SYNC_RUN_ID_RE.fullmatch(normalized_run)
+                and type(sequence) is int
+                and 0 < sequence <= 2**31 - 1
+            ):
+                external_event_sequences[normalized_run] = sequence
+        external_event_sequences = dict(
+            list(external_event_sequences.items())[-_MAX_EXTERNAL_EVENT_RUNS:]
+        )
         return {
             "backend_available": raw.get("backend_available") if isinstance(raw.get("backend_available"), bool) else None,
             "backend_error_code": _safe_code(raw.get("backend_error_code")),
@@ -1167,6 +1201,7 @@ class ProfileSyncClient:
             "managed_profiles": sorted({name for item in managed if (name := normalize_profile_name(str(item)))}),
             "profiles": safe_rows,
             "pending_sync_events": safe_pending_events,
+            "external_event_sequences": external_event_sequences,
         }
 
     def _save_locked(self) -> None:

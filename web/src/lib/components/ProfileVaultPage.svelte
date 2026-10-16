@@ -46,6 +46,11 @@
     queued: 'Antrean', manifest_fetch: 'Baca daftar profil', revision_compare: 'Bandingkan revision',
     bundle_download: 'Unduh bundle', bundle_validation: 'Validasi bundle',
     session_validation: 'Validasi sesi', session_install: 'Pasang sesi', session_commit: 'Simpan sesi',
+    download_staging: 'Siapkan lane Download', download_validation: 'Validasi lane Download', download_install: 'Pasang lane Download',
+    export_staging: 'Siapkan lane Export', export_validation: 'Validasi lane Export', export_install: 'Pasang lane Export',
+    upload_staging: 'Salin lane Upload', upload_validation: 'Validasi lane Upload', upload_install: 'Pasang lane Upload',
+    identity_install: 'Pasang metadata identitas', transaction_rollback: 'Pulihkan seluruh lane',
+    installation_reused: 'Pemasangan sudah tercatat',
     acknowledgement: 'Konfirmasi ke Vault', worker_unreachable: 'Worker tidak terjangkau',
     completed: 'Selesai', cancelled: 'Dibatalkan'
   } as Record<string, string>)[phase] || phase;

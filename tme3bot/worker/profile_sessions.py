@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -30,12 +31,23 @@ from tme3bot.profile_provisioning import (
     extract_single_session,
     validate_profile_bundle,
 )
+from tme3bot.persistence import write_json_atomic_private
 from tme3bot.profiles import build_profile_config
 
 
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 _LOGIN_TTL_SECONDS = 15 * 60
 _PHONE_RE = re.compile(r"^[+0-9(). -]{4,32}$")
+_PROFILE_INSTALL_LANES = ("root/.tdl", "user1/.tdl", "upload")
+_UPLOAD_LANE_MARKER = "upload-lane.json"
+_PROFILE_INSTALL_RECEIPTS = ".profile-provisioning-commits.json"
+_MAX_PROFILE_INSTALL_RECEIPTS = 100
+
+
+class _ProfileInstallFailure(ValueError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass
@@ -218,157 +230,525 @@ class ProfileSessionManager:
         bundle: bytes,
         operation_id: str,
         *,
-        on_stage: Callable[[str], None] | None = None,
+        on_stage: Callable[[str, str, str], None] | None = None,
     ) -> dict[str, Any]:
-        normalized = normalize_profile_name(profile)
-        if not normalized:
-            raise ValueError("Nama profil tidak valid.")
         if len(bundle) > MAX_PROFILE_BUNDLE_BYTES:
             raise ValueError("Bundle profil melebihi batas.")
         entries = validate_profile_bundle(bundle)
-        profile_config = build_profile_config(self.config, normalized)
-        profile_root = Path(profile_config.profile_root)
-        if profile_root.is_symlink():
-            raise ValueError("Direktori profil tidak aman.")
-        for session_parent in (profile_root / "root", profile_root / "user1"):
-            if session_parent.is_symlink():
-                raise ValueError("Direktori sesi profil tidak aman.")
         expected_identity = int(telegram_user_id)
+        if expected_identity < 1:
+            raise ValueError("Identity Telegram tidak valid.")
         with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
             try:
                 identity = json.loads(archive.read("identity.json").decode("utf-8"))
+                if not isinstance(identity, dict):
+                    raise TypeError("Identity bundle harus berupa object.")
                 stored_id = int(identity.get("telegram_user_id", identity.get("tdl_user_id")))
             except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 raise ValueError("Identity bundle profil tidak valid.") from exc
             if stored_id != expected_identity:
                 raise ValueError("Identity bundle tidak cocok dengan profil.")
-        if on_stage:
-            on_stage("bundle_validation")
 
+            with tempfile.TemporaryDirectory(
+                prefix="profile-candidates-", dir=self.root
+            ) as raw_root:
+                candidate_root = Path(raw_root)
+                download_candidate = candidate_root / "download" / ".tdl"
+                export_candidate = candidate_root / "export" / ".tdl"
+                download_candidate.mkdir(parents=True, exist_ok=True)
+                export_candidate.mkdir(parents=True, exist_ok=True)
+                for info, parts in entries:
+                    if info.is_dir():
+                        continue
+                    path = "/".join(parts)
+                    if path.startswith("root/.tdl/"):
+                        destination_root = download_candidate
+                        relative_parts = parts[2:]
+                    elif path.startswith("user1/.tdl/"):
+                        destination_root = export_candidate
+                        relative_parts = parts[2:]
+                    else:
+                        continue
+                    destination = destination_root.joinpath(*relative_parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(archive.read(info))
+                self._set_private_tree(download_candidate)
+                self._set_private_tree(export_candidate)
+                self._require_private_tree(download_candidate)
+                self._require_private_tree(export_candidate)
+                return self.install_candidates(
+                    profile,
+                    expected_identity,
+                    operation_id,
+                    download_candidate=download_candidate,
+                    export_candidate=export_candidate,
+                    on_stage=on_stage,
+                )
+
+    def install_candidates(
+        self,
+        profile: str,
+        telegram_user_id: int,
+        operation_id: str,
+        *,
+        download_candidate: Path | None = None,
+        export_candidate: Path | None = None,
+        on_stage: Callable[[str, str, str], None] | None = None,
+    ) -> dict[str, Any]:
+        def report(stage: str, status: str, code: str = "") -> None:
+            if on_stage is not None:
+                try:
+                    on_stage(stage, status, code)
+                except Exception:
+                    # Progress delivery must not change the session transaction.
+                    pass
+
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            raise ValueError("Nama profil tidak valid.")
+        if download_candidate is None and export_candidate is None:
+            raise ValueError("Kandidat sesi profil tidak tersedia.")
+        if download_candidate is None:
+            download_candidate = export_candidate
+        if export_candidate is None:
+            export_candidate = download_candidate
+        assert download_candidate is not None and export_candidate is not None
+        download_candidate = Path(download_candidate)
+        export_candidate = Path(export_candidate)
+        profile_config = build_profile_config(self.config, normalized)
+        profile_root = Path(profile_config.profile_root)
+        if profile_root.is_symlink():
+            raise ValueError("Direktori profil tidak aman.")
         operation_id = self._valid_operation_id(operation_id or "sync-" + normalized)
-        # Keep staging and rollback data beside profile files on the same
-        # filesystem. For default, this avoids creating directories under /.
+        expected_identity = int(telegram_user_id)
+        if expected_identity < 1:
+            raise ValueError("Identity Telegram tidak valid.")
         stage_root = profile_root / f".{normalized}.provision-{operation_id}"
         backup_root = self._backup_directory(normalized, operation_id)
         marker = profile_root / ".profile-provisioning.json"
+        receipt_file = profile_root / _PROFILE_INSTALL_RECEIPTS
+        for target in (
+            profile_root / "root",
+            profile_root / "user1",
+            profile_root / "upload",
+            profile_root / ".profile-provisioning-backups",
+            backup_root.parent.parent,
+            stage_root,
+            backup_root.parent,
+            backup_root,
+            marker,
+            profile_root / "identity.json",
+            receipt_file,
+        ):
+            if target.is_symlink():
+                raise ValueError("Direktori sesi profil tidak aman.")
+        for relative in _PROFILE_INSTALL_LANES:
+            self._assert_safe_tree(profile_root / relative)
+        self._assert_safe_tree(profile_root / ".profile-provisioning-backups")
+        self._assert_safe_tree(backup_root.parent)
+        self._assert_safe_tree(backup_root)
+        if marker.exists() and not marker.is_file():
+            raise ValueError("Marker provisioning profil tidak aman.")
+        self._assert_candidate_source(download_candidate)
+        self._assert_candidate_source(export_candidate)
+        download_fingerprint = self._session_tree_fingerprint(
+            download_candidate, str(profile_config.tdl_download_namespace),
+            allow_namespace_alias=True,
+        )
+        export_fingerprint = self._session_tree_fingerprint(
+            export_candidate, str(profile_config.tdl_export_namespace),
+            allow_namespace_alias=True,
+        )
+        bundle_digest_builder = hashlib.sha256()
+        bundle_digest_builder.update(str(expected_identity).encode("ascii"))
+        bundle_digest_builder.update(b"\0download\0" + download_fingerprint.encode("ascii"))
+        bundle_digest_builder.update(b"\0export\0" + export_fingerprint.encode("ascii"))
+        bundle_digest = bundle_digest_builder.hexdigest()
+        report("bundle_validation", "succeeded")
+
+        # Keep staging and rollback data beside profile files on the same
+        # filesystem. For default, this avoids creating directories under /.
+        receipts = self._read_install_receipts(profile_root)
+        receipt = receipts["commits"].get(operation_id)
+        if receipt is not None and (
+            receipt.get("bundle_sha256") != bundle_digest
+            or receipt.get("telegram_user_id") != expected_identity
+        ):
+            raise RuntimeError("ID provisioning sudah committed dengan konten lain.")
         if marker.exists():
             try:
                 state = json.loads(marker.read_text(encoding="utf-8"))
-                if state.get("operation_id") != operation_id:
+                if not isinstance(state, dict) or state.get("operation_id") != operation_id:
                     raise RuntimeError("Profil sedang menerima provisioning lain.")
             except json.JSONDecodeError as exc:
                 raise RuntimeError("Marker provisioning profil rusak.") from exc
             original = state.get("original")
             if not isinstance(original, dict):
-                # Markers created before the original-path manifest were
-                # written only after all old files had been moved to backup.
                 original = {
                     relative: (backup_root / relative).exists()
-                    for relative in ("root/.tdl", "user1/.tdl")
+                    for relative in _PROFILE_INSTALL_LANES
                 }
                 original["identity.json"] = (backup_root / "identity.json").exists()
-                state["original"] = original
-                marker.write_text(json.dumps(state), encoding="utf-8")
+            # A marker from the previous two-lane installer did not touch
+            # Upload. Capture its pre-transaction tree before upgrading it.
+            if "upload" not in original:
+                original["upload"] = (profile_root / "upload").exists() or (
+                    backup_root / "upload"
+                ).exists()
+            original.setdefault("root/.tdl", False)
+            original.setdefault("user1/.tdl", False)
+            original.setdefault("identity.json", False)
+            if any(type(original.get(key)) is not bool for key in (*_PROFILE_INSTALL_LANES, "identity.json")):
+                raise RuntimeError("Snapshot provisioning profil tidak valid.")
+            existing_digest = state.get("bundle_sha256")
+            if existing_digest and existing_digest != bundle_digest:
+                raise RuntimeError("ID provisioning sudah terikat ke bundle lain.")
+            existing_identity = state.get("telegram_user_id")
+            if existing_identity is not None and (
+                type(existing_identity) is not int or existing_identity != expected_identity
+            ):
+                raise RuntimeError("ID provisioning sudah terikat ke identitas lain.")
+            state["bundle_sha256"] = bundle_digest
+            state["telegram_user_id"] = expected_identity
+            state["original"] = original
+            state["transaction_version"] = 2
+            already_installed = state.get("installed") is True and self.verify_installed(
+                normalized, expected_identity
+            ) is not False
+            state["installed"] = already_installed
+            self._write_private_json(marker, state)
+            if already_installed:
+                report("installation_reused", "succeeded")
+                return {"profile": normalized, "ready": True, "reused": True}
         else:
+            receipt = receipts["commits"].get(operation_id)
+            if receipt is not None:
+                if receipt.get("bundle_sha256") != bundle_digest:
+                    raise RuntimeError("ID provisioning sudah terikat ke bundle lain.")
+                if receipts.get("last_operation_id") != operation_id:
+                    raise RuntimeError("Operasi provisioning ini sudah digantikan.")
+                if self.verify_installed(normalized, expected_identity) is False:
+                    raise RuntimeError("Hasil provisioning committed sudah berubah.")
+                self._remove_path(backup_root.parent)
+                report("installation_reused", "succeeded")
+                return {"profile": normalized, "ready": True, "reused": True}
             profile_root.mkdir(parents=True, exist_ok=True)
+            # A missing marker means the previous operation committed. Any
+            # remaining operation directory is only an interrupted cleanup.
+            self._remove_path(backup_root.parent)
             backup_root.mkdir(parents=True, exist_ok=True)
             if os.name == "posix":
-                backup_root.parent.mkdir(parents=True, exist_ok=True)
-                backup_root.parent.chmod(0o700)
-                backup_root.chmod(0o700)
+                self._set_private_tree(backup_root.parent.parent)
+                self._set_private_tree(backup_root.parent)
+                self._set_private_tree(backup_root)
             original = {
                 relative: (profile_root / relative).exists()
-                for relative in ("root/.tdl", "user1/.tdl")
+                for relative in _PROFILE_INSTALL_LANES
             }
             original["identity.json"] = (profile_root / "identity.json").exists()
             state = {
                 "operation_id": operation_id,
                 "new_profile": not original["identity.json"],
+                "transaction_version": 2,
+                "bundle_sha256": bundle_digest,
+                "telegram_user_id": expected_identity,
+                "installed": False,
                 "original": original,
             }
-            marker.write_text(json.dumps(state), encoding="utf-8")
-        shutil.rmtree(stage_root, ignore_errors=True)
-        stage_root.mkdir(parents=True, exist_ok=True)
-        if os.name == "posix":
-            stage_root.chmod(0o700)
+            self._write_private_json(marker, state)
+
+        backup_root.mkdir(parents=True, exist_ok=True)
+        self._set_private_tree(backup_root.parent)
+        self._set_private_tree(backup_root)
+        self._require_private_tree(backup_root.parent)
+        self._require_private_tree(backup_root)
+
+        self._remove_path(stage_root)
         try:
-            # Complete any interrupted backup before replacing sessions. The
-            # manifest lets rollback distinguish untouched originals from new
-            # files installed by this operation.
+            stage_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._set_private_tree(stage_root)
+            staging_specs = (
+                (
+                    "download", download_candidate, "root/.tdl",
+                    str(profile_config.tdl_download_namespace),
+                ),
+                (
+                    "export", export_candidate, "user1/.tdl",
+                    str(profile_config.tdl_export_namespace),
+                ),
+            )
+            for lane, candidate_source, relative, namespace in staging_specs:
+                phase = f"{lane}_staging"
+                report(phase, "running")
+                try:
+                    destination = stage_root / relative
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(candidate_source, destination, symlinks=True)
+                    self._normalize_candidate_namespace(destination, namespace)
+                    self._set_private_tree(destination)
+                    self._require_private_tree(destination)
+                except Exception as exc:
+                    code = getattr(exc, "code", "PROFILE_SESSION_STAGING_FAILED")
+                    if code not in {
+                        "PROFILE_SESSION_UNSAFE", "PROFILE_SESSION_PERMISSION_INVALID",
+                        "PROFILE_SESSION_STAGING_FAILED",
+                    }:
+                        code = "PROFILE_SESSION_STAGING_FAILED"
+                    report(phase, "failed", code)
+                    raise _ProfileInstallFailure(code) from None
+                report(phase, "succeeded")
+            identity_stage = stage_root / "identity.json"
+            identity_stage.write_text(
+                json.dumps({
+                    "telegram_user_id": expected_identity,
+                    "tdl_user_id": expected_identity,
+                }),
+                encoding="utf-8",
+            )
+            self._set_private_tree(stage_root)
+            self._require_private_tree(stage_root)
+
+            # Upload is a separate Bolt database copied from the Export
+            # candidate. Never hard-link it: TDL opens each lane independently.
+            report("upload_staging", "running")
+            try:
+                export_storage = stage_root / "user1" / ".tdl"
+                upload_home = stage_root / "upload"
+                upload_storage = upload_home / ".tdl"
+                upload_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.copytree(export_storage, upload_storage, symlinks=False)
+                fingerprint = self._session_tree_fingerprint(
+                    export_storage, str(profile_config.tdl_export_namespace)
+                )
+                self._write_private_json(upload_home / _UPLOAD_LANE_MARKER, {
+                    "format": 1,
+                    "source_fingerprint": fingerprint,
+                })
+                self._set_private_tree(upload_home)
+                self._require_private_tree(upload_home)
+                if self._trees_share_files(export_storage, upload_storage):
+                    raise _ProfileInstallFailure("PROFILE_SESSION_STORAGE_NOT_ISOLATED")
+            except Exception as exc:
+                code = getattr(exc, "code", "PROFILE_SESSION_STAGING_FAILED")
+                if code not in {
+                    "PROFILE_SESSION_UNSAFE", "PROFILE_SESSION_PERMISSION_INVALID",
+                    "PROFILE_SESSION_TDL_INVALID", "PROFILE_SESSION_DATABASE_MISSING",
+                    "PROFILE_SESSION_STORAGE_NOT_ISOLATED", "PROFILE_SESSION_STAGING_FAILED",
+                }:
+                    code = "PROFILE_SESSION_STAGING_FAILED"
+                report("upload_staging", "failed", code)
+                raise _ProfileInstallFailure(code) from None
+            report("upload_staging", "succeeded")
+
+            validation_specs = (
+                ("download", stage_root / "root" / ".tdl", str(profile_config.tdl_download_namespace)),
+                ("export", export_storage, str(profile_config.tdl_export_namespace)),
+                ("upload", upload_storage, str(profile_config.tdl_export_namespace)),
+            )
+            for lane, storage, namespace in validation_specs:
+                phase = f"{lane}_validation"
+                report(phase, "running")
+                try:
+                    self._require_candidate_database(storage, namespace)
+                    actual_identity = self._run_whoami(
+                        storage,
+                        namespace=namespace,
+                        home=storage.parent,
+                    )
+                    if actual_identity != expected_identity:
+                        raise _ProfileInstallFailure("PROFILE_SESSION_IDENTITY_MISMATCH")
+                except Exception as exc:
+                    code = getattr(exc, "code", "PROFILE_SESSION_TDL_INVALID")
+                    if code not in {
+                        "PROFILE_SESSION_IDENTITY_MISMATCH",
+                        "PROFILE_SESSION_DATABASE_MISSING",
+                        "PROFILE_SESSION_TDL_INVALID",
+                    }:
+                        code = "PROFILE_SESSION_TDL_INVALID"
+                    report(phase, "failed", code)
+                    raise _ProfileInstallFailure(code) from None
+                report(phase, "succeeded")
+
+            # Complete any interrupted backup before replacing sessions. Keep
+            # the original Upload home (including its fingerprint marker) with
+            # the two source lanes and identity metadata.
             backup_root.mkdir(parents=True, exist_ok=True)
-            for relative in ("root/.tdl", "user1/.tdl"):
-                current = profile_root / relative
-                saved = backup_root / relative
-                if original.get(relative) and current.exists() and not saved.exists():
-                    saved.parent.mkdir(parents=True, exist_ok=True)
-                    os.replace(current, saved)
+            for relative in _PROFILE_INSTALL_LANES:
+                lane = "download" if relative == "root/.tdl" else "export" if relative == "user1/.tdl" else "upload"
+                phase = f"{lane}_install"
+                report(phase, "running")
+                try:
+                    current = profile_root / relative
+                    saved = backup_root / relative
+                    if original.get(relative) and current.exists() and not saved.exists():
+                        self._set_private_tree(current)
+                        self._require_private_tree(current)
+                        saved.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(current, saved)
+                    if current.exists():
+                        self._remove_path(current)
+                    candidate = stage_root / relative
+                    current.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(candidate, current)
+                    self._set_private_tree(current)
+                    self._require_private_tree(current)
+                except Exception:
+                    report(phase, "failed", "PROFILE_LANE_INSTALL_FAILED")
+                    raise _ProfileInstallFailure("PROFILE_LANE_INSTALL_FAILED") from None
+                report(phase, "succeeded")
+
             identity = profile_root / "identity.json"
             saved_identity = backup_root / "identity.json"
             if original.get("identity.json") and identity.exists() and not saved_identity.exists():
+                try:
+                    identity.chmod(0o600)
+                except OSError:
+                    pass
+                self._require_private_file(identity)
                 os.replace(identity, saved_identity)
-            with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
-                for info, parts in entries:
-                    path = "/".join(parts)
-                    if info.is_dir() or path in {"identity.json", "root", "user1", "root/.tdl", "user1/.tdl"}:
-                        continue
-                    target = stage_root.joinpath(*parts)
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(archive.read(info))
-            self._set_private_tree(stage_root)
-            for relative in ("root/.tdl", "user1/.tdl"):
-                source = stage_root / relative
-                database_files = list((source / "data").glob("*")) if source.exists() else []
-                if not any(item.is_file() and item.stat().st_size for item in database_files):
-                    raise ValueError(f"Bundle tidak memiliki database {relative} yang siap.")
-                destination = profile_root / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.rmtree(destination, ignore_errors=True)
-                os.replace(source, destination)
-            identity_path = profile_root / "identity.json"
-            identity_path.write_text(json.dumps({"telegram_user_id": expected_identity, "tdl_user_id": expected_identity}), encoding="utf-8")
-            self._set_private_tree(profile_root / "root" / ".tdl")
-            self._set_private_tree(profile_root / "user1" / ".tdl")
+            report("identity_install", "running")
             try:
-                identity_path.chmod(0o600)
-            except OSError:
-                pass
-            if on_stage:
-                on_stage("session_validation")
+                os.replace(identity_stage, identity)
+                self._require_private_file(identity)
+            except Exception:
+                report("identity_install", "failed", "PROFILE_IDENTITY_INSTALL_FAILED")
+                raise _ProfileInstallFailure("PROFILE_IDENTITY_INSTALL_FAILED") from None
+            report("identity_install", "succeeded")
+            if self.verify_installed(normalized, expected_identity) is False:
+                raise _ProfileInstallFailure("PROFILE_INSTALL_VALIDATION_FAILED")
+            state["installed"] = True
+            self._write_private_json(marker, state)
             return {"profile": normalized, "ready": True}
         except Exception:
-            shutil.rmtree(stage_root, ignore_errors=True)
-            self.rollback_bundle(normalized, operation_id)
+            self._remove_path(stage_root)
+            report("transaction_rollback", "running")
+            try:
+                restored = self.rollback_bundle(normalized, operation_id)
+            except Exception:
+                restored = False
+            report(
+                "transaction_rollback",
+                "succeeded" if restored else "failed",
+                "" if restored else "PROFILE_INSTALL_ROLLBACK_FAILED",
+            )
+            if not restored:
+                raise _ProfileInstallFailure("PROFILE_INSTALL_ROLLBACK_FAILED") from None
             raise
         finally:
-            shutil.rmtree(stage_root, ignore_errors=True)
+            self._remove_path(stage_root)
 
     def commit_bundle(self, profile: str, operation_id: str) -> bool:
-        profile_root = Path(build_profile_config(self.config, profile).profile_root)
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            return False
+        try:
+            operation_id = self._valid_operation_id(operation_id)
+        except ValueError:
+            return False
+        profile_root = Path(build_profile_config(self.config, normalized).profile_root)
         marker = profile_root / ".profile-provisioning.json"
+        backup_root = self._backup_directory(normalized, operation_id)
+        receipt_file = profile_root / _PROFILE_INSTALL_RECEIPTS
+        if (
+            profile_root.is_symlink()
+            or marker.is_symlink()
+            or receipt_file.is_symlink()
+            or backup_root.parent.is_symlink()
+            or backup_root.parent.parent.is_symlink()
+            or (profile_root / ".profile-provisioning-backups").is_symlink()
+        ):
+            return False
+        if not marker.exists():
+            try:
+                receipts = self._read_install_receipts(profile_root)
+            except (OSError, ValueError, json.JSONDecodeError):
+                return False
+            if operation_id not in receipts["commits"]:
+                return False
+            try:
+                self._assert_safe_tree(backup_root.parent)
+                self._remove_path(backup_root.parent)
+                self._remove_empty_backup_root(profile_root)
+            except (OSError, _ProfileInstallFailure):
+                pass
+            return True
         try:
             state = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return False
-        if state.get("operation_id") != operation_id:
+        if not isinstance(state, dict) or state.get("operation_id") != operation_id:
             return False
-        normalized = normalize_profile_name(profile)
+        bundle_digest = state.get("bundle_sha256")
+        telegram_user_id = state.get("telegram_user_id")
+        if (
+            state.get("installed") is not True
+            or not isinstance(bundle_digest, str)
+            or not re.fullmatch(r"[a-f0-9]{64}", bundle_digest)
+            or type(telegram_user_id) is not int
+            or telegram_user_id < 1
+        ):
+            return False
         backup = self._backup_directory(normalized, operation_id)
-        shutil.rmtree(backup.parent, ignore_errors=True)
-        self._remove_empty_backup_root(profile_root)
-        marker.unlink(missing_ok=True)
+        if backup.is_symlink() or not self._tree_is_safe(backup.parent):
+            return False
+        if self.verify_installed(normalized, telegram_user_id) is False:
+            return False
+        try:
+            self._record_install_commit(
+                profile_root,
+                operation_id,
+                bundle_digest=bundle_digest,
+                telegram_user_id=telegram_user_id,
+            )
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            return False
+        try:
+            self._remove_path(backup.parent)
+            self._remove_empty_backup_root(profile_root)
+        except OSError:
+            # The installation is already committed; a later retry can clean
+            # this private, operation-scoped recovery directory.
+            pass
         return True
 
     def rollback_bundle(self, profile: str, operation_id: str) -> bool:
-        profile_root = Path(build_profile_config(self.config, profile).profile_root)
+        normalized = normalize_profile_name(profile)
+        if not normalized:
+            return False
+        try:
+            operation_id = self._valid_operation_id(operation_id)
+        except ValueError:
+            return False
+        profile_root = Path(build_profile_config(self.config, normalized).profile_root)
         marker = profile_root / ".profile-provisioning.json"
+        backup_root = self._backup_directory(normalized, operation_id)
+        receipt_file = profile_root / _PROFILE_INSTALL_RECEIPTS
+        if (
+            profile_root.is_symlink()
+            or marker.is_symlink()
+            or receipt_file.is_symlink()
+            or backup_root.parent.is_symlink()
+            or backup_root.parent.parent.is_symlink()
+            or (profile_root / ".profile-provisioning-backups").is_symlink()
+        ):
+            return False
         try:
             state = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return False
-        if state.get("operation_id") != operation_id:
+        if not isinstance(state, dict) or state.get("operation_id") != operation_id:
             return False
-        normalized = normalize_profile_name(profile)
         backup = self._backup_directory(normalized, operation_id)
+        try:
+            self._assert_safe_tree(backup.parent)
+        except _ProfileInstallFailure:
+            return False
+        if backup.is_symlink() or not self._tree_is_safe(backup.parent):
+            return False
         original = state.get("original")
         if not isinstance(original, dict):
             original = {
@@ -376,16 +756,38 @@ class ProfileSessionManager:
                 for relative in ("root/.tdl", "user1/.tdl")
             }
             original["identity.json"] = (backup / "identity.json").exists()
-        shutil.rmtree(profile_root / f".{normalized}.provision-{operation_id}", ignore_errors=True)
-        for relative in ("root/.tdl", "user1/.tdl"):
+        if any(
+            relative in original and type(original[relative]) is not bool
+            for relative in (*_PROFILE_INSTALL_LANES, "identity.json")
+        ):
+            return False
+        for target in (
+            profile_root / "root",
+            profile_root / "user1",
+            profile_root / "upload",
+            profile_root / "identity.json",
+        ):
+            if target.is_symlink():
+                return False
+        for relative in _PROFILE_INSTALL_LANES:
+            try:
+                self._assert_safe_tree(profile_root / relative)
+            except _ProfileInstallFailure:
+                return False
+        self._remove_path(profile_root / f".{normalized}.provision-{operation_id}")
+        for relative in _PROFILE_INSTALL_LANES:
+            # A two-lane transaction marker predates managed Upload state.
+            # Leave that untouched lane alone if it has no saved snapshot.
+            if relative not in original:
+                continue
             current = profile_root / relative
             saved = backup / relative
             if saved.exists():
-                shutil.rmtree(current, ignore_errors=True)
+                self._remove_path(current)
                 current.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(saved, current)
             elif not original.get(relative, state.get("new_profile", False)):
-                shutil.rmtree(current, ignore_errors=True)
+                self._remove_path(current)
         identity = profile_root / "identity.json"
         saved_identity = backup / "identity.json"
         if saved_identity.exists():
@@ -393,8 +795,12 @@ class ProfileSessionManager:
             os.replace(saved_identity, identity)
         elif not original.get("identity.json", state.get("new_profile", False)):
             identity.unlink(missing_ok=True)
+        try:
+            self._forget_install_commit(profile_root, operation_id)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
         marker.unlink(missing_ok=True)
-        shutil.rmtree(backup.parent, ignore_errors=True)
+        self._remove_path(backup.parent)
         self._remove_empty_backup_root(profile_root)
         if normalized != normalize_profile_name(self.config.default_profile):
             try:
@@ -803,15 +1209,20 @@ class ProfileSessionManager:
                 raise ValueError("Sesi TDL tidak valid atau belum login.") from exc
 
     def verify_installed(self, profile: str, expected_user_id: int | None = None) -> int | bool:
-        """Check identity and both private Bolt session trees without opening Bolt."""
+        """Check identity and all three isolated Bolt session trees without opening Bolt."""
         normalized = normalize_profile_name(profile)
         if not normalized:
             return False
-        root = Path(build_profile_config(self.config, normalized).profile_root)
+        profile_config = build_profile_config(self.config, normalized)
+        root = Path(profile_config.profile_root)
         if root.is_symlink():
             return False
         identity_path = root / "identity.json"
-        if identity_path.is_symlink() or not identity_path.is_file():
+        if (
+            identity_path.is_symlink()
+            or not identity_path.is_file()
+            or not self._file_is_private(identity_path)
+        ):
             return False
         try:
             payload = json.loads(identity_path.read_text(encoding="utf-8"))
@@ -823,14 +1234,19 @@ class ProfileSessionManager:
         if user_id < 1 or (expected_user_id is not None and user_id != int(expected_user_id)):
             return False
         session_files: list[set[tuple[int, int]]] = []
-        for relative in ("root/.tdl", "user1/.tdl"):
+        specifications = (
+            ("root/.tdl", str(profile_config.tdl_download_namespace)),
+            ("user1/.tdl", str(profile_config.tdl_export_namespace)),
+            ("upload/.tdl", str(profile_config.tdl_export_namespace)),
+        )
+        for relative, namespace in specifications:
             session_root = root / relative
             session_parent = root / relative.split("/", 1)[0]
             data_root = session_root / "data"
             if (
                 session_parent.is_symlink()
-                or session_root.is_symlink()
-                or not session_root.is_dir()
+                or not self._tree_is_safe(session_root)
+                or not self._tree_is_private(session_root)
                 or data_root.is_symlink()
                 or not data_root.is_dir()
             ):
@@ -838,15 +1254,20 @@ class ProfileSessionManager:
             try:
                 files = {
                     (item.stat().st_dev, item.stat().st_ino)
-                    for item in data_root.iterdir()
+                    for item in session_root.rglob("*")
                     if item.is_file() and not item.is_symlink() and item.stat().st_size > 0
                 }
+                database = data_root / namespace
             except OSError:
                 return False
-            if not files:
+            if not files or database.is_symlink() or not database.is_file() or database.stat().st_size <= 0:
                 return False
             session_files.append(files)
-        if session_files[0] & session_files[1]:
+        if any(
+            session_files[left] & session_files[right]
+            for left in range(len(session_files))
+            for right in range(left + 1, len(session_files))
+        ):
             return False
         return user_id
 
@@ -954,6 +1375,274 @@ class ProfileSessionManager:
         if len(value) > 64 or not re.fullmatch(r"[a-zA-Z0-9_-]+", value):
             raise ValueError("ID provisioning tidak valid.")
         return value
+
+    @staticmethod
+    def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+        write_json_atomic_private(path, payload)
+
+    def _read_install_receipts(self, profile_root: Path) -> dict[str, Any]:
+        path = profile_root / _PROFILE_INSTALL_RECEIPTS
+        if profile_root.is_symlink() or path.is_symlink():
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        if not path.exists():
+            return {"format": 1, "commits": {}, "last_operation_id": ""}
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format") != 1
+            or not isinstance(payload.get("commits"), dict)
+        ):
+            raise ValueError("Profile install receipt store is invalid.")
+        commits: dict[str, dict[str, int | str]] = {}
+        for raw_id, raw_record in payload["commits"].items():
+            operation_id = self._valid_operation_id(raw_id)
+            if not isinstance(raw_record, dict):
+                raise ValueError("Profile install receipt is invalid.")
+            digest = raw_record.get("bundle_sha256")
+            telegram_user_id = raw_record.get("telegram_user_id")
+            committed_at = raw_record.get("committed_at")
+            if (
+                not isinstance(digest, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", digest)
+                or type(telegram_user_id) is not int
+                or telegram_user_id < 1
+                or type(committed_at) is not int
+                or committed_at < 0
+            ):
+                raise ValueError("Profile install receipt is invalid.")
+            commits[operation_id] = {
+                "bundle_sha256": digest,
+                "telegram_user_id": telegram_user_id,
+                "committed_at": committed_at,
+            }
+        last_operation_id = payload.get("last_operation_id", "")
+        if last_operation_id and last_operation_id not in commits:
+            raise ValueError("Profile install receipt order is invalid.")
+        return {
+            "format": 1,
+            "commits": commits,
+            "last_operation_id": last_operation_id,
+        }
+
+    def _record_install_commit(
+        self,
+        profile_root: Path,
+        operation_id: str,
+        *,
+        bundle_digest: str,
+        telegram_user_id: int,
+    ) -> None:
+        receipts = self._read_install_receipts(profile_root)
+        prior = receipts["commits"].get(operation_id)
+        if prior is not None and (
+            prior.get("bundle_sha256") != bundle_digest
+            or prior.get("telegram_user_id") != telegram_user_id
+        ):
+            raise ValueError("Provisioning ID is already committed with different content.")
+        commits = receipts["commits"]
+        commits[operation_id] = {
+            "bundle_sha256": bundle_digest,
+            "telegram_user_id": telegram_user_id,
+            "committed_at": int(time.time()),
+        }
+        while len(commits) > _MAX_PROFILE_INSTALL_RECEIPTS:
+            oldest = min(
+                commits,
+                key=lambda item: int(commits[item]["committed_at"]),
+            )
+            if oldest == operation_id:
+                break
+            commits.pop(oldest, None)
+        receipts["last_operation_id"] = operation_id
+        self._write_private_json(profile_root / _PROFILE_INSTALL_RECEIPTS, receipts)
+
+    def _forget_install_commit(self, profile_root: Path, operation_id: str) -> None:
+        receipts = self._read_install_receipts(profile_root)
+        if operation_id not in receipts["commits"]:
+            return
+        receipts["commits"].pop(operation_id, None)
+        if not receipts["commits"]:
+            (profile_root / _PROFILE_INSTALL_RECEIPTS).unlink(missing_ok=True)
+            return
+        if receipts.get("last_operation_id") == operation_id:
+            receipts["last_operation_id"] = max(
+                receipts["commits"],
+                key=lambda item: int(receipts["commits"][item]["committed_at"]),
+            )
+        self._write_private_json(profile_root / _PROFILE_INSTALL_RECEIPTS, receipts)
+
+    @staticmethod
+    def _remove_path(path: Path) -> None:
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            path.unlink(missing_ok=True)
+        elif path.is_dir():
+            shutil.rmtree(path)
+
+    @classmethod
+    def _assert_safe_tree(cls, path: Path) -> None:
+        if path.is_symlink():
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        if not path.exists():
+            return
+        if not path.is_dir():
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        try:
+            for item in path.rglob("*"):
+                if item.is_symlink() or not (item.is_dir() or item.is_file()):
+                    raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        except OSError:
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE") from None
+
+    @classmethod
+    def _tree_is_safe(cls, path: Path) -> bool:
+        if not path.is_dir() or path.is_symlink():
+            return False
+        try:
+            cls._assert_safe_tree(path)
+            return True
+        except _ProfileInstallFailure:
+            return False
+
+    @classmethod
+    def _require_private_tree(cls, path: Path) -> None:
+        if not cls._tree_is_safe(path):
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        if os.name != "posix":
+            return
+        try:
+            for item in (path, *path.rglob("*")):
+                expected_mode = 0o700 if item.is_dir() else 0o600
+                if stat.S_IMODE(item.stat().st_mode) != expected_mode:
+                    raise _ProfileInstallFailure("PROFILE_SESSION_PERMISSION_INVALID")
+        except OSError:
+            raise _ProfileInstallFailure("PROFILE_SESSION_PERMISSION_INVALID") from None
+
+    @classmethod
+    def _tree_is_private(cls, path: Path) -> bool:
+        if not cls._tree_is_safe(path):
+            return False
+        if os.name != "posix":
+            return True
+        try:
+            return all(
+                stat.S_IMODE(item.stat().st_mode) == (0o700 if item.is_dir() else 0o600)
+                for item in (path, *path.rglob("*"))
+            )
+        except OSError:
+            return False
+
+    @staticmethod
+    def _require_private_file(path: Path) -> None:
+        if path.is_symlink() or not path.is_file():
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        if os.name == "posix" and stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise _ProfileInstallFailure("PROFILE_SESSION_PERMISSION_INVALID")
+
+    @staticmethod
+    def _file_is_private(path: Path) -> bool:
+        try:
+            return os.name != "posix" or stat.S_IMODE(path.stat().st_mode) == 0o600
+        except OSError:
+            return False
+
+    @classmethod
+    def _require_candidate_database(
+        cls,
+        storage: Path,
+        namespace: str,
+        *,
+        allow_namespace_alias: bool = False,
+    ) -> None:
+        cls._assert_safe_tree(storage)
+        data_root = storage / "data"
+        database = storage / "data" / namespace
+        if storage.is_symlink() or not storage.is_dir() or data_root.is_symlink() or not data_root.is_dir():
+            raise _ProfileInstallFailure("PROFILE_SESSION_DATABASE_MISSING")
+        if not database.is_symlink() and database.is_file() and database.stat().st_size > 0:
+            return
+        if allow_namespace_alias:
+            candidates = [
+                item for item in data_root.iterdir()
+                if item.is_file() and not item.is_symlink() and item.stat().st_size > 0
+            ]
+            if len(candidates) == 1:
+                return
+        raise _ProfileInstallFailure("PROFILE_SESSION_DATABASE_MISSING")
+
+    @classmethod
+    def _session_tree_fingerprint(
+        cls,
+        storage: Path,
+        namespace: str,
+        *,
+        allow_namespace_alias: bool = False,
+    ) -> str:
+        cls._require_candidate_database(
+            storage, namespace, allow_namespace_alias=allow_namespace_alias
+        )
+        digest = hashlib.sha256()
+        try:
+            for path in sorted(
+                storage.rglob("*"),
+                key=lambda item: item.relative_to(storage).as_posix(),
+            ):
+                relative = path.relative_to(storage).as_posix().encode("utf-8")
+                if path.is_dir():
+                    digest.update(b"D\0" + relative + b"\0")
+                    continue
+                digest.update(b"F\0" + relative + b"\0")
+                with path.open("rb") as source:
+                    while chunk := source.read(1024 * 1024):
+                        digest.update(chunk)
+        except OSError:
+            raise _ProfileInstallFailure("PROFILE_SESSION_TDL_INVALID") from None
+        return digest.hexdigest()
+
+    @classmethod
+    def _assert_candidate_source(cls, candidate: Path) -> None:
+        absolute = Path(os.path.abspath(candidate))
+        current = absolute
+        while True:
+            if current.is_symlink():
+                raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+            if current.parent == current:
+                break
+            current = current.parent
+        cls._assert_safe_tree(absolute)
+        if not absolute.is_dir():
+            raise _ProfileInstallFailure("PROFILE_SESSION_DATABASE_MISSING")
+
+    @classmethod
+    def _normalize_candidate_namespace(cls, storage: Path, namespace: str) -> None:
+        data_root = storage / "data"
+        expected = data_root / namespace
+        if expected.is_file() and not expected.is_symlink() and expected.stat().st_size > 0:
+            return
+        if data_root.is_symlink() or not data_root.is_dir():
+            raise _ProfileInstallFailure("PROFILE_SESSION_DATABASE_MISSING")
+        candidates = [
+            item for item in data_root.iterdir()
+            if item.is_file() and not item.is_symlink() and item.stat().st_size > 0
+        ]
+        if len(candidates) != 1:
+            raise _ProfileInstallFailure("PROFILE_SESSION_DATABASE_MISSING")
+        if expected.exists() or expected.is_symlink():
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        os.replace(candidates[0], expected)
+
+    @staticmethod
+    def _trees_share_files(left: Path, right: Path) -> bool:
+        def identities(root: Path) -> set[tuple[int, int]]:
+            return {
+                (item.stat().st_dev, item.stat().st_ino)
+                for item in root.rglob("*")
+                if item.is_file() and not item.is_symlink()
+            }
+
+        try:
+            return bool(identities(left) & identities(right))
+        except OSError:
+            raise _ProfileInstallFailure("PROFILE_SESSION_TDL_INVALID") from None
 
     @staticmethod
     def _write_files(root: Path, files: dict[str, bytes]) -> None:

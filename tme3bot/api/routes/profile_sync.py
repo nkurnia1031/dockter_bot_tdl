@@ -19,6 +19,10 @@ _SYNC_PHASES = {
     "queued", "manifest_fetch", "revision_compare", "bundle_download",
     "bundle_validation", "session_validation", "session_install", "session_commit", "acknowledgement",
     "worker_unreachable", "completed", "cancelled",
+    "download_staging", "download_validation", "download_install",
+    "export_staging", "export_validation", "export_install",
+    "upload_staging", "upload_validation", "upload_install",
+    "identity_install", "transaction_rollback", "installation_reused",
 }
 _SYNC_STATUSES = {"queued", "running", "succeeded", "failed", "waiting", "cancelled"}
 

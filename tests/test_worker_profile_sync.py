@@ -516,6 +516,39 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertEqual(replay_transport.sync_events[0]["details"], {"bundle_bytes": 512})
         self.assertEqual(restarted._state["pending_sync_events"], [])
 
+    def test_three_lane_progress_phases_are_durable_and_allowlisted(self):
+        client, transport = self.make_client([], {})
+        phases = (
+            "download_staging", "download_validation", "download_install",
+            "export_staging", "export_validation", "export_install",
+            "upload_staging", "upload_validation", "upload_install",
+            "identity_install", "transaction_rollback", "installation_reused",
+        )
+
+        for sequence, phase in enumerate(phases, start=1):
+            client._report_sync_event(
+                run_id="worker-run-three-lanes",
+                sequence=sequence,
+                profile="irang",
+                revision=7,
+                phase=phase,
+                status="running",
+            )
+
+        self.assertEqual([event["phase"] for event in transport.sync_events], list(phases))
+        self.assertTrue(all(event["sequence"] == index for index, event in enumerate(transport.sync_events, 1)))
+
+    def test_external_install_and_commit_event_sequences_resume_after_restart(self):
+        client, _ = self.make_client([], {})
+        run_id = "vault-install-run-123"
+        self.assertEqual(client.next_external_event_sequence(run_id), 1)
+        self.assertEqual(client.next_external_event_sequence(run_id), 2)
+
+        restarted, _ = self.make_client([], {})
+
+        self.assertEqual(restarted.next_external_event_sequence(run_id), 3)
+        self.assertEqual(restarted.next_external_event_sequence("another-run-123"), 1)
+
     def test_cancel_queued_profile_sync_skips_the_request(self):
         client, transport = self.make_client([], {})
         key = ("irang", "check")

@@ -1,4 +1,6 @@
 import io
+import json
+import os
 import sqlite3
 import threading
 import tempfile
@@ -6,6 +8,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tme3bot.config import AppConfig
 from tme3bot.domain.models import DomainError
@@ -18,6 +21,8 @@ from tme3bot.profile_provisioning import (
     validate_profile_bundle,
 )
 from tme3bot.worker.profile_sessions import ProfileSessionManager
+from tme3bot.worker import profile_sessions as profile_sessions_module
+from tme3bot.worker.upload_lane import UploadLanePreparer
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.worker.executor import WorkerJobExecutor
 
@@ -48,6 +53,23 @@ def make_config(root: Path) -> AppConfig:
         log_level="INFO",
         app_role="worker",
     )
+
+
+def profile_bundle_with_sessions(
+    download_session: dict[str, bytes],
+    export_session: dict[str, bytes],
+    telegram_user_id: int,
+) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for lane, files in (("root/.tdl", download_session), ("user1/.tdl", export_session)):
+            for relative, payload in files.items():
+                archive.writestr(f"{lane}/{relative}", payload)
+        archive.writestr(
+            "identity.json",
+            json.dumps({"telegram_user_id": telegram_user_id, "tdl_user_id": telegram_user_id}),
+        )
+    return output.getvalue()
 
 
 def single_session_zip() -> bytes:
@@ -365,6 +387,95 @@ class ProfileProvisioningTests(unittest.TestCase):
             {"locked": (True, True)},
         )
 
+    def test_external_install_and_commit_share_one_event_sequence(self):
+        locks = (threading.RLock(), threading.RLock())
+        upload_lock = threading.RLock()
+
+        class FakeProfileManager:
+            def profile_operation_locks(self, _profile):
+                return locks
+
+            def profile_upload_operation_lock(self, _profile):
+                return upload_lock
+
+            def refresh_profile_runtime(self, _profile):
+                return None
+
+        class FakeProfileSessions:
+            def install_bundle(self, *_args, **kwargs):
+                kwargs["on_stage"]("download_validation", "running", "")
+                return {"profile": "default", "ready": True}
+
+            def commit_bundle(self, *_args):
+                return True
+
+        class FakeProfileSync:
+            def __init__(self):
+                self.sequence = 0
+                self.events = []
+
+            def next_external_event_sequence(self, _run_id):
+                self.sequence += 1
+                return self.sequence
+
+            def report_external_event(self, **event):
+                self.events.append(event)
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = FakeProfileManager()
+        executor._profile_sessions = FakeProfileSessions()
+        executor.profile_sync = FakeProfileSync()
+
+        executor.install_profile_bundle(
+            "default", 123, b"bundle", "sync-1",
+            sync_run_id="a" * 32, sync_revision=7,
+        )
+        self.assertTrue(executor.commit_profile_bundle(
+            "default", "sync-1", sync_run_id="a" * 32, sync_revision=7
+        ))
+
+        self.assertEqual(
+            [event["sequence"] for event in executor.profile_sync.events],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(
+            [event["phase"] for event in executor.profile_sync.events],
+            ["session_install", "download_validation", "session_install", "session_commit", "session_commit"],
+        )
+
+    def test_profile_transaction_rollback_does_not_reconcile_restored_upload_lane(self):
+        locks = (threading.RLock(), threading.RLock())
+        upload_lock = threading.RLock()
+
+        class FakeProfileManager:
+            def profile_operation_locks(self, _profile):
+                return locks
+
+            def profile_upload_operation_lock(self, _profile):
+                return upload_lock
+
+            def refresh_profile_runtime(self, _profile):
+                return None
+
+        class FakeProfileSessions:
+            def rollback_bundle(self, _profile, _operation_id):
+                return True
+
+        class FakeUploadLanePreparer:
+            def __init__(self):
+                self.calls = []
+
+            def ensure(self, profile):
+                self.calls.append(profile)
+
+        executor = object.__new__(WorkerJobExecutor)
+        executor.profile_manager = FakeProfileManager()
+        executor._profile_sessions = FakeProfileSessions()
+        executor.upload_lane_preparer = FakeUploadLanePreparer()
+
+        self.assertTrue(executor.rollback_profile_bundle("novel", "rollback-1"))
+        self.assertEqual(executor.upload_lane_preparer.calls, [])
+
     def test_tdl_login_validation_runs_in_background_after_manual_status_refresh(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -395,13 +506,18 @@ class ProfileProvisioningTests(unittest.TestCase):
             bundle = build_profile_bundle(session, 123456)
             manager = ProfileSessionManager(make_config(root))
 
-            manager.install_bundle("novel", 123456, bundle, "operation-1")
+            with patch.object(manager, "_run_whoami", return_value=123456):
+                manager.install_bundle("novel", 123456, bundle, "operation-1")
             profile_root = root / "profiles" / "novel"
             download_db = profile_root / "root" / ".tdl" / "data" / "default"
             export_db = profile_root / "user1" / ".tdl" / "data" / "default"
+            upload_db = profile_root / "upload" / ".tdl" / "data" / "default"
             self.assertEqual(download_db.read_bytes(), b"bolt-session")
             self.assertEqual(export_db.read_bytes(), b"bolt-session")
+            self.assertEqual(upload_db.read_bytes(), b"bolt-session")
             self.assertNotEqual(download_db.resolve(), export_db.resolve())
+            self.assertNotEqual(export_db.resolve(), upload_db.resolve())
+            self.assertTrue((profile_root / "upload" / "upload-lane.json").is_file())
             self.assertEqual(
                 manager.export_bundle("novel")[0],
                 123456,
@@ -409,7 +525,296 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertTrue(manager.commit_bundle("novel", "operation-1"))
             self.assertFalse((profile_root / ".profile-provisioning.json").exists())
 
-    def test_installed_profile_integrity_requires_both_independent_sessions(self):
+    def test_three_lane_install_keeps_download_and_export_candidates_and_reports_each_stage(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = profile_bundle_with_sessions(
+                {"data/default": b"download-candidate"},
+                {"data/default": b"export-candidate"},
+                123456,
+            )
+            manager = ProfileSessionManager(make_config(root))
+            events = []
+
+            with patch.object(manager, "_run_whoami", return_value=123456):
+                manager.install_bundle(
+                    "novel", 123456, bundle, "distinct-lanes",
+                    on_stage=lambda stage, status, code="": events.append((stage, status, code)),
+                )
+
+            profile_root = root / "profiles" / "novel"
+            download_db = profile_root / "root" / ".tdl" / "data" / "default"
+            export_db = profile_root / "user1" / ".tdl" / "data" / "default"
+            upload_db = profile_root / "upload" / ".tdl" / "data" / "default"
+            self.assertEqual(download_db.read_bytes(), b"download-candidate")
+            self.assertEqual(export_db.read_bytes(), b"export-candidate")
+            self.assertEqual(upload_db.read_bytes(), b"export-candidate")
+            self.assertNotEqual(export_db.stat().st_ino, upload_db.stat().st_ino)
+            marker = json.loads((profile_root / "upload" / "upload-lane.json").read_text())
+            self.assertEqual(
+                marker["source_fingerprint"],
+                UploadLanePreparer._fingerprint(profile_root / "user1" / ".tdl", "default"),
+            )
+            for phase in (
+                "download_staging", "download_validation", "download_install",
+                "export_staging", "export_validation", "export_install",
+                "upload_staging", "upload_validation", "upload_install",
+            ):
+                self.assertIn((phase, "running", ""), events)
+                self.assertIn((phase, "succeeded", ""), events)
+
+    def test_candidate_install_can_fallback_one_session_to_all_three_lanes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate" / ".tdl" / "data" / "default"
+            candidate.parent.mkdir(parents=True)
+            candidate.write_bytes(b"single-candidate")
+            manager = ProfileSessionManager(make_config(root))
+
+            with patch.object(manager, "_run_whoami", return_value=123456):
+                result = manager.install_candidates(
+                    "novel", 123456, "single-candidate",
+                    download_candidate=candidate.parent.parent,
+                )
+
+            profile_root = root / "profiles" / "novel"
+            databases = [
+                profile_root / relative / "data" / "default"
+                for relative in ("root/.tdl", "user1/.tdl", "upload/.tdl")
+            ]
+            self.assertTrue(result["ready"])
+            self.assertEqual([path.read_bytes() for path in databases], [b"single-candidate"] * 3)
+            self.assertEqual(len({path.stat().st_ino for path in databases}), 3)
+
+    def test_three_lane_install_rolls_back_all_lanes_when_any_lane_commit_fails(self):
+        bundle = profile_bundle_with_sessions(
+            {"data/default": b"new-download"},
+            {"data/default": b"new-export"},
+            88,
+        )
+        for failing_lane in ("root/.tdl", "user1/.tdl", "upload"):
+            with self.subTest(lane=failing_lane), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = make_config(root)
+                profile_root = root / "profiles" / "novel"
+                old_sessions = {
+                    "root/.tdl": b"old-download",
+                    "user1/.tdl": b"old-export",
+                    "upload/.tdl": b"old-upload",
+                }
+                for relative, payload in old_sessions.items():
+                    database = profile_root / relative / "data" / "default"
+                    database.parent.mkdir(parents=True, exist_ok=True)
+                    database.write_bytes(payload)
+                upload_marker = profile_root / "upload" / "upload-lane.json"
+                upload_marker.write_text('{"format":1,"source_fingerprint":"old"}')
+                identity_path = profile_root / "identity.json"
+                identity_path.write_text('{"telegram_user_id":77,"tdl_user_id":77}')
+                manager = ProfileSessionManager(config)
+                operation_id = "fail-" + failing_lane.replace("/", "-").replace(".", "-")
+                candidate_root = profile_root / f".novel.provision-{operation_id}"
+                destination = profile_root / failing_lane
+                real_replace = os.replace
+                injected = False
+
+                def fail_selected_candidate(source, target):
+                    nonlocal injected
+                    if (
+                        not injected
+                        and Path(source) == candidate_root / failing_lane
+                        and Path(target) == destination
+                    ):
+                        injected = True
+                        raise OSError("synthetic lane install failure")
+                    return real_replace(source, target)
+
+                with patch.object(manager, "_run_whoami", return_value=88), patch.object(
+                    profile_sessions_module.os, "replace", side_effect=fail_selected_candidate
+                ):
+                    with self.assertRaises(ValueError):
+                        manager.install_bundle("novel", 88, bundle, operation_id)
+
+                self.assertTrue(injected)
+                for relative, payload in old_sessions.items():
+                    self.assertEqual(
+                        (profile_root / relative / "data" / "default").read_bytes(),
+                        payload,
+                    )
+                self.assertEqual(upload_marker.read_text(), '{"format":1,"source_fingerprint":"old"}')
+                self.assertEqual(identity_path.read_text(), '{"telegram_user_id":77,"tdl_user_id":77}')
+                self.assertFalse((profile_root / ".profile-provisioning.json").exists())
+
+    def test_candidate_identity_failure_in_each_lane_leaves_live_profile_untouched(self):
+        bundle = profile_bundle_with_sessions(
+            {"data/default": b"candidate-download"},
+            {"data/default": b"candidate-export"},
+            88,
+        )
+        for invalid_call in (1, 2, 3):
+            with self.subTest(lane=invalid_call), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                profile_root = root / "profiles" / "novel"
+                old_sessions = {
+                    "root/.tdl": b"old-download",
+                    "user1/.tdl": b"old-export",
+                    "upload/.tdl": b"old-upload",
+                }
+                for relative, payload in old_sessions.items():
+                    database = profile_root / relative / "data" / "default"
+                    database.parent.mkdir(parents=True, exist_ok=True)
+                    database.write_bytes(payload)
+                identity_path = profile_root / "identity.json"
+                identity_path.write_text('{"telegram_user_id":77}')
+                manager = ProfileSessionManager(make_config(root))
+                checked = []
+                events = []
+
+                def candidate_identity(storage, *, namespace, home):
+                    checked.append(storage)
+                    self.assertIn(".novel.provision-identity-check", str(storage))
+                    return 77 if len(checked) == invalid_call else 88
+
+                with patch.object(manager, "_run_whoami", side_effect=candidate_identity):
+                    with self.assertRaisesRegex(ValueError, "PROFILE_SESSION_IDENTITY_MISMATCH"):
+                        manager.install_bundle(
+                            "novel", 88, bundle, "identity-check",
+                            on_stage=lambda stage, status, code="": events.append((stage, status, code)),
+                        )
+
+                self.assertEqual(len(checked), invalid_call)
+                for relative, payload in old_sessions.items():
+                    self.assertEqual(
+                        (profile_root / relative / "data" / "default").read_bytes(),
+                        payload,
+                    )
+                self.assertEqual(identity_path.read_text(), '{"telegram_user_id":77}')
+                failed_validation = [
+                    event for event in events if event[1] == "failed"
+                ]
+                self.assertEqual(failed_validation[-1][2], "PROFILE_SESSION_IDENTITY_MISMATCH")
+                self.assertIn(("transaction_rollback", "succeeded", ""), events)
+
+    def test_staging_failure_in_each_lane_leaves_live_profile_untouched(self):
+        bundle = profile_bundle_with_sessions(
+            {"data/default": b"candidate-download"},
+            {"data/default": b"candidate-export"},
+            88,
+        )
+        for failing_lane in ("download", "export", "upload"):
+            with self.subTest(lane=failing_lane), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                profile_root = root / "profiles" / "novel"
+                old_sessions = {
+                    "root/.tdl": b"old-download",
+                    "user1/.tdl": b"old-export",
+                    "upload/.tdl": b"old-upload",
+                }
+                for relative, payload in old_sessions.items():
+                    database = profile_root / relative / "data" / "default"
+                    database.parent.mkdir(parents=True, exist_ok=True)
+                    database.write_bytes(payload)
+                identity_path = profile_root / "identity.json"
+                identity_path.write_text('{"telegram_user_id":77}')
+                manager = ProfileSessionManager(make_config(root))
+                operation_id = "stage-failure"
+                candidate_root = profile_root / f".novel.provision-{operation_id}"
+                events = []
+
+                real_copy = profile_sessions_module.shutil.copytree
+                injected = False
+                copy_attempts = []
+                candidate_relative = {
+                    "download": "root/.tdl",
+                    "export": "user1/.tdl",
+                    "upload": "upload/.tdl",
+                }[failing_lane]
+
+                def fail_candidate_copy(source, destination, *args, **kwargs):
+                    nonlocal injected
+                    copy_attempts.append((Path(source), Path(destination)))
+                    if not injected and Path(destination) == candidate_root / candidate_relative:
+                        injected = True
+                        raise OSError("synthetic lane stage failure")
+                    return real_copy(source, destination, *args, **kwargs)
+
+                failure_patch = patch.object(
+                    profile_sessions_module.shutil, "copytree", fail_candidate_copy
+                )
+
+                with patch.object(manager, "_run_whoami", return_value=88), failure_patch:
+                    with self.assertRaisesRegex(ValueError, "PROFILE_SESSION_STAGING_FAILED"):
+                        manager.install_bundle(
+                            "novel", 88, bundle, operation_id,
+                            on_stage=lambda stage, status, code="": events.append((stage, status, code)),
+                        )
+
+                self.assertTrue(injected, (events, copy_attempts))
+                self.assertIn((f"{failing_lane}_staging", "failed", "PROFILE_SESSION_STAGING_FAILED"), events)
+                for relative, payload in old_sessions.items():
+                    self.assertEqual(
+                        (profile_root / relative / "data" / "default").read_bytes(),
+                        payload,
+                    )
+                self.assertEqual(identity_path.read_text(), '{"telegram_user_id":77}')
+                self.assertIn(("transaction_rollback", "succeeded", ""), events)
+
+    def test_profile_install_rejects_symlinked_lane_parent_before_mutating_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile_root = root / "profiles" / "novel"
+            external = root / "outside"
+            external.mkdir()
+            external_file = external / "keep.txt"
+            external_file.write_text("untouched")
+            profile_root.mkdir(parents=True)
+            try:
+                os.symlink(external, profile_root / "root", target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"directory symlink unavailable: {exc}")
+            manager = ProfileSessionManager(make_config(root))
+            bundle = build_profile_bundle({"data/default": b"candidate"}, 88)
+
+            with self.assertRaises(ValueError):
+                manager.install_bundle("novel", 88, bundle, "unsafe-path")
+
+            self.assertEqual(external_file.read_text(), "untouched")
+            self.assertFalse((profile_root / ".profile-provisioning.json").exists())
+
+    def test_same_operation_retry_keeps_one_original_snapshot_for_all_lanes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            profile_root = root / "profiles" / "novel"
+            for relative, payload in (
+                ("root/.tdl", b"old-download"),
+                ("user1/.tdl", b"old-export"),
+                ("upload/.tdl", b"old-upload"),
+            ):
+                database = profile_root / relative / "data" / "default"
+                database.parent.mkdir(parents=True, exist_ok=True)
+                database.write_bytes(payload)
+            (profile_root / "identity.json").write_text('{"telegram_user_id":77}')
+            manager = ProfileSessionManager(make_config(root))
+            bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
+            backup_root = profile_root / ".profile-provisioning-backups" / "retry-1" / "novel"
+
+            with patch.object(manager, "_run_whoami", return_value=88):
+                manager.install_bundle("novel", 88, bundle, "retry-1")
+                original_snapshot = (backup_root / "upload" / ".tdl" / "data" / "default").read_bytes()
+                retry = manager.install_bundle("novel", 88, bundle, "retry-1")
+
+            self.assertTrue(retry["reused"])
+            self.assertEqual(original_snapshot, b"old-upload")
+            self.assertEqual(
+                list((profile_root / ".profile-provisioning-backups").glob("retry-1/novel")),
+                [backup_root],
+            )
+            self.assertTrue(manager.rollback_bundle("novel", "retry-1"))
+            self.assertEqual(
+                (profile_root / "upload" / ".tdl" / "data" / "default").read_bytes(),
+                b"old-upload",
+            )
+
+    def test_installed_profile_integrity_requires_three_independent_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manager = ProfileSessionManager(make_config(root))
@@ -417,10 +822,15 @@ class ProfileProvisioningTests(unittest.TestCase):
                 extract_single_session(single_session_zip()), 123456
             )
 
-            manager.install_bundle("novel", 123456, bundle, "integrity-check")
+            with patch.object(manager, "_run_whoami", return_value=123456):
+                manager.install_bundle("novel", 123456, bundle, "integrity-check")
 
             self.assertEqual(manager.verify_installed("novel"), 123456)
             self.assertFalse(manager.verify_installed("novel", 123457))
+            upload_db = root / "profiles" / "novel" / "upload" / ".tdl" / "data" / "default"
+            upload_db.unlink()
+            self.assertFalse(manager.verify_installed("novel"))
+            upload_db.write_bytes(b"bolt-session")
             (root / "profiles" / "novel" / "root" / ".tdl" / "data" / "default").unlink()
             self.assertFalse(manager.verify_installed("novel"))
 
@@ -455,7 +865,8 @@ class ProfileProvisioningTests(unittest.TestCase):
             manager = ProfileSessionManager(config)
             bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
 
-            manager.install_bundle("novel", 88, bundle, "operation-2")
+            with patch.object(manager, "_run_whoami", return_value=88):
+                manager.install_bundle("novel", 88, bundle, "operation-2")
             self.assertEqual(old_root.read_bytes(), b"new-session")
             self.assertTrue(manager.rollback_bundle("novel", "operation-2"))
             self.assertEqual(old_root.read_bytes(), b"old-root-session")
@@ -478,7 +889,8 @@ class ProfileProvisioningTests(unittest.TestCase):
             manager = ProfileSessionManager(config)
             bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
 
-            manager.install_bundle("default", 88, bundle, "default-replace-1")
+            with patch.object(manager, "_run_whoami", return_value=88):
+                manager.install_bundle("default", 88, bundle, "default-replace-1")
 
             self.assertEqual(old_root.read_bytes(), b"new-session")
             self.assertEqual(old_export.read_bytes(), b"new-session")
@@ -490,12 +902,33 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertIn("77", (root / "identity.json").read_text())
             self.assertEqual(config.state_file.read_text(), "backend-state")
 
-            manager.install_bundle("default", 88, bundle, "default-replace-2")
+            with patch.object(manager, "_run_whoami", return_value=88):
+                manager.install_bundle("default", 88, bundle, "default-replace-2")
+            self.assertTrue(manager.commit_bundle("default", "default-replace-2"))
             self.assertTrue(manager.commit_bundle("default", "default-replace-2"))
             self.assertEqual(old_root.read_bytes(), b"new-session")
             self.assertEqual(old_export.read_bytes(), b"new-session")
             self.assertEqual(config.state_file.read_text(), "backend-state")
             self.assertFalse((root / ".profile-provisioning-backups").exists())
+
+    def test_committed_operation_retry_reuses_installed_lanes_without_replacing_them(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = ProfileSessionManager(make_config(root))
+            bundle = build_profile_bundle({"data/default": b"committed-session"}, 88)
+
+            with patch.object(manager, "_run_whoami", return_value=88):
+                manager.install_bundle("novel", 88, bundle, "committed-retry")
+            self.assertTrue(manager.commit_bundle("novel", "committed-retry"))
+            upload_db = root / "profiles" / "novel" / "upload" / ".tdl" / "data" / "default"
+            original_inode = upload_db.stat().st_ino
+
+            with patch.object(manager, "_run_whoami", return_value=88):
+                retried = manager.install_bundle("novel", 88, bundle, "committed-retry")
+
+            self.assertTrue(retried["reused"])
+            self.assertEqual(upload_db.stat().st_ino, original_inode)
+            self.assertTrue(manager.commit_bundle("novel", "committed-retry"))
 
     def test_zip_path_traversal_and_missing_tdl_directory_are_rejected(self):
         output = io.BytesIO()

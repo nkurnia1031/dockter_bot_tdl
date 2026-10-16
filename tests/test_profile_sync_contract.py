@@ -288,7 +288,7 @@ class ProfileSyncContractTests(unittest.TestCase):
             "run_id": "a" * 32,
             "sequence": 1,
             "revision": 1,
-            "phase": "bundle_validation",
+            "phase": "download_validation",
             "status": "succeeded",
             "code": "",
             "details": {"bundle_bytes": 12, "private_path": "/not-allowed"},
@@ -311,7 +311,7 @@ class ProfileSyncContractTests(unittest.TestCase):
         self.assertEqual(logs.status_code, 200)
         payload = logs.json()
         self.assertEqual(len(payload["items"]), 2)
-        self.assertEqual(payload["items"][0]["phase"], "bundle_validation")
+        self.assertEqual(payload["items"][0]["phase"], "download_validation")
         self.assertEqual(payload["items"][0]["details"], {"bundle_bytes": 12})
         self.assertEqual(payload["latest_status"], "succeeded")
         self.assertFalse(payload["active"])

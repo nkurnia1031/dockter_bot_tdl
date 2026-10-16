@@ -70,10 +70,11 @@ describe('ProfileVaultPage', () => {
       }), { status: 200 });
       if (url.endsWith('/sync-logs?limit=50')) return new Response(JSON.stringify({
         active: true,
-        next_after_id: 2,
+        next_after_id: 3,
         items: [
           { id: 1, run_id: 'operation-123', sequence: null, revision: 3, phase: 'queued', status: 'queued', code: 'PROFILE_SYNC_QUEUED', created_at: '2026-10-01T10:00:00Z' },
-          { id: 2, run_id: 'worker-run-123', sequence: 1, revision: 3, phase: 'bundle_download', status: 'running', code: '', created_at: '2026-10-01T10:00:03Z' }
+          { id: 2, run_id: 'worker-run-123', sequence: 1, revision: 3, phase: 'bundle_download', status: 'running', code: '', created_at: '2026-10-01T10:00:03Z' },
+          { id: 3, run_id: 'worker-run-123', sequence: 2, revision: 3, phase: 'upload_validation', status: 'succeeded', code: '', created_at: '2026-10-01T10:00:04Z' }
         ]
       }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -82,6 +83,7 @@ describe('ProfileVaultPage', () => {
     render(ProfileVaultPage);
 
     expect(await screen.findByText('Unduh bundle')).toBeTruthy();
+    expect(screen.getByText('Validasi lane Upload')).toBeTruthy();
     expect(screen.getByText('Antrean')).toBeTruthy();
     expect(screen.getAllByText('Berjalan').length).toBeGreaterThan(0);
     expect(requests).toContain('/api/v1/profiles/default/workers/remote-1/sync-logs?limit=50');
