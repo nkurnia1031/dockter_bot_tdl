@@ -182,12 +182,24 @@ memiliki field `enabled` dianggap aktif. Error admission yang diharapkan adalah
 - Pendaftaran perangkat dilakukan terpisah dari pekerjaan agent dan harus
   disetujui pengguna dari sesi Web yang sudah login. Jangan mendaftarkan key,
   membuka production, atau memulai login Telegram secara otomatis.
-- Helper Windows berada di `tools/trusted_device.py`. Buat key dan berkas
-  public-key enrollment dengan:
+- Helper Windows/Linux berada di `tools/trusted_device.py`. Buat key dan
+  berkas public-key enrollment dengan perintah sesuai OS:
 
   ```powershell
   python -m tools.trusted_device init --origin https://ui.utama.naufix.space --name "Laptop agent"
   ```
+
+  ```bash
+  python3 -m tools.trusted_device init --origin https://ui.utama.naufix.space --name "Laptop agent"
+  ```
+
+  Di Windows, private key dilindungi DPAPI akun saat ini. Di Linux, helper
+  meminta passphrase minimal 12 karakter dan mengenkripsi private key dengan
+  Scrypt + AES-GCM; file tetap dibatasi ke permission user (`0700`/`0600`).
+  Passphrase diminta kembali saat `status` atau `prepare-browser`, dan tidak
+  boleh disimpan di environment variable atau command history. Credential
+  Linux berada di `$XDG_CONFIG_HOME/tme3bot/trusted-devices` atau
+  `~/.config/tme3bot/trusted-devices`.
 
   Backend harus dikonfigurasi dengan `WEB_PUBLIC_ORIGIN` persis ke origin
   HTTPS situs sebelum fitur ini dapat dipakai.
@@ -201,7 +213,9 @@ memiliki field `enabled` dianggap aktif. Error admission yang diharapkan adalah
   python -m tools.trusted_device prepare-browser --origin https://ui.utama.naufix.space
   ```
 
-  Helper menghasilkan Playwright storage state di direktori privat Windows.
+  Di Linux, gunakan `python3 -m tools.trusted_device` untuk kedua perintah itu.
+
+  Helper menghasilkan Playwright storage state di direktori privat OS.
   Jangan membuka atau mencetak isi file, menyalin cookie ke log/chat, atau
   memasukkannya ke URL. Impor hanya bila tool browser yang tersedia secara
   eksplisit menerima Playwright `storage_state`; setelah tool memuat state,
