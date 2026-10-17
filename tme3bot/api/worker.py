@@ -405,6 +405,70 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             "Worker tidak dapat memasang sesi profil.",
         )
 
+    @app.post(
+        "/internal/v1/profiles/distributions/{operation_id}",
+        dependencies=[Depends(authorize)],
+    )
+    def distribute_vault_profile(operation_id: str, body: dict[str, Any]):
+        allowed = {
+            "worker", "profile", "revision", "telegram_user_id", "message_ids",
+            "archive_sha256", "bundle_sha256",
+            "event_sequence_start",
+            "channel_ref",
+        }
+        if (
+            set(body) != allowed
+            or not re.fullmatch(r"[0-9a-fA-F-]{36}", operation_id)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", str(body.get("worker") or ""))
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", str(body.get("profile") or ""))
+            or type(body.get("revision")) is not int or int(body["revision"]) < 1
+            or type(body.get("telegram_user_id")) is not int or int(body["telegram_user_id"]) < 1
+            or not isinstance(body.get("message_ids"), list) or not body["message_ids"]
+            or len(body["message_ids"]) > 100
+            or any(type(message_id) is not int or message_id < 1 for message_id in body["message_ids"])
+            or len(set(body["message_ids"])) != len(body["message_ids"])
+            or not re.fullmatch(r"[a-f0-9]{64}", str(body.get("archive_sha256") or ""))
+            or not re.fullmatch(r"[a-f0-9]{64}", str(body.get("bundle_sha256") or ""))
+            or type(body.get("event_sequence_start")) is not int or int(body["event_sequence_start"]) < 0
+            or not isinstance(body.get("channel_ref"), str) or not body["channel_ref"].strip() or len(body["channel_ref"]) > 200
+        ):
+            raise DomainError(
+                "PROFILE_DISTRIBUTION_METADATA_INVALID",
+                "Metadata distribusi profil tidak valid.",
+                status_code=422,
+            )
+        expected_worker = str(getattr(context.config, "backup_node_name", "") or "").strip().lower()
+        if str(body["worker"]) != expected_worker:
+            raise DomainError(
+                "PROFILE_DISTRIBUTION_WORKER_MISMATCH",
+                "Operasi ini ditujukan ke worker lain.",
+                status_code=403,
+            )
+        distribute = getattr(context.executor, "distribute_profile_bundle", None)
+        if not callable(distribute):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung distribusi Vault.",
+                status_code=409,
+            )
+        try:
+            result = distribute(operation_id, body)
+        except Exception as exc:
+            raw = str(getattr(exc, "code", "") or str(exc))
+            code = raw if re.fullmatch(r"PROFILE_[A-Z0-9_-]{1,56}", raw) else "PROFILE_DISTRIBUTION_FAILED"
+            raise DomainError(
+                code,
+                "Worker gagal memasang revision Vault secara aman.",
+                status_code=409,
+            ) from None
+        if not isinstance(result, dict) or result.get("ready") is not True:
+            raise DomainError(
+                "PROFILE_DISTRIBUTION_NOT_CONFIRMED",
+                "Worker tidak mengonfirmasi pemasangan revision Vault.",
+                status_code=409,
+            )
+        return result
+
     @app.get("/internal/v1/profiles/{profile}/session", dependencies=[Depends(authorize)])
     def export_profile_bundle(profile: str):
         try:

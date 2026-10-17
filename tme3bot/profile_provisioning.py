@@ -966,6 +966,27 @@ class ProfileProvisioningStore:
             return None
         return int(row["telegram_user_id"]), self._decrypt(profile, bytes(row["encrypted_bundle"]))
 
+    def bundle_for_revision(self, profile: str, revision: int) -> dict[str, Any] | None:
+        """Read one immutable Vault revision without changing worker assignment."""
+        with self._db() as db:
+            row = db.execute(
+                "SELECT profile,revision,bundle_sha256,telegram_user_id,encrypted_bundle "
+                "FROM profile_session_revisions WHERE profile=? AND revision=?",
+                (str(profile), int(revision)),
+            ).fetchone()
+        if row is None:
+            return None
+        bundle = self._decrypt(str(row["profile"]), bytes(row["encrypted_bundle"]))
+        if hashlib.sha256(bundle).hexdigest() != str(row["bundle_sha256"]):
+            raise ValueError("PROFILE_REVISION_CHECKSUM_INVALID")
+        return {
+            "profile": str(row["profile"]),
+            "revision": int(row["revision"]),
+            "bundle_sha256": str(row["bundle_sha256"]),
+            "telegram_user_id": int(row["telegram_user_id"]),
+            "bundle": bundle,
+        }
+
     def desired_revision(self, profile: str) -> dict[str, Any] | None:
         with self._db() as db:
             row = db.execute(
@@ -1447,7 +1468,8 @@ class ProfileProvisioningStore:
     def waiting_distributions(self) -> list[tuple[str, str, str | None]]:
         with self._db() as db:
             rows = db.execute(
-                "SELECT profile,worker,provisioning_id FROM profile_distributions WHERE status IN ('waiting','failed') ORDER BY updated_at"
+                "SELECT profile,worker,provisioning_id FROM profile_distributions "
+                "WHERE provisioning_id IS NOT NULL AND status IN ('waiting','failed') ORDER BY updated_at"
             ).fetchall()
         return [(str(row["profile"]), str(row["worker"]), row["provisioning_id"]) for row in rows]
 
@@ -1809,8 +1831,6 @@ class ProfileProvisioningService:
                 except Exception:
                     # A later background pass retries worker and TDL outages.
                     pass
-        for name in self.worker_registry.names():
-            self.store.add_worker_for_active_profiles(name)
         for profile, worker, operation_id in self.store.waiting_distributions():
             profile_registry = getattr(self.profile_manager, "profile_registry", None)
             deleting = getattr(profile_registry, "local_deletion_active", None)

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tme3bot.media import has_downloadable_media
+from tme3bot.profile_provisioning import MAX_PROFILE_BUNDLE_BYTES
 
 _SCAN_LAST_MESSAGES = 1000
 _SAFE_PART_NAME = re.compile(r"[A-Za-z0-9_.+-]{1,200}\Z")
@@ -37,6 +38,137 @@ class BackupChannelDownloadError(RuntimeError):
 class DownloadedBackupPart:
     path: Path
     message_id: int
+
+
+def download_profile_distribution_artifact(
+    client: Any,
+    *,
+    channel_ref: str,
+    node_name: str,
+    operation_id: str,
+    profile: str,
+    revision: int,
+    destination: Path,
+    message_ids: list[int] | None = None,
+    message_id: int | None = None,
+    archive_sha256: str = "",
+) -> Path:
+    """Download one exact encrypted Vault artifact, bound by its channel caption."""
+    if (
+        not channel_ref
+        or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", str(node_name or ""))
+        or not re.fullmatch(r"[0-9a-fA-F-]{36}", str(operation_id or ""))
+        or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", str(profile or ""))
+        or type(revision) is not int or revision < 1
+    ):
+        raise BackupChannelDownloadError("PROFILE_DISTRIBUTION_METADATA_INVALID")
+    selected_ids = list(message_ids) if isinstance(message_ids, list) else ([message_id] if message_id else [])
+    if (
+        not selected_ids or len(selected_ids) > 100
+        or any(type(value) is not int or value < 1 for value in selected_ids)
+        or len(set(selected_ids)) != len(selected_ids)
+        or (archive_sha256 and not re.fullmatch(r"[a-fA-F0-9]{64}", archive_sha256))
+    ):
+        raise BackupChannelDownloadError("PROFILE_DISTRIBUTION_METADATA_INVALID")
+
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        destination.chmod(0o700)
+    except OSError:
+        pass
+    target = destination / f"{operation_id}.enc"
+    if target.exists() or target.is_symlink():
+        raise BackupChannelDownloadError("PROFILE_DISTRIBUTION_DESTINATION_EXISTS")
+    try:
+        with tempfile.TemporaryDirectory(prefix="profile-distribution-") as raw_temp:
+            work = Path(raw_temp)
+            total_bytes = 0
+            with target.open("xb") as output:
+                for part_index, selected_message_id in enumerate(selected_ids, start=1):
+                    export_path = work / f"channel-messages-{part_index}.json"
+                    try:
+                        client.export_messages(
+                            channel_ref, selected_message_id, export_path,
+                            with_content=True, end_id=selected_message_id,
+                        )
+                        payload = json.loads(export_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        raise BackupChannelDownloadError("BACKUP_CHANNEL_EXPORT_FAILED") from None
+                    messages = payload.get("messages") if isinstance(payload, dict) else None
+                    if not isinstance(messages, list):
+                        raise BackupChannelDownloadError("BACKUP_CHANNEL_EXPORT_INVALID")
+                    rows = [
+                        row for row in messages
+                        if isinstance(row, dict) and _message_id(row.get("id")) == selected_message_id
+                    ]
+                    if len(rows) != 1:
+                        raise BackupChannelDownloadError("PROFILE_DISTRIBUTION_MESSAGE_NOT_FOUND")
+                    row = rows[0]
+                    caption = row.get("caption") if isinstance(row.get("caption"), str) else row.get("text")
+                    if not isinstance(caption, str) or not _distribution_caption_matches(
+                        caption, node_name, operation_id, profile, revision,
+                        part_index, len(selected_ids), archive_sha256,
+                    ):
+                        raise BackupChannelDownloadError("PROFILE_DISTRIBUTION_BINDING_MISMATCH")
+                    if not has_downloadable_media(row):
+                        raise BackupChannelDownloadError("BACKUP_CHANNEL_MEDIA_MISSING")
+                    one_message = work / f"message-{selected_message_id}.json"
+                    download_dir = work / f"download-{selected_message_id}"
+                    try:
+                        payload["messages"] = [row]
+                        one_message.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                        download_dir.mkdir(parents=True, mode=0o700)
+                        client.download(one_message, download_dir)
+                    except Exception:
+                        raise BackupChannelDownloadError("BACKUP_CHANNEL_DOWNLOAD_FAILED") from None
+                    media = [
+                        path for path in download_dir.iterdir()
+                        if path.is_file() and not path.is_symlink() and path.name.startswith(f"{selected_message_id}_")
+                    ] if download_dir.is_dir() else []
+                    if len(media) != 1:
+                        raise BackupChannelDownloadError("BACKUP_CHANNEL_MEDIA_MISSING")
+                    total_bytes += media[0].stat().st_size
+                    if total_bytes > MAX_PROFILE_BUNDLE_BYTES + 28:
+                        raise BackupChannelDownloadError("PROFILE_ARCHIVE_TOO_LARGE")
+                    with media[0].open("rb") as part_file:
+                        shutil.copyfileobj(part_file, output)
+            return target
+    except Exception:
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _message_id(value: Any) -> int | None:
+    if type(value) is int:
+        return value if value > 0 else None
+    if isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,18}", value):
+        return int(value)
+    return None
+
+
+def _distribution_caption_matches(
+    caption: str, worker: str, operation_id: str, profile: str, revision: int,
+    part_index: int, part_total: int, archive_sha256: str = "",
+) -> bool:
+    expected = {
+        "Operation": operation_id,
+        "Profile": profile,
+        "Revision": str(revision),
+        "Worker": worker,
+        "Part-Index": str(part_index),
+        "Part-Total": str(part_total),
+    }
+    if archive_sha256:
+        expected["Archive-SHA256"] = archive_sha256.lower()
+    rows = {}
+    for line in caption.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            rows[key.strip()] = value.strip()
+    return "#profile_distribution" in caption.splitlines() and all(rows.get(key) == value for key, value in expected.items())
 
 
 def download_backup_parts(

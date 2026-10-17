@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
-  import { CircleAlert, RefreshCw, ShieldCheck, Trash2 } from '@lucide/svelte';
+  import { CircleAlert, RefreshCw, Send, ShieldCheck, Trash2 } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; online: boolean; secure: boolean };
   type WorkerState = {
@@ -17,7 +17,7 @@
     runtime_desired_revision?: number | null;
     runtime_installed_revision?: number | null;
   };
-  type Profile = { name: string; status: string; vault: boolean; error?: string; workers: WorkerState[] };
+  type Profile = { name: string; status: string; vault: boolean; desired_revision?: number; error?: string; workers: WorkerState[] };
   type Management = { items: Profile[]; workers: Worker[] };
   type SyncEvent = {
     id: number; run_id: string; sequence: number | null; revision: number | null;
@@ -25,6 +25,18 @@
     details?: Record<string, number>;
   };
   type SyncHistory = { items: SyncEvent[]; active: boolean; next_after_id: number };
+  type DistributionWorker = {
+    worker: string; status: string; phase: string; reason_code: string;
+    archive_message_id?: number | null; updated_at: string;
+  };
+  type DistributionOperation = {
+    id: string; profile: string; revision: number; target_workers: string[];
+    status: string; created_at: string; updated_at: string; workers: DistributionWorker[];
+  };
+  type DistributionEvents = {
+    items: Array<{ id: number; worker: string; sequence: number | null; phase: string; status: string; code: string; created_at: string }>;
+    active: boolean; next_after_id: number;
+  };
 
   let profiles = $state<Profile[]>([]);
   let workers = $state<Worker[]>([]);
@@ -34,6 +46,9 @@
   let checkedAt = $state('');
   let deletingProfile = $state('');
   let syncHistories = $state<Record<string, SyncHistory>>({});
+  let distributionBusy = $state('');
+  let distributionOperations = $state<Record<string, DistributionOperation[]>>({});
+  let distributionEvents = $state<Record<string, DistributionEvents>>({});
 
   const workerByName = $derived(new Map(workers.map((worker) => [worker.name, worker])));
   const statusLabel = (status: string) => ({
@@ -44,7 +59,7 @@
   } as Record<string, string>)[status] || status || 'Belum diperiksa';
   const phaseLabel = (phase: string) => ({
     queued: 'Antrean', manifest_fetch: 'Baca daftar profil', revision_compare: 'Bandingkan revision',
-    bundle_download: 'Unduh bundle', bundle_validation: 'Validasi bundle',
+    bundle_download: 'Unduh bundle', archive_upload: 'Unggah arsip terenkripsi', archive_download: 'Unduh arsip dari channel', bundle_validation: 'Validasi bundle',
     session_validation: 'Validasi sesi', session_install: 'Pasang sesi', session_commit: 'Simpan sesi',
     download_staging: 'Siapkan lane Download', download_validation: 'Validasi lane Download', download_install: 'Pasang lane Download',
     export_staging: 'Siapkan lane Export', export_validation: 'Validasi lane Export', export_install: 'Pasang lane Export',
@@ -52,7 +67,7 @@
     identity_install: 'Pasang metadata identitas', transaction_rollback: 'Pulihkan seluruh lane',
     installation_reused: 'Pemasangan sudah tercatat',
     acknowledgement: 'Konfirmasi ke Vault', worker_unreachable: 'Worker tidak terjangkau',
-    completed: 'Selesai', cancelled: 'Dibatalkan'
+    worker_dispatch: 'Kirim perintah ke worker', completed: 'Selesai', cancelled: 'Dibatalkan', failed: 'Gagal'
   } as Record<string, string>)[phase] || phase;
   const historyKey = (profile: string, worker: string) => `${profile}:${worker}`;
 
@@ -69,6 +84,70 @@
         syncHistories = { ...syncHistories, [key]: { items: [], active: false, next_after_id: 0 } };
       }
     }));
+  }
+
+  async function loadDistributionOperations() {
+    const vaulted = profiles.filter((profile) => profile.vault);
+    await Promise.all(vaulted.map(async (profile) => {
+      try {
+        const result = await api<{ items: DistributionOperation[] }>(`/profiles/${encodeURIComponent(profile.name)}/distributions`);
+        const items = Array.isArray(result.items) ? result.items : [];
+        distributionOperations = { ...distributionOperations, [profile.name]: items };
+        await Promise.all(items.map(async (operation) => {
+          try {
+            const events = await api<DistributionEvents>(`/profile-distributions/${encodeURIComponent(operation.id)}/events?limit=100`);
+            distributionEvents = { ...distributionEvents, [operation.id]: events };
+          } catch {
+            distributionEvents = { ...distributionEvents, [operation.id]: { items: [], active: false, next_after_id: 0 } };
+          }
+        }));
+      } catch {
+        distributionOperations = { ...distributionOperations, [profile.name]: [] };
+      }
+    }));
+  }
+
+  function idempotencyKey() {
+    return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `profile-distribution-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  async function distribute(profile: Profile) {
+    if (distributionBusy) return;
+    distributionBusy = profile.name;
+    failure = '';
+    notice = '';
+    try {
+      const operation = await api<DistributionOperation>(`/profiles/${encodeURIComponent(profile.name)}/distributions`, {
+        method: 'POST', headers: { 'Idempotency-Key': idempotencyKey() }
+      });
+      notice = `Distribusi ${profile.name} revision ${operation.revision} masuk antrean (${operation.id}).`;
+      await loadDistributionOperations();
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Distribusi ${profile.name} gagal dimulai.`;
+    } finally {
+      distributionBusy = '';
+    }
+  }
+
+  async function retryDistribution(operation: DistributionOperation, worker: string) {
+    const key = `${operation.id}:${worker}`;
+    if (distributionBusy) return;
+    distributionBusy = key;
+    failure = '';
+    notice = '';
+    try {
+      await api(`/profile-distributions/${encodeURIComponent(operation.id)}/workers/${encodeURIComponent(worker)}/retry`, {
+        method: 'POST', headers: { 'Idempotency-Key': idempotencyKey() }
+      });
+      notice = `Retry ${worker} masuk antrean pada revision ${operation.revision}.`;
+      await loadDistributionOperations();
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Retry ${worker} gagal dimulai.`;
+    } finally {
+      distributionBusy = '';
+    }
   }
 
   function runtimeMessage(item: WorkerState, worker?: Worker) {
@@ -108,7 +187,7 @@
       profiles = Array.isArray(result.items) ? result.items : [];
       workers = Array.isArray(result.workers) ? result.workers : [];
       checkedAt = new Date().toLocaleString();
-      await loadSyncHistories();
+      await Promise.all([loadSyncHistories(), loadDistributionOperations()]);
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Status Vault gagal dimuat.';
     } finally {
@@ -139,6 +218,9 @@
     void load();
     const timer = window.setInterval(() => {
       if (Object.values(syncHistories).some((history) => history.active)) void loadSyncHistories();
+      if (Object.values(distributionOperations).flat().some((operation) => ['queued', 'running', 'waiting'].includes(operation.status))) {
+        void loadDistributionOperations();
+      }
     }, 3000);
     return () => window.clearInterval(timer);
   });
@@ -192,13 +274,48 @@
               <h3 class="font-extrabold">{profile.name}</h3>
               <div class="flex items-center gap-2">
                 <span class="badge">{statusLabel(profile.status)}</span>
+                {#if profile.desired_revision && workers.length > 0}
+                  <button class="button" onclick={() => distribute(profile)} disabled={Boolean(distributionBusy)} aria-label={`Distribusikan ${profile.name} revision ${profile.desired_revision} ke semua worker`}>
+                    <Send size={15}/>{distributionBusy === profile.name ? 'Mengantrikan...' : `Distribusikan r${profile.desired_revision}`}
+                  </button>
+                {/if}
                 <button class="button secondary" onclick={() => deleteBundle(profile)} disabled={Boolean(deletingProfile)} aria-label={`Hapus bundle ${profile.name} dari Vault`}>
                   <Trash2 size={15}/>{deletingProfile === profile.name ? 'Menghapus...' : 'Hapus dari Vault'}
                 </button>
               </div>
             </div>
             {#if profile.error}<p class="mt-2 text-sm text-rose-600">{profile.error}</p>{/if}
-            {#if profile.workers.length === 0}
+            {#each (distributionOperations[profile.name] || []).slice(0, 3) as operation (operation.id)}
+              {@const operationEvents = distributionEvents[operation.id]}
+              <section class="mt-4 rounded-xl border border-violet-200 bg-violet-50/60 p-3 dark:border-violet-900 dark:bg-violet-950/30" aria-label={`Operasi distribusi ${profile.name} revision ${operation.revision}`}>
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div><b class="text-sm">Distribusi revision {operation.revision}</b><p class="muted mt-1 text-xs">ID {operation.id} · snapshot: {operation.target_workers.join(', ')}</p></div>
+                  <span class="badge">{statusLabel(operation.status)}</span>
+                </div>
+                <div class="mt-3 grid gap-2 lg:grid-cols-2">
+                  {#each operation.workers as target (target.worker)}
+                    {@const targetEvents = (operationEvents?.items || []).filter((event) => event.worker === target.worker).slice(-5).reverse()}
+                    <div class="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
+                      <div class="flex flex-wrap items-center justify-between gap-2"><b class="text-sm">{target.worker}</b><span class="text-xs font-bold">{statusLabel(target.status)} · {phaseLabel(target.phase)}</span></div>
+                      {#if target.reason_code}<p class="mt-1 text-xs text-rose-600">{target.reason_code}</p>{/if}
+                      {#if target.status === 'failed'}
+                        <button class="button secondary mt-2" onclick={() => retryDistribution(operation, target.worker)} disabled={Boolean(distributionBusy)} aria-label={`Retry distribusi ${operation.id} pada ${target.worker}`}>
+                          <RefreshCw size={14}/>{distributionBusy === `${operation.id}:${target.worker}` ? 'Mengantrikan...' : 'Retry worker'}
+                        </button>
+                      {/if}
+                      {#if targetEvents.length}
+                        <ol class="mt-2 space-y-1 border-t border-[var(--line)] pt-2">
+                          {#each targetEvents as event (event.id)}
+                            <li class="flex items-start justify-between gap-2 text-xs"><span>{phaseLabel(event.phase)} · {statusLabel(event.status)}{#if event.code}<span class="muted"> ({event.code})</span>{/if}</span><time class="muted shrink-0">{new Date(event.created_at).toLocaleTimeString()}</time></li>
+                          {/each}
+                        </ol>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              </section>
+            {/each}
+            {#if profile.workers.length === 0 && !(distributionOperations[profile.name]?.length)}
               <p class="muted mt-3 text-sm">Belum ada status distribusi worker untuk profil ini.</p>
             {:else}
               <div class="mt-3 grid gap-2 lg:grid-cols-2">

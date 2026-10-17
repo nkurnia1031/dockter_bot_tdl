@@ -313,6 +313,7 @@ class WorkerApiTests(unittest.TestCase):
             json={"mode": "force-shell"},
         )
         self.assertEqual(invalid_mode.status_code, 422)
+
         extra = self.client.post(
             "/internal/v1/profile-sync",
             headers=headers,
@@ -341,6 +342,47 @@ class WorkerApiTests(unittest.TestCase):
             json={"profile": "irang", "url": "http://attacker.invalid"},
         )
         self.assertEqual(invalid_cancel.status_code, 422)
+
+    def test_vault_distribution_worker_api_accepts_only_correlation_metadata(self):
+        captured = []
+        self.executor.distribute_profile_bundle = lambda operation_id, payload: (
+            captured.append((operation_id, dict(payload))) or {"ready": True}
+        )
+        operation_id = "a36b11cb-2135-4fce-89c2-772b0eb25792"
+        payload = {
+            "worker": "local",
+            "profile": "archive",
+            "revision": 7,
+            "telegram_user_id": 123,
+            "message_ids": [40, 41],
+            "archive_sha256": "a" * 64,
+            "bundle_sha256": "b" * 64,
+            "channel_ref": "-100456",
+            "event_sequence_start": 0,
+        }
+        denied = self.client.post(
+            f"/internal/v1/profiles/distributions/{operation_id}", json=payload
+        )
+        self.assertEqual(denied.status_code, 401)
+        accepted = self.client.post(
+            f"/internal/v1/profiles/distributions/{operation_id}",
+            headers={"Authorization": "Bearer worker-secret"},
+            json=payload,
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json(), {"ready": True})
+        self.assertEqual(captured, [(operation_id, payload)])
+        self.assertNotIn("bundle", accepted.text)
+        self.assertNotIn("synthetic-session", accepted.text)
+
+        payload["worker"] = "remote-2"
+        rejected = self.client.post(
+            f"/internal/v1/profiles/distributions/{operation_id}",
+            headers={"Authorization": "Bearer worker-secret"},
+            json=payload,
+        )
+        self.assertEqual(rejected.status_code, 403)
+        self.assertEqual(rejected.json()["error"]["code"], "PROFILE_DISTRIBUTION_WORKER_MISMATCH")
 
     def test_local_profile_inventory_requires_worker_token_and_returns_safe_summary(self):
         expected = {

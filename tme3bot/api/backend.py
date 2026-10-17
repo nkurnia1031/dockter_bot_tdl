@@ -102,6 +102,8 @@ class BackendContext:
     runtime_settings_store: Any = None
     backup_scheduler: Any = None
     profile_provisioner: Any = None
+    profile_distribution_store: Any = None
+    profile_distribution_service: Any = None
     device_auth: Any = None
     source_repository: Any = None
     operation_service: Any = None
@@ -1098,6 +1100,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         provisioner = context.profile_provisioner
         if provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
+        distributions = getattr(context, "profile_distribution_store", None)
+        if distributions is not None and distributions.has_active_profile(str(profile or "").strip().lower()):
+            raise DomainError("PROFILE_VAULT_BUSY", "Distribusi Vault profil masih berjalan.", status_code=409)
         try:
             return provisioner.delete_vault_bundle(profile, actor.telegram_user_id)
         except KeyError as exc:
@@ -1469,6 +1474,13 @@ def _add_internal_state_routes(
         context,
         require_internal=require_internal,
         current_actor=current_actor,
+    )
+    from tme3bot.api.routes.profile_distribution import register_profile_distribution
+    register_profile_distribution(
+        app,
+        context,
+        current_actor=current_actor,
+        require_internal=require_internal,
     )
 
     cursor_service = None

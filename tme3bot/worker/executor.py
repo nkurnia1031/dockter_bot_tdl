@@ -597,6 +597,7 @@ class WorkerJobExecutor(
         *,
         sync_run_id: str = "",
         sync_revision: int = 0,
+        distribution_operation_id: str = "",
     ) -> dict[str, Any]:
         sequence = 0
 
@@ -619,6 +620,7 @@ class WorkerJobExecutor(
                     phase=phase,
                     status=status,
                     code=code,
+                    distribution_operation_id=distribution_operation_id,
                 )
             except Exception:
                 LOGGER.debug("Could not report profile bundle install progress")
@@ -657,6 +659,7 @@ class WorkerJobExecutor(
         *,
         sync_run_id: str = "",
         sync_revision: int = 0,
+        distribution_operation_id: str = "",
     ) -> bool:
         def report(status: str, code: str = "") -> None:
             if not sync_run_id or sync_revision < 1:
@@ -674,6 +677,7 @@ class WorkerJobExecutor(
                     phase="session_commit",
                     status=status,
                     code=code,
+                    distribution_operation_id=distribution_operation_id,
                 )
             except Exception:
                 LOGGER.debug("Could not report profile bundle commit progress")
@@ -688,6 +692,144 @@ class WorkerJobExecutor(
                 ensure_upload(profile)
         report("succeeded" if committed else "failed", "" if committed else "PROFILE_INSTALL_COMMIT_FAILED")
         return committed
+
+    def distribute_profile_bundle(self, operation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Fetch an encrypted operation artifact from the private channel and install it."""
+        import hashlib
+        import tempfile
+        from pathlib import Path
+
+        from tme3bot.profile_distribution_crypto import decrypt_distribution_bundle
+        from tme3bot.worker.backup_channel_download import (
+            BackupChannelDownloadError,
+            download_profile_distribution_artifact,
+        )
+
+        profile = str(payload.get("profile") or "").strip().lower()
+        revision = payload.get("revision")
+        user_id = payload.get("telegram_user_id")
+        message_ids = payload.get("message_ids")
+        archive_sha256 = str(payload.get("archive_sha256") or "").lower()
+        bundle_sha256 = str(payload.get("bundle_sha256") or "").lower()
+        worker = str(getattr(self.config, "backup_node_name", "") or "").strip().lower()
+        requested_worker = str(payload.get("worker") or "").strip().lower()
+        event_sequence_start = payload.get("event_sequence_start")
+        channel_ref = str(payload.get("channel_ref") or "").strip()
+        configured_channel_ref = str(getattr(self.config, "backup_channel_ref", "") or "").strip()
+        if (
+            not profile or type(revision) is not int or revision < 1
+            or type(user_id) is not int or user_id < 1
+            or not isinstance(message_ids, list) or not message_ids or len(message_ids) > 100
+            or any(type(value) is not int or value < 1 for value in message_ids)
+            or len(set(message_ids)) != len(message_ids)
+            or not re.fullmatch(r"[a-f0-9]{64}", archive_sha256)
+            or not re.fullmatch(r"[a-f0-9]{64}", bundle_sha256)
+            or not worker or requested_worker != worker
+            or type(event_sequence_start) is not int or event_sequence_start < 0
+            or not channel_ref or len(channel_ref) > 200
+            or any(ord(char) < 33 or ord(char) > 126 for char in channel_ref)
+            or (configured_channel_ref and channel_ref != configured_channel_ref)
+        ):
+            raise RuntimeError("PROFILE_DISTRIBUTION_METADATA_INVALID")
+
+        sequence = 0
+
+        def report(phase: str, status: str, code: str = "") -> None:
+            nonlocal sequence
+            try:
+                sequence = self.profile_sync.next_external_event_sequence(operation_id)
+                self.profile_sync.report_external_event(
+                    run_id=operation_id,
+                    sequence=sequence,
+                    profile=profile,
+                    revision=revision,
+                    phase=phase,
+                    status=status,
+                    code=code,
+                    distribution_operation_id=operation_id,
+                )
+            except Exception:
+                LOGGER.debug("Could not report profile distribution progress")
+
+        report("archive_download", "running")
+        runtime = self.profile_manager.runtime(
+            str(getattr(self.config, "default_profile", "default") or "default")
+        )
+        worker_token_provider = getattr(getattr(self, "runtime_settings", None), "worker_api_token", None)
+        worker_token = str(worker_token_provider() or "") if callable(worker_token_provider) else str(getattr(self.config, "worker_api_token", "") or "")
+        if not channel_ref or len(worker_token) < 16:
+            report("failed", "failed", "PROFILE_DISTRIBUTION_CONFIG_INVALID")
+            raise RuntimeError("PROFILE_DISTRIBUTION_CONFIG_INVALID")
+
+        self.profile_sync.seed_external_event_sequence(operation_id, event_sequence_start)
+
+        temp_root = Path(getattr(self.config, "temp_root", "/tmp"))
+        temp_root.mkdir(parents=True, exist_ok=True)
+        try:
+            with tempfile.TemporaryDirectory(prefix="profile-distribution-", dir=str(temp_root)) as raw_temp:
+                with runtime.export_operation_lock, runtime.download_operation_lock:
+                    artifact_path = download_profile_distribution_artifact(
+                        runtime.export_tdl_client,
+                        channel_ref=channel_ref,
+                        node_name=worker,
+                        operation_id=operation_id,
+                        profile=profile,
+                        revision=revision,
+                        destination=Path(raw_temp),
+                        message_ids=message_ids,
+                        archive_sha256=archive_sha256,
+                    )
+                encrypted = artifact_path.read_bytes()
+                if not hashlib.sha256(encrypted).hexdigest() == archive_sha256:
+                    raise RuntimeError("PROFILE_DISTRIBUTION_ARCHIVE_CHECKSUM_INVALID")
+                report("archive_download", "succeeded")
+                report("bundle_validation", "running")
+                bundle = decrypt_distribution_bundle(
+                    encrypted,
+                    worker_token=worker_token,
+                    operation_id=operation_id,
+                    profile=profile,
+                    revision=revision,
+                    worker=worker,
+                )
+                if not hashlib.sha256(bundle).hexdigest() == bundle_sha256:
+                    raise RuntimeError("PROFILE_DISTRIBUTION_BUNDLE_CHECKSUM_INVALID")
+                if self.validate_profile_session(bundle).get("telegram_user_id") != user_id:
+                    raise RuntimeError("PROFILE_DISTRIBUTION_IDENTITY_MISMATCH")
+                report("bundle_validation", "succeeded")
+            installed = self.install_profile_bundle(
+                profile,
+                user_id,
+                bundle,
+                operation_id,
+                sync_run_id=operation_id,
+                sync_revision=revision,
+                distribution_operation_id=operation_id,
+            )
+            if not isinstance(installed, dict) or installed.get("ready") is not True:
+                raise RuntimeError("PROFILE_INSTALL_FAILED")
+            committed = self.commit_profile_bundle(
+                profile,
+                operation_id,
+                sync_run_id=operation_id,
+                sync_revision=revision,
+                distribution_operation_id=operation_id,
+            )
+            if not committed:
+                self.rollback_profile_bundle(profile, operation_id)
+                raise RuntimeError("PROFILE_INSTALL_COMMIT_FAILED")
+            report("completed", "succeeded")
+            return {"ready": True, "profile": profile, "revision": revision}
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if not re.fullmatch(r"[A-Z][A-Z0-9_-]{1,63}", code):
+                code = str(exc) if re.fullmatch(r"PROFILE_[A-Z0-9_-]{1,56}", str(exc)) else "PROFILE_DISTRIBUTION_FAILED"
+            try:
+                self.rollback_profile_bundle(profile, operation_id)
+            except Exception:
+                code = "PROFILE_INSTALL_ROLLBACK_FAILED"
+            report("failed", "failed", code)
+            raise RuntimeError(code) from None
 
     def rollback_profile_bundle(self, profile: str, operation_id: str) -> bool:
         with self._profile_session_locks(profile):

@@ -28,6 +28,7 @@ from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.profile_provisioning import ProfileProvisioningStore, build_profile_bundle
+from tme3bot.profile_distribution_store import ProfileDistributionStore
 from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_links import sign_storage_item
@@ -1724,6 +1725,73 @@ class BackendApiTests(unittest.TestCase):
             "local_copies_unchanged": True,
         })
         self.assertEqual(provisioner.delete_vault_call, ("default", 42))
+
+    def test_manual_vault_distribution_pins_workers_revision_and_accepts_durable_worker_events(self):
+        headers = self.login()
+        vault = ProfileProvisioningStore(self.jobs.path, Path(self.temp.name) / "vault")
+        provision = vault.begin(
+            profile="default", actor_user_id=42, bootstrap_worker="local",
+            source="adoption", target_workers=["local"],
+        )
+        bundle = build_profile_bundle({"data/session": b"synthetic-session"}, 42)
+        vault.store_bundle(provision, 42, bundle)
+        distribution_store = ProfileDistributionStore(self.jobs.path)
+        wake = []
+        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
+        self.context.profile_distribution_store = distribution_store
+        self.context.profile_distribution_service = type(
+            "DistributionService", (), {"wake": lambda _self: wake.append(True)}
+        )()
+        self.context.bot.send_document = lambda **_kwargs: None
+
+        response = self.client.post(
+            "/api/v1/profiles/default/distributions",
+            headers={**headers, "Idempotency-Key": "vault-distribution-once"},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        operation = response.json()
+        self.assertEqual(operation["revision"], 1)
+        self.assertEqual(operation["target_workers"], ["local"])
+        self.assertEqual(operation["status"], "queued")
+        self.assertEqual(wake, [True])
+
+        duplicate = self.client.post(
+            "/api/v1/profiles/default/distributions",
+            headers={**headers, "Idempotency-Key": "vault-distribution-once"},
+        )
+        self.assertEqual(duplicate.status_code, 202, duplicate.text)
+        self.assertEqual(duplicate.json()["id"], operation["id"])
+        self.assertEqual(duplicate.json()["target_workers"], ["local"])
+        self.assertEqual(wake, [True])
+
+        internal_headers = {
+            "Authorization": "Bearer internal",
+            "X-Worker-Name": "local",
+            "X-Worker-Token": "secret",
+        }
+        event = {
+            "profile": "default", "revision": 1, "sequence": 1,
+            "phase": "archive_download", "status": "running",
+        }
+        reported = self.client.post(
+            f"/internal/v1/profile-distributions/{operation['id']}/events",
+            headers=internal_headers,
+            json=event,
+        )
+        self.assertEqual(reported.status_code, 200, reported.text)
+        self.assertTrue(reported.json()["accepted"])
+        repeated = self.client.post(
+            f"/internal/v1/profile-distributions/{operation['id']}/events",
+            headers=internal_headers,
+            json=event,
+        )
+        self.assertTrue(repeated.json()["duplicate"])
+        progress = self.client.get(
+            f"/api/v1/profile-distributions/{operation['id']}/events", headers=headers
+        )
+        self.assertEqual(progress.status_code, 200, progress.text)
+        self.assertEqual([item["phase"] for item in progress.json()["items"]], ["queued", "archive_download"])
+        self.assertNotIn("synthetic-session", progress.text)
 
     def test_profile_management_uses_fast_worker_health_check(self):
         headers = self.login()

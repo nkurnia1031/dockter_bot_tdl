@@ -293,6 +293,19 @@ class WorkerHttpDispatcher:
         )
         return json.loads(data.decode("utf-8")) if data else {"ready": True}
 
+    def distribute_profile_bundle(
+        self, worker: str, operation_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Send only correlation metadata; encrypted archive bytes stay in Telegram."""
+        result = self._profile_json(
+            worker,
+            "POST",
+            f"/internal/v1/profiles/distributions/{quote(operation_id, safe='')}",
+            {**payload, "worker": worker},
+            timeout=600,
+        )
+        return result
+
     def commit_profile_bundle(
         self, worker: str, profile: str, operation_id: str, *, sync_run_id: str = "", revision: int = 0
     ) -> None:

@@ -35,6 +35,8 @@ from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.labels import LabelStore
 from tme3bot.profiles import ProfileManager
 from tme3bot.profile_provisioning import ProfileProvisioningService, ProfileProvisioningStore
+from tme3bot.profile_distribution import ProfileDistributionService
+from tme3bot.profile_distribution_store import ProfileDistributionStore
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_maintenance import StorageMaintenanceService
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
@@ -119,6 +121,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         config.storage_db_file,
         config.state_file.parent / "profile-vault",
     )
+    profile_distribution_store = ProfileDistributionStore(config.storage_db_file)
     profiles = ProfileManager(
         config,
         registry,
@@ -282,6 +285,14 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         scheduler = BackupScheduler(config, coordinator)
     except RuntimeError:
         LOGGER.warning("Backup scheduler menunggu setidaknya satu identity.")
+    profile_distribution_service = ProfileDistributionService(
+        config,
+        bot,
+        profile_distribution_store,
+        profile_vault,
+        registry,
+        dispatcher,
+    )
     context = BackendContext(
         config=config,
         control_plane=control_plane,
@@ -301,6 +312,8 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         runtime_settings_store=runtime_settings_store,
         backup_scheduler=scheduler,
         profile_provisioner=profile_provisioner,
+        profile_distribution_store=profile_distribution_store,
+        profile_distribution_service=profile_distribution_service,
         device_auth=device_auth,
         source_repository=source_repository,
         operation_service=operation_service,
@@ -318,6 +331,8 @@ def run_backend(config: AppConfig) -> None:
     context.storage_maintenance.start()
     if context.profile_provisioner is not None:
         context.profile_provisioner.start()
+    if context.profile_distribution_service is not None:
+        context.profile_distribution_service.start()
     if context.queue_publisher is not None:
         context.queue_publisher.start()
     try:
@@ -330,6 +345,8 @@ def run_backend(config: AppConfig) -> None:
     finally:
         if context.profile_provisioner is not None:
             context.profile_provisioner.stop()
+        if context.profile_distribution_service is not None:
+            context.profile_distribution_service.stop()
         if context.queue_publisher is not None:
             context.queue_publisher.stop()
 

@@ -1258,7 +1258,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertEqual(profile_for_owner["operation_id"], operation)
             self.assertIsNone(profile_for_other["operation_id"])
 
-    def test_profile_waits_for_disabled_offline_worker_then_syncs_future_workers(self):
+    def test_profile_waits_for_disabled_offline_worker_and_keeps_original_worker_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manager = FakeProfileManager(root)
@@ -1298,8 +1298,8 @@ class ProfileProvisioningTests(unittest.TestCase):
             workers.add("future-worker")
             dispatcher.online.add("future-worker")
             service.process_once()
-            self.assertIn(("novel", "future-worker"), dispatcher.installed)
-            self.assertTrue(service.worker_ready("novel", "future-worker"))
+            self.assertNotIn(("novel", "future-worker"), dispatcher.installed)
+            self.assertFalse(service.worker_ready("novel", "future-worker"))
 
             committed_before_retry = len(dispatcher.committed)
             store.update_distribution("novel", "remote-offline", "failed", provisioning_id=operation)

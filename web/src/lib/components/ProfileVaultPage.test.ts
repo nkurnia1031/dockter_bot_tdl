@@ -119,4 +119,63 @@ describe('ProfileVaultPage', () => {
     expect(await screen.findByText('Bundle archive dihapus dari Vault. Sesi worker lokal tetap utuh.')).toBeTruthy();
     expect(screen.getByText('Belum ada profil yang tersimpan di Vault.')).toBeTruthy();
   });
+
+  it('starts one pinned distribution and retries only the failed worker with metadata requests', async () => {
+    const requests: { url: string; method: string; headers: Headers; body: string | null }[] = [];
+    let started = false;
+    const operation = {
+      id: 'a36b11cb-2135-4fce-89c2-772b0eb25792', profile: 'archive', revision: 7,
+      target_workers: ['remote-1', 'remote-2'], status: 'failed',
+      created_at: '2026-10-17T10:00:00Z', updated_at: '2026-10-17T10:01:00Z',
+      workers: [
+        { worker: 'remote-1', status: 'failed', phase: 'failed', reason_code: 'PROFILE_INSTALL_FAILED', updated_at: '2026-10-17T10:01:00Z' },
+        { worker: 'remote-2', status: 'ready', phase: 'completed', reason_code: '', updated_at: '2026-10-17T10:01:00Z' }
+      ]
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      const headers = new Headers(init?.headers);
+      const body = typeof init?.body === 'string' ? init.body : null;
+      requests.push({ url, method, headers, body });
+      if (url === '/api/v1/profiles/management') return new Response(JSON.stringify({
+        workers: [
+          { name: 'remote-1', enabled: true, online: true, secure: true },
+          { name: 'remote-2', enabled: true, online: true, secure: true }
+        ],
+        items: [{ name: 'archive', active: true, status: 'stored', vault: true, desired_revision: 7, workers: [] }]
+      }), { status: 200 });
+      if (url === '/api/v1/profiles/archive/distributions' && method === 'GET') return new Response(JSON.stringify({ items: started ? [operation] : [] }), { status: 200 });
+      if (url.endsWith('/events?limit=100')) return new Response(JSON.stringify({
+        active: false, next_after_id: 3, items: [
+          { id: 1, worker: 'remote-1', sequence: 1, phase: 'queued', status: 'queued', code: '', created_at: '2026-10-17T10:00:00Z' },
+          { id: 2, worker: 'remote-1', sequence: 2, phase: 'archive_download', status: 'running', code: '', created_at: '2026-10-17T10:00:30Z' },
+          { id: 3, worker: 'remote-1', sequence: 3, phase: 'failed', status: 'failed', code: 'PROFILE_INSTALL_FAILED', created_at: '2026-10-17T10:01:00Z' }
+        ]
+      }), { status: 200 });
+      if (url === '/api/v1/profiles/archive/distributions' && method === 'POST') {
+        started = true;
+        return new Response(JSON.stringify(operation), { status: 202 });
+      }
+      if (url.endsWith('/workers/remote-1/retry') && method === 'POST') return new Response(JSON.stringify(operation), { status: 202 });
+      if (url.endsWith('/sync-logs?limit=50')) return new Response(JSON.stringify({ items: [], active: false, next_after_id: 0 }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfileVaultPage);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Distribusikan archive revision 7 ke semua worker' }));
+    expect(await screen.findByText(/Unduh arsip dari channel/)).toBeTruthy();
+    expect(screen.getByText(/snapshot: remote-1, remote-2/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: `Retry distribusi ${operation.id} pada remote-1` })).toBeTruthy();
+    const submit = requests.find((request) => request.method === 'POST' && request.url === '/api/v1/profiles/archive/distributions');
+    expect(submit?.headers.get('Idempotency-Key')).toBeTruthy();
+    expect(submit?.body).toBeNull();
+    const retryButton = screen.getByRole('button', { name: `Retry distribusi ${operation.id} pada remote-1` });
+    await waitFor(() => expect(retryButton.hasAttribute('disabled')).toBe(false));
+    await fireEvent.click(retryButton);
+    const retry = requests.find((request) => request.method === 'POST' && request.url.endsWith('/workers/remote-1/retry'));
+    expect(retry?.headers.get('Idempotency-Key')).toBeTruthy();
+    expect(retry?.body).toBeNull();
+    expect(requests.some((request) => request.url.includes('/workers/remote-2/retry'))).toBe(false);
+  });
 });

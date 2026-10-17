@@ -32,7 +32,7 @@ _MAX_QUEUED_SYNC_REQUESTS = 32
 _MAX_PENDING_SYNC_EVENTS = 10000
 _MAX_EXTERNAL_EVENT_RUNS = 512
 _SYNC_EVENT_PHASES = {
-    "queued", "manifest_fetch", "revision_compare", "bundle_download",
+    "queued", "manifest_fetch", "revision_compare", "bundle_download", "archive_download",
     "bundle_validation", "session_validation", "session_install", "session_commit",
     "acknowledgement", "worker_unreachable", "completed", "cancelled",
     "download_staging", "download_validation", "download_install",
@@ -777,6 +777,7 @@ class ProfileSyncClient:
         phase: str,
         status: str,
         code: str = "",
+        distribution_operation_id: str = "",
     ) -> None:
         """Report a worker-side stage for a vault-initiated bundle install."""
         self._report_sync_event(
@@ -787,6 +788,7 @@ class ProfileSyncClient:
             phase=phase,
             status=status,
             code=code,
+            distribution_operation_id=distribution_operation_id,
         )
 
     def next_external_event_sequence(self, run_id: str) -> int:
@@ -804,6 +806,16 @@ class ProfileSyncClient:
             self._save_locked()
             return sequence
 
+    def seed_external_event_sequence(self, run_id: str, sequence: int) -> None:
+        """Continue after a durable sequence already assigned by the backend."""
+        normalized = str(run_id or "")
+        if not _SYNC_RUN_ID_RE.fullmatch(normalized) or type(sequence) is not int or sequence < 0:
+            raise ValueError("ID run sinkronisasi profil tidak valid.")
+        with self._condition:
+            sequences = self._state.setdefault("external_event_sequences", {})
+            sequences[normalized] = max(int(sequences.get(normalized, 0)), sequence)
+            self._save_locked()
+
     def _report_sync_event(
         self,
         *,
@@ -815,6 +827,7 @@ class ProfileSyncClient:
         status: str,
         code: str = "",
         details: dict[str, Any] | None = None,
+        distribution_operation_id: str = "",
     ) -> None:
         payload: dict[str, Any] = {
             "profile": profile,
@@ -826,6 +839,10 @@ class ProfileSyncClient:
         }
         if code:
             payload["code"] = _safe_code(code)
+        if distribution_operation_id:
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", str(distribution_operation_id)):
+                return
+            payload["distribution_operation_id"] = str(distribution_operation_id)
         if details:
             payload["details"] = {
                 key: max(0, min(2**31 - 1, int(value)))
@@ -862,9 +879,15 @@ class ProfileSyncClient:
             if event is None:
                 return
             try:
+                distribution_id = str(event.pop("distribution_operation_id", ""))
+                event_path = (
+                    f"/internal/v1/profile-distributions/{quote(distribution_id, safe='')}/events"
+                    if distribution_id
+                    else "/internal/v1/profile-sync/events"
+                )
                 response, _ = self._request(
                     "POST",
-                    "/internal/v1/profile-sync/events",
+                    event_path,
                     json.dumps(event, separators=(",", ":")).encode("utf-8"),
                     timeout=3,
                 )
@@ -912,6 +935,11 @@ class ProfileSyncClient:
             "phase": phase,
             "status": status,
         }
+        distribution_operation_id = str(event.get("distribution_operation_id") or "")
+        if distribution_operation_id:
+            if not re.fullmatch(r"[0-9a-fA-F-]{36}", distribution_operation_id):
+                return None
+            safe["distribution_operation_id"] = distribution_operation_id
         code = _safe_code(event.get("code"))
         if code:
             safe["code"] = code
