@@ -3,13 +3,20 @@ from __future__ import annotations
 import base64
 import json
 import os
+import platform
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.trusted_device import browser_state, canonical_payload
-from tools.trusted_device_store import TrustedDeviceError, TrustedDeviceStore, WindowsDpapi
+from tools.trusted_device_store import (
+    LinuxPassphraseProtector,
+    TrustedDeviceError,
+    TrustedDeviceStore,
+    WindowsDpapi,
+)
 
 
 class FakeProtector:
@@ -52,6 +59,66 @@ class TrustedDeviceHelperTests(unittest.TestCase):
             self.assertNotIn(base64.urlsafe_b64encode(private).rstrip(b"="), raw_document)
             self.assertNotIn("private_key_dpapi", enrollment)
             self.assertEqual(store.credentials()[1], private)
+
+    @unittest.skipUnless(platform.system() == "Linux", "Linux storage format only")
+    def test_linux_enrollment_uses_web_protocol_v1_and_private_permissions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = TrustedDeviceStore(
+                "https://ui.example.test",
+                base_dir=Path(temp) / "trusted",
+                protector=FakeProtector(),
+            )
+            enrollment = store.save_credentials(
+                device_id="fd9f67f1-bba8-4011-9ed3-0f819ac8df10",
+                name="Linux agent",
+                public_key=bytes(range(32)),
+                private_key=bytes(range(32, 64)),
+            )
+            local = json.loads(store.credentials_path.read_text(encoding="utf-8"))
+            self.assertEqual(local["version"], 2)
+            self.assertEqual(enrollment["version"], 1)
+            self.assertEqual(enrollment["algorithm"], "Ed25519")
+            self.assertNotIn("private_key_scrypt", enrollment)
+            self.assertEqual(store.root.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(store.credentials_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(store.enrollment_path.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipUnless(platform.system() == "Linux", "Linux passphrase encryption only")
+    def test_linux_passphrase_protector_encrypts_and_rejects_wrong_passphrase(self):
+        class InteractiveStdin:
+            @staticmethod
+            def isatty():
+                return True
+
+        protector = LinuxPassphraseProtector()
+        secret = bytes(range(32))
+        entropy = b"trusted-device-test-origin"
+        passphrase = "correct horse battery staple"
+        with (
+            patch("tools.trusted_device_store.sys.stdin", InteractiveStdin()),
+            patch(
+                "tools.trusted_device_store.getpass.getpass",
+                side_effect=[passphrase, passphrase],
+            ),
+        ):
+            encrypted = protector.protect(secret, entropy)
+        self.assertNotIn(base64.urlsafe_b64encode(secret), encrypted)
+
+        with (
+            patch("tools.trusted_device_store.sys.stdin", InteractiveStdin()),
+            patch("tools.trusted_device_store.getpass.getpass", return_value=passphrase),
+        ):
+            self.assertEqual(protector.unprotect(encrypted, entropy), secret)
+
+        with (
+            patch("tools.trusted_device_store.sys.stdin", InteractiveStdin()),
+            patch(
+                "tools.trusted_device_store.getpass.getpass",
+                return_value="another valid passphrase",
+            ),
+        ):
+            with self.assertRaises(TrustedDeviceError):
+                protector.unprotect(encrypted, entropy)
 
     def test_dpapi_failure_has_no_plaintext_fallback(self):
         class BrokenProtector:

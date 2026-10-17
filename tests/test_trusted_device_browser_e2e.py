@@ -4,6 +4,8 @@ import hashlib
 import ipaddress
 import json
 import os
+import platform
+import shlex
 import socket
 import subprocess
 import sys
@@ -13,6 +15,8 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import uvicorn
 from cryptography import x509
@@ -23,6 +27,9 @@ from fastapi.testclient import TestClient
 
 from tme3bot.api.backend import create_backend_app
 from tme3bot.infrastructure.device_auth import DeviceAuthService
+from tools.trusted_device import command_init, command_prepare
+from tools.trusted_device_browser import open_trusted_context
+from tools.trusted_device_store import LinuxPassphraseProtector
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -247,6 +254,148 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
                     text=True,
                     timeout=20,
                 )
+            fixture.tearDown()
+            temp.cleanup()
+
+
+@unittest.skipUnless(
+    platform.system() == "Linux" and RUN_E2E,
+    "Set TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E=1; requires Linux and Playwright Chromium",
+)
+class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
+    def test_linux_enrollment_v1_and_playwright_session_revocation(self):
+        from tests.test_backend_api import BackendApiTests
+        from playwright.sync_api import sync_playwright
+
+        fixture = BackendApiTests()
+        fixture.setUp()
+        temp = tempfile.TemporaryDirectory(prefix="tme3-device-linux-e2e-")
+        folder = Path(temp.name)
+        server = None
+        server_thread = None
+        try:
+            config_home = folder / "config"
+            config_home.mkdir()
+            port_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            port_socket.bind(("127.0.0.1", 0))
+            port = port_socket.getsockname()[1]
+            port_socket.close()
+            origin = f"https://127.0.0.1:{port}"
+
+            _, ca_pem, cert_path, key_path, _ = make_test_certificates(folder)
+            fixture.context.config.web_cookie_secure = True
+            fixture.context.config.web_public_origin = origin
+            fixture.context.device_auth = DeviceAuthService(fixture.auth_repository, fixture.auth, origin)
+            app = create_backend_app(fixture.context)
+            server = uvicorn.Server(
+                uvicorn.Config(
+                    app,
+                    host="127.0.0.1",
+                    port=port,
+                    ssl_certfile=str(cert_path),
+                    ssl_keyfile=str(key_path),
+                    log_level="critical",
+                    access_log=False,
+                )
+            )
+            server_thread = threading.Thread(target=server.run, daemon=True)
+            server_thread.start()
+            deadline = time.monotonic() + 10
+            while not server.started and server_thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(server.started, "Local HTTPS API fixture did not start")
+
+            helper_env = {"XDG_CONFIG_HOME": str(config_home), "SSL_CERT_FILE": str(ca_pem)}
+            passphrase = b"trusted-device e2e passphrase"
+            with patch.dict(os.environ, helper_env):
+                with patch.object(LinuxPassphraseProtector, "_read_passphrase", return_value=passphrase):
+                    initialized = command_init(
+                        SimpleNamespace(origin=origin, name="Linux Playwright E2E")
+                    )
+                enrollment_path = Path(initialized["enrollment_file"])
+                enrollment = json.loads(enrollment_path.read_text(encoding="utf-8"))
+                self.assertEqual(enrollment["version"], 1)
+                self.assertEqual(enrollment["origin"], origin)
+                self.assertNotIn("private_key_scrypt", enrollment)
+
+                browser_client = TestClient(app, base_url=origin)
+                pair = fixture.auth._new_web_session(42)
+                csrf = "local-linux-device-enrollment-csrf"
+                browser_client.cookies.set("tme3_access", pair.access_token)
+                browser_client.cookies.set("tme3_refresh", pair.refresh_token)
+                browser_client.cookies.set("tme3_csrf", csrf)
+                registered = browser_client.post(
+                    "/api/v1/auth/devices",
+                    headers={"Origin": origin, "X-CSRF-Token": csrf},
+                    json=enrollment,
+                )
+                self.assertEqual(registered.status_code, 201, registered.text)
+                device_id = enrollment["device_id"]
+
+                def prepare_state() -> Path:
+                    with patch.object(
+                        LinuxPassphraseProtector,
+                        "_read_passphrase",
+                        return_value=passphrase,
+                    ):
+                        result = command_prepare(SimpleNamespace(origin=origin))
+                    return Path(result["browser_state_file"])
+
+                first_state = prepare_state()
+                with sync_playwright() as playwright:
+                    chromium = Path(playwright.chromium.executable_path)
+                self.assertTrue(chromium.is_file(), "Playwright Chromium is not installed")
+                browser_wrapper = folder / "chromium-test-wrapper"
+                browser_wrapper.write_text(
+                    "#!/bin/sh\n"
+                    f"exec {shlex.quote(str(chromium))} --ignore-certificate-errors \"$@\"\n",
+                    encoding="utf-8",
+                )
+                browser_wrapper.chmod(0o700)
+
+                with open_trusted_context(
+                    origin=origin,
+                    storage_state=first_state,
+                    headless=True,
+                    executable_path=str(browser_wrapper),
+                ) as context:
+                    page = context.new_page()
+                    response = page.goto(
+                        f"{origin}/api/v1/auth/browser/session",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    self.assertEqual(response.status if response else None, 200)
+                    payload = response.json()
+                    self.assertTrue(payload["authenticated"])
+                    self.assertEqual(payload["actor"]["telegram_user_id"], 42)
+                self.assertFalse(first_state.exists(), "Imported browser state must be consumed")
+
+                second_state = prepare_state()
+                revoked = browser_client.delete(
+                    f"/api/v1/auth/devices/{device_id}",
+                    headers={"Origin": origin, "X-CSRF-Token": csrf},
+                )
+                self.assertEqual(revoked.status_code, 200, revoked.text)
+                with open_trusted_context(
+                    origin=origin,
+                    storage_state=second_state,
+                    headless=True,
+                    executable_path=str(browser_wrapper),
+                ) as context:
+                    page = context.new_page()
+                    response = page.goto(
+                        f"{origin}/api/v1/auth/browser/session",
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                    self.assertEqual(response.status if response else None, 401)
+                self.assertFalse(second_state.exists(), "Rejected browser state must also be consumed")
+        finally:
+            if server is not None:
+                server.should_exit = True
+            if server_thread is not None:
+                server_thread.join(timeout=5)
             fixture.tearDown()
             temp.cleanup()
 
