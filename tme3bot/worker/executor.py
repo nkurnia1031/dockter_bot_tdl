@@ -28,6 +28,7 @@ from tme3bot.profile_diagnostics import (
     PROFILE_LOCAL_DIAGNOSTIC_CODES,
 )
 from tme3bot.profiles import build_profile_config
+from tme3bot.profile_provisioning import profile_bundle_identity
 from tme3bot.names import normalize_profile_name
 from tme3bot.state import HttpStateStore, StateApiError
 from tme3bot.rclone import RcloneRunner
@@ -794,7 +795,11 @@ class WorkerJobExecutor(
                 )
                 if not hashlib.sha256(bundle).hexdigest() == bundle_sha256:
                     raise RuntimeError("PROFILE_DISTRIBUTION_BUNDLE_CHECKSUM_INVALID")
-                if self.validate_profile_session(bundle).get("telegram_user_id") != user_id:
+                try:
+                    bundle_user_id = profile_bundle_identity(bundle)
+                except ValueError:
+                    raise RuntimeError("PROFILE_DISTRIBUTION_BUNDLE_INVALID") from None
+                if bundle_user_id != user_id:
                     raise RuntimeError("PROFILE_DISTRIBUTION_IDENTITY_MISMATCH")
                 report("bundle_validation", "succeeded")
             installed = self.install_profile_bundle(

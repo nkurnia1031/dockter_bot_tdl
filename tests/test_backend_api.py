@@ -1786,11 +1786,23 @@ class BackendApiTests(unittest.TestCase):
             json=event,
         )
         self.assertTrue(repeated.json()["duplicate"])
+        install_started = self.client.post(
+            f"/internal/v1/profile-distributions/{operation['id']}/events",
+            headers=internal_headers,
+            json={
+                "profile": "default", "revision": 1, "sequence": 2,
+                "phase": "session_install", "status": "running",
+            },
+        )
+        self.assertEqual(install_started.status_code, 200, install_started.text)
         progress = self.client.get(
             f"/api/v1/profile-distributions/{operation['id']}/events", headers=headers
         )
         self.assertEqual(progress.status_code, 200, progress.text)
-        self.assertEqual([item["phase"] for item in progress.json()["items"]], ["queued", "archive_download"])
+        self.assertEqual(
+            [item["phase"] for item in progress.json()["items"]],
+            ["queued", "archive_download", "session_install"],
+        )
         self.assertNotIn("synthetic-session", progress.text)
 
     def test_profile_management_uses_fast_worker_health_check(self):

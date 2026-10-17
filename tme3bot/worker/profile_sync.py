@@ -32,7 +32,7 @@ _MAX_QUEUED_SYNC_REQUESTS = 32
 _MAX_PENDING_SYNC_EVENTS = 10000
 _MAX_EXTERNAL_EVENT_RUNS = 512
 _SYNC_EVENT_PHASES = {
-    "queued", "manifest_fetch", "revision_compare", "bundle_download", "archive_download",
+    "queued", "manifest_fetch", "revision_compare", "bundle_download", "archive_download", "failed",
     "bundle_validation", "session_validation", "session_install", "session_commit",
     "acknowledgement", "worker_unreachable", "completed", "cancelled",
     "download_staging", "download_validation", "download_install",
@@ -878,8 +878,13 @@ class ProfileSyncClient:
                 event = dict(pending[0]) if pending else None
             if event is None:
                 return
+            identity = self._sync_event_identity(event)
             try:
                 distribution_id = str(event.pop("distribution_operation_id", ""))
+                if distribution_id:
+                    # The distribution endpoint correlates events by operation ID in
+                    # the URL and accepts only its public event schema.
+                    event.pop("run_id", None)
                 event_path = (
                     f"/internal/v1/profile-distributions/{quote(distribution_id, safe='')}/events"
                     if distribution_id
@@ -897,7 +902,6 @@ class ProfileSyncClient:
             except Exception as exc:
                 LOGGER.debug("Could not report profile sync event (%s)", type(exc).__name__)
                 return
-            identity = self._sync_event_identity(event)
             with self._condition:
                 pending = self._state.setdefault("pending_sync_events", [])
                 self._state["pending_sync_events"] = [

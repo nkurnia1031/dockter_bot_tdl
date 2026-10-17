@@ -516,6 +516,48 @@ class WorkerProfileSyncTests(unittest.TestCase):
         self.assertEqual(replay_transport.sync_events[0]["details"], {"bundle_bytes": 512})
         self.assertEqual(restarted._state["pending_sync_events"], [])
 
+    def test_distribution_event_uses_distribution_endpoint_contract(self):
+        client, _transport = self.make_client([], {})
+        operation_id = "a36b11cb-2135-4fce-89c2-772b0eb25792"
+        requests = []
+
+        def accept_event(method, path, data, *, timeout):
+            requests.append((method, path, json.loads(data.decode("utf-8")), timeout))
+            return json.dumps({"accepted": True}).encode("utf-8"), {}
+
+        client._request = accept_event
+        client.report_external_event(
+            run_id=operation_id,
+            sequence=1,
+            profile="irang",
+            revision=7,
+            phase="failed",
+            status="failed",
+            code="PROFILE_INSTALL_FAILED",
+            distribution_operation_id=operation_id,
+        )
+
+        self.assertEqual(len(requests), 1)
+        method, path, body, timeout = requests[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            path,
+            f"/internal/v1/profile-distributions/{operation_id}/events",
+        )
+        self.assertEqual(
+            body,
+            {
+                "profile": "irang",
+                "revision": 7,
+                "sequence": 1,
+                "phase": "failed",
+                "status": "failed",
+                "code": "PROFILE_INSTALL_FAILED",
+            },
+        )
+        self.assertEqual(timeout, 3)
+        self.assertEqual(client._state["pending_sync_events"], [])
+
     def test_three_lane_progress_phases_are_durable_and_allowlisted(self):
         client, transport = self.make_client([], {})
         phases = (

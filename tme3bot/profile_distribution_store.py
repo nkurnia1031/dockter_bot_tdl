@@ -175,7 +175,7 @@ class ProfileDistributionStore:
             "download_staging", "download_validation", "download_install",
             "export_staging", "export_validation", "export_install",
             "upload_staging", "upload_validation", "upload_install",
-            "identity_install", "session_commit", "transaction_rollback",
+            "identity_install", "session_install", "session_commit", "transaction_rollback",
             "completed", "waiting_worker", "failed",
         }
         allowed_statuses = {"queued", "running", "waiting", "succeeded", "failed"}

@@ -16,7 +16,7 @@ _PHASES = {
     "archive_download", "bundle_validation", "download_staging", "download_validation",
     "download_install", "export_staging", "export_validation", "export_install",
     "upload_staging", "upload_validation", "upload_install", "identity_install",
-    "session_commit", "transaction_rollback", "completed", "failed",
+    "session_install", "session_commit", "transaction_rollback", "completed", "failed",
 }
 _STATUSES = {"running", "waiting", "succeeded", "failed"}
 
