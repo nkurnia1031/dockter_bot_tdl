@@ -89,6 +89,28 @@
             </div>
           </div>
         </div>
+        {#if job.kind === 'storage_upload' && progress.activeItems.length}
+          <div class="mt-3 grid gap-2 sm:grid-cols-2" aria-label="Upload Storage aktif per profil">
+            {#each progress.activeItems as active (String(active.profile || job.profile) + ':' + String(active.name || '') + ':' + String(active.attempt || 0))}
+              <div class="min-w-0 rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] p-2.5">
+                <div class="flex items-start justify-between gap-2">
+                  <div class="min-w-0">
+                    <small class="block text-[11px] font-semibold text-[var(--muted)]">Profil {active.profile || job.profile}</small>
+                    <b class="block truncate text-xs font-semibold text-[var(--ink)]" title={active.name || 'File Storage'}>{active.name || 'File Storage'}</b>
+                  </div>
+                  <span class="shrink-0 text-[10px] font-semibold text-[var(--muted)]">{phaseLabel(String(active.phase || progress.phase))}</span>
+                </div>
+                <div class="progress-track mt-2 !h-1.5">
+                  <div class="progress-fill" style={`width:${active.percent ?? 0}%`}></div>
+                </div>
+                <div class="mt-1.5 flex justify-between gap-2 font-mono text-[10px] text-[var(--muted)]">
+                  <span>{active.size_bytes ? `${formatBytes(active.bytes_current || 0)} / ${formatBytes(active.size_bytes)}` : 'Ukuran belum diketahui'}</span>
+                  <span>{active.percent !== undefined ? `${active.percent.toFixed(0)}%` : '...'}</span>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
         <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-semibold text-[var(--muted)]">
           {#if queueWaitSeconds !== undefined}<span>Antre {formatDuration(queueWaitSeconds)}</span>{/if}
           {#if phaseElapsedSeconds !== undefined && job.status !== 'queued'}<span>Fase ini {formatDuration(phaseElapsedSeconds)}</span>{/if}
@@ -155,7 +177,7 @@
       </div>
 
       <!-- Active File / Item Progress -->
-      {#if progress.item.name}
+      {#if job.kind !== 'storage_upload' && progress.item.name}
         <div class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3.5">
           <div class="flex justify-between gap-3 text-sm">
             <b class="min-w-0 truncate font-semibold">{progress.item.name}</b>

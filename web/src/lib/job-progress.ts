@@ -6,6 +6,7 @@ export type NormalizedProgress = {
   batch: Record<string, any>;
   overall: Record<string, any>;
   item: Record<string, any>;
+  activeItems: Record<string, any>[];
   transfer: Record<string, any>;
   counters: { succeeded: number; failed: number; skipped: number };
   indeterminate: boolean;
@@ -24,13 +25,18 @@ export function clampPercent(value: unknown): number | undefined {
 
 export function normalizeJobProgress(job: JobLike): NormalizedProgress {
   const raw = job.progress || {};
-  if (raw.phase && (raw.overall || raw.item || raw.transfer || raw.counters)) {
+  if (raw.phase && (raw.overall || raw.item || raw.transfer || raw.counters || raw.active_items)) {
     return {
       phase: String(raw.phase),
       message: String(raw.message || `${job.kind} sedang diproses`),
       batch: { ...(raw.batch || {}) },
       overall: { ...(raw.overall || {}), percent: clampPercent(raw.overall?.percent) },
       item: { ...(raw.item || {}), percent: clampPercent(raw.item?.percent) },
+      activeItems: Array.isArray(raw.active_items)
+        ? raw.active_items
+            .filter((active: unknown): active is Record<string, any> => Boolean(active && typeof active === 'object' && !Array.isArray(active)))
+            .map((active: Record<string, any>) => ({ ...active, percent: clampPercent(active.percent) }))
+        : [],
       transfer: raw.transfer || {},
       counters: {
         succeeded: number(raw.counters?.succeeded) || 0,
@@ -61,6 +67,7 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
       total: number(raw.tdl_fraction_total ?? raw.current_media_total),
       percent: clampPercent(raw.tdl_percent)
     },
+    activeItems: [],
     transfer: {
       speed_bps: number(raw.tdl_speed_bps),
       speed_text: raw.tdl_speed,

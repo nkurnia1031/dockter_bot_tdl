@@ -1018,6 +1018,7 @@ class StorageExecutorMixin:
         succeeded = 0
         failed_count = 0
         in_flight = 0
+        active_items: dict[str, dict[str, Any]] = {}
         lane_condition = threading.Condition(lanes_lock)
 
         def persist(
@@ -1111,11 +1112,6 @@ class StorageExecutorMixin:
             transfer: dict[str, Any] | None = None,
             force: bool = False,
         ) -> dict[str, Any]:
-            with results_lock:
-                current = completed_files
-                current_bytes = completed_bytes + sum(active_bytes.values())
-                success_count = succeeded
-                failure_count = failed_count
             item: dict[str, Any] = {}
             if name is not None:
                 item["name"] = name
@@ -1132,15 +1128,43 @@ class StorageExecutorMixin:
                 item["index"] = file_indexes.get(relative, 0)
                 item["total"] = len(files)
                 item["size_bytes"] = file_sizes.get(selected_path, 0) if selected_path else 0
-            overall = {
-                "current": current,
-                "total": len(files),
-                "percent": current_bytes * 100 / total_bytes if total_bytes else 100,
-                "unit": "files",
-                "bytes_current": min(total_bytes, current_bytes),
-                "bytes_total": total_bytes,
-            }
             with progress_lock:
+                with results_lock:
+                    active_item = active_items.get(relative) if relative is not None else None
+                    if active_item is not None:
+                        if name is not None:
+                            active_item["name"] = name
+                        if profile is not None:
+                            active_item["profile"] = profile
+                        if attempt is not None:
+                            active_item["attempt"] = attempt
+                        active_item["phase"] = phase
+                        if item_percent is not None:
+                            active_item["percent"] = item_percent
+                        if transfer is not None:
+                            for key in ("bytes_current", "bytes_total", "speed_bps", "eta_seconds"):
+                                value = transfer.get(key)
+                                if value is not None:
+                                    active_item[key] = value
+                    current = completed_files
+                    current_bytes = completed_bytes + sum(active_bytes.values())
+                    success_count = succeeded
+                    failure_count = failed_count
+                    active_items_snapshot = sorted(
+                        (dict(active) for active in active_items.values()),
+                        key=lambda active: (
+                            str(active.get("profile") or ""),
+                            str(active.get("name") or ""),
+                        ),
+                    )
+                overall = {
+                    "current": current,
+                    "total": len(files),
+                    "percent": current_bytes * 100 / total_bytes if total_bytes else 100,
+                    "unit": "files",
+                    "bytes_current": min(total_bytes, current_bytes),
+                    "bytes_total": total_bytes,
+                }
                 return reporter.report(
                     phase=phase,
                     message=message,
@@ -1148,6 +1172,7 @@ class StorageExecutorMixin:
                     item=item,
                     transfer=transfer,
                     counters={"succeeded": success_count, "failed": failure_count},
+                    extra={"active_items": active_items_snapshot},
                     force=force,
                     indeterminate=item_percent is None and phase in {"sending", "resolving_message"},
                 )
@@ -1181,6 +1206,7 @@ class StorageExecutorMixin:
             )
             with results_lock:
                 active_bytes.pop(relative, None)
+                active_items.pop(relative, None)
                 completed_files += 1
                 completed_bytes += int(file_sizes.get(path, 0))
                 if status == "succeeded":
@@ -1308,6 +1334,16 @@ class StorageExecutorMixin:
                         retryable=False,
                         caption=caption,
                     )
+                    with results_lock:
+                        active_items[relative] = {
+                            "name": path.name,
+                            "profile": profile,
+                            "attempt": attempt,
+                            "phase": "uploading",
+                            "percent": 0,
+                            "size_bytes": size,
+                            "bytes_current": 0,
+                        }
                     progress = report_progress(
                         phase="uploading",
                         message=f"Mengupload {path.name} melalui lane Upload {profile}",
@@ -1439,9 +1475,17 @@ class StorageExecutorMixin:
                                     error_code=access_denial,
                                     error_message=denied_message,
                                 )
+                                with results_lock:
+                                    active_items.pop(relative, None)
+                                    active_bytes.pop(relative, None)
                                 with lane_condition:
                                     tasks.put({**task, "attempt": attempt + 1})
                                     lane_condition.notify_all()
+                                report_progress(
+                                    phase="uploading",
+                                    message=f"Memindahkan {path.name} ke lane Upload lain",
+                                    force=True,
+                                )
                             else:
                                 finish_item(
                                     task,

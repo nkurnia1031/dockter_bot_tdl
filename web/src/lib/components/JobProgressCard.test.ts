@@ -37,6 +37,36 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('1')).toBeTruthy();
   });
 
+  it('shows every active Storage upload with its profile and file', () => {
+    render(JobProgressCard, {
+      job: {
+        kind: 'storage_upload',
+        status: 'running',
+        profile: 'default',
+        worker: 'local',
+        created_at: new Date().toISOString(),
+        progress: {
+          phase: 'uploading',
+          message: 'Mengupload archive.zip',
+          active_items: [
+            { profile: 'default', name: 'camera.zip', phase: 'uploading', percent: 35, size_bytes: 1000, bytes_current: 350 },
+            { profile: 'archive', name: 'archive.zip', phase: 'uploading', percent: 72, size_bytes: 2000, bytes_current: 1440 }
+          ]
+        }
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn()
+    });
+
+    expect(screen.getByText('Profil default')).toBeTruthy();
+    expect(screen.getByText('camera.zip')).toBeTruthy();
+    expect(screen.getByText('35%')).toBeTruthy();
+    expect(screen.getByText('Profil archive')).toBeTruthy();
+    expect(screen.getByText('archive.zip')).toBeTruthy();
+    expect(screen.getByText('72%')).toBeTruthy();
+  });
+
   it('toggles detail drawer when clicking Detail button', async () => {
     render(JobProgressCard, {
       job: {

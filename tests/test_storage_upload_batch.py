@@ -228,6 +228,25 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertEqual(result["succeeded"], 4)
         self.assertGreaterEqual(uploader.metrics.maximum_total, 2)
         self.assertEqual(uploader.metrics.maximum, {"default": 1, "archive": 1})
+        progress_snapshots = [
+            kwargs.get("progress", {})
+            for args, kwargs in uploader.events
+            if len(args) > 2 and args[2] == "progress.snapshot"
+        ]
+        overlapping_items = next(
+            (
+                snapshot.get("active_items")
+                for snapshot in progress_snapshots
+                if len(snapshot.get("active_items") or []) >= 2
+            ),
+            None,
+        )
+        self.assertIsNotNone(overlapping_items)
+        self.assertEqual(
+            {item["profile"] for item in overlapping_items},
+            {"default", "archive"},
+        )
+        self.assertEqual(len({item["name"] for item in overlapping_items}), 2)
         items = self.store.storage_upload_items("storage-command")
         self.assertEqual([item["name"] for item in items], ["four.txt", "one.txt", "three.txt", "two.txt"])
         self.assertTrue(all(item["status"] == "succeeded" for item in items))
