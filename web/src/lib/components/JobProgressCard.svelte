@@ -56,6 +56,9 @@
           {#if progress.item.index}
             <span class="rounded bg-sky-100 px-1.5 py-0.5 text-xs font-bold text-sky-800 dark:bg-sky-950 dark:text-sky-200">File {progress.item.index}/{progress.item.total || '?'}</span>
           {/if}
+          {#if job.kind === 'storage_upload' && progress.activeItems.length > 1}
+            <span class="rounded bg-violet-100 px-1.5 py-0.5 text-xs font-bold text-violet-800 dark:bg-violet-950 dark:text-violet-200">{progress.activeItems.length} file aktif</span>
+          {/if}
           <span class="muted hidden text-xs sm:inline">{job.profile} / {job.worker}</span>
         </div>
 
@@ -175,6 +178,35 @@
           <div class="progress-fill" style={`width:${overallPercent ?? 0}%`}></div>
         </div>
       </div>
+
+      {#if job.kind === 'storage_upload' && progress.activeItems.length}
+        <section class="mt-4" aria-label="Detail upload Storage aktif per profil">
+          <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <b class="text-sm font-extrabold">File yang sedang diupload</b>
+            <span class="muted text-xs">{progress.activeItems.length} lane aktif</span>
+          </div>
+          <div class="grid gap-2 sm:grid-cols-2">
+            {#each progress.activeItems as active (String(active.profile || job.profile) + ':' + String(active.name || '') + ':' + String(active.attempt || 0))}
+              <div class="min-w-0 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3.5">
+                <div class="flex items-start justify-between gap-3">
+                  <div class="min-w-0">
+                    <small class="muted block">Profil {active.profile || job.profile}</small>
+                    <b class="mt-1 block truncate text-sm" title={active.name || 'File Storage'}>{active.name || 'File Storage'}</b>
+                  </div>
+                  <span class="muted shrink-0 text-xs">{phaseLabel(String(active.phase || progress.phase))}</span>
+                </div>
+                <div class="progress-track mt-3 !h-2">
+                  <div class="progress-fill" style={`width:${active.percent ?? 0}%`}></div>
+                </div>
+                <div class="muted mt-2 flex flex-wrap justify-between gap-2 text-xs font-mono">
+                  <span>{active.size_bytes ? `${formatBytes(active.bytes_current || 0)} / ${formatBytes(active.size_bytes)}` : 'Ukuran belum diketahui'}</span>
+                  <span>{active.percent !== undefined ? `${active.percent.toFixed(0)}%` : 'Sedang diproses'}</span>
+                </div>
+              </div>
+            {/each}
+          </div>
+        </section>
+      {/if}
 
       <!-- Active File / Item Progress -->
       {#if job.kind !== 'storage_upload' && progress.item.name}
