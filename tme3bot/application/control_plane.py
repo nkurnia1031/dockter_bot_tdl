@@ -416,20 +416,11 @@ class ControlPlane:
             job_id, private_values
         )
         existing = self.jobs.get(job_id)
+        retry_event = None
+        retry_attempt = 1
         if existing is not None and existing.status.terminal:
-            # Retry is an in-place reset. The event stream remains attached to
-            # the stable ID, while the current row becomes the new attempt.
-            reset = self.jobs.reset_for_retry
-            if encrypted_private_values:
-                reset(
-                    job_id,
-                    redacted_payload,
-                    settings_version=settings_version,
-                    private_values=encrypted_private_values,
-                )
-            else:
-                reset(job_id, redacted_payload, settings_version=settings_version)
-            job = self.jobs.get(job_id)
+            # Keep the retry event and command payload with the queue reset so
+            # the scheduler cannot observe a half-prepared queued job.
             retry_attempt = 1 + sum(
                 1
                 for event in self.jobs.events(job_id)
@@ -445,20 +436,18 @@ class ControlPlane:
             sequence = max(
                 (event.sequence for event in self.jobs.events(job_id)), default=0
             ) + 1
-            self.jobs.append_event(
-                JobEvent(
-                    job_id=job_id,
-                    sequence=sequence,
-                    status=JobStatus.QUEUED,
-                    event_type="retry_started",
-                    progress={
-                        "phase": "queued",
-                        "retry_attempt": retry_attempt,
-                        "retry_phase": retry_phase,
-                    },
-                )
+            retry_event = JobEvent(
+                job_id=job_id,
+                sequence=sequence,
+                status=JobStatus.QUEUED,
+                event_type="retry_started",
+                progress={
+                    "phase": "queued",
+                    "retry_attempt": retry_attempt,
+                    "retry_phase": retry_phase,
+                },
             )
-            job = self.jobs.get(job_id) or job
+            job = existing
         elif existing is not None:
             raise DomainError(
                 "JOB_NOT_TERMINAL",
@@ -476,17 +465,6 @@ class ControlPlane:
                 payload=redacted_payload,
                 settings_version=settings_version,
             )
-            if encrypted_private_values:
-                creator = getattr(self.jobs, "create_with_private_values", None)
-                if not callable(creator):
-                    raise DomainError(
-                        "JOB_PRIVATE_STORAGE_UNAVAILABLE",
-                        "Penyimpanan privat job belum tersedia.",
-                        status_code=503,
-                    )
-                creator(job, encrypted_private_values)
-            else:
-                self.jobs.create(job)
         retry_meta = internal_payload.get("quick_retry") or {}
         retry_meta = retry_meta if isinstance(retry_meta, dict) else {}
         stable_stage_id = retry_meta.get("stage_job_id")
@@ -511,21 +489,50 @@ class ControlPlane:
                 1
                 for event in self.jobs.events(job.id)
                 if event.event_type == "retry_started"
-            ),
+            ) + (1 if retry_event is not None else 0),
             "kind": kind,
             "profile": execution_profile,
             "actor_user_id": actor.telegram_user_id,
             "worker": selected_worker,
             "execution": execution.as_dict(),
-            "payload": self._worker_payload(job.id, kind, internal_payload),
         }
-        self.jobs.save_execution_plan(job.id, execution.as_dict(), internal_payload)
+        if retry_event is not None:
+            reset = self.jobs.reset_for_retry
+            reset(
+                job_id,
+                redacted_payload,
+                settings_version=settings_version,
+                private_values=encrypted_private_values or None,
+                execution_plan=execution.as_dict(),
+                command_payload=internal_payload,
+                retry_event=retry_event,
+            )
+            job = self.jobs.get(job_id) or job
+        else:
+            creator = getattr(self.jobs, "create_with_private_values", None)
+            if not callable(creator):
+                raise DomainError(
+                    "JOB_PRIVATE_STORAGE_UNAVAILABLE",
+                    "Penyimpanan privat job belum tersedia.",
+                    status_code=503,
+                )
+            creator(
+                job,
+                encrypted_private_values,
+                execution_plan=execution.as_dict(),
+                command_payload=internal_payload,
+            )
+        command["payload"] = self._worker_payload(job.id, kind, internal_payload)
         admission = self.jobs.try_acquire_execution(job.id)
-        self.jobs.set_queue_info(
-            job.id, int(admission.get("position", 1)), admission.get("blocked_reason")
-        )
+        current_job = self.jobs.get(job.id)
+        if current_job is not None and current_job.status == JobStatus.QUEUED:
+            self.jobs.set_queue_info(
+                job.id,
+                int(admission.get("position", 1)),
+                admission.get("blocked_reason"),
+            )
         if not admission.get("admitted"):
-            return self.jobs.get(job.id) or job
+            return current_job or job
         try:
             self._dispatch_admitted_job(self.jobs.get(job.id) or job, command)
             return self.jobs.get(job.id) or job
@@ -1868,11 +1875,13 @@ class ControlPlane:
                         # must never silently fall back to worker-local state.
                         continue
                 admission = self.jobs.try_acquire_execution(queued.id)
-                self.jobs.set_queue_info(
-                    queued.id,
-                    int(admission.get("position", 1)),
-                    admission.get("blocked_reason"),
-                )
+                current = self.jobs.get(queued.id)
+                if current is not None and current.status == JobStatus.QUEUED:
+                    self.jobs.set_queue_info(
+                        queued.id,
+                        int(admission.get("position", 1)),
+                        admission.get("blocked_reason"),
+                    )
                 if not admission.get("admitted"):
                     continue
                 if not isinstance(command_payload, dict):

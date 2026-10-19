@@ -652,6 +652,54 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertNotIn("_tdl_sender_session_fingerprints", job.payload)
         self.assertEqual(job.payload["sender_profile"], "archive")
 
+    def test_storage_submit_is_safe_when_scheduler_scans_during_job_creation(self):
+        self.authorize_quick_mode_storage()
+        create = self.jobs.create_with_private_values
+
+        def create_and_scan_scheduler(job, private_values, **kwargs):
+            created = create(job, private_values, **kwargs)
+            self.control._dispatch_pending_jobs()
+            return created
+
+        self.jobs.create_with_private_values = create_and_scan_scheduler
+
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/source"},
+            worker="local",
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(len(self.dispatcher.commands), 1)
+        self.assertEqual(
+            self.dispatcher.commands[0]["payload"]["tdl_access_target"], "-100123"
+        )
+        self.assertEqual(
+            self.dispatcher.commands[0]["payload"]["_tdl_sender_session_fingerprints"],
+            {"default": "a" * 64, "archive": "b" * 64, "other": "c" * 64},
+        )
+
+    def test_scheduler_does_not_claim_job_already_admitted_by_submitter(self):
+        self.authorize_quick_mode_storage()
+        dispatch = self.control._dispatch_admitted_job
+
+        def scan_after_submitter_claim(job, command):
+            self.control._dispatch_pending_jobs()
+            dispatch(job, command)
+
+        self.control._dispatch_admitted_job = scan_after_submitter_claim
+
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/source"},
+            worker="local",
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(len(self.dispatcher.commands), 1)
+
     def test_storage_retry_submits_only_confirmed_not_sent_files(self):
         fingerprints = {"default": "a" * 64, "archive": "b" * 64}
         self.dispatcher.capabilities = lambda _worker: {

@@ -253,9 +253,25 @@ class SqliteJobRepository:
         return self.create_with_private_values(job, {})
 
     def create_with_private_values(
-        self, job: Job, private_values: dict[str, bytes]
+        self,
+        job: Job,
+        private_values: dict[str, bytes],
+        *,
+        execution_plan: dict[str, Any] | None = None,
+        command_payload: dict[str, Any] | None = None,
     ) -> Job:
+        if (execution_plan is None) != (command_payload is None):
+            raise ValueError("Execution plan dan command payload harus disimpan bersama.")
         with self._db() as db:
+            if execution_plan is not None and command_payload is not None:
+                self.insert_prepared_job(
+                    db,
+                    job,
+                    execution_plan,
+                    command_payload,
+                    private_values,
+                )
+                return job
             db.execute(
                 """
                 INSERT INTO jobs(
@@ -354,6 +370,9 @@ class SqliteJobRepository:
         self, job_id: str, payload: dict[str, Any], *,
         settings_version: int | None = None,
         private_values: dict[str, bytes] | None = None,
+        execution_plan: dict[str, Any] | None = None,
+        command_payload: dict[str, Any] | None = None,
+        retry_event: JobEvent | None = None,
     ) -> Job:
         """Reset a terminal row for a new attempt without changing its ID.
 
@@ -361,6 +380,8 @@ class SqliteJobRepository:
         increasing event sequence lets the worker publish the new attempt
         without colliding with the previous attempt's telemetry.
         """
+        if (execution_plan is None) != (command_payload is None):
+            raise ValueError("Execution plan dan command payload harus disimpan bersama.")
         now = datetime.now(timezone.utc).isoformat()
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -406,6 +427,55 @@ class SqliteJobRepository:
             db.execute(
                 "DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,)
             )
+            if execution_plan is not None and command_payload is not None:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO job_execution_plans(
+                        job_id, concurrency_keys, queue_group, priority, lane,
+                        queued_at, admitted_at, released_at, blocked_reason
+                    ) VALUES(?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
+                    """,
+                    (
+                        job_id,
+                        _dump(execution_plan.get("resource_keys", [])),
+                        str(execution_plan.get("queue_group", "")),
+                        int(execution_plan.get("priority", 100)),
+                        str(execution_plan.get("lane", "unknown")),
+                        str(execution_plan.get("queued_at") or now),
+                    ),
+                )
+                db.execute(
+                    "INSERT OR REPLACE INTO job_commands(job_id, payload) VALUES(?, ?)",
+                    (job_id, _dump(command_payload)),
+                )
+            if retry_event is not None:
+                db.execute(
+                    """
+                    INSERT INTO job_events(
+                        job_id, sequence, status, event_type, progress, result,
+                        error, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        retry_event.job_id,
+                        retry_event.sequence,
+                        retry_event.status.value,
+                        retry_event.event_type,
+                        _dump(retry_event.progress),
+                        _dump(retry_event.result) if retry_event.result is not None else None,
+                        _dump(retry_event.error) if retry_event.error is not None else None,
+                        retry_event.created_at.isoformat(),
+                    ),
+                )
+                progress = {
+                    "phase": "queued",
+                    "retry_sequence": retry_event.sequence,
+                    **retry_event.progress,
+                }
+                db.execute(
+                    "UPDATE jobs SET progress = ?, progress_sequence = ? WHERE id = ?",
+                    (_dump(progress), retry_event.sequence, job_id),
+                )
             # A reused job ID also reuses its Telegram status message, but it
             # must become eligible for a fresh terminal notification.
             db.execute(
@@ -857,14 +927,33 @@ class SqliteJobRepository:
             )
             plan_row = db.execute(
                 """
-                SELECT p.*, j.worker, j.profile, j.status, j.payload
+                SELECT p.*, j.worker, j.profile, j.status, j.payload,
+                    c.payload AS command_payload
                 FROM job_execution_plans p JOIN jobs j ON j.id = p.job_id
+                LEFT JOIN job_commands c ON c.job_id = j.id
                 WHERE p.job_id = ?
                 """,
                 (job_id,),
             ).fetchone()
             if plan_row is None:
                 return {"admitted": True, "position": 1, "blocked_reason": None}
+            if str(plan_row["status"]) != JobStatus.QUEUED.value:
+                return {"admitted": False, "position": 1, "blocked_reason": None}
+            stored_command = _load(plan_row["command_payload"], None)
+            is_durable_dispatch = (
+                isinstance(stored_command, dict)
+                and stored_command.get("dispatch_mode") == "durable"
+            )
+            if (
+                plan_row["admitted_at"]
+                and not plan_row["released_at"]
+                and not is_durable_dispatch
+            ):
+                return {
+                    "admitted": False,
+                    "position": 1,
+                    "blocked_reason": None,
+                }
             is_quick_mode = _quick_mode_sql(True)[0] and bool(
                 db.execute(
                     "SELECT 1 FROM jobs WHERE id = ? AND " + _quick_mode_sql(True)[0],
@@ -930,6 +1019,10 @@ class SqliteJobRepository:
                         "INSERT OR IGNORE INTO job_quickmode_slots(job_id, worker, acquired_at) VALUES(?, ?, ?)",
                         (job_id, worker_name, now),
                     )
+                db.execute(
+                    "UPDATE job_execution_plans SET admitted_at = ?, released_at = NULL, blocked_reason = NULL WHERE job_id = ?",
+                    (now, job_id),
+                )
                 return {"admitted": True, "position": 1, "blocked_reason": None}
             placeholders = ",".join("?" for _ in keys)
             conflicts = db.execute(
