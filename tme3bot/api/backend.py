@@ -112,6 +112,7 @@ class BackendContext:
     local_profile_catalog: Any = None
     runtime_readiness_store: Any = None
     activity_journal: Any = None
+    decrypt_history_store: Any = None
 
 
 def _model_dict(model) -> dict[str, Any]:
@@ -1201,6 +1202,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         context,
         current_actor=current_actor,
         job_dict=job_dict,
+    )
+
+    from tme3bot.api.routes.decrypt_history import register_decrypt_history
+    register_decrypt_history(
+        app,
+        context,
+        current_actor=current_actor,
     )
 
 

@@ -512,6 +512,10 @@ class SafelinkJobRequest(BaseModel):
     worker: str | None = Field(default=None, min_length=1, max_length=48)
 
 
+class DecryptHistoryCreateRequest(BaseModel):
+    result: str
+
+
 class WorkerEventRequest(BaseModel):
     sequence: int
     status: str

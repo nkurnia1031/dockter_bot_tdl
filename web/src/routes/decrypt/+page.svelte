@@ -6,6 +6,12 @@
 
   const PASSPHRASE = 'root';
   const EXAMPLE = 'a77894319ebfd94509a5db3c280d9aee30d8f20e48773993e3a07eda5632fcf4050a8da670fb4831a28b1f68f6cef20af063b32024485302';
+  const DECRYPT_HISTORY_PAGE_SIZE = 50;
+  interface DecryptHistoryItem {
+    id: string;
+    result: string;
+    created_at: string;
+  }
   interface SafelinkFormatter {
     stringify(params: CryptoJS.lib.CipherParams): string;
     parse(value: string): CryptoJS.lib.CipherParams;
@@ -25,6 +31,14 @@
 
   let encrypted = $state('');
   let plaintext = $state('');
+  let decryptHistory = $state<DecryptHistoryItem[]>([]);
+  let decryptHistoryError = $state('');
+  let decryptHistoryLoading = $state(false);
+  let decryptHistoryLoadingMore = $state(false);
+  let decryptHistoryTotal = $state(0);
+  let decryptHistoryNextOffset = $state<number | null>(null);
+  let selectedDecryptHistoryId = $state('');
+  let decryptSaving = $state(false);
   let error = $state('');
   let notice = $state('');
   let copied = $state(false);
@@ -91,11 +105,13 @@
     return { value: raw.replace(/\s+/g, ''), fromParameter: false };
   }
 
-  function decrypt() {
+  async function decrypt() {
+    if (decryptSaving) return;
     error = '';
     notice = '';
     plaintext = '';
     copied = false;
+    selectedDecryptHistoryId = '';
 
     let input: { value: string; fromParameter: boolean };
     try {
@@ -116,18 +132,83 @@
       return;
     }
 
+    let decoded = '';
     try {
       const result = CryptoJS.AES.decrypt(value, PASSPHRASE, { format: formatter });
-      const decoded = result.toString(CryptoJS.enc.Utf8);
-      if (!decoded) {
-        error = 'Hasil dekripsi kosong. Periksa kembali teks dan kunci yang digunakan.';
-        return;
-      }
-      plaintext = decoded;
-      notice = input.fromParameter ? 'Parameter o ditemukan dan berhasil didekripsi di browser ini.' : 'Dekripsi selesai di browser ini.';
+      decoded = result.toString(CryptoJS.enc.Utf8);
     } catch {
       error = 'Dekripsi gagal. Periksa teks terenkripsi dan kecocokan kunci.';
+      return;
     }
+    if (!decoded) {
+      error = 'Hasil dekripsi kosong. Periksa kembali teks dan kunci yang digunakan.';
+      return;
+    }
+
+    plaintext = decoded;
+    decryptSaving = true;
+    try {
+      const saved = await api<{ item: DecryptHistoryItem }>('/decrypt/history', {
+        method: 'POST',
+        body: JSON.stringify({ result: decoded })
+      });
+      if (saved.item) {
+        decryptHistory = [saved.item, ...decryptHistory.filter((item) => item.id !== saved.item.id)];
+        decryptHistoryTotal += 1;
+        if (decryptHistoryNextOffset !== null) decryptHistoryNextOffset += 1;
+        selectedDecryptHistoryId = saved.item.id;
+      }
+      notice = input.fromParameter ? 'Parameter o berhasil didekripsi dan hasilnya disimpan di riwayat.' : 'Dekripsi selesai dan hasilnya disimpan di riwayat.';
+    } catch (cause) {
+      error = cause instanceof Error
+        ? `Dekripsi berhasil, tetapi hasil gagal disimpan di riwayat: ${cause.message}`
+        : 'Dekripsi berhasil, tetapi hasil gagal disimpan di riwayat.';
+    } finally {
+      decryptSaving = false;
+    }
+  }
+
+  async function loadDecryptHistory(offset = 0) {
+    if (decryptHistoryLoading || decryptHistoryLoadingMore) return;
+    const knownIds = new Set(decryptHistory.map((item) => item.id));
+    if (offset === 0) decryptHistoryLoading = true;
+    else decryptHistoryLoadingMore = true;
+    try {
+      const result = await api<{
+        items: DecryptHistoryItem[];
+        total: number;
+        next_offset: number | null;
+      }>(`/decrypt/history?limit=${DECRYPT_HISTORY_PAGE_SIZE}&offset=${offset}`);
+      if (offset === 0) {
+        const received = result.items || [];
+        const receivedIds = new Set(received.map((item) => item.id));
+        const addedWhileLoading = decryptHistory.filter(
+          (item) => !knownIds.has(item.id) && !receivedIds.has(item.id)
+        );
+        decryptHistory = [...addedWhileLoading, ...received];
+        decryptHistoryTotal = Number(result.total || 0) + addedWhileLoading.length;
+        decryptHistoryNextOffset = result.next_offset === null
+          ? null
+          : Number(result.next_offset || 0) + addedWhileLoading.length;
+      }
+      else {
+        const existingIds = new Set(decryptHistory.map((item) => item.id));
+        decryptHistory = [...decryptHistory, ...(result.items || []).filter((item) => !existingIds.has(item.id))];
+        decryptHistoryTotal = Number(result.total || 0);
+        decryptHistoryNextOffset = result.next_offset ?? null;
+      }
+      decryptHistoryError = '';
+    } catch (cause) {
+      decryptHistoryError = cause instanceof Error ? cause.message : 'Riwayat hasil dekripsi tidak dapat dimuat.';
+    } finally {
+      decryptHistoryLoading = false;
+      decryptHistoryLoadingMore = false;
+    }
+  }
+
+  function formatHistoryDate(value: string): string {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
   }
 
   async function copyOutput() {
@@ -145,6 +226,7 @@
   function fillExample() {
     encrypted = EXAMPLE;
     plaintext = '';
+    selectedDecryptHistoryId = '';
     error = '';
     notice = 'Contoh siap. Tekan Dekripsi untuk memprosesnya.';
   }
@@ -260,10 +342,11 @@
 
   onMount(() => {
     resolverMounted = true;
-    const refresh = () => { void loadResolverJobs(); void loadResolverWorkers(); };
+    const refresh = () => { void loadResolverJobs(); void loadResolverWorkers(); void loadDecryptHistory(); };
     window.addEventListener('tme3:data-mutated', refresh);
     void loadResolverJobs();
     void loadResolverWorkers();
+    void loadDecryptHistory();
     return () => {
       resolverMounted = false;
       if (resolverTimer) clearTimeout(resolverTimer);
@@ -274,6 +357,7 @@
   function clearAll() {
     encrypted = '';
     plaintext = '';
+    selectedDecryptHistoryId = '';
     error = '';
     notice = '';
     copied = false;
@@ -315,7 +399,7 @@
   ></textarea>
 
   <div class="mt-4 flex flex-wrap items-center gap-2">
-    <button class="button" type="button" onclick={decrypt}><KeyRound size={16}/>Dekripsi</button>
+    <button class="button" type="button" onclick={decrypt} disabled={decryptSaving}><KeyRound size={16}/>{decryptSaving ? 'Menyimpan…' : 'Dekripsi'}</button>
     <button class="button secondary" type="button" onclick={clearAll}><Trash2 size={15}/>Bersihkan</button>
   </div>
 
@@ -327,7 +411,7 @@
   <div class="flex flex-wrap items-start justify-between gap-3">
     <div>
       <h2 id="plaintext-title" class="font-extrabold">Hasil dekripsi</h2>
-      <p class="muted mt-1 text-sm">Hasil hanya disimpan di halaman ini sampai dibersihkan atau halaman ditutup.</p>
+      <p class="muted mt-1 text-sm">Setiap hasil yang berhasil didekripsi akan disimpan terenkripsi dan dapat dibuka kembali dari riwayat.</p>
     </div>
     <button class="button secondary" type="button" onclick={copyOutput} disabled={!plaintext}><Clipboard size={15}/>{copied ? 'Tersalin' : 'Salin hasil'}</button>
   </div>
@@ -352,7 +436,44 @@
   {/if}
 </section>
 
-<p class="muted mt-4 flex items-start gap-2 text-xs leading-5"><ShieldCheck size={15} class="mt-0.5 shrink-0"/>Pemrosesan dilakukan sepenuhnya di browser. Teks tidak dikirim ke backend atau worker. Kunci mengikuti script contoh.</p>
+<section class="card mt-5 p-4 sm:p-6" aria-labelledby="decrypt-history-title">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h2 id="decrypt-history-title" class="font-extrabold">Riwayat hasil dekripsi</h2>
+      <p class="muted mt-1 text-sm">{decryptHistory.length} dari {decryptHistoryTotal} hasil tersimpan</p>
+    </div>
+    <button class="button secondary" type="button" onclick={() => loadDecryptHistory()} disabled={decryptHistoryLoading}>
+      <RefreshCw size={15} class={decryptHistoryLoading ? 'animate-spin' : ''}/>Muat ulang
+    </button>
+  </div>
+  {#if decryptHistoryError}<p class="mt-3 text-sm text-rose-700 dark:text-rose-300" role="alert">{decryptHistoryError}</p>{/if}
+  {#if decryptHistory.length}
+    <div class="mt-4 space-y-2">
+      {#each decryptHistory as item (item.id)}
+        <button
+          class={`block w-full rounded-xl border p-3 text-left ${selectedDecryptHistoryId === item.id ? 'border-violet-400 bg-[var(--brand-soft)]/30' : 'border-[var(--line)] bg-[var(--surface-soft)]'}`}
+          type="button"
+          onclick={() => { plaintext = item.result; selectedDecryptHistoryId = item.id; error = ''; notice = 'Hasil dekripsi dimuat dari riwayat.'; copied = false; }}
+          aria-label={`Tampilkan hasil dekripsi ${formatHistoryDate(item.created_at)}`}
+        >
+          <span class="muted block text-xs">{formatHistoryDate(item.created_at)}</span>
+          <span class="mt-1 block truncate font-mono text-sm">{item.result}</span>
+        </button>
+      {/each}
+    </div>
+  {:else if decryptHistoryLoading}
+    <p class="muted mt-4 text-sm" role="status">Memuat riwayat dekripsi…</p>
+  {:else}
+    <p class="muted mt-4 rounded-xl border border-dashed border-[var(--line)] p-4 text-center text-sm">Belum ada hasil dekripsi tersimpan.</p>
+  {/if}
+  {#if decryptHistoryNextOffset !== null}
+    <button class="button secondary mt-3" type="button" onclick={() => loadDecryptHistory(decryptHistoryNextOffset ?? 0)} disabled={decryptHistoryLoadingMore}>
+      <RefreshCw size={14} class={decryptHistoryLoadingMore ? 'animate-spin' : ''}/>{decryptHistoryLoadingMore ? 'Memuat…' : 'Muat lebih banyak'}
+    </button>
+  {/if}
+</section>
+
+<p class="muted mt-4 flex items-start gap-2 text-xs leading-5"><ShieldCheck size={15} class="mt-0.5 shrink-0"/>Dekripsi dilakukan di browser. Saat berhasil, hasil teks dikirim melalui sesi login dan disimpan terenkripsi di database agar tersedia di riwayat; input terenkripsi tidak dikirim. Kunci mengikuti script contoh.</p>
 
 <section class="card mt-7 p-4 sm:p-6" aria-labelledby="resolver-title">
   <div class="flex flex-wrap items-start justify-between gap-3">

@@ -17,6 +17,7 @@ from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
+from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistoryStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
@@ -88,6 +89,10 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     legacy_utility_settings = UtilitySettingsStore(config.utility_settings_file)
     legacy_utility_values = legacy_utility_settings.get()
     runtime_settings_store = SqliteSettingsStore(
+        config.storage_db_file,
+        config.state_file.parent / "runtime-settings" / "settings.key",
+    )
+    decrypt_history_store = SqliteDecryptHistoryStore(
         config.storage_db_file,
         config.state_file.parent / "runtime-settings" / "settings.key",
     )
@@ -330,6 +335,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         local_profile_catalog=local_profile_catalog,
         runtime_readiness_store=runtime_readiness_store,
         activity_journal=activity_journal,
+        decrypt_history_store=decrypt_history_store,
     )
     return context, scheduler
 

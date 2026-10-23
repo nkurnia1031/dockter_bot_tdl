@@ -10,7 +10,22 @@ describe('Decrypt page shortlink resolver', () => {
   });
 
   it('renders decrypted HTTP URLs as clickable links', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ items: [] }), { status: 200 })));
+    const requests: { path: string; method: string; body?: Record<string, unknown> }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const path = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
+      requests.push({ path, method, body });
+      if (path.includes('/decrypt/history') && method === 'POST') {
+        return new Response(JSON.stringify({ item: {
+          id: 'decrypt-result-1',
+          result: 'https://qiwi.gg/file/aHda4057-HDHTIND884',
+          created_at: '2026-10-20T00:00:00Z'
+        } }), { status: 201 });
+      }
+      if (path.includes('/decrypt/history')) return new Response(JSON.stringify({ items: [], total: 0, next_offset: null }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
     render(DecryptPage);
 
     await fireEvent.input(screen.getByRole('textbox', { name: 'Teks terenkripsi' }), {
@@ -23,6 +38,31 @@ describe('Decrypt page shortlink resolver', () => {
     expect(link.getAttribute('target')).toBe('_blank');
     expect(link.getAttribute('rel')).toBe('noopener noreferrer');
     expect(screen.queryByRole('textbox', { name: 'Hasil dekripsi' })).toBeNull();
+    expect(await screen.findByText('Dekripsi selesai dan hasilnya disimpan di riwayat.')).toBeTruthy();
+    expect(requests.find((request) => request.path.includes('/decrypt/history') && request.method === 'POST')?.body)
+      .toEqual({ result: 'https://qiwi.gg/file/aHda4057-HDHTIND884' });
+    expect(await screen.findByRole('button', { name: /Tampilkan hasil dekripsi/ })).toBeTruthy();
+  });
+
+  it('loads a previously saved decrypted result from history', async () => {
+    const previousResult = 'https://files.example.test/previous.zip';
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const path = String(input);
+      if (path.includes('/decrypt/history')) {
+        return new Response(JSON.stringify({ items: [{
+          id: 'decrypt-result-old',
+          result: previousResult,
+          created_at: '2026-10-19T12:00:00Z'
+        }], total: 1, next_offset: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+    render(DecryptPage);
+
+    await fireEvent.click(await screen.findByRole('button', { name: /Tampilkan hasil dekripsi/ }));
+
+    expect(await screen.findByRole('link', { name: previousResult })).toBeTruthy();
+    expect(screen.getByText('Hasil dekripsi dimuat dari riwayat.')).toBeTruthy();
   });
 
   it('submits a shortlink job, restores its result from job history, and does not open it', async () => {

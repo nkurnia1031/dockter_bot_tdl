@@ -21,6 +21,7 @@ from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
+from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistoryStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
@@ -517,6 +518,9 @@ class BackendApiTests(unittest.TestCase):
         runtime_settings_store = SqliteSettingsStore(
             db, root / "runtime-settings" / "settings.key"
         )
+        self.decrypt_history_store = SqliteDecryptHistoryStore(
+            db, root / "runtime-settings" / "settings.key"
+        )
         runtime_settings_store.seed_once(
             "test-runtime-seed-v1", runtime_settings.get(), source="test-env"
         )
@@ -547,6 +551,7 @@ class BackendApiTests(unittest.TestCase):
             local_profile_catalog=self.local_profile_catalog,
             runtime_readiness_store=self.runtime_readiness_store,
             activity_journal=self.activity_journal,
+            decrypt_history_store=self.decrypt_history_store,
             bot=self.bot,
             runtime_settings=runtime_settings,
             runtime_settings_store=runtime_settings_store,
@@ -1753,6 +1758,45 @@ class BackendApiTests(unittest.TestCase):
             {"url": private_url},
         )
         self.assertEqual(job.worker, "local")
+
+    def test_decrypt_history_is_persisted_encrypted_and_scoped_to_actor(self):
+        client = TestClient(create_backend_app(self.context))
+        result = "https://files.example.test/private-result.zip"
+
+        saved = client.post(
+            "/api/v1/decrypt/history",
+            headers=self.login(42),
+            json={"result": result},
+        )
+
+        self.assertEqual(saved.status_code, 201, saved.text)
+        self.assertEqual(saved.json()["item"]["result"], result)
+        row = sqlite3.connect(self.jobs.path).execute(
+            "SELECT result_ciphertext FROM decrypt_history WHERE id=?",
+            (saved.json()["item"]["id"],),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertNotIn(result.encode(), bytes(row[0]))
+
+        own_history = client.get("/api/v1/decrypt/history", headers=self.login(42))
+        other_history = client.get("/api/v1/decrypt/history", headers=self.login(43))
+        self.assertEqual(own_history.status_code, 200)
+        self.assertEqual(own_history.json()["items"][0]["result"], result)
+        self.assertEqual(own_history.json()["total"], 1)
+        self.assertEqual(other_history.status_code, 200)
+        self.assertEqual(other_history.json(), {"items": [], "total": 0, "next_offset": None})
+
+    def test_decrypt_history_rejects_oversized_result_without_echoing_it(self):
+        oversized = "private-" + ("x" * 65536)
+        response = self.client.post(
+            "/api/v1/decrypt/history",
+            headers=self.login(42),
+            json={"result": oversized},
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "DECRYPT_HISTORY_INVALID")
+        self.assertNotIn("private-", response.text)
 
     def test_safelink_submit_errors_are_clear_without_echoing_shortlink(self):
         self.context.queue_publisher = object()
