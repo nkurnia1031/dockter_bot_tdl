@@ -311,6 +311,18 @@ Recovery `/start`, `/menu`, `/panel`, unknown command, serta teks persis
 
 ## Operasional
 
+### Workflow Git agent
+
+Semua pekerjaan agent dilakukan langsung pada branch `main`. Pastikan
+`git branch --show-current` menghasilkan `main`, lalu edit dan commit di
+worktree tersebut. Push ke `origin main` ketika pengguna memintanya. Jangan
+membuat atau berpindah ke branch fitur maupun worktree terpisah untuk
+implementasi.
+
+Sebelum staging, periksa `git status` dan stage hanya file atau hunk yang
+terkait tujuan aktif. Pertahankan perubahan lain yang sudah ada di worktree;
+commit perubahan tersebut hanya jika pengguna meminta.
+
 ```bash
 python3 run.py up
 python3 run.py update
