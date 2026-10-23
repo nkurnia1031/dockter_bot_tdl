@@ -1,11 +1,173 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from tme3bot.utility import UtilityRunner, UtilitySettingsStore
+from tme3bot.utility import (
+    UtilityRuntimeError,
+    UtilityRunner,
+    UtilitySettingsStore,
+    probe_quickmode_runtime,
+    probe_utility_runtime,
+)
 
 
 class UtilitySummaryTests(unittest.TestCase):
+    def test_compress_missing_runtime_command_has_stable_runtime_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir) / "quick-stage"
+            folder.mkdir()
+            runner = UtilityRunner(Path("utility"))
+            with patch.object(
+                runner,
+                "_run_folder",
+                side_effect=RuntimeError(
+                    "utility-compress exit code 127: 7z: command not found"
+                ),
+            ):
+                with self.assertRaises(UtilityRuntimeError) as raised:
+                    runner.run("compress", [str(folder)])
+
+            self.assertEqual(raised.exception.code, "UTILITY_COMMAND_MISSING")
+
+    def test_quickmode_probe_checks_only_quick_runtime_and_is_read_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            utility_root = root / "utility"
+            workspace = root / "workspace"
+            profile_root = root / "data"
+            workspace.mkdir()
+            profile_root.mkdir()
+            compress = utility_root / "compress" / "compress.sh"
+            compress.parent.mkdir(parents=True)
+            compress.write_text("#!/bin/bash\n", encoding="utf-8")
+            config = profile_root / "rclone.conf"
+            config.write_text("[googledrive]\ntype = drive\ntoken = opaque\n", encoding="utf-8")
+            before = list(workspace.iterdir())
+            bin_root = root / "bin"
+            bin_root.mkdir()
+            commands = ("bash", "python3", "7z", "du", "cut", "ffmpeg", "ffprobe", "rclone")
+            command_paths = {}
+            for command in commands:
+                path = bin_root / command
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+                path.chmod(0o755)
+                command_paths[command] = str(path)
+
+            with patch("tme3bot.utility.shutil.which", side_effect=command_paths.get):
+                result = probe_quickmode_runtime(
+                    utility_root,
+                    workspace,
+                    config,
+                    profile_root,
+                    "googledrive:backup",
+                )
+
+            self.assertTrue(result["ready"])
+            self.assertRegex(result["fingerprint"], r"^[a-f0-9]{64}$")
+            self.assertEqual(list(workspace.iterdir()), before)
+            self.assertNotIn("opaque", str(result))
+
+            with patch("tme3bot.utility.shutil.which", side_effect=command_paths.get):
+                missing_remote = probe_quickmode_runtime(
+                    utility_root,
+                    workspace,
+                    config,
+                    profile_root,
+                    "missing:backup",
+                )
+            self.assertFalse(missing_remote["ready"])
+            self.assertEqual(missing_remote["reason_code"], "RCLONE_RUNTIME_UNAVAILABLE")
+
+    def test_runtime_probe_is_read_only_and_fingerprints_utility_runtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            utility_root = root / "utility"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            for relative in (
+                "extract/extract.py",
+                "compress/compress.sh",
+                "export/telegram_messages_to_json.py",
+                "export/organize_media_from_json.py",
+                "pindah/pindah.sh",
+                "pindah/pindah4.py",
+                "pindah/pindah.py",
+                "pindah/pindah2.py",
+            ):
+                path = utility_root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# probe fixture\n", encoding="utf-8")
+
+            before = sorted(str(path.relative_to(workspace)) for path in workspace.rglob("*"))
+            with patch("tme3bot.utility.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+                result = probe_utility_runtime(utility_root, workspace)
+
+            after = sorted(str(path.relative_to(workspace)) for path in workspace.rglob("*"))
+            self.assertEqual(before, after)
+            self.assertTrue(result["ready"])
+            self.assertEqual(result["reason_code"], "")
+            self.assertRegex(result["fingerprint"], r"^[a-f0-9]{64}$")
+
+            (utility_root / "pindah" / "pindah.py").write_text(
+                "# changed runtime fixture\n", encoding="utf-8"
+            )
+            with patch("tme3bot.utility.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+                changed = probe_utility_runtime(utility_root, workspace)
+            self.assertNotEqual(result["fingerprint"], changed["fingerprint"])
+
+    def test_runtime_probe_reports_missing_script_without_workspace_mutation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            utility_root = root / "utility"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            with patch("tme3bot.utility.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+                result = probe_utility_runtime(utility_root, workspace)
+
+            self.assertFalse(result["ready"])
+            self.assertEqual(result["reason_code"], "UTILITY_SCRIPT_MISSING")
+            self.assertFalse(any(workspace.iterdir()))
+
+    def test_runtime_probe_reports_missing_7z_without_mutating_workspace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            utility_root = root / "utility"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            for relative in (
+                "extract/extract.py",
+                "compress/compress.sh",
+                "export/telegram_messages_to_json.py",
+                "export/organize_media_from_json.py",
+                "pindah/pindah.sh",
+                "pindah/pindah4.py",
+                "pindah/pindah.py",
+                "pindah/pindah2.py",
+            ):
+                path = utility_root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# probe fixture\n", encoding="utf-8")
+
+            def which(name):
+                return None if name == "7z" else f"/usr/bin/{name}"
+
+            with patch("tme3bot.utility.shutil.which", side_effect=which):
+                result = probe_utility_runtime(utility_root, workspace)
+
+            self.assertFalse(result["ready"])
+            self.assertEqual(result["reason_code"], "UTILITY_COMMAND_MISSING")
+            self.assertFalse(any(workspace.iterdir()))
+
+    def test_runner_classifies_process_start_failure_as_utility_runtime_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner = UtilityRunner(Path("utility"))
+            with patch("tme3bot.utility.subprocess.Popen", side_effect=OSError("missing executable")):
+                with self.assertRaises(UtilityRuntimeError) as raised:
+                    runner._command(["missing-tool"], Path(temp_dir), "utility-test")
+            self.assertEqual(raised.exception.code, "UTILITY_RUNTIME_UNAVAILABLE")
+            self.assertNotIn("missing executable", str(raised.exception))
+
     def test_organizer_log_is_reduced_to_useful_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir)
@@ -78,7 +240,7 @@ class UtilitySummaryTests(unittest.TestCase):
                 "print('group-1 ... 25% [25 MB in 5s; ~ETA: 15s; 5 MB/s]')"
             )
             runner._command(
-                ["python", "-c", script],
+                ["python3", "-c", script],
                 Path(temp_dir),
                 "utility-compress",
             )

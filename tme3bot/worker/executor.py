@@ -34,10 +34,21 @@ from tme3bot.state import HttpStateStore, StateApiError
 from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult
 from tme3bot.storage_catalog import build_storage_caption
-from tme3bot.tdl import ProcessStalledError, TDLClient, TDLStalledError
+from tme3bot.tdl import (
+    ProcessStalledError,
+    TDLClient,
+    TDLStalledError,
+    tdl_session_denial_code,
+    tdl_write_denial_code,
+)
 from tme3bot.tdl_access_fingerprint import normalize_session_fingerprints
 from tme3bot.tdl_output import is_tdl_telemetry_line
-from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, UtilityRunner
+from tme3bot.utility import (
+    DEFAULT_UTILITY_SETTINGS,
+    UtilityRunner,
+    probe_quickmode_runtime,
+    probe_utility_runtime,
+)
 from tme3bot.worker.quick_export import (
     QUICK_PHASES,
     QuickModeError,
@@ -1380,8 +1391,7 @@ class WorkerJobExecutor(
             tts_ready = bool(tts_health.get("ready"))
         except Exception:
             tts_ready = False
-        resolver_probe = getattr(self, "_safelink_resolver_ready", None)
-        resolver_ready = bool(resolver_probe()) if callable(resolver_probe) else False
+        resolver_supported = callable(getattr(self, "_safelink_resolve", None))
         return {
             "profiles": profiles,
             "export_profiles": export_profiles,
@@ -1395,13 +1405,43 @@ class WorkerJobExecutor(
             "tts": tts_ready,
             "tts_profiles": tts_profiles,
             "tts_health": tts_health,
-            "safelink_resolver": resolver_ready,
+            # This is a code capability, not a live addon health check. Runtime
+            # readiness is scanned explicitly and persisted by the backend.
+            "safelink_resolver": resolver_supported,
         }
+
+    def utility_runtime_readiness(self) -> dict[str, object]:
+        """Run the read-only Utility probe for an explicit Profile scan."""
+        utility_root = Path("/app/utility") if Path("/app/utility").exists() else Path("utility")
+        return probe_utility_runtime(
+            utility_root,
+            Path(getattr(self.config, "utility_workspace_root", "/workspace")),
+        )
+
+    def quickmode_runtime_readiness(self, rclone_destination: str) -> dict[str, object]:
+        """Inspect Quick Mode runtime dependencies for an explicit Profile scan."""
+        utility_root = Path("/app/utility") if Path("/app/utility").exists() else Path("utility")
+        return probe_quickmode_runtime(
+            utility_root,
+            Path(getattr(self.config, "utility_workspace_root", "/workspace")),
+            Path(getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")),
+            Path(getattr(self.config, "profile_root", "/data")),
+            str(rclone_destination or ""),
+        )
 
     def _safelink_resolver_ready(self) -> bool:
         from tme3bot.worker.resolver_client import resolver_addon_ready
 
         return resolver_addon_ready()
+
+    def safelink_runtime_readiness(self) -> dict[str, object]:
+        """Run the read-only resolver addon health probe for Profile scan."""
+        ready = self._safelink_resolver_ready()
+        return {
+            "ready": ready,
+            "reason_code": "" if ready else "RESOLVER_RUNTIME_UNAVAILABLE",
+            "fingerprint": hashlib.sha256(b"safelink-resolver-runtime-v1").hexdigest() if ready else "",
+        }
 
     def storage_profile(self) -> str:
         return self.runtime_settings.storage_profile()
@@ -1995,14 +2035,17 @@ class WorkerJobExecutor(
             LOGGER.exception("Job %s (%s) failed", job_id, kind)
             self._append_job_log(f"[job failed: {exc}]")
             self._publish_log_snapshot(job_id, snapshot)
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            quick_mode_job = kind == "export" and bool(payload.get("quick_mode"))
+            stalled = isinstance(exc, (ProcessStalledError, TDLStalledError))
             with self._lock:
-                if isinstance(exc, (ProcessStalledError, TDLStalledError)):
+                already_cancelled = job_id in self._cancel_requested
+                if stalled and not (quick_mode_job and not already_cancelled):
                     self._cancel_requested.add(job_id)
                 cancelled = job_id in self._cancel_requested
             if cancelled:
                 phase = self._quick_terminal_phase(command, "cancelled")
                 staging_path = self._quick_staging_path(command)
-                stalled = isinstance(exc, (ProcessStalledError, TDLStalledError))
                 self.publisher.emit(
                     job_id,
                     "cancelled",
@@ -2030,9 +2073,19 @@ class WorkerJobExecutor(
                 )
                 command_terminal_status = "cancelled"
             else:
+                failure = exc
+                if quick_mode_job:
+                    error_code = (
+                        str(getattr(exc, "code", "") or "").strip().upper()
+                        or tdl_session_denial_code(exc)
+                        or tdl_write_denial_code(exc)
+                        or ("QUICK_MODE_RUNTIME_UNAVAILABLE" if stalled else "")
+                    )
+                    if error_code and not str(getattr(exc, "code", "") or "").strip():
+                        failure = QuickModeError(str(exc), code=error_code)
                 self._failed(
                     command,
-                    exc,
+                    failure,
                     started_at=started_at,
                     phase=self._quick_terminal_phase(command, "failed"),
                     staging_path=self._quick_staging_path(command),
@@ -2085,6 +2138,23 @@ class WorkerJobExecutor(
         staging_path: str | None = None,
     ) -> None:
         try:
+            message = str(exc)[:1000]
+            error_code = str(getattr(exc, "code", "") or "").strip().upper()
+            command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            is_quick_mode = (
+                str(command.get("kind") or "").strip().lower() == "export"
+                and bool(command_payload.get("quick_mode"))
+            )
+            prefix_code = is_quick_mode or (
+                str(command.get("kind") or "").strip().lower() == "tts"
+                and error_code != "TTS_ERROR"
+            )
+            if (
+                prefix_code
+                and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", error_code)
+                and not message.startswith(error_code + ":")
+            ):
+                message = f"{error_code}: {message}"[:1000]
             self.publisher.emit(
                 str(command["job_id"]),
                 "failed",
@@ -2097,8 +2167,13 @@ class WorkerJobExecutor(
                     "finished_at": utc_now().isoformat(),
                 },
                 error={
-                    "code": "WORKER_JOB_FAILED",
-                    "message": str(exc)[:1000],
+                    "code": (
+                        error_code
+                        if str(command.get("kind") or "").strip().lower() == "safelink_resolve"
+                        and error_code == "RESOLVER_RUNTIME_UNAVAILABLE"
+                        else "WORKER_JOB_FAILED"
+                    ),
+                    "message": message,
                 },
             )
         except Exception:

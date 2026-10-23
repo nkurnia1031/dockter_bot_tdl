@@ -11,6 +11,7 @@ from tme3bot.api.backend import BackendContext, create_backend_app
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService
+from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
@@ -21,6 +22,7 @@ from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.queue_transport import (
     QueueCommandService,
     QueueOutboxPublisher,
@@ -116,6 +118,10 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     local_profile_catalog = LocalProfileCatalog(
         config.state_file.parent / "local_profile_catalog.json"
     )
+    runtime_readiness_store = RuntimeReadinessStore(
+        config.state_file.parent / "runtime_readiness.json"
+    )
+    runtime_readiness_gate = RuntimeReadinessGate(runtime_readiness_store)
     source_repository = SqliteSourceRepository(config.storage_db_file)
     profile_vault = ProfileProvisioningStore(
         config.storage_db_file,
@@ -185,6 +191,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         registry,
         dispatcher,
         operation_service,
+        runtime_readiness_gate=runtime_readiness_gate,
     )
     folders = UtilityFolderStore(
         config.utility_folders_file, config.utility_workspace_root
@@ -214,6 +221,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         export_catalog=export_catalog,
         worker_registry=registry,
         local_profile_catalog=local_profile_catalog,
+        runtime_readiness_gate=runtime_readiness_gate,
         profile_readiness=profile_provisioner.worker_ready,
         utility_folders=folders,
         utility_settings=settings,
@@ -320,6 +328,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         queue_command_service=queue_command_service,
         queue_publisher=queue_publisher,
         local_profile_catalog=local_profile_catalog,
+        runtime_readiness_store=runtime_readiness_store,
         activity_journal=activity_journal,
     )
     return context, scheduler

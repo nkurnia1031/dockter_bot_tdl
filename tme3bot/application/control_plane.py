@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import secrets
+import hashlib
 import json
-import uuid
 import logging
 import re
+import secrets
 import threading
 import time
+import uuid
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -40,6 +41,7 @@ _DURABLE_JOB_KINDS = frozenset({
     "export", "leave", "download", "utility", "storage_upload", "tts",
     "safelink_resolve", "tdl_access_verify", "backup_verify",
 })
+_STORAGE_DURABLE_DISPATCH_KEY = "_storage_durable_dispatch"
 
 
 class ControlPlane:
@@ -61,6 +63,7 @@ class ControlPlane:
         storage_delivery=None,
         profile_readiness=None,
         local_profile_catalog=None,
+        runtime_readiness_gate=None,
         label_store=None,
         export_cursor_service=None,
         tdl_access_store=None,
@@ -81,6 +84,7 @@ class ControlPlane:
         self.storage_delivery = storage_delivery
         self.profile_readiness = profile_readiness
         self.local_profile_catalog = local_profile_catalog
+        self.runtime_readiness_gate = runtime_readiness_gate
         self.label_store = label_store
         self.export_cursor_service = export_cursor_service
         self.tdl_access_store = tdl_access_store
@@ -93,8 +97,8 @@ class ControlPlane:
         self._stale_cancel_requested: dict[str, Any] = {}
         self._tts_route_lock = threading.Lock()
         self._tts_round_robin = 0
-        self._safelink_route_lock = threading.Lock()
-        self._safelink_round_robin = 0
+        self._tts_sender_round_robin: dict[str, int] = {}
+        self.add_event_observer(self._invalidate_runtime_readiness_from_event)
 
     def actor(self, telegram_user_id: int) -> Actor:
         profile = self.profile_manager.profile_for_user(telegram_user_id)
@@ -284,20 +288,32 @@ class ControlPlane:
         )
         execution_profile = owner_profile
         internal_payload = deepcopy(payload)
+        if kind == "storage_upload":
+            internal_payload[_STORAGE_DURABLE_DISPATCH_KEY] = {
+                "command_id": str(uuid.uuid4()),
+                "dispatch_token": secrets.token_urlsafe(32),
+            }
         private_values = dict(private_job_values or {})
         if kind == "tts":
             target_chat = self._tdl_access_target("tts")
             if not target_chat:
                 raise DomainError("TTS_CHAT_UNAVAILABLE", "Chat tujuan TTS belum dikonfigurasi.", status_code=503)
             selected_worker = self._select_tts_worker(worker, destination=target_chat)
-            execution_profile, sender_profiles, _session_fingerprints = self._tdl_access_sender_options(
-                selected_worker, "tts", target_chat
+            sender_fingerprints = self._tts_ready_sender_fingerprints(
+                selected_worker, target_chat
+            )
+            sender_profiles = list(sender_fingerprints)
+            execution_profile = self._select_tts_sender_profile(
+                selected_worker, sender_profiles
             )
             internal_payload.update(
                 _tdl_sender_profile=execution_profile,
                 _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
             )
             private_values["telegram_tts_chat_id"] = target_chat
+            private_values["tdl_sender_session_fingerprints"] = json.dumps(
+                sender_fingerprints, separators=(",", ":")
+            )
         elif kind == "storage_upload":
             _, selected_worker = self.resolve_target(
                 actor, worker=worker
@@ -320,31 +336,19 @@ class ControlPlane:
                 target_chat = str(
                     self.private_job_value(retry_source.id, "tdl_storage_chat_ref") or ""
                 ).strip()
-                try:
-                    session_fingerprints = normalize_session_fingerprints(
-                        json.loads(
-                            self.private_job_value(
-                                retry_source.id, "tdl_sender_session_fingerprints"
-                            ) or "{}"
-                        )
-                    )
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    session_fingerprints = {}
-                sender_profiles = list(session_fingerprints)
-                if not target_chat or not sender_profiles:
+                if not target_chat:
                     raise DomainError(
                         "STORAGE_RETRY_SNAPSHOT_UNAVAILABLE",
-                        "Snapshot tujuan atau sesi upload asli tidak tersedia.",
+                        "Snapshot tujuan upload asli tidak tersedia.",
                         status_code=409,
                     )
-                execution_profile = sender_profiles[0]
             else:
                 target_chat = self._tdl_access_target("storage")
                 if not target_chat:
                     raise DomainError("TDL_ACCESS_TARGET_UNAVAILABLE", "Tujuan TDL Storage belum dikonfigurasi.", status_code=503)
-                execution_profile, sender_profiles, session_fingerprints = self._tdl_access_sender_options(
-                    selected_worker, "storage", target_chat
-                )
+            execution_profile, sender_profiles, session_fingerprints = (
+                self._storage_sender_snapshot(selected_worker, destination=target_chat)
+            )
             internal_payload.update(
                 _tdl_sender_profile=execution_profile,
                 _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
@@ -392,9 +396,29 @@ class ControlPlane:
                 worker=worker,
             )
             execution_profile = owner_profile
+        if kind == "utility":
+            submitted_utility_settings = internal_payload.get("settings")
+            internal_payload = self._prepare_durable_payload(
+                actor,
+                "utility",
+                {
+                    key: internal_payload.get(key)
+                    for key in ("utility", "folders", "password")
+                    if key in internal_payload
+                },
+                owner_profile,
+                selected_worker,
+            )
+            if isinstance(submitted_utility_settings, dict):
+                internal_payload["settings"] = deepcopy(submitted_utility_settings)
+        self._require_runtime_readiness(
+            kind, execution_profile, selected_worker, internal_payload
+        )
         if kind == "export" and bool(internal_payload.get("quick_mode")):
             target_chat, session_fingerprints = self._quick_storage_access_snapshot(
-                selected_worker
+                selected_worker,
+                execution_profile,
+                internal_payload.get("quick_settings"),
             )
             private_values["tdl_storage_chat_ref"] = target_chat
             private_values["tdl_sender_session_fingerprints"] = json.dumps(
@@ -539,6 +563,29 @@ class ControlPlane:
         except Exception as exc:
             self.jobs.release_execution(job.id)
             failure = self._worker_dispatch_error(selected_worker, exc)
+            if self.runtime_readiness_gate is not None:
+                if kind == "export":
+                    self.runtime_readiness_gate.record_export_failure(
+                        worker=selected_worker,
+                        profile=execution_profile,
+                        error_code=failure.code,
+                    )
+                elif kind == "utility":
+                    self.runtime_readiness_gate.record_utility_failure(
+                        worker=selected_worker, error_code=failure.code
+                    )
+                elif kind == "tts":
+                    self.runtime_readiness_gate.record_tts_failure(
+                        worker=selected_worker,
+                        profile=execution_profile,
+                        error_code=failure.code,
+                    )
+                elif kind == "storage_upload":
+                    self.runtime_readiness_gate.record_storage_failure(
+                        worker=selected_worker,
+                        profile=execution_profile,
+                        error_code=failure.code,
+                    )
             sequence = max(
                 (event.sequence for event in self.jobs.events(job.id)), default=0
             ) + 1
@@ -583,13 +630,9 @@ class ControlPlane:
         )
         execution_profile = owner_profile
         if kind == "safelink_resolve":
-            if str(target.get("worker") or "").strip():
-                raise DomainError(
-                    "SAFELINK_WORKER_AUTO_SELECTED",
-                    "Worker dipilih otomatis berdasarkan kesiapan addon resolver dan panjang antrean.",
-                    status_code=422,
-                )
-            selected_worker = self._select_safelink_worker()
+            selected_worker = self._select_safelink_worker(
+                str(target.get("worker") or "").strip() or None
+            )
         elif kind == "tts":
             target_chat = self._tdl_access_target("tts")
             if not target_chat:
@@ -597,6 +640,12 @@ class ControlPlane:
             selected_worker = self._select_tts_worker(
                 str(target.get("worker") or "").strip() or None,
                 destination=target_chat,
+            )
+            sender_fingerprints = self._tts_ready_sender_fingerprints(
+                selected_worker, target_chat
+            )
+            execution_profile = self._select_tts_sender_profile(
+                selected_worker, list(sender_fingerprints)
             )
         elif kind == "tdl_access_verify":
             if not str(target.get("worker") or "").strip():
@@ -622,12 +671,22 @@ class ControlPlane:
         quick_storage_snapshot = None
         if kind == "export" and bool(payload.get("quick_mode")):
             quick_storage_snapshot = self._quick_storage_access_snapshot(
-                selected_worker
+                selected_worker,
+                execution_profile,
+                payload.get("quick_settings"),
             )
 
         private_job_values: dict[str, bytes] = {}
-        if kind in {"tts", "storage_upload"}:
-            purpose = "tts" if kind == "tts" else "storage"
+        if kind == "tts":
+            payload.update(
+                _tdl_sender_profile=execution_profile,
+                _tdl_sender_profiles=[
+                    execution_profile,
+                    *[item for item in sender_fingerprints if item != execution_profile],
+                ],
+            )
+        elif kind == "storage_upload":
+            purpose = "storage"
             destination = self._tdl_access_target(purpose)
             if not destination:
                 raise DomainError(
@@ -635,19 +694,18 @@ class ControlPlane:
                     f"Tujuan TDL {purpose} belum dikonfigurasi.",
                     status_code=503,
                 )
-            execution_profile, sender_profiles, session_fingerprints = self._tdl_access_sender_options(
-                selected_worker, purpose, destination
+            execution_profile, sender_profiles, session_fingerprints = (
+                self._storage_sender_snapshot(selected_worker, destination=destination)
             )
             payload.update(
                 _tdl_sender_profile=execution_profile,
                 _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
             )
-            if purpose == "storage":
-                payload["_tdl_sender_session_fingerprints"] = {
-                    profile: session_fingerprints[profile]
-                    for profile in sender_profiles
-                    if profile in session_fingerprints
-                }
+            payload["_tdl_sender_session_fingerprints"] = {
+                profile: session_fingerprints[profile]
+                for profile in sender_profiles
+                if profile in session_fingerprints
+            }
         elif kind == "tdl_access_verify":
             purpose = str(payload.get("purpose") or "")
             destination = self._tdl_access_target(purpose)
@@ -665,6 +723,7 @@ class ControlPlane:
                     status_code=503,
                 )
 
+        self._require_runtime_readiness(kind, execution_profile, selected_worker, payload)
         self._assert_profile_admission(
             kind, execution_profile, selected_worker, payload
         )
@@ -715,7 +774,18 @@ class ControlPlane:
             payload=self._redacted_payload(kind, payload),
             settings_version=settings_version,
         )
-        if kind == "tdl_access_verify":
+        if kind == "tts":
+            target_chat = self._tdl_access_target("tts")
+            private_job_values = self._encrypt_private_job_values(
+                job_id,
+                {
+                    "telegram_tts_chat_id": target_chat,
+                    "tdl_sender_session_fingerprints": json.dumps(
+                        sender_fingerprints, separators=(",", ":")
+                    ),
+                },
+            )
+        elif kind == "tdl_access_verify":
             purpose = str(payload.get("purpose") or "")
             destination = self._tdl_access_target(purpose)
             private_job_values = self._encrypt_private_job_values(
@@ -763,6 +833,118 @@ class ControlPlane:
             execution_plan=execution.as_dict(),
             command_payload=command_payload,
         )
+
+    def _require_runtime_readiness(
+        self, kind: str, profile: str, worker: str, payload: dict[str, Any]
+    ) -> None:
+        if (
+            kind == "export"
+            and self.runtime_readiness_gate is not None
+        ):
+            if bool(payload.get("quick_mode")):
+                self.runtime_readiness_gate.require_quick_mode(profile, worker)
+            else:
+                self.runtime_readiness_gate.require_export(profile, worker)
+        elif kind == "utility" and self.runtime_readiness_gate is not None:
+            self.runtime_readiness_gate.require(
+                runtime="utility", profile=None, worker=worker
+            )
+        elif kind == "tts" and self.runtime_readiness_gate is not None:
+            self.runtime_readiness_gate.require(
+                runtime="tts", profile=profile, worker=worker
+            )
+        elif kind == "storage_upload" and self.runtime_readiness_gate is not None:
+            self.runtime_readiness_gate.require_storage(profile, worker)
+        elif kind == "safelink_resolve" and self.runtime_readiness_gate is not None:
+            self.runtime_readiness_gate.require_resolver(worker)
+
+    def _invalidate_runtime_readiness_from_event(self, event: JobEvent) -> None:
+        if event.status != JobStatus.FAILED or self.runtime_readiness_gate is None:
+            return
+        job = self.jobs.get(event.job_id)
+        if job is None or job.kind not in {
+            "export", "utility", "tts", "storage_upload", "safelink_resolve"
+        }:
+            return
+        error = event.error if isinstance(event.error, dict) else {}
+        error_code = str(error.get("code") or "")
+        message = str(error.get("message") or "")
+        if error_code == "WORKER_JOB_FAILED":
+            match = re.match(r"^([A-Z][A-Z0-9_]{0,79}):", message.strip())
+            if match:
+                error_code = match.group(1)
+        if job.kind == "safelink_resolve":
+            self.runtime_readiness_gate.record_resolver_failure(
+                worker=job.worker,
+                error_code=error_code,
+            )
+            return
+        if job.kind == "export" and bool(job.payload.get("quick_mode")):
+            candidates = [error_code]
+            candidates.extend(re.findall(r"\b([A-Z][A-Z0-9_]{0,79})\b", message))
+            for candidate in dict.fromkeys(candidates):
+                if self.runtime_readiness_gate.record_quick_mode_failure(
+                    worker=job.worker,
+                    profile=job.profile,
+                    error_code=candidate,
+                ):
+                    break
+            return
+        if job.kind == "utility":
+            self.runtime_readiness_gate.record_utility_failure(
+                worker=job.worker,
+                error_code=error_code,
+            )
+        elif job.kind == "tts":
+            command = self.jobs.command_payload(job.id)
+            payload = command.get("payload") if isinstance(command, dict) else None
+            payload = payload if isinstance(payload, dict) else (
+                command if isinstance(command, dict) else {}
+            )
+            sender_profile = str(payload.get("_tdl_sender_profile") or "").strip().lower()
+            if sender_profile:
+                self.runtime_readiness_gate.record_tts_failure(
+                    worker=job.worker,
+                    profile=sender_profile,
+                    error_code=error_code,
+                )
+        elif job.kind == "storage_upload":
+            command = self.jobs.command_payload(job.id)
+            payload = command.get("payload") if isinstance(command, dict) else None
+            payload = payload if isinstance(payload, dict) else (
+                command if isinstance(command, dict) else {}
+            )
+            sender_profile = str(payload.get("_tdl_sender_profile") or "").strip().lower()
+            if sender_profile:
+                self.runtime_readiness_gate.record_storage_failure(
+                    worker=job.worker,
+                    profile=sender_profile,
+                    error_code=error_code,
+                )
+            result = event.result if isinstance(event.result, dict) else {}
+            if isinstance(result.get("value"), dict):
+                result = result["value"]
+            failed_items = result.get("items")
+            if not isinstance(failed_items, list):
+                failed_items = result.get("failed")
+            if isinstance(failed_items, list):
+                for item in failed_items:
+                    if not isinstance(item, dict):
+                        continue
+                    failed_profile = str(item.get("profile") or "").strip().lower()
+                    failed_code = str(item.get("error_code") or "")
+                    if failed_profile and failed_code:
+                        self.runtime_readiness_gate.record_storage_failure(
+                            worker=job.worker,
+                            profile=failed_profile,
+                            error_code=failed_code,
+                        )
+        else:
+            self.runtime_readiness_gate.record_export_failure(
+                worker=job.worker,
+                profile=job.profile,
+                error_code=error_code,
+            )
 
     def _prepare_durable_payload(
         self,
@@ -1076,6 +1258,41 @@ class ControlPlane:
         context = self._tdl_access_worker_context(worker, purpose, destination)
         return context[0] if context is not None else []
 
+    def tts_access_evidence_ready(
+        self,
+        worker: str,
+        profile: str,
+        session_fingerprint: str,
+        *,
+        destination: str | None = None,
+    ) -> bool:
+        """Check saved TTS send evidence against an observed Export session."""
+        store = self.tdl_access_store
+        target = str(destination or self._tdl_access_target("tts")).strip()
+        selected_worker = str(worker or "").strip().lower()
+        selected_profile = str(profile or "").strip().lower()
+        fingerprints = normalize_session_fingerprints(
+            {selected_profile: session_fingerprint}
+        )
+        fingerprint = fingerprints.get(selected_profile)
+        if not store or not target or not selected_worker or not fingerprint:
+            return False
+        destination_hash = store.destination_fingerprint(target)
+        # Existing TTS evidence is indexed by the local profile inventory. The
+        # row's session_fingerprint binds that proof to the observed TDL tree.
+        inventory_hash = store.inventory_fingerprint([selected_profile])
+        results = store.snapshot(
+            selected_worker,
+            "tts",
+            destination_hash,
+            inventory_hash,
+            session_fingerprints={selected_profile: fingerprint},
+        )
+        return any(
+            item.get("profile") == selected_profile and item.get("ready") is True
+            for item in results
+        )
+
     def _tdl_access_worker_context(
         self, worker: str, purpose: str, destination: str
     ) -> tuple[list[str], dict[str, str] | None, str, str] | None:
@@ -1135,8 +1352,148 @@ class ControlPlane:
             details={"worker": worker, "purpose": purpose},
         )
 
-    def _quick_storage_access_snapshot(self, worker: str) -> tuple[str, dict[str, str]]:
-        """Pin Quick Mode's Telegram upload target and verified Upload lanes."""
+    def _storage_sender_snapshot(
+        self, worker: str, *, destination: str | None = None
+    ) -> tuple[str, list[str], dict[str, str]]:
+        """Choose Upload senders from persisted Storage readiness evidence."""
+        target = str(destination or self._tdl_access_target("storage") or "").strip()
+        if not target:
+            raise DomainError(
+                "TDL_ACCESS_TARGET_UNAVAILABLE",
+                "Tujuan TDL Storage belum dikonfigurasi.",
+                status_code=503,
+            )
+        access_store = self.tdl_access_store
+        gate = self.runtime_readiness_gate
+        if gate is None:
+            selected, profiles, fingerprints = self._tdl_access_sender_options(
+                worker, "storage", target
+            )
+            normalized = normalize_session_fingerprints(fingerprints)
+            ready_fingerprints = {
+                profile: normalized[profile]
+                for profile in profiles
+                if profile in normalized
+            }
+            return selected, [selected, *[item for item in profiles if item != selected]], ready_fingerprints
+        if access_store is None:
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                "Bukti akses Storage tersimpan belum tersedia. Jalankan Scan Profil.",
+                status_code=409,
+                details={"worker": worker, "runtime": "storage", "reason_code": "TDL_ACCESS_NOT_VERIFIED"},
+            )
+
+        runtime_store = gate.store
+        worker_state = runtime_store.worker(worker)
+        if worker_state is None or worker_state.get("status") != "success":
+            gate.require(runtime="storage", profile=None, worker=worker)
+
+        cells = [
+            item
+            for item in runtime_store.snapshot().get("cells", [])
+            if item.get("worker") == str(worker or "").strip().lower()
+            and item.get("runtime") == "storage"
+            and item.get("profile")
+        ]
+        if not cells:
+            gate.require(runtime="storage", profile=None, worker=worker)
+        ready_cells: dict[str, dict[str, Any]] = {}
+        for raw in cells:
+            profile = str(raw.get("profile") or "").strip().lower()
+            try:
+                cell = gate.require_storage(profile, worker)
+            except DomainError:
+                continue
+            ready_cells[profile] = cell
+        if not ready_cells:
+            gate.require_storage(str(cells[0].get("profile") or ""), worker)
+
+        destination_hash = access_store.destination_fingerprint(target)
+        fingerprints: dict[str, str] = {}
+        stale_reason = "TDL_ACCESS_NOT_VERIFIED"
+        for profile, cell in ready_cells.items():
+            if cell.get("destination_fingerprint") != destination_hash:
+                stale_reason = "STORAGE_SETTINGS_CHANGED"
+                runtime_store.invalidate(
+                    worker=worker,
+                    profile=profile,
+                    runtime="storage",
+                    reason_code=stale_reason,
+                )
+                continue
+            fingerprint = str(cell.get("session_fingerprint") or "").strip().lower()
+            if fingerprint:
+                fingerprints[profile] = fingerprint
+
+        if fingerprints:
+            inventory_hash = access_store.inventory_fingerprint(
+                list(fingerprints), fingerprints
+            )
+            verified = set(
+                access_store.verified_profiles(
+                    worker,
+                    "storage",
+                    destination_hash,
+                    inventory_hash,
+                    session_fingerprints=fingerprints,
+                )
+            )
+            for profile in set(fingerprints) - verified:
+                runtime_store.invalidate(
+                    worker=worker,
+                    profile=profile,
+                    runtime="storage",
+                    reason_code="TDL_ACCESS_NOT_VERIFIED",
+                )
+            fingerprints = {
+                profile: fingerprint
+                for profile, fingerprint in fingerprints.items()
+                if profile in verified
+            }
+
+        if not fingerprints:
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                "Belum ada profil Upload dengan bukti akses tersimpan yang cocok. Jalankan Scan Profil.",
+                status_code=409,
+                details={
+                    "worker": worker,
+                    "runtime": "storage",
+                    "reason_code": stale_reason,
+                },
+            )
+        inventory_hash = access_store.inventory_fingerprint(
+            list(fingerprints), fingerprints
+        )
+        selected = access_store.choose_next(
+            worker,
+            "storage",
+            destination_hash,
+            inventory_hash,
+            session_fingerprints=fingerprints,
+        )
+        if not selected:
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                "Bukti akses semua profil Upload sudah berubah. Jalankan Scan Profil.",
+                status_code=409,
+                details={
+                    "worker": worker,
+                    "runtime": "storage",
+                    "reason_code": "TDL_ACCESS_NOT_VERIFIED",
+                },
+            )
+        profiles = [selected, *[item for item in sorted(fingerprints) if item != selected]]
+        return selected, profiles, fingerprints
+
+    def _quick_storage_access_snapshot(
+        self,
+        worker: str,
+        profile: str,
+        quick_settings: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        """Pin upload target and sender lanes from the Profile scan snapshot."""
         destination = self._tdl_access_target("storage")
         if not destination:
             raise DomainError(
@@ -1144,21 +1501,115 @@ class ControlPlane:
                 "Tujuan TDL Storage belum dikonfigurasi.",
                 status_code=503,
             )
-        _selected, profiles, fingerprints = self._tdl_access_sender_options(
-            worker, "storage", destination
+        gate = self.runtime_readiness_gate
+        if gate is None:
+            # Compatibility for isolated ControlPlane tests and older custom
+            # compositions. Production composition always supplies the gate.
+            _selected, profiles, fingerprints = self._tdl_access_sender_options(
+                worker, "storage", destination
+            )
+            normalized = normalize_session_fingerprints(fingerprints)
+            selected_fingerprints = {
+                profile: normalized[profile]
+                for profile in profiles
+                if profile in normalized
+            }
+            if not selected_fingerprints:
+                raise DomainError(
+                    "TDL_ACCESS_NOT_VERIFIED",
+                    "Belum ada sesi Upload terverifikasi untuk Quick Mode.",
+                    status_code=409,
+                    details={"worker": worker, "purpose": "storage"},
+                )
+            return destination, selected_fingerprints
+
+        cell = gate.require_quick_mode(profile, worker)
+        export_cell = gate.require_export(profile, worker)
+        access_store = self.tdl_access_store
+        if (
+            not access_store
+            or cell.get("session_fingerprint") != export_cell.get("fingerprint")
+            or cell.get("destination_fingerprint")
+            != access_store.destination_fingerprint(destination)
+        ):
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                "Snapshot Quick Mode berubah sejak Scan Profil. Jalankan Scan Profil kembali.",
+                status_code=409,
+                details={
+                    "worker": worker,
+                    "profile": profile,
+                    "runtime": "quick_mode",
+                    "reason_code": "QUICK_MODE_SNAPSHOT_STALE",
+                },
+            )
+        settings = quick_settings if isinstance(quick_settings, dict) else self._utility_settings_snapshot()
+        rclone_destination = str(
+            settings.get("rclone_destination") or DEFAULT_UTILITY_SETTINGS["rclone_destination"]
+        ).strip()
+        current_rclone_fingerprint = hashlib.sha256(
+            rclone_destination.encode("utf-8")
+        ).hexdigest()
+        if current_rclone_fingerprint != cell.get("rclone_destination_fingerprint"):
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                "Tujuan rclone berubah sejak Scan Profil. Jalankan Scan Profil kembali.",
+                status_code=409,
+                details={
+                    "worker": worker,
+                    "profile": profile,
+                    "runtime": "quick_mode",
+                    "reason_code": "QUICK_MODE_SETTINGS_CHANGED",
+                },
+            )
+        profiles = [
+            str(item).strip().lower()
+            for item in cell.get("sender_profiles", [])
+            if str(item).strip()
+        ]
+        fingerprints = normalize_session_fingerprints(
+            cell.get("sender_session_fingerprints")
         )
-        normalized = normalize_session_fingerprints(fingerprints)
         selected_fingerprints = {
-            profile: normalized[profile]
-            for profile in profiles
-            if profile in normalized
+            sender: fingerprints[sender]
+            for sender in profiles
+            if sender in fingerprints
         }
         if not selected_fingerprints:
             raise DomainError(
-                "TDL_ACCESS_NOT_VERIFIED",
-                "Belum ada sesi Upload terverifikasi untuk Quick Mode.",
+                "RUNTIME_NOT_READY",
+                "Snapshot akses Upload Quick Mode tidak lengkap. Jalankan Scan Profil kembali.",
                 status_code=409,
-                details={"worker": worker, "purpose": "storage"},
+                details={
+                    "worker": worker,
+                    "profile": profile,
+                    "runtime": "quick_mode",
+                    "reason_code": "QUICK_MODE_EVIDENCE_INCOMPLETE",
+                },
+            )
+        inventory_hash = access_store.inventory_fingerprint(
+            list(selected_fingerprints), selected_fingerprints
+        )
+        current_verified = set(
+            access_store.verified_profiles(
+                worker,
+                "storage",
+                str(cell.get("destination_fingerprint") or ""),
+                inventory_hash,
+                session_fingerprints=selected_fingerprints,
+            )
+        )
+        if current_verified != set(selected_fingerprints):
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                "Bukti akses Upload berubah sejak Scan Profil. Jalankan Scan Profil kembali.",
+                status_code=409,
+                details={
+                    "worker": worker,
+                    "profile": profile,
+                    "runtime": "quick_mode",
+                    "reason_code": "QUICK_MODE_STORAGE_PROOF_STALE",
+                },
             )
         return destination, selected_fingerprints
 
@@ -1452,7 +1903,7 @@ class ControlPlane:
         if not options:
             raise DomainError(
                 "TTS_WORKER_UNAVAILABLE",
-                "Tidak ada worker dengan helper TTS siap dan profil pengirim TDL yang sudah diverifikasi.",
+                "Tidak ada worker TTS dengan sel kesiapan Profil yang valid.",
                 status_code=503,
             )
         if requested:
@@ -1473,12 +1924,177 @@ class ControlPlane:
             self._tts_round_robin += 1
         return selected
 
+    def _tts_ready_sender_fingerprints(
+        self, worker: str, destination: str
+    ) -> dict[str, str]:
+        gate = self.runtime_readiness_gate
+        store = getattr(gate, "store", None)
+        access_store = self.tdl_access_store
+        target = str(destination or "").strip()
+        normalized_worker = str(worker or "").strip().lower()
+        if (
+            store is None
+            or access_store is None
+            or not target
+            or not callable(getattr(access_store, "destination_fingerprint", None))
+        ):
+            return {}
+        worker_record = self.worker_registry.get(normalized_worker) if self.worker_registry else None
+        if worker_record is None or not bool(worker_record.get("enabled", True)):
+            return {}
+        worker_status = store.worker(normalized_worker)
+        if worker_status is None or worker_status.get("status") != "success":
+            return {}
+        destination_fingerprint = access_store.destination_fingerprint(target)
+        ready: dict[str, str] = {}
+        for cell in store.snapshot().get("cells", []):
+            if (
+                cell.get("worker") != normalized_worker
+                or cell.get("runtime") != "tts"
+                or cell.get("status") != "ready"
+                or cell.get("destination_fingerprint") != destination_fingerprint
+            ):
+                continue
+            profile = str(cell.get("profile") or "").strip().lower()
+            session_fingerprint = str(cell.get("session_fingerprint") or "").strip().lower()
+            if not profile or not re.fullmatch(r"[a-f0-9]{64}", session_fingerprint):
+                continue
+            try:
+                gate.require(runtime="tts", profile=profile, worker=normalized_worker)
+            except DomainError:
+                continue
+            export_cell = store.cell(normalized_worker, profile, "export")
+            if (
+                export_cell is None
+                or export_cell.get("status") != "ready"
+                or export_cell.get("fingerprint") != session_fingerprint
+            ):
+                continue
+            ready[profile] = session_fingerprint
+        return dict(sorted(ready.items()))
+
+    def _select_tts_sender_profile(
+        self, worker: str, profiles: list[str]
+    ) -> str:
+        choices = sorted({str(profile).strip().lower() for profile in profiles if str(profile).strip()})
+        if not choices:
+            raise DomainError(
+                "TTS_WORKER_UNAVAILABLE",
+                "Worker TTS belum memiliki profil pengirim yang siap dari Scan Profil.",
+                status_code=503,
+            )
+        with self._tts_route_lock:
+            index = self._tts_sender_round_robin.get(worker, 0) % len(choices)
+            self._tts_sender_round_robin[worker] = index + 1
+        return choices[index]
+
     def tts_worker_options(self, *, destination: str | None = None) -> list[dict[str, Any]]:
         return [
-            {"name": item["name"], "queued_jobs": item["queued_jobs"]}
-            for item in self.tts_worker_diagnostics(destination=destination)
+            item for item in self.tts_worker_statuses(destination=destination)
             if item["ready"]
         ]
+
+    def tts_worker_statuses(self, *, destination: str | None = None) -> list[dict[str, Any]]:
+        registry = self.worker_registry
+        if registry is None:
+            return []
+        statuses = ("queued", "dispatched", "running", "paused")
+        result: list[dict[str, Any]] = []
+        target = str(destination or self._tdl_access_target("tts") or "").strip()
+        gate_store = getattr(self.runtime_readiness_gate, "store", None)
+        for name in registry.names():
+            record = registry.get(name)
+            if record is None:
+                continue
+            ready_profiles = self._tts_ready_sender_fingerprints(
+                name, target
+            )
+            enabled = bool(record.get("enabled", True))
+            worker_status = gate_store.worker(name) if gate_store is not None else None
+            cells = [
+                cell for cell in gate_store.snapshot().get("cells", [])
+                if cell.get("worker") == name and cell.get("runtime") == "tts"
+            ] if gate_store is not None else []
+            destination_fingerprint = (
+                self.tdl_access_store.destination_fingerprint(target)
+                if target
+                and callable(getattr(self.tdl_access_store, "destination_fingerprint", None))
+                else ""
+            )
+            if not enabled:
+                reason = "WORKER_DISABLED"
+            elif not target:
+                reason = "TTS_CHAT_UNAVAILABLE"
+            elif worker_status is not None and worker_status.get("status") == "failed":
+                reason = str(worker_status.get("reason_code") or "WORKER_UNAVAILABLE")
+            elif ready_profiles:
+                reason = "READY"
+            elif not cells:
+                reason = "RUNTIME_NOT_SCANNED"
+            else:
+                reason = next(
+                    (str(cell.get("reason_code") or "RUNTIME_NOT_READY") for cell in cells
+                     if cell.get("status") != "ready"),
+                    "TTS_DESTINATION_CHANGED",
+                )
+            profile_rows = []
+            for cell in cells:
+                profile_name = str(cell.get("profile") or "")
+                if not profile_name:
+                    continue
+                if not enabled:
+                    profile_status = "disabled"
+                    profile_reason = "worker_disabled"
+                elif worker_status is not None and worker_status.get("status") == "failed":
+                    profile_status = "offline"
+                    profile_reason = str(worker_status.get("reason_code") or "worker_unavailable").lower()
+                elif profile_name in ready_profiles:
+                    profile_status = "ready"
+                    profile_reason = ""
+                elif (
+                    cell.get("status") == "ready"
+                    and cell.get("session_fingerprint")
+                    and (
+                        (export_cell := gate_store.cell(name, profile_name, "export")) is None
+                        or export_cell.get("status") != "ready"
+                        or export_cell.get("fingerprint") != cell.get("session_fingerprint")
+                    )
+                ):
+                    profile_status = "not_ready"
+                    profile_reason = "profile_session_changed"
+                elif (
+                    cell.get("status") == "ready"
+                    and cell.get("destination_fingerprint") != destination_fingerprint
+                ):
+                    profile_status = "not_ready"
+                    profile_reason = "tts_destination_changed"
+                elif cell.get("status") == "ready" and not cell.get("session_fingerprint"):
+                    profile_status = "not_ready"
+                    profile_reason = "tdl_access_not_verified"
+                else:
+                    profile_status = "not_ready"
+                    profile_reason = str(cell.get("reason_code") or "runtime_not_ready").lower()
+                profile_rows.append({
+                    "profile": profile_name,
+                    "status": profile_status,
+                    "reason_code": profile_reason,
+                })
+            result.append({
+                "name": name,
+                "enabled": enabled,
+                "queued_jobs": sum(
+                    self.jobs.count(kind="tts", worker=name, status=status, archived=False)
+                    for status in statuses
+                ),
+                "ready": bool(ready_profiles),
+                "reason_code": reason.lower(),
+                "verified_profiles": list(ready_profiles),
+                "profiles": sorted(profile_rows, key=lambda item: item["profile"]),
+                "helpers": [],
+                "profile_session_ready": bool(ready_profiles),
+                "profile_sync_ready": None,
+            })
+        return sorted(result, key=lambda option: option["name"].lower())
 
     def tts_worker_diagnostics(
         self, *, profile: str | None = None, worker: str | None = None,
@@ -1600,70 +2216,107 @@ class ControlPlane:
         return sorted(result, key=lambda option: option["name"].lower())
 
     def _select_safelink_worker(self, requested: str | None = None) -> str:
-        options = self.safelink_worker_options()
-        if not options:
+        registry = self.worker_registry
+        if registry is None:
             raise DomainError(
                 "SAFELINK_WORKER_UNAVAILABLE",
-                "Belum ada worker dengan addon resolver yang siap. Pastikan deployment worker terbaru sudah berjalan, lalu periksa status worker.",
+                "Belum ada worker yang dapat menjalankan resolver. Jalankan Scan Profil.",
                 status_code=503,
             )
         if requested:
             selected = str(requested).strip().lower()
-            for option in options:
-                if option["name"].lower() == selected:
-                    return option["name"]
+            record = registry.get(selected)
+            if record is None:
+                raise DomainError(
+                    "WORKER_NOT_FOUND", "Worker resolver yang dipilih tidak ditemukan.", status_code=404
+                )
+            if not bool(record.get("enabled", True)):
+                raise DomainError(
+                    "WORKER_DISABLED",
+                    f"Worker {selected} sedang dinonaktifkan dan tidak menerima job baru.",
+                    status_code=409,
+                    details={"worker": selected},
+                )
+            gate = self.runtime_readiness_gate
+            require = getattr(gate, "require_resolver", None)
+            if not callable(require):
+                raise DomainError(
+                    "RUNTIME_NOT_READY",
+                    f"Runtime resolver pada worker {selected} belum dipindai. Jalankan Scan Profil.",
+                    status_code=409,
+                    details={"worker": selected, "profile": None, "runtime": "resolver", "reason_code": "RUNTIME_NOT_SCANNED"},
+                )
+            require(selected)
+            return selected
+
+        options = self.safelink_worker_options()
+        ready = [item for item in options if item["enabled"] and item["status"] == "ready"]
+        if not ready:
             raise DomainError(
                 "SAFELINK_WORKER_UNAVAILABLE",
-                "Worker yang dipilih belum siap dengan addon resolver shortlink.",
+                "Belum ada worker resolver yang siap. Jalankan Scan Profil atau aktifkan worker.",
                 status_code=503,
             )
-        counts = {option["name"]: int(option["queued_jobs"]) for option in options}
-        minimum = min(counts.values())
-        tied = sorted(name for name, count in counts.items() if count == minimum)
-        with self._safelink_route_lock:
-            selected = tied[self._safelink_round_robin % len(tied)]
-            self._safelink_round_robin += 1
+        selected = min(ready, key=lambda item: (item["queued_jobs"], item["name"].lower()))["name"]
+        gate = self.runtime_readiness_gate
+        require = getattr(gate, "require_resolver", None)
+        if not callable(require):
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                f"Runtime resolver pada worker {selected} belum dipindai. Jalankan Scan Profil.",
+                status_code=409,
+                details={"worker": selected, "profile": None, "runtime": "resolver", "reason_code": "RUNTIME_NOT_SCANNED"},
+            )
+        require(selected)
         return selected
 
     def safelink_worker_options(self) -> list[dict[str, Any]]:
         registry = self.worker_registry
-        checker = getattr(self.dispatcher, "capabilities", None)
-        if registry is None or not callable(checker):
+        if registry is None:
             return []
-        enabled = getattr(registry, "enabled_names", None)
-        candidates = list(enabled()) if callable(enabled) else registry.names()
+        names = registry.names()
         statuses = ("queued", "dispatched", "running", "paused")
         result: list[dict[str, Any]] = []
-        for name in candidates:
+        gate_store = getattr(self.runtime_readiness_gate, "store", None)
+        for name in names:
             record = registry.get(name)
-            if record is None or not bool(record.get("enabled", True)):
+            if record is None:
                 continue
-            try:
-                response = checker(name)
-            except Exception:
-                continue
-            capabilities = response.get("capabilities", []) if isinstance(response, dict) else []
-            if (
-                not isinstance(response, dict)
-                or response.get("safelink_resolver") is not True
-                or not isinstance(capabilities, list)
-                or CAP_SAFELINK_RESOLVE not in capabilities
-                or CAP_DURABLE_COMMANDS_V1 not in capabilities
-            ):
-                continue
+            enabled = bool(record.get("enabled", True))
+            worker_state = gate_store.worker(name) if callable(getattr(gate_store, "worker", None)) else None
+            cell = gate_store.cell(name, None, "resolver") if callable(getattr(gate_store, "cell", None)) else None
+            if not enabled:
+                readiness_status, reason = "disabled", "WORKER_DISABLED"
+            elif worker_state is not None and worker_state.get("status") == "failed":
+                readiness_status, reason = "offline", str(worker_state.get("reason_code") or "WORKER_UNAVAILABLE")
+            elif worker_state is None or cell is None:
+                readiness_status, reason = "unscanned", "RUNTIME_NOT_SCANNED"
+            elif cell.get("status") == "ready" and cell.get("fingerprint"):
+                readiness_status, reason = "ready", ""
+            else:
+                readiness_status, reason = "not_ready", str(cell.get("reason_code") or "RUNTIME_NOT_READY")
             queued_jobs = sum(
                 self.jobs.count(
                     kind="safelink_resolve", worker=name, status=status, archived=False
                 )
                 for status in statuses
             )
-            result.append({"name": str(name), "queued_jobs": queued_jobs})
+            result.append({
+                "name": str(name),
+                "enabled": enabled,
+                "status": readiness_status,
+                "reason_code": reason,
+                "queued_jobs": queued_jobs,
+            })
         return sorted(result, key=lambda option: option["name"].lower())
 
     def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
         sequence = max(
             (event.sequence for event in self.jobs.events(job.id)), default=0
         ) + 1
+        if job.kind == "storage_upload":
+            self._dispatch_storage_upload_command(job, command, sequence)
+            return
         command["event_sequence_start"] = sequence
         command["payload"] = self._worker_payload(
             job.id, job.kind, command.get("payload") or {}
@@ -1678,6 +2331,91 @@ class ControlPlane:
         self.jobs.append_event(dispatched)
         self.dispatcher.dispatch(job.worker, command)
 
+    def _dispatch_storage_upload_command(
+        self, job: Job, command: dict[str, Any], sequence: int
+    ) -> None:
+        """Use the durable worker command path required for parallel Storage lanes."""
+        dispatch_command = getattr(self.dispatcher, "dispatch_command", None)
+        if not callable(dispatch_command):
+            raise DomainError(
+                "WORKER_INCOMPATIBLE",
+                "Worker dispatcher belum mendukung command durable untuk Storage.",
+                status_code=409,
+            )
+
+        stored_payload = self.jobs.command_payload(job.id)
+        if not isinstance(stored_payload, dict):
+            raise DomainError(
+                "JOB_COMMAND_UNAVAILABLE",
+                "Payload internal upload Storage tidak tersedia.",
+                status_code=500,
+            )
+        dispatch_data = stored_payload.get(_STORAGE_DURABLE_DISPATCH_KEY)
+        dispatch_data = dispatch_data if isinstance(dispatch_data, dict) else {}
+        command_id = str(dispatch_data.get("command_id") or "").strip()
+        dispatch_token = str(dispatch_data.get("dispatch_token") or "").strip()
+        if not command_id or not dispatch_token:
+            dispatch_data = {
+                "command_id": str(uuid.uuid4()),
+                "dispatch_token": secrets.token_urlsafe(32),
+            }
+            stored_payload = {
+                **stored_payload,
+                _STORAGE_DURABLE_DISPATCH_KEY: dispatch_data,
+            }
+            update_payload = getattr(self.jobs, "update_command_payload", None)
+            if not callable(update_payload):
+                raise DomainError(
+                    "JOB_COMMAND_UNAVAILABLE",
+                    "Worker tidak dapat menyimpan identitas command upload Storage.",
+                    status_code=500,
+                )
+            update_payload(job.id, stored_payload)
+            command_id = dispatch_data["command_id"]
+            dispatch_token = dispatch_data["dispatch_token"]
+
+        internal_payload = {
+            key: value
+            for key, value in stored_payload.items()
+            if key != _STORAGE_DURABLE_DISPATCH_KEY
+        }
+        execution_profile = str(
+            internal_payload.get("_tdl_sender_profile")
+            or command.get("profile")
+            or job.profile
+        )
+        envelope = {
+            "command_id": command_id,
+            "job_id": job.id,
+            "attempt": max(1, int(command.get("attempt") or 1)),
+            "dispatch_token": dispatch_token,
+            "profile_revision": 0,
+            "settings_version": int(job.settings_version or 0),
+            "event_sequence_start": sequence,
+            "execution_plan": self.jobs.execution_plan(job.id)
+            or command.get("execution")
+            or {},
+            "job": {
+                "kind": job.kind,
+                "profile": execution_profile,
+                "actor_user_id": int(job.actor_user_id),
+                "worker": job.worker,
+                "payload": self._worker_payload(
+                    job.id, job.kind, internal_payload
+                ),
+            },
+        }
+        receipt = dispatch_command(job.worker, envelope)
+        if not isinstance(receipt, dict) or receipt.get("accepted") is not True:
+            raise RuntimeError("Worker belum mengonfirmasi command upload Storage.")
+        self.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=sequence,
+            status=JobStatus.DISPATCHED,
+            event_type="durable_dispatch_accepted",
+            progress={"worker": job.worker, "position": 1},
+        ))
+
     def _worker_payload(
         self, job_id: str, kind: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1685,6 +2423,12 @@ class ControlPlane:
             password = self.private_job_value(job_id, "backup_archive_password")
             return {**payload, **({"password": password} if password else {})}
         if kind in {"tts", "storage_upload", "storage_reconcile"}:
+            if kind == "storage_upload":
+                payload = {
+                    key: value
+                    for key, value in payload.items()
+                    if key != _STORAGE_DURABLE_DISPATCH_KEY
+                }
             key = "telegram_tts_chat_id" if kind == "tts" else "tdl_storage_chat_ref"
             target = self.private_job_value(job_id, key)
             result = {**payload, **({"tdl_access_target": target} if target else {})}
@@ -2921,16 +3665,17 @@ class ControlPlane:
             profiles = result.get("profiles")
             session_fingerprints = (
                 normalize_session_fingerprints(result.get("session_fingerprints"))
-                if purpose == "storage"
+                if purpose in {"storage", "tts"}
                 else None
             )
             inventory_matches = (
-                purpose != "storage"
+                purpose not in {"storage", "tts"}
                 or (
                     session_fingerprints is not None
                     and store is not None
                     and store.inventory_fingerprint(
-                        list(session_fingerprints), session_fingerprints
+                        list(session_fingerprints),
+                        session_fingerprints if purpose == "storage" else None,
                     )
                     == inventory_hash
                 )
@@ -2956,8 +3701,9 @@ class ControlPlane:
                     logging.getLogger(__name__).exception(
                         "Could not persist TDL access verification for job %s", job.id
                     )
+        is_quick_mode_job = job.kind == "export" and bool(job.payload.get("quick_mode"))
         if (
-            job.kind == "storage_upload"
+            (job.kind == "storage_upload" or is_quick_mode_job)
             and event.event_type == "tdl_access.profile_denied"
             and self.tdl_access_store is not None
         ):
@@ -2974,6 +3720,23 @@ class ControlPlane:
                 or ""
             ).strip()
             error_code = str(result.get("error_code") or "").strip().upper()
+            if is_quick_mode_job and profile and self.runtime_readiness_gate is not None:
+                self.runtime_readiness_gate.record_quick_mode_failure(
+                    worker=job.worker,
+                    profile=job.profile,
+                    error_code=error_code,
+                )
+            if profile and self.runtime_readiness_gate is not None:
+                self.runtime_readiness_gate.invalidate_quick_mode_sender(
+                    worker=job.worker,
+                    sender_profile=profile[0],
+                    reason_code=error_code or "TDL_ACCESS_NOT_VERIFIED",
+                )
+                self.runtime_readiness_gate.record_storage_failure(
+                    worker=job.worker,
+                    profile=profile[0],
+                    error_code=error_code,
+                )
             if profile and target and fingerprints.get(profile[0]):
                 try:
                     self.tdl_access_store.invalidate_profile(
@@ -2990,6 +3753,51 @@ class ControlPlane:
                         profile[0],
                     )
 
+        if (
+            job.kind == "tts"
+            and event.event_type == "tdl_access.profile_denied"
+            and isinstance(result, dict)
+        ):
+            profiles = normalize_profiles([result.get("profile")])
+            profile = profiles[0] if profiles else ""
+            error_code = str(result.get("error_code") or "").strip().upper()
+            try:
+                raw_fingerprints = json.loads(
+                    self.private_job_value(job.id, "tdl_sender_session_fingerprints") or "{}"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raw_fingerprints = {}
+            fingerprints = normalize_session_fingerprints(raw_fingerprints)
+            if profile and self.runtime_readiness_gate is not None:
+                self.runtime_readiness_gate.record_tts_failure(
+                    worker=job.worker,
+                    profile=profile,
+                    error_code=error_code,
+                )
+            target = str(
+                self.private_job_value(job.id, "telegram_tts_chat_id") or ""
+            ).strip()
+            if (
+                profile
+                and target
+                and fingerprints.get(profile)
+                and self.tdl_access_store is not None
+            ):
+                try:
+                    self.tdl_access_store.invalidate_profile(
+                        job.worker,
+                        self.tdl_access_store.destination_fingerprint(target),
+                        profile,
+                        fingerprints[profile],
+                        error_code,
+                        purpose="tts",
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Could not invalidate TTS access proof for job %s profile %s",
+                        job.id,
+                        profile,
+                    )
         if event.event_type == "storage.folder_discovered" and self.storage_catalog is not None:
             relative_path = str(result.get("relative_path", "")).strip()
             if relative_path:

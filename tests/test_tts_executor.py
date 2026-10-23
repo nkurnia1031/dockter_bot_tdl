@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from tme3bot.worker.executor_tts import TtsExecutorMixin, tts_delivery_filename
 from tme3bot.worker.executor import WorkerJobExecutor
+from tme3bot.worker.tts_pipeline import TtsError
 
 
 class _FakePipeline:
@@ -45,9 +46,12 @@ class _FakePipeline:
 class _FakeTdl:
     def __init__(self):
         self.uploads = []
+        self.error = None
 
     def upload(self, path, chat_ref, caption):
         self.uploads.append((Path(path), chat_ref, caption))
+        if self.error is not None:
+            raise self.error
 
 
 class _Executor(TtsExecutorMixin):
@@ -96,6 +100,37 @@ class _Executor(TtsExecutorMixin):
 
 
 class TtsExecutorTests(unittest.TestCase):
+    def test_worker_failure_event_preserves_tts_runtime_code_for_backend_invalidation(self):
+        events = []
+        executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
+        executor.publisher = SimpleNamespace(
+            emit=lambda *args, **kwargs: events.append((args, kwargs))
+        )
+
+        executor._failed(
+            {"job_id": "job-helper-down", "kind": "tts"},
+            TtsError("helper stopped", code="TTS_HELPER_UNAVAILABLE"),
+        )
+
+        self.assertEqual(events[0][1]["error"]["code"], "WORKER_JOB_FAILED")
+        self.assertTrue(events[0][1]["error"]["message"].startswith("TTS_HELPER_UNAVAILABLE:"))
+
+    def test_unhealthy_helper_uses_a_runtime_failure_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = _Executor(directory)
+            pipeline = _FakePipeline()
+            pipeline.ready = lambda: False
+            with patch.object(executor, "_tts_pipeline", return_value=pipeline):
+                with self.assertRaises(TtsError) as raised:
+                    executor._tts({
+                        "job_id": "helper-down",
+                        "kind": "tts",
+                        "profile": "default",
+                        "worker": "local",
+                        "payload": {"title": "Bab", "text": "Isi"},
+                    })
+        self.assertEqual(raised.exception.code, "TTS_HELPER_UNAVAILABLE")
+
     def test_health_and_recovery_use_current_runtime_helper_config(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = _Executor(directory)
@@ -174,6 +209,48 @@ class TtsExecutorTests(unittest.TestCase):
             self.assertEqual(chat_ref, "+1123456789")
             self.assertEqual(caption, "Bab 1")
             self.assertEqual(path.name, "Bab 1.mp3")
+
+    def test_tts_sender_permission_failure_emits_scoped_profile_denial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = _Executor(directory)
+            executor.tdl.error = RuntimeError("CHAT_WRITE_FORBIDDEN")
+            responses = iter([
+                {"registered_parts": 1, "chat_ref": "-100123"},
+                {"items": [{
+                    "id": "delivery-1",
+                    "artifact_ref": "a" * 48,
+                    "part_index": 1,
+                    "total_parts": 1,
+                }]},
+                {},
+            ])
+            command = {
+                "job_id": "job-denied",
+                "kind": "tts",
+                "profile": "default",
+                "worker": "local",
+                "payload": {
+                    "title": "Bab",
+                    "text": "Isi",
+                    "_tdl_sender_profiles": ["default"],
+                },
+            }
+            with patch.object(executor, "_tts_pipeline", return_value=_FakePipeline()), patch(
+                "tme3bot.worker.executor_tts.request_json",
+                side_effect=lambda *args, **kwargs: next(responses),
+            ):
+                with self.assertRaises(TtsError):
+                    executor._tts(command)
+
+        denial_events = [
+            (args, kwargs) for args, kwargs in executor.events
+            if len(args) > 2 and args[2] == "tdl_access.profile_denied"
+        ]
+        self.assertEqual(len(denial_events), 1)
+        self.assertEqual(denial_events[0][1]["result"], {
+            "profile": "default",
+            "error_code": "CHAT_WRITE_FORBIDDEN",
+        })
 
     def test_tts_delivery_filename_uses_title_and_numbers_multiple_parts(self):
         self.assertEqual(tts_delivery_filename("Bab 1", 1, 1), "Bab 1.mp3")

@@ -7,6 +7,11 @@ from tme3bot.domain.models import DomainError
 
 
 def register_safelink(app, context, *, current_actor, job_dict) -> None:
+    @app.get("/api/v1/safelink/workers")
+    def safelink_workers(actor=Depends(current_actor)):
+        del actor
+        return {"items": context.control_plane.safelink_worker_options()}
+
     @app.post("/api/v1/safelink/jobs", status_code=202)
     def submit_safelink_job(
         body: SafelinkJobRequest,
@@ -21,7 +26,10 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
         operation, _ = operations.submit(
             actor,
             kind="job.submit",
-            target={"profile": actor.profile},
+            target={
+                "profile": actor.profile,
+                **({"worker": body.worker} if body.worker else {}),
+            },
             input_data={"job_kind": "safelink_resolve", "payload": {"url": body.url}},
             idempotency_key=idempotency_key,
             request_id=request.state.request_id,

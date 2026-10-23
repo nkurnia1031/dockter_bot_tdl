@@ -3,7 +3,7 @@
   import { api, post, put, remove } from '$lib/api';
   import { normalizeTdlChatRef } from '$lib/chatRef';
   import { session } from '$lib/session.svelte';
-  import { profileOptionLabel } from '$lib/profile-catalog';
+  import { profileOptionLabel, runtimeReadinessFor } from '$lib/profile-catalog';
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
@@ -11,15 +11,6 @@
 
   type Job = Record<string, any>;
   type Stage = Record<string, any>;
-  type Verification = {
-    verified: boolean;
-    purpose: string;
-    worker: string;
-    profile?: string | null;
-    quick_mode?: boolean;
-    [key: string]: any;
-  };
-
   let sources = $state<any[]>([]);
   let labels = $state<LabelItem[]>([]);
   let chatRef = $state('');
@@ -31,11 +22,14 @@
   let selected = $state('');
   let targetProfile = $state('');
   let targetWorker = $state('');
-  let targetVerified = $state<Verification | null>(null);
   let message = $state('');
   let submitting = $state(false);
   let cooldown = $state(false);
   let cooldownTimer: ReturnType<typeof setTimeout> | undefined;
+  const quickModeReadiness = $derived(
+    runtimeReadinessFor(session.runtimeReadiness, targetProfile, targetWorker, 'quick_mode')
+  );
+  const quickModeRuntimeReady = $derived(quickModeReadiness.status === 'ready');
   let sourceLoading = $state(false);
   let statsLoading = $state(false);
   let allJobs = $state<Job[]>([]);
@@ -319,7 +313,6 @@
     saveNumericSource = false;
     label = '';
     selected = '';
-    targetVerified = null;
     message = '';
     if (cooldownTimer) clearTimeout(cooldownTimer);
     cooldownTimer = undefined;
@@ -337,8 +330,8 @@
 
   async function submit() {
     if (submitting || cooldown) return;
-    if (!targetVerified || targetVerified.profile !== targetProfile || targetVerified.worker !== targetWorker || targetVerified.quick_mode !== true) {
-      message = 'Verifikasi profile dan worker Quick Mode terlebih dahulu.';
+    if (!quickModeRuntimeReady) {
+      message = 'Runtime Quick Mode belum siap. Jalankan Scan semua worker di halaman Profil.';
       return;
     }
     const normalizedChatRef = url.trim() ? null : normalizeTdlChatRef(chatRef);
@@ -438,7 +431,7 @@
 
 <section class="card mt-6 p-5 sm:p-6">
   <div class="flex flex-wrap items-center justify-between gap-3"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Tambah Quick Mode</h2><p class="muted text-sm">Form ini selalu mengirim job dengan Quick Mode aktif.</p></div></div><span class="badge running">Quick Mode aktif</span></div>
-  <div class="mt-5"><TargetPicker purpose="export" quickMode={true} bind:profile={targetProfile} bind:worker={targetWorker} bind:verified={targetVerified}/></div>
+  <div class="mt-5"><TargetPicker purpose="export" quickMode={true} requiresVerification={false} readinessRuntime="quick_mode" bind:profile={targetProfile} bind:worker={targetWorker}/></div>
   <div class="mt-5 grid gap-4 lg:grid-cols-2">
     <label class="block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)} disabled={sourceLoading}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
     <label class="block text-sm font-bold">Referensi chat<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="@iyear · 123456789 · https://t.me/iyear · +1 123456789" /></label>
@@ -449,7 +442,7 @@
   <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId}/><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Gunakan Start ID manual untuk job ini.</span></span></label>
   {#if isNumeric(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource}/><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Simpan Last ID numeric source untuk penggunaan berikutnya.</span></span></label>{/if}
   {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => { label = item.label; clearMessage(); }}>{item.label}</button>{/each}</div>{/if}
-  <div class="mt-5 flex flex-wrap justify-end gap-3"><button class="button secondary" onclick={resetForm} disabled={submitting}>Reset form</button><button class="button" onclick={submit} disabled={submitting || cooldown || !targetVerified}>{submitting ? 'Mengirim...' : cooldown ? 'Tunggu sebentar...' : 'Tambah Quick Mode'}<FileDown size={16}/></button></div>
+  <div class="mt-5 flex flex-wrap justify-end gap-3"><button class="button secondary" onclick={resetForm} disabled={submitting}>Reset form</button><button class="button" onclick={submit} disabled={submitting || cooldown || !quickModeRuntimeReady}>{submitting ? 'Mengirim...' : cooldown ? 'Tunggu sebentar...' : 'Tambah Quick Mode'}<FileDown size={16}/></button></div>
   {#if message}<p class={`mt-3 rounded-xl px-3 py-2 text-sm ${message.includes('berhasil') ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-200'}`}>{message}</p>{/if}
 </section>
 

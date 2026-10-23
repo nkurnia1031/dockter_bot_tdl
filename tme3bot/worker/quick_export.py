@@ -33,6 +33,10 @@ from tme3bot.url_parser import slugify_label
 class QuickModeError(RuntimeError):
     """A user-actionable error in the Quick Mode pipeline."""
 
+    def __init__(self, message: str, *, code: str = "") -> None:
+        self.code = str(code or "").strip().upper()
+        super().__init__(message)
+
 
 QUICK_PHASES = (
     "exporting",
@@ -508,6 +512,10 @@ class QuickThumbnailBuilder:
                         try:
                             valid_videos.append((video, self._video_duration(video)))
                             return True
+                        except QuickModeError as exc:
+                            if exc.code:
+                                raise
+                            skip_media(video, exc)
                         except ProcessStalledError:
                             raise
                         except Exception as exc:
@@ -544,6 +552,12 @@ class QuickThumbnailBuilder:
                         frame_path.unlink(missing_ok=True)
                         try:
                             self._extract_video_frame(video, ts, frame_path)
+                        except QuickModeError as exc:
+                            if exc.code:
+                                raise
+                            frame_path.unlink(missing_ok=True)
+                            skip_media(video, exc)
+                            break
                         except ProcessStalledError:
                             raise
                         except Exception as exc:
@@ -712,7 +726,10 @@ class QuickThumbnailBuilder:
                     0.0,
                     "quick-thumbnail",
                 )
-            raise
+            raise QuickModeError(
+                "Runtime ffmpeg/ffprobe Quick Mode tidak tersedia pada worker.",
+                code="QUICK_MODE_RUNTIME_UNAVAILABLE",
+            ) from exc
         command_id = notify_command_started(
             self.command_callback, command, "quick-thumbnail"
         )

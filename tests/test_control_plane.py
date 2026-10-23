@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from datetime import timedelta
@@ -8,12 +9,10 @@ from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.application.runtime_readiness import RuntimeReadinessGate
+from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
-from tme3bot.domain.worker_contract import (
-    CAP_DURABLE_COMMANDS_V1,
-    CAP_SAFELINK_RESOLVE,
-    CAP_SHARED_EXPORT_CURSOR,
-)
+from tme3bot.domain.worker_contract import CAP_SHARED_EXPORT_CURSOR
 from tme3bot.worker_registry import WorkerRegistry
 
 
@@ -45,11 +44,28 @@ class FakeJobSecretStore:
 class FakeDispatcher:
     def __init__(self):
         self.commands = []
+        self.durable_commands = []
         self.cancel_result = True
         self.resume_result = False
 
     def dispatch(self, worker, command):
         self.commands.append(command)
+
+    def dispatch_command(self, worker, envelope):
+        self.durable_commands.append(envelope)
+        job = envelope["job"]
+        self.dispatch(worker, {
+            "job_id": envelope["job_id"],
+            "attempt": envelope["attempt"],
+            "kind": job["kind"],
+            "profile": job["profile"],
+            "actor_user_id": job["actor_user_id"],
+            "worker": job["worker"],
+            "payload": job["payload"],
+            "execution": envelope["execution_plan"],
+            "event_sequence_start": envelope["event_sequence_start"],
+        })
+        return {"accepted": True}
 
     def cancel(self, worker, job_id):
         return self.cancel_result
@@ -143,6 +159,22 @@ class ControlPlaneTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def attach_resolver_readiness(self, control, workers):
+        store = RuntimeReadinessStore(
+            Path(self.temp.name) / f"resolver-readiness-{id(control)}.json"
+        )
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": name, "status": "success"} for name in workers],
+            profiles={},
+        )
+        store.apply_resolver_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=workers,
+        )
+        control.runtime_readiness_gate = RuntimeReadinessGate(store)
+        return store
+
     def authorize_quick_mode_storage(
         self, control=None, dispatcher=None, workers=("local",)
     ):
@@ -174,6 +206,37 @@ class ControlPlaneTests(unittest.TestCase):
                 session_fingerprints=fingerprints,
             )
 
+    def attach_storage_readiness(self, *, profiles=("default", "archive", "other")):
+        runtime_store = RuntimeReadinessStore(
+            Path(self.temp.name) / f"storage-readiness-{id(self.control)}.json"
+        )
+        capabilities = self.dispatcher.capabilities("local")
+        fingerprints = capabilities["storage_upload_fingerprints"]
+        runtime_store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [
+                {"profile": profile, "ready": True, "fingerprint": fingerprints[profile]}
+                for profile in fingerprints
+            ]},
+        )
+        destination_hash = self.control.tdl_access_store.destination_fingerprint("-100123")
+        runtime_store.apply_storage_scan(
+            checked_at="2026-10-23T10:05:00Z",
+            profiles={"local": [
+                {
+                    "profile": profile,
+                    "ready": True,
+                    "fingerprint": hashlib.sha256(profile.encode()).hexdigest(),
+                    "session_fingerprint": fingerprints[profile],
+                    "destination_fingerprint": destination_hash,
+                }
+                for profile in profiles
+            ]},
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(runtime_store)
+        return runtime_store
+
     def test_quick_mode_pins_verified_storage_target_and_hides_fingerprints(self):
         self.authorize_quick_mode_storage()
 
@@ -196,22 +259,400 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
         self.assertNotIn("-100123", str(job.payload))
 
+    def test_quick_mode_requires_scanned_cell_without_live_capability_probe(self):
+        self.authorize_quick_mode_storage()
+        store = RuntimeReadinessStore(Path(self.temp.name) / "quick-readiness.json")
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{"profile": "default", "ready": True, "fingerprint": "a" * 64}]},
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
+
+        def fail_if_probed(_worker):
+            raise AssertionError("submit must use the Profile scan snapshot")
+
+        self.dispatcher.capabilities = fail_if_probed
+        with self.assertRaises(DomainError) as raised:
+            self.control.submit_job(
+                self.actor,
+                "export",
+                {"url": "https://t.me/c/1/3", "quick_mode": True},
+            )
+
+        self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
+        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+
+        export_job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/4"}
+        )
+        self.assertEqual(export_job.payload["url"], "https://t.me/c/1/4")
+
+    def test_storage_upload_uses_saved_readiness_without_live_capability_probe(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = self.attach_storage_readiness()
+
+        def fail_if_probed(_worker):
+            raise AssertionError("Storage submit must use the Profile scan snapshot")
+
+        self.dispatcher.capabilities = fail_if_probed
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-readiness-batch"},
+        )
+
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(job.worker, "local")
+        self.assertEqual(runtime_store.cell("local", "archive", "storage")["status"], "ready")
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(payload["_tdl_sender_profile"], "archive")
+        self.assertEqual(
+            payload["_tdl_sender_session_fingerprints"],
+            {"archive": "b" * 64, "default": "a" * 64, "other": "c" * 64},
+        )
+        self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
+
+    def test_storage_upload_dispatches_durable_command_with_every_ready_sender_profile(self):
+        self.authorize_quick_mode_storage()
+        self.attach_storage_readiness()
+
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-parallel"},
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(len(self.dispatcher.durable_commands), 1)
+        envelope = self.dispatcher.durable_commands[0]
+        self.assertEqual(envelope["job"]["kind"], "storage_upload")
+        self.assertEqual(
+            set(envelope["job"]["payload"]["_tdl_sender_profiles"]),
+            {"default", "archive", "other"},
+        )
+        self.assertNotIn(
+            "_storage_durable_dispatch", envelope["job"]["payload"]
+        )
+        stored_payload = self.jobs.command_payload(job.id)
+        dispatch_data = stored_payload["_storage_durable_dispatch"]
+        self.assertEqual(envelope["command_id"], dispatch_data["command_id"])
+        self.assertEqual(envelope["dispatch_token"], dispatch_data["dispatch_token"])
+        self.assertNotIn("_storage_durable_dispatch", self.dispatcher.commands[-1]["payload"])
+
+    def test_storage_upload_rejects_without_storage_cell_before_creating_job(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = RuntimeReadinessStore(
+            Path(self.temp.name) / "storage-no-cell-readiness.json"
+        )
+        runtime_store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{"profile": "default", "ready": True, "fingerprint": "a" * 64}]},
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(runtime_store)
+
+        def fail_if_probed(_worker):
+            raise AssertionError("Storage submit must not check worker capabilities")
+
+        self.dispatcher.capabilities = fail_if_probed
+        with self.assertRaises(DomainError) as raised:
+            self.control.submit_job(
+                self.actor,
+                "storage_upload",
+                {"folder_path": "/workspace/biasa", "batch_id": "storage-no-cell"},
+            )
+
+        self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
+        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+
+    def test_storage_upload_rejects_when_saved_access_proof_is_stale(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = self.attach_storage_readiness(profiles=("default",))
+        capabilities = self.dispatcher.capabilities("local")
+        fingerprints = capabilities["storage_upload_fingerprints"]
+        access_store = self.control.tdl_access_store
+        destination_hash = access_store.destination_fingerprint("-100123")
+        inventory_hash = access_store.inventory_fingerprint(["default"], fingerprints)
+        access_store.replace_results(
+            "local",
+            "storage",
+            destination_hash,
+            inventory_hash,
+            [{"profile": "default", "ready": False}],
+            session_fingerprints={"default": fingerprints["default"]},
+        )
+
+        def fail_if_probed(_worker):
+            raise AssertionError("Storage submit must not refresh access proof online")
+
+        self.dispatcher.capabilities = fail_if_probed
+        with self.assertRaises(DomainError) as raised:
+            self.control.submit_job(
+                self.actor,
+                "storage_upload",
+                {"folder_path": "/workspace/biasa", "batch_id": "storage-stale-proof"},
+            )
+
+        self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
+        self.assertEqual(runtime_store.cell("local", "default", "storage")["status"], "not_ready")
+        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+
+    def test_storage_access_failure_invalidates_only_the_sender_profile(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = self.attach_storage_readiness()
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-denied-batch"},
+        )
+        sender_profile = self.dispatcher.commands[-1]["payload"]["_tdl_sender_profile"]
+        sequence = max(event.sequence for event in self.jobs.events(job.id)) + 1
+
+        self.control.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=sequence,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={"code": "CHAT_WRITE_FORBIDDEN", "message": "write access denied"},
+        ))
+
+        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "not_ready")
+        for profile in {"default", "archive", "other"} - {sender_profile}:
+            self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
+        self.assertEqual(runtime_store.cell("local", sender_profile, "export")["status"], "ready")
+
+    def test_storage_dispatch_failure_marks_worker_offline_without_clearing_profile_cells(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = self.attach_storage_readiness()
+
+        def fail_dispatch(_worker, _command):
+            raise RuntimeError("worker offline")
+
+        self.dispatcher.dispatch = fail_dispatch
+        with self.assertRaises(DomainError):
+            self.control.submit_job(
+                self.actor,
+                "storage_upload",
+                {"folder_path": "/workspace/biasa", "batch_id": "storage-dispatch-failure"},
+            )
+
+        self.assertEqual(runtime_store.worker("local")["status"], "failed")
+        self.assertEqual(runtime_store.cell("local", "archive", "storage")["status"], "ready")
+
+    def test_storage_item_session_change_invalidates_the_reported_profile(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = self.attach_storage_readiness()
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-session-change"},
+        )
+        sender_profile = self.dispatcher.commands[-1]["payload"]["_tdl_sender_profile"]
+        sequence = max(event.sequence for event in self.jobs.events(job.id)) + 1
+
+        self.control.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=sequence,
+            status=JobStatus.FAILED,
+            event_type="storage.batch_completed",
+            result={"value": {"items": [{
+                "profile": sender_profile,
+                "status": "failed",
+                "error_code": "PROFILE_UPLOAD_SESSION_CHANGED",
+            }]}},
+            error={"code": "STORAGE_UPLOAD_FAILED", "message": "All files failed."},
+        ))
+
+        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "not_ready")
+        for profile in {"default", "archive", "other"} - {sender_profile}:
+            self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
+
+    def test_quick_mode_profile_denied_invalidates_quick_cell_and_storage_proof_on_running_event(self):
+        self.authorize_quick_mode_storage()
+        job = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/8", "quick_mode": True},
+        )
+        store = RuntimeReadinessStore(Path(self.temp.name) / "quick-denial-readiness.json")
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [
+                {"profile": "default", "ready": True, "fingerprint": "a" * 64},
+                {"profile": "archive", "ready": True, "fingerprint": "b" * 64},
+            ]},
+        )
+        store.apply_quickmode_scan(
+            checked_at="2026-10-23T10:05:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [
+                {
+                    "profile": "default", "ready": True, "fingerprint": "1" * 64,
+                    "session_fingerprint": "a" * 64,
+                    "destination_fingerprint": "2" * 64,
+                    "rclone_destination_fingerprint": "3" * 64,
+                    "sender_profiles": ["default", "archive", "other"],
+                    "sender_session_fingerprints": {"default": "a" * 64, "archive": "b" * 64, "other": "c" * 64},
+                },
+                {
+                    "profile": "archive", "ready": True, "fingerprint": "4" * 64,
+                    "session_fingerprint": "b" * 64,
+                    "destination_fingerprint": "2" * 64,
+                    "rclone_destination_fingerprint": "3" * 64,
+                    "sender_profiles": ["default", "archive", "other"],
+                    "sender_session_fingerprints": {"default": "a" * 64, "archive": "b" * 64, "other": "c" * 64},
+                },
+                {
+                    "profile": "other", "ready": True, "fingerprint": "5" * 64,
+                    "session_fingerprint": "c" * 64,
+                    "destination_fingerprint": "2" * 64,
+                    "rclone_destination_fingerprint": "3" * 64,
+                    "sender_profiles": ["archive", "other"],
+                    "sender_session_fingerprints": {"archive": "b" * 64, "other": "c" * 64},
+                },
+            ]},
+        )
+        store.apply_storage_scan(
+            checked_at="2026-10-23T10:05:00Z",
+            profiles={"local": [
+                {
+                    "profile": profile, "ready": True,
+                    "fingerprint": str(index) * 64,
+                    "session_fingerprint": session,
+                    "destination_fingerprint": "2" * 64,
+                }
+                for index, (profile, session) in enumerate((
+                    ("default", "a" * 64),
+                    ("archive", "b" * 64),
+                    ("other", "c" * 64),
+                ), start=1)
+            ]},
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
+
+        self.control.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1,
+            status=JobStatus.RUNNING,
+            event_type="tdl_access.profile_denied",
+            result={"profile": "default", "error_code": "CHAT_WRITE_FORBIDDEN"},
+        ))
+
+        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "archive", "quick_mode")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "other", "quick_mode")["status"], "ready")
+        self.assertEqual(store.cell("local", "default", "storage")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "archive", "storage")["status"], "ready")
+        self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
+        status = self.control.tdl_access_verification_status("local", "storage")
+        self.assertNotIn("default", status["verified_profiles"])
+        self.assertIn("archive", status["verified_profiles"])
+
+    def test_quick_mode_terminal_runtime_failure_is_scoped_and_input_cancel_keep_cell(self):
+        store = RuntimeReadinessStore(Path(self.temp.name) / "quick-terminal-readiness.json")
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [
+                {"profile": "default", "ready": True, "fingerprint": "a" * 64},
+                {"profile": "archive", "ready": True, "fingerprint": "b" * 64},
+            ]},
+        )
+        quick_cells = [{
+            "profile": profile,
+            "ready": True,
+            "fingerprint": fingerprint,
+            "session_fingerprint": session,
+            "destination_fingerprint": "c" * 64,
+            "rclone_destination_fingerprint": "d" * 64,
+            "sender_profiles": [profile],
+            "sender_session_fingerprints": {profile: session},
+        } for profile, fingerprint, session in (
+            ("default", "1" * 64, "a" * 64),
+            ("archive", "2" * 64, "b" * 64),
+        )]
+        store.apply_quickmode_scan(
+            checked_at="2026-10-23T10:05:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": quick_cells},
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
+        job = Job(
+            id="quick-terminal-failure",
+            kind="export",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.DISPATCHED,
+            payload={"quick_mode": True},
+        )
+        self.jobs.create(job)
+
+        self.control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "UTILITY_PROCESS_STALLED: compression stopped",
+            },
+        ))
+        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "archive", "quick_mode")["status"], "ready")
+        self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
+
+        store.apply_quickmode_scan(
+            checked_at="2026-10-23T11:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": quick_cells},
+        )
+        self.control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=2,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "INVALID_EXPORT_INPUT: file manifest is missing",
+            },
+        ))
+        self.control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=3,
+            status=JobStatus.CANCELLED,
+            event_type="cancelled",
+            error={"code": "JOB_TERMINATED", "message": "cancelled by user"},
+        ))
+        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
+
     def configure_tdl_access(self, control, dispatcher, registry, purposes=("tts", "storage")):
         store = SqliteTdlAccessStore(Path(self.temp.name) / f"tdl-access-{id(control)}.db")
         control.tdl_access_store = store
         control.tdl_access_target_resolver = lambda _purpose: "123456789"
         control.runtime_settings_store = FakeJobSecretStore()
+        tts_cells = {}
+        worker_rows = []
         for worker in registry.names():
             response = dispatcher.capabilities(worker)
+            worker_rows.append({"worker": worker, "status": "success"})
             for purpose in purposes:
                 if purpose == "storage":
                     profiles = response.get("available_storage_profiles") or []
                     fingerprints = response.get("storage_upload_fingerprints") or {}
                 else:
                     profiles = response.get("export_profiles") or response.get("profiles") or []
-                    fingerprints = None
+                    fingerprints = {
+                        profile: f"{(ord(profile[0]) % 16):x}" * 64
+                        for profile in profiles if purpose == "tts"
+                    }
                 destination_hash = store.destination_fingerprint("123456789")
-                inventory_hash = store.inventory_fingerprint(profiles, fingerprints)
+                inventory_hash = store.inventory_fingerprint(
+                    profiles,
+                    fingerprints if purpose == "storage" else None,
+                )
                 store.replace_results(
                     worker,
                     purpose,
@@ -220,6 +661,42 @@ class ControlPlaneTests(unittest.TestCase):
                     [{"profile": profile, "ready": True} for profile in profiles],
                     session_fingerprints=fingerprints,
                 )
+                if purpose == "tts":
+                    tts_cells[worker] = [
+                        {
+                            "profile": profile,
+                            "ready": bool(response.get("tts")),
+                            "reason_code": "TTS_HELPER_UNAVAILABLE",
+                            "fingerprint": "c" * 64,
+                            "session_fingerprint": fingerprints[profile],
+                            "destination_fingerprint": destination_hash,
+                        }
+                        for profile in profiles
+                    ]
+        if "tts" in purposes:
+            readiness = RuntimeReadinessStore(
+                Path(self.temp.name) / f"runtime-readiness-{id(control)}.json"
+            )
+            readiness.apply_export_scan(
+                checked_at="2026-10-23T00:00:00Z",
+                workers=worker_rows,
+                profiles={
+                    worker: [
+                        {
+                            "profile": cell["profile"],
+                            "ready": True,
+                            "fingerprint": cell["session_fingerprint"],
+                        }
+                        for cell in cells
+                    ]
+                    for worker, cells in tts_cells.items()
+                },
+            )
+            readiness.apply_tts_scan(
+                checked_at="2026-10-23T00:00:00Z",
+                profiles=tts_cells,
+            )
+            control.runtime_readiness_gate = RuntimeReadinessGate(readiness)
         return store
 
     def test_active_job_keeps_original_worker_when_route_changes(self):
@@ -358,6 +835,9 @@ class ControlPlaneTests(unittest.TestCase):
         }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
         self.configure_tdl_access(control, dispatcher, registry)
+        dispatcher.capabilities = lambda _worker: self.fail(
+            "TTS submission must use the stored readiness snapshot"
+        )
 
         jobs = [
             control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"}),
@@ -415,6 +895,92 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
         self.assertEqual(self.jobs.count(kind="tts"), 0)
 
+    def test_tts_rejects_snapshot_for_a_different_destination_before_job_creation(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "stale-tts-destination.json",
+            {"local": "http://worker"},
+            {"local": "token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "tts": True,
+            "export_profiles": ["default"],
+            "profiles": ["default"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
+        control.tdl_access_target_resolver = lambda _purpose: "987654321"
+
+        with self.assertRaises(DomainError) as error:
+            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+
+        self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
+        self.assertEqual(self.jobs.count(kind="tts"), 0)
+
+    def test_tts_snapshot_fails_closed_when_export_session_cell_is_stale(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "stale-tts-session.json",
+            {"local": "http://worker"},
+            {"local": "token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "tts": True,
+            "export_profiles": ["default"],
+            "profiles": ["default"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
+        control.runtime_readiness_gate.store.invalidate(
+            worker="local",
+            profile="default",
+            runtime="export",
+            reason_code="PROFILE_SESSION_CHANGED",
+        )
+
+        with self.assertRaises(DomainError) as error:
+            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+
+        self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
+        self.assertEqual(self.jobs.count(kind="tts"), 0)
+
+    def test_tts_failure_invalidates_execution_sender_cell_not_owner_cell(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "tts-execution-profile.json",
+            {"local": "http://worker"},
+            {"local": "token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "tts": True,
+            "export_profiles": ["default", "archive"],
+            "profiles": ["default", "archive"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
+        control._tts_sender_round_robin["local"] = 0
+        job = control.submit_job(
+            self.actor, "tts", {"title": "A", "text": "private text"}
+        )
+        stored = self.jobs.command_payload(job.id)
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(stored["_tdl_sender_profile"], "archive")
+
+        control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "TTS_HELPER_UNAVAILABLE: helper stopped",
+            },
+        ))
+
+        store = control.runtime_readiness_gate.store
+        self.assertEqual(store.cell("local", "archive", "tts")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "default", "tts")["status"], "ready")
+
     def test_explicit_false_tts_capability_is_not_overridden_by_a_stale_capability_list(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "stale-tts-capability.json",
@@ -452,15 +1018,15 @@ class ControlPlaneTests(unittest.TestCase):
             {"worker-a": "a", "worker-b": "b", "worker-c": "c"},
         )
         dispatcher = FakeDispatcher()
-        dispatcher.capabilities = lambda worker: {
-            "safelink_resolver": worker != "worker-c",
-            "capabilities": (
-                [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1]
-                if worker != "worker-c"
-                else []
-            ),
-        }
+        dispatcher.capabilities = lambda _worker: self.fail(
+            "Resolver job admission must not probe live capabilities"
+        )
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.attach_resolver_readiness(control, {
+            "worker-a": {"ready": True, "fingerprint": "a" * 64},
+            "worker-b": {"ready": True, "fingerprint": "b" * 64},
+            "worker-c": {"ready": False, "reason_code": "RESOLVER_RUNTIME_UNAVAILABLE"},
+        })
 
         prepared = control.prepare_durable_job(
             self.actor,
@@ -482,34 +1048,32 @@ class ControlPlaneTests(unittest.TestCase):
             prepared.execution_plan["resource_keys"],
         )
 
-        with self.assertRaises(DomainError) as forced_target:
-            control.prepare_durable_job(
-                self.actor,
-                {"worker": "worker-b"},
-                {
-                    "job_kind": "safelink_resolve",
-                    "payload": {"url": "https://pndk.to/another"},
-                },
-            )
-        self.assertEqual(forced_target.exception.code, "SAFELINK_WORKER_AUTO_SELECTED")
+        manual = control.prepare_durable_job(
+            self.actor,
+            {"worker": "worker-b"},
+            {
+                "job_kind": "safelink_resolve",
+                "payload": {"url": "https://pndk.to/another"},
+            },
+        )
+        self.assertEqual(manual.job.worker, "worker-b")
 
-    def test_safelink_router_uses_queue_depth_and_round_robin_ties(self):
+    def test_safelink_router_uses_queue_depth_and_deterministic_ties(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "resolver-addon-load-workers.json",
             {"worker-a": "http://worker-a", "worker-b": "http://worker-b", "offline": "http://worker-c"},
             {"worker-a": "a", "worker-b": "b", "offline": "c"},
         )
         dispatcher = FakeDispatcher()
-        dispatcher.capabilities = lambda worker: {
-            "safelink_resolver": worker != "offline",
-            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1]
-            if worker != "offline"
-            else [],
-        }
         control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.attach_resolver_readiness(control, {
+            "worker-a": {"ready": True, "fingerprint": "a" * 64},
+            "worker-b": {"ready": True, "fingerprint": "b" * 64},
+            "offline": {"ready": False, "reason_code": "RESOLVER_RUNTIME_UNAVAILABLE"},
+        })
 
         self.assertEqual(control._select_safelink_worker(), "worker-a")
-        self.assertEqual(control._select_safelink_worker(), "worker-b")
+        self.assertEqual(control._select_safelink_worker(), "worker-a")
         self.jobs.create(
             Job(
                 id="worker-a-queued",
@@ -522,6 +1086,87 @@ class ControlPlaneTests(unittest.TestCase):
             )
         )
         self.assertEqual(control._select_safelink_worker(), "worker-b")
+        registry.set_enabled("worker-b", False)
+        self.assertEqual(control._select_safelink_worker(), "worker-a")
+
+    def test_safelink_manual_selection_rejects_disabled_or_unready_worker(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "resolver-manual-workers.json",
+            {"ready": "http://ready", "not-ready": "http://not-ready", "disabled": "http://disabled"},
+            {"ready": "a", "not-ready": "b", "disabled": "c"},
+        )
+        registry.set_enabled("disabled", False)
+        control = ControlPlane(
+            self.jobs, FakeDispatcher(), self.profiles, worker_registry=registry
+        )
+        self.attach_resolver_readiness(control, {
+            "ready": {"ready": True, "fingerprint": "a" * 64},
+            "not-ready": {"ready": False, "reason_code": "RESOLVER_RUNTIME_UNAVAILABLE"},
+            "disabled": {"ready": True, "fingerprint": "c" * 64},
+        })
+
+        for worker, expected in (("not-ready", "RUNTIME_NOT_READY"), ("disabled", "WORKER_DISABLED")):
+            with self.subTest(worker=worker), self.assertRaises(DomainError) as raised:
+                control.prepare_durable_job(
+                    self.actor,
+                    {"worker": worker},
+                    {"job_kind": "safelink_resolve", "payload": {"url": "https://pndk.to/code"}},
+                )
+            self.assertEqual(raised.exception.code, expected)
+
+    def test_safelink_runtime_failure_invalidates_only_its_worker_cell(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "resolver-failure-workers.json",
+            {"ready": "http://ready"},
+            {"ready": "a"},
+        )
+        control = ControlPlane(
+            self.jobs, FakeDispatcher(), self.profiles, worker_registry=registry
+        )
+        store = self.attach_resolver_readiness(control, {
+            "ready": {"ready": True, "fingerprint": "a" * 64},
+        })
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:01:00Z",
+            workers=[{"worker": "ready", "status": "success"}],
+            profiles={"ready": [{
+                "profile": "default", "ready": True, "fingerprint": "b" * 64,
+            }]},
+        )
+        job = Job(
+            id="resolver-runtime-failure",
+            kind="safelink_resolve",
+            profile="default",
+            actor_user_id=42,
+            worker="ready",
+            status=JobStatus.FAILED,
+            payload={"submitted": True},
+        )
+        self.jobs.create(job)
+
+        control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={"code": "RESOLVER_RUNTIME_UNAVAILABLE", "message": "Addon tidak dapat dihubungi."},
+        ))
+
+        self.assertEqual(store.cell("ready", None, "resolver")["status"], "not_ready")
+        self.assertEqual(store.cell("ready", "default", "export")["status"], "ready")
+
+        store.upsert_cell(
+            worker="ready", profile=None, runtime="resolver", ready=True,
+            fingerprint="c" * 64,
+        )
+        control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=2,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={"code": "RESOLVER_FAILED", "message": "Shortlink tidak dapat diproses."},
+        ))
+        self.assertEqual(store.cell("ready", None, "resolver")["status"], "ready")
 
     def test_safelink_submit_rejects_untrusted_domains_and_missing_workers(self):
         registry = WorkerRegistry(
@@ -538,12 +1183,9 @@ class ControlPlaneTests(unittest.TestCase):
             )
         self.assertEqual(unavailable.exception.code, "SAFELINK_WORKER_UNAVAILABLE")
 
-        dispatcher = FakeDispatcher()
-        dispatcher.capabilities = lambda _worker: {
-            "safelink_resolver": True,
-            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
-        }
-        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.attach_resolver_readiness(control, {
+            "ordinary": {"ready": True, "fingerprint": "a" * 64},
+        })
         with self.assertRaises(DomainError) as invalid:
             control.prepare_durable_job(
                 self.actor,
@@ -607,6 +1249,61 @@ class ControlPlaneTests(unittest.TestCase):
             {"utility": "compress", "folders": ["/workspace/biasa"]},
         )
         self.assertEqual(job.status, JobStatus.DISPATCHED)
+
+    def test_utility_runtime_failure_invalidates_only_utility_cell(self):
+        store = RuntimeReadinessStore(Path(self.temp.name) / "runtime-readiness.json")
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{
+                "profile": "default", "ready": True, "fingerprint": "a" * 64,
+            }]},
+        )
+        store.upsert_cell(
+            worker="local", profile=None, runtime="utility", ready=True,
+            fingerprint="b" * 64,
+        )
+        control = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            runtime_readiness_gate=RuntimeReadinessGate(store),
+        )
+        job = Job(
+            id="utility-runtime-failure",
+            kind="utility",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"utility": "compress", "folders": ["/workspace/folder"]},
+        )
+        self.jobs.create(job)
+
+        control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "UTILITY_PATH_INVALID: folder outside workspace",
+            },
+        ))
+        self.assertEqual(store.cell("local", None, "utility")["status"], "ready")
+
+        control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=2,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "UTILITY_RUNTIME_UNAVAILABLE: cannot start process",
+            },
+        ))
+        self.assertEqual(store.cell("local", None, "utility")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
 
     def test_storage_uses_verified_sender_profile_but_keeps_actor_as_job_owner(self):
         registry = WorkerRegistry(
@@ -1103,6 +1800,7 @@ class ControlPlaneTests(unittest.TestCase):
             "utility",
             {
                 "utility": "compress",
+                "folders": ["/workspace/folder"],
                 "password": "extract-secret",
                 "settings": {
                     "compress_password": "archive-secret",
@@ -1218,7 +1916,7 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_terminate_all_force_cancels_stale_jobs(self):
         first = self.control.submit_job(self.actor, "export", {"url": "https://t.me/c/1/2"})
-        second = self.control.submit_job(self.actor, "utility", {"utility": "pindah", "folders": []})
+        second = self.control.submit_job(self.actor, "utility", {"utility": "pindah", "folders": ["/workspace/folder"]})
         self.dispatcher.cancel_result = False
 
         result = self.control.terminate_active_jobs(self.actor)
@@ -1482,7 +2180,8 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(len(self.dispatcher.commands), 4)
 
     def _create_ambiguous_storage_upload(self):
-        self.control.runtime_settings_store = FakeJobSecretStore()
+        self.authorize_quick_mode_storage()
+        self.attach_storage_readiness()
         source = Job(
             id="storage-source-reconcile",
             kind="storage_upload",

@@ -72,13 +72,6 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
                 values["chat_ref"] = normalize_tdl_chat_ref(values["chat_ref"])
             except ValueError as exc:
                 raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
-        verify_target(
-            actor,
-            "export",
-            values.get("profile"),
-            values.get("worker"),
-            quick_mode=bool(values.get("quick_mode")),
-        )
         if bool(values.get("quick_mode")):
             # Snapshot settings at submission time. The password is retained
             # only in the internal worker command and redacted from the Job API.

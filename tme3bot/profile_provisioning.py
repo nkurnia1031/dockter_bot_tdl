@@ -1569,13 +1569,14 @@ class ProfileProvisioningStore:
 class ProfileProvisioningService:
     def __init__(
         self, store: ProfileProvisioningStore, profile_manager, worker_registry,
-        dispatcher, operation_service=None,
+        dispatcher, operation_service=None, runtime_readiness_gate=None,
     ) -> None:
         self.store = store
         self.profile_manager = profile_manager
         self.worker_registry = worker_registry
         self.dispatcher = dispatcher
         self.operation_service = operation_service
+        self.runtime_readiness_gate = runtime_readiness_gate
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1889,6 +1890,18 @@ class ProfileProvisioningService:
                 )
                 if not isinstance(installed, dict) or not installed.get("ready"):
                     raise RuntimeError("Worker tidak mengonfirmasi sesi siap.")
+                invalidate_readiness = getattr(
+                    self.runtime_readiness_gate, "invalidate_profile_mutation", None
+                )
+                if callable(invalidate_readiness):
+                    try:
+                        invalidate_readiness(
+                            worker=worker,
+                            profile=profile,
+                            reason_code="PROFILE_SESSION_CHANGED",
+                        )
+                    except Exception:
+                        LOGGER.warning("Could not invalidate profile runtime readiness after install.")
                 self.store.update_distribution(profile, worker, "ready", provisioning_id=operation_id)
                 if operation_id:
                     self._operation_log(

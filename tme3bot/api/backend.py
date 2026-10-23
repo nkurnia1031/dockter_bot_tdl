@@ -110,6 +110,7 @@ class BackendContext:
     queue_command_service: Any = None
     queue_publisher: Any = None
     local_profile_catalog: Any = None
+    runtime_readiness_store: Any = None
     activity_journal: Any = None
 
 
@@ -1172,7 +1173,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         _model_dict=_model_dict,
         current_actor=current_actor,
         job_dict=job_dict,
-        verify_target=verify_target,
     )
 
 
@@ -1224,7 +1224,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         current_actor=current_actor,
         job_dict=job_dict,
         require_service=require_service,
-        verify_target=verify_target,
     )
 
 

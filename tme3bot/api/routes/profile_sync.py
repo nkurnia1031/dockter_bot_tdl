@@ -25,6 +25,21 @@ _SYNC_PHASES = {
     "identity_install", "transaction_rollback", "installation_reused",
 }
 _SYNC_STATUSES = {"queued", "running", "succeeded", "failed", "waiting", "cancelled"}
+_SESSION_MUTATION_PHASES = frozenset({
+    "session_install", "session_commit", "identity_install",
+    "download_install", "export_install", "upload_install",
+})
+
+
+def _invalidate_export_readiness(context, profile: str, worker: str) -> None:
+    gate = getattr(getattr(context, "control_plane", None), "runtime_readiness_gate", None)
+    invalidate = getattr(gate, "invalidate_profile_mutation", None)
+    if callable(invalidate):
+        invalidate(
+            profile=profile,
+            worker=worker,
+            reason_code="PROFILE_SESSION_CHANGED",
+        )
 
 
 def _worker_identity(context, worker_name: str, worker_token: str) -> str:
@@ -226,6 +241,12 @@ def register_profile_sync(app, context, *, require_internal, current_actor) -> N
             code=code,
             details=details,
         )
+        if (
+            row_id is not None
+            and phase in _SESSION_MUTATION_PHASES
+            and status in {"running", "succeeded", "failed"}
+        ):
+            _invalidate_export_readiness(context, profile, worker)
         for sync_request in provisioner.store.sync_requests(profile, worker, revision):
             _append_operation_sync_event(
                 context,

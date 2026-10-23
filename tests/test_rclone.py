@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tme3bot.rclone import RcloneError, RcloneRunner
+from tme3bot.tdl import TDLCommandError
 
 
 class FakeSubprocessRunner:
@@ -21,6 +22,87 @@ class FakeSubprocessRunner:
 
 
 class RcloneRunnerTests(unittest.TestCase):
+    def test_upload_remote_access_failure_has_stable_runtime_code(self):
+        class AccessDeniedRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                del kwargs
+                raise TDLCommandError(
+                    command, 1, "", "Failed to copy: 403 Forbidden: access denied"
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            archive.write_bytes(b"archive")
+
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(AccessDeniedRunner()).copy_files(
+                        [archive],
+                        "googledrive:backup",
+                        config,
+                        workspace_root=workspace,
+                    )
+
+            self.assertEqual(raised.exception.code, "RCLONE_ACCESS_FAILED")
+
+    def test_nonzero_rclone_result_classifies_remote_access_but_not_input_permission(self):
+        class ResultRunner(FakeSubprocessRunner):
+            def __init__(self, stderr):
+                super().__init__()
+                self.stderr = stderr
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=1, stdout="", stderr=self.stderr)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            archive.write_bytes(b"archive")
+
+            for detail, expected_code in (
+                ("googleapi: Error 403: Forbidden", "RCLONE_ACCESS_FAILED"),
+                ("permission denied while opening local source", ""),
+            ):
+                with self.subTest(detail=detail), patch(
+                    "tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"
+                ):
+                    with self.assertRaises(RcloneError) as raised:
+                        RcloneRunner(ResultRunner(detail)).copy_files(
+                            [archive],
+                            "googledrive:backup",
+                            config,
+                            workspace_root=workspace,
+                        )
+                    self.assertEqual(raised.exception.code, expected_code)
+
+    def test_missing_rclone_binary_has_stable_runtime_code(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            archive = workspace / "result.7z.001"
+            archive.write_bytes(b"archive")
+
+            with patch("tme3bot.rclone.shutil.which", return_value=None):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(FakeSubprocessRunner()).copy_files(
+                        [archive],
+                        "googledrive:backup",
+                        config,
+                        workspace_root=workspace,
+                    )
+
+            self.assertEqual(raised.exception.code, "RCLONE_RUNTIME_UNAVAILABLE")
+
     def test_uploads_only_the_given_workspace_files_with_explicit_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)

@@ -21,6 +21,7 @@ from tme3bot.domain.worker_contract import (
 from tme3bot.infrastructure.http_client import JsonHttpError, WorkerHttpDispatcher
 from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.executor_support import WorkerEventPublisher
+from tme3bot.worker.safelink_resolver import SafelinkResolveError, SafelinkRuntimeUnavailable
 
 
 class ContractWorkerExecutor:
@@ -46,6 +47,14 @@ class ContractWorkerRegistry:
         return {"url": "http://worker.test", "token": "worker-token"}
 
 
+class CapturingPublisher:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, *args, **kwargs):
+        self.events.append((args, kwargs))
+
+
 class WorkerContractTests(unittest.TestCase):
     def test_profile_sync_status_uses_short_timeout_for_profiles_page(self):
         dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
@@ -54,6 +63,22 @@ class WorkerContractTests(unittest.TestCase):
 
         profile_json.assert_called_once_with(
             "remote", "GET", "/internal/v1/profile-sync", timeout=4
+        )
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_resolver_readiness_uses_authenticated_internal_probe(self, request):
+        request.return_value = {"ready": True, "fingerprint": "a" * 64}
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        result = dispatcher.safelink_runtime_readiness("remote")
+
+        self.assertTrue(result["ready"])
+        request.assert_called_once_with(
+            "http://worker.test",
+            "worker-token",
+            "GET",
+            "/internal/v1/safelink/runtime-readiness",
+            timeout=15,
         )
 
     def test_local_profile_inventory_dispatch_classifies_timeout_network_and_worker_error(self):
@@ -101,6 +126,35 @@ class WorkerContractTests(unittest.TestCase):
             self.assertTrue(executor._safelink_resolver_ready())
         ready.assert_called_once_with()
 
+    def test_executor_capabilities_do_not_probe_resolver_addon_for_each_job(self):
+        executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
+        executor.config = type("Config", (), {"utility_workspace_root": "/workspace"})()
+        executor.available_export_profiles = lambda: []
+        executor.available_download_profiles = lambda: []
+        executor.available_storage_profiles = lambda: []
+        executor.available_storage_session_fingerprints = lambda _profiles: {}
+        executor.storage_profile = lambda: "default"
+        executor.tts_health = lambda: {"ready": False, "tts_profiles": [], "helpers": []}
+        executor._safelink_resolver_ready = lambda: self.fail(
+            "capability negotiation must not perform the Resolver health probe"
+        )
+
+        details = executor.capabilities()
+
+        self.assertTrue(details["safelink_resolver"])
+
+    def test_only_resolver_addon_runtime_failure_has_specific_job_error_code(self):
+        executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
+        publisher = CapturingPublisher()
+        executor.publisher = publisher
+        command = {"job_id": "resolver-job", "kind": "safelink_resolve"}
+
+        executor._failed(command, SafelinkRuntimeUnavailable("Addon offline."))
+        self.assertEqual(publisher.events[-1][1]["error"]["code"], "RESOLVER_RUNTIME_UNAVAILABLE")
+
+        executor._failed(command, SafelinkResolveError("Shortlink tidak dapat diproses."))
+        self.assertEqual(publisher.events[-1][1]["error"]["code"], "WORKER_JOB_FAILED")
+
     def test_worker_capability_endpoint_advertises_versioned_wire_features(self):
         executor = ContractWorkerExecutor()
         app = create_worker_app(
@@ -141,7 +195,7 @@ class WorkerContractTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(CAP_DURABLE_COMMANDS_V1, response.json()["capabilities"])
 
-    def test_worker_resolver_capability_tracks_http_addon_readiness(self):
+    def test_worker_capability_endpoint_advertises_declared_resolver_support(self):
         executor = ContractWorkerExecutor()
         executor.capabilities = lambda: {
             "profiles": ["default"],

@@ -131,6 +131,47 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         contract["capabilities"] = sorted(set(capabilities))
         return {**details, **contract}
 
+    @app.get("/internal/v1/utility/runtime-readiness", dependencies=[Depends(authorize)])
+    def utility_runtime_readiness():
+        probe = getattr(context.executor, "utility_runtime_readiness", None)
+        if not callable(probe):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pemeriksaan runtime Utility.",
+                status_code=404,
+            )
+        return probe()
+
+    @app.post("/internal/v1/quickmode/runtime-readiness", dependencies=[Depends(authorize)])
+    def quickmode_runtime_readiness(body: dict[str, Any]):
+        if set(body) != {"rclone_destination"} or not isinstance(
+            body.get("rclone_destination"), str
+        ):
+            raise DomainError(
+                "QUICK_MODE_READINESS_REQUEST_INVALID",
+                "Tujuan rclone Quick Mode tidak valid.",
+                status_code=422,
+            )
+        probe = getattr(context.executor, "quickmode_runtime_readiness", None)
+        if not callable(probe):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pemeriksaan runtime Quick Mode.",
+                status_code=404,
+            )
+        return probe(body["rclone_destination"])
+
+    @app.get("/internal/v1/safelink/runtime-readiness", dependencies=[Depends(authorize)])
+    def safelink_runtime_readiness():
+        probe = getattr(context.executor, "safelink_runtime_readiness", None)
+        if not callable(probe):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pemeriksaan runtime Resolver.",
+                status_code=404,
+            )
+        return probe()
+
     @app.get("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
     def profile_sync_status():
         snapshot = getattr(context.executor, "profile_sync_status", None)

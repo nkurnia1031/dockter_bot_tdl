@@ -16,6 +16,7 @@ from tme3bot.progress_reporter import (
 from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.tdl_access_fingerprint import normalize_session_fingerprints
 from tme3bot.rclone import (
+    RcloneError,
     RcloneRunner,
 )
 from tme3bot.storage_catalog import (
@@ -377,14 +378,17 @@ class StorageExecutorMixin:
             self._rclone_runners[job_id] = runner
         try:
             kwargs = {"remote_names": remote_names} if remote_names is not None else {}
-            return runner.copy_files(
-                files,
-                destination,
-                config_path,
-                workspace_root=workspace,
-                config_root=config_root,
-                **kwargs,
-            )
+            try:
+                return runner.copy_files(
+                    files,
+                    destination,
+                    config_path,
+                    workspace_root=workspace,
+                    config_root=config_root,
+                    **kwargs,
+                )
+            except RcloneError as exc:
+                raise QuickModeError(str(exc), code=exc.code) from exc
         finally:
             with self._lock:
                 self._rclone_runners.pop(job_id, None)

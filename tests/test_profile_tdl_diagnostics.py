@@ -440,6 +440,38 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("424242", json.dumps(result))
             self.assertNotIn("987654", json.dumps(result))
 
+    def test_tdl_diagnosis_returns_opaque_fingerprint_that_tracks_session_changes(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            config = make_config(root)
+            profile_root = self.prepare_profile(config)
+            manager = ProfileSessionManager(config)
+
+            def fake_run(command, **_kwargs):
+                identity_file = Path(command[command.index("--identity-file") + 1])
+                identity_file.write_text(
+                    json.dumps({"telegram_user_id": 424242}), encoding="utf-8"
+                )
+                return subprocess.CompletedProcess(command, 0)
+
+            with patch("tme3bot.worker.profile_sessions.subprocess.run", side_effect=fake_run):
+                first = manager.diagnose_tdl_sessions("default")
+                (profile_root / "user1/.tdl/data/export-ns").write_bytes(
+                    b"changed export session"
+                )
+                second = manager.diagnose_tdl_sessions("default")
+
+            first_fingerprint = first.get("fingerprint", "")
+            second_fingerprint = second.get("fingerprint", "")
+            self.assertTrue(first["ready"])
+            self.assertTrue(second["ready"])
+            self.assertRegex(first_fingerprint, r"^[a-f0-9]{64}$")
+            self.assertRegex(second_fingerprint, r"^[a-f0-9]{64}$")
+            self.assertNotEqual(first_fingerprint, second_fingerprint)
+            serialized = json.dumps({"first": first, "second": second})
+            self.assertNotIn("424242", serialized)
+            self.assertNotIn("changed export session", serialized)
+
     def test_missing_bolt_database_is_not_opened_or_created(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

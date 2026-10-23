@@ -4,7 +4,14 @@ import ExportPage from './ExportPage.svelte';
 
 const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles: [
   { name: 'default', workers: ['local'], exclusive_worker: 'local' }
-] }), { status: 200 });
+], runtime_readiness: {
+  checked_at: '2026-10-23T10:00:00Z',
+  workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }],
+  cells: [
+    { worker: 'local', profile: 'default', runtime: 'export', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' },
+    { worker: 'local', profile: 'default', runtime: 'quick_mode', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }
+  ]
+} }), { status: 200 });
 
 describe('ExportPage labels', () => {
   afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); sessionStorage.clear(); });
@@ -35,6 +42,34 @@ describe('ExportPage labels', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  it('submits normal Export from persisted Profile readiness without manual verification', async () => {
+    const requests: { url: string; method: string }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles: [{ name: 'default', workers: ['local'], exclusive_worker: 'local' }],
+        runtime_readiness: {
+          checked_at: '2026-10-23T10:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }],
+          cells: [{ worker: 'local', profile: 'default', runtime: 'export', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }]
+        }
+      }), { status: 200 });
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.endsWith('/exports') && method === 'POST') return new Response(JSON.stringify({ id: 'export-ready', status: 'dispatched' }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ExportPage);
+    expect(await screen.findByText('Export siap')).toBeTruthy();
+    await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Mulai export' }));
+
+    expect(requests.some((item) => item.url.includes('/context/verify'))).toBe(false);
+    expect(requests.some((item) => item.url.endsWith('/exports') && item.method === 'POST')).toBe(true);
+  });
+
   it('keeps queue and completion alerts visible with media totals', async () => {
     let status = 'queued';
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
@@ -58,8 +93,7 @@ describe('ExportPage labels', () => {
     }));
     render(ExportPage);
     await screen.findByText('Export baru');
-    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
-    await screen.findByText('Target backend terverifikasi');
+    await screen.findByText('Export siap');
     const input=screen.getByLabelText('Referensi chat');
     await fireEvent.input(input, {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
@@ -85,8 +119,7 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
-    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
-    await screen.findByText('Target backend terverifikasi');
+    await screen.findByText('Export siap');
     const source=await screen.findByLabelText('Pilih source tersimpan');
     await screen.findByRole('option', {name:/example/});
     await fireEvent.change(source, {target:{value:'example'}});
@@ -121,8 +154,7 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
-    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
-    await screen.findByText('Target backend terverifikasi');
+    await screen.findByText('Export siap');
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
 
@@ -145,16 +177,11 @@ describe('ExportPage labels', () => {
     expect(screen.getByRole('button', {name:'Mulai export'})).toBeTruthy();
   });
 
-  it('re-verifies and sends quick_mode when Quick Mode is enabled', async () => {
+  it('uses the Profile Quick Mode snapshot without manual verification', async () => {
     const requests: {url:string; body:Record<string,unknown>}[]=[];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
       if (url.includes('/profiles/local')) return localProfileCatalogResponse();
-      if (url.includes('/context/verify')) {
-        const body=JSON.parse(String(init?.body || '{}')) as Record<string,unknown>;
-        requests.push({url, body});
-        return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', worker_health: 'healthy', quick_mode: body.quick_mode === true }), { status: 200 });
-      }
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
       if (url.endsWith('/exports') && init?.method === 'POST') {
         requests.push({url, body:JSON.parse(String(init.body))});
@@ -163,16 +190,13 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
-    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
-    await screen.findByText('Target backend terverifikasi');
+    await screen.findByText('Export siap');
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
-    expect(screen.queryByText('Target backend terverifikasi')).toBeNull();
-    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
-    expect(requests[1].body).toMatchObject({purpose:'export', quick_mode:true});
-    await screen.findByText('Target backend terverifikasi');
+    expect(await screen.findByText('Quick Mode siap')).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
-    expect(requests[2].body).toMatchObject({chat_ref:'example',quick_mode:true});
+    expect(requests).toHaveLength(1);
+    expect(requests[0].body).toMatchObject({chat_ref:'example',quick_mode:true});
     expect(await screen.findByText(/ModeCepat\/2026/)).toBeTruthy();
     expect(await screen.findByText(/thumbnail sebagai foto/)).toBeTruthy();
   });
@@ -181,10 +205,6 @@ describe('ExportPage labels', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url=String(input);
       if (url.includes('/profiles/local')) return localProfileCatalogResponse();
-      if (url.includes('/context/verify')) {
-        const body=JSON.parse(String(init?.body || '{}')) as Record<string,unknown>;
-        return new Response(JSON.stringify({ verified:true, purpose:'export', profile:'default', worker:'local', worker_health:'healthy', quick_mode:body.quick_mode === true }), {status:200});
-      }
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({items:[]}), {status:200});
       if (url.endsWith('/exports') && init?.method === 'POST') {
         return new Response(JSON.stringify({id:'quick-queued',status:'queued',progress:{message:'Menunggu worker'}}), {status:200});
@@ -193,12 +213,9 @@ describe('ExportPage labels', () => {
     }));
     render(ExportPage);
     await screen.findByText('Export baru');
-    await fireEvent.click(screen.getByRole('button', {name:'Verifikasi target'}));
-    await screen.findByText('Target backend terverifikasi');
+    await screen.findByText('Export siap');
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
-    await fireEvent.click(screen.getByRole('button', {name:'Verifikasi target'}));
-    await screen.findByText('Target backend terverifikasi');
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
 
     const lockedButton=await screen.findByRole('button', {name:'Tunggu sebentar...'});

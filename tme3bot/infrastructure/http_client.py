@@ -547,6 +547,45 @@ class WorkerHttpDispatcher:
             timeout=15,
         )
 
+    def utility_runtime_readiness(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            "/internal/v1/utility/runtime-readiness",
+            timeout=15,
+        )
+
+    def quickmode_runtime_readiness(
+        self, worker: str, rclone_destination: str
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            "/internal/v1/quickmode/runtime-readiness",
+            {"rclone_destination": str(rclone_destination or "")},
+            timeout=15,
+        )
+
+    def safelink_runtime_readiness(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            "/internal/v1/safelink/runtime-readiness",
+            timeout=15,
+        )
+
     def tts_health(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

@@ -64,6 +64,10 @@ _Avoid_: identitas folder, identitas worker.
 Status apakah salinan lokal profil pada satu worker lolos pemeriksaan TDL dan cocok dengan identitas profil. Kesiapan dicatat per worker dan tidak menunggu worker lain.
 _Avoid_: kesiapan seluruh worker.
 
+**Kesiapan runtime**:
+Bukti bahwa kemampuan fitur tertentu tersedia pada satu worker dan, bila diperlukan, satu profil. Bukti tetap berlaku sampai fingerprint terkait berubah atau kegagalan akses/runtime yang cocok menginvalidasinya.
+_Avoid_: status online worker, verifikasi setiap job.
+
 **Revision vault**:
 Versi tertentu dari bundle kanonis di backend yang hanya dipasang ke worker melalui operasi distribusi eksplisit.
 _Avoid_: status sync.

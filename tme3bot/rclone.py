@@ -13,6 +13,10 @@ from tme3bot.utility import validate_rclone_destination
 class RcloneError(RuntimeError):
     """Raised when an rclone transfer cannot be completed."""
 
+    def __init__(self, message: str, *, code: str = "") -> None:
+        self.code = str(code or "").strip().upper()
+        super().__init__(message)
+
 
 class RcloneRunner:
     """Small, cancellable rclone adapter for files already in the workspace."""
@@ -56,6 +60,38 @@ class RcloneRunner:
         lines, _ = bounded_output_tail(output, max_lines=12, max_bytes=2048)
         return "\n".join(sanitize_text(line) for line in lines)
 
+    @staticmethod
+    def _access_error_code(exc: BaseException) -> str:
+        """Classify only explicit remote authentication/connectivity failures."""
+        sources = [str(exc)]
+        for name in ("stdout", "stderr"):
+            value = getattr(exc, name, None)
+            if isinstance(value, str):
+                sources.append(value)
+        text = "\n".join(sources).casefold()
+        markers = (
+            "401 unauthorized",
+            "401: unauthorized",
+            "403 forbidden",
+            "403: forbidden",
+            "authentication failed",
+            "authorization failed",
+            "invalid_grant",
+            "token expired",
+            "failed to renew token",
+            "accessdenied",
+            "insufficient permission",
+            "insufficientpermissions",
+            "permission denied (publickey)",
+            "connection refused",
+            "network is unreachable",
+            "no route to host",
+            "no such host",
+            "i/o timeout",
+            "context deadline exceeded",
+        )
+        return "RCLONE_ACCESS_FAILED" if any(marker in text for marker in markers) else ""
+
     def copy_files(
         self,
         files: Iterable[Path],
@@ -82,9 +118,15 @@ class RcloneRunner:
                 "Konfigurasi rclone harus berada di dalam direktori data yang diizinkan."
             ) from exc
         if not config.is_file():
-            raise RcloneError(f"Konfigurasi rclone tidak ditemukan: {config}")
+            raise RcloneError(
+                f"Konfigurasi rclone tidak ditemukan: {config}",
+                code="RCLONE_RUNTIME_UNAVAILABLE",
+            )
         if shutil.which("rclone") is None:
-            raise RcloneError("Binary rclone belum tersedia pada worker.")
+            raise RcloneError(
+                "Binary rclone belum tersedia pada worker.",
+                code="RCLONE_RUNTIME_UNAVAILABLE",
+            )
 
         paths = [Path(item).resolve() for item in files]
         names = list(remote_names) if remote_names is not None else [path.name for path in paths]
@@ -129,11 +171,18 @@ class RcloneRunner:
                 raise
             except TDLCommandError as exc:
                 raise RcloneError(
-                    f"rclone gagal untuk {path.name} (exit code {exc.returncode})."
+                    f"rclone gagal untuk {path.name} (exit code {exc.returncode}).",
+                    code=self._access_error_code(exc),
+                ) from exc
+            except OSError as exc:
+                raise RcloneError(
+                    "Worker tidak dapat memulai proses rclone.",
+                    code="RCLONE_RUNTIME_UNAVAILABLE",
                 ) from exc
             if result.returncode != 0:
                 raise RcloneError(
-                    f"rclone gagal untuk {path.name} (exit code {result.returncode})."
+                    f"rclone gagal untuk {path.name} (exit code {result.returncode}).",
+                    code=self._access_error_code(result),
                 )
             uploaded.append("/".join(remote_parts))
             if self.progress_callback is not None:

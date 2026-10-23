@@ -128,6 +128,45 @@ class TdlAccessStoreTests(unittest.TestCase):
                 ["archive"],
             )
 
+    def test_tts_denial_invalidates_tts_proof_without_touching_storage_proof(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = SqliteTdlAccessStore(Path(root) / "access.db")
+            destination = store.destination_fingerprint("-100123")
+            fingerprints = {"default": "a" * 64}
+            inventory = store.inventory_fingerprint(["default"])
+            for purpose in ("tts", "storage"):
+                store.replace_results(
+                    "remote-1",
+                    purpose,
+                    destination,
+                    inventory,
+                    [{"profile": "default", "ready": True}],
+                    session_fingerprints=fingerprints,
+                )
+
+            self.assertTrue(store.invalidate_profile(
+                "remote-1",
+                destination,
+                "default",
+                fingerprints["default"],
+                "CHAT_WRITE_FORBIDDEN",
+                purpose="tts",
+            ))
+            self.assertEqual(
+                store.verified_profiles(
+                    "remote-1", "tts", destination, inventory,
+                    session_fingerprints=fingerprints,
+                ),
+                [],
+            )
+            self.assertEqual(
+                store.verified_profiles(
+                    "remote-1", "storage", destination, inventory,
+                    session_fingerprints=fingerprints,
+                ),
+                ["default"],
+            )
+
     def test_existing_access_database_gains_fingerprint_column_without_losing_rows(self):
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "access.db"
@@ -235,6 +274,12 @@ class _VerifyExecutor(TdlAccessExecutorMixin):
     def available_export_profiles(self):
         return ["default", "archive"]
 
+    def diagnose_profile_tdl(self, profile):
+        return {
+            "ready": True,
+            "fingerprint": self.session_fingerprints[profile],
+        }
+
     def available_storage_session_fingerprints(self, profiles=None):
         selected = profiles if profiles is not None else self.available_storage_profiles()
         return {
@@ -251,6 +296,21 @@ class _VerifyExecutor(TdlAccessExecutorMixin):
 
 
 class TdlAccessWorkerTests(unittest.TestCase):
+    def test_tts_verification_records_session_fingerprints_for_explicit_proof_refresh(self):
+        executor = _VerifyExecutor()
+
+        with patch(
+            "tme3bot.worker.executor_tdl_access.request_json",
+            return_value={"purpose": "tts", "target": "@target"},
+        ):
+            result = executor._tdl_access_verify(
+                {"job_id": "job-tts-proof", "worker": "local", "payload": {"purpose": "tts"}}
+            )
+
+        self.assertEqual(result["inventory_hash"], SqliteTdlAccessStore.inventory_fingerprint(["default", "archive"]))
+        self.assertEqual(result["session_fingerprints"], executor.session_fingerprints)
+        self.assertTrue(all(item["ready"] for item in result["profiles"]))
+
     def test_worker_publishes_only_opaque_upload_fingerprints(self):
         from tme3bot.worker.executor import WorkerJobExecutor
 

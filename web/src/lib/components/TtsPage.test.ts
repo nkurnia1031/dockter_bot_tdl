@@ -17,8 +17,8 @@ describe('TTS page target controls', () => {
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
       requests.push({ path, method, body });
       if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [
-        { name: 'local', enabled: true, ready: true, reason_code: 'ready', helpers: [], queued_jobs: 1 },
-        { name: 'remote-tts', enabled: true, ready: true, reason_code: 'ready', helpers: [], queued_jobs: 0 },
+        { name: 'local', enabled: true, ready: true, reason_code: 'ready', profiles: [{ profile: 'default', status: 'ready', reason_code: '' }], queued_jobs: 1 },
+        { name: 'remote-tts', enabled: true, ready: true, reason_code: 'ready', profiles: [{ profile: 'archive', status: 'ready', reason_code: '' }], queued_jobs: 0 },
       ] }), { status: 200 });
       if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: true }), { status: 200 });
       if (path.endsWith('/tts/jobs') && method === 'POST') return new Response(JSON.stringify({ id: 'tts-job-1', status: 'queued' }), { status: 200 });
@@ -34,6 +34,9 @@ describe('TTS page target controls', () => {
     expect(await screen.findByText('Job TTS masuk antrean.')).toBeTruthy();
     expect(requests.find((request) => request.path.endsWith('/tts/jobs') && request.method === 'POST')?.body)
       .toMatchObject({ title: 'Bab 1', text: 'Teks untuk dibacakan', worker: 'remote-tts' });
+    expect(requests.some((request) => request.path.includes('/tdl-access/verification'))).toBe(false);
+    expect(requests.some((request) => request.path.includes('/tts/health'))).toBe(false);
+    expect(await screen.findByText(/Profil dari Scan Profil: archive: siap/)).toBeTruthy();
   });
 
   it('verifies a worker sender through an operation and refreshes status manually', async () => {
@@ -68,11 +71,12 @@ describe('TTS page target controls', () => {
     }));
 
     render(TtsPage);
-    await fireEvent.click(await screen.findByRole('button', { name: 'Verifikasi akses kirim' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Perbarui bukti akses' }));
     expect(await screen.findByText(/Operation queued/)).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
 
     expect(await screen.findByText(/dapat mengirim/)).toBeTruthy();
+    expect(await screen.findByText(/Bukti akses diperbarui\. Jalankan Scan Profil/)).toBeTruthy();
     await fireEvent.input(screen.getByLabelText('Judul audio'), { target: { value: 'Bab teruji' } });
     await fireEvent.input(screen.getByLabelText(/Teks/), { target: { value: 'Isi teruji' } });
     await waitFor(() => expect(screen.getByRole('button', { name: 'Buat job TTS' }).hasAttribute('disabled')).toBe(false));
@@ -112,7 +116,7 @@ describe('TTS page target controls', () => {
     }));
 
     render(TtsPage);
-    await fireEvent.click(await screen.findByRole('button', { name: 'Verifikasi akses kirim' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Perbarui bukti akses' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Muat status' }));
 
     expect(await screen.findByText(/Database sesi TDL export profil ini tidak ditemukan/)).toBeTruthy();
@@ -141,7 +145,7 @@ describe('TTS page target controls', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Simpan ID chat' }));
 
     await waitFor(() => expect(updates).toEqual([{ telegram_tts_chat_id: '-100123456789' }]));
-    expect(await screen.findByText(/ID chat tersimpan\. Verifikasi akses kirim untuk worker yang akan dipakai/)).toBeTruthy();
+    expect(await screen.findByText(/ID chat tersimpan\. Jalankan Scan Profil untuk memperbarui kesiapan TTS/)).toBeTruthy();
     expect(screen.queryByDisplayValue('-100123456789')).toBeNull();
   });
 

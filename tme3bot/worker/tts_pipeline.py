@@ -323,10 +323,17 @@ class TtsPipeline:
                 exc.close()
             except Exception:
                 pass
-            raise TtsError("gTTS helper request failed", status=int(exc.code)) from None
+            code = "TTS_HELPER_UNAVAILABLE" if int(exc.code) >= 500 else "TTS_ERROR"
+            raise TtsError(
+                "gTTS helper request failed",
+                status=int(exc.code),
+                code=code,
+            ) from None
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise TtsError(
-                f"gTTS helper connection failed ({type(exc).__name__})", retryable=True
+                f"gTTS helper connection failed ({type(exc).__name__})",
+                retryable=True,
+                code="TTS_HELPER_UNAVAILABLE",
             ) from None
         finally:
             try:
@@ -399,6 +406,11 @@ class TtsPipeline:
                             or bool(getattr(exc, "retryable", False))
                         )
                         if not retryable or attempt >= max_attempts:
+                            if getattr(exc, "code", "") == "TTS_HELPER_UNAVAILABLE":
+                                raise TtsError(
+                                    "TTS_HELPER_UNAVAILABLE: helper tidak dapat menyelesaikan sintesis.",
+                                    code="TTS_HELPER_UNAVAILABLE",
+                                ) from None
                             raise TtsError(f"Sintesis bagian {index}/{total} gagal setelah {attempt} percobaan") from None
                         next_route = (route + 1) % TTS_PARALLELISM if rate_limited else route
                         if rate_limited or attempt >= self.newnym_after_retries:

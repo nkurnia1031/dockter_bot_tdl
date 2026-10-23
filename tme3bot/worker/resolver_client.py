@@ -7,7 +7,11 @@ from typing import Any, Callable
 
 import httpx
 
-from tme3bot.worker.safelink_resolver import SafelinkCancelled, SafelinkResolveError
+from tme3bot.worker.safelink_resolver import (
+    SafelinkCancelled,
+    SafelinkResolveError,
+    SafelinkRuntimeUnavailable,
+)
 
 
 RESOLVER_ADDON_URL = "http://resolver-addon:8091"
@@ -42,7 +46,9 @@ def resolve_with_addon(
                 if response.status_code == 409:
                     raise SafelinkResolveError("Resolver sedang memproses job lain.")
                 if response.status_code == 503:
-                    raise SafelinkResolveError("Layanan resolver belum siap.")
+                    raise SafelinkRuntimeUnavailable("Layanan resolver belum siap.")
+                if response.status_code >= 500:
+                    raise SafelinkRuntimeUnavailable("Resolver addon sedang tidak tersedia.")
                 if response.status_code >= 400:
                     raise SafelinkResolveError("Resolver tidak dapat menerima job.")
 
@@ -74,8 +80,8 @@ def resolve_with_addon(
                     raise SafelinkResolveError(error)
                 if result:
                     return result
-                raise SafelinkResolveError("Koneksi ke resolver terputus sebelum job selesai.")
+                raise SafelinkRuntimeUnavailable("Koneksi ke resolver terputus sebelum job selesai.")
     except (SafelinkCancelled, SafelinkResolveError):
         raise
     except Exception:
-        raise SafelinkResolveError("Resolver addon tidak dapat dihubungi.") from None
+        raise SafelinkRuntimeUnavailable("Resolver addon tidak dapat dihubungi.") from None

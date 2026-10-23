@@ -55,6 +55,12 @@ class SafelinkResolveError(RuntimeError):
     """A safe, user-facing resolver failure with no untrusted URL attached."""
 
 
+class SafelinkRuntimeUnavailable(SafelinkResolveError):
+    """The worker could not use its resolver addon runtime."""
+
+    code = "RESOLVER_RUNTIME_UNAVAILABLE"
+
+
 class SafelinkCancelled(SafelinkResolveError):
     """Raised when the persisted job receives a cancellation request."""
 

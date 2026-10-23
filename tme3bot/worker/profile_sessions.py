@@ -1047,12 +1047,28 @@ class ProfileSessionManager:
             and identity_ids[1] is not None
             and identity_ids[0] == identity_ids[1] == metadata_id
         )
+        fingerprint = ""
+        if identity_match and not reasons:
+            digest = hashlib.sha256()
+            digest.update(b"tdl-export-readiness-v1\0")
+            digest.update(normalized.encode("utf-8"))
+            try:
+                for name, storage_root, namespace, _home in specifications:
+                    lane_fingerprint = self._session_tree_fingerprint(
+                        storage_root, namespace, allow_namespace_alias=True
+                    )
+                    digest.update(b"\0" + name.encode("ascii") + b"\0")
+                    digest.update(lane_fingerprint.encode("ascii"))
+                fingerprint = digest.hexdigest()
+            except (OSError, ValueError):
+                reasons.append("PROFILE_SESSION_UNREADABLE")
         reasons = list(dict.fromkeys(reasons))
         return {
-            "ready": identity_match and not reasons,
+            "ready": identity_match and not reasons and bool(fingerprint),
             "identity_match": identity_match,
             "reason_codes": reasons,
             "sessions": sessions,
+            "fingerprint": fingerprint,
         }
 
     @staticmethod

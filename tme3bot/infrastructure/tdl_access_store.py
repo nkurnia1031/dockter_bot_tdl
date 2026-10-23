@@ -212,15 +212,19 @@ class SqliteTdlAccessStore:
         profile: str,
         session_fingerprint: str,
         error_code: str,
+        *,
+        purpose: str = "storage",
     ) -> bool:
-        """Invalidate one Storage proof without affecting other sender lanes."""
+        """Invalidate one purpose-scoped proof without affecting other lanes."""
         worker = str(worker or "").strip().lower()
+        selected_purpose = str(purpose or "").strip().lower()
         destination = str(destination_hash or "").strip().lower()
         selected_profile = str(profile or "").strip().lower()
         fingerprint = str(session_fingerprint or "").strip().lower()
         code = _safe_error_code(error_code)
         if (
             not worker
+            or selected_purpose not in {"storage", "tts"}
             or not re.fullmatch(r"[a-f0-9]{64}", destination)
             or not _PROFILE.fullmatch(selected_profile)
             or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
@@ -231,9 +235,9 @@ class SqliteTdlAccessStore:
         with self._lock, self._connect() as db:
             cursor = db.execute(
                 "UPDATE tdl_access_profiles SET ready=0,error_code=?,checked_at=? "
-                "WHERE worker=? AND purpose='storage' AND destination_hash=? "
+                "WHERE worker=? AND purpose=? AND destination_hash=? "
                 "AND profile=? AND session_fingerprint=?",
-                (code, now, worker, destination, selected_profile, fingerprint),
+                (code, now, worker, selected_purpose, destination, selected_profile, fingerprint),
             )
             return cursor.rowcount > 0
 

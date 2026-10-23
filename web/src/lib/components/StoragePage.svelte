@@ -3,6 +3,8 @@
   import { Modal } from 'flowbite-svelte';
   import { api, patch, post, remove } from '$lib/api';
   import { formatBytes, formatDate } from '$lib/presentation';
+  import { session } from '$lib/session.svelte';
+  import { runtimeReadinessFor, runtimeReadinessForWorker } from '$lib/profile-catalog';
   import WorkspaceExplorer from './WorkspaceExplorer.svelte';
   import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
@@ -28,9 +30,6 @@
     current_folder:FolderEntry|null; breadcrumbs:{id:number;name:string}[];
     folders:FolderEntry[]; items:Item[]; total_folders:number; total_items:number
   };
-  type AccessOperation = { operation_id:string; status:string; phase:string; job_id?:string|null; worker:string };
-  type AccessProfile = { profile:string; ready:boolean; error_code?:string|null; error_message?:string|null; session?:'upload'|'export'; session_status?:string; command_attempted?:boolean; checked_at?:string };
-  type AccessJob = { progress?:{message?:string|null}; result?:{value?:{session?:'upload'|'export';profiles?:AccessProfile[];command_template?:string;summary?:{total:number;tested:number;ready:number;failed:number}}} };
 
   let folderId = $state<number|null>(null);
   let scope = $state<'current'|'global'|'recent'|'trash'>('current');
@@ -63,20 +62,24 @@
   let displayName = $state('');
   let editKeywords = $state('');
   let worker = $state('');
-  let verified = $state<any>(null);
-  let tdlAccessOperation = $state<AccessOperation|null>(null);
-  let tdlAccessProfiles = $state<AccessProfile[]>([]);
-  let tdlAccessReady = $state(false);
-  let tdlAccessWorker = $state('');
-  let tdlAccessLoading = $state(false);
-  let tdlAccessError = $state('');
-  let tdlAccessProgress = $state('');
-  let tdlAccessCommand = $state('');
-  let tdlAccessSession = $state<'upload'|'export'|''>('');
-  let tdlAccessSummary = $state<{total:number;tested:number;ready:number;failed:number}|null>(null);
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
-  const storageTdlAccessReady = $derived(tdlAccessReady && tdlAccessWorker === worker);
+  const storageReadiness = $derived(
+    runtimeReadinessForWorker(session.runtimeReadiness, worker, 'storage')
+  );
+  const storageReadinessCells = $derived(
+    session.runtimeReadiness.cells.filter((cell) =>
+      cell.worker === worker && cell.runtime === 'storage'
+    )
+  );
+  const storageRuntimeReady = $derived(storageReadiness.status === 'ready');
+  const storageReadinessStyle = $derived(
+    storageRuntimeReady
+      ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200'
+      : storageReadiness.status === 'offline' || storageReadiness.status === 'not_ready'
+        ? 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-200'
+        : 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-200'
+  );
   const isTrash = $derived(scope === 'trash');
   const currentName = $derived(data.current_folder?.name || (scope === 'trash' ? 'Recycle Bin' : scope === 'recent' ? 'Recent' : scope === 'global' ? 'All Files' : 'My Drive'));
 
@@ -202,21 +205,8 @@
   }
   async function upload() {
     if (!workspaceFolders[0]) return;
-    if (!verified || verified.worker !== worker) { message = 'Verifikasi worker terlebih dahulu.'; return; }
-    try {
-      const access = await api<{worker:string;ready:boolean;session?:'upload'|'export';profiles:AccessProfile[]}>(
-        `/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker)}`
-      );
-      tdlAccessProfiles = access.profiles || [];
-      tdlAccessReady = access.ready;
-      tdlAccessWorker = access.worker;
-      tdlAccessSession = access.session || 'upload';
-      if (!access.ready) {
-        message = 'Verifikasi akses kirim TDL untuk worker ini terlebih dahulu.';
-        return;
-      }
-    } catch (cause) {
-      message = cause instanceof Error ? cause.message : 'Status akses kirim TDL gagal diperiksa.';
+    if (!storageRuntimeReady) {
+      message = 'Belum ada profil Upload siap pada worker ini. Jalankan Scan Profil.';
       return;
     }
     await post('/storage/uploads', {
@@ -225,69 +215,6 @@
     });
     uploadOpen=false; workspaceFolders=[]; keywords=''; rcloneUpload=false;
     message='Upload masuk antrean. Struktur subfolder akan dipertahankan.';
-  }
-  function accessIdempotencyKey() {
-    return globalThis.crypto?.randomUUID?.() || `storage-tdl-access-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  }
-  async function verifyStorageTdlAccess() {
-    if (!worker) { tdlAccessError = 'Pilih worker terlebih dahulu.'; return; }
-    tdlAccessError = '';
-    tdlAccessProfiles = [];
-    tdlAccessReady = false;
-    tdlAccessProgress = '';
-    tdlAccessCommand = '';
-    tdlAccessSession = '';
-    tdlAccessSummary = null;
-    tdlAccessLoading = true;
-    try {
-      const operation = await api<Omit<AccessOperation, 'worker'>>('/tdl-access/verification', {
-        method:'POST',
-        headers:{'Idempotency-Key':accessIdempotencyKey()},
-        body:JSON.stringify({purpose:'storage',worker})
-      });
-      tdlAccessOperation = {...operation,worker};
-      localStorage.setItem('storage-tdl-access-operation', JSON.stringify(tdlAccessOperation));
-    } catch (cause) {
-      tdlAccessError = cause instanceof Error ? cause.message : 'Verifikasi akses TDL gagal dimulai.';
-    } finally { tdlAccessLoading = false; }
-  }
-  async function refreshStorageTdlAccess() {
-    tdlAccessError = '';
-    tdlAccessLoading = true;
-    try {
-      let hasOperationResult = false;
-      if (tdlAccessOperation) {
-        const operation = await api<Omit<AccessOperation, 'worker'>>(`/operations/${tdlAccessOperation.operation_id}`);
-        tdlAccessOperation = {...operation,worker:tdlAccessOperation.worker};
-        localStorage.setItem('storage-tdl-access-operation', JSON.stringify(tdlAccessOperation));
-        if (operation.job_id) {
-          const job = await api<AccessJob>(`/jobs/${operation.job_id}`);
-          tdlAccessProgress = job.progress?.message || '';
-          const result = job.result?.value;
-          if (result) {
-            hasOperationResult = true;
-            tdlAccessProfiles = result.profiles || [];
-            tdlAccessCommand = result.command_template || '';
-            tdlAccessSession = result.session || 'upload';
-            tdlAccessSummary = result.summary || null;
-          }
-        }
-      }
-      if (worker) {
-        const current = await api<{worker:string;ready:boolean;session?:'upload'|'export';profiles:AccessProfile[]}>(
-          `/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker)}`
-        );
-        if (!hasOperationResult) tdlAccessProfiles = current.profiles || [];
-        tdlAccessReady = current.ready;
-        tdlAccessWorker = current.worker;
-        tdlAccessSession = current.session || 'upload';
-      } else {
-        tdlAccessReady = false;
-        tdlAccessWorker = '';
-      }
-    } catch (cause) {
-      tdlAccessError = cause instanceof Error ? cause.message : 'Status verifikasi akses TDL gagal dimuat.';
-    } finally { tdlAccessLoading = false; }
   }
   async function deliver(item:Item) {
     await post(`/storage/items/${item.id}/deliveries`, {method:'telegram'});
@@ -332,11 +259,11 @@
     folderId=urlFolder();
     view=(localStorage.getItem('storage-view') as 'list'|'grid') || 'grid';
     sort=localStorage.getItem('storage-sort') || 'name';
-    try {
-      const saved = localStorage.getItem('storage-tdl-access-operation');
-      if (saved) tdlAccessOperation = JSON.parse(saved) as AccessOperation;
-    } catch { localStorage.removeItem('storage-tdl-access-operation'); }
+    void session.refreshProfileCatalog();
+    const onJobFinished = () => { void session.refreshProfileCatalog(); };
+    window.addEventListener('tme3:job-finished', onJobFinished);
     load();
+    return () => window.removeEventListener('tme3:job-finished', onJobFinished);
   });
   function setView(next:'list'|'grid') { view=next; localStorage.setItem('storage-view',next); }
   function setSort(next:string) { sort=next; localStorage.setItem('storage-sort',next); load(); }
@@ -347,17 +274,34 @@
   <div class="page-icon"><HardDrive size={23}/></div>
 </header>
 
-<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified /></div>
+<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime="storage" bind:worker /></div>
 
 <section class="card mt-4 p-4 sm:p-5">
-  <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Akses kirim Storage</h2><p class="muted mt-1 text-sm">Profil pengirim diuji melalui lane Upload ke tujuan Storage yang tersimpan. Setiap profil yang diuji meninggalkan satu pesan penanda di chat.</p></div><div class="flex gap-2"><button class="button secondary" onclick={verifyStorageTdlAccess} disabled={!worker || tdlAccessLoading}><Send size={15}/>{tdlAccessLoading ? 'Memulai...' : 'Verifikasi akses TDL'}</button><button class="button secondary" onclick={refreshStorageTdlAccess} disabled={!worker || tdlAccessLoading}><RefreshCw size={15}/>{tdlAccessLoading ? 'Memuat...' : 'Muat status'}</button></div></div>
-  {#if tdlAccessSession}<p class="muted mt-2 text-xs">Lane yang diuji: {tdlAccessSession === 'upload' ? 'Upload' : 'Export'}.</p>{/if}
-  {#if tdlAccessOperation}<p class="muted mt-3 text-xs">Operation {tdlAccessOperation.status} · tahap {tdlAccessOperation.phase} · worker {tdlAccessOperation.worker}. Status diperbarui saat tombol Muat status ditekan.</p>{/if}
-  {#if tdlAccessProgress}<p role="status" class="mt-2 text-sm">{tdlAccessProgress}</p>{/if}
-  {#if tdlAccessSummary}<p class="muted mt-2 text-xs">{tdlAccessSummary.ready} profil dapat mengirim dari {tdlAccessSummary.total} · {tdlAccessSummary.tested} perintah TDL dijalankan · {tdlAccessSummary.failed} gagal atau dilewati.</p>{/if}
-  {#if tdlAccessCommand}<details class="mt-2 text-xs"><summary class="cursor-pointer font-semibold">Lihat bentuk perintah TDL</summary><code class="mt-2 block overflow-x-auto rounded-lg bg-[var(--surface-soft)] p-2">{tdlAccessCommand}</code><span class="muted mt-1 block">Nilai tujuan chat, path sesi, dan nama file sementara disamarkan.</span></details>{/if}
-  {#if tdlAccessProfiles.length}<ul class="mt-2 grid gap-2 text-sm sm:grid-cols-2">{#each tdlAccessProfiles as item}<li class="rounded-lg border border-[var(--line)] p-2"><div><b>{item.profile}</b> · {item.ready ? 'dapat mengirim' : `gagal (${item.error_code || 'VERIFICATION_FAILED'})`}</div>{#if !item.ready && item.error_message}<p class="mt-1 text-rose-700 dark:text-rose-300">{item.error_message}</p>{/if}{#if item.command_attempted === false}<span class="muted block text-xs">Perintah TDL tidak dijalankan karena sesi tidak tersedia.</span>{:else if item.command_attempted === true}<span class="muted block text-xs">Perintah TDL dijalankan dengan lane {item.session === 'upload' || (!item.session && tdlAccessSession === 'upload') ? 'Upload' : 'Export'} profil ini.</span>{/if}</li>{/each}</ul>{:else}<p class="muted mt-2 text-sm">Belum ada hasil pemeriksaan profil. Tekan Muat status untuk mengambil hasil terbaru.</p>{/if}
-  {#if tdlAccessError}<p role="alert" class="mt-2 text-sm text-rose-600">{tdlAccessError}</p>{/if}
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h2 class="font-extrabold">Kesiapan Storage</h2>
+      <p class="muted mt-1 text-sm">Status lane Upload dan bukti akses kirim memakai hasil Scan Profil yang tersimpan.</p>
+    </div>
+    <span class={`rounded-full px-3 py-1 text-xs font-bold ${storageReadinessStyle}`} role="status">
+      {storageReadiness.status === 'ready' ? 'Siap' : storageReadiness.status === 'offline' ? 'Worker offline' : storageReadiness.status === 'disabled' ? 'Worker nonaktif' : storageReadiness.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+    </span>
+  </div>
+  {#if storageReadinessCells.length}
+    <ul class="mt-3 grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
+      {#each storageReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
+        {@const pair = runtimeReadinessFor(session.runtimeReadiness, cell.profile, cell.worker, 'storage')}
+        <li class="flex items-center justify-between gap-2 rounded-lg border border-[var(--line)] p-2" aria-label={`Storage ${cell.profile} pada ${cell.worker}`}>
+          <b>{cell.profile}</b>
+          <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>{pair.status === 'ready' ? 'Siap' : pair.status === 'not_ready' ? `Tidak siap · ${pair.reason_code}` : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : 'Belum dipindai'}</span>
+        </li>
+      {/each}
+    </ul>
+  {:else}
+    <p class="muted mt-3 text-sm">Belum ada profil Upload yang dipindai pada worker ini. Jalankan Scan Profil untuk melihat status.</p>
+  {/if}
+  {#if storageReadiness.status !== 'ready'}
+    <a class="mt-3 inline-flex text-sm font-semibold text-violet-700 underline dark:text-violet-300" href="/profiles">Buka Profil untuk menjalankan Scan Profil</a>
+  {/if}
 </section>
 
 {#if message}<div class="mt-5 flex items-center justify-between rounded-2xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-800 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-100"><span>{message}</span><button onclick={() => message=''}><X size={16}/></button></div>{/if}
@@ -396,7 +340,7 @@
             {/each}
           </div>
           <div class="flex flex-wrap gap-2">
-            {#if !isTrash}<button class="button secondary" onclick={() => createOpen=true}><CirclePlus size={16}/>Folder baru</button><button class="button" onclick={startUpload} disabled={!verified}><CloudUpload size={16}/>Upload</button>
+            {#if !isTrash}<button class="button secondary" onclick={() => createOpen=true}><CirclePlus size={16}/>Folder baru</button><button class="button" onclick={startUpload} disabled={!worker}><CloudUpload size={16}/>Upload</button>
             {:else if data.items.length || data.folders.length}<button class="button danger" onclick={emptyTrash}><Trash2 size={16}/>Kosongkan Trash</button>{/if}
           </div>
         </div>
@@ -483,11 +427,11 @@
 <Modal open={createOpen} onclose={() => createOpen=false} title="Folder baru" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" placeholder="Dokumen 2026"/></label><p class="muted mt-2 text-xs">Maksimal 120 karakter. Slash, titik tunggal, dan karakter kontrol tidak diperbolehkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => createOpen=false}>Batal</button><button class="button" disabled={!newFolderName.trim()} onclick={createFolder}>Buat folder</button></div></Modal>
 
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
-  <p class="muted mb-4 text-sm">Pilih source dari worker yang sudah diverifikasi. Semua subfolder akan dibuat kembali di Storage.</p><TargetPicker purpose="storage" requireProfile={false} bind:worker bind:verified/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
+  <p class="muted mb-4 text-sm">Pilih worker dengan profil Upload siap. Semua subfolder akan dibuat kembali di Storage.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime="storage" bind:worker/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
   <div class="mt-4 grid gap-3 sm:grid-cols-2"><label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
   <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--line)] p-3 text-sm"><input class="mt-1" type="checkbox" bind:checked={rcloneUpload}/><span><b>Salin juga ke Google Drive</b><small class="muted mt-1 block">Memakai tujuan rclone pada Pengaturan dan konfigurasi <code>/data/.config/rclone.conf</code>.</small></span></label>
   <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>Destination dipilih dari folder Storage, bukan input teks. Nested dan empty folder dipertahankan.</p></div>
-  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || !storageTdlAccessReady} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || !storageRuntimeReady} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
 </Modal>
 
 <Modal open={moveOpen} onclose={() => moveOpen=false} title="Pindahkan ke folder" size="md"><label class="text-sm font-bold">Folder tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => moveOpen=false}>Batal</button><button class="button" onclick={moveSelection}><Move size={16}/>Pindahkan</button></div></Modal>

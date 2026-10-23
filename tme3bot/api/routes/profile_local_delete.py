@@ -385,6 +385,17 @@ def advance_profile_local_delete_command(command: dict[str, Any], context) -> di
         _finish_marker(context, payload)
         return {"status": "terminal", "reason": "worker_delete_failed"}
 
+    gate = getattr(
+        getattr(context, "control_plane", None), "runtime_readiness_gate", None
+    )
+    invalidate = getattr(gate, "invalidate_profile_mutation", None)
+    if callable(invalidate):
+        invalidate(
+            profile=profile,
+            worker=worker,
+            reason_code="PROFILE_SESSION_MISSING",
+        )
+
     try:
         _mark_distribution_removed(context, profile, worker)
     except Exception:

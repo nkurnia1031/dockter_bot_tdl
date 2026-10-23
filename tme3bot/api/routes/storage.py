@@ -8,7 +8,7 @@ from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
 import uuid
 
-def register_storage(app, context, *, _active_storage_item, _deliver_storage_telegram, _model_dict, _require_storage_folders_idle, _storage_item, current_actor, job_dict, require_service, verify_target):
+def register_storage(app, context, *, _active_storage_item, _deliver_storage_telegram, _model_dict, _require_storage_folders_idle, _storage_item, current_actor, job_dict, require_service):
 
     @app.get("/api/v1/storage/items", response_model=StorageItemListResponse)
     def search_storage(
@@ -172,7 +172,6 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
             payload["rclone_destination"] = context.utility_settings.get().get(
                 "rclone_destination", "googledrive:backup"
             )
-        verify_target(actor, "storage", None, payload.get("worker"))
         if payload.get("destination_folder_id") is None and payload.get("folder"):
             folder = context.storage_catalog.ensure_path(
                 str(payload["folder"]), actor.telegram_user_id

@@ -34,6 +34,9 @@
   let resolverBusy = $state(false);
   let resolverCopied = $state(false);
   let resolverJobs = $state<Record<string, any>[]>([]);
+  let resolverWorkers = $state<Record<string, any>[]>([]);
+  let selectedResolverWorker = $state('');
+  let resolverWorkerError = $state('');
   let selectedResolverJobId = $state('');
   let resolverTimer: number | undefined;
   let resolverRequestActive = $state(false);
@@ -158,6 +161,7 @@
     resolverTimer = window.setTimeout(() => {
       resolverTimer = undefined;
       void loadResolverJobs();
+      void loadResolverWorkers();
     }, 2500);
   }
 
@@ -185,6 +189,17 @@
     }
   }
 
+  async function loadResolverWorkers() {
+    try {
+      const result = await api<{ items?: Record<string, any>[] }>('/safelink/workers');
+      resolverWorkers = Array.isArray(result.items) ? result.items : [];
+      resolverWorkerError = '';
+    } catch (cause) {
+      resolverWorkers = [];
+      resolverWorkerError = cause instanceof Error ? cause.message : 'Status worker Resolver tidak dapat dimuat.';
+    }
+  }
+
   async function resolveShortlink() {
     resolverError = '';
     resolverNotice = '';
@@ -198,11 +213,15 @@
       const job = await api<Record<string, any>>('/safelink/jobs', {
         method: 'POST',
         headers: { 'Idempotency-Key': requestKey() },
-        body: JSON.stringify({ url: shortlink.trim() })
+        body: JSON.stringify({
+          url: shortlink.trim(),
+          ...(selectedResolverWorker ? { worker: selectedResolverWorker } : {})
+        })
       });
       selectedResolverJobId = String(job.id || '');
       resolverNotice = 'Job resolver masuk antrean. Kamu dapat menutup halaman; hasilnya tersimpan di riwayat.';
       await loadResolverJobs();
+      await loadResolverWorkers();
       selectedResolverJobId = String(job.id || '');
       scheduleResolverRefresh();
     } catch (cause) {
@@ -241,9 +260,10 @@
 
   onMount(() => {
     resolverMounted = true;
-    const refresh = () => { void loadResolverJobs(); };
+    const refresh = () => { void loadResolverJobs(); void loadResolverWorkers(); };
     window.addEventListener('tme3:data-mutated', refresh);
     void loadResolverJobs();
+    void loadResolverWorkers();
     return () => {
       resolverMounted = false;
       if (resolverTimer) clearTimeout(resolverTimer);
@@ -341,7 +361,7 @@
       <h2 id="resolver-title" class="mt-1 font-extrabold">Resolver shortlink</h2>
       <p class="muted mt-1 max-w-2xl text-sm">Ikuti langkah shortlink pndk.to atau go.fakta.id di browser worker. Fitur ini hanya mencari URL tujuan dan tidak mengunduh file.</p>
     </div>
-    <button class="button secondary" type="button" onclick={loadResolverJobs} disabled={resolverRequestActive}><RefreshCw size={15} class={resolverRequestActive ? 'animate-spin' : ''}/>Refresh job</button>
+    <button class="button secondary" type="button" onclick={() => { void loadResolverJobs(); void loadResolverWorkers(); }} disabled={resolverRequestActive}><RefreshCw size={15} class={resolverRequestActive ? 'animate-spin' : ''}/>Refresh job</button>
   </div>
 
   <label class="mt-4 block text-sm font-bold" for="shortlink-input">URL shortlink</label>
@@ -355,6 +375,15 @@
     autocomplete="off"
     autocapitalize="off"
   ></textarea>
+  <label class="mt-4 block text-sm font-bold" for="resolver-worker">Worker</label>
+  <select id="resolver-worker" class="field mt-2" bind:value={selectedResolverWorker}>
+    <option value="">Auto · antrean terpendek</option>
+    {#each resolverWorkers as worker (worker.name)}
+      {@const statusLabel = worker.status === 'ready' ? 'siap' : worker.status === 'offline' ? 'offline' : worker.status === 'disabled' ? 'nonaktif' : worker.status === 'not_ready' ? 'tidak siap' : 'belum dipindai'}
+      <option value={worker.name}>{worker.name} · {statusLabel} · antrean {worker.queued_jobs ?? 0}</option>
+    {/each}
+  </select>
+  {#if resolverWorkerError}<p class="muted mt-2 text-xs" role="status">{resolverWorkerError}</p>{/if}
   <div class="mt-3 flex flex-wrap items-center gap-2">
     <button class="button" type="button" onclick={resolveShortlink} disabled={resolverBusy}><Link size={16} class={resolverBusy ? 'animate-pulse' : ''}/>{resolverBusy ? 'Mengirim…' : 'Resolve'}</button>
     <span class="muted text-xs">Input dibatasi ke domain yang didukung; URL tidak ditampilkan di log job.</span>

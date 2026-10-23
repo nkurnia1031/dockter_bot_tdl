@@ -2,6 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
 import { api, post, remove } from '$lib/api';
 import { session } from '$lib/session.svelte';
+import { normalizeRuntimeReadiness, runtimeReadinessFor, type RuntimeReadinessSnapshot } from '$lib/profile-catalog';
   import { profileDiagnosticLabel } from '$lib/tdl-lanes';
 import { CircleAlert, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, Upload, UserRoundPlus, X } from '@lucide/svelte';
 
@@ -13,7 +14,7 @@ type ProvisioningWorker = { name: string; enabled: boolean; online: boolean; sec
   type IdentityCleanup = { profile: string; status: string; deleted_worker: string; updated_at: string };
   type Inventory = { worker: string; checked_at: string; items: LocalProfile[]; pending_identity_cleanup?: IdentityCleanup[] };
   type ScanWorker = { name: string; status: 'success' | 'failed' | 'disabled'; checked_at: string; error_code: string };
-  type LocalProfileCatalog = { checked_at: string; workers: ScanWorker[]; inventories: Inventory[] };
+  type LocalProfileCatalog = { checked_at: string; workers: ScanWorker[]; inventories: Inventory[]; runtime_readiness: RuntimeReadinessSnapshot };
   type VaultProfile = { name: string; vault: boolean; status: string; source?: string; operation_id?: string; error?: string };
   type AdoptionOperation = { id: string; status: string; error?: string };
 type ProvisioningOperation = {
@@ -71,6 +72,22 @@ let savingProvisioning = $state(false);
   let progressRequestActive = false;
   let progressGeneration = 0;
   let catalogGeneration = 0;
+  let onJobFinished: (() => void) | undefined;
+  let readinessTimer: ReturnType<typeof setInterval> | undefined;
+  const exportReadinessCells = $derived(
+    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'export')
+  );
+  const quickModeReadinessCells = $derived(
+    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'quick_mode')
+  );
+  const ttsReadinessCells = $derived(
+    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'tts')
+  );
+  const storageReadinessCells = $derived(
+    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'storage')
+  );
+  const resolverReadinessWorkers = $derived(profileCatalog?.workers || []);
+  const utilityReadinessWorkers = $derived(profileCatalog?.workers || []);
 
   const codeMessages: Record<string, string> = {
     PROFILE_IDENTITY_MISSING: 'File identitas tidak ditemukan.',
@@ -84,6 +101,8 @@ let savingProvisioning = $state(false);
     PROFILE_SESSION_UNREADABLE: 'Data sesi tidak dapat dibaca.',
     PROFILE_SESSION_BUSY: 'Sesi sedang dipakai job.',
     PROFILE_SESSION_UNAVAILABLE: 'Pemeriksaan sesi tidak tersedia.',
+    PROFILE_SESSION_CHANGED: 'Sesi berubah sejak scan terakhir.',
+    PROFILE_SESSION_MISSING: 'Sesi profil sudah dihapus dari worker.',
     PROFILE_EXPORT_SESSION_MISSING: 'Sesi Export tidak ditemukan.',
     PROFILE_EXPORT_SESSION_UNSAFE: 'Sesi Export memiliki file yang tidak aman.',
     PROFILE_EXPORT_SESSION_INVALID: 'TDL tidak dapat memakai sesi Export.',
@@ -99,6 +118,28 @@ let savingProvisioning = $state(false);
     WORKER_UNAVAILABLE: 'Worker offline atau tidak dapat dijangkau.',
     WORKER_TIMEOUT: 'Worker melewati batas waktu pemeriksaan.',
     WORKER_UPDATE_REQUIRED: 'Worker perlu diperbarui untuk membaca inventaris profil.',
+    RESOLVER_RUNTIME_UNAVAILABLE: 'Addon Resolver tidak dapat digunakan pada worker.',
+    RESOLVER_FINGERPRINT_MISSING: 'Bukti kesiapan Resolver tidak lengkap.',
+    UTILITY_COMMAND_MISSING: 'Perintah pendukung Utility tidak tersedia pada worker.',
+    UTILITY_SCRIPT_MISSING: 'Script Utility tidak ditemukan pada worker.',
+    UTILITY_SCRIPT_UNREADABLE: 'Script Utility tidak dapat dibaca pada worker.',
+    UTILITY_WORKSPACE_UNAVAILABLE: 'Workspace Utility tidak tersedia atau tidak dapat ditulis.',
+    UTILITY_RUNTIME_UNAVAILABLE: 'Runtime Utility tidak tersedia pada worker.',
+    UTILITY_FINGERPRINT_MISSING: 'Fingerprint runtime Utility tidak tersedia.',
+    TTS_CHAT_UNAVAILABLE: 'Chat tujuan TTS belum dikonfigurasi.',
+    TTS_HELPER_UNAVAILABLE: 'Helper TTS atau jalur Tor belum siap.',
+    TTS_RUNTIME_UNAVAILABLE: 'Runtime helper TTS tidak tersedia.',
+    TTS_FINGERPRINT_MISSING: 'Fingerprint kesiapan TTS tidak tersedia.',
+    TDL_ACCESS_TARGET_UNAVAILABLE: 'Tujuan Storage belum dikonfigurasi.',
+    STORAGE_EVIDENCE_INCOMPLETE: 'Bukti lane Upload atau akses Storage belum lengkap.',
+    STORAGE_FINGERPRINT_MISSING: 'Fingerprint kesiapan Storage tidak tersedia.',
+    PROFILE_UPLOAD_SESSION_CHANGED: 'Sesi Upload berubah sejak Scan Profil terakhir.',
+    QUICK_MODE_RUNTIME_UNAVAILABLE: 'Runtime Quick Mode belum siap pada worker.',
+    QUICK_MODE_FINGERPRINT_MISSING: 'Fingerprint runtime Quick Mode tidak tersedia.',
+    QUICK_MODE_EVIDENCE_INCOMPLETE: 'Snapshot Upload Quick Mode belum lengkap.',
+    RCLONE_RUNTIME_UNAVAILABLE: 'Remote atau konfigurasi rclone belum siap.',
+    TDL_ACCESS_NOT_VERIFIED: 'Bukti akses kirim tidak ada atau sudah stale. Jalankan Scan Profil untuk memperbarui status.',
+    TDL_SESSION_UNAUTHORIZED: 'Sesi TDL tidak terotorisasi untuk mengirim.',
     WORKER_SCAN_FAILED: 'Worker gagal membaca inventaris profil.'
   };
 
@@ -112,6 +153,14 @@ let savingProvisioning = $state(false);
     installing: 'Memasang lane Upload',
     ready: 'Siap',
     failed: 'Gagal'
+  };
+
+  const exportReadinessLabels = {
+    ready: 'Siap',
+    not_ready: 'Tidak siap',
+    offline: 'Worker offline',
+    disabled: 'Worker nonaktif',
+    unscanned: 'Belum dipindai'
   };
 
 const availableProvisioningWorkers = $derived(
@@ -151,7 +200,8 @@ const provisioningStatusLabels: Record<string, string> = {
       return {
         checked_at: String(payload.checked_at || ''),
         workers: payload.workers as ScanWorker[],
-        inventories: payload.inventories as Inventory[]
+        inventories: payload.inventories as Inventory[],
+        runtime_readiness: normalizeRuntimeReadiness(payload.runtime_readiness)
       };
     }
     // Older worker snapshots are accepted while a mixed-version deployment rolls forward.
@@ -161,10 +211,11 @@ const provisioningStatusLabels: Record<string, string> = {
       return {
         checked_at,
         workers: [{ name: worker, status: 'success', checked_at, error_code: '' }],
-        inventories: [{ worker, checked_at, items: payload.items as LocalProfile[] }]
+        inventories: [{ worker, checked_at, items: payload.items as LocalProfile[] }],
+        runtime_readiness: normalizeRuntimeReadiness(undefined)
       };
     }
-    return { checked_at: '', workers: [], inventories: [] };
+    return { checked_at: '', workers: [], inventories: [], runtime_readiness: normalizeRuntimeReadiness(undefined) };
   }
 
   async function loadProfileCatalog() {
@@ -649,9 +700,22 @@ async function cancelProfileProvisioning() {
     void loadWorkers();
     void loadProfileCatalog();
   void loadProvisioningWorkers();
+    readinessTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void loadProfileCatalog();
+        void session.refreshProfileCatalog();
+      }
+    }, 15000);
+    onJobFinished = () => {
+      void loadProfileCatalog();
+      void session.refreshProfileCatalog();
+    };
+    window.addEventListener('tme3:job-finished', onJobFinished);
   });
 
   onDestroy(() => {
+    if (onJobFinished) window.removeEventListener('tme3:job-finished', onJobFinished);
+    if (readinessTimer !== undefined) clearInterval(readinessTimer);
     stopProgressRefresh();
     if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);
   });
@@ -834,6 +898,142 @@ async function cancelProfileProvisioning() {
           </div>
         {/each}
       </div>
+      {#if exportReadinessCells.length}
+        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Export per worker dan profil">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-extrabold">Kesiapan Export per worker dan profil</h3>
+            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+          </div>
+          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {#each exportReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
+              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
+              <div class="flex items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Export ${cell.profile} pada ${cell.worker}`}>
+                <span class="font-bold">{cell.profile} · {cell.worker}</span>
+                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
+                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+                </span>
+                {#if pair.status !== 'ready' && pair.reason_code}
+                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#if quickModeReadinessCells.length}
+        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Quick Mode per worker dan profil">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-extrabold">Kesiapan Quick Mode per worker dan profil</h3>
+            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+          </div>
+          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {#each quickModeReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
+              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
+              <div class="flex items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Quick Mode ${cell.profile} pada ${cell.worker}`}>
+                <span class="font-bold">{cell.profile} · {cell.worker}</span>
+                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
+                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+                </span>
+                {#if pair.status !== 'ready' && pair.reason_code}
+                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan TTS per worker dan profil">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h3 class="text-sm font-extrabold">Kesiapan TTS per worker dan profil</h3>
+          <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+        </div>
+        {#if ttsReadinessCells.length}
+          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {#each ttsReadinessCells as cell (cell.worker + ':' + cell.profile + ':' + cell.runtime)}
+              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
+              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={"TTS " + cell.profile + " pada " + cell.worker}>
+                <span class="font-bold">{cell.profile} · {cell.worker}</span>
+                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
+                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+                </span>
+                {#if pair.status !== 'ready' && pair.reason_code}
+                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p class="muted mt-2 text-xs">Belum ada sel kesiapan TTS. Jalankan Scan Profil untuk melihat status helper dan bukti akses.</p>
+        {/if}
+      </div>
+      <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Storage per worker dan profil">
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <h3 class="text-sm font-extrabold">Kesiapan Storage per worker dan profil</h3>
+          <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+        </div>
+        {#if storageReadinessCells.length}
+          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {#each storageReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
+              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
+              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Storage ${cell.profile} pada ${cell.worker}`}>
+                <span class="font-bold">{cell.profile} · {cell.worker}</span>
+                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
+                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+                </span>
+                {#if pair.status !== 'ready' && pair.reason_code}
+                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <p class="muted mt-2 text-xs">Belum ada sel kesiapan Storage. Jalankan Scan Profil untuk memeriksa lane Upload dan bukti akses tersimpan.</p>
+        {/if}
+      </div>
+      {#if resolverReadinessWorkers.length}
+        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Resolver per worker">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-extrabold">Kesiapan Resolver per worker</h3>
+            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+          </div>
+          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {#each resolverReadinessWorkers as worker (worker.name)}
+              {@const resolverReadiness = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'resolver')}
+              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Resolver pada ${worker.name}`}>
+                <span class="font-bold">{worker.name}</span>
+                <span class={resolverReadiness.status === 'ready' ? 'font-bold text-emerald-600' : resolverReadiness.status === 'offline' || resolverReadiness.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
+                  {resolverReadiness.status === 'ready' ? 'Siap' : resolverReadiness.status === 'offline' ? 'Worker offline' : resolverReadiness.status === 'disabled' ? 'Worker nonaktif' : resolverReadiness.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+                </span>
+                {#if resolverReadiness.status !== 'ready' && resolverReadiness.reason_code}
+                  <span class="muted w-full text-xs">{codeMessage(resolverReadiness.reason_code)}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+      {#if utilityReadinessWorkers.length}
+        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Utility per worker">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-extrabold">Kesiapan Utility per worker</h3>
+            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+          </div>
+          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {#each utilityReadinessWorkers as worker (worker.name)}
+              {@const utilityReadiness = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'utility')}
+              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Utility pada ${worker.name}`}>
+                <span class="font-bold">{worker.name}</span>
+                <span class={utilityReadiness.status === 'ready' ? 'font-bold text-emerald-600' : utilityReadiness.status === 'offline' || utilityReadiness.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
+                  {utilityReadiness.status === 'ready' ? 'Siap' : utilityReadiness.status === 'offline' ? 'Worker offline' : utilityReadiness.status === 'disabled' ? 'Worker nonaktif' : utilityReadiness.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+                </span>
+                {#if utilityReadiness.status !== 'ready' && utilityReadiness.reason_code}
+                  <span class="muted w-full text-xs">{codeMessage(utilityReadiness.reason_code)}</span>
+                {/if}
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
     </section>
   {:else}
     <p class="muted mt-3 text-xs" role="status">Belum ada katalog hasil scan tersimpan.</p>
@@ -891,6 +1091,7 @@ async function cancelProfileProvisioning() {
     {:else}
       <div class="mt-5 grid gap-3 lg:grid-cols-2">
         {#each inventory.items as profile (profile.name)}
+          {@const exportReadiness = runtimeReadinessFor(profileCatalog?.runtime_readiness || normalizeRuntimeReadiness(undefined), profile.name, inventory.worker)}
           <article class="rounded-2xl border border-[var(--line)] bg-[var(--panel-strong)] p-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
               <h3 class="font-extrabold">{profile.name}</h3>
@@ -925,6 +1126,19 @@ async function cancelProfileProvisioning() {
             {#if profile.reason_codes.length}
               <p class="mt-3 text-xs text-rose-600">Kode: {profile.reason_codes.join(', ')}</p>
             {/if}
+            <section class={`mt-4 rounded-xl border p-3 ${exportReadiness.status === 'ready' ? 'border-emerald-200 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-100' : exportReadiness.status === 'offline' || exportReadiness.status === 'not_ready' ? 'border-rose-200 bg-rose-50 text-rose-800 dark:border-rose-900 dark:bg-rose-950/40 dark:text-rose-100' : 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100'}`} aria-label={`Kesiapan Export ${profile.name} pada ${inventory.worker}`} role="status">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <p class="text-sm font-bold">Kesiapan runtime Export · {exportReadinessLabels[exportReadiness.status]}</p>
+                {#if exportReadiness.checked_at}<span class="text-xs opacity-75">{checkedAt(exportReadiness.checked_at)}</span>{/if}
+              </div>
+              {#if exportReadiness.status === 'ready'}
+                <p class="mt-1 text-xs">Sesi TDL pada worker ini lolos scan terakhir. Export dapat dikirim tanpa verifikasi ulang.</p>
+              {:else if exportReadiness.status === 'unscanned'}
+                <p class="mt-1 text-xs">Jalankan Scan semua worker untuk menyimpan kesiapan Export.</p>
+              {:else}
+                <p class="mt-1 text-xs">{codeMessage(exportReadiness.reason_code || 'PROFILE_SESSION_UNAVAILABLE')}. Jalankan Scan semua worker setelah sesi diperbaiki.</p>
+              {/if}
+            </section>
             {#if adoptionOperations[profile.name]}
               <p class="mt-3 text-xs" role="status">{adoptionStatusLabel(adoptionOperations[profile.name].status)}{#if adoptionOperations[profile.name].error}: {adoptionOperations[profile.name].error}{/if}</p>
             {/if}

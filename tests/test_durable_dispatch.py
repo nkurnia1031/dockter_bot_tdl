@@ -4,6 +4,7 @@ from pathlib import Path
 
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService
+from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.domain.models import Actor, DomainError, JobEvent, JobStatus
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
@@ -13,6 +14,7 @@ from tme3bot.domain.worker_contract import (
 )
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 
@@ -115,6 +117,9 @@ class DurableDispatchTests(unittest.TestCase):
         self.dispatcher = FakeDispatcher()
         self.workers = FakeWorkerRegistry()
         self.tdl_access = SqliteTdlAccessStore(self.db_file)
+        self.runtime_readiness = RuntimeReadinessStore(
+            Path(self.temp.name) / "runtime-readiness.json"
+        )
         self.control = ControlPlane(
             self.jobs, self.dispatcher, FakeProfiles(),
             runtime_settings_store=self.settings,
@@ -122,13 +127,51 @@ class DurableDispatchTests(unittest.TestCase):
             tdl_access_store=self.tdl_access,
             tdl_access_target_resolver=lambda purpose: "123456789" if purpose == "tts" else "123",
         )
+        session_fingerprints = {"default": "a" * 64, "archive": "b" * 64}
         inventory_hash = self.tdl_access.inventory_fingerprint(["default", "archive"])
         destination_hash = self.tdl_access.destination_fingerprint("123456789")
         for worker in self.workers.names():
             self.tdl_access.replace_results(
                 worker, "tts", destination_hash, inventory_hash,
                 [{"profile": profile, "ready": True} for profile in ("default", "archive")],
+                session_fingerprints=session_fingerprints,
             )
+        self.runtime_readiness.apply_export_scan(
+            checked_at="2026-10-23T00:00:00Z",
+            workers=[{"worker": worker, "status": "success"} for worker in self.workers.names()],
+            profiles={
+                worker: [
+                    {"profile": profile, "ready": True, "fingerprint": session_fingerprints[profile]}
+                    for profile in session_fingerprints
+                ]
+                for worker in self.workers.names()
+            },
+        )
+        self.runtime_readiness.apply_tts_scan(
+            checked_at="2026-10-23T00:00:00Z",
+            profiles={
+                worker: [
+                    {
+                        "profile": profile,
+                        "ready": True,
+                        "fingerprint": "c" * 64,
+                        "session_fingerprint": session_fingerprints[profile],
+                        "destination_fingerprint": destination_hash,
+                    }
+                    for profile in session_fingerprints
+                ]
+                for worker in self.workers.names()
+            },
+        )
+        for worker in self.workers.names():
+            self.runtime_readiness.upsert_cell(
+                worker=worker,
+                profile=None,
+                runtime="utility",
+                ready=True,
+                fingerprint="d" * 64,
+            )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(self.runtime_readiness)
         self.control.utility_settings = FakeUtilitySettings()
         self.control.add_event_observer(self.operations.on_job_event)
         self.operations.register_handler("job.submit", self.control.prepare_durable_job)

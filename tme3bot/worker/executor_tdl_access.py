@@ -154,6 +154,22 @@ class TdlAccessExecutorMixin:
             normalized_profiles = [
                 profile for profile in normalized_profiles if profile in session_fingerprints
             ]
+        elif purpose == "tts":
+            diagnose_profile = getattr(self, "diagnose_profile_tdl", None)
+            for profile in normalized_profiles:
+                try:
+                    diagnostic = diagnose_profile(profile) if callable(diagnose_profile) else {}
+                except Exception:
+                    diagnostic = {}
+                if isinstance(diagnostic, dict) and diagnostic.get("ready") is True:
+                    session_fingerprints.update(
+                        normalize_session_fingerprints(
+                            {profile: diagnostic.get("fingerprint")}
+                        )
+                    )
+            normalized_profiles = [
+                profile for profile in normalized_profiles if profile in session_fingerprints
+            ]
         inventory_hash = tdl_access_inventory_fingerprint(
             normalized_profiles,
             session_fingerprints if purpose == "storage" else None,
@@ -252,6 +268,18 @@ class TdlAccessExecutorMixin:
                     else:
                         tdl_client = runtime.export_tdl_client
                         operation_lock = runtime.export_operation_lock
+                    if purpose == "tts":
+                        diagnose_profile = getattr(self, "diagnose_profile_tdl", None)
+                        current = diagnose_profile(profile) if callable(diagnose_profile) else {}
+                        current_fingerprint = normalize_session_fingerprints(
+                            {profile: current.get("fingerprint")}
+                            if isinstance(current, dict) and current.get("ready") is True
+                            else {}
+                        ).get(profile)
+                        if current_fingerprint != session_fingerprints.get(profile):
+                            raise RuntimeError(
+                                "PROFILE_SESSION_CHANGED: sesi Export berubah saat verifikasi."
+                            )
                     with operation_lock:
                         if purpose == "storage":
                             current_fingerprints = normalize_session_fingerprints(
@@ -271,6 +299,18 @@ class TdlAccessExecutorMixin:
                             destination,
                             f"[TME3BOT TEST] Verifikasi akses kirim {purpose.upper()} - pesan uji, boleh dihapus.",
                         )
+                    if purpose == "tts":
+                        diagnose_profile = getattr(self, "diagnose_profile_tdl", None)
+                        current = diagnose_profile(profile) if callable(diagnose_profile) else {}
+                        current_fingerprint = normalize_session_fingerprints(
+                            {profile: current.get("fingerprint")}
+                            if isinstance(current, dict) and current.get("ready") is True
+                            else {}
+                        ).get(profile)
+                        if current_fingerprint != session_fingerprints.get(profile):
+                            raise RuntimeError(
+                                "PROFILE_SESSION_CHANGED: sesi Export berubah saat verifikasi."
+                            )
                     outcome["ready"] = True
                     LOGGER.info("TDL access verification succeeded job=%s purpose=%s profile=%s", job_id, purpose, profile)
                 except TdlAccessMarkerPermissionError:

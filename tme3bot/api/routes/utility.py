@@ -5,7 +5,7 @@ from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, S
 from tme3bot.domain.models import DomainError
 from tme3bot.utility import utility_setting_specs
 
-def register_utility(app, context, *, _model_dict, current_actor, job_dict, verify_target):
+def register_utility(app, context, *, _model_dict, current_actor, job_dict):
 
     @app.get("/api/v1/utility/folders", response_model=ItemListResponse)
     def utility_folders(actor=Depends(current_actor)):
@@ -66,10 +66,7 @@ def register_utility(app, context, *, _model_dict, current_actor, job_dict, veri
 
     @app.post("/api/v1/utility/jobs", response_model=JobResponse)
     def submit_utility(body: UtilityJobRequest, actor=Depends(current_actor)):
-        settings = context.utility_settings.get()
         payload = _model_dict(body)
-        payload["settings"] = settings
-        verify_target(actor, "utility", None, payload.get("worker"))
         return job_dict(
             context.control_plane.submit_job(
                 actor, "utility", payload, profile=actor.profile, worker=payload.get("worker")

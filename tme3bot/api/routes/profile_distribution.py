@@ -19,6 +19,10 @@ _PHASES = {
     "session_install", "session_commit", "transaction_rollback", "completed", "failed",
 }
 _STATUSES = {"running", "waiting", "succeeded", "failed"}
+_SESSION_MUTATION_PHASES = frozenset({
+    "session_install", "session_commit", "identity_install",
+    "download_install", "export_install", "upload_install",
+})
 
 
 def register_profile_distribution(
@@ -170,4 +174,15 @@ def register_profile_distribution(
         if worker not in operation["target_workers"]:
             raise DomainError("WORKER_NOT_IN_SNAPSHOT", "Worker bukan bagian dari snapshot operasi.", status_code=403)
         accepted = store().event(operation_id, worker, phase, status, code, sequence=sequence)
+        if accepted and phase in _SESSION_MUTATION_PHASES and status in {"running", "succeeded", "failed"}:
+            gate = getattr(
+                getattr(context, "control_plane", None), "runtime_readiness_gate", None
+            )
+            invalidate = getattr(gate, "invalidate_profile_mutation", None)
+            if callable(invalidate):
+                invalidate(
+                    profile=profile,
+                    worker=worker,
+                    reason_code="PROFILE_SESSION_CHANGED",
+                )
         return {"accepted": True, "duplicate": not accepted}

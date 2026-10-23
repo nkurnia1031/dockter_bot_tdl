@@ -16,8 +16,8 @@ from tme3bot.api.backend import BackendContext, create_backend_app, job_dict
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService, PreparedOperation
+from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
-from tme3bot.domain.worker_contract import CAP_DURABLE_COMMANDS_V1, CAP_SAFELINK_RESOLVE
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
@@ -25,6 +25,7 @@ from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payl
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
+from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
 from tme3bot.profile_provisioning import ProfileProvisioningStore, build_profile_bundle
@@ -101,6 +102,7 @@ class JobDictionaryTests(unittest.TestCase):
 class FakeDispatcher:
     def __init__(self):
         self.commands = []
+        self.durable_commands = []
         self.storage_available = True
         self.tts_ready = False
         self.tts_health_result = {
@@ -111,6 +113,7 @@ class FakeDispatcher:
                 for slot in range(1, 4)
             ],
         }
+        self.tts_health_calls = []
         self.tts_recoveries = []
         self.storage_fingerprint_overrides = {}
         self.profile_sync_requests = []
@@ -164,6 +167,22 @@ class FakeDispatcher:
         self.commands.append((worker, payload))
         return {"position": 1}
 
+    def dispatch_command(self, worker, envelope):
+        self.durable_commands.append(envelope)
+        job = envelope["job"]
+        self.dispatch(worker, {
+            "job_id": envelope["job_id"],
+            "attempt": envelope["attempt"],
+            "kind": job["kind"],
+            "profile": job["profile"],
+            "actor_user_id": job["actor_user_id"],
+            "worker": job["worker"],
+            "payload": job["payload"],
+            "execution": envelope["execution_plan"],
+            "event_sequence_start": envelope["event_sequence_start"],
+        })
+        return {"accepted": True}
+
     def capabilities(self, worker):
         del worker
         health = dict(self.tts_health_result)
@@ -196,7 +215,7 @@ class FakeDispatcher:
         }
 
     def tts_health(self, worker):
-        del worker
+        self.tts_health_calls.append(worker)
         return dict(self.tts_health_result)
 
     def recover_tts_helper(self, worker, slot):
@@ -424,6 +443,9 @@ class BackendApiTests(unittest.TestCase):
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
         self.local_profile_catalog = LocalProfileCatalog(root / "local-profile-catalog.json")
+        self.runtime_readiness_store = RuntimeReadinessStore(
+            root / "runtime-readiness.json"
+        )
         self.activity_journal = ActivityJournalStore(db)
         self.operation_service = OperationsService(
             SqliteOperationStore(self.jobs), activity_journal=self.activity_journal
@@ -523,6 +545,7 @@ class BackendApiTests(unittest.TestCase):
             ),
             worker_dispatcher=self.dispatcher,
             local_profile_catalog=self.local_profile_catalog,
+            runtime_readiness_store=self.runtime_readiness_store,
             activity_journal=self.activity_journal,
             bot=self.bot,
             runtime_settings=runtime_settings,
@@ -543,16 +566,65 @@ class BackendApiTests(unittest.TestCase):
             session_fingerprints = capabilities.get("storage_upload_fingerprints", {})
         else:
             profiles = list(profiles if profiles is not None else capabilities.get("export_profiles", []))
-            session_fingerprints = None
+            session_fingerprints = {profile: "a" * 64 for profile in profiles}
         store = self.control.tdl_access_store
         destination = "123456789" if purpose == "tts" else "123"
+        inventory_hash = store.inventory_fingerprint(
+            profiles,
+            session_fingerprints if purpose == "storage" else None,
+        )
         store.replace_results(
             worker,
             purpose,
             store.destination_fingerprint(destination),
-            store.inventory_fingerprint(profiles, session_fingerprints),
+            inventory_hash,
             [{"profile": profile, "ready": True} for profile in profiles],
             session_fingerprints=session_fingerprints,
+        )
+        if purpose == "tts":
+            self.runtime_readiness_store.apply_export_scan(
+                checked_at="2026-10-23T00:00:00Z",
+                workers=[{"worker": worker, "status": "success"}],
+                profiles={worker: [
+                    {
+                        "profile": profile,
+                        "ready": True,
+                        "fingerprint": session_fingerprints[profile],
+                    }
+                    for profile in profiles
+                ]},
+            )
+            self.runtime_readiness_store.apply_tts_scan(
+                checked_at="2026-10-23T00:00:00Z",
+                profiles={worker: [
+                    {
+                        "profile": profile,
+                        "ready": bool(capabilities.get("tts")),
+                        "reason_code": "TTS_HELPER_UNAVAILABLE",
+                        "fingerprint": "c" * 64,
+                        "session_fingerprint": session_fingerprints[profile],
+                        "destination_fingerprint": store.destination_fingerprint(destination),
+                    }
+                    for profile in profiles
+                ]},
+            )
+            self.control.runtime_readiness_gate = RuntimeReadinessGate(
+                self.runtime_readiness_store
+            )
+
+    def seed_resolver_readiness(self, workers=None):
+        workers = workers or {"local": {"ready": True, "fingerprint": "d" * 64}}
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-23T00:00:00Z",
+            workers=[{"worker": name, "status": "success"} for name in workers],
+            profiles={},
+        )
+        self.runtime_readiness_store.apply_resolver_scan(
+            checked_at="2026-10-23T00:00:00Z",
+            workers=workers,
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
         )
 
     def local_profile_delete_client(self, inventories):
@@ -805,6 +877,14 @@ class BackendApiTests(unittest.TestCase):
         )
 
         revision = vault.desired_revision("default")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{"profile": "default", "ready": True, "fingerprint": "a" * 64}]},
+        )
         worker_headers = {
             "Authorization": "Bearer internal",
             "X-Worker-Name": "local",
@@ -825,6 +905,9 @@ class BackendApiTests(unittest.TestCase):
             json=worker_event,
         )
         self.assertEqual(event_response.status_code, 200, event_response.text)
+        changed_cell = self.runtime_readiness_store.cell("local", "default", "export")
+        self.assertEqual(changed_cell["status"], "not_ready")
+        self.assertEqual(changed_cell["reason_code"], "PROFILE_SESSION_CHANGED")
         duplicate_response = client.post(
             "/internal/v1/profile-sync/events",
             headers=worker_headers,
@@ -1176,6 +1259,21 @@ class BackendApiTests(unittest.TestCase):
             ]}
 
         self.dispatcher.profile_local_inventory = inventory
+        self.dispatcher.profile_tdl_diagnostics = lambda worker, profile: {
+            "ready": True,
+            "reason_codes": [],
+            "fingerprint": hashlib.sha256(f"{worker}:{profile}".encode()).hexdigest(),
+        }
+        self.dispatcher.utility_runtime_readiness = lambda _worker: {
+            "ready": True,
+            "reason_code": "",
+            "fingerprint": "c" * 64,
+        }
+        resolver_probe_calls = []
+        self.dispatcher.safelink_runtime_readiness = lambda worker: (
+            resolver_probe_calls.append(worker)
+            or {"ready": True, "reason_code": "", "fingerprint": "e" * 64}
+        )
         self.dispatcher.scan_local_profiles = lambda _worker: self.fail(
             "cross-worker scan must not start Upload lane preparation"
         )
@@ -1203,13 +1301,263 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("telegram_user_id", response.text)
         self.assertNotIn("/data", response.text)
         self.assertNotIn("must-not-leak", response.text)
+        self.assertNotIn("fingerprint", response.text)
+        self.assertEqual(resolver_probe_calls, ["local"])
+        utility_cells = [
+            item for item in body["runtime_readiness"]["cells"]
+            if item["runtime"] == "utility"
+        ]
+        self.assertEqual(utility_cells, [{
+            "worker": "local",
+            "profile": None,
+            "runtime": "utility",
+            "status": "ready",
+            "checked_at": body["runtime_readiness"]["checked_at"],
+            "reason_code": "",
+        }])
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", None, "utility")["fingerprint"],
+            "c" * 64,
+        )
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", "default", "export")["fingerprint"],
+            hashlib.sha256(b"local:default").hexdigest(),
+        )
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", "incomplete", "export")["status"],
+            "not_ready",
+        )
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", None, "resolver")["fingerprint"],
+            "e" * 64,
+        )
+        resolver_cells = [
+            item for item in body["runtime_readiness"]["cells"]
+            if item["runtime"] == "resolver"
+        ]
+        self.assertEqual(len(resolver_cells), 1)
+        self.assertEqual(resolver_cells[0]["worker"], "local")
+        self.assertEqual(resolver_cells[0]["profile"], None)
+        self.assertEqual(resolver_cells[0]["status"], "ready")
+        self.assertEqual(body["runtime_readiness"]["workers"][1]["status"], "failed")
 
         before_read = list(calls)
         read = self.client.get("/api/v1/profiles/local", headers=auth)
         self.assertEqual(read.status_code, 200, read.text)
         self.assertEqual(read.json(), body)
         self.assertEqual(calls, before_read)
+        self.assertEqual(resolver_probe_calls, ["local"])
         self.assertNotIn("stale", read.text)
+
+    def test_profile_scan_reads_tts_helpers_and_matching_saved_access_without_sending(self):
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default",
+            "ready": True,
+            "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+            "upload_lane": {
+                "status": "ready", "phase": "ready", "progress": 100,
+                "code": "OK", "updated_at": "2026-10-23T00:00:00Z",
+            },
+        }]}
+        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
+            "ready": True,
+            "reason_codes": [],
+            "fingerprint": "a" * 64,
+        }
+        self.dispatcher.tts_health_result = {
+            "ready": True,
+            "helpers_ready": True,
+            "helpers": [
+                {"slot": slot, "status": "ready", "bootstrap_percent": 100}
+                for slot in range(1, 4)
+            ],
+        }
+        access_store = self.control.tdl_access_store
+        destination_hash = access_store.destination_fingerprint("123456789")
+        session_fingerprints = {"default": "a" * 64}
+        inventory_hash = access_store.inventory_fingerprint(
+            ["default"], session_fingerprints
+        )
+        access_store.replace_results(
+            "local", "tts", destination_hash, inventory_hash,
+            [{"profile": "default", "ready": True}],
+            session_fingerprints=session_fingerprints,
+        )
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan", headers=self.login(42)
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        cell = self.runtime_readiness_store.cell("local", "default", "tts")
+        self.assertEqual(cell["status"], "ready")
+        self.assertEqual(cell["session_fingerprint"], "a" * 64)
+        self.assertEqual(self.dispatcher.tts_health_calls, ["local"])
+        self.assertEqual(self.dispatcher.commands, [])
+        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+
+    def test_profile_scan_stores_separate_quick_mode_cell_and_private_upload_snapshot(self):
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default",
+            "ready": True,
+            "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+            "upload_lane": {
+                "status": "ready", "phase": "ready", "progress": 100,
+                "code": "OK", "updated_at": "2026-10-23T00:00:00Z",
+            },
+        }]}
+        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
+            "ready": True, "reason_codes": [], "fingerprint": "a" * 64,
+        }
+        self.dispatcher.quickmode_runtime_readiness = lambda _worker, _destination: {
+            "ready": True, "reason_code": "", "fingerprint": "b" * 64,
+        }
+        access_store = self.control.tdl_access_store
+        destination = self.control._tdl_access_target("storage")
+        capabilities = self.dispatcher.capabilities("local")
+        fingerprints = capabilities["storage_upload_fingerprints"]
+        destination_hash = access_store.destination_fingerprint(destination)
+        inventory_hash = access_store.inventory_fingerprint(
+            capabilities["available_storage_profiles"], fingerprints
+        )
+        access_store.replace_results(
+            "local", "storage", destination_hash, inventory_hash,
+            [{"profile": "default", "ready": True}],
+            session_fingerprints=fingerprints,
+        )
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan", headers=self.login(42)
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        quick = self.runtime_readiness_store.cell("local", "default", "quick_mode")
+        storage = self.runtime_readiness_store.cell("local", "default", "storage")
+        export = self.runtime_readiness_store.cell("local", "default", "export")
+        self.assertEqual(export["status"], "ready")
+        self.assertEqual(quick["status"], "ready")
+        self.assertEqual(storage["status"], "ready")
+        self.assertEqual(storage["session_fingerprint"], fingerprints["default"])
+        self.assertEqual(storage["destination_fingerprint"], destination_hash)
+        self.assertEqual(quick["session_fingerprint"], "a" * 64)
+        self.assertEqual(quick["destination_fingerprint"], destination_hash)
+        self.assertEqual(quick["sender_profiles"], ["default"])
+        self.assertEqual(
+            quick["sender_session_fingerprints"]["default"],
+            fingerprints["default"],
+        )
+        body = response.json()
+        public_quick = next(
+            cell for cell in body["runtime_readiness"]["cells"]
+            if cell["runtime"] == "quick_mode"
+        )
+        self.assertEqual(public_quick["status"], "ready")
+        self.assertNotIn("fingerprint", str(body["runtime_readiness"]))
+        self.assertNotIn("sender_session_fingerprints", response.text)
+        self.assertNotIn("_storage_readiness", response.text)
+        self.assertEqual(self.dispatcher.commands, [])
+        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+
+    def test_profile_scan_rejects_missing_or_stale_tts_access_evidence(self):
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default", "ready": True, "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+        }]}
+        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
+            "ready": True, "reason_codes": [], "fingerprint": "b" * 64,
+        }
+        self.dispatcher.tts_health_result = {
+            "ready": True, "helpers_ready": True,
+            "helpers": [{"slot": slot, "status": "ready"} for slot in range(1, 4)],
+        }
+        access_store = self.control.tdl_access_store
+        destination_hash = access_store.destination_fingerprint("123456789")
+        stale_fingerprints = {"default": "a" * 64}
+        access_store.replace_results(
+            "local", "tts", destination_hash,
+            access_store.inventory_fingerprint(["default"], stale_fingerprints),
+            [{"profile": "default", "ready": True}],
+            session_fingerprints=stale_fingerprints,
+        )
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan", headers=self.login(42)
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        cell = self.runtime_readiness_store.cell("local", "default", "tts")
+        self.assertEqual(cell["status"], "not_ready")
+        self.assertEqual(cell["reason_code"], "TDL_ACCESS_NOT_VERIFIED")
+        self.assertEqual(cell["session_fingerprint"], "")
+
+    def test_successful_tts_proof_event_persists_export_session_fingerprint(self):
+        store = self.control.tdl_access_store
+        destination_hash = store.destination_fingerprint("123456789")
+        inventory_hash = store.inventory_fingerprint(["default"])
+        job = Job(
+            id="verify-tts-proof",
+            kind="tdl_access_verify",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload={"purpose": "tts"},
+        )
+        self.jobs.create_with_private_values(
+            job,
+            {},
+            execution_plan={},
+            command_payload={
+                "payload": {
+                    "purpose": "tts",
+                    "destination_hash": destination_hash,
+                }
+            },
+        )
+
+        self.control._apply_event_side_effects(job, JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.SUCCEEDED,
+            event_type="succeeded",
+            result={"value": {
+                "purpose": "tts",
+                "inventory_hash": inventory_hash,
+                "session_fingerprints": {"default": "a" * 64},
+                "profiles": [{"profile": "default", "ready": True}],
+            }},
+        ))
+
+        self.assertEqual(
+            store.verified_profiles(
+                "local",
+                "tts",
+                destination_hash,
+                inventory_hash,
+                session_fingerprints={"default": "a" * 64},
+            ),
+            ["default"],
+        )
 
     def test_local_profile_delete_rejects_default_and_any_active_profile_job(self):
         inventories = {"local": {"worker": "local", "items": [
@@ -1373,18 +1721,25 @@ class BackendApiTests(unittest.TestCase):
     def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
         self.context.queue_publisher = object()
         self.context.queue_command_service = object()
-        self.dispatcher.capabilities = lambda _worker: {
-            "safelink_resolver": True,
-            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
-        }
+        self.seed_resolver_readiness()
+        self.dispatcher.capabilities = lambda _worker: self.fail(
+            "job submission must use the persisted Resolver snapshot"
+        )
         client = TestClient(create_backend_app(self.context))
         auth = self.login(42)
         private_url = "https://pndk.to/private-short-token"
 
+        options = client.get("/api/v1/safelink/workers", headers=auth)
+        self.assertEqual(options.status_code, 200, options.text)
+        self.assertEqual(options.json()["items"], [{
+            "name": "local", "enabled": True, "status": "ready",
+            "reason_code": "", "queued_jobs": 0,
+        }])
+
         response = client.post(
             "/api/v1/safelink/jobs",
             headers={**auth, "Idempotency-Key": "safelink-submit-1"},
-            json={"url": private_url},
+            json={"url": private_url, "worker": "local"},
         )
 
         self.assertEqual(response.status_code, 202)
@@ -1415,10 +1770,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(unavailable.json()["error"]["code"], "SAFELINK_WORKER_UNAVAILABLE")
         self.assertNotIn(private_url, unavailable.text)
 
-        self.dispatcher.capabilities = lambda _worker: {
-            "safelink_resolver": True,
-            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
-        }
+        self.seed_resolver_readiness()
         invalid = client.post(
             "/api/v1/safelink/jobs",
             headers={**auth, "Idempotency-Key": "safelink-invalid-host"},
@@ -1437,14 +1789,15 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(oversized.status_code, 422)
         self.assertEqual(oversized.json()["error"]["code"], "SAFELINK_URL_INVALID")
         self.assertNotIn(oversized_url, oversized.text)
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", None, "resolver")["status"],
+            "ready",
+        )
 
     def test_safelink_jobs_use_persisted_cancel_and_retry_operations(self):
         self.context.queue_publisher = object()
         self.context.queue_command_service = object()
-        self.dispatcher.capabilities = lambda _worker: {
-            "safelink_resolver": True,
-            "capabilities": [CAP_SAFELINK_RESOLVE, CAP_DURABLE_COMMANDS_V1],
-        }
+        self.seed_resolver_readiness()
         client = TestClient(create_backend_app(self.context))
         auth = self.login(42)
         self.control.add_event_observer(self.operation_service.on_job_event)
@@ -1461,6 +1814,10 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(cancel.status_code, 202)
         cancel_operation = self.operation_service.store.get_by_job_id(submitted.json()["id"])
         self.assertEqual(cancel_operation.status.value, "cancelling")
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", None, "resolver")["status"],
+            "ready",
+        )
 
         retriable = client.post(
             "/api/v1/safelink/jobs",
@@ -1477,6 +1834,10 @@ class BackendApiTests(unittest.TestCase):
         )
         self.jobs.append_event(failed)
         self.operation_service.on_job_event(failed)
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", None, "resolver")["status"],
+            "ready",
+        )
         retry = client.post(
             f"/api/v1/safelink/jobs/{job_id}/retry",
             headers={**auth, "Idempotency-Key": "safelink-retry-1"},
@@ -1485,6 +1846,37 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(retry.json()["status"], "queued")
         self.assertEqual(self.operation_service.store.get_by_job_id(job_id).status.value, "queued")
         self.assertEqual(self.jobs.command_payload(job_id)["payload"], {"url": "https://go.fakta.id/retry-me"})
+
+    def test_safelink_manual_worker_gate_rejects_disabled_and_unready_before_creating_job(self):
+        self.workers.upsert("remote", "http://remote-worker", "remote-secret")
+        self.seed_resolver_readiness({
+            "local": {"ready": True, "fingerprint": "d" * 64},
+            "remote": {"ready": False, "reason_code": "RESOLVER_RUNTIME_UNAVAILABLE"},
+        })
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        client = TestClient(create_backend_app(self.context))
+        auth = self.login(42)
+        before = len(self.jobs.list(profile="default", limit=20))
+
+        unready = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-manual-unready"},
+            json={"url": "https://pndk.to/not-ready", "worker": "remote"},
+        )
+        self.assertEqual(unready.status_code, 409, unready.text)
+        self.assertEqual(unready.json()["error"]["code"], "RUNTIME_NOT_READY")
+        self.assertEqual(len(self.jobs.list(profile="default", limit=20)), before)
+
+        self.workers.set_enabled("remote", False)
+        disabled = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-manual-disabled"},
+            json={"url": "https://pndk.to/disabled", "worker": "remote"},
+        )
+        self.assertEqual(disabled.status_code, 409, disabled.text)
+        self.assertEqual(disabled.json()["error"]["code"], "WORKER_DISABLED")
+        self.assertEqual(len(self.jobs.list(profile="default", limit=20)), before)
 
     def test_trusted_device_routes_require_browser_csrf_and_hide_keys(self):
         private = Ed25519PrivateKey.generate()
@@ -2406,6 +2798,174 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.json()["profile"], "archive")
         self.assertEqual(response.json()["worker"], "local")
 
+    def test_export_submit_uses_persisted_readiness_without_worker_probe(self):
+        store = RuntimeReadinessStore(Path(self.temp.name) / "runtime-readiness.json")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
+        calls = []
+
+        def forbidden_probe(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise AssertionError("Export submit must not probe the worker")
+
+        self.dispatcher.check_worker = forbidden_probe
+        self.dispatcher.profile_tdl_diagnostics = forbidden_probe
+
+        denied = self.client.post(
+            "/api/v1/exports",
+            headers=self.login(),
+            json={"url": "https://t.me/c/123/456"},
+        )
+        self.assertEqual(denied.status_code, 409, denied.text)
+        self.assertEqual(denied.json()["error"]["code"], "RUNTIME_NOT_READY")
+        self.assertEqual(self.jobs.list(actor_user_id=42), [])
+        self.assertEqual(calls, [])
+
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{"profile": "default", "ready": True, "fingerprint": "a" * 64}]},
+        )
+        response = self.client.post(
+            "/api/v1/exports",
+            headers=self.login(),
+            json={"url": "https://t.me/c/123/457"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["status"], "dispatched")
+        self.assertEqual(calls, [])
+
+    def test_quick_export_submit_uses_quick_snapshot_and_pins_upload_evidence(self):
+        store = self.runtime_readiness_store
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": []}
+        destination = self.control._tdl_access_target("storage")
+        capabilities = self.dispatcher.capabilities("local")
+        senders = capabilities["storage_upload_fingerprints"]
+        destination_hash = self.control.tdl_access_store.destination_fingerprint(destination)
+        inventory_hash = self.control.tdl_access_store.inventory_fingerprint(
+            capabilities["available_storage_profiles"], senders
+        )
+        self.control.tdl_access_store.replace_results(
+            "local", "storage", destination_hash, inventory_hash,
+            [{"profile": profile, "ready": True} for profile in senders],
+            session_fingerprints=senders,
+        )
+        rclone_destination_fingerprint = hashlib.sha256(
+            b"googledrive:backup"
+        ).hexdigest()
+        store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{"profile": "default", "ready": True, "fingerprint": "a" * 64}]},
+        )
+        store.apply_quickmode_scan(
+            checked_at="2026-10-23T10:05:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{
+                "profile": "default", "ready": True, "fingerprint": "b" * 64,
+                "session_fingerprint": "a" * 64,
+                "destination_fingerprint": destination_hash,
+                "rclone_destination_fingerprint": rclone_destination_fingerprint,
+                "sender_profiles": list(senders),
+                "sender_session_fingerprints": senders,
+            }]},
+        )
+
+        def forbidden_capability_probe(_worker):
+            self.fail("Quick Mode submit must use Profile scan evidence")
+
+        self.dispatcher.capabilities = forbidden_capability_probe
+        response = self.client.post(
+            "/api/v1/exports",
+            headers=self.login(),
+            json={
+                "url": "https://t.me/c/123/458",
+                "quick_mode": True,
+                "profile": "default",
+                "worker": "local",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["payload"]["quick_mode"], True)
+        self.assertNotIn("tdl_storage_chat_ref", str(response.json()["payload"]))
+        self.assertNotIn("sender_session_fingerprints", str(response.json()["payload"]))
+        worker_payload = self.dispatcher.commands[-1][1]["payload"]
+        self.assertEqual(worker_payload["_quick_storage_tdl_access_target"], "123")
+        self.assertEqual(worker_payload["_quick_storage_sender_session_fingerprints"], senders)
+
+        jobs_before_stale_submit = len(self.jobs.list(actor_user_id=42))
+        self.control.tdl_access_store.invalidate_profile(
+            "local",
+            destination_hash,
+            "default",
+            senders["default"],
+            "TDL_SESSION_UNAUTHORIZED",
+            purpose="storage",
+        )
+        stale = self.client.post(
+            "/api/v1/exports",
+            headers=self.login(),
+            json={
+                "url": "https://t.me/c/123/459",
+                "quick_mode": True,
+                "profile": "default",
+                "worker": "local",
+            },
+        )
+        self.assertEqual(stale.status_code, 409, stale.text)
+        self.assertEqual(stale.json()["error"]["code"], "RUNTIME_NOT_READY")
+        self.assertEqual(len(self.jobs.list(actor_user_id=42)), jobs_before_stale_submit)
+
+    def test_utility_submit_uses_worker_snapshot_and_preserves_workspace_guard(self):
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": []},
+        )
+        checker_calls = []
+
+        def forbidden_probe(worker):
+            checker_calls.append(worker)
+            raise AssertionError("Utility submit must use the saved runtime snapshot")
+
+        self.dispatcher.check_worker = forbidden_probe
+        headers = self.login()
+        invalid_path = self.client.post(
+            "/api/v1/utility/jobs",
+            headers=headers,
+            json={"utility": "compress", "folders": ["/etc"], "worker": "local"},
+        )
+        self.assertEqual(invalid_path.status_code, 422, invalid_path.text)
+        self.assertEqual(invalid_path.json()["error"]["code"], "UTILITY_PATH_INVALID")
+
+        denied = self.client.post(
+            "/api/v1/utility/jobs",
+            headers=headers,
+            json={"utility": "compress", "folders": ["/workspace/archive"], "worker": "local"},
+        )
+        self.assertEqual(denied.status_code, 409, denied.text)
+        self.assertEqual(denied.json()["error"]["code"], "RUNTIME_NOT_READY")
+        self.assertEqual(self.jobs.list(actor_user_id=42), [])
+        self.assertEqual(checker_calls, [])
+
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="utility", ready=True,
+            fingerprint="d" * 64,
+        )
+        accepted = self.client.post(
+            "/api/v1/utility/jobs",
+            headers=headers,
+            json={"utility": "compress", "folders": ["/workspace/archive"], "worker": "local"},
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json()["kind"], "utility")
+        self.assertEqual(checker_calls, [])
+
     def test_context_checker_rejects_profile_worker_pair_outside_verified_catalog(self):
         headers = self.login()
         self.workers.values["remote-1"] = {"url": "http://remote", "token": "secret"}
@@ -2884,7 +3444,7 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 400)
 
-    def test_quick_export_requires_storage_and_redacts_settings(self):
+    def test_quick_export_requires_saved_storage_proof_and_redacts_settings(self):
         headers = self.login()
         self.dispatcher.storage_available = False
         rejected = self.client.post(
@@ -2893,7 +3453,7 @@ class BackendApiTests(unittest.TestCase):
             json={"url": "https://t.me/c/1/2", "quick_mode": True},
         )
         self.assertEqual(rejected.status_code, 409)
-        self.assertEqual(rejected.json()["error"]["code"], "STORAGE_PROFILE_UNAVAILABLE")
+        self.assertEqual(rejected.json()["error"]["code"], "TDL_ACCESS_NOT_VERIFIED")
 
         self.dispatcher.storage_available = True
         self.seed_tdl_access(worker="local", purpose="storage")
@@ -3582,6 +4142,12 @@ class BackendApiTests(unittest.TestCase):
         self.dispatcher.tts_health_result["available_profiles"] = ["default"]
         self.seed_tdl_access("local", "tts", ["default"])
         self.seed_tdl_access("remote-tts", "tts", ["default"])
+        self.dispatcher.capabilities = lambda _worker: self.fail(
+            "TTS status and submission must use the Profile scan snapshot"
+        )
+        self.dispatcher.tts_health = lambda _worker: self.fail(
+            "TTS status and submission must not probe helper health"
+        )
 
         options = self.client.get("/api/v1/tts/workers", headers=headers)
         self.assertEqual(options.status_code, 200, options.text)
@@ -3602,6 +4168,53 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(created.json()["profile"], "default")
         self.assertEqual(created.json()["payload"]["sender_profile"], "default")
         self.assertEqual(self.dispatcher.commands[-1][0], "remote-tts")
+
+    def test_tts_access_denial_invalidates_only_matching_tts_proof_and_readiness_cell(self):
+        self.dispatcher.tts_ready = True
+        self.seed_tdl_access("local", "tts", ["default"])
+        self.seed_tdl_access("local", "storage", ["default"])
+        headers = self.login(42)
+        submitted = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": "Isi"},
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        job = self.jobs.get(submitted.json()["id"])
+
+        self.control._apply_event_side_effects(job, JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.RUNNING,
+            event_type="tdl_access.profile_denied",
+            result={"profile": "default", "error_code": "CHAT_WRITE_FORBIDDEN"},
+        ))
+
+        store = self.control.tdl_access_store
+        tts_destination = store.destination_fingerprint("123456789")
+        storage_destination = store.destination_fingerprint("123")
+        session_fingerprints = {"default": "a" * 64}
+        self.assertEqual(
+            store.verified_profiles(
+                "local", "tts", tts_destination,
+                store.inventory_fingerprint(["default"]),
+                session_fingerprints=session_fingerprints,
+            ),
+            [],
+        )
+        storage_fingerprints = self.dispatcher.capabilities("local")["storage_upload_fingerprints"]
+        self.assertEqual(
+            store.verified_profiles(
+                "local", "storage", storage_destination,
+                store.inventory_fingerprint(["default"], storage_fingerprints),
+                session_fingerprints=storage_fingerprints,
+            ),
+            ["default"],
+        )
+        self.assertEqual(
+            self.runtime_readiness_store.cell("local", "default", "tts")["status"],
+            "not_ready",
+        )
 
     def test_tdl_access_verification_is_durable_and_target_is_private_to_owner_worker(self):
         self.context.queue_publisher = object()
@@ -3663,7 +4276,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(status.json()["session"], "upload")
         self.assertEqual(status.json()["verified_profiles"], ["archive"])
 
-    def test_tts_worker_diagnostics_are_complete_and_logs_are_authenticated_json(self):
+    def test_tts_worker_list_reads_snapshot_and_diagnostics_logs_remain_authenticated(self):
         headers = self.login()
         store = ProfileProvisioningStore(
             Path(self.temp.name) / "diagnostic.db", Path(self.temp.name) / "diagnostic-vault"
@@ -3681,14 +4294,17 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(response.json()["items"]), 1)
         self.assertFalse(response.json()["items"][0]["ready"])
-        self.assertEqual(response.json()["items"][0]["reason_code"], "helpers_not_ready")
+        self.assertEqual(response.json()["items"][0]["reason_code"], "runtime_not_scanned")
+        self.assertEqual(store.diagnostic_logs(42, "tts", 20), [])
+
+        self.client.get("/api/v1/workers/local/tts/health", headers=headers)
 
         denied = self.client.get("/api/v1/diagnostics/tts/logs")
         self.assertEqual(denied.status_code, 401)
         logs = self.client.get("/api/v1/diagnostics/tts/logs?limit=20", headers=headers)
         self.assertEqual(logs.status_code, 200, logs.text)
         self.assertEqual(logs.json()["items"][0]["worker"], "local")
-        self.assertEqual(logs.json()["items"][0]["code"], "HELPERS_NOT_READY")
+        self.assertEqual(logs.json()["items"][0]["event"], "worker_health_check")
 
 if __name__ == "__main__":
     unittest.main()

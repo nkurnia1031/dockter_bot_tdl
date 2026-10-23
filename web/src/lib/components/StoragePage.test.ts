@@ -3,6 +3,14 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import StoragePage from './StoragePage.svelte';
 import { session } from '../session.svelte';
 
+type TestDialogPrototype = { showModal?: () => void; close?: () => void };
+
+function enableDialogMethods() {
+  const prototype = HTMLDialogElement.prototype as unknown as TestDialogPrototype;
+  prototype.showModal = function (this: HTMLDialogElement) { this.setAttribute('open', ''); };
+  prototype.close = function (this: HTMLDialogElement) { this.removeAttribute('open'); };
+}
+
 function stubStorageFile() {
   vi.stubGlobal('fetch', vi.fn(async (input: string) => {
     const url = new URL(String(input), 'https://ui.test');
@@ -17,7 +25,14 @@ function stubStorageFile() {
 }
 
 describe('Storage file manager', () => {
-  afterEach(() => { cleanup(); vi.unstubAllGlobals(); localStorage.clear(); });
+  afterEach(() => {
+    cleanup();
+    const prototype = HTMLDialogElement.prototype as unknown as TestDialogPrototype;
+    delete prototype.showModal;
+    delete prototype.close;
+    vi.unstubAllGlobals();
+    localStorage.clear();
+  });
 
   it('renders folder tree, opens nested folder, and exposes recycle bin', async () => {
     const fetcher = vi.fn(async (input: string) => {
@@ -50,51 +65,80 @@ describe('Storage file manager', () => {
     expect(fetcher.mock.calls.some(([url]) => String(url).includes('folder_id=1'))).toBe(true);
   }, 15000);
 
-  it('shows skipped profile reason and TDL command from the verification job', async () => {
+  it('uses the saved Storage readiness snapshot and does not start a verification message/job', async () => {
+    enableDialogMethods();
+    const requests: { url: string; method: string }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = new URL(String(input), 'https://ui.test');
       const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url: url.pathname, method });
       if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
         authenticated: true, profiles: ['default'], actor: { telegram_user_id: 1, profile: 'default', worker_route: 'local' },
       }), { status: 200 });
-      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({ items: [{ name: 'local', url: 'http://worker' }] }), { status: 200 });
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({ items: [{ name: 'local', url: 'http://worker', enabled: true }] }), { status: 200 });
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles: [{ name: 'default', workers: ['local'] }],
+        runtime_readiness: {
+          checked_at: '2026-10-23T05:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+          cells: [{ worker: 'local', profile: 'default', runtime: 'storage', status: 'ready', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+        },
+      }), { status: 200 });
       if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({
         current_folder: null, breadcrumbs: [], folders: [], items: [], total_folders: 0, total_items: 0,
       }), { status: 200 });
       if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
-      if (url.pathname.endsWith('/tdl-access/verification') && method === 'POST') return new Response(JSON.stringify({
-        operation_id: 'storage-operation', status: 'queued', phase: 'queued', job_id: 'storage-verify-job',
-      }), { status: 202 });
-      if (url.pathname.endsWith('/operations/storage-operation')) return new Response(JSON.stringify({
-        operation_id: 'storage-operation', status: 'succeeded', phase: 'completed', job_id: 'storage-verify-job',
-      }), { status: 200 });
-      if (url.pathname.endsWith('/jobs/storage-verify-job')) return new Response(JSON.stringify({
-        status: 'succeeded',
-        progress: { message: 'Profil default dilewati (TDL_SESSION_DIRECTORY_MISSING); perintah TDL tidak dijalankan.' },
-        result: { value: {
-          session: 'upload',
-          command_template: 'tdl --storage type=bolt,path=<session-database> -n <export-namespace> up -p <temporary-test-file> -c <configured-destination> --caption <temporary-caption-file>',
-          summary: { total: 1, tested: 0, ready: 0, failed: 1 },
-          profiles: [{ profile: 'default', ready: false, session: 'upload', session_status: 'unavailable', command_attempted: false, error_code: 'TDL_SESSION_DIRECTORY_MISSING', error_message: 'Folder lane Upload profil ini belum tersedia pada worker.' }],
-        } },
-      }), { status: 200 });
-      if (url.pathname.endsWith('/tdl-access/verification')) return new Response(JSON.stringify({
-        worker: 'local', purpose: 'storage', session: 'upload', ready: false, profiles: [],
-      }), { status: 200 });
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({ path: '/workspace', items: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
     await session.restore();
     render(StoragePage);
 
-    await fireEvent.click(await screen.findByRole('button', { name: 'Verifikasi akses TDL' }));
-    await fireEvent.click(await screen.findByRole('button', { name: 'Muat status' }));
+    expect(await screen.findByText('Storage siap')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /verifikasi akses tdl/i })).toBeNull();
+    expect(requests.some(({ url, method }) => url.endsWith('/tdl-access/verification') && method === 'POST')).toBe(false);
+    expect(requests.some(({ url, method }) => url.endsWith('/context/verify') && method === 'POST')).toBe(false);
 
-    expect(await screen.findByText(/Folder lane Upload profil ini belum tersedia/)).toBeTruthy();
-    expect(screen.getByText('Lane yang diuji: Upload.')).toBeTruthy();
-    expect(screen.getByText(/tdl --storage type=bolt,path=<session-database>/)).toBeTruthy();
-    expect(screen.getByText(/Profil default dilewati/)).toBeTruthy();
-    expect(screen.getByText(/0 profil dapat mengirim dari 1/)).toBeTruthy();
-    expect(screen.getByText(/tidak dijalankan karena sesi/i)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
+    expect(await screen.findByRole('heading', { name: 'Upload folder workspace' })).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Pilih' }));
+    const submit = screen.getByRole('button', { name: 'Mulai upload' });
+    expect((submit as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(submit);
+    expect(requests.some(({ url, method }) => url.endsWith('/storage/uploads') && method === 'POST')).toBe(true);
+    expect(requests.some(({ url, method }) => url.endsWith('/tdl-access/verification') && method === 'POST')).toBe(false);
+  }, 15000);
+
+  it('keeps Storage upload gated when the saved readiness snapshot has no ready profile', async () => {
+    enableDialogMethods();
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = new URL(String(input), 'https://ui.test');
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true, profiles: ['default'], actor: { telegram_user_id: 1, profile: 'default', worker_route: 'local' },
+      }), { status: 200 });
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({ items: [{ name: 'local', url: 'http://worker', enabled: true }] }), { status: 200 });
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles: [{ name: 'default', workers: ['local'] }],
+        runtime_readiness: {
+          checked_at: '2026-10-23T05:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+          cells: [{ worker: 'local', profile: 'default', runtime: 'storage', status: 'not_ready', checked_at: '2026-10-23T05:00:00Z', reason_code: 'TDL_ACCESS_NOT_VERIFIED' }],
+        },
+      }), { status: 200 });
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({
+        current_folder: null, breadcrumbs: [], folders: [], items: [], total_folders: 0, total_items: 0,
+      }), { status: 200 });
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({ path: '/workspace', items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+    await session.restore();
+    render(StoragePage);
+
+    expect(await screen.findByText('Storage belum siap')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
+    expect(await screen.findByRole('heading', { name: 'Upload folder workspace' })).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Mulai upload' }) as HTMLButtonElement).disabled).toBe(true);
   }, 15000);
 
   it('closes file details from the close button, backdrop, and Escape', async () => {

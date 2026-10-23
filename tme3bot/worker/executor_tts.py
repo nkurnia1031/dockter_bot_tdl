@@ -12,7 +12,7 @@ from typing import Any
 
 from tme3bot.domain.models import utc_now
 from tme3bot.infrastructure.http_client import request_json
-from tme3bot.tdl import tdl_write_denial_code
+from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.worker.tts_pipeline import TtsCancelled, TtsError, TtsPipeline
 
 LOGGER = logging.getLogger(__name__)
@@ -126,7 +126,10 @@ class TtsExecutorMixin:
         root = self._tts_artifact_directory(job_id)
         pipeline = self._tts_pipeline()
         if not pipeline.ready():
-            raise TtsError("Tiga helper TTS dan tiga jalur Tor harus siap")
+            raise TtsError(
+                "TTS_HELPER_UNAVAILABLE: tiga helper TTS dan jalur Tor harus siap",
+                code="TTS_HELPER_UNAVAILABLE",
+            )
         pause_event = self._pause_events.setdefault(job_id, threading.Event())
         last_phase = {"value": "starting"}
 
@@ -322,13 +325,31 @@ class TtsExecutorMixin:
                                     uploaded = True
                                     break
                                 except Exception as send_error:
-                                    denial = tdl_write_denial_code(send_error)
+                                    denial = (
+                                        tdl_write_denial_code(send_error)
+                                        or tdl_session_denial_code(send_error)
+                                    )
+                                    if denial:
+                                        self.publisher.emit(
+                                            job_id,
+                                            "running",
+                                            "tdl_access.profile_denied",
+                                            result={
+                                                "profile": sender_profile,
+                                                "error_code": denial,
+                                            },
+                                        )
                                     if denial and sender_index + 1 < len(sender_profiles):
                                         last_denial = denial
                                         self._append_job_log(
                                             f"[TTS] profil pengirim ditolak={sender_profile} code={denial}; mencoba profil berikutnya"
                                         )
                                         continue
+                                    if denial:
+                                        raise TtsError(
+                                            f"{denial}: pengiriman TDL ditolak untuk profil pengirim.",
+                                            code=denial,
+                                        ) from None
                                     raise
                             if not uploaded:
                                 raise TtsError(
@@ -352,6 +373,12 @@ class TtsExecutorMixin:
                                 job_id[:8],
                                 part_index,
                             )
+                        denial = tdl_write_denial_code(exc) or tdl_session_denial_code(exc)
+                        if denial:
+                            raise TtsError(
+                                f"{denial}: pengiriman TDL ditolak untuk profil pengirim.",
+                                code=denial,
+                            ) from None
                         raise TtsError(f"Pengiriman TDL gagal ({type(exc).__name__})") from None
                     request_json(
                         self.config.backend_api_url,

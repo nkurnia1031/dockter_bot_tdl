@@ -31,6 +31,7 @@ from tme3bot.rclone import (
 from tme3bot.service import (
     ExportJobResult,
 )
+from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.utility import (
     DEFAULT_UTILITY_SETTINGS,
     UtilityRunner,
@@ -1194,8 +1195,15 @@ class QuickModeExecutorMixin:
                     LOGGER.warning("Could not persist Quick Mode manifest at %s", stage_root, exc_info=True)
             if isinstance(exc, QuickModeError) and "staging dipertahankan di" in str(exc):
                 raise
+            error_code = (
+                str(getattr(exc, "code", "") or "").strip().upper()
+                or tdl_session_denial_code(exc)
+                or tdl_write_denial_code(exc)
+                or ""
+            )
             raise QuickModeError(
-                f"{exc}; staging dipertahankan di {stage_root}."
+                f"{exc}; staging dipertahankan di {stage_root}.",
+                code=error_code,
             ) from exc
 
     def quickmode_verify(self, stage_job_id: str, expected_phase: str = "uploading") -> dict[str, Any]:
@@ -1317,12 +1325,18 @@ class QuickModeExecutorMixin:
             verify_root: Path | None = None
             try:
                 if storage_profile not in self.available_storage_profiles():
-                    raise QuickModeError("Lane Upload profil Storage belum siap pada worker.")
+                    raise QuickModeError(
+                        "Lane Upload profil Storage belum siap pada worker.",
+                        code="PROFILE_UPLOAD_LANE_UNSAFE",
+                    )
                 storage_runtime = self.profile_manager.runtime(storage_profile)
                 client = storage_runtime.upload_tdl_client
                 channel_ref = str(getattr(storage_runtime.config, "storage_channel_ref", "") or "")
                 if not channel_ref:
-                    raise QuickModeError("Storage channel belum dikonfigurasi.")
+                    raise QuickModeError(
+                        "Storage channel belum dikonfigurasi.",
+                        code="TDL_ACCESS_TARGET_UNAVAILABLE",
+                    )
                 verify_root = stage_root / ".quickmode-verify"
                 verify_root.mkdir(mode=0o770, parents=True, exist_ok=True)
                 ensure_quick_stage_writable(verify_root)

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import configparser
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import threading
@@ -32,6 +35,17 @@ DEFAULT_UTILITY_SETTINGS = {
     "compress_password": "A1031@bokep@1031A",
     "rclone_destination": "googledrive:backup",
 }
+UTILITY_RUNTIME_SCRIPTS = (
+    "extract/extract.py",
+    "compress/compress.sh",
+    "export/telegram_messages_to_json.py",
+    "export/organize_media_from_json.py",
+    "pindah/pindah.sh",
+    "pindah/pindah4.py",
+    "pindah/pindah.py",
+    "pindah/pindah2.py",
+)
+UTILITY_RUNTIME_COMMANDS = ("python3", "bash", "7z", "du", "cut")
 UTILITY_SETTING_SPECS = {
     "move_size": {
         "label": "Batas ukuran grup pindah",
@@ -66,6 +80,142 @@ UTILITY_SETTING_SPECS = {
 
 class UtilityPathError(ValueError):
     pass
+
+
+class UtilityRuntimeError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {message}")
+
+
+def probe_utility_runtime(utility_root: Path, workspace_root: Path) -> dict[str, object]:
+    """Inspect Utility dependencies without creating or changing workspace files."""
+    utility_root = Path(utility_root)
+    workspace_root = Path(workspace_root)
+    workspace = workspace_root.resolve()
+    if not workspace.is_dir() or not os.access(workspace, os.R_OK | os.W_OK | os.X_OK):
+        return {"ready": False, "reason_code": "UTILITY_WORKSPACE_UNAVAILABLE", "fingerprint": ""}
+    commands = {name: shutil.which(name) for name in UTILITY_RUNTIME_COMMANDS}
+    if any(not resolved for resolved in commands.values()):
+        return {"ready": False, "reason_code": "UTILITY_COMMAND_MISSING", "fingerprint": ""}
+
+    script_hashes = []
+    try:
+        for relative in UTILITY_RUNTIME_SCRIPTS:
+            path = utility_root / relative
+            if not path.is_file() or not os.access(path, os.R_OK):
+                return {"ready": False, "reason_code": "UTILITY_SCRIPT_MISSING", "fingerprint": ""}
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            script_hashes.append((relative, digest))
+    except OSError:
+        return {"ready": False, "reason_code": "UTILITY_SCRIPT_UNREADABLE", "fingerprint": ""}
+
+    command_evidence = {}
+    try:
+        for name, resolved in commands.items():
+            path = Path(resolved).resolve()
+            if not path.is_file() or not os.access(path, os.X_OK):
+                return {"ready": False, "reason_code": "UTILITY_COMMAND_MISSING", "fingerprint": ""}
+            metadata = path.stat()
+            command_evidence[name] = {
+                "path": str(path),
+                "size": metadata.st_size,
+                "mtime_ns": metadata.st_mtime_ns,
+            }
+    except OSError:
+        return {"ready": False, "reason_code": "UTILITY_COMMAND_MISSING", "fingerprint": ""}
+
+    evidence = {
+        "workspace": str(workspace),
+        "commands": command_evidence,
+        "scripts": script_hashes,
+    }
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "ready": True,
+        "reason_code": "",
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def probe_quickmode_runtime(
+    utility_root: Path,
+    workspace_root: Path,
+    rclone_config_path: Path,
+    config_root: Path,
+    rclone_destination: str,
+) -> dict[str, object]:
+    """Inspect only Quick Mode's local runtime dependencies without mutation.
+
+    This deliberately does not call rclone against the remote. It confirms the
+    configured remote exists in the local config and fingerprints the files
+    and binaries Quick Mode will use.
+    """
+    utility_root = Path(utility_root)
+    workspace = Path(workspace_root).resolve()
+    if not workspace.is_dir() or not os.access(workspace, os.R_OK | os.W_OK | os.X_OK):
+        return {"ready": False, "reason_code": "UTILITY_WORKSPACE_UNAVAILABLE", "fingerprint": ""}
+
+    try:
+        validate_rclone_destination(str(rclone_destination or "").strip())
+    except ValueError:
+        return {"ready": False, "reason_code": "RCLONE_RUNTIME_UNAVAILABLE", "fingerprint": ""}
+    remote = str(rclone_destination).strip().split(":", 1)[0]
+
+    commands = (
+        "bash", "python3", "7z", "du", "cut", "ffmpeg", "ffprobe", "rclone"
+    )
+    resolved_commands = {name: shutil.which(name) for name in commands}
+    if any(not path for path in resolved_commands.values()):
+        return {"ready": False, "reason_code": "QUICK_MODE_RUNTIME_UNAVAILABLE", "fingerprint": ""}
+
+    compress_script = utility_root / "compress" / "compress.sh"
+    if not compress_script.is_file() or not os.access(compress_script, os.R_OK):
+        return {"ready": False, "reason_code": "UTILITY_SCRIPT_MISSING", "fingerprint": ""}
+
+    config = Path(rclone_config_path).resolve()
+    allowed_root = Path(config_root).resolve()
+    try:
+        config.relative_to(allowed_root)
+        if not config.is_file() or not os.access(config, os.R_OK):
+            raise OSError("config unavailable")
+        config_bytes = config.read_bytes()
+        parser = configparser.ConfigParser(interpolation=None)
+        parser.read_string(config_bytes.decode("utf-8"))
+        if remote not in parser:
+            raise ValueError("remote missing")
+    except (OSError, UnicodeDecodeError, configparser.Error, ValueError):
+        return {"ready": False, "reason_code": "RCLONE_RUNTIME_UNAVAILABLE", "fingerprint": ""}
+
+    try:
+        command_evidence = {}
+        for name, raw_path in resolved_commands.items():
+            path = Path(str(raw_path)).resolve()
+            if not path.is_file() or not os.access(path, os.X_OK):
+                raise OSError("command unavailable")
+            stat = path.stat()
+            command_evidence[name] = {
+                "path": str(path),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        script_hash = hashlib.sha256(compress_script.read_bytes()).hexdigest()
+    except OSError:
+        return {"ready": False, "reason_code": "QUICK_MODE_RUNTIME_UNAVAILABLE", "fingerprint": ""}
+
+    evidence = {
+        "workspace": str(workspace),
+        "commands": command_evidence,
+        "compress_script": script_hash,
+        "rclone_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "rclone_remote": remote,
+    }
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "ready": True,
+        "reason_code": "",
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 class UtilitySettingsStore:
@@ -392,8 +542,22 @@ class UtilityRunner:
                     }
                 )
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
-                if isinstance(exc, ProcessStalledError):
+                if isinstance(exc, UtilityRuntimeError):
                     raise
+                if isinstance(exc, ProcessStalledError):
+                    raise UtilityRuntimeError(
+                        "UTILITY_PROCESS_STALLED",
+                        "Proses Utility berhenti menghasilkan progres.",
+                    ) from exc
+                if re.search(
+                    r"\b(?:7z|ffmpeg|ffprobe|rclone|du|cut|python3):\s*(?:command not found|not found)\b",
+                    str(exc),
+                    re.IGNORECASE,
+                ):
+                    raise UtilityRuntimeError(
+                        "UTILITY_COMMAND_MISSING",
+                        "Worker tidak memiliki command runtime yang diperlukan Utility.",
+                    ) from exc
         summary: dict[str, object] = {
             "folders_processed": len(succeeded),
             "folders_failed": len(failed),
@@ -536,7 +700,10 @@ class UtilityRunner:
                     time.monotonic() - started_at,
                     prefix,
                 )
-            raise
+            raise UtilityRuntimeError(
+                "UTILITY_RUNTIME_UNAVAILABLE",
+                "Worker tidak dapat memulai proses Utility.",
+            ) from exc
         command_id = notify_command_started(self.command_callback, command, prefix)
         with self._process_lock:
             self._current_process = process

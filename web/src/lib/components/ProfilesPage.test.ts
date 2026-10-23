@@ -18,6 +18,140 @@ describe('ProfilesPage', () => {
     vi.useRealTimers();
   });
 
+  it('shows an empty TTS readiness state before the first profile scan', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({
+          checked_at: '2026-10-23T05:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', error_code: '' }],
+          inventories: [{ worker: 'local', checked_at: '2026-10-23T05:00:00Z', items: [] }],
+          runtime_readiness: {
+            checked_at: '2026-10-23T05:00:00Z',
+            workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+            cells: [],
+          },
+        }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/management') {
+        return new Response(JSON.stringify({ items: [], workers: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const matrix = await screen.findByRole('region', { name: 'Kesiapan TTS per worker dan profil' });
+    expect(matrix.textContent).toMatch(/Belum ada sel kesiapan TTS/);
+    expect(matrix.textContent).toMatch(/Jalankan Scan Profil/);
+  });
+
+  it('shows worker-only Resolver readiness saved by Profile scan', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({
+          checked_at: '2026-10-23T05:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', error_code: '' }],
+          inventories: [{ worker: 'local', checked_at: '2026-10-23T05:00:00Z', items: [] }],
+          runtime_readiness: {
+            checked_at: '2026-10-23T05:00:00Z',
+            workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+            cells: [{ worker: 'local', profile: null, runtime: 'resolver', status: 'not_ready', checked_at: '2026-10-23T05:00:00Z', reason_code: 'RESOLVER_RUNTIME_UNAVAILABLE' }],
+          },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const matrix = await screen.findByRole('region', { name: 'Kesiapan Resolver per worker' });
+    expect(matrix.textContent).toContain('local');
+    expect(matrix.textContent).toContain('Tidak siap');
+    expect(matrix.textContent).toContain('Addon Resolver tidak dapat digunakan pada worker.');
+  });
+
+  it('shows Quick Mode readiness in a matrix separate from normal Export', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({
+          checked_at: '2026-10-23T05:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', error_code: '' }],
+          inventories: [{ worker: 'local', checked_at: '2026-10-23T05:00:00Z', items: [] }],
+          runtime_readiness: {
+            checked_at: '2026-10-23T05:00:00Z',
+            workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+            cells: [
+              { worker: 'local', profile: 'default', runtime: 'export', status: 'ready', checked_at: '2026-10-23T05:00:00Z', reason_code: '' },
+              { worker: 'local', profile: 'default', runtime: 'quick_mode', status: 'not_ready', checked_at: '2026-10-23T05:00:00Z', reason_code: 'TDL_ACCESS_NOT_VERIFIED' }
+            ],
+          },
+        }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/management') {
+        return new Response(JSON.stringify({ items: [], workers: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const quick = await screen.findByRole('region', { name: 'Kesiapan Quick Mode per worker dan profil' });
+    const exportMatrix = await screen.findByRole('region', { name: 'Kesiapan Export per worker dan profil' });
+    expect(quick.textContent).toContain('Tidak siap');
+    expect(quick.textContent).toContain('default · local');
+    expect(exportMatrix.textContent).toContain('Siap');
+    expect(screen.getByRole('region', { name: 'Kesiapan TTS per worker dan profil' })).toBeTruthy();
+  });
+
+  it('shows Storage readiness per profile and worker from the saved scan', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({
+          checked_at: '2026-10-23T05:00:00Z',
+          workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', error_code: '' }],
+          inventories: [{ worker: 'local', checked_at: '2026-10-23T05:00:00Z', items: [] }],
+          runtime_readiness: {
+            checked_at: '2026-10-23T05:00:00Z',
+            workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T05:00:00Z', reason_code: '' }],
+            cells: [
+              { worker: 'local', profile: 'default', runtime: 'storage', status: 'ready', checked_at: '2026-10-23T05:00:00Z', reason_code: '' },
+              { worker: 'local', profile: 'archive', runtime: 'storage', status: 'not_ready', checked_at: '2026-10-23T05:00:00Z', reason_code: 'TDL_ACCESS_NOT_VERIFIED' },
+            ],
+          },
+        }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/management') {
+        return new Response(JSON.stringify({ items: [], workers: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const matrix = await screen.findByRole('region', { name: 'Kesiapan Storage per worker dan profil' });
+    expect(matrix.textContent).toContain('default · local');
+    expect(matrix.textContent).toContain('archive · local');
+    expect(matrix.textContent).toContain('Siap');
+    expect(matrix.textContent).toContain('Tidak siap');
+    expect(matrix.textContent).toContain('Bukti akses kirim tidak ada atau sudah stale');
+  });
+
   it('starts a new profile login from the profile menu and displays the QR prompt', async () => {
     const requests: { url: string; method: string; body?: string }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
@@ -127,6 +261,21 @@ describe('ProfilesPage', () => {
             { name: 'local', status: 'failed', checked_at: '2026-10-12T05:00:00+00:00', error_code: 'WORKER_UNAVAILABLE' },
             { name: 'remote-2', status: 'success', checked_at: '2026-10-12T05:00:00+00:00', error_code: '' }
           ],
+          runtime_readiness: {
+            checked_at: '2026-10-12T05:00:00+00:00',
+            workers: [
+              { name: 'local', status: 'failed', checked_at: '2026-10-12T05:00:00+00:00', reason_code: 'WORKER_UNAVAILABLE' },
+              { name: 'remote-2', status: 'success', checked_at: '2026-10-12T05:00:00+00:00', reason_code: '' }
+            ],
+            cells: [
+              { worker: 'local', profile: 'irang', runtime: 'export', status: 'ready', checked_at: '2026-10-11T05:00:00+00:00', reason_code: '' },
+              { worker: 'remote-2', profile: 'irang', runtime: 'export', status: 'ready', checked_at: '2026-10-12T05:00:00+00:00', reason_code: '' },
+              { worker: 'remote-2', profile: 'archive', runtime: 'export', status: 'not_ready', checked_at: '2026-10-12T05:00:00+00:00', reason_code: 'PROFILE_SESSION_TDL_INVALID' },
+              { worker: 'local', profile: 'irang', runtime: 'tts', status: 'ready', checked_at: '2026-10-11T05:00:00+00:00', reason_code: '' },
+              { worker: 'remote-2', profile: 'irang', runtime: 'tts', status: 'not_ready', checked_at: '2026-10-12T05:00:00+00:00', reason_code: 'TDL_ACCESS_NOT_VERIFIED' },
+              { worker: 'remote-2', profile: null, runtime: 'utility', status: 'not_ready', checked_at: '2026-10-12T05:00:00+00:00', reason_code: 'UTILITY_SCRIPT_MISSING' }
+            ]
+          },
           inventories: [{ worker: 'remote-2', checked_at: '2026-10-12T05:00:00+00:00', items: [{
             name: 'irang', ready: true, reason_codes: [], checks: [
               { name: 'identity', ready: true, code: 'OK' },
@@ -152,21 +301,31 @@ describe('ProfilesPage', () => {
     const statuses = screen.getByRole('region', { name: 'Status scan semua worker' }).textContent || '';
     expect(statuses).toMatch(/local.*Gagal/);
     expect(statuses).toMatch(/remote-2.*Berhasil/);
+    const readinessMatrix = screen.getByRole('region', { name: 'Kesiapan Export per worker dan profil' });
+    expect(readinessMatrix.textContent).toMatch(/irang.*local.*Worker offline/);
+    expect(readinessMatrix.textContent).toMatch(/irang.*remote-2.*Siap/);
+    expect(readinessMatrix.textContent).toMatch(/archive.*remote-2.*Tidak siap.*PROFILE_SESSION_TDL_INVALID/);
+    const ttsReadiness = screen.getByRole('region', { name: 'Kesiapan TTS per worker dan profil' });
+    expect(ttsReadiness.textContent).toMatch(/irang.*local.*Worker offline/);
+    expect(ttsReadiness.textContent).toMatch(/irang.*remote-2.*Tidak siap.*Bukti akses kirim tidak ada atau sudah stale/);
+    const utilityReadiness = screen.getByRole('region', { name: 'Kesiapan Utility per worker' });
+    expect(utilityReadiness.textContent).toMatch(/local.*Worker offline/);
+    expect(utilityReadiness.textContent).toMatch(/remote-2.*Tidak siap.*Script Utility tidak ditemukan/);
     expect(requests).toContainEqual({ url: '/api/v1/profiles/local/scan', method: 'POST' });
 
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
 
     expect(await screen.findByText('irang')).toBeTruthy();
     expect(screen.getByText(/Download.*Siap/)).toBeTruthy();
-    expect(screen.getByText(/Export.*Siap/)).toBeTruthy();
     expect(screen.getByText(/future_session.*Siap/)).toBeTruthy();
     expect(screen.getByRole('region', { name: 'Lane Upload irang' }).textContent).toMatch(/Lane Upload.*Siap/s);
     expect(screen.getByText(/Hasil scan.*remote-2/)).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'Kesiapan Export irang pada remote-2' }).textContent).toMatch(/runtime Export · Siap/);
     expect(await screen.findByRole('button', { name: 'Adopsi profil irang dari remote-2 ke Vault' })).toBeTruthy();
     expect(requests.some((item) => item.url === '/api/v1/workers/remote-2/profiles/scan')).toBe(false);
 
     await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang worker' }));
-    expect((await screen.findByRole('status')).textContent).toMatch(/katalog tetap memakai hasil Scan terakhir/i);
+    expect(await screen.findByText(/katalog tetap memakai hasil Scan terakhir/i)).toBeTruthy();
     expect(screen.getByText('irang')).toBeTruthy();
     expect(requests.filter((item) => item.url.endsWith('/profiles/local/scan'))).toHaveLength(1);
   });
@@ -465,7 +624,7 @@ describe('ProfilesPage', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Hapus profil archive dari local' }));
 
-    expect((await screen.findByRole('status')).textContent).toMatch(/tidak ditemukan.*dihapus dari daftar lokal/i);
+    expect(await screen.findByText(/Profil archive tidak ditemukan.*dihapus dari daftar lokal/i)).toBeTruthy();
     expect(screen.queryByRole('heading', { name: 'archive' })).toBeNull();
     expect(screen.queryByRole('region', { name: 'Operasi penghapusan profil' })).toBeNull();
   });

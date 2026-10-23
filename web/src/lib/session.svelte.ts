@@ -1,11 +1,21 @@
 import { api, post, put } from './api';
-import { normalizeLocalProfileCatalog, type LocalProfileOption } from './profile-catalog';
+import {
+  normalizeLocalProfileCatalog,
+  normalizeRuntimeReadiness,
+  type LocalProfileOption,
+  type RuntimeReadinessSnapshot
+} from './profile-catalog';
 
 export type Session = { authenticated: boolean; actor?: { telegram_user_id: number; profile: string; worker_route: string }; profiles: string[] };
 export type SessionWorker = { name: string; url: string; enabled?: boolean; selected?: boolean };
+type ProfileCatalogLoad = {
+  profiles: LocalProfileOption[];
+  runtimeReadiness: RuntimeReadinessSnapshot;
+};
 let current = $state<Session>({ authenticated: false, profiles: [] });
 let workers = $state<SessionWorker[]>([]);
 let profileCatalog = $state<LocalProfileOption[]>([]);
+let runtimeReadiness = $state<RuntimeReadinessSnapshot>({ checked_at: '', workers: [], cells: [] });
 let selectedTargetProfile = $state('');
 let loading = $state(true);
 let switching = $state(false);
@@ -21,11 +31,21 @@ async function loadWorkers(route?: string): Promise<SessionWorker[]> {
   return selectedWorkers(response.items || [], route);
 }
 
-async function loadProfileCatalog(): Promise<LocalProfileOption[]> {
+async function loadProfileCatalog(): Promise<ProfileCatalogLoad> {
   try {
-    return normalizeLocalProfileCatalog(await api<unknown>('/profiles/local'));
+    const snapshot = await api<unknown>('/profiles/local');
+    const payload = snapshot && typeof snapshot === 'object'
+      ? snapshot as Record<string, unknown>
+      : {};
+    return {
+      profiles: normalizeLocalProfileCatalog(snapshot),
+      runtimeReadiness: normalizeRuntimeReadiness(payload.runtime_readiness)
+    };
   } catch {
-    return [];
+    return {
+      profiles: [],
+      runtimeReadiness: { checked_at: '', workers: [], cells: [] }
+    };
   }
 }
 
@@ -63,6 +83,7 @@ export const session = {
   get current() { return current; },
   get workers() { return workers; },
   get profileCatalog() { return profileCatalog; },
+  get runtimeReadiness() { return runtimeReadiness; },
   get selectedTargetProfile() { return selectedTargetProfile; },
   get loading() { return loading; },
   get switching() { return switching; },
@@ -83,11 +104,12 @@ export const session = {
             loadWorkers(restored.actor?.worker_route),
             loadProfileCatalog()
           ])
-        : [[], []] as [SessionWorker[], LocalProfileOption[]];
+        : [[], { profiles: [], runtimeReadiness: { checked_at: '', workers: [], cells: [] } }] as [SessionWorker[], ProfileCatalogLoad];
       if (request !== generation) return;
       current = restored;
       workers = restoredWorkers;
-      profileCatalog = restoredCatalog;
+      profileCatalog = restoredCatalog.profiles;
+      runtimeReadiness = restoredCatalog.runtimeReadiness;
       if (!profileCatalog.some((item) => item.name === selectedTargetProfile)) {
         selectedTargetProfile = fallbackTargetProfile(restored.actor?.profile);
       }
@@ -96,6 +118,7 @@ export const session = {
       current = { authenticated: false, profiles: [] };
       workers = [];
       profileCatalog = [];
+      runtimeReadiness = { checked_at: '', workers: [], cells: [] };
       selectedTargetProfile = '';
     } finally {
       if (request === generation) loading = false;
@@ -113,7 +136,8 @@ export const session = {
         loadProfileCatalog()
       ]);
       workers = nextWorkers;
-      profileCatalog = nextCatalog;
+      profileCatalog = nextCatalog.profiles;
+      runtimeReadiness = nextCatalog.runtimeReadiness;
       selectedTargetProfile = fallbackTargetProfile(current.actor?.profile);
       challenge = null;
       contextChanged();
@@ -139,7 +163,8 @@ export const session = {
   },
   async refreshProfileCatalog() {
     const next = await loadProfileCatalog();
-    profileCatalog = next;
+    profileCatalog = next.profiles;
+    runtimeReadiness = next.runtimeReadiness;
     if (!profileCatalog.some((item) => item.name === selectedTargetProfile)) {
       selectedTargetProfile = fallbackTargetProfile(current.actor?.profile);
     }
@@ -167,6 +192,7 @@ export const session = {
     current = { authenticated: false, profiles: [] };
     workers = [];
     profileCatalog = [];
+    runtimeReadiness = { checked_at: '', workers: [], cells: [] };
     selectedTargetProfile = '';
     challenge = null;
   }

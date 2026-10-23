@@ -5,14 +5,14 @@
   import { api, post, put } from '$lib/api';
   import { normalizeTdlChatRef } from '$lib/chatRef';
 
-  type Helper = { slot: number; status: string; bootstrap_percent?: number | null };
+  type TtsProfile = { profile: string; status: string; reason_code: string };
   type TtsWorker = {
     name: string;
     enabled: boolean;
     ready: boolean;
     queued_jobs: number;
     reason_code: string;
-    helpers: Helper[];
+    profiles?: TtsProfile[];
     verified_profiles?: string[];
     profile_sync_ready?: boolean;
     profile_session_ready?: boolean;
@@ -42,10 +42,21 @@
   let accessProgress = $state('');
   let accessCommand = $state('');
   let accessSummary = $state<{ total: number; tested: number; ready: number; failed: number } | null>(null);
+  let accessNotice = $state('');
+  let readinessTimer: ReturnType<typeof setInterval> | undefined;
   const maxChars = 100_000;
   const readyWorkers = $derived(workers.filter((item) => item.ready));
   const workerReason = (code: string) => ({
     ready: 'Siap menerima job',
+    runtime_not_scanned: 'Belum ada Scan Profil',
+    tts_destination_changed: 'Tujuan berubah; jalankan Scan Profil',
+    tts_chat_unavailable: 'Chat tujuan belum dikonfigurasi',
+    tts_helper_unavailable: 'Helper TTS tidak siap',
+    tts_runtime_unavailable: 'Runtime TTS tidak siap',
+    tdl_access_not_verified: 'Bukti akses belum cocok dengan sesi saat ini',
+    tdl_session_unauthorized: 'Sesi TDL perlu diperiksa',
+    profile_session_changed: 'Sesi profil berubah; jalankan Scan Profil',
+    profile_session_unavailable: 'Sesi profil tidak siap',
     worker_disabled: 'Dinonaktifkan untuk job baru',
     worker_unavailable: 'Worker tidak dapat dihubungi',
     worker_update_required: 'Perlu update worker',
@@ -102,7 +113,7 @@
       chatDraft = '';
       chatMessage = clear
         ? 'ID chat dihapus. Job TTS berikutnya tidak akan dikirim sampai tujuan baru diatur.'
-        : 'ID chat tersimpan. Verifikasi akses kirim untuk worker yang akan dipakai.';
+        : 'ID chat tersimpan. Jalankan Scan Profil untuk memperbarui kesiapan TTS.';
       accessProfiles = [];
       void loadWorkers();
     } catch (cause) {
@@ -164,6 +175,9 @@
         `/tdl-access/verification?purpose=tts&worker=${encodeURIComponent(accessOperation.worker)}`
       );
       if (!hasOperationResult && current.profiles) accessProfiles = current.profiles;
+      if (operation.status === 'succeeded') {
+        accessNotice = 'Bukti akses diperbarui. Jalankan Scan Profil agar status kesiapan mencerminkan bukti terbaru.';
+      }
       await loadWorkers();
     } catch (cause) {
       accessError = cause instanceof Error ? cause.message : 'Status verifikasi akses TDL gagal dimuat.';
@@ -203,6 +217,15 @@
       if (saved) accessOperation = JSON.parse(saved) as AccessOperation & { worker: string };
     } catch { localStorage.removeItem('tts-tdl-access-operation'); }
     void Promise.all([loadWorkers(), loadChatStatus()]);
+    readinessTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') void loadWorkers();
+    }, 15000);
+    const onJobFinished = () => { void loadWorkers(); };
+    window.addEventListener('tme3:job-finished', onJobFinished);
+    return () => {
+      if (readinessTimer !== undefined) clearInterval(readinessTimer);
+      window.removeEventListener('tme3:job-finished', onJobFinished);
+    };
   });
 </script>
 
@@ -241,15 +264,15 @@
     <div class="flex items-center justify-between gap-3">
       <h2 class="text-lg font-extrabold">Worker TTS</h2>
       <button class="button secondary !px-3 !py-2" onclick={refreshWorkers} disabled={workersLoading || workersRefreshing}>
-        <RefreshCw size={15}/>{workersRefreshing ? 'Memeriksa...' : 'Periksa ulang'}
+        <RefreshCw size={15}/>{workersRefreshing ? 'Memuat...' : 'Muat ulang status'}
       </button>
     </div>
-    <p class="muted mt-1 text-sm">Helper/Tor dan akses profil ke chat tujuan diperiksa terpisah. Sinkronisasi vault hanya informasi diagnosis.</p>
+    <p class="muted mt-1 text-sm">Status berasal dari Scan Profil dan tetap berlaku sampai sesi, tujuan, atau runtime berubah.</p>
     {#if workersLoading}
       <p class="muted mt-3 text-sm">Memeriksa worker...</p>
     {:else}
       {#if workers.length === 0}<p class="muted mt-3 text-sm">Belum ada worker terdaftar.</p>{/if}
-      {#if workers.length > 0 && readyWorkers.length === 0}<p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker dengan helper siap dan profil pengirim yang terverifikasi. Jalankan verifikasi akses pada worker yang akan dipakai.</p>{/if}
+      {#if workers.length > 0 && readyWorkers.length === 0}<p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker dengan profil TTS siap. Jalankan Scan Profil; jika bukti akses belum ada atau stale, perbarui bukti akses lalu pindai kembali.</p>{/if}
       <div class="mt-3 space-y-2">
         {#each workers as option}
           <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm">
@@ -257,8 +280,8 @@
               <span class="font-bold">{option.name}</span>
               <span class={option.ready ? 'text-emerald-600' : 'text-amber-600'}>{workerReason(option.reason_code)}</span>
             </div>
-            <p class="muted mt-1 text-xs">Helper/Tor: {option.helpers?.length ? option.helpers.map((helper) => `H${helper.slot}: ${helper.status}`).join(' · ') : 'belum diperiksa'} · Profil pengirim: {option.verified_profiles?.length ? option.verified_profiles.join(', ') : 'belum terverifikasi'} · Sync vault: {option.profile_sync_ready ? 'siap' : 'tertunda (tidak menghalangi job)'}</p>
-            <button class="button secondary mt-2 !px-3 !py-2 text-xs" onclick={() => verifyTdlAccess(option.name)} disabled={accessLoading || !chatConfigured}>{accessLoading && accessOperation?.worker === option.name ? 'Memulai verifikasi...' : 'Verifikasi akses kirim'}</button>
+            <p class="muted mt-1 text-xs">Profil dari Scan Profil: {option.profiles?.length ? option.profiles.map((profile) => `${profile.profile}: ${profile.status === 'ready' ? 'siap' : workerReason(profile.reason_code)}`).join(' · ') : 'belum dipindai'}</p>
+            <button class="button secondary mt-2 !px-3 !py-2 text-xs" onclick={() => verifyTdlAccess(option.name)} disabled={accessLoading || !chatConfigured}>{accessLoading && accessOperation?.worker === option.name ? 'Memperbarui bukti...' : 'Perbarui bukti akses'}</button>
           </div>
         {/each}
       </div>
@@ -267,7 +290,8 @@
     {#if accessOperation}
       <div class="mt-3 rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3 text-sm">
         <div class="flex flex-wrap items-center justify-between gap-2"><b>Verifikasi {accessOperation.worker}</b><button class="button secondary !px-3 !py-2 text-xs" onclick={refreshTdlAccess} disabled={accessLoading}><RefreshCw size={14}/>{accessLoading ? 'Memuat...' : 'Muat status'}</button></div>
-        <p class="muted mt-1 text-xs">Operation {accessOperation.status} · tahap {accessOperation.phase}. Pemeriksaan mengirim satu pesan penanda per profil; pesan tersebut tidak dihapus otomatis.</p>
+        <p class="muted mt-1 text-xs">Operation {accessOperation.status} · tahap {accessOperation.phase}. Aksi ini mengirim satu pesan penanda per profil untuk membuat bukti akses; pesan tersebut tidak dihapus otomatis. Setelah selesai, jalankan Scan Profil.</p>
+        {#if accessNotice}<p role="status" class="mt-2 text-xs text-emerald-700 dark:text-emerald-300">{accessNotice}</p>{/if}
         {#if accessProgress}<p role="status" class="mt-2 text-sm">{accessProgress}</p>{/if}
         {#if accessSummary}<p class="muted mt-2 text-xs">{accessSummary.ready} profil dapat mengirim dari {accessSummary.total} · {accessSummary.tested} perintah TDL dijalankan · {accessSummary.failed} gagal atau dilewati.</p>{/if}
         {#if accessCommand}<details class="mt-2 text-xs"><summary class="cursor-pointer font-semibold">Lihat bentuk perintah TDL</summary><code class="mt-2 block overflow-x-auto rounded-lg bg-[var(--surface-soft)] p-2">{accessCommand}</code><span class="muted mt-1 block">Tujuan chat, path sesi, dan nama file sementara disamarkan.</span></details>{/if}

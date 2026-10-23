@@ -20,6 +20,9 @@ class FakeExecutor:
         self.durable_commands = {}
         self.artifact_file = None
         self.runtime_updates = []
+        self.utility_probe_calls = 0
+        self.quickmode_probe_destinations = []
+        self.safelink_probe_calls = 0
         self.worker_api_token = "worker-secret"
         self.previous_worker_api_token = ""
         self.profile_inputs = []
@@ -61,8 +64,24 @@ class FakeExecutor:
         return {
             "profiles": ["default"],
             "tts": self.tts_ready,
-            "safelink_resolver": self.safelink_ready,
+            "safelink_resolver": True,
             "profile_sync": {"status": "ready"},
+        }
+
+    def utility_runtime_readiness(self):
+        self.utility_probe_calls += 1
+        return {"ready": True, "reason_code": "", "fingerprint": "a" * 64}
+
+    def quickmode_runtime_readiness(self, destination):
+        self.quickmode_probe_destinations.append(destination)
+        return {"ready": True, "reason_code": "", "fingerprint": "b" * 64}
+
+    def safelink_runtime_readiness(self):
+        self.safelink_probe_calls += 1
+        return {
+            "ready": self.safelink_ready,
+            "reason_code": "" if self.safelink_ready else "RESOLVER_RUNTIME_UNAVAILABLE",
+            "fingerprint": "c" * 64 if self.safelink_ready else "",
         }
 
     def profile_sync_status(self):
@@ -274,6 +293,30 @@ class WorkerApiTests(unittest.TestCase):
     def test_worker_has_no_openapi_surface(self):
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 404)
+
+    def test_quickmode_runtime_readiness_is_worker_authenticated_and_read_only_probe(self):
+        denied = self.client.post(
+            "/internal/v1/quickmode/runtime-readiness",
+            json={"rclone_destination": "googledrive:backup"},
+        )
+        self.assertEqual(denied.status_code, 401)
+
+        response = self.client.post(
+            "/internal/v1/quickmode/runtime-readiness",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"rclone_destination": "googledrive:backup"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["ready"])
+        self.assertEqual(self.executor.quickmode_probe_destinations, ["googledrive:backup"])
+
+        invalid = self.client.post(
+            "/internal/v1/quickmode/runtime-readiness",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"rclone_destination": "googledrive:backup", "secret": "hidden"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(self.executor.quickmode_probe_destinations, ["googledrive:backup"])
 
     def test_healthz_distinguishes_running_process_from_pending_profile_sync(self):
         ready = self.client.get("/healthz")
@@ -518,14 +561,42 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(audio.content, b"audio")
         self.assertIn("artifact-", audio.headers["content-disposition"])
 
-    def test_resolver_capability_tracks_private_addon_readiness(self):
+    def test_utility_runtime_probe_is_explicit_and_separate_from_capabilities(self):
         headers = {"Authorization": "Bearer worker-secret"}
-        not_ready = self.client.get("/internal/v1/capabilities", headers=headers)
-        self.assertNotIn("safelink_resolve.v1", not_ready.json()["capabilities"])
+        capability = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertEqual(capability.status_code, 200)
+        self.assertEqual(self.executor.utility_probe_calls, 0)
+
+        denied = self.client.get("/internal/v1/utility/runtime-readiness")
+        self.assertEqual(denied.status_code, 401)
+        ready = self.client.get(
+            "/internal/v1/utility/runtime-readiness", headers=headers
+        )
+        self.assertEqual(ready.status_code, 200, ready.text)
+        self.assertEqual(ready.json()["ready"], True)
+        self.assertEqual(self.executor.utility_probe_calls, 1)
+
+    def test_resolver_capability_is_static_and_runtime_health_is_explicit(self):
+        headers = {"Authorization": "Bearer worker-secret"}
+        capability = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertIn("safelink_resolve.v1", capability.json()["capabilities"])
+        self.assertEqual(self.executor.safelink_probe_calls, 0)
+
+        denied = self.client.get("/internal/v1/safelink/runtime-readiness")
+        self.assertEqual(denied.status_code, 401)
+        unavailable = self.client.get(
+            "/internal/v1/safelink/runtime-readiness", headers=headers
+        )
+        self.assertEqual(unavailable.status_code, 200)
+        self.assertFalse(unavailable.json()["ready"])
+        self.assertEqual(self.executor.safelink_probe_calls, 1)
 
         self.executor.safelink_ready = True
-        ready = self.client.get("/internal/v1/capabilities", headers=headers)
-        self.assertIn("safelink_resolve.v1", ready.json()["capabilities"])
+        ready = self.client.get(
+            "/internal/v1/safelink/runtime-readiness", headers=headers
+        )
+        self.assertTrue(ready.json()["ready"])
+        self.assertEqual(self.executor.safelink_probe_calls, 2)
 
     def test_tts_health_and_helper_recovery_require_worker_auth(self):
         denied = self.client.get("/internal/v1/tts/health")

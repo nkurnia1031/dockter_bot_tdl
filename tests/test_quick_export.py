@@ -616,6 +616,19 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
             with self.assertRaises(QuickModeError):
                 QuickThumbnailBuilder().build(root, root / "result.png")
 
+    def test_missing_thumbnail_runtime_has_stable_runtime_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self.make_media(root, ["photo.jpg"])
+            with patch(
+                "tme3bot.worker.quick_export.subprocess.Popen",
+                side_effect=FileNotFoundError("ffmpeg"),
+            ):
+                with self.assertRaises(QuickModeError) as raised:
+                    QuickThumbnailBuilder().build(root, root / "result.png")
+
+            self.assertEqual(raised.exception.code, "QUICK_MODE_RUNTIME_UNAVAILABLE")
+
     def test_quick_folder_and_caption_are_deterministic(self) -> None:
         self.assertEqual(quick_folder_name(Path("/tmp/My Folder!.json")), "my-folder")
         self.assertEqual(

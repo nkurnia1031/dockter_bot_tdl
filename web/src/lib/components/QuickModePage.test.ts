@@ -4,7 +4,11 @@ import QuickModePage from './QuickModePage.svelte';
 
 const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles: [
   { name: 'default', workers: ['local'], exclusive_worker: 'local' }
-] }), { status: 200 });
+], runtime_readiness: {
+  checked_at: '2026-10-23T10:00:00Z',
+  workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }],
+  cells: [{ worker: 'local', profile: 'default', runtime: 'quick_mode', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }]
+} }), { status: 200 });
 
 describe('QuickModePage', () => {
   afterEach(() => {
@@ -12,18 +16,13 @@ describe('QuickModePage', () => {
     vi.unstubAllGlobals();
   });
 
-  it('verifies Quick Mode, creates a job, and loads the global filter', async () => {
+  it('creates a job from Profile Quick Mode readiness without manual verification', async () => {
     const requests: { url: string; body?: Record<string, unknown> }[] = [];
     const calls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
       if (url.includes('/profiles/local')) return localProfileCatalogResponse();
       calls.push(url);
-      if (url.includes('/context/verify')) {
-        const body = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
-        requests.push({ url, body });
-        return new Response(JSON.stringify({ verified: true, purpose: 'export', profile: 'default', worker: 'local', quick_mode: body.quick_mode === true }), { status: 200 });
-      }
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (url.includes('/jobs') && init?.method !== 'POST') return new Response(JSON.stringify({ items: [] }), { status: 200 });
       if (url.endsWith('/exports') && init?.method === 'POST') {
@@ -37,12 +36,11 @@ describe('QuickModePage', () => {
     await screen.findByRole('button', { name: 'Tambah Quick Mode' });
     const profileFilter = await screen.findByLabelText('Profile') as HTMLSelectElement;
     await waitFor(() => expect([...profileFilter.options].map((option) => option.value)).toEqual(['', 'default']));
-    await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
-    await screen.findByText('Target backend terverifikasi');
+    expect(await screen.findByText('Quick Mode siap')).toBeTruthy();
     await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Tambah Quick Mode' }));
 
-    expect(requests.find((item) => item.url.includes('/context/verify'))?.body).toMatchObject({ purpose: 'export', quick_mode: true });
+    expect(requests.some((item) => item.url.includes('/context/verify'))).toBe(false);
     expect(requests.find((item) => item.url.endsWith('/exports'))?.body).toMatchObject({ chat_ref: 'example', quick_mode: true });
     await waitFor(() => expect(calls.some((item) => item.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true'))).toBe(true));
   });
