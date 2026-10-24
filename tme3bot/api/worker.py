@@ -617,6 +617,9 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         ] if isinstance(reasons, list) else []
         raw_worker_name = str(getattr(context.config, "backup_node_name", "worker") or "worker")
         worker_name = raw_worker_name if re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_worker_name) else "worker"
+        fingerprint = str(result.get("fingerprint") or "").strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", fingerprint):
+            fingerprint = ""
         return {
             "worker": worker_name[:64],
             "profile": normalized,
@@ -625,6 +628,7 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             "identity_match": bool(result.get("identity_match")),
             "reason_codes": safe_reasons,
             "sessions": sessions,
+            "fingerprint": fingerprint,
         }
 
     @app.post("/internal/v1/profiles/{profile}/session/commit", dependencies=[Depends(authorize)])

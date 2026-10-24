@@ -41,6 +41,7 @@ class FakeExecutor:
         self.profile_tdl_diagnostics = {
             "ready": True,
             "identity_match": True,
+            "fingerprint": "f" * 64,
             "reason_codes": [],
             "sessions": [
                 {"name": "root", "ready": True, "code": "OK", "identity_matches_metadata": True},
@@ -855,10 +856,20 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(payload["profile"], "default")
         self.assertTrue(payload["ready"])
         self.assertEqual([row["name"] for row in payload["sessions"]], ["root", "user1"])
+        self.assertEqual(payload["fingerprint"], "f" * 64)
         self.assertNotIn("telegram_user_id", response.text)
         self.assertNotIn("/workspace", response.text)
         self.assertIn("checked_at", payload)
         self.assertEqual(payload["worker"], "local")
+
+        self.executor.profile_tdl_diagnostics["fingerprint"] = "session-material-must-not-leak"
+        malformed = self.client.get(
+            "/internal/v1/profiles/default/tdl-diagnostics",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+        self.assertEqual(malformed.status_code, 200, malformed.text)
+        self.assertEqual(malformed.json()["fingerprint"], "")
+        self.assertNotIn("session-material-must-not-leak", malformed.text)
 
     def test_shared_export_cursor_capability_is_dynamic(self):
         self.executor.shared_export_cursor_ready = lambda: True
