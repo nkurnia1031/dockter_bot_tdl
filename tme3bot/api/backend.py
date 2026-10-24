@@ -110,6 +110,7 @@ class BackendContext:
     queue_command_service: Any = None
     queue_publisher: Any = None
     local_profile_catalog: Any = None
+    profile_scan_store: Any = None
     runtime_readiness_store: Any = None
     activity_journal: Any = None
     decrypt_history_store: Any = None

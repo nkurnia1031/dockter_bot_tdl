@@ -234,6 +234,20 @@ class ControlPlaneTests(unittest.TestCase):
                 for profile in profiles
             ]},
         )
+        runtime_store.apply_profile_lane_scan(
+            runtime="upload",
+            checked_at="2026-10-23T10:05:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [
+                {
+                    "profile": profile,
+                    "ready": True,
+                    "fingerprint": hashlib.sha256(f"upload:{profile}".encode()).hexdigest(),
+                    "session_fingerprint": fingerprints[profile],
+                }
+                for profile in profiles
+            ]},
+        )
         self.control.runtime_readiness_gate = RuntimeReadinessGate(runtime_store)
         return runtime_store
 
@@ -312,6 +326,27 @@ class ControlPlaneTests(unittest.TestCase):
             {"archive": "b" * 64, "default": "a" * 64, "other": "c" * 64},
         )
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
+
+    def test_storage_upload_omits_profiles_without_ready_upload_lane(self):
+        self.authorize_quick_mode_storage()
+        runtime_store = self.attach_storage_readiness()
+        runtime_store.invalidate(
+            worker="local",
+            profile="archive",
+            runtime="upload",
+            reason_code="PROFILE_UPLOAD_SESSION_INVALID",
+        )
+
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-lane-filter"},
+        )
+
+        sender_profiles = self.dispatcher.commands[-1]["payload"]["_tdl_sender_profiles"]
+        self.assertNotIn("archive", sender_profiles)
+        self.assertIn("default", sender_profiles)
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
 
     def test_storage_upload_dispatches_durable_command_with_every_ready_sender_profile(self):
         self.authorize_quick_mode_storage()
@@ -418,6 +453,7 @@ class ControlPlaneTests(unittest.TestCase):
         ))
 
         self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "not_ready")
+        self.assertEqual(runtime_store.cell("local", sender_profile, "upload")["status"], "not_ready")
         for profile in {"default", "archive", "other"} - {sender_profile}:
             self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
         self.assertEqual(runtime_store.cell("local", sender_profile, "export")["status"], "ready")
@@ -578,6 +614,10 @@ class ControlPlaneTests(unittest.TestCase):
             workers=[{"worker": "local", "status": "success"}],
             profiles={"local": quick_cells},
         )
+        store.upsert_cell(
+            worker="local", profile=None, runtime="quick_mode_runtime",
+            ready=True, fingerprint="e" * 64,
+        )
         self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
         job = Job(
             id="quick-terminal-failure",
@@ -600,14 +640,19 @@ class ControlPlaneTests(unittest.TestCase):
                 "message": "UTILITY_PROCESS_STALLED: compression stopped",
             },
         ))
-        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
         self.assertEqual(store.cell("local", "archive", "quick_mode")["status"], "ready")
+        self.assertEqual(store.cell("local", None, "quick_mode_runtime")["status"], "not_ready")
         self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
 
         store.apply_quickmode_scan(
             checked_at="2026-10-23T11:00:00Z",
             workers=[{"worker": "local", "status": "success"}],
             profiles={"local": quick_cells},
+        )
+        store.upsert_cell(
+            worker="local", profile=None, runtime="quick_mode_runtime",
+            ready=True, fingerprint="e" * 64,
         )
         self.control._invalidate_runtime_readiness_from_event(JobEvent(
             job_id=job.id,
@@ -696,6 +741,18 @@ class ControlPlaneTests(unittest.TestCase):
                 checked_at="2026-10-23T00:00:00Z",
                 profiles=tts_cells,
             )
+            for worker in tts_cells:
+                response = dispatcher.capabilities(worker)
+                helper_ready = response.get("tts") is True
+                readiness.upsert_cell(
+                    worker=worker,
+                    profile=None,
+                    runtime="tts_helper",
+                    ready=helper_ready,
+                    fingerprint="e" * 64 if helper_ready else "",
+                    reason_code="" if helper_ready else "TTS_HELPER_UNAVAILABLE",
+                    checked_at="2026-10-23T00:00:00Z",
+                )
             control.runtime_readiness_gate = RuntimeReadinessGate(readiness)
         return store
 
@@ -944,7 +1001,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
         self.assertEqual(self.jobs.count(kind="tts"), 0)
 
-    def test_tts_failure_invalidates_execution_sender_cell_not_owner_cell(self):
+    def test_tts_helper_failure_invalidates_worker_runtime_not_profile_canaries(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "tts-execution-profile.json",
             {"local": "http://worker"},
@@ -978,7 +1035,8 @@ class ControlPlaneTests(unittest.TestCase):
         ))
 
         store = control.runtime_readiness_gate.store
-        self.assertEqual(store.cell("local", "archive", "tts")["status"], "not_ready")
+        self.assertEqual(store.cell("local", None, "tts_helper")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "archive", "tts")["status"], "ready")
         self.assertEqual(store.cell("local", "default", "tts")["status"], "ready")
 
     def test_explicit_false_tts_capability_is_not_overridden_by_a_stale_capability_list(self):
@@ -1243,6 +1301,9 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_utility_does_not_wait_for_unrelated_profile_sync(self):
         self.control.profile_readiness = lambda _profile, _worker: False
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            RuntimeReadinessStore(Path(self.temp.name) / "utility-unscanned.json")
+        )
         job = self.control.submit_job(
             self.actor,
             "utility",
@@ -1250,7 +1311,7 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(job.status, JobStatus.DISPATCHED)
 
-    def test_utility_runtime_failure_invalidates_only_utility_cell(self):
+    def test_utility_runtime_failure_does_not_use_scan_readiness_snapshot(self):
         store = RuntimeReadinessStore(Path(self.temp.name) / "runtime-readiness.json")
         store.apply_export_scan(
             checked_at="2026-10-23T10:00:00Z",
@@ -1302,7 +1363,7 @@ class ControlPlaneTests(unittest.TestCase):
                 "message": "UTILITY_RUNTIME_UNAVAILABLE: cannot start process",
             },
         ))
-        self.assertEqual(store.cell("local", None, "utility")["status"], "not_ready")
+        self.assertEqual(store.cell("local", None, "utility")["status"], "ready")
         self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
 
     def test_storage_uses_verified_sender_profile_but_keeps_actor_as_job_owner(self):

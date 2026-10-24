@@ -4,6 +4,8 @@ import unittest
 import base64
 import json
 import sqlite3
+import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +27,7 @@ from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistorySto
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
+from tme3bot.infrastructure.profile_scan_store import ProfileScanOperationStore
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
@@ -135,6 +138,9 @@ class FakeDispatcher:
             "queued_requests": [{"profile": "default", "mode": "check"}],
         }
         self.profile_tdl_diagnostic_calls = []
+        self.profile_readiness_canary_calls = []
+        self.profile_readiness_canaries = {}
+        self.profile_readiness_canary_messages = []
         self.profile_tdl_diagnostic_result = {
             "worker": "local",
             "profile": "default",
@@ -233,6 +239,34 @@ class FakeDispatcher:
             **self.profile_tdl_diagnostic_result,
             "sessions": [dict(item) for item in self.profile_tdl_diagnostic_result["sessions"]],
         }
+
+    def start_profile_readiness_canary(self, worker, profile, storage_target, tts_target):
+        from uuid import uuid4
+
+        self.profile_readiness_canary_calls.append((worker, profile, storage_target, tts_target))
+        diagnostic = self.profile_tdl_diagnostics(worker, profile)
+        fingerprint = str(diagnostic.get("fingerprint") or "")
+        upload_fingerprint = self.capabilities(worker)["storage_upload_fingerprints"].get(profile, "")
+        operation = {
+            "id": str(uuid4()),
+            "profile": profile,
+            "status": "succeeded",
+            "phase": "complete",
+            "checks": {
+                name: {"ready": True, "reason_code": ""}
+                for name in ("export", "download", "upload", "storage", "tts")
+            },
+            "messages": list(self.profile_readiness_canary_messages),
+            "session_fingerprint": fingerprint,
+            "upload_session_fingerprint": upload_fingerprint,
+            "error_code": "",
+        }
+        self.profile_readiness_canaries[operation["id"]] = operation
+        return dict(operation)
+
+    def profile_readiness_canary(self, _worker, operation_id):
+        operation = self.profile_readiness_canaries.get(operation_id)
+        return dict(operation) if operation else None
 
     def request_profile_sync(self, worker, *, profile=None, mode="check"):
         self.profile_sync_requests.append((worker, profile, mode))
@@ -338,6 +372,8 @@ class FakeTelegramBot:
     def __init__(self):
         self.copy_calls = []
         self.chat_lookups = []
+        self.delete_calls = []
+        self.delete_error = False
 
     def get_chat(self, chat_id):
         self.chat_lookups.append(chat_id)
@@ -346,6 +382,12 @@ class FakeTelegramBot:
     def copy_message(self, **values):
         self.copy_calls.append(values)
         return type("CopiedMessage", (), {"message_id": 777})()
+
+    def delete_message(self, **values):
+        self.delete_calls.append(values)
+        if self.delete_error:
+            raise RuntimeError("Bot API deletion denied")
+        return True
 
 
 class FakeProfileProvisioner:
@@ -444,6 +486,7 @@ class BackendApiTests(unittest.TestCase):
         self.export_catalog = ExportArtifactCatalog(db)
         self.workers = FakeWorkers()
         self.local_profile_catalog = LocalProfileCatalog(root / "local-profile-catalog.json")
+        self.profile_scan_store = ProfileScanOperationStore(db)
         self.runtime_readiness_store = RuntimeReadinessStore(
             root / "runtime-readiness.json"
         )
@@ -549,6 +592,7 @@ class BackendApiTests(unittest.TestCase):
             ),
             worker_dispatcher=self.dispatcher,
             local_profile_catalog=self.local_profile_catalog,
+            profile_scan_store=self.profile_scan_store,
             runtime_readiness_store=self.runtime_readiness_store,
             activity_journal=self.activity_journal,
             decrypt_history_store=self.decrypt_history_store,
@@ -613,9 +657,35 @@ class BackendApiTests(unittest.TestCase):
                     for profile in profiles
                 ]},
             )
+            helper_ready = capabilities.get("tts") is True
+            self.runtime_readiness_store.upsert_cell(
+                worker=worker,
+                profile=None,
+                runtime="tts_helper",
+                ready=helper_ready,
+                fingerprint="b" * 64 if helper_ready else "",
+                reason_code="" if helper_ready else "TTS_HELPER_UNAVAILABLE",
+                checked_at="2026-10-23T00:00:00Z",
+            )
             self.control.runtime_readiness_gate = RuntimeReadinessGate(
                 self.runtime_readiness_store
             )
+
+    def run_profile_catalog_scan(self, headers):
+        response = self.client.post("/api/v1/profiles/local/scan", headers=headers)
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            operation = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=headers
+            )
+            self.assertEqual(operation.status_code, 200, operation.text)
+            if operation.json()["status"] in {"succeeded", "failed"}:
+                self.assertEqual(operation.json()["status"], "succeeded")
+                return self.client.get("/api/v1/profiles/local", headers=headers)
+            time.sleep(0.01)
+        self.fail("profile scan did not finish before the test deadline")
 
     def seed_resolver_readiness(self, workers=None):
         workers = workers or {"local": {"ready": True, "fingerprint": "d" * 64}}
@@ -1189,6 +1259,64 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(calls, ["local", "snapshot:local"])
 
+    def test_profile_catalog_scan_returns_async_operation_with_worker_profile_progress(self):
+        entered = threading.Event()
+        release = threading.Event()
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default",
+            "ready": True,
+            "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+        }]}
+
+        def slow_diagnostics(_worker, _profile):
+            entered.set()
+            release.wait(timeout=3)
+            return {"ready": True, "reason_codes": [], "fingerprint": "a" * 64}
+
+        self.dispatcher.profile_tdl_diagnostics = slow_diagnostics
+        try:
+            response = self.client.post(
+                "/api/v1/profiles/local/scan", headers=self.login(42)
+            )
+            self.assertEqual(response.status_code, 202, response.text)
+            operation_id = response.json()["id"]
+            self.assertTrue(entered.wait(timeout=1), "scan must run outside the HTTP request")
+
+            progress = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=self.login(42)
+            )
+            self.assertEqual(progress.status_code, 200, progress.text)
+            self.assertEqual(progress.json()["status"], "running")
+            worker = progress.json()["progress"]["workers"][0]
+            self.assertEqual(worker["name"], "local")
+            self.assertEqual(worker["status"], "running")
+            self.assertEqual(worker["profiles"][0]["name"], "default")
+            self.assertEqual(worker["profiles"][0]["status"], "running")
+        finally:
+            release.set()
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            completed = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=self.login(42)
+            )
+            if completed.status_code == 200 and completed.json()["status"] in {
+                "succeeded", "failed"
+            }:
+                break
+            time.sleep(0.01)
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["status"], "succeeded")
+        self.assertEqual(
+            completed.json()["progress"]["workers"][0]["profiles"][0]["status"],
+            "succeeded",
+        )
+
     def test_local_profile_scan_distinguishes_timeout_offline_and_worker_api_failure(self):
         from tme3bot.infrastructure.http_client import JsonHttpError
 
@@ -1269,10 +1397,9 @@ class BackendApiTests(unittest.TestCase):
             "reason_codes": [],
             "fingerprint": hashlib.sha256(f"{worker}:{profile}".encode()).hexdigest(),
         }
-        self.dispatcher.utility_runtime_readiness = lambda _worker: {
-            "ready": True,
-            "reason_code": "",
-            "fingerprint": "c" * 64,
+        utility_probe_calls = []
+        self.dispatcher.utility_runtime_readiness = lambda worker: utility_probe_calls.append(worker) or {
+            "ready": True, "reason_code": "", "fingerprint": "c" * 64,
         }
         resolver_probe_calls = []
         self.dispatcher.safelink_runtime_readiness = lambda worker: (
@@ -1286,7 +1413,7 @@ class BackendApiTests(unittest.TestCase):
         denied = self.client.post("/api/v1/profiles/local/scan")
         self.assertEqual(denied.status_code, 401)
 
-        response = self.client.post("/api/v1/profiles/local/scan", headers=auth)
+        response = self.run_profile_catalog_scan(auth)
         self.assertEqual(response.status_code, 200, response.text)
         body = response.json()
         self.assertCountEqual(calls, ["local", "remote-1"])
@@ -1312,18 +1439,9 @@ class BackendApiTests(unittest.TestCase):
             item for item in body["runtime_readiness"]["cells"]
             if item["runtime"] == "utility"
         ]
-        self.assertEqual(utility_cells, [{
-            "worker": "local",
-            "profile": None,
-            "runtime": "utility",
-            "status": "ready",
-            "checked_at": body["runtime_readiness"]["checked_at"],
-            "reason_code": "",
-        }])
-        self.assertEqual(
-            self.runtime_readiness_store.cell("local", None, "utility")["fingerprint"],
-            "c" * 64,
-        )
+        self.assertEqual(utility_cells, [])
+        self.assertEqual(utility_probe_calls, [])
+        self.assertIsNone(self.runtime_readiness_store.cell("local", None, "utility"))
         self.assertEqual(
             self.runtime_readiness_store.cell("local", "default", "export")["fingerprint"],
             hashlib.sha256(b"local:default").hexdigest(),
@@ -1354,7 +1472,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(resolver_probe_calls, ["local"])
         self.assertNotIn("stale", read.text)
 
-    def test_profile_scan_reads_tts_helpers_and_matching_saved_access_without_sending(self):
+    def test_profile_scan_uses_tts_canary_and_helper_probe_without_manual_marker(self):
         self.control.runtime_readiness_gate = RuntimeReadinessGate(
             self.runtime_readiness_store
         )
@@ -1385,29 +1503,54 @@ class BackendApiTests(unittest.TestCase):
                 for slot in range(1, 4)
             ],
         }
-        access_store = self.control.tdl_access_store
-        destination_hash = access_store.destination_fingerprint("123456789")
-        session_fingerprints = {"default": "a" * 64}
-        inventory_hash = access_store.inventory_fingerprint(
-            ["default"], session_fingerprints
-        )
-        access_store.replace_results(
-            "local", "tts", destination_hash, inventory_hash,
-            [{"profile": "default", "ready": True}],
-            session_fingerprints=session_fingerprints,
-        )
-
-        response = self.client.post(
-            "/api/v1/profiles/local/scan", headers=self.login(42)
-        )
+        response = self.run_profile_catalog_scan(self.login(42))
 
         self.assertEqual(response.status_code, 200, response.text)
         cell = self.runtime_readiness_store.cell("local", "default", "tts")
         self.assertEqual(cell["status"], "ready")
         self.assertEqual(cell["session_fingerprint"], "a" * 64)
+        tts_worker = self.runtime_readiness_store.cell("local", None, "tts_helper")
+        self.assertEqual(tts_worker["status"], "ready")
         self.assertEqual(self.dispatcher.tts_health_calls, ["local"])
+        self.assertEqual(len(self.dispatcher.profile_readiness_canary_calls), 1)
         self.assertEqual(self.dispatcher.commands, [])
         self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+
+    def test_profile_scan_reports_cleanup_failure_without_revoking_ready_lanes(self):
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default", "ready": True, "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+        }]}
+        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
+            "ready": True, "reason_codes": [], "fingerprint": "a" * 64,
+        }
+        self.dispatcher.profile_readiness_canary_messages = [
+            {"target": "storage", "message_id": 801},
+            {"target": "tts", "message_id": 802},
+        ]
+        self.bot.delete_error = True
+
+        response = self.run_profile_catalog_scan(self.login(42))
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "upload")["status"], "ready")
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "storage")["status"], "ready")
+        self.assertEqual(len(self.bot.delete_calls), 2)
+        operation = self.profile_scan_store.latest()
+        progress_profile = operation["progress"]["workers"][0]["profiles"][0]
+        self.assertEqual(progress_profile["cleanup"]["status"], "failed")
+        self.assertEqual(
+            [item["message_id"] for item in progress_profile["cleanup"]["items"]],
+            [801, 802],
+        )
+        self.assertTrue(all(
+            item["error_code"] == "CANARY_CLEANUP_FAILED"
+            for item in progress_profile["cleanup"]["items"]
+        ))
 
     def test_profile_scan_stores_separate_quick_mode_cell_and_private_upload_snapshot(self):
         self.control.runtime_readiness_gate = RuntimeReadinessGate(
@@ -1435,37 +1578,28 @@ class BackendApiTests(unittest.TestCase):
         }
         access_store = self.control.tdl_access_store
         destination = self.control._tdl_access_target("storage")
-        capabilities = self.dispatcher.capabilities("local")
-        fingerprints = capabilities["storage_upload_fingerprints"]
         destination_hash = access_store.destination_fingerprint(destination)
-        inventory_hash = access_store.inventory_fingerprint(
-            capabilities["available_storage_profiles"], fingerprints
-        )
-        access_store.replace_results(
-            "local", "storage", destination_hash, inventory_hash,
-            [{"profile": "default", "ready": True}],
-            session_fingerprints=fingerprints,
-        )
 
-        response = self.client.post(
-            "/api/v1/profiles/local/scan", headers=self.login(42)
-        )
+        response = self.run_profile_catalog_scan(self.login(42))
 
         self.assertEqual(response.status_code, 200, response.text)
         quick = self.runtime_readiness_store.cell("local", "default", "quick_mode")
+        quick_worker = self.runtime_readiness_store.cell("local", None, "quick_mode_runtime")
         storage = self.runtime_readiness_store.cell("local", "default", "storage")
         export = self.runtime_readiness_store.cell("local", "default", "export")
         self.assertEqual(export["status"], "ready")
         self.assertEqual(quick["status"], "ready")
+        self.assertEqual(quick_worker["status"], "ready")
         self.assertEqual(storage["status"], "ready")
-        self.assertEqual(storage["session_fingerprint"], fingerprints["default"])
+        upload_fingerprint = self.dispatcher.capabilities("local")["storage_upload_fingerprints"]["default"]
+        self.assertEqual(storage["session_fingerprint"], upload_fingerprint)
         self.assertEqual(storage["destination_fingerprint"], destination_hash)
         self.assertEqual(quick["session_fingerprint"], "a" * 64)
         self.assertEqual(quick["destination_fingerprint"], destination_hash)
         self.assertEqual(quick["sender_profiles"], ["default"])
         self.assertEqual(
             quick["sender_session_fingerprints"]["default"],
-            fingerprints["default"],
+            upload_fingerprint,
         )
         body = response.json()
         public_quick = next(
@@ -1479,7 +1613,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.commands, [])
         self.assertEqual(self.jobs.list(profile="default", limit=20), [])
 
-    def test_profile_scan_rejects_missing_or_stale_tts_access_evidence(self):
+    def test_profile_scan_replaces_stale_tts_marker_with_canary_evidence(self):
         self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
             "name": "default", "ready": True, "reason_codes": [],
             "checks": [
@@ -1505,15 +1639,12 @@ class BackendApiTests(unittest.TestCase):
             session_fingerprints=stale_fingerprints,
         )
 
-        response = self.client.post(
-            "/api/v1/profiles/local/scan", headers=self.login(42)
-        )
+        response = self.run_profile_catalog_scan(self.login(42))
 
         self.assertEqual(response.status_code, 200, response.text)
         cell = self.runtime_readiness_store.cell("local", "default", "tts")
-        self.assertEqual(cell["status"], "not_ready")
-        self.assertEqual(cell["reason_code"], "TDL_ACCESS_NOT_VERIFIED")
-        self.assertEqual(cell["session_fingerprint"], "")
+        self.assertEqual(cell["status"], "ready")
+        self.assertEqual(cell["session_fingerprint"], "b" * 64)
 
     def test_successful_tts_proof_event_persists_export_session_fingerprint(self):
         store = self.control.tdl_access_store
@@ -2915,6 +3046,45 @@ class BackendApiTests(unittest.TestCase):
                 "sender_session_fingerprints": senders,
             }]},
         )
+        store.upsert_cell(
+            worker="local",
+            profile=None,
+            runtime="quick_mode_runtime",
+            ready=True,
+            fingerprint=hashlib.sha256(b"quick-mode-runtime").hexdigest(),
+        )
+        store.apply_profile_lane_scan(
+            runtime="download",
+            checked_at="2026-10-23T10:05:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{
+                "profile": "default",
+                "ready": True,
+                "fingerprint": hashlib.sha256(b"download-lane").hexdigest(),
+                "session_fingerprint": "a" * 64,
+            }]},
+        )
+        store.apply_profile_lane_scan(
+            runtime="upload",
+            checked_at="2026-10-23T10:05:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": [{
+                "profile": profile,
+                "ready": True,
+                "fingerprint": hashlib.sha256(f"upload:{profile}".encode()).hexdigest(),
+                "session_fingerprint": senders[profile],
+            } for profile in senders]},
+        )
+        store.apply_storage_scan(
+            checked_at="2026-10-23T10:05:00Z",
+            profiles={"local": [{
+                "profile": profile,
+                "ready": True,
+                "fingerprint": hashlib.sha256(f"storage:{profile}".encode()).hexdigest(),
+                "session_fingerprint": senders[profile],
+                "destination_fingerprint": destination_hash,
+            } for profile in senders]},
+        )
 
         def forbidden_capability_probe(_worker):
             self.fail("Quick Mode submit must use Profile scan evidence")
@@ -2987,20 +3157,6 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(invalid_path.status_code, 422, invalid_path.text)
         self.assertEqual(invalid_path.json()["error"]["code"], "UTILITY_PATH_INVALID")
 
-        denied = self.client.post(
-            "/api/v1/utility/jobs",
-            headers=headers,
-            json={"utility": "compress", "folders": ["/workspace/archive"], "worker": "local"},
-        )
-        self.assertEqual(denied.status_code, 409, denied.text)
-        self.assertEqual(denied.json()["error"]["code"], "RUNTIME_NOT_READY")
-        self.assertEqual(self.jobs.list(actor_user_id=42), [])
-        self.assertEqual(checker_calls, [])
-
-        self.runtime_readiness_store.upsert_cell(
-            worker="local", profile=None, runtime="utility", ready=True,
-            fingerprint="d" * 64,
-        )
         accepted = self.client.post(
             "/api/v1/utility/jobs",
             headers=headers,
@@ -3008,6 +3164,8 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(accepted.status_code, 200, accepted.text)
         self.assertEqual(accepted.json()["kind"], "utility")
+        self.assertEqual(accepted.json()["status"], "dispatched")
+        self.assertIsNone(self.runtime_readiness_store.cell("local", None, "utility"))
         self.assertEqual(checker_calls, [])
 
     def test_context_checker_rejects_profile_worker_pair_outside_verified_catalog(self):
@@ -4338,7 +4496,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(response.json()["items"]), 1)
         self.assertFalse(response.json()["items"][0]["ready"])
-        self.assertEqual(response.json()["items"][0]["reason_code"], "runtime_not_scanned")
+        self.assertEqual(response.json()["items"][0]["reason_code"], "tts_helper_not_scanned")
         self.assertEqual(store.diagnostic_logs(42, "tts", 20), [])
 
         self.client.get("/api/v1/workers/local/tts/health", headers=headers)

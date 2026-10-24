@@ -5,7 +5,7 @@
   import { normalizeTdlChatRef } from '$lib/chatRef';
   import { formatBytes, formatDate } from '$lib/presentation';
   import { session } from '$lib/session.svelte';
-  import { profileOptionLabel } from '$lib/profile-catalog';
+  import { profileOptionLabel, runtimeReadinessFor } from '$lib/profile-catalog';
   import JobTable from './JobTable.svelte';
   import { Archive, Boxes, CheckSquare, Download, FastForward, History, Play, RefreshCw, RotateCcw, Trash2 } from '@lucide/svelte';
 
@@ -52,7 +52,19 @@
       : activeTab === 'history'
         ? !item.archived_at && (terminal.includes(item.status) || item.available === false || item.available === 0)
         : Boolean(item.archived_at) || item.status === 'archived'));
-  let selectable = $derived(visible.filter(item => Boolean(item.available ?? true) && ['pending','failed'].includes(item.status)));
+  function downloadReadiness(item:Artifact) {
+    return runtimeReadinessFor(
+      session.runtimeReadiness,
+      item.profile || null,
+      item.worker || 'local',
+      'download'
+    );
+  }
+  let selectable = $derived(visible.filter(item =>
+    Boolean(item.available ?? true)
+    && ['pending','failed'].includes(item.status)
+    && downloadReadiness(item).status === 'ready'
+  ));
   let selectedItems = $derived(artifacts.filter(item => selected.includes(item.id)));
   let allVisibleSelected = $derived(selectable.length > 0 && selectable.every(item => selected.includes(item.id)));
 
@@ -76,7 +88,7 @@
     selected = allVisibleSelected ? selected.filter(id => !selectable.some(item => item.id === id)) : [...new Set([...selected, ...selectable.map(item => item.id)])];
   }
   function toggle(item:Artifact) {
-    if (!(item.available ?? true) || !['pending','failed'].includes(item.status)) return;
+    if (!(item.available ?? true) || !['pending','failed'].includes(item.status) || downloadReadiness(item).status !== 'ready') return;
     selected = selected.includes(item.id) ? selected.filter(id => id !== item.id) : [...selected, item.id];
   }
   async function start(ids:string[], priority:'normal'|'next' = 'normal') {
@@ -147,6 +159,12 @@
   }
   onMount(() => {
     let disposed=false;
+    void session.refreshProfileCatalog();
+    const readinessTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') void session.refreshProfileCatalog();
+    }, 15000);
+    const onJobFinished = () => { void session.refreshProfileCatalog(); };
+    window.addEventListener('tme3:job-finished', onJobFinished);
     void (async () => {
       try {
         // Opening the manager is a catalog read only.  A worker inventory
@@ -159,7 +177,12 @@
         if (!disposed) message = cause instanceof Error ? cause.message : 'Artifact gagal dimuat.';
       }
     })();
-    return () => { disposed=true; generation += 1; };
+    return () => {
+      disposed=true;
+      generation += 1;
+      clearInterval(readinessTimer);
+      window.removeEventListener('tme3:job-finished', onJobFinished);
+    };
   });
 </script>
 
@@ -172,7 +195,7 @@
   {#if selected.length}<div class="flex flex-wrap items-center gap-2 border-b border-[var(--line)] bg-violet-50 p-3 dark:bg-violet-950"><b class="mr-auto text-sm">{selected.length} artifact dipilih</b><button class="button" onclick={() => start(selected)} disabled={pending||syncing}><Download size={15}/>Mulai terpilih</button><button class="button secondary" onclick={() => start(selected,'next')} disabled={pending||syncing}><FastForward size={15}/>Berikutnya</button><button class="button danger" onclick={() => confirm='delete'} disabled={pending||syncing}><Trash2 size={15}/>Hapus terpilih</button></div>{/if}
   {#if message}<p class="m-4 rounded-xl bg-[var(--brand-soft)] p-3 text-sm">{message}</p>{/if}
   <div class="overflow-x-auto"><table class="w-full min-w-[980px] text-left text-sm"><thead class="border-b border-[var(--line)] text-xs uppercase text-[var(--muted)]"><tr><th class="p-4">Pilih</th><th>Artifact</th><th>Origin</th><th>Statistik</th><th>Ukuran</th><th>Status</th><th>Waktu</th><th class="pr-4 text-right">Aksi</th></tr></thead><tbody class="divide-y divide-[var(--line)]">
-    {#each visible as item}<tr class="hover:bg-[var(--brand-soft)]/35"><td class="p-4"><input type="checkbox" checked={selected.includes(item.id)} disabled={pending||syncing||!(item.available??true)||!['pending','failed'].includes(item.status)} onchange={() => toggle(item)}/></td><td><b>{item.filename}</b><p class="muted mt-1">{item.label||item.chat_ref||'-'}</p>{#if item.error}<p class="mt-1 max-w-72 truncate text-xs text-rose-600">{item.error}</p>{/if}</td><td><span class="badge">{item.profile||'-'}</span><br/><span class="muted text-xs">{item.worker||'local'}</span></td><td>{item.message_count??'?'} pesan<br/><span class="muted">{item.photo_count??'?'} foto · {item.video_count??'?'} video · {item.media_count??'?'} media</span></td><td>{formatBytes(item.actual_downloaded_bytes??item.expected_media_bytes??item.json_bytes)}</td><td><span class={`badge ${item.status}`}>{item.status}</span>{#if !(item.available??true)}<span class="badge failed ml-1">File tidak tersedia</span>{/if}</td><td>{formatDate(item.completed_at||item.created_at)}</td><td class="pr-4"><div class="flex justify-end gap-1">{#if activeTab==='archived'}<button class="button secondary" onclick={() => restore(item)}><RotateCcw size={14}/>Restore</button><button class="button danger" onclick={() => {selected=[item.id];confirm='purge'}}><Trash2 size={14}/>Purge</button>{:else if activeTab==='history'&&item.status==='downloaded'}<button class="button secondary" onclick={() => archive(item)}><Archive size={14}/>Archive</button>{:else if ['pending','failed'].includes(item.status)&&Boolean(item.available??true)}<button class="button secondary" onclick={() => start([item.id])} disabled={pending||syncing}><Play size={14}/>Mulai</button>{:else}<span class="muted text-xs">Tidak ada aksi</span>{/if}</div></td></tr>{:else}<tr><td colspan="8" class="py-14 text-center"><History class="mx-auto mb-2 text-violet-400"/><b>Tidak ada artifact pada tab ini.</b></td></tr>{/each}
+    {#each visible as item}<tr class="hover:bg-[var(--brand-soft)]/35"><td class="p-4"><input type="checkbox" checked={selected.includes(item.id)} disabled={pending||syncing||!(item.available??true)||!['pending','failed'].includes(item.status)||downloadReadiness(item).status!=='ready'} onchange={() => toggle(item)}/></td><td><b>{item.filename}</b><p class="muted mt-1">{item.label||item.chat_ref||'-'}</p>{#if item.error}<p class="mt-1 max-w-72 truncate text-xs text-rose-600">{item.error}</p>{/if}</td><td><span class="badge">{item.profile||'-'}</span><br/><span class="muted text-xs">{item.worker||'local'}</span></td><td>{item.message_count??'?'} pesan<br/><span class="muted">{item.photo_count??'?'} foto · {item.video_count??'?'} video · {item.media_count??'?'} media</span></td><td>{formatBytes(item.actual_downloaded_bytes??item.expected_media_bytes??item.json_bytes)}</td><td><span class={`badge ${item.status}`}>{item.status}</span>{#if !(item.available??true)}<span class="badge failed ml-1">File tidak tersedia</span>{/if}{#if ['pending','failed'].includes(item.status)&&downloadReadiness(item).status!=='ready'}<span class="badge failed ml-1" title={downloadReadiness(item).reason_code}>Download belum siap · Scan Profil</span>{/if}</td><td>{formatDate(item.completed_at||item.created_at)}</td><td class="pr-4"><div class="flex justify-end gap-1">{#if activeTab==='archived'}<button class="button secondary" onclick={() => restore(item)}><RotateCcw size={14}/>Restore</button><button class="button danger" onclick={() => {selected=[item.id];confirm='purge'}}><Trash2 size={14}/>Purge</button>{:else if activeTab==='history'&&item.status==='downloaded'}<button class="button secondary" onclick={() => archive(item)}><Archive size={14}/>Archive</button>{:else if ['pending','failed'].includes(item.status)&&Boolean(item.available??true)}<button class="button secondary" onclick={() => start([item.id])} disabled={pending||syncing||downloadReadiness(item).status!=='ready'}><Play size={14}/>Mulai</button>{:else}<span class="muted text-xs">Tidak ada aksi</span>{/if}</div></td></tr>{:else}<tr><td colspan="8" class="py-14 text-center"><History class="mx-auto mb-2 text-violet-400"/><b>Tidak ada artifact pada tab ini.</b></td></tr>{/each}
   </tbody></table></div>
 </section>
 <JobTable kind="download" title="Progress & riwayat download" scope="global" />

@@ -25,7 +25,8 @@
     disabled = false,
     quickMode = false,
     requiresVerification = true,
-    readinessRuntime = 'export'
+    readinessRuntime = 'export',
+    showReadiness = true
   }: {
     purpose?: 'export'|'utility'|'storage';
     requireProfile?: boolean;
@@ -36,6 +37,7 @@
     quickMode?: boolean;
     requiresVerification?: boolean;
     readinessRuntime?: 'export'|'utility'|'quick_mode'|'storage';
+    showReadiness?: boolean;
   } = $props();
 
   let checking = $state(false);
@@ -73,7 +75,7 @@
   );
 
   onMount(() => {
-    const tracksRuntimeReadiness = requireProfile || readinessRuntime === 'utility' || readinessRuntime === 'storage';
+    const tracksRuntimeReadiness = showReadiness && (requireProfile || readinessRuntime === 'storage');
     if (tracksRuntimeReadiness) void session.refreshProfileCatalog();
     const onJobFinished = () => { void session.refreshProfileCatalog(); };
     if (tracksRuntimeReadiness) window.addEventListener('tme3:job-finished', onJobFinished);
@@ -158,7 +160,7 @@
     </div>
   {:else if requiresVerification}
     <div class="mt-3 flex items-center gap-2 text-xs text-[var(--muted)]"><ShieldCheck size={15}/>Pilih target lalu verifikasi sebelum mengirim job.</div>
-  {:else}
+  {:else if showReadiness}
     <div class={`mt-3 flex flex-wrap items-center gap-2 rounded-xl border px-3 py-2 text-sm ${readinessStyle}`} aria-label={`Kesiapan ${readinessRuntimeLabel}`} role="status">
       {#if readiness.status === 'ready'}<CheckCircle2 size={17}/>{:else}<ShieldCheck size={17}/>{/if}
       <b>{readinessLabels[readiness.status]}</b>

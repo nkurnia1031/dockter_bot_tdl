@@ -41,4 +41,39 @@ describe('DownloadsPage profile filter', () => {
 
     await waitFor(() => expect(requests.some((request) => request.includes('profile=remote-only'))).toBe(true));
   });
+
+  it('blocks artifacts until the saved Profile scan marks their download lane ready', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', enabled: true }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles: [{ name: 'default', workers: ['local'], exclusive_worker: 'local' }],
+        runtime_readiness: {
+          checked_at: '2026-10-24T10:00:00Z',
+          workers: [{ name: 'local', status: 'success' }],
+          cells: [{ worker: 'local', profile: 'default', runtime: 'download', status: 'not_ready', checked_at: '2026-10-24T10:00:00Z', reason_code: 'PROFILE_CANARY_DOWNLOAD_FAILED' }]
+        }
+      }), { status: 200 });
+      if (url.includes('/downloads/artifacts?') && url.includes('archived=false')) return new Response(JSON.stringify({ items: [
+        { id: 'artifact-1', filename: 'backup.json', profile: 'default', worker: 'local', status: 'pending', available: true }
+      ], total: 1 }), { status: 200 });
+      if (url.includes('/downloads/artifacts?')) return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      if (url.includes('/jobs')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    await session.restore();
+    render(DownloadsPage);
+
+    expect(await screen.findByText('Download belum siap · Scan Profil')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Mulai' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
+  });
 });

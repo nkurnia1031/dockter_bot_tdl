@@ -61,6 +61,94 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                 "ready",
             )
 
+    def test_download_and_upload_cells_replace_only_successfully_scanned_workers(self):
+        with tempfile.TemporaryDirectory() as raw:
+            store = RuntimeReadinessStore(Path(raw) / "runtime-readiness.json")
+            store.apply_export_scan(
+                checked_at="2026-10-23T10:00:00Z",
+                workers=[
+                    {"worker": "local", "status": "success"},
+                    {"worker": "remote-1", "status": "success"},
+                ],
+                profiles={},
+            )
+            ready_cell = {
+                "profile": "default",
+                "ready": True,
+                "fingerprint": "d" * 64,
+                "session_fingerprint": "a" * 64,
+            }
+            store.apply_profile_lane_scan(
+                runtime="download",
+                checked_at="2026-10-23T10:05:00Z",
+                workers=[{"worker": "local", "status": "success"}],
+                profiles={"local": [ready_cell]},
+            )
+            store.apply_profile_lane_scan(
+                runtime="upload",
+                checked_at="2026-10-23T10:05:00Z",
+                workers=[{"worker": "local", "status": "success"}],
+                profiles={"local": [ready_cell]},
+            )
+
+            gate = RuntimeReadinessGate(store)
+            self.assertEqual(gate.require_download("default", "local")["status"], "ready")
+            self.assertEqual(gate.require_upload("default", "local")["status"], "ready")
+            self.assertIsNone(store.cell("remote-1", "default", "download"))
+            with self.assertRaises(DomainError):
+                gate.require_download("default", "remote-1")
+
+            store.apply_profile_lane_scan(
+                runtime="download",
+                checked_at="2026-10-23T11:00:00Z",
+                workers=[{"worker": "local", "status": "success"}],
+                profiles={"local": [{"profile": "default", "ready": False, "reason_code": "PROFILE_CANARY_DOWNLOAD_FAILED"}]},
+            )
+            self.assertEqual(store.cell("local", "default", "download")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "upload")["status"], "ready")
+
+    def test_runtime_failure_invalidates_only_affected_profile_lane_and_storage_proof(self):
+        with tempfile.TemporaryDirectory() as raw:
+            store = RuntimeReadinessStore(Path(raw) / "runtime-readiness.json")
+            store.apply_export_scan(
+                checked_at="2026-10-23T10:00:00Z",
+                workers=[{"worker": "local", "status": "success"}],
+                profiles={"local": [self.make_cell("default", "a" * 64)]},
+            )
+            lane = {
+                "profile": "default", "ready": True, "fingerprint": "b" * 64,
+                "session_fingerprint": "a" * 64,
+            }
+            for runtime in ("download", "upload"):
+                store.apply_profile_lane_scan(
+                    runtime=runtime,
+                    checked_at="2026-10-23T10:00:00Z",
+                    workers=[{"worker": "local", "status": "success"}],
+                    profiles={"local": [lane]},
+                )
+            store.apply_storage_scan(
+                checked_at="2026-10-23T10:00:00Z",
+                profiles={"local": [{
+                    "profile": "default", "ready": True, "fingerprint": "c" * 64,
+                    "session_fingerprint": "a" * 64, "destination_fingerprint": "e" * 64,
+                }]},
+            )
+            gate = RuntimeReadinessGate(store)
+
+            self.assertTrue(gate.record_download_failure(
+                worker="local", profile="default", error_code="TDL_SESSION_UNAUTHORIZED"
+            ))
+            self.assertEqual(store.cell("local", "default", "download")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "upload")["status"], "ready")
+            self.assertEqual(store.cell("local", "default", "storage")["status"], "ready")
+
+            self.assertTrue(gate.record_storage_failure(
+                worker="local", profile="default", error_code="CHAT_WRITE_FORBIDDEN"
+            ))
+            self.assertEqual(store.cell("local", "default", "upload")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "storage")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
+
     def test_failed_worker_scan_is_separate_from_persisted_export_readiness(self):
         with tempfile.TemporaryDirectory() as raw:
             store = RuntimeReadinessStore(Path(raw) / "runtime-readiness.json")
@@ -210,7 +298,7 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
             gate = RuntimeReadinessGate(store)
 
             with self.assertRaises(DomainError) as raised:
-                gate.require(runtime="quick_mode", profile="default", worker="local")
+                gate.require_quick_mode("default", "local")
             self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
             self.assertEqual(gate.require_export("default", "local")["status"], "ready")
 
@@ -227,7 +315,22 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                     "sender_session_fingerprints": {"upload": "d" * 64},
                 }]},
             )
-            cell = gate.require(runtime="quick_mode", profile="default", worker="local")
+            store.upsert_cell(
+                worker="local", profile=None, runtime="quick_mode_runtime",
+                ready=True, fingerprint="f" * 64,
+            )
+            with self.assertRaises(DomainError) as missing_lane:
+                gate.require_quick_mode("default", "local")
+            self.assertEqual(
+                missing_lane.exception.details["runtime"], "download"
+            )
+            for runtime in ("download", "upload", "storage"):
+                store.upsert_cell(
+                    worker="local", profile="default", runtime=runtime,
+                    ready=True, fingerprint="f" * 64,
+                    session_fingerprint="a" * 64,
+                )
+            cell = gate.require_quick_mode("default", "local")
             self.assertEqual(cell["status"], "ready")
             self.assertEqual(cell["sender_session_fingerprints"], {"upload": "d" * 64})
 
@@ -259,6 +362,10 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                 checked_at="2026-10-23T10:05:00Z",
                 workers=[{"worker": "local", "status": "success"}],
                 profiles={"local": quick_cells},
+            )
+            store.upsert_cell(
+                worker="local", profile=None, runtime="quick_mode_runtime",
+                ready=True, fingerprint="e" * 64,
             )
             gate = RuntimeReadinessGate(store)
 
@@ -351,6 +458,10 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                     ("archive", "1" * 64, "f" * 64),
                 )]},
             )
+            store.upsert_cell(
+                worker="local", profile=None, runtime="quick_mode_runtime",
+                ready=True, fingerprint="e" * 64,
+            )
             gate = RuntimeReadinessGate(store)
 
             self.assertFalse(gate.record_quick_mode_failure(
@@ -360,8 +471,9 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                 worker="local", profile="default", error_code="UTILITY_PROCESS_STALLED"
             ))
 
-            self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
             self.assertEqual(store.cell("local", "archive", "quick_mode")["status"], "ready")
+            self.assertEqual(store.cell("local", None, "quick_mode_runtime")["status"], "not_ready")
             self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
 
     def test_explicit_rescan_replaces_old_fingerprint_without_affecting_other_workers(self):
@@ -509,6 +621,10 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                     worker="local", profile=profile, runtime="tts", ready=True,
                     fingerprint=fingerprint,
                 )
+            store.upsert_cell(
+                worker="local", profile=None, runtime="tts_helper",
+                ready=True, fingerprint="e" * 64,
+            )
             gate = RuntimeReadinessGate(store)
 
             self.assertFalse(gate.record_tts_failure(
@@ -521,9 +637,12 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                 worker="local", profile="default", error_code="TTS_HELPER_UNAVAILABLE"
             ))
 
-            self.assertEqual(store.cell("local", "default", "tts")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "tts")["status"], "ready")
             self.assertEqual(store.cell("local", "archive", "tts")["status"], "ready")
+            self.assertEqual(store.cell("local", None, "tts_helper")["status"], "not_ready")
             self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
+            with self.assertRaises(DomainError):
+                gate.require_tts("default", "local")
 
     def test_tts_session_fingerprint_is_persisted_privately(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -579,6 +698,17 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                     "destination_fingerprint": "c" * 64,
                 }]},
             )
+            for runtime in ("download", "upload"):
+                store.apply_profile_lane_scan(
+                    runtime=runtime,
+                    checked_at="2026-10-23T10:00:00Z",
+                    workers=[{"worker": "local", "status": "success"}],
+                    profiles={"local": [{
+                        "profile": "default", "ready": True,
+                        "fingerprint": "f" * 64,
+                        "session_fingerprint": "a" * 64,
+                    }]},
+                )
             store.apply_quickmode_scan(
                 checked_at="2026-10-23T10:00:00Z",
                 workers=[{"worker": "local", "status": "success"}],
@@ -608,6 +738,8 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
             self.assertEqual(store.cell("local", "default", "export")["status"], "not_ready")
             self.assertEqual(store.cell("local", "default", "tts")["status"], "not_ready")
             self.assertEqual(store.cell("local", "default", "storage")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "download")["status"], "not_ready")
+            self.assertEqual(store.cell("local", "default", "upload")["status"], "not_ready")
             self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "not_ready")
             self.assertEqual(store.cell("local", "archive", "quick_mode")["status"], "not_ready")
             self.assertEqual(store.cell("local", "other", "quick_mode")["status"], "ready")

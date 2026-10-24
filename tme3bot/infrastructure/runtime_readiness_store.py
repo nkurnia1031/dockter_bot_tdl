@@ -134,6 +134,77 @@ class RuntimeReadinessStore:
             self._save_locked(snapshot)
             return copy.deepcopy(snapshot)
 
+    def apply_profile_lane_scan(
+        self,
+        *,
+        runtime: str,
+        checked_at: str,
+        workers: list[dict[str, Any]],
+        profiles: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Replace one profile lane's cells for workers completed by a scan."""
+        lane = str(runtime or "").strip().lower()
+        if lane not in {"download", "upload"}:
+            raise ValueError("Runtime lane scan harus Download atau Upload.")
+        when = str(checked_at or "")[:64] or utc_now_iso()
+        successful_workers: set[str] = set()
+        for raw in workers:
+            if not isinstance(raw, dict):
+                continue
+            worker = str(raw.get("worker") or raw.get("name") or "").strip().lower()
+            if _WORKER_RE.fullmatch(worker) and raw.get("status") in {"success", "succeeded"}:
+                successful_workers.add(worker)
+        with self._lock:
+            self._load_locked()
+            assert self._snapshot is not None
+            snapshot = copy.deepcopy(self._snapshot)
+            cells = {
+                _cell_key(item["worker"], item["profile"], item["runtime"]): item
+                for item in snapshot["cells"]
+            }
+            for key in list(cells):
+                if key is not None and key[0] in successful_workers and key[2] == lane:
+                    del cells[key]
+            for worker in successful_workers:
+                raw_cells = profiles.get(worker, [])
+                for raw in raw_cells if isinstance(raw_cells, list) else []:
+                    if not isinstance(raw, dict):
+                        continue
+                    key = _cell_key(worker, raw.get("profile"), lane)
+                    if key is None or key[1] is None:
+                        continue
+                    fingerprint = _safe_fingerprint(raw.get("fingerprint"))
+                    session_fingerprint = _safe_fingerprint(
+                        raw.get("session_fingerprint")
+                    )
+                    ready = raw.get("ready") is True and bool(fingerprint)
+                    reason = _reason(
+                        raw.get("reason_code"),
+                        "PROFILE_DOWNLOAD_LANE_UNAVAILABLE"
+                        if lane == "download"
+                        else "PROFILE_UPLOAD_LANE_UNAVAILABLE",
+                    )
+                    if raw.get("ready") is True and not ready:
+                        reason = "PROFILE_LANE_EVIDENCE_INCOMPLETE"
+                    cells[key] = {
+                        "worker": worker,
+                        "profile": key[1],
+                        "runtime": lane,
+                        "status": "ready" if ready else "not_ready",
+                        "checked_at": str(raw.get("checked_at") or when)[:64],
+                        "reason_code": "" if ready else reason,
+                        "fingerprint": fingerprint if ready else "",
+                        "session_fingerprint": session_fingerprint if ready else "",
+                        "destination_fingerprint": "",
+                    }
+            snapshot["cells"] = sorted(
+                cells.values(),
+                key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
+            )
+            snapshot["checked_at"] = when
+            self._save_locked(snapshot)
+            return copy.deepcopy(snapshot)
+
     def mark_worker_failed(
         self,
         *,

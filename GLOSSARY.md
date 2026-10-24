@@ -65,8 +65,16 @@ Status apakah salinan lokal profil pada satu worker lolos pemeriksaan TDL dan co
 _Avoid_: kesiapan seluruh worker.
 
 **Kesiapan runtime**:
-Bukti bahwa kemampuan fitur tertentu tersedia pada satu worker dan, bila diperlukan, satu profil. Bukti tetap berlaku sampai fingerprint terkait berubah atau kegagalan akses/runtime yang cocok menginvalidasinya.
+Bukti bahwa kemampuan fitur tertentu tersedia pada satu worker dan, bila diperlukan, satu profil. Bukti berasal dari probe runtime atau canary operasional yang sesuai dengan jalur fitur. Bukti tetap berlaku sampai fingerprint terkait berubah atau kegagalan akses/runtime yang cocok menginvalidasinya.
 _Avoid_: status online worker, verifikasi setiap job.
+
+**Scan kesiapan profil**:
+Operasi eksplisit yang memeriksa service worker dan menguji lane profil melalui canary terisolasi. Hasil disimpan per worker, profil, service, lane, dan tujuan; pesan canary dihapus setelah verifikasi, sedangkan kegagalan cleanup ditampilkan terpisah dari kesiapan lane.
+_Avoid_: scan read-only, satu status global semua worker.
+
+**Kesiapan lane**:
+Bukti bahwa lane Export, Download, atau Upload pada satu profil-worker berhasil melewati canary-nya. Kesiapan Download dicatat setelah kecepatan transfer terlihat lalu job canary dibatalkan; pembatalan itu tidak membatalkan hasil lane lain.
+_Avoid_: satu kesiapan gabungan profil, hasil job fitur lain.
 
 **Revision vault**:
 Versi tertentu dari bundle kanonis di backend yang hanya dipasang ke worker melalui operasi distribusi eksplisit.

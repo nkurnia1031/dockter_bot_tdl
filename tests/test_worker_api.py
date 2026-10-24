@@ -6,7 +6,10 @@ from fastapi.testclient import TestClient
 
 from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.domain.models import DomainError
-from tme3bot.domain.worker_contract import CAP_SHARED_EXPORT_CURSOR
+from tme3bot.domain.worker_contract import (
+    CAP_PROFILE_READINESS_CANARY,
+    CAP_SHARED_EXPORT_CURSOR,
+)
 
 
 class FakeExecutor:
@@ -23,6 +26,12 @@ class FakeExecutor:
         self.utility_probe_calls = 0
         self.quickmode_probe_destinations = []
         self.safelink_probe_calls = 0
+        self.profile_readiness_canary_requests = []
+        self.profile_readiness_canary_status = {
+            "id": "8ec4a6df-26f8-49eb-a1ae-c057d9fa4bc1",
+            "status": "running",
+            "phase": "export_canary",
+        }
         self.worker_api_token = "worker-secret"
         self.previous_worker_api_token = ""
         self.profile_inputs = []
@@ -84,6 +93,17 @@ class FakeExecutor:
             "reason_code": "" if self.safelink_ready else "RESOLVER_RUNTIME_UNAVAILABLE",
             "fingerprint": "c" * 64 if self.safelink_ready else "",
         }
+
+    def start_profile_readiness_canary(self, profile, storage_target, tts_target):
+        self.profile_readiness_canary_requests.append(
+            (profile, storage_target, tts_target)
+        )
+        return dict(self.profile_readiness_canary_status)
+
+    def profile_readiness_canary(self, operation_id):
+        if operation_id != self.profile_readiness_canary_status["id"]:
+            return None
+        return dict(self.profile_readiness_canary_status)
 
     def profile_sync_status(self):
         return dict(self.profile_sync_snapshot)
@@ -319,6 +339,47 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(self.executor.quickmode_probe_destinations, ["googledrive:backup"])
 
+    def test_profile_readiness_canary_start_and_poll_require_worker_auth(self):
+        payload = {
+            "profile": "default",
+            "storage_target": "-1001234567890",
+            "tts_target": "@tts_channel",
+        }
+        denied = self.client.post(
+            "/internal/v1/profiles/readiness-canaries", json=payload
+        )
+        self.assertEqual(denied.status_code, 401)
+
+        headers = {"Authorization": "Bearer worker-secret"}
+        started = self.client.post(
+            "/internal/v1/profiles/readiness-canaries",
+            headers=headers,
+            json=payload,
+        )
+        self.assertEqual(started.status_code, 202)
+        self.assertEqual(
+            self.executor.profile_readiness_canary_requests,
+            [("default", "-1001234567890", "@tts_channel")],
+        )
+
+        denied_poll = self.client.get(
+            f"/internal/v1/profiles/readiness-canaries/{started.json()['id']}"
+        )
+        self.assertEqual(denied_poll.status_code, 401)
+        polled = self.client.get(
+            f"/internal/v1/profiles/readiness-canaries/{started.json()['id']}",
+            headers=headers,
+        )
+        self.assertEqual(polled.status_code, 200)
+        self.assertEqual(polled.json()["phase"], "export_canary")
+
+        invalid = self.client.post(
+            "/internal/v1/profiles/readiness-canaries",
+            headers=headers,
+            json={**payload, "extra": "ignored"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+
     def test_healthz_distinguishes_running_process_from_pending_profile_sync(self):
         ready = self.client.get("/healthz")
         self.assertEqual(ready.json()["ok"], True)
@@ -545,6 +606,7 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(denied_capability.status_code, 401)
         headers = {"Authorization": "Bearer worker-secret"}
         capabilities = self.client.get("/internal/v1/capabilities", headers=headers)
+        self.assertIn(CAP_PROFILE_READINESS_CANARY, capabilities.json()["capabilities"])
         self.assertNotIn("tts", capabilities.json()["capabilities"])
 
         self.executor.tts_ready = True

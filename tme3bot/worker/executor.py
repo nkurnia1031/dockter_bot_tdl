@@ -67,6 +67,10 @@ from tme3bot.worker.quick_export import (
 )
 from tme3bot.worker.runtime_settings import WorkerRuntimeSettings
 from tme3bot.worker.profile_sessions import ProfileSessionManager
+from tme3bot.worker.profile_readiness import (
+    ProfileReadinessCanary,
+    ProfileReadinessCanaryOperations,
+)
 from tme3bot.worker.profile_sync import ProfileSyncClient, ProfileSyncError
 from tme3bot.worker.upload_lane import UploadLanePreparer
 from tme3bot.worker.command_runner import WorkerCommandRunner
@@ -149,6 +153,16 @@ class WorkerJobExecutor(
         self.profile_manager = profile_manager
         self.publisher = publisher
         self._profile_sessions = ProfileSessionManager(config)
+        self.profile_readiness_canaries = ProfileReadinessCanaryOperations(
+            ProfileReadinessCanary(
+                profile_manager,
+                self.diagnose_profile_tdl,
+                Path(getattr(config, "temp_root", "/tmp")),
+                upload_session_fingerprint=lambda profile: self.available_storage_session_fingerprints(
+                    [profile]
+                ).get(profile, ""),
+            )
+        )
         self.upload_lane_preparer = UploadLanePreparer(
             profile_manager=profile_manager,
             session_checker=lambda storage, namespace, home: self._profile_sessions.test_profile_session(
@@ -956,6 +970,16 @@ class WorkerJobExecutor(
             if download_acquired:
                 download_lock.release()
             export_lock.release()
+
+    def start_profile_readiness_canary(
+        self, profile: str, storage_target: str, tts_target: str
+    ) -> dict[str, Any]:
+        return self.profile_readiness_canaries.start(
+            profile, storage_target, tts_target
+        )
+
+    def profile_readiness_canary(self, operation_id: str) -> dict[str, Any] | None:
+        return self.profile_readiness_canaries.get(operation_id)
 
     @staticmethod
     def _profile_tdl_busy_result() -> dict[str, Any]:

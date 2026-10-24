@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
 import { api, post, remove } from '$lib/api';
 import { session } from '$lib/session.svelte';
-import { normalizeRuntimeReadiness, runtimeReadinessFor, type RuntimeReadinessSnapshot } from '$lib/profile-catalog';
+import { normalizeRuntimeReadiness, runtimeReadinessFor, runtimeReadinessForWorker, type RuntimeReadinessSnapshot } from '$lib/profile-catalog';
   import { profileDiagnosticLabel } from '$lib/tdl-lanes';
 import { CircleAlert, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, Upload, UserRoundPlus, X } from '@lucide/svelte';
 
@@ -15,6 +15,24 @@ type ProvisioningWorker = { name: string; enabled: boolean; online: boolean; sec
   type Inventory = { worker: string; checked_at: string; items: LocalProfile[]; pending_identity_cleanup?: IdentityCleanup[] };
   type ScanWorker = { name: string; status: 'success' | 'failed' | 'disabled'; checked_at: string; error_code: string };
   type LocalProfileCatalog = { checked_at: string; workers: ScanWorker[]; inventories: Inventory[]; runtime_readiness: RuntimeReadinessSnapshot };
+  type ScanProfileProgress = {
+    name: string;
+    status: string;
+    phase: string;
+    error_code: string;
+    checks?: Record<string, { ready: boolean; reason_code: string }>;
+    cleanup?: { status: 'not_needed'|'succeeded'|'failed'; items: Array<{ target: string; message_id: number; status: string; error_code: string }> };
+  };
+  type ScanWorkerProgress = { name: string; status: string; phase: string; error_code: string; profiles: ScanProfileProgress[] };
+  type ProfileScanOperation = {
+    id: string;
+    status: string;
+    progress: { workers: ScanWorkerProgress[]; total_workers: number; completed_workers: number; total_profiles: number; completed_profiles: number };
+    error_code: string;
+    created_at: string;
+    updated_at: string;
+    finished_at: string;
+  };
   type VaultProfile = { name: string; vault: boolean; status: string; source?: string; operation_id?: string; error?: string };
   type AdoptionOperation = { id: string; status: string; error?: string };
 type ProvisioningOperation = {
@@ -54,6 +72,7 @@ let provisioningFailure = $state('');
 let provisioningNotice = $state('');
   let inventory = $state<Inventory | null>(null);
   let profileCatalog = $state<LocalProfileCatalog | null>(null);
+  let scanOperation = $state<ProfileScanOperation | null>(null);
   let catalogFailure = $state('');
   let vaultProfiles = $state<VaultProfile[]>([]);
   let vaultStatusLoaded = $state(false);
@@ -67,28 +86,16 @@ let savingProvisioning = $state(false);
   let failure = $state('');
   let notice = $state('');
   let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  let scanPollTimer: ReturnType<typeof setTimeout> | undefined;
   let provisioningTimer: ReturnType<typeof setTimeout> | undefined;
   let provisioningRequestActive = false;
   let progressRequestActive = false;
+  let scanPollRequestActive = false;
+  let handledScanOperationId = '';
   let progressGeneration = 0;
   let catalogGeneration = 0;
   let onJobFinished: (() => void) | undefined;
   let readinessTimer: ReturnType<typeof setInterval> | undefined;
-  const exportReadinessCells = $derived(
-    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'export')
-  );
-  const quickModeReadinessCells = $derived(
-    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'quick_mode')
-  );
-  const ttsReadinessCells = $derived(
-    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'tts')
-  );
-  const storageReadinessCells = $derived(
-    (profileCatalog?.runtime_readiness.cells || []).filter((cell) => cell.runtime === 'storage')
-  );
-  const resolverReadinessWorkers = $derived(profileCatalog?.workers || []);
-  const utilityReadinessWorkers = $derived(profileCatalog?.workers || []);
-
   const codeMessages: Record<string, string> = {
     PROFILE_IDENTITY_MISSING: 'File identitas tidak ditemukan.',
     PROFILE_IDENTITY_INVALID: 'Identitas profil tidak valid.',
@@ -194,6 +201,113 @@ const provisioningStatusLabels: Record<string, string> = {
     return `Gagal · ${codeMessage(worker.error_code || 'WORKER_SCAN_FAILED')}`;
   }
 
+  function normalizeScanOperation(value: unknown): ProfileScanOperation | null {
+    if (!value || typeof value !== 'object') return null;
+    const payload = value as Record<string, unknown>;
+    if (typeof payload.id !== 'string' || !['queued', 'running', 'succeeded', 'failed'].includes(String(payload.status))) return null;
+    const rawProgress = payload.progress && typeof payload.progress === 'object'
+      ? payload.progress as Record<string, unknown>
+      : {};
+    const workers = Array.isArray(rawProgress.workers) ? rawProgress.workers.flatMap((rawWorker) => {
+      if (!rawWorker || typeof rawWorker !== 'object') return [];
+      const worker = rawWorker as Record<string, unknown>;
+      const profiles = Array.isArray(worker.profiles) ? worker.profiles.flatMap((rawProfile) => {
+        if (!rawProfile || typeof rawProfile !== 'object') return [];
+        const profile = rawProfile as Record<string, unknown>;
+        if (typeof profile.name !== 'string') return [];
+        return [{
+          name: profile.name,
+          status: String(profile.status || 'queued'),
+          phase: String(profile.phase || ''),
+          error_code: String(profile.error_code || '')
+        }];
+      }) : [];
+      if (typeof worker.name !== 'string') return [];
+      return [{
+        name: worker.name,
+        status: String(worker.status || 'queued'),
+        phase: String(worker.phase || ''),
+        error_code: String(worker.error_code || ''),
+        profiles
+      }];
+    }) : [];
+    const count = (value: unknown) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+    return {
+      id: payload.id,
+      status: String(payload.status),
+      progress: {
+        workers,
+        total_workers: count(rawProgress.total_workers),
+        completed_workers: count(rawProgress.completed_workers),
+        total_profiles: count(rawProgress.total_profiles),
+        completed_profiles: count(rawProgress.completed_profiles)
+      },
+      error_code: String(payload.error_code || ''),
+      created_at: String(payload.created_at || ''),
+      updated_at: String(payload.updated_at || ''),
+      finished_at: String(payload.finished_at || '')
+    };
+  }
+
+  function scanOperationIsActive(operation: ProfileScanOperation | null) {
+    return operation !== null && ['queued', 'running'].includes(operation.status);
+  }
+
+  function scanOperationStatusLabel(status: string) {
+    return ({
+      queued: 'Dalam antrean',
+      running: 'Berjalan',
+      succeeded: 'Scan selesai',
+      failed: 'Scan gagal'
+    } as Record<string, string>)[status] || 'Status tidak diketahui';
+  }
+
+  function progressStatusLabel(status: string) {
+    return ({
+      queued: 'Menunggu',
+      running: 'Memeriksa',
+      succeeded: 'Selesai',
+      failed: 'Gagal',
+      disabled: 'Nonaktif'
+    } as Record<string, string>)[status] || status;
+  }
+
+  function scanPhaseLabel(phase: string) {
+    return ({
+      queued: 'Menunggu worker',
+      inventory: 'Membaca profil',
+      runtime_probe: 'Memeriksa runtime dan profil',
+      session_probe: 'Memeriksa sesi TDL',
+      export_canary: 'Menguji Export',
+      download_canary: 'Menguji Download',
+      upload_storage: 'Mengirim canary ke Storage',
+      verify_storage: 'Memverifikasi canary Storage',
+      upload_tts: 'Mengirim canary ke TTS',
+      verify_tts: 'Memverifikasi canary TTS',
+      cleanup: 'Membersihkan canary',
+      complete: 'Pemeriksaan selesai',
+      failed: 'Pemeriksaan gagal',
+      interrupted: 'Terhenti saat backend dimulai ulang',
+      not_scanned: 'Tidak dipindai'
+    } as Record<string, string>)[phase] || phase;
+  }
+
+  function readinessStatusLabel(status: string) {
+    return ({
+      ready: 'Siap',
+      not_ready: 'Tidak siap',
+      offline: 'Worker offline',
+      disabled: 'Worker nonaktif',
+      unscanned: 'Belum dipindai'
+    } as Record<string, string>)[status] || 'Belum dipindai';
+  }
+
+  function readinessTone(status: string) {
+    if (status === 'ready') return 'font-bold text-emerald-600';
+    if (['not_ready', 'offline', 'disabled'].includes(status)) return 'font-bold text-rose-600';
+    return 'muted font-bold';
+  }
+
   function normalizeProfileCatalog(value: unknown): LocalProfileCatalog {
     const payload = value && typeof value === 'object' ? value as Record<string, unknown> : {};
     if (Array.isArray(payload.workers) && Array.isArray(payload.inventories)) {
@@ -230,6 +344,78 @@ const provisioningStatusLabels: Record<string, string> = {
       }
     } catch (cause) {
       catalogFailure = cause instanceof Error ? cause.message : 'Katalog profil lokal gagal dimuat.';
+    }
+  }
+
+  function stopScanPolling() {
+    if (scanPollTimer !== undefined) clearTimeout(scanPollTimer);
+    scanPollTimer = undefined;
+  }
+
+  function scheduleScanPolling(operationId: string) {
+    stopScanPolling();
+    scanPollTimer = setTimeout(() => void refreshScanOperation(operationId), 900);
+  }
+
+  async function finishScanOperation(operation: ProfileScanOperation) {
+    scanning = false;
+    stopScanPolling();
+    if (operation.id === handledScanOperationId) return;
+    handledScanOperationId = operation.id;
+    if (operation.status !== 'succeeded') {
+      failure = codeMessage(operation.error_code || 'WORKER_SCAN_FAILED');
+      return;
+    }
+    await loadProfileCatalog();
+    await session.refreshProfileCatalog();
+    inventory = selectedWorker
+      ? profileCatalog?.inventories.find((item) => item.worker === selectedWorker) || null
+      : null;
+    const successful = profileCatalog?.workers.filter((worker) => worker.status === 'success').length || 0;
+    const failed = profileCatalog?.workers.filter((worker) => worker.status === 'failed').length || 0;
+    const disabled = profileCatalog?.workers.filter((worker) => worker.status === 'disabled').length || 0;
+    notice = `Scan selesai: ${successful} worker berhasil, ${failed} gagal, ${disabled} nonaktif.`;
+    if (selectedWorker && inventory) {
+      const generation = progressGeneration;
+      await refreshDeleteOperations(selectedWorker, generation);
+      await refreshVaultProfiles(selectedWorker, generation);
+      scheduleProgressRefresh();
+    }
+  }
+
+  async function refreshScanOperation(operationId?: string) {
+    if (scanPollRequestActive) {
+      if (operationId && scanOperation?.id === operationId && scanOperationIsActive(scanOperation)) {
+        scheduleScanPolling(operationId);
+      }
+      return;
+    }
+    scanPollRequestActive = true;
+    try {
+      const path = operationId
+        ? `/profiles/local/scan/${encodeURIComponent(operationId)}`
+        : '/profiles/local/scan';
+      const payload = await api<unknown>(path);
+      const raw = operationId
+        ? payload
+        : payload && typeof payload === 'object'
+          ? (payload as Record<string, unknown>).operation
+          : null;
+      const operation = normalizeScanOperation(raw);
+      if (!operation) return;
+      scanOperation = operation;
+      scanning = scanOperationIsActive(operation);
+      if (scanning) scheduleScanPolling(operation.id);
+      else if (operation.status === 'succeeded' || operation.status === 'failed') {
+        await finishScanOperation(operation);
+      }
+    } catch {
+      // Keep the persisted operation visible and retry transient polling failures.
+      if (operationId && scanOperation?.id === operationId && scanOperationIsActive(scanOperation)) {
+        scheduleScanPolling(operationId);
+      }
+    } finally {
+      scanPollRequestActive = false;
     }
   }
 
@@ -437,6 +623,7 @@ async function cancelProfileProvisioning() {
 
   async function scanProfiles() {
     if (scanning) return;
+    stopScanPolling();
     stopProgressRefresh();
     catalogGeneration += 1;
     const generation = progressGeneration;
@@ -444,29 +631,38 @@ async function cancelProfileProvisioning() {
     failure = '';
     notice = '';
     try {
-      const result = normalizeProfileCatalog(await post<unknown>('/profiles/local/scan'));
+      const payload = await post<unknown>('/profiles/local/scan');
       if (generation !== progressGeneration) return;
-      profileCatalog = result;
-      await session.refreshProfileCatalog();
-      inventory = selectedWorker
-        ? profileCatalog.inventories.find((item) => item.worker === selectedWorker) || null
-        : null;
       catalogFailure = '';
-      const successful = profileCatalog.workers.filter((worker) => worker.status === 'success').length;
-      const failed = profileCatalog.workers.filter((worker) => worker.status === 'failed').length;
-      const disabled = profileCatalog.workers.filter((worker) => worker.status === 'disabled').length;
-      notice = `Scan selesai: ${successful} worker berhasil, ${failed} gagal, ${disabled} nonaktif.`;
-      if (selectedWorker && inventory) {
-        await refreshDeleteOperations(selectedWorker, generation);
-        await refreshVaultProfiles(selectedWorker, generation);
-        scheduleProgressRefresh();
+      const operation = normalizeScanOperation(payload);
+      if (operation) {
+        scanOperation = operation;
+        scanning = scanOperationIsActive(operation);
+        if (scanning) scheduleScanPolling(operation.id);
+        else await finishScanOperation(operation);
+      } else {
+        // Accept the previous synchronous response during a mixed-version rollout.
+        profileCatalog = normalizeProfileCatalog(payload);
+        await session.refreshProfileCatalog();
+        inventory = selectedWorker
+          ? profileCatalog.inventories.find((item) => item.worker === selectedWorker) || null
+          : null;
+        const successful = profileCatalog.workers.filter((worker) => worker.status === 'success').length;
+        const failed = profileCatalog.workers.filter((worker) => worker.status === 'failed').length;
+        const disabled = profileCatalog.workers.filter((worker) => worker.status === 'disabled').length;
+        notice = `Scan selesai: ${successful} worker berhasil, ${failed} gagal, ${disabled} nonaktif.`;
+        if (selectedWorker && inventory) {
+          await refreshDeleteOperations(selectedWorker, generation);
+          await refreshVaultProfiles(selectedWorker, generation);
+          scheduleProgressRefresh();
+        }
       }
     } catch (cause) {
       if (generation !== progressGeneration) return;
       const error = cause as { code?: string; message?: string };
       failure = error.message || 'Scan profil lokal semua worker gagal. Katalog sebelumnya dipertahankan.';
     } finally {
-      scanning = false;
+      if (!scanOperationIsActive(scanOperation)) scanning = false;
     }
   }
 
@@ -699,6 +895,7 @@ async function cancelProfileProvisioning() {
   onMount(() => {
     void loadWorkers();
     void loadProfileCatalog();
+    void refreshScanOperation();
   void loadProvisioningWorkers();
     readinessTimer = setInterval(() => {
       if (document.visibilityState === 'visible') {
@@ -716,6 +913,7 @@ async function cancelProfileProvisioning() {
   onDestroy(() => {
     if (onJobFinished) window.removeEventListener('tme3:job-finished', onJobFinished);
     if (readinessTimer !== undefined) clearInterval(readinessTimer);
+    stopScanPolling();
     stopProgressRefresh();
     if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);
   });
@@ -884,6 +1082,58 @@ async function cancelProfileProvisioning() {
   {#if catalogFailure}
     <p class="mt-3 text-sm text-rose-600" role="alert">{catalogFailure}</p>
   {/if}
+  {#if scanOperation}
+    <section class="mt-4 rounded-xl border border-[var(--line)] p-3" aria-label="Progress Scan Profil" role="status">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <h2 class="text-sm font-extrabold">{scanOperationStatusLabel(scanOperation.status)}</h2>
+        {#if scanOperation.progress.total_profiles > 0}
+          <span class="muted text-xs">Profil {scanOperation.progress.completed_profiles}/{scanOperation.progress.total_profiles} · Worker {scanOperation.progress.completed_workers}/{scanOperation.progress.total_workers}</span>
+        {:else}
+          <span class="muted text-xs">Worker {scanOperation.progress.completed_workers}/{scanOperation.progress.total_workers}</span>
+        {/if}
+      </div>
+      {#if scanOperation.error_code}
+        <p class="mt-2 text-xs text-rose-600">{codeMessage(scanOperation.error_code)}</p>
+      {/if}
+      <div class="mt-3 grid gap-2 sm:grid-cols-2">
+        {#each scanOperation.progress.workers as progressWorker (progressWorker.name)}
+          <article class="rounded-lg bg-[var(--panel)] p-3" aria-label={`Progress worker ${progressWorker.name}`}>
+            <div class="flex items-center justify-between gap-2 text-sm">
+              <span class="font-bold">{progressWorker.name}</span>
+              <span class={readinessTone(progressWorker.status === 'succeeded' ? 'ready' : progressWorker.status === 'failed' ? 'not_ready' : progressWorker.status === 'disabled' ? 'disabled' : 'unscanned')}>{progressStatusLabel(progressWorker.status)}</span>
+            </div>
+            {#if progressWorker.phase}<p class="muted mt-1 text-xs">{scanPhaseLabel(progressWorker.phase)}</p>{/if}
+            {#if progressWorker.error_code}<p class="mt-1 text-xs text-rose-600">{codeMessage(progressWorker.error_code)}</p>{/if}
+            {#if progressWorker.profiles.length}
+              <div class="mt-2 space-y-1 border-l border-[var(--line)] pl-3">
+                {#each progressWorker.profiles as progressProfile (`${progressWorker.name}:${progressProfile.name}`)}
+                  <div class="flex items-center justify-between gap-2 text-xs" aria-label={`Progress profil ${progressProfile.name} pada ${progressWorker.name}`}>
+                    <span>{progressProfile.name}</span>
+                    <span class={readinessTone(progressProfile.status === 'succeeded' ? 'ready' : progressProfile.status === 'failed' ? 'not_ready' : 'unscanned')}>{progressStatusLabel(progressProfile.status)}</span>
+                  </div>
+                  {#if progressProfile.checks}
+                    <div class="grid gap-1 pl-2 text-[11px] sm:grid-cols-2">
+                      {#each Object.entries(progressProfile.checks) as [runtime, check] (runtime)}
+                        <div class="flex items-center justify-between gap-2">
+                          <span class="capitalize">{runtime === 'tts' ? 'TTS' : runtime}</span>
+                          <span class={readinessTone(check.ready ? 'ready' : 'not_ready')}>{check.ready ? 'Siap' : check.reason_code || 'Tidak siap'}</span>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                  {#if progressProfile.cleanup && progressProfile.cleanup.status !== 'not_needed'}
+                    <p class={`pl-2 text-[11px] ${progressProfile.cleanup.status === 'failed' ? 'text-amber-600' : 'text-emerald-600'}`}>
+                      Cleanup canary: {progressProfile.cleanup.status === 'succeeded' ? 'berhasil' : `gagal pada ${progressProfile.cleanup.items.filter((item) => item.status === 'failed').length} pesan`}
+                    </p>
+                  {/if}
+                {/each}
+              </div>
+            {/if}
+          </article>
+        {/each}
+      </div>
+    </section>
+  {/if}
   {#if profileCatalog?.checked_at}
     <section class="mt-4 rounded-xl border border-[var(--line)] p-3" aria-label="Status scan semua worker">
       <div class="flex flex-wrap items-center justify-between gap-2">
@@ -898,142 +1148,79 @@ async function cancelProfileProvisioning() {
           </div>
         {/each}
       </div>
-      {#if exportReadinessCells.length}
-        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Export per worker dan profil">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h3 class="text-sm font-extrabold">Kesiapan Export per worker dan profil</h3>
-            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
-          </div>
-          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {#each exportReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
-              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
-              <div class="flex items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Export ${cell.profile} pada ${cell.worker}`}>
-                <span class="font-bold">{cell.profile} · {cell.worker}</span>
-                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
-                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
-                </span>
-                {#if pair.status !== 'ready' && pair.reason_code}
-                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        </div>
-      {/if}
-      {#if quickModeReadinessCells.length}
-        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Quick Mode per worker dan profil">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h3 class="text-sm font-extrabold">Kesiapan Quick Mode per worker dan profil</h3>
-            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
-          </div>
-          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {#each quickModeReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
-              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
-              <div class="flex items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Quick Mode ${cell.profile} pada ${cell.worker}`}>
-                <span class="font-bold">{cell.profile} · {cell.worker}</span>
-                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
-                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
-                </span>
-                {#if pair.status !== 'ready' && pair.reason_code}
-                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        </div>
-      {/if}
-      <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan TTS per worker dan profil">
+      <section class="mt-5 border-t border-[var(--line)] pt-4" aria-label="Kesiapan per worker dan profil">
         <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-sm font-extrabold">Kesiapan TTS per worker dan profil</h3>
-          <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+          <h3 class="text-sm font-extrabold">Kesiapan layanan per worker dan profil</h3>
+          <span class="muted text-xs">Worker → profil</span>
         </div>
-        {#if ttsReadinessCells.length}
-          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {#each ttsReadinessCells as cell (cell.worker + ':' + cell.profile + ':' + cell.runtime)}
-              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
-              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={"TTS " + cell.profile + " pada " + cell.worker}>
-                <span class="font-bold">{cell.profile} · {cell.worker}</span>
-                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
-                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
-                </span>
-                {#if pair.status !== 'ready' && pair.reason_code}
-                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
-                {/if}
+        <div class="mt-3 space-y-3">
+          {#each profileCatalog.workers as worker (worker.name)}
+            {@const workerInventory = profileCatalog.inventories.find((item) => item.worker === worker.name)}
+            {@const resolver = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'resolver')}
+            {@const ttsHelper = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'tts_helper')}
+            {@const quickRuntime = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'quick_mode_runtime')}
+            {@const workerServices = [
+              { name: 'Resolver', result: resolver },
+              { name: 'TorTTS', result: ttsHelper },
+              { name: 'Quick Mode runtime', result: quickRuntime },
+            ]}
+            <article class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3" aria-label={`Worker ${worker.name}`}>
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <h4 class="font-extrabold">Worker {worker.name}</h4>
+                <span class={worker.status === 'success' ? 'font-bold text-emerald-600' : worker.status === 'failed' ? 'font-bold text-rose-600' : 'muted font-bold'}>{workerScanLabel(worker)}</span>
               </div>
-            {/each}
-          </div>
-        {:else}
-          <p class="muted mt-2 text-xs">Belum ada sel kesiapan TTS. Jalankan Scan Profil untuk melihat status helper dan bukti akses.</p>
-        {/if}
-      </div>
-      <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Storage per worker dan profil">
-        <div class="flex flex-wrap items-center justify-between gap-2">
-          <h3 class="text-sm font-extrabold">Kesiapan Storage per worker dan profil</h3>
-          <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
+              <div class="mt-2 grid gap-2 sm:grid-cols-3">
+                {#each workerServices as service (service.name)}
+                  <div class="rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 text-sm" aria-label={`${service.name} worker ${worker.name}`}>
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="font-semibold">{service.name}</span>
+                      <span class={readinessTone(service.result.status)}>{readinessStatusLabel(service.result.status)}</span>
+                    </div>
+                    {#if service.result.status !== 'ready' && service.result.reason_code}
+                      <p class="muted mt-1 text-xs">{codeMessage(service.result.reason_code)}</p>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+              {#if workerInventory}
+                <div class="mt-3 space-y-2 border-l-2 border-[var(--line)] pl-3">
+                  {#each workerInventory.items as profile (profile.name)}
+                    {@const profileServices = [
+                      { name: 'Export', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'export') },
+                      { name: 'Download', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'download') },
+                      { name: 'Upload', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'upload') },
+                      { name: 'Storage', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'storage') },
+                      { name: 'TTS', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'tts') },
+                      { name: 'Quick Mode', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'quick_mode') },
+                    ]}
+                    <section class="rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] p-3" aria-label={`Profil ${profile.name} pada worker ${worker.name}`}>
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <h5 class="font-bold">Profil {profile.name}</h5>
+                        <span class={profile.ready ? 'font-semibold text-emerald-600' : 'font-semibold text-rose-600'}>{profile.ready ? 'Sesi tersedia' : 'Sesi perlu diperiksa'}</span>
+                      </div>
+                      <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+                        {#each profileServices as service (service.name)}
+                          <div class="rounded-md bg-[var(--panel)] px-2 py-1.5 text-xs" aria-label={`${service.name} profil ${profile.name} worker ${worker.name}`}>
+                            <div class="flex items-center justify-between gap-2">
+                              <span>{service.name}</span>
+                              <span class={readinessTone(service.result.status)}>{readinessStatusLabel(service.result.status)}</span>
+                            </div>
+                            {#if service.result.status !== 'ready' && service.result.reason_code}
+                              <p class="muted mt-1">{codeMessage(service.result.reason_code)}</p>
+                            {/if}
+                          </div>
+                        {/each}
+                      </div>
+                    </section>
+                  {/each}
+                </div>
+              {:else if worker.status === 'success'}
+                <p class="muted mt-3 border-l-2 border-[var(--line)] pl-3 text-xs">Worker ini belum mengembalikan profil lokal.</p>
+              {/if}
+            </article>
+          {/each}
         </div>
-        {#if storageReadinessCells.length}
-          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {#each storageReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
-              {@const pair = runtimeReadinessFor(profileCatalog.runtime_readiness, cell.profile, cell.worker, cell.runtime)}
-              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Storage ${cell.profile} pada ${cell.worker}`}>
-                <span class="font-bold">{cell.profile} · {cell.worker}</span>
-                <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
-                  {pair.status === 'ready' ? 'Siap' : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : pair.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
-                </span>
-                {#if pair.status !== 'ready' && pair.reason_code}
-                  <span class="muted w-full text-xs">{codeMessage(pair.reason_code)}</span>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        {:else}
-          <p class="muted mt-2 text-xs">Belum ada sel kesiapan Storage. Jalankan Scan Profil untuk memeriksa lane Upload dan bukti akses tersimpan.</p>
-        {/if}
-      </div>
-      {#if resolverReadinessWorkers.length}
-        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Resolver per worker">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h3 class="text-sm font-extrabold">Kesiapan Resolver per worker</h3>
-            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
-          </div>
-          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {#each resolverReadinessWorkers as worker (worker.name)}
-              {@const resolverReadiness = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'resolver')}
-              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Resolver pada ${worker.name}`}>
-                <span class="font-bold">{worker.name}</span>
-                <span class={resolverReadiness.status === 'ready' ? 'font-bold text-emerald-600' : resolverReadiness.status === 'offline' || resolverReadiness.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
-                  {resolverReadiness.status === 'ready' ? 'Siap' : resolverReadiness.status === 'offline' ? 'Worker offline' : resolverReadiness.status === 'disabled' ? 'Worker nonaktif' : resolverReadiness.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
-                </span>
-                {#if resolverReadiness.status !== 'ready' && resolverReadiness.reason_code}
-                  <span class="muted w-full text-xs">{codeMessage(resolverReadiness.reason_code)}</span>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        </div>
-      {/if}
-      {#if utilityReadinessWorkers.length}
-        <div class="mt-4 border-t border-[var(--line)] pt-3" role="region" aria-label="Kesiapan Utility per worker">
-          <div class="flex flex-wrap items-center justify-between gap-2">
-            <h3 class="text-sm font-extrabold">Kesiapan Utility per worker</h3>
-            <span class="muted text-xs">{checkedAt(profileCatalog.runtime_readiness.checked_at)}</span>
-          </div>
-          <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-            {#each utilityReadinessWorkers as worker (worker.name)}
-              {@const utilityReadiness = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'utility')}
-              <div class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-[var(--panel)] px-3 py-2 text-sm" aria-label={`Utility pada ${worker.name}`}>
-                <span class="font-bold">{worker.name}</span>
-                <span class={utilityReadiness.status === 'ready' ? 'font-bold text-emerald-600' : utilityReadiness.status === 'offline' || utilityReadiness.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>
-                  {utilityReadiness.status === 'ready' ? 'Siap' : utilityReadiness.status === 'offline' ? 'Worker offline' : utilityReadiness.status === 'disabled' ? 'Worker nonaktif' : utilityReadiness.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
-                </span>
-                {#if utilityReadiness.status !== 'ready' && utilityReadiness.reason_code}
-                  <span class="muted w-full text-xs">{codeMessage(utilityReadiness.reason_code)}</span>
-                {/if}
-              </div>
-            {/each}
-          </div>
-        </div>
-      {/if}
+      </section>
     </section>
   {:else}
     <p class="muted mt-3 text-xs" role="status">Belum ada katalog hasil scan tersimpan.</p>

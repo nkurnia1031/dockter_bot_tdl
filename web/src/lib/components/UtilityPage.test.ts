@@ -14,14 +14,14 @@ function readinessResponse(status: 'ready' | 'not_ready' = 'ready') {
   }), { status: 200 });
 }
 
-describe('UtilityPage runtime readiness', () => {
+describe('UtilityPage access controls', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
     sessionStorage.clear();
   });
 
-  it('uses the profile scan snapshot and submits without manual target verification', async () => {
+  it('uses the selected worker and submits without manual target verification', async () => {
     const requests: { url: string; method: string }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -44,7 +44,8 @@ describe('UtilityPage runtime readiness', () => {
 
     await session.restore();
     render(UtilityPage);
-    expect(await screen.findByText('Utility siap')).toBeTruthy();
+    expect(await screen.findByRole('combobox', { name: 'Worker target' })).toBeTruthy();
+    expect(screen.queryByRole('status', { name: 'Kesiapan Utility' })).toBeNull();
     await fireEvent.click(await screen.findByRole('button', { name: 'Pilih' }));
     const submit = screen.getByRole('button', { name: 'Jalankan utility' }) as HTMLButtonElement;
     await waitFor(() => expect(submit.disabled).toBe(false));
@@ -54,9 +55,11 @@ describe('UtilityPage runtime readiness', () => {
     expect(requests.some((item) => item.url.endsWith('/utility/jobs') && item.method === 'POST')).toBe(true);
   });
 
-  it('shows Utility as not ready and prevents submitting until a profile scan succeeds', async () => {
+  it('does not gate Utility on a Profile scan runtime snapshot', async () => {
+    const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
+      requests.push(url);
       if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
         authenticated: true,
         actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
@@ -73,7 +76,11 @@ describe('UtilityPage runtime readiness', () => {
 
     await session.restore();
     render(UtilityPage);
-    expect(await screen.findByText('Utility belum siap')).toBeTruthy();
-    expect((screen.getByRole('button', { name: 'Jalankan utility' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.queryByRole('status', { name: 'Kesiapan Utility' })).toBeNull();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Pilih' }));
+    const submit = screen.getByRole('button', { name: 'Jalankan utility' }) as HTMLButtonElement;
+    await waitFor(() => expect(submit.disabled).toBe(false));
+    await fireEvent.click(submit);
+    expect(requests.some((url) => url.endsWith('/utility/jobs'))).toBe(true);
   });
 });

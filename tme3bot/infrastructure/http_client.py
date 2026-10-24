@@ -10,6 +10,7 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
+    CAP_PROFILE_READINESS_CANARY,
     CAP_JOB_CONTROL,
     CAP_JOB_LOG_SNAPSHOT,
     CAP_QUICKMODE_SCAN,
@@ -583,6 +584,45 @@ class WorkerHttpDispatcher:
             str(record["token"]),
             "GET",
             "/internal/v1/safelink/runtime-readiness",
+            timeout=15,
+        )
+
+    def start_profile_readiness_canary(
+        self, worker: str, profile: str, storage_target: str, tts_target: str
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(
+            worker, {CAP_PROFILE_READINESS_CANARY}, record=record
+        )
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            "/internal/v1/profiles/readiness-canaries",
+            {
+                "profile": str(profile),
+                "storage_target": str(storage_target or ""),
+                "tts_target": str(tts_target or ""),
+            },
+            timeout=15,
+        )
+
+    def profile_readiness_canary(
+        self, worker: str, operation_id: str
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        self._require_capabilities(
+            worker, {CAP_PROFILE_READINESS_CANARY}, record=record
+        )
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "GET",
+            f"/internal/v1/profiles/readiness-canaries/{quote(str(operation_id), safe='')}",
             timeout=15,
         )
 

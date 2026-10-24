@@ -22,6 +22,7 @@ from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
+from tme3bot.infrastructure.profile_scan_store import ProfileScanOperationStore
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.queue_transport import (
@@ -123,6 +124,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     local_profile_catalog = LocalProfileCatalog(
         config.state_file.parent / "local_profile_catalog.json"
     )
+    profile_scan_store = ProfileScanOperationStore(config.storage_db_file)
     runtime_readiness_store = RuntimeReadinessStore(
         config.state_file.parent / "runtime_readiness.json"
     )
@@ -333,6 +335,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         queue_command_service=queue_command_service,
         queue_publisher=queue_publisher,
         local_profile_catalog=local_profile_catalog,
+        profile_scan_store=profile_scan_store,
         runtime_readiness_store=runtime_readiness_store,
         activity_journal=activity_journal,
         decrypt_history_store=decrypt_history_store,

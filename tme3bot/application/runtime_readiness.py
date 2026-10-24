@@ -50,6 +50,20 @@ _STORAGE_RUNTIME_FAILURES = frozenset({
     "CHAT_RESTRICTED",
     "USER_RESTRICTED",
 })
+_DOWNLOAD_RUNTIME_FAILURES = frozenset({
+    *_EXPORT_RUNTIME_FAILURES,
+    "TDL_SESSION_UNAUTHORIZED",
+    "CHAT_WRITE_FORBIDDEN",
+    "CHAT_ADMIN_REQUIRED",
+    "USER_BANNED_IN_CHANNEL",
+    "CHANNEL_PRIVATE",
+    "CHAT_RESTRICTED",
+    "USER_RESTRICTED",
+})
+_UPLOAD_RUNTIME_FAILURES = frozenset({
+    *_STORAGE_RUNTIME_FAILURES,
+    "PROFILE_UPLOAD_PREPARATION_FAILED",
+})
 _TTS_RUNTIME_FAILURES = frozenset({
     "TTS_HELPER_UNAVAILABLE",
     "TTS_RUNTIME_UNAVAILABLE",
@@ -83,6 +97,18 @@ _QUICK_MODE_RUNTIME_FAILURES = frozenset({
     "RCLONE_RUNTIME_UNAVAILABLE",
     "RCLONE_ACCESS_FAILED",
 })
+_QUICK_MODE_WORKER_FAILURES = frozenset({
+    "UTILITY_COMMAND_MISSING",
+    "UTILITY_SCRIPT_MISSING",
+    "UTILITY_SCRIPT_UNREADABLE",
+    "UTILITY_WORKSPACE_UNAVAILABLE",
+    "UTILITY_RUNTIME_UNAVAILABLE",
+    "UTILITY_PROCESS_STALLED",
+    "QUICK_MODE_RUNTIME_UNAVAILABLE",
+    "QUICKMODE_RUNTIME_UNAVAILABLE",
+    "RCLONE_RUNTIME_UNAVAILABLE",
+    "RCLONE_ACCESS_FAILED",
+})
 
 
 class RuntimeReadinessGate:
@@ -95,6 +121,11 @@ class RuntimeReadinessGate:
         return self.require(runtime=_EXPORT_RUNTIME, profile=profile, worker=worker)
 
     def require_quick_mode(self, profile: str, worker: str) -> dict[str, Any]:
+        self.require(runtime="quick_mode_runtime", profile=None, worker=worker)
+        self.require_export(profile, worker)
+        self.require_download(profile, worker)
+        self.require_upload(profile, worker)
+        self.require_storage(profile, worker)
         cell = self.require(
             runtime=_QUICK_MODE_RUNTIME, profile=profile, worker=worker
         )
@@ -118,8 +149,19 @@ class RuntimeReadinessGate:
             )
         return cell
 
+    def require_tts(self, profile: str, worker: str) -> dict[str, Any]:
+        """Require worker helper and profile sender canary evidence."""
+        self.require(runtime="tts_helper", profile=None, worker=worker)
+        return self.require(runtime="tts", profile=profile, worker=worker)
+
     def require_storage(self, profile: str, worker: str) -> dict[str, Any]:
         return self.require(runtime="storage", profile=profile, worker=worker)
+
+    def require_download(self, profile: str, worker: str) -> dict[str, Any]:
+        return self.require(runtime="download", profile=profile, worker=worker)
+
+    def require_upload(self, profile: str, worker: str) -> dict[str, Any]:
+        return self.require(runtime="upload", profile=profile, worker=worker)
 
     def require_resolver(self, worker: str) -> dict[str, Any]:
         """Require persisted worker-only Resolver evidence.
@@ -312,15 +354,24 @@ class RuntimeReadinessGate:
             )
         if code not in _TTS_RUNTIME_FAILURES:
             return False
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        if code in {"TTS_HELPER_UNAVAILABLE", "TTS_RUNTIME_UNAVAILABLE"}:
+            return bool(
+                self.store.invalidate(
+                    worker=worker,
+                    profile=None,
+                    runtime="tts_helper",
+                    reason_code=code,
+                    checked_at=checked_at,
+                )
+            )
         return bool(
             self.store.invalidate(
                 worker=worker,
                 profile=profile,
                 runtime="tts",
                 reason_code=code,
-                checked_at=datetime.now(timezone.utc)
-                .replace(microsecond=0)
-                .isoformat(),
+                checked_at=checked_at,
             )
         )
 
@@ -341,8 +392,7 @@ class RuntimeReadinessGate:
             )
         if code not in _STORAGE_RUNTIME_FAILURES:
             return False
-        return bool(
-            self.store.invalidate(
+        storage = self.store.invalidate(
                 worker=worker,
                 profile=profile,
                 runtime="storage",
@@ -351,7 +401,70 @@ class RuntimeReadinessGate:
                 .replace(microsecond=0)
                 .isoformat(),
             )
+        upload = self.store.invalidate(
+            worker=worker,
+            profile=profile,
+            runtime="upload",
+            reason_code=code,
+            checked_at=datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
         )
+        return bool(storage or upload)
+
+    def record_download_failure(
+        self, *, worker: str, profile: str, error_code: str
+    ) -> bool:
+        code = str(error_code or "").strip().upper()
+        if code in _WORKER_FAILURES:
+            return bool(
+                self.store.mark_worker_failed(
+                    worker=worker,
+                    reason_code=code,
+                    checked_at=datetime.now(timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat(),
+                )
+            )
+        if code not in _DOWNLOAD_RUNTIME_FAILURES:
+            return False
+        return bool(
+            self.store.invalidate(
+                worker=worker,
+                profile=profile,
+                runtime="download",
+                reason_code=code,
+                checked_at=datetime.now(timezone.utc)
+                .replace(microsecond=0)
+                .isoformat(),
+            )
+        )
+
+    def record_upload_failure(
+        self, *, worker: str, profile: str, error_code: str
+    ) -> bool:
+        code = str(error_code or "").strip().upper()
+        if code not in _UPLOAD_RUNTIME_FAILURES:
+            return False
+        upload = self.store.invalidate(
+            worker=worker,
+            profile=profile,
+            runtime="upload",
+            reason_code=code,
+            checked_at=datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+        )
+        storage = self.store.invalidate(
+            worker=worker,
+            profile=profile,
+            runtime="storage",
+            reason_code=code,
+            checked_at=datetime.now(timezone.utc)
+            .replace(microsecond=0)
+            .isoformat(),
+        )
+        return bool(upload or storage)
 
     def record_quick_mode_failure(
         self, *, worker: str, profile: str, error_code: str
@@ -370,15 +483,24 @@ class RuntimeReadinessGate:
             )
         if code not in _QUICK_MODE_RUNTIME_FAILURES:
             return False
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        if code in _QUICK_MODE_WORKER_FAILURES:
+            return bool(
+                self.store.invalidate(
+                    worker=worker,
+                    profile=None,
+                    runtime="quick_mode_runtime",
+                    reason_code=code,
+                    checked_at=checked_at,
+                )
+            )
         return bool(
             self.store.invalidate(
                 worker=worker,
                 profile=profile,
                 runtime=_QUICK_MODE_RUNTIME,
                 reason_code=code,
-                checked_at=datetime.now(timezone.utc)
-                .replace(microsecond=0)
-                .isoformat(),
+                checked_at=checked_at,
             )
         )
 
@@ -416,6 +538,20 @@ class RuntimeReadinessGate:
             reason_code=reason_code,
             checked_at=checked_at,
         )
+        download_invalidated = self.store.invalidate(
+            worker=worker,
+            profile=profile,
+            runtime="download",
+            reason_code=reason_code,
+            checked_at=checked_at,
+        )
+        upload_invalidated = self.store.invalidate(
+            worker=worker,
+            profile=profile,
+            runtime="upload",
+            reason_code=reason_code,
+            checked_at=checked_at,
+        )
         tts_invalidated = self.store.invalidate(
             worker=worker,
             profile=profile,
@@ -450,6 +586,8 @@ class RuntimeReadinessGate:
         )
         return bool(
             export_invalidated
+            or download_invalidated
+            or upload_invalidated
             or tts_invalidated
             or storage_invalidated
             or quick_target_invalidated

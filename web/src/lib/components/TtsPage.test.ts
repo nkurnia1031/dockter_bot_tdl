@@ -39,91 +39,26 @@ describe('TTS page target controls', () => {
     expect(await screen.findByText(/Profil dari Scan Profil: archive: siap/)).toBeTruthy();
   });
 
-  it('verifies a worker sender through an operation and refreshes status manually', async () => {
+  it('uses Profile scan readiness without a per-page TDL access verification action', async () => {
     const requests: { path: string; method: string; body?: Record<string, unknown> }[] = [];
-    let workerReady = false;
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const path = String(input);
       const method = (init?.method || 'GET').toUpperCase();
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
       requests.push({ path, method, body });
       if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [{
-        name: 'local', enabled: true, ready: workerReady,
-        reason_code: workerReady ? 'ready' : 'tdl_access_unverified',
-        helpers: [{ slot: 1, status: 'ready' }],
-        verified_profiles: workerReady ? ['default'] : [],
+        name: 'local', enabled: true, ready: false,
+        reason_code: 'tdl_access_unverified',
+        profiles: [{ profile: 'default', status: 'not_ready', reason_code: 'tdl_access_unverified' }],
       }] }), { status: 200 });
       if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: true }), { status: 200 });
-      if (path.endsWith('/tdl-access/verification') && method === 'POST') {
-        return new Response(JSON.stringify({ operation_id: 'operation-1', status: 'queued', phase: 'queued', job_id: 'verify-job-1' }), { status: 202 });
-      }
-      if (path.endsWith('/operations/operation-1')) {
-        return new Response(JSON.stringify({ operation_id: 'operation-1', status: 'succeeded', phase: 'completed', job_id: 'verify-job-1' }), { status: 200 });
-      }
-      if (path.endsWith('/jobs/verify-job-1')) {
-        return new Response(JSON.stringify({ result: { value: { profiles: [{ profile: 'default', ready: true }] } } }), { status: 200 });
-      }
-      if (path.includes('/tdl-access/verification?')) {
-        workerReady = true;
-        return new Response(JSON.stringify({ worker: 'local', ready: true, profiles: [{ profile: 'default', ready: true }] }), { status: 200 });
-      }
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
     render(TtsPage);
-    await fireEvent.click(await screen.findByRole('button', { name: 'Perbarui bukti akses' }));
-    expect(await screen.findByText(/Operation queued/)).toBeTruthy();
-    await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
-
-    expect(await screen.findByText(/dapat mengirim/)).toBeTruthy();
-    expect(await screen.findByText(/Bukti akses diperbarui\. Jalankan Scan Profil/)).toBeTruthy();
-    await fireEvent.input(screen.getByLabelText('Judul audio'), { target: { value: 'Bab teruji' } });
-    await fireEvent.input(screen.getByLabelText(/Teks/), { target: { value: 'Isi teruji' } });
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Buat job TTS' }).hasAttribute('disabled')).toBe(false));
-    const submitted = requests.find((request) => request.path.endsWith('/tdl-access/verification') && request.method === 'POST');
-    expect(submitted?.body).toEqual({ purpose: 'tts', worker: 'local' });
-  });
-
-  it('shows failed profile details and the redacted TDL command after manual refresh', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
-      const path = String(input);
-      const method = (init?.method || 'GET').toUpperCase();
-      if (path.endsWith('/tts/workers')) return new Response(JSON.stringify({ items: [
-        { name: 'local', enabled: true, ready: false, reason_code: 'tdl_access_unverified', helpers: [] },
-      ] }), { status: 200 });
-      if (path.endsWith('/runtime/secrets')) return new Response(JSON.stringify({ telegram_tts_chat_configured: true }), { status: 200 });
-      if (path.endsWith('/tdl-access/verification') && method === 'POST') {
-        return new Response(JSON.stringify({ operation_id: 'operation-failed', status: 'queued', phase: 'queued', job_id: 'verify-job-failed' }), { status: 202 });
-      }
-      if (path.endsWith('/operations/operation-failed')) {
-        return new Response(JSON.stringify({ operation_id: 'operation-failed', status: 'succeeded', phase: 'completed', job_id: 'verify-job-failed' }), { status: 200 });
-      }
-      if (path.endsWith('/jobs/verify-job-failed')) {
-        return new Response(JSON.stringify({
-          status: 'succeeded',
-          progress: { message: 'Profil default dilewati (TDL_SESSION_DATABASE_MISSING); perintah TDL tidak dijalankan.' },
-          result: { value: {
-            command_template: 'tdl --storage type=bolt,path=<session-database> -n <export-namespace> up -p <temporary-test-file> -c <configured-destination> --caption <temporary-caption-file>',
-            summary: { total: 1, tested: 0, ready: 0, failed: 1 },
-            profiles: [{ profile: 'default', ready: false, session_status: 'unavailable', command_attempted: false, error_code: 'TDL_SESSION_DATABASE_MISSING', error_message: 'Database sesi TDL export profil ini tidak ditemukan pada worker.' }],
-          } },
-        }), { status: 200 });
-      }
-      if (path.includes('/tdl-access/verification?')) {
-        return new Response(JSON.stringify({ worker: 'local', ready: false, profiles: [] }), { status: 200 });
-      }
-      return new Response(JSON.stringify({ items: [] }), { status: 200 });
-    }));
-
-    render(TtsPage);
-    await fireEvent.click(await screen.findByRole('button', { name: 'Perbarui bukti akses' }));
-    await fireEvent.click(await screen.findByRole('button', { name: 'Muat status' }));
-
-    expect(await screen.findByText(/Database sesi TDL export profil ini tidak ditemukan/)).toBeTruthy();
-    expect(screen.getByText(/tdl --storage type=bolt,path=<session-database>/)).toBeTruthy();
-    expect(screen.getByText(/Profil default dilewati/)).toBeTruthy();
-    expect(screen.getByText(/0 profil dapat mengirim dari 1/)).toBeTruthy();
-    expect(screen.getByText(/tidak dijalankan karena sesi/i)).toBeTruthy();
+    expect(await screen.findByText(/Profil dari Scan Profil: default: Belum ada profil yang terverifikasi ke chat tujuan/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Perbarui bukti akses' })).toBeNull();
+    expect(requests.some((request) => request.path.includes('/tdl-access/verification'))).toBe(false);
   });
 
   it('saves the MP3 destination chat ID without exposing the saved value', async () => {

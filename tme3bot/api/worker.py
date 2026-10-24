@@ -43,6 +43,10 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+    canary_operations = getattr(context.executor, "profile_readiness_canaries", None)
+    close_canaries = getattr(canary_operations, "close", None)
+    if callable(close_canaries):
+        app.add_event_handler("shutdown", close_canaries)
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
@@ -193,6 +197,66 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             "PROFILE_INVENTORY_FAILED",
             "Worker tidak dapat membaca inventaris profil lokal.",
         )
+
+    @app.post(
+        "/internal/v1/profiles/readiness-canaries",
+        status_code=202,
+        dependencies=[Depends(authorize)],
+    )
+    def start_profile_readiness_canary(body: dict[str, Any]):
+        if set(body) != {"profile", "storage_target", "tts_target"} or any(
+            not isinstance(body.get(key), str)
+            for key in ("profile", "storage_target", "tts_target")
+        ):
+            raise DomainError(
+                "PROFILE_CANARY_REQUEST_INVALID",
+                "Target canary profil tidak valid.",
+                status_code=422,
+            )
+        start = getattr(context.executor, "start_profile_readiness_canary", None)
+        if not callable(start):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung canary kesiapan profil.",
+                status_code=404,
+            )
+        try:
+            return start(
+                body["profile"], body["storage_target"], body["tts_target"]
+            )
+        except ValueError:
+            raise DomainError(
+                "PROFILE_CANARY_REQUEST_INVALID",
+                "Target canary profil tidak valid.",
+                status_code=422,
+            ) from None
+
+    @app.get(
+        "/internal/v1/profiles/readiness-canaries/{operation_id}",
+        dependencies=[Depends(authorize)],
+    )
+    def get_profile_readiness_canary(operation_id: str):
+        if not re.fullmatch(r"[0-9a-f-]{36}", operation_id):
+            raise DomainError(
+                "PROFILE_CANARY_NOT_FOUND",
+                "Canary kesiapan profil tidak ditemukan.",
+                status_code=404,
+            )
+        get_operation = getattr(context.executor, "profile_readiness_canary", None)
+        if not callable(get_operation):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung canary kesiapan profil.",
+                status_code=404,
+            )
+        operation = get_operation(operation_id)
+        if operation is None:
+            raise DomainError(
+                "PROFILE_CANARY_NOT_FOUND",
+                "Canary kesiapan profil tidak ditemukan.",
+                status_code=404,
+            )
+        return operation
 
     @app.post("/internal/v1/profiles/local/scan", dependencies=[Depends(authorize)])
     def scan_local_profiles():

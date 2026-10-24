@@ -570,9 +570,11 @@ class ControlPlane:
                         profile=execution_profile,
                         error_code=failure.code,
                     )
-                elif kind == "utility":
-                    self.runtime_readiness_gate.record_utility_failure(
-                        worker=selected_worker, error_code=failure.code
+                elif kind == "download":
+                    self.runtime_readiness_gate.record_download_failure(
+                        worker=selected_worker,
+                        profile=execution_profile,
+                        error_code=failure.code,
                     )
                 elif kind == "tts":
                     self.runtime_readiness_gate.record_tts_failure(
@@ -845,15 +847,12 @@ class ControlPlane:
                 self.runtime_readiness_gate.require_quick_mode(profile, worker)
             else:
                 self.runtime_readiness_gate.require_export(profile, worker)
-        elif kind == "utility" and self.runtime_readiness_gate is not None:
-            self.runtime_readiness_gate.require(
-                runtime="utility", profile=None, worker=worker
-            )
         elif kind == "tts" and self.runtime_readiness_gate is not None:
-            self.runtime_readiness_gate.require(
-                runtime="tts", profile=profile, worker=worker
-            )
+            self.runtime_readiness_gate.require_tts(profile, worker)
+        elif kind == "download" and self.runtime_readiness_gate is not None:
+            self.runtime_readiness_gate.require_download(profile, worker)
         elif kind == "storage_upload" and self.runtime_readiness_gate is not None:
+            self.runtime_readiness_gate.require_upload(profile, worker)
             self.runtime_readiness_gate.require_storage(profile, worker)
         elif kind == "safelink_resolve" and self.runtime_readiness_gate is not None:
             self.runtime_readiness_gate.require_resolver(worker)
@@ -863,7 +862,7 @@ class ControlPlane:
             return
         job = self.jobs.get(event.job_id)
         if job is None or job.kind not in {
-            "export", "utility", "tts", "storage_upload", "safelink_resolve"
+            "export", "download", "tts", "storage_upload", "safelink_resolve"
         }:
             return
         error = event.error if isinstance(event.error, dict) else {}
@@ -879,6 +878,13 @@ class ControlPlane:
                 error_code=error_code,
             )
             return
+        if job.kind == "download":
+            self.runtime_readiness_gate.record_download_failure(
+                worker=job.worker,
+                profile=job.profile,
+                error_code=error_code,
+            )
+            return
         if job.kind == "export" and bool(job.payload.get("quick_mode")):
             candidates = [error_code]
             candidates.extend(re.findall(r"\b([A-Z][A-Z0-9_]{0,79})\b", message))
@@ -890,12 +896,7 @@ class ControlPlane:
                 ):
                     break
             return
-        if job.kind == "utility":
-            self.runtime_readiness_gate.record_utility_failure(
-                worker=job.worker,
-                error_code=error_code,
-            )
-        elif job.kind == "tts":
+        if job.kind == "tts":
             command = self.jobs.command_payload(job.id)
             payload = command.get("payload") if isinstance(command, dict) else None
             payload = payload if isinstance(payload, dict) else (
@@ -1403,7 +1404,22 @@ class ControlPlane:
             profile = str(raw.get("profile") or "").strip().lower()
             try:
                 cell = gate.require_storage(profile, worker)
+                upload_cell = gate.require_upload(profile, worker)
             except DomainError:
+                continue
+            upload_fingerprint = str(
+                upload_cell.get("session_fingerprint") or ""
+            ).strip().lower()
+            storage_fingerprint = str(
+                cell.get("session_fingerprint") or ""
+            ).strip().lower()
+            if not upload_fingerprint or storage_fingerprint != upload_fingerprint:
+                runtime_store.invalidate(
+                    worker=worker,
+                    profile=profile,
+                    runtime="storage",
+                    reason_code="PROFILE_UPLOAD_SESSION_CHANGED",
+                )
                 continue
             ready_cells[profile] = cell
         if not ready_cells:
@@ -1575,6 +1591,19 @@ class ControlPlane:
             for sender in profiles
             if sender in fingerprints
         }
+        for sender in tuple(selected_fingerprints):
+            try:
+                upload_cell = gate.require_upload(sender, worker)
+                storage_cell = gate.require_storage(sender, worker)
+            except DomainError:
+                selected_fingerprints.pop(sender, None)
+                continue
+            sender_fingerprint = selected_fingerprints[sender]
+            if (
+                upload_cell.get("session_fingerprint") != sender_fingerprint
+                or storage_cell.get("session_fingerprint") != sender_fingerprint
+            ):
+                selected_fingerprints.pop(sender, None)
         if not selected_fingerprints:
             raise DomainError(
                 "RUNTIME_NOT_READY",
@@ -1945,6 +1974,10 @@ class ControlPlane:
         worker_status = store.worker(normalized_worker)
         if worker_status is None or worker_status.get("status") != "success":
             return {}
+        try:
+            gate.require(runtime="tts_helper", profile=None, worker=normalized_worker)
+        except DomainError:
+            return {}
         destination_fingerprint = access_store.destination_fingerprint(target)
         ready: dict[str, str] = {}
         for cell in store.snapshot().get("cells", []):
@@ -1960,7 +1993,7 @@ class ControlPlane:
             if not profile or not re.fullmatch(r"[a-f0-9]{64}", session_fingerprint):
                 continue
             try:
-                gate.require(runtime="tts", profile=profile, worker=normalized_worker)
+                gate.require_tts(profile, normalized_worker)
             except DomainError:
                 continue
             export_cell = store.cell(normalized_worker, profile, "export")
@@ -2011,6 +2044,11 @@ class ControlPlane:
             )
             enabled = bool(record.get("enabled", True))
             worker_status = gate_store.worker(name) if gate_store is not None else None
+            helper_cell = (
+                gate_store.cell(name, None, "tts_helper")
+                if gate_store is not None
+                else None
+            )
             cells = [
                 cell for cell in gate_store.snapshot().get("cells", [])
                 if cell.get("worker") == name and cell.get("runtime") == "tts"
@@ -2027,6 +2065,10 @@ class ControlPlane:
                 reason = "TTS_CHAT_UNAVAILABLE"
             elif worker_status is not None and worker_status.get("status") == "failed":
                 reason = str(worker_status.get("reason_code") or "WORKER_UNAVAILABLE")
+            elif helper_cell is None or helper_cell.get("status") != "ready":
+                reason = str(
+                    (helper_cell or {}).get("reason_code") or "TTS_HELPER_NOT_SCANNED"
+                )
             elif ready_profiles:
                 reason = "READY"
             elif not cells:
@@ -2048,6 +2090,11 @@ class ControlPlane:
                 elif worker_status is not None and worker_status.get("status") == "failed":
                     profile_status = "offline"
                     profile_reason = str(worker_status.get("reason_code") or "worker_unavailable").lower()
+                elif helper_cell is None or helper_cell.get("status") != "ready":
+                    profile_status = "not_ready"
+                    profile_reason = str(
+                        (helper_cell or {}).get("reason_code") or "tts_helper_not_scanned"
+                    ).lower()
                 elif profile_name in ready_profiles:
                     profile_status = "ready"
                     profile_reason = ""
