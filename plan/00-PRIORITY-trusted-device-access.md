@@ -8,7 +8,7 @@ Task ini adalah **rencana implementasi**, belum menyatakan fitur aktif atau pera
 
 ## Prasyarat
 
-Tidak bergantung pada task 01–22, Redis, atau settings store baru. Kerjakan P0 sebelum task 01. Baca [overview](00-OVERVIEW.md) dan periksa [progres](PROGRESS.md); agent cukup membaca dua dokumen ini untuk melaksanakan P0.
+Tidak bergantung pada task implementasi 01–11, Redis, atau settings store baru. Kerjakan P0 sebelum task 01. Baca [overview](00-OVERVIEW.md) dan periksa [progres](PROGRESS.md); agent cukup membaca dua dokumen ini untuk memahami P0.
 
 Backend menggunakan SQLite auth yang sudah ada. Pendaftaran nyata memerlukan sesi Web terautentikasi dan keputusan pengguna di Pengaturan; implementasi serta test lokal memakai actor/layanan mock.
 
@@ -143,7 +143,7 @@ Kerjakan HANYA task P0: Akses production dari laptop tepercaya.
 Baca plan/00-OVERVIEW.md dan seluruh plan/00-PRIORITY-trusted-device-access.md.
 1. Periksa git status --short, git log -5 --oneline, dan diff baseline.
    Gunakan graphify query untuk relasi auth, lalu source aktual.
-2. Task ini mandiri, tidak membutuhkan Redis/task 01–22. Ikuti seluruh
+2. Task ini mandiri, tidak membutuhkan Redis/task implementasi 01–11. Ikuti seluruh
    Kontrak dan perilaku serta Spesifikasi implementasi di file P0.
 3. Edit hanya allowlist P0 menggunakan apply_patch. Pertahankan Python 3.10,
    SQLite auth existing, Web statis, CSRF, batas actor dan perubahan lokal.
