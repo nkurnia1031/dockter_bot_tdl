@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import shutil
@@ -68,6 +69,16 @@ def _validate_target(origin: str, url: str, *, allow_query: bool = False) -> Non
         raise TrustedDeviceError("URL browser harus memakai origin yang sama dengan credential perangkat.")
 
 
+def _is_loopback_origin(origin: str) -> bool:
+    hostname = urlsplit(origin).hostname or ""
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
 def _read_storage_state(store: TrustedDeviceStore, path: Path) -> dict:
     expected_root = store.states.resolve()
     try:
@@ -123,13 +134,17 @@ def open_trusted_context(
     storage_state: str | Path,
     headless: bool = True,
     executable_path: str | None = None,
+    allow_localhost_tls_errors: bool = False,
 ):
     """Import one helper-issued Playwright state and yield a same-origin browser context.
 
     The helper state file is deleted after import, including when browser startup fails.
     Callers must keep navigation on the pinned origin and must not log cookie data.
+    TLS errors can be ignored only for loopback origins used by local HTTPS tests.
     """
     origin = canonical_origin(origin)
+    if allow_localhost_tls_errors and not _is_loopback_origin(origin):
+        raise TrustedDeviceError("Validasi TLS hanya boleh diabaikan untuk origin localhost.")
     path = Path(storage_state).expanduser()
     store = TrustedDeviceStore(origin)
     state = None
@@ -154,7 +169,10 @@ def open_trusted_context(
                     "Browser Chromium/Chrome tidak dapat dijalankan. Pasang browser Playwright atau atur TME3_TRUSTED_DEVICE_BROWSER."
                 ) from exc
             try:
-                context = browser.new_context(storage_state=state)
+                context = browser.new_context(
+                    storage_state=state,
+                    ignore_https_errors=allow_localhost_tls_errors,
+                )
                 state = None
                 path.unlink(missing_ok=True)
 
@@ -191,6 +209,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--url", help="Same-origin URL; defaults to the authenticated browser-session API")
     parser.add_argument("--browser-executable", help="Chrome/Chromium executable; defaults to installed Chrome/Edge or Playwright Chromium")
     parser.add_argument("--headed", action="store_true", help="Show the browser window")
+    parser.add_argument(
+        "--allow-localhost-tls-errors",
+        action="store_true",
+        help="Allow a self-signed certificate only for a loopback origin used in local tests",
+    )
     args = parser.parse_args(argv)
     try:
         origin = canonical_origin(args.origin)
@@ -201,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
             storage_state=args.state_file,
             headless=not args.headed,
             executable_path=args.browser_executable,
+            allow_localhost_tls_errors=args.allow_localhost_tls_errors,
         ) as context:
             page = context.new_page()
             response = page.goto(target, wait_until="domcontentloaded", timeout=30_000)

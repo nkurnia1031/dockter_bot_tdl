@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
 import os
 import platform
-import shlex
 import socket
 import subprocess
 import sys
@@ -39,11 +37,10 @@ CHROME_CANDIDATES = [
     Path(os.environ.get("PROGRAMFILES", "C:/Program Files")) / "Microsoft/Edge/Application/msedge.exe",
 ]
 CHROME = next((path for path in CHROME_CANDIDATES if path.is_file()), None)
-CERTUTIL = Path(os.environ.get("WINDIR", "C:/Windows")) / "System32/certutil.exe"
 RUN_E2E = os.environ.get("TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E") == "1"
 
 
-def make_test_certificates(folder: Path) -> tuple[Path, Path, Path, Path, str]:
+def make_test_certificates(folder: Path) -> tuple[Path, Path, Path]:
     now = datetime.now(timezone.utc)
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "tme3 local e2e ephemeral CA")])
@@ -75,11 +72,9 @@ def make_test_certificates(folder: Path) -> tuple[Path, Path, Path, Path, str]:
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(ca_key, hashes.SHA256())
     )
-    ca_der = folder / "local-test-ca.cer"
     ca_pem = folder / "local-test-ca.pem"
     server_cert_path = folder / "server-cert.pem"
     server_key_path = folder / "server-key.pem"
-    ca_der.write_bytes(ca_cert.public_bytes(serialization.Encoding.DER))
     ca_pem.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
     server_cert_path.write_bytes(server_cert.public_bytes(serialization.Encoding.PEM))
     server_key_path.write_bytes(
@@ -89,13 +84,12 @@ def make_test_certificates(folder: Path) -> tuple[Path, Path, Path, Path, str]:
             serialization.NoEncryption(),
         )
     )
-    thumbprint = hashlib.sha1(ca_cert.public_bytes(serialization.Encoding.DER)).hexdigest()
-    return ca_der, ca_pem, server_cert_path, server_key_path, thumbprint
+    return ca_pem, server_cert_path, server_key_path
 
 
 @unittest.skipUnless(
-    os.name == "nt" and RUN_E2E and CHROME is not None and CERTUTIL.is_file(),
-    "Set TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E=1; requires Windows, Chrome/Edge and certutil",
+    os.name == "nt" and RUN_E2E and CHROME is not None,
+    "Set TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E=1; requires Windows and Chrome/Edge",
 )
 class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
     def test_helper_state_imports_in_chrome_and_revoke_invalidates_it(self):
@@ -105,7 +99,6 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
         fixture.setUp()
         temp = tempfile.TemporaryDirectory(prefix="tme3-device-e2e-")
         folder = Path(temp.name)
-        ca_thumbprint = None
         server = None
         server_thread = None
         try:
@@ -117,14 +110,7 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
             port_socket.close()
             origin = f"https://127.0.0.1:{port}"
 
-            ca_der, ca_pem, cert_path, key_path, ca_thumbprint = make_test_certificates(folder)
-            imported = subprocess.run(
-                [str(CERTUTIL), "-user", "-addstore", "Root", str(ca_der)],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-            self.assertEqual(imported.returncode, 0, "Could not trust the temporary localhost CA in CurrentUser Root")
+            ca_pem, cert_path, key_path = make_test_certificates(folder)
 
             fixture.context.config.web_cookie_secure = True
             fixture.context.config.web_public_origin = origin
@@ -208,6 +194,7 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
                 origin,
                 "--browser-executable",
                 str(CHROME),
+                "--allow-localhost-tls-errors",
             ]
             first = subprocess.run(
                 runner + ["--state-file", str(first_state)],
@@ -245,16 +232,6 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
                 server.should_exit = True
             if server_thread is not None:
                 server_thread.join(timeout=5)
-            if ca_thumbprint:
-                try:
-                    subprocess.run(
-                        [str(CERTUTIL), "-user", "-delstore", "Root", ca_thumbprint],
-                        capture_output=True,
-                        text=True,
-                        timeout=60,
-                    )
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
             fixture.tearDown()
             temp.cleanup()
 
@@ -266,7 +243,6 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
 class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
     def test_linux_enrollment_v1_and_playwright_session_revocation(self):
         from tests.test_backend_api import BackendApiTests
-        from playwright.sync_api import sync_playwright
 
         fixture = BackendApiTests()
         fixture.setUp()
@@ -283,7 +259,7 @@ class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
             port_socket.close()
             origin = f"https://127.0.0.1:{port}"
 
-            _, ca_pem, cert_path, key_path, _ = make_test_certificates(folder)
+            ca_pem, cert_path, key_path = make_test_certificates(folder)
             fixture.context.config.web_cookie_secure = True
             fixture.context.config.web_public_origin = origin
             fixture.context.device_auth = DeviceAuthService(fixture.auth_repository, fixture.auth, origin)
@@ -343,22 +319,11 @@ class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
                     return Path(result["browser_state_file"])
 
                 first_state = prepare_state()
-                with sync_playwright() as playwright:
-                    chromium = Path(playwright.chromium.executable_path)
-                self.assertTrue(chromium.is_file(), "Playwright Chromium is not installed")
-                browser_wrapper = folder / "chromium-test-wrapper"
-                browser_wrapper.write_text(
-                    "#!/bin/sh\n"
-                    f"exec {shlex.quote(str(chromium))} --ignore-certificate-errors \"$@\"\n",
-                    encoding="utf-8",
-                )
-                browser_wrapper.chmod(0o700)
-
                 with open_trusted_context(
                     origin=origin,
                     storage_state=first_state,
                     headless=True,
-                    executable_path=str(browser_wrapper),
+                    allow_localhost_tls_errors=True,
                 ) as context:
                     page = context.new_page()
                     response = page.goto(
@@ -382,7 +347,7 @@ class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
                     origin=origin,
                     storage_state=second_state,
                     headless=True,
-                    executable_path=str(browser_wrapper),
+                    allow_localhost_tls_errors=True,
                 ) as context:
                     page = context.new_page()
                     response = page.goto(
