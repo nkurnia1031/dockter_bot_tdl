@@ -488,8 +488,8 @@ Di VPS remote baru:
 git clone <repository-url> /www/wwwroot/dockter_bot_tdl
 cd /www/wwwroot/dockter_bot_tdl
 git switch main
-cp .env.worker.example .env.worker
-cp .env.example .env
+touch .env
+cp .env.worker.local.example .env.worker
 ```
 
 Edit `.env.worker`:
@@ -519,7 +519,6 @@ Jika image registry private, login GHCR pada VPS remote dengan permission pull.
 Addon resolver dan helper TTS sudah menjadi bagian stack worker:
 
 ```bash
-cp -n .env.example .env
 docker login ghcr.io
 python3 run.py deploy worker --pull
 docker compose -f docker-compose.worker.yml -f docker-compose.resolver.yml ps

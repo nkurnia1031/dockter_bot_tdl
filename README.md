@@ -48,7 +48,10 @@ dijelaskan di [Pengaturan runtime lewat Web](docs/PENGATURAN_RUNTIME.md).
 ## Setup VPS utama
 
 ```bash
-cp .env.example .env
+cat > .env <<'EOF'
+GATEWAY_DATA_ROOT=/srv/tme3bot/gateway
+LOCAL_WORKER_DATA_ROOT=/srv/tme3bot/worker-local
+EOF
 cp .env.backend.example .env.backend
 cp .env.telegram.example .env.telegram
 cp .env.worker.local.example .env.worker.local
@@ -155,8 +158,8 @@ fingerprint dependency/base berubah, script akan memberi peringatan dan
 Pada VPS worker:
 
 ```bash
-cp -n .env.example .env
-cp -n .env.worker.example .env.worker
+touch .env
+cp -n .env.worker.local.example .env.worker
 python3 run.py deploy worker --pull
 ```
 

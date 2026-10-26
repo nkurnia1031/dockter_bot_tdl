@@ -590,8 +590,8 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
 def require_env_file() -> None:
     if not active_env_file().exists():
         raise RuntimeError(
-            ".env atau env tidak ditemukan. Buat dari .env.example lalu isi "
-            "lokasi data host dan file env tiap role."
+            ".env atau env tidak ditemukan. Buat file interpolasi Compose dan isi "
+            "PROFILE_ROOT, GATEWAY_DATA_ROOT, atau LOCAL_WORKER_DATA_ROOT."
         )
 
 
@@ -1340,7 +1340,7 @@ def migrate_images(env: dict[str, str]) -> Path:
         (
             "worker",
             {
-                "WORKER_ENV_FILE": ".env.worker.example",
+                "WORKER_ENV_FILE": ".env.worker.local.example",
                 # Compose validates runtime volumes even for a build-only
                 # command. The builder does not mount this path; it only keeps
                 # PROFILE_ROOT mandatory for real worker deployments.

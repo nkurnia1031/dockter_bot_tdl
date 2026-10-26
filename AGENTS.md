@@ -399,7 +399,7 @@ git diff --check
   memperbaiki data stale; gunakan preflight submit atau aksi manual reconcile.
 - Jangan mengelompokkan download berdasarkan actor/session navbar; gunakan
   origin profile-worker yang tersimpan pada artifact.
-- README bisa tertinggal; gunakan source code, `.env.example`, dan dokumen ini sebagai konteks aktual.
+- README bisa tertinggal; gunakan source code, file `.env.*.example` yang tersedia, dan dokumen ini sebagai konteks aktual.
 
 Pertahankan Python 3.10/Ubuntu 22.04 compatibility, gunakan `apply_patch`, tambahkan test untuk behavior baru, dan laporkan bila Docker/Go tidak tersedia untuk verifikasi build.
 

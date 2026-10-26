@@ -24,7 +24,7 @@ Tidak ada akses/test production pada penyusunan paket ini. Keadaan deployment te
 | Queue | Job persisten tetapi `profile_queue.py` antrean memori; submit ControlPlane masih dispatch. GET login dapat memicu fase validating. |
 | Web | Polling di JobTable, QuickModePage, ExportPage, Login; Profiles punya perubahan lokal refresh manual. `web/package.json`: pnpm check/test/build. |
 | Settings | `backend_runtime_settings.py` dan `worker/runtime_settings.py` sudah sebagian dinamis; PUT worker masih RPC. `config.py` memerlukan BOT_TOKEN sebelum bootstrap persisten. |
-| ENV | Nama dan consumer runtime ada di `config.py`, `.env.example`, dan konfigurasi compose. Tidak ada task inventaris ENV lanjutan yang aktif. |
+| ENV | Nama dan consumer runtime ada di `config.py`, file `.env.*.example` yang tersedia, dan konfigurasi compose. Tidak ada task inventaris ENV lanjutan yang aktif. |
 
 ## Arsitektur target
 

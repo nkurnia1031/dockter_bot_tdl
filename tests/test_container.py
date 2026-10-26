@@ -26,7 +26,11 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn('test "$(id -u)" = "0"', basefile)
         self.assertIn("! id user1 >/dev/null 2>&1", basefile)
         self.assertNotIn("useradd --create-home --home-dir /home/user1", basefile)
-        for filename in (".env.example", ".env.worker.example", ".env.worker.local.example"):
+        for filename in (
+            ".env.backend.example",
+            ".env.telegram.example",
+            ".env.worker.local.example",
+        ):
             env_example = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
             self.assertNotIn("TDL_EXPORT_USER", env_example)
             self.assertNotIn("TDL_DOWNLOAD_USER", env_example)
@@ -65,7 +69,7 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn('127.0.0.1:${WORKER_PORT:-8080}:${WORKER_PORT:-8080}', worker)
         self.assertIn("APP_ROLE=backend", (PROJECT_ROOT / ".env.backend.example").read_text(encoding="utf-8"))
         self.assertIn("APP_ROLE=telegram", (PROJECT_ROOT / ".env.telegram.example").read_text(encoding="utf-8"))
-        self.assertIn("APP_ROLE=worker", (PROJECT_ROOT / ".env.worker.example").read_text(encoding="utf-8"))
+        self.assertIn("APP_ROLE=worker", (PROJECT_ROOT / ".env.worker.local.example").read_text(encoding="utf-8"))
         self.assertIn("FROM runtime-base AS gateway", dockerfile)
         self.assertIn("FROM runtime-base AS worker", dockerfile)
         self.assertFalse((PROJECT_ROOT / "Dockerfile.web").exists())
@@ -160,7 +164,9 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertNotIn("requirements-browser.txt", names)
         self.assertIn(".env.backend.example", names)
         self.assertIn(".env.telegram.example", names)
-        self.assertIn(".env.worker.example", names)
+        self.assertIn(".env.worker.local.example", names)
+        self.assertNotIn(".env.example", names)
+        self.assertNotIn(".env.worker.example", names)
         self.assertIn("package.json", names)
         self.assertIn("svelte.config.js", names)
         self.assertIn("DEPLOYMENT_RUNBOOK.md", names)
