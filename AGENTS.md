@@ -173,6 +173,11 @@ memiliki field `enabled` dianggap aktif. Error admission yang diharapkan adalah
 - Utility hanya boleh memakai path di dalam `/workspace` setelah `resolve()` dan `relative_to()`.
 - Jangan log password utility.
 
+### Pemisahan tes CI dan production
+
+- GitHub Actions hanya menjalankan tes dengan fixture, data sementara, dan server lokal/terisolasi. Workflow CI tidak boleh mengakses URL production atau memakai credential, sesi browser, maupun cookie production.
+- Tes production hanya boleh dijalankan dari mesin/workspace ini melalui tooling lokal, dan hanya untuk tugas yang secara eksplisit mengizinkan akses production. Jangan menambahkan tes production ke workflow GitHub Actions.
+
 ### Trusted device untuk browser agent
 
 - Gunakan jalur ini hanya jika tugas yang sedang dikerjakan memang mengizinkan

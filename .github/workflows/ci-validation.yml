@@ -1,0 +1,122 @@
+name: Reusable test suite
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend unit and integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile Python sources
+        run: python -m compileall -q tme3bot utility bot.py run.py
+
+      - name: Run backend tests
+        run: python -m unittest discover -s tests -v
+
+  web:
+    name: Web checks, tests, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.20.0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install web dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Check Svelte and TypeScript
+        working-directory: web
+        run: pnpm check
+
+      - name: Run web tests
+        working-directory: web
+        run: pnpm test
+
+      - name: Build static site
+        working-directory: web
+        run: pnpm build
+
+  browser-e2e-linux:
+    name: Trusted-device browser E2E (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install browser test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "playwright==1.64.0"
+          python -m playwright install --with-deps chromium
+
+      - name: Run Linux browser E2E
+        env:
+          TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E: "1"
+        run: python -m unittest tests.test_trusted_device_browser_e2e -v
+
+  browser-e2e-windows:
+    name: Trusted-device browser E2E (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install browser test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "playwright==1.64.0"
+          python -m playwright install chromium
+
+      - name: Run Windows browser E2E
+        env:
+          TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E: "1"
+        run: python -m unittest tests.test_trusted_device_browser_e2e -v

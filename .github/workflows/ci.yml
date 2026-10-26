@@ -1,0 +1,18 @@
+name: CI tests
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-suite:
+    name: Unit, integration, web, and browser E2E
+    uses: ./.github/workflows/ci-validation.yml
