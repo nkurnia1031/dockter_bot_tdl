@@ -1,12 +1,13 @@
 <script lang="ts">
   import CryptoJS from 'crypto-js';
   import { onMount } from 'svelte';
-  import { Check, Clipboard, KeyRound, RotateCcw, ShieldCheck, Trash2, Link, RefreshCw, XCircle } from '@lucide/svelte';
+  import { Check, ChevronLeft, ChevronRight, Clipboard, KeyRound, RotateCcw, ShieldCheck, Trash2, Link, RefreshCw, XCircle } from '@lucide/svelte';
   import { api } from '$lib/api';
 
   const PASSPHRASE = 'root';
   const EXAMPLE = 'a77894319ebfd94509a5db3c280d9aee30d8f20e48773993e3a07eda5632fcf4050a8da670fb4831a28b1f68f6cef20af063b32024485302';
-  const DECRYPT_HISTORY_PAGE_SIZE = 50;
+  const DECRYPT_HISTORY_PAGE_SIZE = 5;
+  type DecryptHistoryPageToken = number | `ellipsis-${number}-${number}`;
   interface DecryptHistoryItem {
     id: string;
     result: string;
@@ -34,9 +35,8 @@
   let decryptHistory = $state<DecryptHistoryItem[]>([]);
   let decryptHistoryError = $state('');
   let decryptHistoryLoading = $state(false);
-  let decryptHistoryLoadingMore = $state(false);
   let decryptHistoryTotal = $state(0);
-  let decryptHistoryNextOffset = $state<number | null>(null);
+  let decryptHistoryPage = $state(1);
   let selectedDecryptHistoryId = $state('');
   let decryptSaving = $state(false);
   let error = $state('');
@@ -66,6 +66,12 @@
   });
   const plaintextLink = $derived(httpLink(plaintext));
   const resolverLink = $derived(httpLink(resolverResult));
+  const decryptHistoryPageCount = $derived(
+    Math.max(1, Math.ceil(decryptHistoryTotal / DECRYPT_HISTORY_PAGE_SIZE))
+  );
+  const decryptHistoryPageTokens = $derived(
+    getDecryptHistoryPageTokens(decryptHistoryPage, decryptHistoryPageCount)
+  );
 
   function httpLink(value: string): string {
     const candidate = value.trim();
@@ -153,10 +159,8 @@
         body: JSON.stringify({ result: decoded })
       });
       if (saved.item) {
-        decryptHistory = [saved.item, ...decryptHistory.filter((item) => item.id !== saved.item.id)];
-        decryptHistoryTotal += 1;
-        if (decryptHistoryNextOffset !== null) decryptHistoryNextOffset += 1;
         selectedDecryptHistoryId = saved.item.id;
+        await loadDecryptHistory(1);
       }
       notice = input.fromParameter ? 'Parameter o berhasil didekripsi dan hasilnya disimpan di riwayat.' : 'Dekripsi selesai dan hasilnya disimpan di riwayat.';
     } catch (cause) {
@@ -168,42 +172,51 @@
     }
   }
 
-  async function loadDecryptHistory(offset = 0) {
-    if (decryptHistoryLoading || decryptHistoryLoadingMore) return;
+  async function loadDecryptHistory(page = decryptHistoryPage) {
+    if (decryptHistoryLoading) return;
+    const targetPage = Math.max(1, Math.floor(page));
+    const offset = (targetPage - 1) * DECRYPT_HISTORY_PAGE_SIZE;
     const knownIds = new Set(decryptHistory.map((item) => item.id));
-    if (offset === 0) decryptHistoryLoading = true;
-    else decryptHistoryLoadingMore = true;
+    decryptHistoryLoading = true;
     try {
       const result = await api<{
         items: DecryptHistoryItem[];
         total: number;
-        next_offset: number | null;
       }>(`/decrypt/history?limit=${DECRYPT_HISTORY_PAGE_SIZE}&offset=${offset}`);
-      if (offset === 0) {
-        const received = result.items || [];
-        const receivedIds = new Set(received.map((item) => item.id));
-        const addedWhileLoading = decryptHistory.filter(
-          (item) => !knownIds.has(item.id) && !receivedIds.has(item.id)
-        );
-        decryptHistory = [...addedWhileLoading, ...received];
-        decryptHistoryTotal = Number(result.total || 0) + addedWhileLoading.length;
-        decryptHistoryNextOffset = result.next_offset === null
-          ? null
-          : Number(result.next_offset || 0) + addedWhileLoading.length;
-      }
-      else {
-        const existingIds = new Set(decryptHistory.map((item) => item.id));
-        decryptHistory = [...decryptHistory, ...(result.items || []).filter((item) => !existingIds.has(item.id))];
-        decryptHistoryTotal = Number(result.total || 0);
-        decryptHistoryNextOffset = result.next_offset ?? null;
-      }
+      const received = result.items || [];
+      const receivedIds = new Set(received.map((item) => item.id));
+      const addedWhileLoading = targetPage === 1
+        ? decryptHistory.filter((item) => !knownIds.has(item.id) && !receivedIds.has(item.id))
+        : [];
+      decryptHistory = [...addedWhileLoading, ...received].slice(0, DECRYPT_HISTORY_PAGE_SIZE);
+      decryptHistoryTotal = Number(result.total || 0) + addedWhileLoading.length;
+      decryptHistoryPage = Math.min(
+        targetPage,
+        Math.max(1, Math.ceil(decryptHistoryTotal / DECRYPT_HISTORY_PAGE_SIZE))
+      );
       decryptHistoryError = '';
     } catch (cause) {
       decryptHistoryError = cause instanceof Error ? cause.message : 'Riwayat hasil dekripsi tidak dapat dimuat.';
     } finally {
       decryptHistoryLoading = false;
-      decryptHistoryLoadingMore = false;
     }
+  }
+
+  function getDecryptHistoryPageTokens(currentPage: number, pageCount: number): DecryptHistoryPageToken[] {
+    const pages = new Set<number>([1, pageCount]);
+    for (let page = currentPage - 1; page <= currentPage + 1; page += 1) {
+      if (page >= 1 && page <= pageCount) pages.add(page);
+    }
+    const sortedPages = [...pages].sort((left, right) => left - right);
+    const tokens: DecryptHistoryPageToken[] = [];
+    sortedPages.forEach((page, index) => {
+      if (index > 0) {
+        const previous = sortedPages[index - 1];
+        if (page - previous > 1) tokens.push(`ellipsis-${previous}-${page}`);
+      }
+      tokens.push(page);
+    });
+    return tokens;
   }
 
   function formatHistoryDate(value: string): string {
@@ -466,10 +479,29 @@
   {:else}
     <p class="muted mt-4 rounded-xl border border-dashed border-[var(--line)] p-4 text-center text-sm">Belum ada hasil dekripsi tersimpan.</p>
   {/if}
-  {#if decryptHistoryNextOffset !== null}
-    <button class="button secondary mt-3" type="button" onclick={() => loadDecryptHistory(decryptHistoryNextOffset ?? 0)} disabled={decryptHistoryLoadingMore}>
-      <RefreshCw size={14} class={decryptHistoryLoadingMore ? 'animate-spin' : ''}/>{decryptHistoryLoadingMore ? 'Memuat…' : 'Muat lebih banyak'}
-    </button>
+  {#if decryptHistoryPageCount > 1}
+    <nav class="mt-4 flex flex-wrap items-center justify-center gap-2" aria-label="Navigasi halaman riwayat dekripsi">
+      <button class="button secondary" type="button" onclick={() => loadDecryptHistory(decryptHistoryPage - 1)} disabled={decryptHistoryLoading || decryptHistoryPage <= 1} aria-label="Sebelumnya">
+        <ChevronLeft size={15}/>Sebelumnya
+      </button>
+      {#each decryptHistoryPageTokens as token (`${token}`)}
+        {#if typeof token === 'number'}
+          <button
+            class={token === decryptHistoryPage ? 'button' : 'button secondary'}
+            type="button"
+            onclick={() => loadDecryptHistory(token)}
+            disabled={decryptHistoryLoading || token === decryptHistoryPage}
+            aria-label={`Halaman ${token}`}
+            aria-current={token === decryptHistoryPage ? 'page' : undefined}
+          >{token}</button>
+        {:else}
+          <span class="muted px-1" aria-hidden="true">…</span>
+        {/if}
+      {/each}
+      <button class="button secondary" type="button" onclick={() => loadDecryptHistory(decryptHistoryPage + 1)} disabled={decryptHistoryLoading || decryptHistoryPage >= decryptHistoryPageCount} aria-label="Berikutnya">
+        Berikutnya<ChevronRight size={15}/>
+      </button>
+    </nav>
   {/if}
 </section>
 

@@ -11,19 +11,25 @@ describe('Decrypt page shortlink resolver', () => {
 
   it('renders decrypted HTTP URLs as clickable links', async () => {
     const requests: { path: string; method: string; body?: Record<string, unknown> }[] = [];
+    let savedHistoryItem: { id: string; result: string; created_at: string } | null = null;
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const path = String(input);
       const method = (init?.method || 'GET').toUpperCase();
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
       requests.push({ path, method, body });
       if (path.includes('/decrypt/history') && method === 'POST') {
-        return new Response(JSON.stringify({ item: {
+        savedHistoryItem = {
           id: 'decrypt-result-1',
           result: 'https://qiwi.gg/file/aHda4057-HDHTIND884',
           created_at: '2026-10-20T00:00:00Z'
-        } }), { status: 201 });
+        };
+        return new Response(JSON.stringify({ item: savedHistoryItem }), { status: 201 });
       }
-      if (path.includes('/decrypt/history')) return new Response(JSON.stringify({ items: [], total: 0, next_offset: null }), { status: 200 });
+      if (path.includes('/decrypt/history')) return new Response(JSON.stringify({
+        items: savedHistoryItem ? [savedHistoryItem] : [],
+        total: savedHistoryItem ? 1 : 0,
+        next_offset: null
+      }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
     render(DecryptPage);
