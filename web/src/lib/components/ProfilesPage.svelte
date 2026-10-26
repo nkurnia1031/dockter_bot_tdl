@@ -775,8 +775,8 @@ async function cancelProfileProvisioning() {
     }
   }
 
-  function deletionIsActive(profile: string) {
-    return deleteOperations.some((operation) => operation.target.worker === selectedWorker
+  function deletionIsActive(profile: string, worker = selectedWorker) {
+    return deleteOperations.some((operation) => operation.target.worker === worker
       && operation.target.profile === profile && isDeleteActive(operation));
   }
 
@@ -826,10 +826,10 @@ async function cancelProfileProvisioning() {
       || `profile-delete-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
 
-  async function deleteProfile(profile: LocalProfile) {
-    const worker = selectedWorker;
-    if (!worker || !profile.deletable || deletionIsActive(profile.name)) return;
+  async function deleteProfile(profile: LocalProfile, worker = selectedWorker) {
+    if (!worker || !profile.deletable || deletionIsActive(profile.name, worker)) return;
     if (typeof window !== 'undefined' && !window.confirm(`Hapus seluruh data profil "${profile.name}" dari worker "${worker}"? Bundle Vault tidak ikut dihapus.`)) return;
+    if (selectedWorker !== worker) selectWorker(worker);
     failure = '';
     notice = '';
     try {
@@ -1196,7 +1196,14 @@ async function cancelProfileProvisioning() {
                     <section class="rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] p-3" aria-label={`Profil ${profile.name} pada worker ${worker.name}`}>
                       <div class="flex flex-wrap items-center justify-between gap-2">
                         <h5 class="font-bold">Profil {profile.name}</h5>
-                        <span class={profile.ready ? 'font-semibold text-emerald-600' : 'font-semibold text-rose-600'}>{profile.ready ? 'Sesi tersedia' : 'Sesi perlu diperiksa'}</span>
+                        <div class="flex flex-wrap items-center gap-2">
+                          <span class={profile.ready ? 'font-semibold text-emerald-600' : 'font-semibold text-rose-600'}>{profile.ready ? 'Sesi tersedia' : 'Sesi perlu diperiksa'}</span>
+                          {#if profile.deletable}
+                            <button class="button secondary" onclick={() => deleteProfile(profile, worker.name)} disabled={deletionIsActive(profile.name, worker.name)} aria-label={`Hapus profil ${profile.name} dari ${worker.name}`}>
+                              <Trash2 size={15}/>{deletionIsActive(profile.name, worker.name) ? 'Menghapus...' : 'Hapus profil'}
+                            </button>
+                          {/if}
+                        </div>
                       </div>
                       <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
                         {#each profileServices as service (service.name)}
@@ -1294,11 +1301,6 @@ async function cancelProfileProvisioning() {
                       <KeyRound size={15}/>{adoptionIsActive(profile.name) ? 'Menyimpan...' : 'Adopsi ke Vault'}
                     </button>
                   {/if}
-                {/if}
-                {#if profile.deletable}
-                  <button class="button secondary" onclick={() => deleteProfile(profile)} disabled={deletionIsActive(profile.name)} aria-label={`Hapus profil ${profile.name} dari ${selectedWorker}`}>
-                    <Trash2 size={15}/>{deletionIsActive(profile.name) ? 'Menghapus...' : 'Hapus profil'}
-                  </button>
                 {/if}
               </div>
             </div>

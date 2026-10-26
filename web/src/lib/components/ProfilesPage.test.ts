@@ -50,6 +50,56 @@ describe('ProfilesPage', () => {
     expect(hierarchy.textContent).toMatch(/Quick Mode runtime Belum dipindai/);
   });
 
+  it('offers delete for a non-default profile directly in its worker group', async () => {
+    const requests: { url: string; method: string }[] = [];
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method });
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'remote-1', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({
+          checked_at: '2026-10-24T05:00:00Z',
+          workers: [{ name: 'remote-1', status: 'success', checked_at: '2026-10-24T05:00:00Z', error_code: '' }],
+          inventories: [{ worker: 'remote-1', checked_at: '2026-10-24T05:00:00Z', items: [{
+            name: 'irang', ready: true, deletable: true, reason_codes: [], checks: [],
+            upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' },
+          }] }],
+          runtime_readiness: {
+            checked_at: '2026-10-24T05:00:00Z',
+            workers: [{ name: 'remote-1', status: 'success' }],
+            cells: [],
+          },
+        }), { status: 200 });
+      }
+      if (url === '/api/v1/operations?limit=100') {
+        return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/management') {
+        return new Response(JSON.stringify({ items: [], workers: [] }), { status: 200 });
+      }
+      if (url === '/api/v1/workers/remote-1/profiles/local/irang' && method === 'DELETE') {
+        return new Response(JSON.stringify({
+          operation_id: 'delete-irang', kind: 'profile.local_delete',
+          target: { worker: 'remote-1', profile: 'irang' }, status: 'queued',
+          phase: 'queued', progress: {}, error: null, created_at: '2026-10-24T05:00:01Z',
+        }), { status: 202 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const deleteButton = await screen.findByRole('button', { name: 'Hapus profil irang dari remote-1' });
+    await fireEvent.click(deleteButton);
+    await waitFor(() => expect(requests).toContainEqual({
+      url: '/api/v1/workers/remote-1/profiles/local/irang', method: 'DELETE',
+    }));
+  });
+
   it('shows durable scan progress and readiness grouped by worker then profile', async () => {
     let scanReads = 0;
     const catalog = {
