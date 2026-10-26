@@ -144,7 +144,7 @@ class TDLClientTests(unittest.TestCase):
         with self.assertRaises(TDLDataError):
             client.resolve_chat_peer("@missing_name")
 
-    @unittest.skipIf(os.name == "nt", "SIGSTOP/SIGCONT process groups are Linux worker behavior")
+    @unittest.skipUnless(sys.platform.startswith("linux"), "SIGSTOP/SIGCONT process groups are Linux worker behavior")
     def test_subprocess_runner_freezes_and_resumes_current_process(self):
         runner = SubprocessRunner()
         ready = threading.Event()
@@ -152,9 +152,9 @@ class TDLClientTests(unittest.TestCase):
         errors = []
 
         def output(line: str) -> None:
-            if "READY" in line:
+            if line.strip() == "READY":
                 ready.set()
-            if "DONE" in line:
+            if line.strip() == "DONE":
                 finished.set()
 
         def run() -> None:
@@ -170,9 +170,25 @@ class TDLClientTests(unittest.TestCase):
         thread.start()
         self.assertTrue(ready.wait(timeout=3))
         self.assertTrue(runner.pause_current())
-        time.sleep(0.5)
-        self.assertFalse(finished.is_set())
-        self.assertTrue(runner.resume_current())
+        process = runner._current_process
+        self.assertIsNotNone(process)
+        deadline = time.monotonic() + 3
+        stopped = False
+        while time.monotonic() < deadline:
+            try:
+                status = Path(f"/proc/{process.pid}/status").read_text(encoding="utf-8")
+            except OSError:
+                break
+            state = next((line for line in status.splitlines() if line.startswith("State:")), "")
+            if "T" in state:
+                stopped = True
+                break
+            time.sleep(0.02)
+        try:
+            self.assertTrue(stopped, "TDL subprocess group did not enter a stopped state")
+            self.assertFalse(finished.is_set())
+        finally:
+            self.assertTrue(runner.resume_current())
         self.assertTrue(finished.wait(timeout=4))
         thread.join(timeout=3)
         self.assertFalse(errors)

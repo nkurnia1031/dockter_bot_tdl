@@ -108,7 +108,6 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
         ca_thumbprint = None
         server = None
         server_thread = None
-        added_ca = False
         try:
             local_app_data = folder / "local-app-data"
             local_app_data.mkdir()
@@ -123,10 +122,9 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
                 [str(CERTUTIL), "-user", "-addstore", "Root", str(ca_der)],
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=60,
             )
             self.assertEqual(imported.returncode, 0, "Could not trust the temporary localhost CA in CurrentUser Root")
-            added_ca = True
 
             fixture.context.config.web_cookie_secure = True
             fixture.context.config.web_public_origin = origin
@@ -247,13 +245,16 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
                 server.should_exit = True
             if server_thread is not None:
                 server_thread.join(timeout=5)
-            if added_ca and ca_thumbprint:
-                subprocess.run(
-                    [str(CERTUTIL), "-user", "-delstore", "Root", ca_thumbprint],
-                    capture_output=True,
-                    text=True,
-                    timeout=20,
-                )
+            if ca_thumbprint:
+                try:
+                    subprocess.run(
+                        [str(CERTUTIL), "-user", "-delstore", "Root", ca_thumbprint],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             fixture.tearDown()
             temp.cleanup()
 

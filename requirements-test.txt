@@ -1,0 +1,3 @@
+# Test-only dependencies for the full backend suite.
+-r requirements-verifier.txt
+PyYAML>=6,<7

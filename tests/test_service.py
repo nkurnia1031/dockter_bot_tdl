@@ -12,6 +12,7 @@ from tme3bot.service import (
 )
 from tme3bot.state import StateStore
 from tme3bot.tdl import ExportResult, parse_tdl_progress_line
+from tme3bot.url_parser import slugify_label
 
 
 class FakeExportTDLClient:
@@ -357,7 +358,7 @@ class ServiceTests(unittest.TestCase):
                 download_client.download_calls[0][1],
                 config.download_root
                 / "berlabel"
-                / download_client.download_calls[0][0].stem,
+                / slugify_label(download_client.download_calls[0][0].stem),
             )
             self.assertEqual(list(config.download_root.glob("**/__warmup")), [])
             self.assertTrue(store.get_source("@testbot").warmup_done)

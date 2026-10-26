@@ -131,6 +131,21 @@ class DurableDispatchTests(unittest.TestCase):
         inventory_hash = self.tdl_access.inventory_fingerprint(["default", "archive"])
         destination_hash = self.tdl_access.destination_fingerprint("123456789")
         for worker in self.workers.names():
+            self.runtime_readiness.upsert_cell(
+                worker=worker,
+                profile=None,
+                runtime="tts_helper",
+                ready=True,
+                fingerprint="e" * 64,
+            )
+            for profile in session_fingerprints:
+                self.runtime_readiness.upsert_cell(
+                    worker=worker,
+                    profile=profile,
+                    runtime="download",
+                    ready=True,
+                    fingerprint="f" * 64,
+                )
             self.tdl_access.replace_results(
                 worker, "tts", destination_hash, inventory_hash,
                 [{"profile": profile, "ready": True} for profile in ("default", "archive")],

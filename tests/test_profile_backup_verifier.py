@@ -81,6 +81,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.archive_instances = []
         (self.parts_dir / self.part_name).write_bytes(self.part_data)
         self.settings.write_text(json.dumps({"compress_password": self.password}), encoding="utf-8")
+        self.settings.chmod(0o600)
         connection = sqlite3.connect(self.database)
         connection.executescript(
             """
