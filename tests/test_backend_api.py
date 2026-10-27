@@ -9,6 +9,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 from cryptography.hazmat.primitives import serialization
@@ -750,6 +751,45 @@ class BackendApiTests(unittest.TestCase):
         self.client.cookies.set("tme3_refresh", pair.refresh_token)
         self.client.cookies.set("tme3_csrf", csrf)
         return {"Origin": "http://testserver", "X-CSRF-Token": csrf}
+
+    def test_multi_status_job_list_queries_repository_once_and_paginates(self):
+        repository = Mock()
+        repository.list.return_value = [
+            Job(
+                id="running-b",
+                kind="export",
+                profile="default",
+                actor_user_id=42,
+                worker="local",
+                status=JobStatus.RUNNING,
+                payload={},
+            )
+        ]
+        repository.count.return_value = 3
+        original_repository = self.control.jobs
+        self.control.jobs = repository
+        try:
+            response = self.client.get(
+                "/api/v1/jobs?scope=global&status=%20QUEUED%20,,running,queued&limit=1",
+                headers=self.login(),
+            )
+        finally:
+            self.control.jobs = original_repository
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(repository.list.call_count, 1)
+        self.assertEqual(repository.count.call_count, 1)
+        self.assertEqual(
+            repository.list.call_args.kwargs["statuses"],
+            ("queued", "running"),
+        )
+        self.assertEqual(
+            repository.count.call_args.kwargs["statuses"],
+            ("queued", "running"),
+        )
+        self.assertEqual(response.json()["items"][0]["id"], "running-b")
+        self.assertEqual(response.json()["total"], 3)
+        self.assertEqual(response.json()["next_offset"], 1)
 
     def test_operations_api_is_idempotent_private_and_actor_scoped(self):
         def prepare(actor, target, input_data):

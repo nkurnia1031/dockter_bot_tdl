@@ -19,6 +19,39 @@ class JobStoreTests(unittest.TestCase):
             payload={"url": "https://t.me/c/1/2"},
         )
 
+    def test_multi_status_listing_paginates_globally_with_stable_ties(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            statuses = (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
+            timestamp = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            expected_ids = []
+
+            for status in statuses:
+                for index in range(205):
+                    job_id = f"{status}-{index:03d}"
+                    expected_ids.append(job_id)
+                    store.create(
+                        Job(
+                            id=job_id,
+                            kind="export",
+                            profile="default",
+                            actor_user_id=7,
+                            worker="local",
+                            status=JobStatus(status),
+                            payload={},
+                            created_at=timestamp,
+                            updated_at=timestamp,
+                        )
+                    )
+
+            page = store.list(statuses=statuses, offset=200, limit=10)
+
+            self.assertEqual(store.count(statuses=statuses), 410)
+            self.assertEqual(
+                [job.id for job in page],
+                sorted(expected_ids, reverse=True)[200:210],
+            )
+
     def test_events_are_idempotent_and_persist_job_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")
