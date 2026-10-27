@@ -192,6 +192,78 @@ class JobStoreTests(unittest.TestCase):
                 flush=True,
             )
 
+    def test_quickmode_limits_returns_all_counters_with_one_select(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            class TracedJobRepository(SqliteJobRepository):
+                def __init__(self, path: Path) -> None:
+                    self.read_statements: list[str] = []
+                    super().__init__(path)
+
+                def _connect(self):
+                    db = super()._connect()
+                    db.set_trace_callback(self._record_statement)
+                    return db
+
+                def _record_statement(self, statement: str) -> None:
+                    if statement.lstrip().upper().startswith(("SELECT", "WITH")):
+                        self.read_statements.append(statement)
+
+            path = Path(temp_dir) / "app.db"
+            store = TracedJobRepository(path)
+            store.read_statements.clear()
+            now = datetime(2026, 10, 27, 12, tzinfo=timezone.utc).isoformat()
+            jobs = [
+                ("local-queued-1", "local", "queued", True),
+                ("local-queued-2", "local", "queued", True),
+                ("local-queued-normal", "local", "queued", False),
+                ("local-active-1", "local", "running", True),
+                ("local-active-2", "local", "dispatched", True),
+                ("remote-queued-1", "remote-1", "queued", True),
+                ("remote-active-1", "remote-1", "running", True),
+            ]
+            with sqlite3.connect(path) as db:
+                db.executemany(
+                    """INSERT INTO jobs(
+                        id, kind, profile, actor_user_id, worker, status,
+                        payload, progress, created_at, updated_at
+                    ) VALUES (?, 'export', 'default', 7, ?, ?, ?, '{}', ?, ?)""",
+                    [
+                        (
+                            job_id,
+                            worker,
+                            status,
+                            json.dumps({"quick_mode": quick_mode}),
+                            now,
+                            now,
+                        )
+                        for job_id, worker, status, quick_mode in jobs
+                    ],
+                )
+                db.executemany(
+                    "INSERT INTO job_quickmode_slots(job_id, worker, acquired_at) VALUES (?, ?, ?)",
+                    [
+                        (job_id, worker, now)
+                        for job_id, worker, status, _ in jobs
+                        if status in {"running", "dispatched"}
+                    ],
+                )
+                db.execute(
+                    "INSERT INTO quickmode_worker_limits(worker, max_concurrent, updated_at) VALUES (?, ?, ?)",
+                    ("local", 3, now),
+                )
+
+            result = store.quickmode_limits(["remote-1", "local", "missing", "local"])
+
+            self.assertEqual(
+                result,
+                [
+                    {"worker": "local", "max_concurrent": 3, "active": 2, "queued": 2},
+                    {"worker": "missing", "max_concurrent": 2, "active": 0, "queued": 0},
+                    {"worker": "remote-1", "max_concurrent": 2, "active": 1, "queued": 1},
+                ],
+            )
+            self.assertEqual(len(store.read_statements), 1)
+
     def test_events_are_idempotent_and_persist_job_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SqliteJobRepository(Path(temp_dir) / "app.db")

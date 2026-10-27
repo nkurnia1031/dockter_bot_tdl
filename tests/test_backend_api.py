@@ -3250,6 +3250,9 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(metrics["queued_jobs"], 1)
         self.assertEqual(metrics["workers"][0]["worker"], "local")
         self.assertEqual(metrics["workers"][0]["status"], "busy")
+        self.assertEqual(metrics["workers"][0]["quickmode_limit"], 2)
+        self.assertEqual(metrics["workers"][0]["quickmode_slots"], 0)
+        self.assertEqual(metrics["workers"][0]["quickmode_queued"], 0)
         self.assertIsNotNone(metrics["average_queue_wait_seconds"])
 
     def test_worker_event_latency_and_phase_timing_are_scoped_to_owner_job(self):
