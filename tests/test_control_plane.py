@@ -375,6 +375,41 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(envelope["dispatch_token"], dispatch_data["dispatch_token"])
         self.assertNotIn("_storage_durable_dispatch", self.dispatcher.commands[-1]["payload"])
 
+    def test_dispatch_uses_saved_progress_cursor_without_loading_event_history(self):
+        job = Job(
+            id="sequence-cursor-dispatch",
+            kind="export",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload={},
+        )
+        self.jobs.create(job)
+        self.jobs.update_progress_snapshot(
+            JobEvent(
+                job_id=job.id,
+                sequence=40,
+                status=JobStatus.QUEUED,
+                event_type="progress_snapshot",
+            )
+        )
+
+        event_history_reads = []
+        original_events = self.jobs.events
+
+        def record_event_history_read(job_id, *, after_sequence=0):
+            event_history_reads.append(job_id)
+            return original_events(job_id, after_sequence=after_sequence)
+
+        self.jobs.events = record_event_history_read
+        self.control._dispatch_admitted_job(
+            self.jobs.get(job.id), {"payload": {}}
+        )
+
+        self.assertEqual(self.dispatcher.commands[-1]["event_sequence_start"], 41)
+        self.assertEqual(event_history_reads, [])
+
     def test_storage_upload_rejects_without_storage_cell_before_creating_job(self):
         self.authorize_quick_mode_storage()
         runtime_store = RuntimeReadinessStore(
