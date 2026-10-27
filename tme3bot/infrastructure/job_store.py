@@ -36,6 +36,32 @@ def _quick_mode_sql(quick_mode: bool | None) -> tuple[str, list[object]]:
     return "", []
 
 
+def _append_status_filter(
+    clauses: list[str],
+    values: list[object],
+    *,
+    status: str | None,
+    statuses: tuple[str, ...] | None,
+) -> None:
+    if statuses is None:
+        if status:
+            clauses.append("status = ?")
+            values.append(status)
+        return
+
+    selected = tuple(dict.fromkeys(value for value in statuses if value))
+    if not selected:
+        return
+    if len(selected) == 1:
+        clauses.append("status = ?")
+        values.append(selected[0])
+        return
+
+    placeholders = ", ".join("?" for _ in selected)
+    clauses.append(f"status IN ({placeholders})")
+    values.extend(selected)
+
+
 def _elapsed_between(started_at: str, finished_at: str) -> float:
     try:
         started = datetime.fromisoformat(str(started_at))
@@ -1362,6 +1388,7 @@ class SqliteJobRepository:
         profile: str | None = None,
         kind: str | None = None,
         status: str | None = None,
+        statuses: tuple[str, ...] | None = None,
         worker: str | None = None,
         quick_mode: bool | None = None,
         archived: bool | None = None,
@@ -1378,9 +1405,7 @@ class SqliteJobRepository:
         if kind:
             clauses.append("kind = ?")
             values.append(kind)
-        if status:
-            clauses.append("status = ?")
-            values.append(status)
+        _append_status_filter(clauses, values, status=status, statuses=statuses)
         if worker:
             clauses.append("worker = ?")
             values.append(worker)
@@ -1397,7 +1422,7 @@ class SqliteJobRepository:
         values.append(max(0, int(offset)))
         with self._db() as db:
             rows = db.execute(
-                f"SELECT * FROM jobs{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM jobs{where} ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
                 values,
             ).fetchall()
         return [job for row in rows if (job := self._job(row)) is not None]
@@ -1428,20 +1453,20 @@ class SqliteJobRepository:
         profile: str | None = None,
         kind: str | None = None,
         status: str | None = None,
+        statuses: tuple[str, ...] | None = None,
         worker: str | None = None,
         quick_mode: bool | None = None,
         archived: bool | None = None,
     ) -> int:
         clauses, values = [], []
-        for column, value in (
-            ("profile", profile),
-            ("kind", kind),
-            ("status", status),
-            ("worker", worker),
-        ):
+        for column, value in (("profile", profile), ("kind", kind)):
             if value:
                 clauses.append(f"{column} = ?")
                 values.append(value)
+        _append_status_filter(clauses, values, status=status, statuses=statuses)
+        if worker:
+            clauses.append("worker = ?")
+            values.append(worker)
         quick_clause, quick_values = _quick_mode_sql(quick_mode)
         if quick_clause:
             clauses.append(quick_clause)

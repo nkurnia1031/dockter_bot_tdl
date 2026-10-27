@@ -55,31 +55,25 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
                 archived=archived,
             )
         else:
-            matching: list[Job] = []
-            total = 0
-            for status_value in dict.fromkeys(status_values):
-                matching.extend(
-                    context.control_plane.jobs.list(
-                        profile=selected_profile,
-                        kind=kind,
-                        status=status_value,
-                        worker=worker,
-                        quick_mode=quick_mode,
-                        archived=archived,
-                        offset=0,
-                        limit=200,
-                    )
-                )
-                total += context.control_plane.jobs.count(
-                    profile=selected_profile,
-                    kind=kind,
-                    status=status_value,
-                    worker=worker,
-                    quick_mode=quick_mode,
-                    archived=archived,
-                )
-            matching.sort(key=lambda item: item.updated_at, reverse=True)
-            items = matching[offset : offset + limit]
+            statuses = tuple(dict.fromkeys(status_values))
+            items = context.control_plane.jobs.list(
+                profile=selected_profile,
+                kind=kind,
+                statuses=statuses,
+                worker=worker,
+                quick_mode=quick_mode,
+                archived=archived,
+                offset=offset,
+                limit=limit,
+            )
+            total = context.control_plane.jobs.count(
+                profile=selected_profile,
+                kind=kind,
+                statuses=statuses,
+                worker=worker,
+                quick_mode=quick_mode,
+                archived=archived,
+            )
         return {
             "items": [job_dict(item) for item in items],
             "total": total,
