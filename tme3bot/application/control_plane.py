@@ -457,9 +457,7 @@ class ControlPlane:
                 or retry_meta.get("retry_phase")
                 or "exporting"
             )
-            sequence = max(
-                (event.sequence for event in self.jobs.events(job_id)), default=0
-            ) + 1
+            sequence = existing.progress_sequence + 1
             retry_event = JobEvent(
                 job_id=job_id,
                 sequence=sequence,
@@ -588,8 +586,10 @@ class ControlPlane:
                         profile=execution_profile,
                         error_code=failure.code,
                     )
-            sequence = max(
-                (event.sequence for event in self.jobs.events(job.id)), default=0
+            latest_job = self.jobs.get(job.id)
+            sequence = (
+                latest_job.progress_sequence if latest_job is not None
+                else job.progress_sequence
             ) + 1
             failed = JobEvent(
                 job_id=job.id,
@@ -1765,7 +1765,7 @@ class ControlPlane:
                 "dispatch_started": False,
             }
             self.jobs.update_command_payload(job.id, stored)
-            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+            sequence = job.progress_sequence + 1
             self.jobs.append_event(JobEvent(
                 job_id=job.id,
                 sequence=sequence,
@@ -1845,7 +1845,7 @@ class ControlPlane:
         )
         if not admission.get("admitted"):
             return {"status": "wait", "reason": "not_ready"}
-        latest = max((item.sequence for item in self.jobs.events(job.id)), default=0)
+        latest = job.progress_sequence
         envelope = {
             "command_id": str(stored["command_id"]),
             "operation_id": str(command.get("operation_id") or ""),
@@ -2358,9 +2358,7 @@ class ControlPlane:
         return sorted(result, key=lambda option: option["name"].lower())
 
     def _dispatch_admitted_job(self, job: Job, command: dict[str, Any]) -> None:
-        sequence = max(
-            (event.sequence for event in self.jobs.events(job.id)), default=0
-        ) + 1
+        sequence = job.progress_sequence + 1
         if job.kind == "storage_upload":
             self._dispatch_storage_upload_command(job, command, sequence)
             return
@@ -2667,6 +2665,10 @@ class ControlPlane:
                         continue
                 admission = self.jobs.try_acquire_execution(queued.id)
                 current = self.jobs.get(queued.id)
+                sequence_cursor = (
+                    current.progress_sequence if current is not None
+                    else queued.progress_sequence
+                )
                 if current is not None and current.status == JobStatus.QUEUED:
                     self.jobs.set_queue_info(
                         queued.id,
@@ -2677,7 +2679,7 @@ class ControlPlane:
                     continue
                 if not isinstance(command_payload, dict):
                     self.jobs.release_execution(queued.id)
-                    sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1
+                    sequence = sequence_cursor + 1
                     self.jobs.append_event(
                         JobEvent(
                             job_id=queued.id,
@@ -2708,14 +2710,12 @@ class ControlPlane:
                 try:
                     pause_kind = str(queued.progress.get("pause_kind") or "")
                     resumed = False
+                    resume_sequence = sequence_cursor + 1
                     if pause_kind == "worker":
                         resume = getattr(self.dispatcher, "resume", None)
                         if callable(resume):
-                            sequence = max(
-                                (event.sequence for event in self.jobs.events(queued.id)),
-                                default=0,
-                            ) + 1
-                            self.jobs.append_event(
+                            sequence = sequence_cursor + 1
+                            resuming_job, _ = self.jobs.append_event(
                                 JobEvent(
                                     job_id=queued.id,
                                     sequence=sequence,
@@ -2724,8 +2724,11 @@ class ControlPlane:
                                     progress={"worker": queued.worker, "position": 1},
                                 )
                             )
-                            command["event_sequence_start"] = sequence + 1
-                            resumed = bool(resume(queued.worker, queued.id, sequence + 1))
+                            resume_sequence = resuming_job.progress_sequence + 1
+                            command["event_sequence_start"] = resume_sequence
+                            resumed = bool(
+                                resume(queued.worker, queued.id, resume_sequence)
+                            )
                     if resumed:
                         continue
                     else:
@@ -2738,20 +2741,21 @@ class ControlPlane:
                             payload["quick_retry"] = retry
                             self.jobs.update_command_payload(queued.id, payload)
                         if pause_kind == "worker":
-                            command["event_sequence_start"] = max(
-                                (event.sequence for event in self.jobs.events(queued.id)),
-                                default=0,
-                            ) + 1
+                            command["event_sequence_start"] = resume_sequence
                             command["payload"] = self._worker_payload(
                                 queued.id, queued.kind, command.get("payload") or {}
                             )
                             self.dispatcher.dispatch(queued.worker, command)
                         else:
-                            self._dispatch_admitted_job(queued, command)
+                            self._dispatch_admitted_job(current or queued, command)
                 except Exception as exc:
                     self.jobs.release_execution(queued.id)
                     failure = self._worker_dispatch_error(queued.worker, exc)
-                    sequence = max((event.sequence for event in self.jobs.events(queued.id)), default=0) + 1
+                    current = self.jobs.get(queued.id)
+                    sequence = (
+                        current.progress_sequence if current is not None
+                        else sequence_cursor
+                    ) + 1
                     self.jobs.append_event(
                         JobEvent(
                             job_id=queued.id,
@@ -2776,12 +2780,9 @@ class ControlPlane:
                 event.job_id,
             )
             return current
-        # A reused job ID keeps its old event history. Events from an older
-        # worker attempt therefore have a sequence at or below the last
-        # persisted event and must not be applied to the new attempt.
-        latest_sequence = max(
-            (item.sequence for item in self.jobs.events(event.job_id)), default=0
-        )
+        # The cursor also covers progress snapshots that are not retained in
+        # job_events, so late events from an older worker attempt remain stale.
+        latest_sequence = current.progress_sequence
         if event.sequence <= latest_sequence:
             return current
         event = self._with_observability(current, event)

@@ -516,16 +516,22 @@ class SqliteOperationStore:
 
     @staticmethod
     def _reset_job_for_retry(db: sqlite3.Connection, job_id: str, now: str) -> None:
-        row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = db.execute(
+            "SELECT status, progress_sequence FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
         if row is None:
             return
         from tme3bot.domain.models import JobStatus
 
         if not JobStatus(str(row["status"])).terminal:
             raise DomainError("JOB_NOT_RETRYABLE", "Job terkait belum selesai.", status_code=409)
-        sequence = int(db.execute(
-            "SELECT COALESCE(MAX(sequence), 0) FROM job_events WHERE job_id=?", (job_id,)
-        ).fetchone()[0])
+        sequence = max(
+            int(row["progress_sequence"] or 0),
+            int(db.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM job_events WHERE job_id=?",
+                (job_id,),
+            ).fetchone()[0]),
+        )
         db.execute(
             """UPDATE jobs SET status='queued', progress=?, result=NULL, error=NULL,
                    progress_sequence=?, archived_at=NULL, updated_at=? WHERE id=?""",

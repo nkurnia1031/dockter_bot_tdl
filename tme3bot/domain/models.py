@@ -106,6 +106,9 @@ class Job:
     created_at: datetime = field(default_factory=utc_now)
     updated_at: datetime = field(default_factory=utc_now)
     settings_version: int = 0
+    # Highest job event/progress sequence observed, including snapshots
+    # that are intentionally not retained in the event history.
+    progress_sequence: int = 0
 
     def ensure_transition(self, target: JobStatus) -> None:
         if target == self.status:

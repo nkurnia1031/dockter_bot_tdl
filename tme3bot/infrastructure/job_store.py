@@ -246,6 +246,20 @@ class SqliteJobRepository:
                 db.execute(
                     "ALTER TABLE jobs ADD COLUMN settings_version INTEGER NOT NULL DEFAULT 0"
                 )
+            db.execute(
+                """
+                UPDATE jobs
+                SET progress_sequence = (
+                    SELECT COALESCE(MAX(sequence), 0)
+                    FROM job_events WHERE job_events.job_id = jobs.id
+                )
+                WHERE status IN ('queued', 'dispatched', 'running', 'paused')
+                  AND progress_sequence < (
+                    SELECT COALESCE(MAX(sequence), 0)
+                    FROM job_events WHERE job_events.job_id = jobs.id
+                  )
+                """
+            )
             plan_columns = {
                 str(row["name"])
                 for row in db.execute(
@@ -302,8 +316,9 @@ class SqliteJobRepository:
                 """
                 INSERT INTO jobs(
                     id, kind, profile, actor_user_id, worker, status, payload,
-                    progress, result, error, archived_at, settings_version, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    progress, result, error, progress_sequence, archived_at,
+                    settings_version, created_at, updated_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -316,6 +331,7 @@ class SqliteJobRepository:
                     _dump(job.progress),
                     _dump(job.result) if job.result is not None else None,
                     _dump(job.error) if job.error is not None else None,
+                    max(0, int(job.progress_sequence)),
                     job.archived_at.isoformat() if job.archived_at else None,
                     max(0, int(job.settings_version)),
                     job.created_at.isoformat(),
@@ -355,13 +371,15 @@ class SqliteJobRepository:
         db.execute(
             """INSERT INTO jobs(
                    id, kind, profile, actor_user_id, worker, status, payload,
-                   progress, result, error, archived_at, settings_version, created_at, updated_at
-               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   progress, result, error, progress_sequence, archived_at,
+                   settings_version, created_at, updated_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job.id, job.kind, job.profile, job.actor_user_id, job.worker,
                 job.status.value, _dump(job.payload), _dump(job.progress),
                 _dump(job.result) if job.result is not None else None,
                 _dump(job.error) if job.error is not None else None,
+                max(0, int(job.progress_sequence)),
                 job.archived_at.isoformat() if job.archived_at else None,
                 max(0, int(job.settings_version)),
                 job.created_at.isoformat(), job.updated_at.isoformat(),
@@ -412,13 +430,15 @@ class SqliteJobRepository:
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT status,settings_version FROM jobs WHERE id = ?", (job_id,)
+                "SELECT status,settings_version,progress_sequence FROM jobs WHERE id = ?",
+                (job_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(f"Unknown job: {job_id}")
             if not JobStatus(str(row["status"])).terminal:
                 raise ValueError("Hanya job terminal yang dapat diulang.")
-            max_sequence = int(
+            max_sequence = max(
+                int(row["progress_sequence"] or 0),
                 db.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM job_events WHERE job_id = ?",
                     (job_id,),
@@ -1618,6 +1638,7 @@ class SqliteJobRepository:
                     result=result,
                     error=error,
                     updated_at=event.created_at,
+                    progress_sequence=max(job.progress_sequence, event.sequence),
                 ),
                 True,
             )
@@ -1655,6 +1676,7 @@ class SqliteJobRepository:
                     status=event.status,
                     progress={**job.progress, **(event.progress or {})},
                     updated_at=event.created_at,
+                    progress_sequence=event.sequence,
                 ),
                 True,
             )
@@ -1720,6 +1742,7 @@ class SqliteJobRepository:
                 else None
             ),
             settings_version=int(row["settings_version"] or 0),
+            progress_sequence=int(row["progress_sequence"] or 0),
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
