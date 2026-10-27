@@ -615,38 +615,49 @@ class SqliteJobRepository:
 
     def quickmode_limits(self, workers: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
         names = sorted({str(item).strip().lower() for item in workers if str(item).strip()})
+        if not names:
+            return []
+        requested_workers = ", ".join("(?)" for _ in names)
         with self._db() as db:
-            limits = {
-                str(row["worker"]): int(row["max_concurrent"])
-                for row in db.execute(
-                    "SELECT worker, max_concurrent FROM quickmode_worker_limits"
-                ).fetchall()
-            }
-            active = {
-                str(row["worker"]): int(row["count"])
-                for row in db.execute(
-                    "SELECT worker, COUNT(*) AS count FROM job_quickmode_slots GROUP BY worker"
-                ).fetchall()
-            }
-            queued = {
-                str(row["worker"]): int(row["count"])
-                for row in db.execute(
-                    """
-                    SELECT worker, COUNT(*) AS count FROM jobs
-                    WHERE status = 'queued'
-                      AND (payload LIKE '%\"quick_mode\":true%' OR payload LIKE '%\"quick_mode\": true%')
-                    GROUP BY worker
-                    """
-                ).fetchall()
-            }
+            rows = db.execute(
+                f"""
+                WITH requested(worker) AS (VALUES {requested_workers}),
+                active AS (
+                    SELECT slots.worker, COUNT(*) AS count
+                    FROM job_quickmode_slots AS slots
+                    JOIN requested ON requested.worker = slots.worker
+                    GROUP BY slots.worker
+                ),
+                queued AS (
+                    SELECT jobs.worker, COUNT(*) AS count
+                    FROM jobs
+                    JOIN requested ON requested.worker = jobs.worker
+                    WHERE jobs.status = 'queued'
+                      AND (jobs.payload LIKE '%\"quick_mode\":true%'
+                           OR jobs.payload LIKE '%\"quick_mode\": true%')
+                    GROUP BY jobs.worker
+                )
+                SELECT requested.worker,
+                    COALESCE(limits.max_concurrent, 2) AS max_concurrent,
+                    COALESCE(active.count, 0) AS active,
+                    COALESCE(queued.count, 0) AS queued
+                FROM requested
+                LEFT JOIN quickmode_worker_limits AS limits
+                    ON limits.worker = requested.worker
+                LEFT JOIN active ON active.worker = requested.worker
+                LEFT JOIN queued ON queued.worker = requested.worker
+                ORDER BY requested.worker
+                """,
+                names,
+            ).fetchall()
         return [
             {
-                "worker": name,
-                "max_concurrent": limits.get(name, 2),
-                "active": active.get(name, 0),
-                "queued": queued.get(name, 0),
+                "worker": str(row["worker"]),
+                "max_concurrent": int(row["max_concurrent"]),
+                "active": int(row["active"]),
+                "queued": int(row["queued"]),
             }
-            for name in names
+            for row in rows
         ]
 
     def set_quickmode_limit(self, worker: str, max_concurrent: int) -> dict[str, Any]:
