@@ -1,6 +1,10 @@
+import json
+import statistics
+import sqlite3
 import tempfile
+import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus
@@ -50,6 +54,142 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(
                 [job.id for job in page],
                 sorted(expected_ids, reverse=True)[200:210],
+            )
+
+    def test_monitor_metrics_reports_fixed_window_and_ci_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.db"
+            store = SqliteJobRepository(path)
+            now = datetime(2026, 10, 27, 12, tzinfo=timezone.utc)
+            old = (now - timedelta(hours=48)).isoformat()
+            recent = (now - timedelta(hours=1)).isoformat()
+            progress = json.dumps(
+                {
+                    "observability": {
+                        "last_event_at": recent,
+                        "event_latency": {"count": 1, "total_ms": 17.0},
+                        "phase_durations_seconds": {"exporting": 1.5},
+                        "phase": "exporting",
+                        "phase_elapsed_seconds": 2.0,
+                    }
+                },
+                separators=(",", ":"),
+            )
+            payload_true = json.dumps({"quick_mode": True}, separators=(",", ":"))
+            payload_false = json.dumps({"quick_mode": False}, separators=(",", ":"))
+            rows = []
+
+            def add_job(
+                job_id: str,
+                status: str,
+                *,
+                profile: str = "default",
+                created_at: str,
+                updated_at: str,
+                archived_at: str | None = None,
+                quick_mode: bool = False,
+            ) -> None:
+                rows.append(
+                    (
+                        job_id,
+                        "export",
+                        profile,
+                        7,
+                        "local",
+                        status,
+                        payload_true if quick_mode else payload_false,
+                        progress,
+                        created_at,
+                        updated_at,
+                        archived_at,
+                    )
+                )
+
+            for index in range(10_000):
+                add_job(
+                    f"old-{index:05d}",
+                    "succeeded",
+                    created_at=old,
+                    updated_at=old,
+                )
+            for index in range(200):
+                add_job(
+                    f"recent-success-{index:03d}",
+                    "succeeded",
+                    created_at=recent,
+                    updated_at=recent,
+                    quick_mode=index % 2 == 0,
+                )
+                add_job(
+                    f"recent-failure-{index:03d}",
+                    "failed",
+                    created_at=recent,
+                    updated_at=recent,
+                    quick_mode=index % 2 == 0,
+                )
+            active_counts = {
+                "queued": 4,
+                "dispatched": 3,
+                "running": 3,
+                "paused": 2,
+            }
+            active_index = 0
+            for status, count in active_counts.items():
+                for index in range(count):
+                    add_job(
+                        f"active-{active_index:03d}",
+                        status,
+                        created_at=old,
+                        updated_at=recent,
+                        quick_mode=index % 2 == 0,
+                    )
+                    active_index += 1
+            for index in range(40):
+                add_job(
+                    f"archived-{index:03d}",
+                    "succeeded",
+                    created_at=recent,
+                    updated_at=recent,
+                    archived_at=recent,
+                )
+            for index in range(500):
+                add_job(
+                    f"other-profile-{index:03d}",
+                    "succeeded",
+                    profile="archive",
+                    created_at=recent,
+                    updated_at=recent,
+                )
+
+            with sqlite3.connect(path) as db:
+                db.executemany(
+                    """INSERT INTO jobs(
+                        id, kind, profile, actor_user_id, worker, status,
+                        payload, progress, created_at, updated_at, archived_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    rows,
+                )
+
+            started = time.perf_counter()
+            snapshot = store.monitor_metrics(profile="default", now=now)
+            first_ms = (time.perf_counter() - started) * 1000
+            samples = []
+            for _ in range(15):
+                started = time.perf_counter()
+                snapshot = store.monitor_metrics(profile="default", now=now)
+                samples.append((time.perf_counter() - started) * 1000)
+
+            self.assertEqual(snapshot["window_hours"], 24)
+            self.assertEqual(snapshot["queued_jobs"], 4)
+            self.assertEqual(snapshot["dispatched_jobs"], 3)
+            self.assertEqual(snapshot["running_jobs"], 3)
+            self.assertEqual(snapshot["paused_jobs"], 2)
+            self.assertEqual(snapshot["event_latency"]["count"], 412)
+            print(
+                "MONITOR_METRICS_BASELINE "
+                f"total_rows={len(rows)} selected_rows=412 iterations={len(samples)} "
+                f"first_ms={first_ms:.3f} median_warm_ms={statistics.median(samples):.3f}",
+                flush=True,
             )
 
     def test_events_are_idempotent_and_persist_job_state(self) -> None:
