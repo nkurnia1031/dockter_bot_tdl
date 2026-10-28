@@ -1554,6 +1554,7 @@ class BackendApiTests(unittest.TestCase):
         cell = self.runtime_readiness_store.cell("local", "default", "tts")
         self.assertEqual(cell["status"], "ready")
         self.assertEqual(cell["session_fingerprint"], "a" * 64)
+        self.assertNotIn("a" * 64, response.text)
         tts_worker = self.runtime_readiness_store.cell("local", None, "tts_helper")
         self.assertEqual(tts_worker["status"], "ready")
         self.assertEqual(self.dispatcher.tts_health_calls, ["local"])

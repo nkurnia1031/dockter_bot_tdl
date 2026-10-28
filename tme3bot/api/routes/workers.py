@@ -463,7 +463,6 @@ def register_workers(app, context, *, current_actor):
                 except Exception:
                     quick_runtime["reason_code"] = "QUICK_MODE_RUNTIME_UNAVAILABLE"
 
-            diagnose = getattr(context.worker_dispatcher, "profile_tdl_diagnostics", None)
             start_canary = getattr(context.worker_dispatcher, "start_profile_readiness_canary", None)
             poll_canary = getattr(context.worker_dispatcher, "profile_readiness_canary", None)
             export_cells: list[dict] = []
@@ -472,7 +471,6 @@ def register_workers(app, context, *, current_actor):
             storage_cells: list[dict] = []
             tts_cells: list[dict] = []
             quickmode_cells: list[tuple[dict, dict]] = []
-            session_fingerprints: dict[str, str] = {}
 
             def safe_checks(raw_checks: object) -> dict[str, dict]:
                 result = {}
@@ -512,37 +510,30 @@ def register_workers(app, context, *, current_actor):
                 profile = str(item.get("name") or "")
                 if operation_id:
                     _report_scan_profile(operation_id, name, profile, "running", phase="session_probe")
+                inventory_ready = item.get("ready") is True
+                raw_reasons = item.get("reason_codes")
+                reason_code = (
+                    next(
+                        (
+                            str(code)
+                            for code in (raw_reasons if isinstance(raw_reasons, list) else [])
+                            if isinstance(code, str)
+                            and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code)
+                        ),
+                        "PROFILE_SESSION_UNAVAILABLE",
+                    )
+                    if not inventory_ready
+                    else ""
+                )
                 ready = False
                 fingerprint = ""
-                reason_code = "PROFILE_SESSION_UNAVAILABLE" if callable(diagnose) else "WORKER_UPDATE_REQUIRED"
-                if callable(diagnose):
-                    try:
-                        result = diagnose(name, profile)
-                    except JsonHttpError as exc:
-                        result = None
-                        if exc.status == 404:
-                            reason_code = "WORKER_UPDATE_REQUIRED"
-                    except Exception:
-                        result = None
-                    if isinstance(result, dict):
-                        raw_reasons = result.get("reason_codes")
-                        reason_code = next((str(code) for code in raw_reasons if isinstance(code, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code)), "PROFILE_SESSION_UNAVAILABLE") if isinstance(raw_reasons, list) else "PROFILE_SESSION_UNAVAILABLE"
-                        raw_fingerprint = str(result.get("fingerprint") or "").strip().lower()
-                        ready = item.get("ready") is True and result.get("ready") is True and bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
-                        fingerprint = raw_fingerprint if ready else ""
-                        if ready:
-                            reason_code = ""
-                        elif result.get("ready") is True and not raw_fingerprint:
-                            reason_code = "PROFILE_FINGERPRINT_MISSING"
-                if ready:
-                    session_fingerprints[profile] = fingerprint
-
                 checks = {
                     key: {"ready": False, "reason_code": reason_code or "PROFILE_CANARY_NOT_RUN"}
                     for key in ("export", "download", "upload", "storage", "tts")
                 }
                 canary_state = {}
-                if ready and storage_target and callable(start_canary) and callable(poll_canary):
+                upload_fingerprint = ""
+                if inventory_ready and storage_target and callable(start_canary) and callable(poll_canary):
                     try:
                         canary_state = start_canary(name, profile, storage_target, tts_target)
                         canary_id = str(canary_state.get("id") or "") if isinstance(canary_state, dict) else ""
@@ -577,9 +568,26 @@ def register_workers(app, context, *, current_actor):
                     for check in checks.values():
                         if not check["ready"] and check["reason_code"] == "PROFILE_CANARY_NOT_RUN":
                             check["reason_code"] = canary_error
-                    canary_fingerprint = str(canary_state.get("session_fingerprint") or "").strip().lower()
-                    if canary_fingerprint != fingerprint:
-                        checks = {key: {"ready": False, "reason_code": "PROFILE_SESSION_CHANGED"} for key in checks}
+                    fingerprint = str(canary_state.get("session_fingerprint") or "").strip().lower()
+                    ready = bool(re.fullmatch(r"[a-f0-9]{64}", fingerprint))
+                    if not ready:
+                        canary_reason = next(
+                            (
+                                check["reason_code"]
+                                for check in checks.values()
+                                if check["reason_code"]
+                                and check["reason_code"] != "PROFILE_CANARY_NOT_RUN"
+                            ),
+                            canary_error,
+                        )
+                        if any(check["ready"] for check in checks.values()):
+                            reason_code = "PROFILE_FINGERPRINT_MISSING"
+                            checks = {
+                                key: {"ready": False, "reason_code": reason_code}
+                                for key in checks
+                            }
+                        else:
+                            reason_code = canary_reason or "PROFILE_SESSION_UNAVAILABLE"
                     upload_fingerprint = str(
                         canary_state.get("upload_session_fingerprint") or ""
                     ).strip().lower()
@@ -590,12 +598,16 @@ def register_workers(app, context, *, current_actor):
                                 "ready": False,
                                 "reason_code": "PROFILE_UPLOAD_SESSION_INVALID",
                             }
-                elif ready:
-                    unavailable = "TDL_ACCESS_TARGET_UNAVAILABLE" if not storage_target else "WORKER_UPDATE_REQUIRED"
-                    checks = {key: {"ready": False, "reason_code": unavailable} for key in checks}
-                    upload_fingerprint = ""
-                else:
-                    upload_fingerprint = ""
+                elif inventory_ready:
+                    reason_code = (
+                        "TDL_ACCESS_TARGET_UNAVAILABLE"
+                        if not storage_target
+                        else "WORKER_UPDATE_REQUIRED"
+                    )
+                    checks = {
+                        key: {"ready": False, "reason_code": reason_code}
+                        for key in checks
+                    }
 
                 if operation_id:
                     _report_scan_profile(
