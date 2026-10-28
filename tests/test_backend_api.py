@@ -1530,11 +1530,16 @@ class BackendApiTests(unittest.TestCase):
                 "code": "OK", "updated_at": "2026-10-23T00:00:00Z",
             },
         }]}
-        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
-            "ready": True,
-            "reason_codes": [],
-            "fingerprint": "a" * 64,
-        }
+
+        def diagnose_profile(worker, profile):
+            self.dispatcher.profile_tdl_diagnostic_calls.append((worker, profile))
+            return {
+                "ready": True,
+                "reason_codes": [],
+                "fingerprint": "a" * 64,
+            }
+
+        self.dispatcher.profile_tdl_diagnostics = diagnose_profile
         self.dispatcher.tts_health_result = {
             "ready": True,
             "helpers_ready": True,
