@@ -1552,6 +1552,10 @@ class BackendApiTests(unittest.TestCase):
         tts_worker = self.runtime_readiness_store.cell("local", None, "tts_helper")
         self.assertEqual(tts_worker["status"], "ready")
         self.assertEqual(self.dispatcher.tts_health_calls, ["local"])
+        self.assertEqual(
+            self.dispatcher.profile_tdl_diagnostic_calls,
+            [("local", "default")],
+        )
         self.assertEqual(len(self.dispatcher.profile_readiness_canary_calls), 1)
         self.assertEqual(self.dispatcher.commands, [])
         self.assertEqual(self.jobs.list(profile="default", limit=20), [])
