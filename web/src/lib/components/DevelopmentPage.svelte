@@ -4,30 +4,43 @@
     GitBranch, ListChecks, ShieldCheck
   } from '@lucide/svelte';
 
-  const backendCandidates = [
+  const completedOptimizations = [
     {
       title: 'Query status job',
-      evidence: 'Monitor aktif refresh tiap 2,5 detik. Empat status saat ini menghasilkan empat operasi list dan empat count.',
-      suggestion: 'Satukan filter status dan pagination global di SQLite; kandidat ini paling konkret untuk diukur lebih dulu.',
-      priority: 'Utama'
+      detail: 'Query multi-status kini memakai satu operasi list dan satu count dengan pagination global serta urutan stabil.',
+      commit: 'be43f9a'
     },
     {
-      title: 'Metrik monitor',
-      evidence: 'Setiap refresh menghitung ulang job aktif dan job 24 jam terakhir, termasuk parse payload dan progress.',
-      suggestion: 'Ukur durasi serta jumlah row sebelum memilih ringkasan inkremental atau pengurangan frekuensi.',
-      priority: 'Ukur dulu'
+      title: 'Metrik batas Quick Mode',
+      detail: 'Pembacaan batas dan counter Quick Mode digabung dari tiga SELECT menjadi satu, dengan hasil yang sama.',
+      commit: '523f39c'
     },
     {
       title: 'Sequence event saat dispatch',
-      evidence: 'Dispatch membaca seluruh event job hanya untuk menemukan sequence tertinggi.',
-      suggestion: 'Baca sequence terbaru langsung dari SQLite dan pastikan retry tetap monoton.',
-      priority: 'Terukur'
+      detail: 'Dispatch mengambil sequence terakhir dari SQLite tanpa memuat seluruh riwayat event job.',
+      commit: '594d66d'
     },
     {
       title: 'Scan Profil',
-      evidence: 'Koordinasi probe, canary, dan penyimpanan snapshot masih banyak berada di route worker.',
-      suggestion: 'Kumpulkan alur scan supaya aturan readiness dan tes fake worker/store lebih terlokalisasi.',
-      priority: 'Struktur'
+      detail: 'Backend memakai diagnosis TDL dari canary sebagai sumber fingerprint, menghilangkan probe diagnosis kedua, dan tetap merahasiakan fingerprint dari respons publik.',
+      commit: 'd65b9ff'
+    }
+  ];
+
+  const nextCandidates = [
+    {
+      title: 'Kerja ulang pada metrik monitor',
+      evidence: 'Monitor aktif refresh tiap 2,5 detik. `monitor_metrics()` masih membaca payload/progress job aktif dan job 24 jam terakhir, mengurai JSON, lalu mengagregasi di Python.',
+      suggestion: 'Ukur durasi query, jumlah row, dan biaya parse di GitHub Actions dengan volume fixture bertingkat. Pilih ringkasan inkremental atau pembacaan lebih sempit hanya jika metrik menunjukkan biaya yang berarti.',
+      source: 'JobTable.svelte · SqliteJobRepository.monitor_metrics()',
+      priority: 'Prioritas berikutnya'
+    },
+    {
+      title: 'Setup koneksi SQLite',
+      evidence: '`SqliteJobRepository._db()` membuka koneksi per operasi dan `_connect()` menjalankan `PRAGMA journal_mode=WAL` pada setiap koneksi.',
+      suggestion: 'Bandingkan biaya koneksi dan PRAGMA pada beban baca/tulis bersamaan. Jika signifikan, pindahkan konfigurasi WAL ke inisialisasi database; pertahankan foreign keys dan batas transaksi per koneksi.',
+      source: 'tme3bot/infrastructure/job_store.py · _db() / _connect()',
+      priority: 'Ukur dulu'
     }
   ];
 </script>
@@ -39,7 +52,7 @@
 
 <header class="flex flex-wrap items-end justify-between gap-4">
   <div>
-    <p class="eyebrow">CATATAN INTERNAL · SNAPSHOT 26 OKTOBER 2026</p>
+    <p class="eyebrow">CATATAN INTERNAL · SNAPSHOT 28 OKTOBER 2026</p>
     <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Pengembangan</h1>
     <p class="muted mt-2 max-w-3xl">Aplikasi sudah stabil. Halaman ini merangkum keputusan penting dan pekerjaan berikutnya untuk tahap deployment awal; isinya catatan, bukan status realtime.</p>
   </div>
@@ -53,8 +66,8 @@
     <div class="grid size-11 shrink-0 place-items-center rounded-xl bg-indigo-100 text-indigo-700 dark:bg-indigo-900 dark:text-indigo-200"><Gauge size={21}/></div>
     <div>
       <p class="eyebrow">SARAN SAYA</p>
-      <h2 id="focus-title" class="mt-1 text-lg font-extrabold">Ukur sebelum mengoptimalkan</h2>
-      <p class="muted mt-1 max-w-3xl text-sm leading-6">Mulai dari query monitor job karena jalurnya berulang dan terlihat jelas di source. Ambil baseline waktu respons serta jumlah operasi database, lalu bandingkan setelah perbaikan. Kandidat di bawah belum menjadi perubahan kode.</p>
+      <h2 id="focus-title" class="mt-1 text-lg font-extrabold">Prioritas berikutnya: ukur metrik monitor</h2>
+      <p class="muted mt-1 max-w-3xl text-sm leading-6">Empat optimasi backend terbaru sudah selesai. Metrik monitor masih mengurai data job setiap refresh 2,5 detik; ukur dulu dengan fixture bertingkat di GitHub Actions sebelum memilih perubahan berikutnya.</p>
     </div>
   </div>
 </section>
@@ -99,20 +112,36 @@
 <section class="card mt-5 p-5 sm:p-6" aria-labelledby="backend-title">
   <div class="flex flex-wrap items-end justify-between gap-3">
     <div>
-      <p class="eyebrow">LAPORAN SOURCE · BELUM BENCHMARK</p>
-      <h2 id="backend-title" class="mt-1 text-xl font-extrabold">Kandidat optimasi backend</h2>
+      <p class="eyebrow">PEMBARUAN 28 OKTOBER 2026 · SOURCE + CI</p>
+      <h2 id="backend-title" class="mt-1 text-xl font-extrabold">Optimasi backend</h2>
     </div>
-    <span class="muted inline-flex items-center gap-1 text-xs"><Clock3 size={14}/>Ditinjau 26 Okt 2026</span>
+    <span class="muted inline-flex items-center gap-1 text-xs"><Clock3 size={14}/>4 perubahan selesai</span>
   </div>
 
+  <h3 class="mt-5 text-sm font-extrabold uppercase tracking-wide text-emerald-700 dark:text-emerald-300">Selesai</h3>
   <div class="mt-4 divide-y divide-[var(--line)]">
-    {#each backendCandidates as candidate, index}
+    {#each completedOptimizations as item, index}
       <article class="grid gap-2 py-4 first:pt-1 last:pb-1 md:grid-cols-[2rem_1fr_auto] md:items-start md:gap-4">
         <span class="grid size-7 place-items-center rounded-lg bg-[var(--surface-soft)] text-xs font-black text-[var(--muted)]">0{index + 1}</span>
         <div>
-          <h3 class="font-bold">{candidate.title}</h3>
+          <h4 class="font-bold">{item.title}</h4>
+          <p class="muted mt-1 text-sm leading-6">{item.detail}</p>
+        </div>
+        <a class="w-fit rounded-full border border-emerald-200 px-2.5 py-1 text-xs font-semibold text-emerald-700 underline dark:border-emerald-900 dark:text-emerald-300" href={`https://github.com/nkurnia1031/dockter_bot_tdl/commit/${item.commit}`} target="_blank" rel="noopener noreferrer">{item.commit}</a>
+      </article>
+    {/each}
+  </div>
+
+  <h3 class="mt-6 text-sm font-extrabold uppercase tracking-wide text-violet-700 dark:text-violet-300">Ide berikutnya</h3>
+  <div class="mt-2 divide-y divide-[var(--line)]">
+    {#each nextCandidates as candidate, index}
+      <article class="grid gap-2 py-4 first:pt-2 last:pb-1 md:grid-cols-[2rem_1fr_auto] md:items-start md:gap-4">
+        <span class="grid size-7 place-items-center rounded-lg bg-[var(--surface-soft)] text-xs font-black text-[var(--muted)]">0{index + 1}</span>
+        <div>
+          <h4 class="font-bold">{candidate.title}</h4>
           <p class="muted mt-1 text-sm leading-6">{candidate.evidence}</p>
           <p class="mt-1 text-sm leading-6"><span class="font-semibold">Arah:</span> {candidate.suggestion}</p>
+          <p class="muted mt-1 font-mono text-xs">Source: {candidate.source}</p>
         </div>
         <span class="w-fit rounded-full border border-[var(--line)] px-2.5 py-1 text-xs font-semibold text-[var(--muted)]">{candidate.priority}</span>
       </article>
@@ -121,6 +150,6 @@
 
   <div class="mt-5 grid gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-4 sm:grid-cols-[auto_1fr] sm:items-center">
     <Database class="text-violet-600 dark:text-violet-300" size={20}/>
-    <p class="muted text-sm leading-6">Angka di sini berasal dari bentuk kode yang dibaca, bukan hasil ukur production. Bandingkan durasi dan jumlah row di data uji yang representatif sebelum memilih cache atau perubahan perilaku.</p>
+    <p class="muted text-sm leading-6">Ide baru adalah hipotesis dari source, bukan benchmark production. Ukur lewat fixture dan data sementara di CI; jangan kirim permintaan uji ke production dari workflow.</p>
   </div>
 </section>
