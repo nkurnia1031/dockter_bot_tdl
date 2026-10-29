@@ -198,6 +198,7 @@ describe('Storage file manager', () => {
   }, 15000);
 
   it('browses rclone read-only under the selected worker and configured readiness snapshot', async () => {
+    enableDialogMethods();
     const requests: { path:string; method:string; url:URL }[] = [];
     const fetcher = vi.fn(async (input:string, init?:RequestInit) => {
       const url = new URL(String(input), 'https://ui.test');
