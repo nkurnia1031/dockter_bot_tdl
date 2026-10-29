@@ -257,7 +257,7 @@
     rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false;
     remoteData={path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0};
   }
-  function openRemoteFolder(path:string) { rclonePath=path; remoteOffset=0; remoteTarget=path; }
+  function openRemoteFolder(path:string) { rclonePath=path; remoteOffset=0; remoteTarget=path; void loadRclone(); }
   async function deliver(item:Item) {
     await post(`/storage/items/${item.id}/deliveries`, {method:'telegram'});
     message=`${item.display_name} dikirim ke Telegram.`;

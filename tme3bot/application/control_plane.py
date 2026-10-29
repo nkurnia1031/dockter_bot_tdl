@@ -366,6 +366,7 @@ class ControlPlane:
                         "Snapshot tujuan upload asli tidak tersedia.",
                         status_code=409,
                     )
+                private_values["tdl_storage_chat_ref"] = target_chat
             elif provider == "telegram":
                 target_chat = self._tdl_access_target("storage")
                 if not target_chat:
