@@ -99,3 +99,17 @@ _Avoid_: salinan state per worker.
 **Rollback sesi**:
 Pemulihan sesi lokal sebelumnya jika bundle baru gagal dipasang atau diuji. Sesi lama hanya boleh dipakai bila masih lolos pemeriksaan TDL dan identitasnya cocok.
 _Avoid_: fallback ke sumber profil lain.
+
+## Utility
+
+**Kumpulan kandidat password arsip**:
+Password unik yang ditemukan selama pemrosesan arsip dalam satu folder pilihan. Kandidat dicoba ulang hanya pada arsip yang belum berhasil di folder yang sama.
+_Avoid_: password bersama lintas folder, password yang ditampilkan di laporan.
+
+**Preview Flatten**:
+Simulasi lengkap perubahan susunan folder pilihan sampai tidak ada tindakan lanjutan. Preview menjadi dasar konfirmasi; perubahan pada salah satu folder membatalkan seluruh batch apply.
+_Avoid_: daftar tindakan parsial, apply atas preview yang sudah stale.
+
+**Flatten folder**:
+Perapian isi direktori dengan menghapus subfolder kosong dan menaikkan isi subfolder yang hanya memiliki satu item. Subfolder dengan lebih dari satu item tetap utuh; benturan nama mendapat nama unik tanpa menimpa data.
+_Avoid_: flatten rekursif tanpa batas, overwrite saat benturan.
