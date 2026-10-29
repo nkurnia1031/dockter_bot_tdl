@@ -203,6 +203,33 @@ describe('ProfilesPage', () => {
     expect(hierarchy.textContent).toContain('Addon Resolver tidak dapat digunakan pada worker.');
   });
 
+  it('shows worker-only rclone Storage readiness saved by Profile scan', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'remote-1', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') {
+        return new Response(JSON.stringify({
+          checked_at: '2026-10-29T05:00:00Z',
+          workers: [{ name: 'remote-1', status: 'success', checked_at: '2026-10-29T05:00:00Z', error_code: '' }],
+          inventories: [{ worker: 'remote-1', checked_at: '2026-10-29T05:00:00Z', items: [] }],
+          runtime_readiness: {
+            checked_at: '2026-10-29T05:00:00Z',
+            workers: [{ name: 'remote-1', status: 'success', checked_at: '2026-10-29T05:00:00Z', reason_code: '' }],
+            cells: [{ worker: 'remote-1', profile: null, runtime: 'rclone_storage', status: 'ready', checked_at: '2026-10-29T05:00:00Z', reason_code: '' }],
+          },
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
+    expect(hierarchy.textContent).toContain('Storage rclone Siap');
+  });
+
   it('shows Quick Mode and Export readiness under their worker profile', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);

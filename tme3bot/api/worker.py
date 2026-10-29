@@ -165,6 +165,25 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             )
         return probe(body["rclone_destination"])
 
+    @app.post("/internal/v1/storage/rclone-runtime-readiness", dependencies=[Depends(authorize)])
+    def rclone_storage_runtime_readiness(body: dict[str, Any]):
+        if set(body) != {"rclone_destination"} or not isinstance(
+            body.get("rclone_destination"), str
+        ):
+            raise DomainError(
+                "RCLONE_READINESS_REQUEST_INVALID",
+                "Tujuan rclone Storage tidak valid.",
+                status_code=422,
+            )
+        probe = getattr(context.executor, "rclone_storage_runtime_readiness", None)
+        if not callable(probe):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pemeriksaan akses Storage rclone.",
+                status_code=404,
+            )
+        return probe(body["rclone_destination"])
+
     @app.get("/internal/v1/safelink/runtime-readiness", dependencies=[Depends(authorize)])
     def safelink_runtime_readiness():
         probe = getattr(context.executor, "safelink_runtime_readiness", None)

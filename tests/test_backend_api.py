@@ -1602,6 +1602,60 @@ class BackendApiTests(unittest.TestCase):
             for item in progress_profile["cleanup"]["items"]
         ))
 
+    def test_profile_scan_persists_rclone_storage_readiness_for_configured_root(self):
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.context.utility_settings.set("rclone_destination", "googledrive:storage")
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default",
+            "ready": True,
+            "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+            "upload_lane": {
+                "status": "ready", "phase": "ready", "progress": 100,
+                "code": "OK", "updated_at": "2026-10-23T00:00:00Z",
+            },
+        }]}
+        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
+            "ready": True, "reason_codes": [], "fingerprint": "a" * 64,
+        }
+        probe_calls = []
+        self.dispatcher.rclone_storage_runtime_readiness = lambda worker, destination: (
+            probe_calls.append((worker, destination))
+            or {"ready": True, "reason_code": "", "fingerprint": "f" * 64}
+        )
+
+        response = self.run_profile_catalog_scan(self.login(42))
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(probe_calls, [("local", "googledrive:storage")])
+        cell = self.runtime_readiness_store.cell("local", None, "rclone_storage")
+        self.assertEqual(cell["status"], "ready")
+        self.assertEqual(
+            cell["destination_fingerprint"],
+            hashlib.sha256(b"googledrive:storage").hexdigest(),
+        )
+        public_cell = next(
+            item for item in response.json()["runtime_readiness"]["cells"]
+            if item["runtime"] == "rclone_storage"
+        )
+        self.assertIsNone(public_cell["profile"])
+        self.assertNotIn("fingerprint", public_cell)
+        self.assertNotIn("destination_fingerprint", public_cell)
+        self.assertNotIn("rclone.conf", response.text)
+
+        self.assertEqual(
+            self.control.runtime_readiness_gate.require_rclone_storage(
+                "local", "googledrive:storage"
+            )["status"],
+            "ready",
+        )
+
     def test_profile_scan_stores_separate_quick_mode_cell_and_private_upload_snapshot(self):
         self.control.runtime_readiness_gate = RuntimeReadinessGate(
             self.runtime_readiness_store

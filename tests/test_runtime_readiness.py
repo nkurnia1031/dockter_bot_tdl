@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -240,6 +241,88 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
             self.assertFalse(gate.record_resolver_failure(
                 worker="local", error_code="SAFELINK_URL_INVALID"
             ))
+
+    def test_rclone_storage_readiness_is_worker_only_and_scoped_to_remote_root(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "runtime-readiness.json"
+            store = RuntimeReadinessStore(path)
+            root = "googledrive:backup"
+            root_fingerprint = hashlib.sha256(root.encode("utf-8")).hexdigest()
+            store.apply_export_scan(
+                checked_at="2026-10-23T10:00:00Z",
+                workers=[
+                    {"worker": "local", "status": "success"},
+                    {"worker": "remote-1", "status": "success"},
+                ],
+                profiles={
+                    "local": [self.make_cell("default", "a" * 64)],
+                    "remote-1": [self.make_cell("default", "b" * 64)],
+                },
+            )
+            store.upsert_cell(
+                worker="local",
+                profile=None,
+                runtime="rclone_storage",
+                ready=True,
+                fingerprint="e" * 64,
+                destination_fingerprint=root_fingerprint,
+                checked_at="2026-10-23T10:05:00Z",
+            )
+            store.upsert_cell(
+                worker="remote-1",
+                profile=None,
+                runtime="rclone_storage",
+                ready=True,
+                fingerprint="f" * 64,
+                destination_fingerprint=root_fingerprint,
+                checked_at="2026-10-23T10:05:00Z",
+            )
+
+            restored = RuntimeReadinessStore(path)
+            gate = RuntimeReadinessGate(restored)
+            self.assertEqual(
+                gate.require_rclone_storage("local", root)["status"], "ready"
+            )
+            cell = gate.require_rclone_storage("remote-1", root)
+            self.assertEqual(cell["status"], "ready")
+            self.assertEqual(cell["destination_fingerprint"], root_fingerprint)
+
+            public_cell = next(
+                item for item in restored.public_snapshot()["cells"]
+                if item["runtime"] == "rclone_storage"
+            )
+            self.assertIsNone(public_cell["profile"])
+            self.assertNotIn("fingerprint", public_cell)
+            self.assertNotIn("destination_fingerprint", public_cell)
+
+            with self.assertRaises(DomainError) as raised:
+                gate.require_rclone_storage("remote-1", "googledrive:other")
+            self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
+            self.assertEqual(
+                raised.exception.details["reason_code"],
+                "RCLONE_DESTINATION_CHANGED",
+            )
+            restored.upsert_cell(
+                worker="remote-1",
+                profile=None,
+                runtime="rclone_storage",
+                ready=False,
+                reason_code="RCLONE_ACCESS_FAILED",
+            )
+            self.assertEqual(
+                restored.cell("remote-1", None, "rclone_storage")["status"],
+                "not_ready",
+            )
+            self.assertEqual(
+                restored.cell("local", None, "rclone_storage")["status"], "ready"
+            )
+            self.assertEqual(
+                restored.cell("local", "default", "export")["status"], "ready"
+            )
+            self.assertEqual(
+                restored.cell("remote-1", "default", "export")["status"],
+                "ready",
+            )
 
     def test_quick_mode_scan_persists_separate_private_cells_and_scopes_invalidation(self):
         with tempfile.TemporaryDirectory() as raw:

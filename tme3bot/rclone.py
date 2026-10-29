@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -46,6 +47,96 @@ class RcloneRunner:
 
     def resume_current(self, owner_job_id: str | None = None) -> bool:
         return self.runner.resume_current(owner_job_id)
+
+    def probe_access(
+        self,
+        destination: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+    ) -> dict[str, object]:
+        """Check read-only access to one configured remote root."""
+        def not_ready(reason_code: str) -> dict[str, object]:
+            return {
+                "ready": False,
+                "reason_code": reason_code,
+                "fingerprint": "",
+                "destination_fingerprint": "",
+            }
+
+        destination = str(destination or "").strip()
+        try:
+            validate_rclone_destination(destination)
+        except ValueError:
+            return not_ready("RCLONE_RUNTIME_UNAVAILABLE")
+
+        config = Path(config_path).resolve()
+        allowed_root = Path(config_root).resolve()
+        try:
+            config.relative_to(allowed_root)
+        except ValueError:
+            return not_ready("RCLONE_RUNTIME_UNAVAILABLE")
+        if not config.is_file():
+            return not_ready("RCLONE_RUNTIME_UNAVAILABLE")
+
+        binary = shutil.which("rclone")
+        if binary is None:
+            return not_ready("RCLONE_RUNTIME_UNAVAILABLE")
+
+        try:
+            config_bytes = config.read_bytes()
+            binary_path = Path(binary).resolve()
+            binary_stat = binary_path.stat()
+        except OSError:
+            return not_ready("RCLONE_RUNTIME_UNAVAILABLE")
+
+        command = [
+            "rclone",
+            "lsf",
+            destination,
+            "--max-depth",
+            "1",
+            "--config",
+            str(config),
+            "--log-level",
+            "ERROR",
+        ]
+        try:
+            result = self.runner.run(
+                command,
+                log_prefix="rclone-storage-readiness",
+                output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except (TDLStalledError, TDLCommandError):
+            return not_ready("RCLONE_ACCESS_FAILED")
+        except OSError:
+            return not_ready("RCLONE_RUNTIME_UNAVAILABLE")
+        if result.returncode != 0:
+            return not_ready(
+                self._access_error_code(result) or "RCLONE_ACCESS_FAILED"
+            )
+
+        evidence = {
+            "runtime": "rclone-storage-readiness-v1",
+            "destination": destination,
+            "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "binary_path": str(binary_path),
+            "binary_size": binary_stat.st_size,
+            "binary_mtime_ns": binary_stat.st_mtime_ns,
+        }
+        encoded = json.dumps(
+            evidence, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return {
+            "ready": True,
+            "reason_code": "",
+            "fingerprint": hashlib.sha256(encoded).hexdigest(),
+            "destination_fingerprint": hashlib.sha256(
+                destination.encode("utf-8")
+            ).hexdigest(),
+        }
 
     @staticmethod
     def _command_output(result) -> str:

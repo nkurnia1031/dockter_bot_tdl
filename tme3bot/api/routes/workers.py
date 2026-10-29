@@ -335,7 +335,7 @@ def register_workers(app, context, *, current_actor):
 
     def _scan_profile_worker(
         name: str, operation_id: str = ""
-    ) -> tuple[str, dict | None, str, dict, dict, list[dict], list[dict], dict, list[dict], list[dict]]:
+    ) -> tuple[str, dict | None, str, dict, dict, list[dict], list[dict], dict, dict, list[dict], list[dict]]:
         try:
             if operation_id:
                 _report_scan_worker(
@@ -462,6 +462,63 @@ def register_workers(app, context, *, current_actor):
                     quick_runtime["reason_code"] = "WORKER_UPDATE_REQUIRED" if exc.status == 404 else "QUICK_MODE_RUNTIME_UNAVAILABLE"
                 except Exception:
                     quick_runtime["reason_code"] = "QUICK_MODE_RUNTIME_UNAVAILABLE"
+
+            rclone_storage_readiness = {
+                "ready": False,
+                "reason_code": "WORKER_UPDATE_REQUIRED",
+                "fingerprint": "",
+                "destination_fingerprint": "",
+            }
+            rclone_storage_probe = getattr(
+                context.worker_dispatcher,
+                "rclone_storage_runtime_readiness",
+                None,
+            )
+            if callable(rclone_storage_probe):
+                try:
+                    raw_rclone_storage = rclone_storage_probe(name, rclone_destination)
+                    if (
+                        isinstance(raw_rclone_storage, dict)
+                        and type(raw_rclone_storage.get("ready")) is bool
+                    ):
+                        raw_fingerprint = str(
+                            raw_rclone_storage.get("fingerprint") or ""
+                        ).strip().lower()
+                        reason_code = str(
+                            raw_rclone_storage.get("reason_code")
+                            or "RCLONE_ACCESS_FAILED"
+                        )
+                        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", reason_code):
+                            reason_code = "RCLONE_ACCESS_FAILED"
+                        has_fingerprint = bool(
+                            re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint)
+                        )
+                        ready = raw_rclone_storage["ready"] is True and has_fingerprint
+                        rclone_storage_readiness = {
+                            "ready": ready,
+                            "reason_code": "" if ready else (
+                                "RCLONE_FINGERPRINT_MISSING"
+                                if raw_rclone_storage["ready"] is True
+                                and not has_fingerprint
+                                else reason_code
+                            ),
+                            "fingerprint": raw_fingerprint if ready else "",
+                            "destination_fingerprint": (
+                                rclone_destination_fingerprint if ready else ""
+                            ),
+                        }
+                    else:
+                        rclone_storage_readiness["reason_code"] = (
+                            "RCLONE_ACCESS_FAILED"
+                        )
+                except JsonHttpError as exc:
+                    rclone_storage_readiness["reason_code"] = (
+                        "WORKER_UPDATE_REQUIRED"
+                        if exc.status == 404
+                        else "RCLONE_ACCESS_FAILED"
+                    )
+                except Exception:
+                    rclone_storage_readiness["reason_code"] = "RCLONE_ACCESS_FAILED"
 
             start_canary = getattr(context.worker_dispatcher, "start_profile_readiness_canary", None)
             poll_canary = getattr(context.worker_dispatcher, "profile_readiness_canary", None)
@@ -693,14 +750,18 @@ def register_workers(app, context, *, current_actor):
                         session_fingerprints=storage_sender_fingerprints,
                     )
 
-            return name, inventory, "", tts_readiness, quick_runtime, tts_cells, storage_cells, resolver_readiness, download_cells, upload_cells
+            return (
+                name, inventory, "", tts_readiness, quick_runtime, tts_cells,
+                storage_cells, resolver_readiness, rclone_storage_readiness,
+                download_cells, upload_cells,
+            )
         except DomainError as exc:
             code = exc.code if re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", exc.code) else "WORKER_SCAN_FAILED"
             if operation_id:
                 _report_scan_worker(
                     operation_id, name, "failed", phase="failed", error_code=code
                 )
-            return name, None, code, {}, {}, [], [], {}, [], []
+            return name, None, code, {}, {}, [], [], {}, {}, [], []
         except Exception:
             if operation_id:
                 _report_scan_worker(
@@ -710,7 +771,7 @@ def register_workers(app, context, *, current_actor):
                     phase="failed",
                     error_code="WORKER_UNAVAILABLE",
                 )
-            return name, None, "WORKER_UNAVAILABLE", {}, {}, [], [], {}, [], []
+            return name, None, "WORKER_UNAVAILABLE", {}, {}, [], [], {}, {}, [], []
 
     def _perform_profile_catalog_scan(store, operation_id: str = "") -> dict:
         records = context.worker_registry.list()
@@ -751,10 +812,15 @@ def register_workers(app, context, *, current_actor):
                     for name in scan_names
                 }
                 for future in as_completed(futures):
-                    name, inventory, error_code, tts_readiness, quick_runtime, tts_cells, storage_cells, resolver_readiness, download_cells, upload_cells = future.result()
+                    (
+                        name, inventory, error_code, tts_readiness, quick_runtime,
+                        tts_cells, storage_cells, resolver_readiness,
+                        rclone_storage_readiness, download_cells, upload_cells,
+                    ) = future.result()
                     results[name] = (
                         inventory, error_code, tts_readiness, quick_runtime,
                         tts_cells, storage_cells, resolver_readiness,
+                        rclone_storage_readiness,
                         download_cells, upload_cells,
                     )
                     if operation_id:
@@ -774,10 +840,15 @@ def register_workers(app, context, *, current_actor):
         readiness_quickmode: dict[str, list[dict]] = {}
         readiness_storage: dict[str, list[dict]] = {}
         readiness_resolver: dict[str, dict] = {}
+        readiness_rclone_storage: dict[str, dict] = {}
         readiness_download: dict[str, list[dict]] = {}
         readiness_upload: dict[str, list[dict]] = {}
         for name in scan_names:
-            inventory, error_code, tts_worker, quickmode_worker, tts_cells, storage_cells, resolver_readiness, download_cells, upload_cells = results[name]
+            (
+                inventory, error_code, tts_worker, quickmode_worker, tts_cells,
+                storage_cells, resolver_readiness, rclone_storage_readiness,
+                download_cells, upload_cells,
+            ) = results[name]
             if inventory is None:
                 workers.append({
                     "name": name,
@@ -798,6 +869,7 @@ def register_workers(app, context, *, current_actor):
             readiness_quickmode[name] = []
             readiness_storage[name] = storage_cells
             readiness_resolver[name] = resolver_readiness
+            readiness_rclone_storage[name] = rclone_storage_readiness
             readiness_download[name] = download_cells
             readiness_upload[name] = upload_cells
             safe_items = []
@@ -916,6 +988,21 @@ def register_workers(app, context, *, current_actor):
                 apply_resolver_scan(
                     checked_at=checked_at,
                     workers=readiness_resolver,
+                )
+            for name, readiness in readiness_rclone_storage.items():
+                runtime_store.upsert_cell(
+                    worker=name,
+                    profile=None,
+                    runtime="rclone_storage",
+                    ready=readiness.get("ready") is True,
+                    fingerprint=str(readiness.get("fingerprint") or ""),
+                    destination_fingerprint=str(
+                        readiness.get("destination_fingerprint") or ""
+                    ),
+                    reason_code=str(
+                        readiness.get("reason_code") or "RCLONE_ACCESS_FAILED"
+                    ),
+                    checked_at=checked_at,
                 )
         return _profile_catalog_response(snapshot)
 

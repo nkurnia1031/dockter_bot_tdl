@@ -25,6 +25,7 @@ class FakeExecutor:
         self.runtime_updates = []
         self.utility_probe_calls = 0
         self.quickmode_probe_destinations = []
+        self.rclone_storage_probe_destinations = []
         self.safelink_probe_calls = 0
         self.profile_readiness_canary_requests = []
         self.profile_readiness_canary_status = {
@@ -85,6 +86,15 @@ class FakeExecutor:
     def quickmode_runtime_readiness(self, destination):
         self.quickmode_probe_destinations.append(destination)
         return {"ready": True, "reason_code": "", "fingerprint": "b" * 64}
+
+    def rclone_storage_runtime_readiness(self, destination):
+        self.rclone_storage_probe_destinations.append(destination)
+        return {
+            "ready": True,
+            "reason_code": "",
+            "fingerprint": "d" * 64,
+            "destination_fingerprint": "e" * 64,
+        }
 
     def safelink_runtime_readiness(self):
         self.safelink_probe_calls += 1
@@ -338,6 +348,33 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(self.executor.quickmode_probe_destinations, ["googledrive:backup"])
+
+    def test_rclone_storage_readiness_is_worker_authenticated_and_target_scoped(self):
+        path = "/internal/v1/storage/rclone-runtime-readiness"
+        body = {"rclone_destination": "googledrive:storage"}
+
+        denied = self.client.post(path, json=body)
+        self.assertEqual(denied.status_code, 401)
+
+        headers = {"Authorization": "Bearer worker-secret"}
+        ready = self.client.post(path, headers=headers, json=body)
+        self.assertEqual(ready.status_code, 200, ready.text)
+        self.assertTrue(ready.json()["ready"])
+        self.assertEqual(
+            self.executor.rclone_storage_probe_destinations,
+            ["googledrive:storage"],
+        )
+
+        invalid = self.client.post(
+            path,
+            headers=headers,
+            json={**body, "token": "must-not-be-forwarded"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(
+            self.executor.rclone_storage_probe_destinations,
+            ["googledrive:storage"],
+        )
 
     def test_profile_readiness_canary_start_and_poll_require_worker_auth(self):
         payload = {

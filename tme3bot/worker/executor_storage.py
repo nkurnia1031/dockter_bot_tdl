@@ -393,6 +393,19 @@ class StorageExecutorMixin:
             with self._lock:
                 self._rclone_runners.pop(job_id, None)
 
+    def rclone_storage_runtime_readiness(
+        self, destination: str
+    ) -> dict[str, object]:
+        """Probe the selected rclone root using a read-only worker command."""
+        config_path = Path(
+            getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+        ).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        runner = RcloneRunner(stall_timeout_seconds=30)
+        return runner.probe_access(
+            str(destination or ""), config_path, config_root=config_root
+        )
+
     def _storage_upload(
         self,
         command: dict[str, Any],

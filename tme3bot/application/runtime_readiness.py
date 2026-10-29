@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from typing import Any
 
@@ -8,6 +9,7 @@ from tme3bot.domain.models import DomainError
 _EXPORT_RUNTIME = "export"
 _QUICK_MODE_RUNTIME = "quick_mode"
 _RESOLVER_RUNTIME = "resolver"
+_RCLONE_STORAGE_RUNTIME = "rclone_storage"
 _EXPORT_RUNTIME_FAILURES = frozenset({
     "PROFILE_SESSION_BUSY",
     "PROFILE_SESSION_DATABASE_MISSING",
@@ -203,6 +205,31 @@ class RuntimeReadinessGate:
                     "profile": None,
                     "runtime": _RESOLVER_RUNTIME,
                     "reason_code": reason,
+                },
+            )
+        return cell
+
+    def require_rclone_storage(
+        self, worker: str, destination: str
+    ) -> dict[str, Any]:
+        """Require a worker-only snapshot for the configured rclone root."""
+        cell = self.require(
+            runtime=_RCLONE_STORAGE_RUNTIME, profile=None, worker=worker
+        )
+        expected_fingerprint = hashlib.sha256(
+            str(destination or "").strip().encode("utf-8")
+        ).hexdigest()
+        if cell.get("destination_fingerprint") != expected_fingerprint:
+            normalized_worker = str(worker or "").strip().lower()
+            raise DomainError(
+                "RUNTIME_NOT_READY",
+                f"Root rclone pada worker {normalized_worker} berbeda dari snapshot Scan Profil. Jalankan Scan Profil.",
+                status_code=409,
+                details={
+                    "worker": normalized_worker,
+                    "profile": None,
+                    "runtime": _RCLONE_STORAGE_RUNTIME,
+                    "reason_code": "RCLONE_DESTINATION_CHANGED",
                 },
             )
         return cell

@@ -515,6 +515,7 @@ class RuntimeReadinessStore:
         ready: bool,
         fingerprint: str = "",
         session_fingerprint: str = "",
+        destination_fingerprint: str = "",
         reason_code: str = "",
         checked_at: str | None = None,
     ) -> bool:
@@ -529,6 +530,9 @@ class RuntimeReadinessStore:
             normalized_session_fingerprint
         ):
             normalized_session_fingerprint = ""
+        normalized_destination_fingerprint = _safe_fingerprint(
+            destination_fingerprint
+        )
         is_ready = bool(ready and _FINGERPRINT_RE.fullmatch(normalized_fingerprint))
         cell = {
             "worker": key[0],
@@ -539,7 +543,9 @@ class RuntimeReadinessStore:
             "reason_code": "" if is_ready else _reason(reason_code, "RUNTIME_NOT_READY"),
             "fingerprint": normalized_fingerprint if is_ready else "",
             "session_fingerprint": normalized_session_fingerprint if is_ready else "",
-            "destination_fingerprint": "",
+            "destination_fingerprint": (
+                normalized_destination_fingerprint if is_ready else ""
+            ),
         }
         with self._lock:
             self._load_locked()

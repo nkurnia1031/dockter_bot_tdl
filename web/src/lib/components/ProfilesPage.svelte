@@ -127,6 +127,9 @@ let savingProvisioning = $state(false);
     WORKER_UPDATE_REQUIRED: 'Worker perlu diperbarui untuk membaca inventaris profil.',
     RESOLVER_RUNTIME_UNAVAILABLE: 'Addon Resolver tidak dapat digunakan pada worker.',
     RESOLVER_FINGERPRINT_MISSING: 'Bukti kesiapan Resolver tidak lengkap.',
+    RCLONE_ACCESS_FAILED: 'Worker tidak dapat mengakses root rclone. Periksa izin dan koneksi remote.',
+    RCLONE_FINGERPRINT_MISSING: 'Bukti akses root rclone tidak lengkap.',
+    RCLONE_DESTINATION_CHANGED: 'Root rclone berubah sejak Scan Profil terakhir.',
     UTILITY_COMMAND_MISSING: 'Perintah pendukung Utility tidak tersedia pada worker.',
     UTILITY_SCRIPT_MISSING: 'Script Utility tidak ditemukan pada worker.',
     UTILITY_SCRIPT_UNREADABLE: 'Script Utility tidak dapat dibaca pada worker.',
@@ -1159,9 +1162,11 @@ async function cancelProfileProvisioning() {
             {@const resolver = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'resolver')}
             {@const ttsHelper = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'tts_helper')}
             {@const quickRuntime = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'quick_mode_runtime')}
+            {@const rcloneStorage = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'rclone_storage')}
             {@const workerServices = [
               { name: 'Resolver', result: resolver },
               { name: 'TorTTS', result: ttsHelper },
+              { name: 'Storage rclone', result: rcloneStorage },
               { name: 'Quick Mode runtime', result: quickRuntime },
             ]}
             <article class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3" aria-label={`Worker ${worker.name}`}>
@@ -1169,7 +1174,7 @@ async function cancelProfileProvisioning() {
                 <h4 class="font-extrabold">Worker {worker.name}</h4>
                 <span class={worker.status === 'success' ? 'font-bold text-emerald-600' : worker.status === 'failed' ? 'font-bold text-rose-600' : 'muted font-bold'}>{workerScanLabel(worker)}</span>
               </div>
-              <div class="mt-2 grid gap-2 sm:grid-cols-3">
+              <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
                 {#each workerServices as service (service.name)}
                   <div class="rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 text-sm" aria-label={`${service.name} worker ${worker.name}`}>
                     <div class="flex items-center justify-between gap-2">

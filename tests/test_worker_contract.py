@@ -81,6 +81,25 @@ class WorkerContractTests(unittest.TestCase):
             timeout=15,
         )
 
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_rclone_storage_readiness_uses_worker_and_configured_root(self, request):
+        request.return_value = {"ready": True, "fingerprint": "d" * 64}
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        result = dispatcher.rclone_storage_runtime_readiness(
+            "remote", "googledrive:storage"
+        )
+
+        self.assertTrue(result["ready"])
+        request.assert_called_once_with(
+            "http://worker.test",
+            "worker-token",
+            "POST",
+            "/internal/v1/storage/rclone-runtime-readiness",
+            {"rclone_destination": "googledrive:storage"},
+            timeout=45,
+        )
+
     def test_local_profile_inventory_dispatch_classifies_timeout_network_and_worker_error(self):
         dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
         with patch(

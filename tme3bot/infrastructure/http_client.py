@@ -575,6 +575,21 @@ class WorkerHttpDispatcher:
             timeout=15,
         )
 
+    def rclone_storage_runtime_readiness(
+        self, worker: str, rclone_destination: str
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            "/internal/v1/storage/rclone-runtime-readiness",
+            {"rclone_destination": str(rclone_destination or "")},
+            timeout=45,
+        )
+
     def safelink_runtime_readiness(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

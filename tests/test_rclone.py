@@ -1,6 +1,7 @@
+import hashlib
+import json
 import tempfile
 import unittest
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,6 +23,77 @@ class FakeSubprocessRunner:
 
 
 class RcloneRunnerTests(unittest.TestCase):
+    def test_probe_access_reads_config_and_remote_without_mutating_or_exposing_secrets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text(
+                "[googledrive]\ntoken = private-test-token\n", encoding="utf-8"
+            )
+            binary = workspace / "bin" / "rclone"
+            binary.parent.mkdir()
+            binary.write_bytes(b"fake-rclone-binary")
+            subprocess_runner = FakeSubprocessRunner()
+
+            with patch("tme3bot.rclone.shutil.which", return_value=str(binary)):
+                result = RcloneRunner(subprocess_runner).probe_access(
+                    "googledrive:backup",
+                    config,
+                    config_root=workspace,
+                )
+
+            self.assertTrue(result["ready"])
+            self.assertEqual(result["reason_code"], "")
+            self.assertRegex(result["fingerprint"], r"^[a-f0-9]{64}$")
+            self.assertEqual(
+                result["destination_fingerprint"],
+                hashlib.sha256(b"googledrive:backup").hexdigest(),
+            )
+            self.assertNotIn("private-test-token", repr(result))
+            self.assertEqual(len(subprocess_runner.commands), 1)
+            command = subprocess_runner.commands[0][0]
+            self.assertEqual(command[:3], ["rclone", "lsf", "googledrive:backup"])
+            self.assertEqual(command[command.index("--max-depth") + 1], "1")
+            self.assertEqual(
+                command[command.index("--config") + 1], str(config.resolve())
+            )
+            self.assertFalse(
+                any(
+                    value in {"copy", "copyto", "mkdir", "move", "delete"}
+                    for value in command
+                )
+            )
+
+    def test_probe_access_reports_remote_failure_without_returning_command_output(self):
+        class AccessDeniedRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout="",
+                    stderr="403 Forbidden token=private-test-token",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            config = workspace / ".config" / "rclone.conf"
+            config.parent.mkdir()
+            config.write_text("[googledrive]\n", encoding="utf-8")
+            binary = workspace / "bin" / "rclone"
+            binary.parent.mkdir()
+            binary.write_bytes(b"fake-rclone-binary")
+
+            with patch("tme3bot.rclone.shutil.which", return_value=str(binary)):
+                result = RcloneRunner(AccessDeniedRunner()).probe_access(
+                    "googledrive:backup", config, config_root=workspace
+                )
+
+            self.assertFalse(result["ready"])
+            self.assertEqual(result["reason_code"], "RCLONE_ACCESS_FAILED")
+            self.assertEqual(result["fingerprint"], "")
+            self.assertNotIn("private-test-token", repr(result))
+
     def test_upload_remote_access_failure_has_stable_runtime_code(self):
         class AccessDeniedRunner(FakeSubprocessRunner):
             def run(self, command, **kwargs):
