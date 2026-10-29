@@ -40,6 +40,18 @@ _Avoid_: pengguna TDL.
 Storage sesi khusus untuk mengirim file Storage. Lane ini terpisah dari lane Export dan Download, tetapi memakai identitas Telegram profil yang sama.
 _Avoid_: sesi Storage bersama, storage Export.
 
+**Tujuan Storage**:
+Penyimpanan yang dipilih untuk melihat atau mengunggah file, berupa katalog channel Telegram atau lokasi di remote rclone yang dikonfigurasi.
+_Avoid_: worker sebagai tujuan.
+
+**Mode transfer Storage**:
+Pilihan salin atau pindah file dari worker ke Tujuan Storage. Salin mempertahankan file sumber; pindah menghapus file sumber hanya setelah upload dipastikan berhasil, sedangkan file gagal atau ambigu tetap disimpan.
+_Avoid_: pindah folder katalog.
+
+**Pemindahan katalog Storage**:
+Memindahkan item di antara folder katalog Telegram tanpa menghapus file sumber yang berada di worker.
+_Avoid_: mode transfer pindah.
+
 **Bukti akses kirim**:
 Hasil pemeriksaan bahwa satu profil pada satu worker dapat mengirim ke tujuan tertentu. Bukti berlaku sampai izin atau sesi gagal, tujuan berubah, atau sesi yang diuji berubah.
 _Avoid_: kesiapan worker, verifikasi setiap job.
