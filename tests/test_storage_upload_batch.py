@@ -6,8 +6,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tme3bot.application.job_scheduler import build_execution_plan
+from tme3bot.rclone import RcloneError
 from tme3bot.worker.command_store import WorkerCommandStore
 from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.executor_storage import StorageExecutorMixin
@@ -76,6 +78,36 @@ class _UploadClient:
         return SimpleNamespace(messages=self.export_messages)
 
 
+class _FakeRcloneRunner:
+    behavior = {}
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.copies = []
+        self.verifications = []
+        self.instances.append(self)
+
+    def target_file_exists(self, _destination, remote_name, _config, **_kwargs):
+        return remote_name in self.behavior.get("existing", set())
+
+    def copy_files(self, files, _destination, _config, **kwargs):
+        files = list(files)
+        self.copies.extend(path.name for path in files)
+        if self.behavior.get("definite_failure"):
+            raise RcloneError("simulated rclone startup failure", code="RCLONE_RUNTIME_UNAVAILABLE")
+        mutate = self.behavior.get("mutate")
+        if mutate:
+            Path(mutate).write_text("changed during upload", encoding="utf-8")
+        if self.behavior.get("ambiguous"):
+            raise RuntimeError("simulated timeout after transfer started")
+        return {"succeeded": len(files)}
+
+    def verify_complete_files(self, files, _destination, _config, **kwargs):
+        self.verifications.extend(Path(path).name for path in files)
+        return {"complete": bool(self.behavior.get("verified", True)), "reason_code": ""}
+
+
 class _BatchUploader(StorageExecutorMixin):
     def __init__(self, workspace, command_store, *, parallel=False, behavior=None):
         self.workspace = workspace
@@ -88,6 +120,7 @@ class _BatchUploader(StorageExecutorMixin):
         self.config = SimpleNamespace(
             utility_workspace_root=workspace.parent,
             profile_root=workspace.parent,
+            rclone_config_path=str(workspace.parent / "rclone.conf"),
         )
         self.runtimes = {}
         for profile, message_id in (("default", 10), ("archive", 20)):
@@ -107,6 +140,15 @@ class _BatchUploader(StorageExecutorMixin):
         self.publisher = SimpleNamespace(
             emit=lambda *args, **kwargs: self.events.append((args, kwargs))
         )
+        self._rclone_runners = {}
+
+    @staticmethod
+    def _quick_workspace(config):
+        return Path(config.utility_workspace_root)
+
+    @staticmethod
+    def _command_callback():
+        return None
 
     def available_storage_profiles(self):
         return list(self.runtimes)
@@ -197,6 +239,125 @@ class StorageUploadBatchTests(unittest.TestCase):
     def _add_files(self, *names):
         for name in names:
             (self.workspace / name).write_text(f"body:{name}", encoding="utf-8")
+
+    def _rclone_command(self, uploader, *, transfer_mode="copy", target="nested"):
+        command = uploader.command(self.workspace)
+        command["payload"].update({
+            "provider": "rclone", "rclone_destination": "remote:backup",
+            "rclone_path": target, "transfer_mode": transfer_mode,
+            "move_confirmed": transfer_mode == "move",
+            "preserve_structure": True,
+        })
+        return command
+
+    def test_rclone_upload_is_per_file_durable_and_never_overwrites_existing_target(self):
+        self._add_files("conflict.bin", "success.bin")
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {"existing": {"nested/conflict.bin"}}
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader)
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner):
+            result = uploader._storage_upload(command)
+        self.assertEqual(result["provider"], "rclone")
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["items"][0]["status"], "failed")
+        self.assertEqual(result["items"][0]["error_code"], "STORAGE_TARGET_CONFLICT")
+        self.assertEqual(_FakeRcloneRunner.instances[0].copies, ["success.bin"])
+        persisted = {item["path"]: item for item in self.store.storage_upload_items("storage-command")}
+        self.assertEqual(persisted["conflict.bin"]["status"], "failed")
+        self.assertEqual(persisted["success.bin"]["status"], "succeeded")
+
+    def test_rclone_move_deletes_only_after_full_verification_and_unchanged_source(self):
+        self._add_files("stable.bin", "changed.bin")
+        changed = self.workspace / "changed.bin"
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {"mutate": str(changed), "verified": True}
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader, transfer_mode="move")
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner):
+            result = uploader._storage_upload(command)
+        items = {item["name"]: item for item in result["items"]}
+        self.assertFalse((self.workspace / "stable.bin").exists())
+        self.assertEqual(items["stable.bin"]["cleanup_status"], "deleted")
+        self.assertTrue(changed.exists())
+        self.assertEqual(items["changed.bin"]["cleanup_status"], "skipped_source_changed")
+        self.assertTrue(all(item["verified_full_content"] for item in result["items"]))
+
+    def test_ambiguous_rclone_attempt_is_verified_without_automatic_resend(self):
+        self._add_files("uncertain.bin")
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {"ambiguous": True, "verified": False}
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader, transfer_mode="move")
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner):
+            first = uploader._storage_upload(command)
+            second = uploader._storage_upload(command)
+        self.assertEqual(first["items"][0]["status"], "needs_reconciliation")
+        self.assertEqual(second["items"][0]["status"], "needs_reconciliation")
+        self.assertEqual(sum(len(runner.copies) for runner in _FakeRcloneRunner.instances), 1)
+        self.assertEqual(
+            [name for runner in _FakeRcloneRunner.instances for name in runner.verifications],
+            ["uncertain.bin", "uncertain.bin"],
+        )
+        self.assertTrue((self.workspace / "uncertain.bin").exists())
+
+    def test_definite_rclone_start_failure_is_failed_without_cleanup(self):
+        self._add_files("not_started.bin")
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {"definite_failure": True}
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader, transfer_mode="move")
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner):
+            result = uploader._storage_upload(command)
+        item = result["items"][0]
+        self.assertEqual(item["status"], "failed")
+        self.assertEqual(item["error_code"], "RCLONE_RUNTIME_UNAVAILABLE")
+        self.assertEqual(item["cleanup_status"], "retained_upload_failed")
+        self.assertEqual(_FakeRcloneRunner.instances[0].verifications, [])
+        self.assertTrue((self.workspace / "not_started.bin").exists())
+
+    def test_rclone_restart_recovery_verifies_checkpoint_without_resending(self):
+        self._add_files("recovered.bin")
+        source = self.workspace / "recovered.bin"
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader, transfer_mode="move")
+        identity = uploader._storage_source_identity(source)
+        self.store.record_storage_upload_item(
+            "storage-command", "recovered.bin", file_name="recovered.bin",
+            status="needs_reconciliation", attempt=1,
+            result_item={
+                "path": "recovered.bin", "name": "recovered.bin", "provider": "rclone",
+                "target_path": "nested/recovered.bin", "status": "needs_reconciliation",
+                "upload_status": "needs_reconciliation", "cleanup_status": "retained_ambiguous",
+                "source_identity": identity, "transfer_mode": "move",
+            },
+        )
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {"verified": True}
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner):
+            items = uploader.reconcile_rclone_storage_recovery(
+                "storage-command", str(self.workspace), "remote:backup",
+                self.store.storage_upload_items("storage-command"),
+            )
+        self.assertEqual(items[0]["status"], "succeeded")
+        self.assertEqual(items[0]["uploaded_item"]["cleanup_status"], "deleted")
+        self.assertFalse(source.exists())
+        self.assertEqual(_FakeRcloneRunner.instances[0].copies, [])
+        self.assertEqual(_FakeRcloneRunner.instances[0].verifications, ["recovered.bin"])
+
+    def test_rclone_worker_admission_does_not_require_tdl_upload_profile(self):
+        executor = object.__new__(WorkerJobExecutor)
+        executor._require_local_job_session({
+            "kind": "storage_upload", "profile": "default",
+            "payload": {"provider": "rclone"},
+        })
+        plan = build_execution_plan(
+            "storage_upload", "default", "remote-1", {"provider": "rclone"}
+        )
+        self.assertEqual(
+            plan.resource_keys,
+            frozenset({"worker:remote-1:kind:storage_upload", "worker:remote-1:rclone:storage"}),
+        )
 
     def test_storage_batches_share_worker_lock_without_reserving_export_or_download(self):
         sender_profiles = ["default", "archive"]

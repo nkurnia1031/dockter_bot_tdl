@@ -117,6 +117,15 @@ class WorkerDispatcher(Protocol):
 
     def quickmode_scan(self, worker: str) -> dict[str, Any]: ...
 
+    def rclone_storage_browse(
+        self, worker: str, rclone_destination: str, *, path: str = "", q: str = "",
+        sort: str = "name", order: str = "asc", limit: int = 100, offset: int = 0,
+    ) -> dict[str, Any]: ...
+
+    def storage_move_cleanup(
+        self, worker: str, source_job_id: str, folder_path: str, relative_path: str,
+    ) -> dict[str, Any]: ...
+
 
 class ActorResolver(Protocol):
     def resolve(self, telegram_user_id: int): ...

@@ -10,6 +10,50 @@ import uuid
 
 def register_storage(app, context, *, _active_storage_item, _deliver_storage_telegram, _model_dict, _require_storage_folders_idle, _storage_item, current_actor, job_dict, require_service):
 
+    @app.get("/api/v1/storage/rclone/browser", response_model=ObjectResponse)
+    def rclone_storage_browser(
+        worker: str,
+        path: str = "",
+        q: str = "",
+        sort: str = Query("name", pattern="^(name|updated_at|size|type)$"),
+        order: str = Query("asc", pattern="^(asc|desc)$"),
+        limit: int = Query(100, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        actor=Depends(current_actor),
+    ):
+        normalized_path = str(path or "").replace("\\", "/").strip("/")
+        path_parts = normalized_path.split("/") if normalized_path else []
+        if len(normalized_path) > 2048 or any(ord(char) < 32 for char in normalized_path) or str(path or "").startswith(("/", "\\")) or any(
+            not part or part in {".", ".."} or ":" in part for part in path_parts
+        ):
+            raise DomainError(
+                "RCLONE_BROWSER_PATH_INVALID",
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                status_code=422,
+            )
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=worker, check_readiness=False
+        )
+        settings = context.utility_settings.get()
+        destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
+        gate = getattr(context.control_plane, "runtime_readiness_gate", None)
+        if gate is None:
+            raise DomainError("RUNTIME_NOT_READY", "Snapshot readiness rclone belum tersedia. Jalankan Scan Profil.", status_code=409)
+        gate.require_rclone_storage(selected_worker, destination)
+        browser = getattr(context.worker_dispatcher, "rclone_storage_browse", None)
+        if not callable(browser):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung browser rclone Storage.", status_code=503)
+        try:
+            return browser(
+                selected_worker, destination, path=normalized_path, q=q, sort=sort,
+                order=order, limit=limit, offset=offset,
+            )
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if code == "RCLONE_ACCESS_FAILED":
+                raise DomainError("RCLONE_ACCESS_FAILED", "Worker tidak dapat membaca remote rclone.", status_code=503) from exc
+            raise DomainError("RCLONE_BROWSER_FAILED", "Worker tidak dapat memuat folder rclone.", status_code=503) from exc
+
     @app.get("/api/v1/storage/items", response_model=StorageItemListResponse)
     def search_storage(
         q: str = "",
@@ -166,23 +210,38 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
     @app.post("/api/v1/storage/uploads", response_model=JobResponse)
     def submit_storage_upload(body: StorageUploadRequest, actor=Depends(current_actor)):
         payload = _model_dict(body)
-        if payload.get("rclone_upload"):
-            # Snapshot the destination at enqueue time. The rclone config is
-            # never sent through the browser or persisted in the API payload.
+        provider = payload.get("provider", "telegram")
+        if provider == "rclone":
+            if payload.get("destination_folder_id") is not None or payload.get("folder"):
+                raise DomainError("STORAGE_TARGET_INVALID", "Pilih tepat satu tujuan upload.", status_code=422)
+            remote_path = str(payload.get("rclone_path") or "").replace("\\", "/").strip("/")
+            parts = remote_path.split("/") if remote_path else []
+            if len(remote_path) > 2048 or any(ord(char) < 32 for char in remote_path) or str(payload.get("rclone_path") or "").startswith(("/", "\\")) or any(
+                not part or part in {".", ".."} or ":" in part for part in parts
+            ):
+                raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
+            payload["rclone_path"] = remote_path
+            # Snapshot the configured root. Config contents and local path never
+            # enter the browser or the job payload.
             payload["rclone_destination"] = context.utility_settings.get().get(
                 "rclone_destination", "googledrive:backup"
             )
-        if payload.get("destination_folder_id") is None and payload.get("folder"):
+        elif payload.get("rclone_path"):
+            raise DomainError("STORAGE_TARGET_INVALID", "Path rclone hanya berlaku untuk tujuan rclone.", status_code=422)
+        if provider == "telegram" and payload.get("destination_folder_id") is None and payload.get("folder"):
             folder = context.storage_catalog.ensure_path(
                 str(payload["folder"]), actor.telegram_user_id
             )
             payload["destination_folder_id"] = folder.id if folder else None
         destination = payload.get("destination_folder_id")
-        if destination is not None:
+        if provider == "telegram" and destination is not None:
             selected = context.storage_catalog.get_folder(int(destination))
             if selected is None or selected.status != "active":
                 raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak aktif.", status_code=409)
-        payload["destination_folder_path"] = context.storage_catalog.folder_path(destination)
+        if provider == "telegram":
+            payload["destination_folder_path"] = context.storage_catalog.folder_path(destination)
+        if payload.get("transfer_mode") == "move" and payload.get("move_confirmed") is not True:
+            raise DomainError("STORAGE_MOVE_CONFIRMATION_REQUIRED", "Move memerlukan konfirmasi eksplisit.", status_code=422)
         _, selected_worker = context.control_plane.resolve_target(actor, worker=payload.get("worker"))
         payload.update(
             {

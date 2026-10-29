@@ -166,6 +166,19 @@ def _error(
     )
 
 
+def _hide_worker_file_identity(value: Any) -> Any:
+    """Keep Move's inode evidence inside the control plane/worker journal."""
+    if isinstance(value, dict):
+        return {
+            key: _hide_worker_file_identity(item)
+            for key, item in value.items()
+            if str(key) != "source_identity"
+        }
+    if isinstance(value, list):
+        return [_hide_worker_file_identity(item) for item in value]
+    return value
+
+
 def job_dict(job: Job) -> dict[str, Any]:
     retry_meta = job.payload.get("quick_retry")
     if not isinstance(retry_meta, dict):
@@ -218,7 +231,7 @@ def job_dict(job: Job) -> dict[str, Any]:
         "status": job.status.value,
         "payload": job.payload,
         "progress": job.progress,
-        "result": job.result,
+        "result": _hide_worker_file_identity(job.result),
         "error": job.error,
         "archived_at": job.archived_at.isoformat() if job.archived_at else None,
         "queue_position": job.progress.get("position"),
@@ -241,7 +254,7 @@ def event_dict(event: JobEvent) -> dict[str, Any]:
         "status": event.status.value,
         "event_type": event.event_type,
         "progress": event.progress,
-        "result": event.result,
+        "result": _hide_worker_file_identity(event.result),
         "error": event.error,
         "created_at": event.created_at.isoformat(),
     }

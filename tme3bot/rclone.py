@@ -139,6 +139,181 @@ class RcloneRunner:
         }
 
     @staticmethod
+    def _remote_path(root: str, relative_path: str = "") -> tuple[str, str]:
+        """Join a browser path below a configured root and reject traversal."""
+        root = str(root or "").strip().rstrip("/")
+        relative = str(relative_path or "").replace("\\", "/")
+        if relative.startswith("/"):
+            raise RcloneError("Path rclone harus berada di bawah root yang dikonfigurasi.")
+        relative = relative.strip("/")
+        parts = relative.split("/") if relative else []
+        if (
+            not root
+            or relative.startswith("/")
+            or len(relative) > 2048
+            or any(ord(char) < 32 for char in relative)
+            or any(not part or part in {".", ".."} or ":" in part for part in parts)
+        ):
+            raise RcloneError("Path rclone harus berada di bawah root yang dikonfigurasi.")
+        return root + ("/" + "/".join(parts) if parts else ""), relative
+
+    def list_directory(
+        self,
+        destination: str,
+        relative_path: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+        query: str = "",
+        sort: str = "name",
+        order: str = "asc",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        """Return a read-only, paginated listing below the configured root."""
+        try:
+            validate_rclone_destination(destination)
+            remote, normalized = self._remote_path(destination, relative_path)
+        except ValueError as exc:
+            raise RcloneError("Root rclone tidak valid.") from exc
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        if not config.is_file() or shutil.which("rclone") is None:
+            raise RcloneError("Runtime rclone belum tersedia pada worker.", code="RCLONE_RUNTIME_UNAVAILABLE")
+        if sort not in {"name", "updated_at", "size", "type"} or order not in {"asc", "desc"}:
+            raise RcloneError("Opsi pengurutan listing rclone tidak valid.")
+        limit = max(1, min(200, int(limit)))
+        offset = max(0, int(offset))
+        command = ["rclone", "lsjson", remote, "--max-depth", "1", "--config", str(config), "--log-level", "ERROR"]
+        try:
+            result = self.runner.run(
+                command, log_prefix="rclone-storage-browser", output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except (TDLStalledError, TDLCommandError, OSError) as exc:
+            raise RcloneError("Worker tidak dapat membaca folder rclone.", code="RCLONE_ACCESS_FAILED") from exc
+        if result.returncode != 0:
+            raise RcloneError("Worker tidak dapat membaca folder rclone.", code="RCLONE_ACCESS_FAILED")
+        try:
+            raw_entries = json.loads(getattr(result, "stdout", "") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
+        if not isinstance(raw_entries, list):
+            raise RcloneError("Worker menerima listing rclone yang tidak valid.")
+        needle = str(query or "").strip().casefold()
+        entries: list[dict[str, object]] = []
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("Name") or "").strip()
+            if not name or name in {".", ".."} or "/" in name or "\\" in name:
+                continue
+            is_dir = raw.get("IsDir") is True
+            try:
+                size = max(0, int(raw.get("Size") or 0))
+            except (TypeError, ValueError):
+                size = 0
+            modified = str(raw.get("ModTime") or "")[:64]
+            if needle and needle not in name.casefold():
+                continue
+            entries.append({"name": name, "path": "/".join(part for part in (normalized, name) if part),
+                            "is_dir": is_dir, "size": size, "updated_at": modified})
+        def key(item: dict[str, object]):
+            if sort == "size":
+                return (not bool(item["is_dir"]), int(item["size"]), str(item["name"]).casefold())
+            if sort == "updated_at":
+                return (not bool(item["is_dir"]), str(item["updated_at"]), str(item["name"]).casefold())
+            if sort == "type":
+                return (not bool(item["is_dir"]), Path(str(item["name"])).suffix.casefold(), str(item["name"]).casefold())
+            return (not bool(item["is_dir"]), str(item["name"]).casefold())
+        entries.sort(key=key, reverse=order == "desc")
+        return {"path": normalized, "breadcrumbs": normalized.split("/") if normalized else [],
+                "items": entries[offset:offset + limit], "total": len(entries),
+                "limit": limit, "offset": offset}
+
+    def target_file_exists(
+        self, destination: str, remote_name: str, config_path: Path, *, config_root: Path
+    ) -> bool:
+        """Check one exact target path without changing the remote."""
+        _, normalized = self._remote_path(destination, remote_name)
+        if not normalized:
+            raise RcloneError("Path target rclone tidak valid.")
+        parent_name, _, file_name = normalized.rpartition("/")
+        parent, _ = self._remote_path(destination, parent_name)
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        command = ["rclone", "lsjson", parent, "--max-depth", "1", "--config", str(config), "--log-level", "ERROR"]
+        try:
+            result = self.runner.run(command, log_prefix="rclone-storage-conflict-check",
+                                     output_callback=self.log_callback,
+                                     stall_timeout_seconds=self.stall_timeout_seconds,
+                                     command_callback=self.command_callback)
+        except (TDLStalledError, TDLCommandError, OSError) as exc:
+            raise RcloneError("Worker tidak dapat memeriksa benturan target rclone.", code="RCLONE_ACCESS_FAILED") from exc
+        if result.returncode != 0:
+            detail = self._command_output(result).casefold()
+            if any(marker in detail for marker in ("directory not found", "object not found", "not found", "doesn't exist", "does not exist")):
+                return False
+            raise RcloneError("Worker tidak dapat memeriksa benturan target rclone.", code="RCLONE_ACCESS_FAILED")
+        try:
+            entries = json.loads(getattr(result, "stdout", "") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
+        return isinstance(entries, list) and any(
+            isinstance(item, dict) and str(item.get("Name") or "") == file_name
+            for item in entries
+        )
+
+    def verify_complete_files(
+        self,
+        files: Iterable[Path],
+        destination: str,
+        config_path: Path,
+        *,
+        workspace_root: Path,
+        config_root: Path,
+        remote_names: Iterable[str],
+    ) -> dict[str, object]:
+        """Verify complete content via read-only rclone checksums/download reads."""
+        paths = [Path(item).resolve() for item in files]
+        names = list(remote_names)
+        if len(paths) != len(names):
+            raise RcloneError("Jumlah path verifikasi rclone tidak sesuai.")
+        workspace = Path(workspace_root).resolve()
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        verified: list[str] = []
+        for path, name in zip(paths, names):
+            try:
+                path.relative_to(workspace)
+            except ValueError as exc:
+                raise RcloneError("File verifikasi harus berada di dalam workspace.") from exc
+            target, normalized = self._remote_path(destination, str(name))
+            command = ["rclone", "check", str(path), target, "--download", "--one-way",
+                       "--config", str(config), "--log-level", "ERROR"]
+            try:
+                result = self.runner.run(command, log_prefix="rclone-storage-full-verify",
+                                         output_callback=self.log_callback,
+                                         stall_timeout_seconds=self.stall_timeout_seconds,
+                                         command_callback=self.command_callback)
+            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                return {"complete": False, "verified": verified, "reason_code": "RCLONE_VERIFY_UNAVAILABLE"}
+            if result.returncode != 0:
+                return {"complete": False, "verified": verified, "reason_code": "RCLONE_CONTENT_MISMATCH"}
+            verified.append(normalized)
+        return {"complete": len(verified) == len(paths), "verified": verified, "reason_code": ""}
+
+    @staticmethod
     def _command_output(result) -> str:
         output = "\n".join(
             value
@@ -192,6 +367,7 @@ class RcloneRunner:
         workspace_root: Path,
         config_root: Path | None = None,
         remote_names: Iterable[str] | None = None,
+        ignore_existing: bool = False,
     ) -> dict[str, object]:
         destination = str(destination or "").strip()
         try:
@@ -235,11 +411,13 @@ class RcloneRunner:
         for index, (path, remote_name) in enumerate(zip(paths, names), start=1):
             if self.cancel_check is not None and self.cancel_check():
                 raise RcloneError("Upload rclone dibatalkan oleh user.")
-            remote_name = str(remote_name).replace("\\", "/").strip("/")
-            remote_parts = [part for part in remote_name.split("/") if part]
-            if not remote_parts or any(part in {".", ".."} for part in remote_parts):
+            try:
+                target, normalized_name = self._remote_path(destination, str(remote_name))
+            except RcloneError as exc:
+                raise RcloneError(f"Nama tujuan rclone tidak valid untuk {path.name}.") from exc
+            remote_parts = normalized_name.split("/") if normalized_name else []
+            if not remote_parts:
                 raise RcloneError(f"Nama tujuan rclone tidak valid untuk {path.name}.")
-            target = f"{destination.rstrip('/')}/{'/'.join(remote_parts)}"
             command = [
                 "rclone",
                 "copyto",
@@ -250,6 +428,8 @@ class RcloneRunner:
                 "--log-level",
                 "ERROR",
             ]
+            if ignore_existing:
+                command.extend(["--ignore-existing"])
             try:
                 result = self.runner.run(
                     command,
@@ -275,7 +455,7 @@ class RcloneRunner:
                     f"rclone gagal untuk {path.name} (exit code {result.returncode}).",
                     code=self._access_error_code(result),
                 )
-            uploaded.append("/".join(remote_parts))
+            uploaded.append(normalized_name)
             if self.progress_callback is not None:
                 self.progress_callback(index, len(paths), "/".join(remote_parts))
         return {

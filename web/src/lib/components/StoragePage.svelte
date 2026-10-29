@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { Modal } from 'flowbite-svelte';
   import { api, patch, post, remove } from '$lib/api';
   import { formatBytes, formatDate } from '$lib/presentation';
@@ -30,7 +30,10 @@
     current_folder:FolderEntry|null; breadcrumbs:{id:number;name:string}[];
     folders:FolderEntry[]; items:Item[]; total_folders:number; total_items:number
   };
+  type RcloneEntry = {name:string; path:string; is_dir:boolean; size:number; updated_at:string};
+  type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number};
 
+  let provider = $state<'telegram'|'rclone'>('telegram');
   let folderId = $state<number|null>(null);
   let scope = $state<'current'|'global'|'recent'|'trash'>('current');
   let query = $state('');
@@ -58,7 +61,17 @@
   let destinationId = $state<number|null>(null);
   let workspaceFolders = $state<string[]>([]);
   let keywords = $state('');
-  let rcloneUpload = $state(false);
+  let rclonePath = $state('');
+  let remoteTarget = $state('');
+  let remoteTargetSelected = $state(false);
+  let remoteQuery = $state('');
+  let remoteSort = $state('name');
+  let remoteOrder = $state('asc');
+  let remoteOffset = $state(0);
+  let remoteLoading = $state(false);
+  let remoteData = $state<RcloneBrowserResponse>({path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0});
+  let transferMode = $state<'copy'|'move'>('copy');
+  let confirmMove = $state(false);
   let displayName = $state('');
   let editKeywords = $state('');
   let worker = $state('');
@@ -73,6 +86,8 @@
     )
   );
   const storageRuntimeReady = $derived(storageReadiness.status === 'ready');
+  const rcloneReadiness = $derived(runtimeReadinessFor(session.runtimeReadiness, null, worker, 'rclone_storage'));
+  const rcloneRuntimeReady = $derived(rcloneReadiness.status === 'ready');
   const storageReadinessStyle = $derived(
     storageRuntimeReady
       ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200'
@@ -205,17 +220,44 @@
   }
   async function upload() {
     if (!workspaceFolders[0]) return;
-    if (!storageRuntimeReady) {
+    if (provider === 'telegram' && !storageRuntimeReady) {
       message = 'Belum ada profil Upload siap pada worker ini. Jalankan Scan Profil.';
       return;
     }
+    if (provider === 'rclone' && !rcloneRuntimeReady) {
+      message = 'Akses rclone pada worker ini belum siap. Jalankan Scan Profil.';
+      return;
+    }
+    if (provider === 'rclone' && transferMode === 'move' && !confirmMove) return;
+    const selectedTransferMode=transferMode;
     await post('/storage/uploads', {
-      folder_path:workspaceFolders[0], destination_folder_id:destinationId,
-      preserve_structure:true, keywords, worker, rclone_upload:rcloneUpload
+      folder_path:workspaceFolders[0], destination_folder_id:provider==='telegram'?destinationId:null,
+      provider, rclone_path:provider==='rclone'?remoteTarget:'', transfer_mode:transferMode,
+      preserve_structure:true, keywords, worker, move_confirmed:transferMode==='move'&&confirmMove
     });
-    uploadOpen=false; workspaceFolders=[]; keywords=''; rcloneUpload=false;
-    message='Upload masuk antrean. Struktur subfolder akan dipertahankan.';
+    uploadOpen=false; workspaceFolders=[]; keywords=''; transferMode='copy'; confirmMove=false;
+    message=`Upload ${provider==='telegram'?'Telegram':'rclone'} masuk antrean sebagai ${selectedTransferMode}. Struktur subfolder akan dipertahankan.`;
   }
+  async function loadRclone() {
+    if (!worker || provider !== 'rclone' || !rcloneRuntimeReady) return;
+    remoteLoading=true;
+    try {
+      const params=new URLSearchParams({worker,path:rclonePath,q:remoteQuery,sort:remoteSort,order:remoteOrder,limit:'100',offset:String(remoteOffset)});
+      remoteData=await api<RcloneBrowserResponse>(`/storage/rclone/browser?${params}`);
+      message='';
+    } catch (cause) { message=cause instanceof Error?cause.message:'Remote rclone tidak dapat dimuat.'; }
+    finally { remoteLoading=false; }
+  }
+  function setProvider(next:'telegram'|'rclone') {
+    provider=next;
+    if (next==='rclone') { rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false; }
+    else void load();
+  }
+  function handleWorkerChange() {
+    rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false;
+    remoteData={path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0};
+  }
+  function openRemoteFolder(path:string) { rclonePath=path; remoteOffset=0; remoteTarget=path; }
   async function deliver(item:Item) {
     await post(`/storage/items/${item.id}/deliveries`, {method:'telegram'});
     message=`${item.display_name} dikirim ke Telegram.`;
@@ -225,7 +267,7 @@
     await navigator.clipboard.writeText(result.code);
     message=`Kode ${item.display_name} disalin. Buka bot, pilih Panggil file dengan kode, lalu tempel kode tersebut.`;
   }
-  function startUpload() { destinationId=folderId; rcloneUpload=false; uploadOpen=true; }
+  function startUpload() { if (provider==='telegram') destinationId=folderId; else if (!remoteTargetSelected) {remoteTarget=rclonePath;remoteTargetSelected=true;} transferMode='copy'; confirmMove=false; uploadOpen=true; }
   function startMove() { destinationId=folderId; moveOpen=true; }
   function beginItemEdit(item:Item) {
     editItem=item; displayName=item.display_name; editKeywords=item.keywords || '';
@@ -265,17 +307,29 @@
     load();
     return () => window.removeEventListener('tme3:job-finished', onJobFinished);
   });
+  $effect(() => {
+    const activeProvider=provider;
+    const activeWorker=worker;
+    const ready=rcloneRuntimeReady;
+    if (activeProvider==='rclone' && activeWorker && ready) untrack(() => void loadRclone());
+  });
   function setView(next:'list'|'grid') { view=next; localStorage.setItem('storage-view',next); }
   function setSort(next:string) { sort=next; localStorage.setItem('storage-sort',next); load(); }
 </script>
 
 <header class="flex flex-wrap items-end justify-between gap-4">
-  <div><p class="eyebrow">STORAGE</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Cloud Storage</h1><p class="muted mt-2">Kelola katalog Telegram seperti file hosting—folder bersama untuk seluruh user.</p></div>
+  <div><p class="eyebrow">STORAGE</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Cloud Storage</h1><p class="muted mt-2">{provider==='telegram'?'Kelola katalog Telegram seperti file hosting—folder bersama untuk seluruh user.':'Jelajahi remote rclone pada worker terpilih dan pilih tujuan upload.'}</p></div>
   <div class="page-icon"><HardDrive size={23}/></div>
 </header>
 
-<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime="storage" bind:worker /></div>
+<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange} /></div>
 
+<div class="mt-4 inline-flex rounded-xl border border-[var(--line)] p-1" role="tablist" aria-label="Sumber Storage">
+  <button role="tab" aria-selected={provider==='telegram'} class={`rounded-lg px-4 py-2 text-sm font-bold ${provider==='telegram'?'bg-[var(--brand-soft)] text-[var(--brand)]':''}`} onclick={() => setProvider('telegram')}>Telegram</button>
+  <button role="tab" aria-selected={provider==='rclone'} class={`rounded-lg px-4 py-2 text-sm font-bold ${provider==='rclone'?'bg-[var(--brand-soft)] text-[var(--brand)]':''}`} onclick={() => setProvider('rclone')}>Rclone</button>
+</div>
+
+{#if provider==='telegram'}
 <section class="card mt-4 p-4 sm:p-5">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div>
@@ -303,9 +357,36 @@
     <a class="mt-3 inline-flex text-sm font-semibold text-violet-700 underline dark:text-violet-300" href="/profiles">Buka Profil untuk menjalankan Scan Profil</a>
   {/if}
 </section>
+{/if}
 
 {#if message}<div class="mt-5 flex items-center justify-between rounded-2xl border border-violet-200 bg-violet-50 p-4 text-sm text-violet-800 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-100"><span>{message}</span><button onclick={() => message=''}><X size={16}/></button></div>{/if}
 
+{#if provider==='rclone'}
+<section class="card mt-6 overflow-hidden p-4 sm:p-5" aria-label="Browser rclone">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div><h2 class="text-xl font-black">Remote rclone</h2><p class="muted mt-1 text-sm">Worker {worker || 'belum dipilih'} · status {rcloneReadiness.status}</p></div>
+    <button class="button" disabled={!worker || !rcloneRuntimeReady} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
+  </div>
+  {#if !rcloneRuntimeReady}<p class="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-100">{rcloneReadiness.reason_code || 'Akses rclone belum dipindai pada worker ini.'} · Jalankan Scan Profil sebelum membuka remote.</p>{/if}
+  <div class="mt-4 flex flex-wrap items-center gap-2">
+    <div class="flex min-w-0 flex-1 items-center gap-1"><button class="button ghost" onclick={() => openRemoteFolder('')}>Root</button>{#each rclonePath.split('/').filter(Boolean) as crumb,index}<ChevronRight size={14}/><button class="max-w-40 truncate rounded px-2 py-1 text-sm font-semibold hover:bg-[var(--brand-soft)]" onclick={() => openRemoteFolder(rclonePath.split('/').filter(Boolean).slice(0,index+1).join('/'))}>{crumb}</button>{/each}</div>
+    <input class="field min-w-[180px] flex-1" bind:value={remoteQuery} placeholder="Cari di folder ini" onkeydown={(e)=>e.key==='Enter'&&(remoteOffset=0,loadRclone())}/>
+    <select class="field !w-auto" bind:value={remoteSort} onchange={()=>{remoteOffset=0;loadRclone()}}><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select>
+    <button class="button ghost" onclick={()=>{remoteOrder=remoteOrder==='asc'?'desc':'asc';loadRclone()}} title="Balik urutan"><ArrowUp class={remoteOrder==='desc'?'rotate-180':''} size={17}/></button>
+    <button class="button ghost" disabled={remoteLoading||!rcloneRuntimeReady} onclick={loadRclone}><RefreshCw class={remoteLoading?'animate-spin':''} size={17}/></button>
+  </div>
+  <div class="mt-4 divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
+    {#each remoteData.items as entry (entry.path)}
+      <div class="flex items-center gap-3 p-3 text-sm">
+        {#if entry.is_dir}<Folder class="shrink-0 text-amber-500" size={19}/><button class="min-w-0 flex-1 truncate text-left font-bold" onclick={()=>openRemoteFolder(entry.path)}>{entry.name}</button><button class="button secondary !py-1" onclick={()=>{remoteTarget=entry.path;remoteTargetSelected=true;message=`Tujuan upload dipilih: ${entry.path}`}}>Pilih tujuan</button>
+        {:else}<File class="shrink-0 text-violet-500" size={19}/><span class="min-w-0 flex-1 truncate">{entry.name}</span><span class="muted">{formatBytes(entry.size)}</span>{/if}
+      </div>
+    {/each}
+    {#if !remoteData.items.length}<p class="muted p-8 text-center">{remoteLoading?'Memuat remote…':'Folder kosong atau tidak ada hasil.'}</p>{/if}
+  </div>
+  <div class="mt-3 flex items-center justify-between text-sm"><span class="muted">{remoteData.total} entri · tujuan: {remoteTargetSelected?(remoteTarget||'root'):'belum dipilih'}</span><div class="flex gap-2"><button class="button secondary" disabled={remoteOffset<=0||remoteLoading} onclick={()=>{remoteOffset=Math.max(0,remoteOffset-100);loadRclone()}}>Sebelumnya</button><span class="muted self-center">Halaman {Math.floor(remoteOffset/100)+1}</span><button class="button secondary" disabled={remoteOffset+remoteData.limit>=remoteData.total||remoteLoading} onclick={()=>{remoteOffset+=100;loadRclone()}}>Berikutnya</button></div></div>
+</section>
+{:else}
 <section class="card mt-6 overflow-hidden">
   <div class="grid min-h-[650px] lg:grid-cols-[250px_minmax(0,1fr)]">
     <aside class={`${mobileTree ? 'fixed inset-0 z-40 block bg-black/35 lg:static lg:bg-transparent' : 'hidden lg:block'}`}>
@@ -408,6 +489,7 @@
     </main>
   </div>
 </section>
+{/if}
 
 <JobTable kind="storage_upload" title="Transfer upload" retryable={true}/>
 
@@ -427,11 +509,12 @@
 <Modal open={createOpen} onclose={() => createOpen=false} title="Folder baru" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" placeholder="Dokumen 2026"/></label><p class="muted mt-2 text-xs">Maksimal 120 karakter. Slash, titik tunggal, dan karakter kontrol tidak diperbolehkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => createOpen=false}>Batal</button><button class="button" disabled={!newFolderName.trim()} onclick={createFolder}>Buat folder</button></div></Modal>
 
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
-  <p class="muted mb-4 text-sm">Pilih worker dengan profil Upload siap. Semua subfolder akan dibuat kembali di Storage.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime="storage" bind:worker/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
-  <div class="mt-4 grid gap-3 sm:grid-cols-2"><label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
-  <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--line)] p-3 text-sm"><input class="mt-1" type="checkbox" bind:checked={rcloneUpload}/><span><b>Salin juga ke Google Drive</b><small class="muted mt-1 block">Memakai tujuan rclone pada Pengaturan dan konfigurasi <code>/data/.config/rclone.conf</code>.</small></span></label>
-  <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>Destination dipilih dari folder Storage, bukan input teks. Nested dan empty folder dipertahankan.</p></div>
-  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || !storageRuntimeReady} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
+  <p class="muted mb-4 text-sm">{provider==='telegram'?'Pilih worker dengan lane Upload siap.':'Pilih worker dengan akses rclone siap.'} Semua subfolder sumber dipertahankan.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange}/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
+  <div class="mt-4 grid gap-3 sm:grid-cols-2">{#if provider==='telegram'}<label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label>{:else}<div class="rounded-xl border border-[var(--line)] p-3 text-sm"><b>Tujuan rclone</b><p class="mt-1 break-all">{remoteTargetSelected?(remoteTarget||'root'):'Pilih folder dari tab Rclone'}</p></div>{/if}<label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
+  <label class="mt-4 block text-sm font-bold">Transfer<select class="field mt-2" bind:value={transferMode}><option value="copy">Copy · sumber tetap ada</option><option value="move">Move · hapus sumber setelah upload terkonfirmasi</option></select></label>
+  {#if transferMode==='move'}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"><input class="mt-1" type="checkbox" bind:checked={confirmMove}/><span>Saya memahami file Workspace akan dihapus satu per satu hanya setelah upload terverifikasi dan file sumber tidak berubah.</span></label>{/if}
+  <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>{provider==='telegram'?'Batch ini hanya dikirim ke Telegram Storage.':'Batch ini hanya dikirim ke rclone; kegagalan tidak dialihkan ke Telegram.'} File yang bertabrakan di remote tidak akan ditimpa.</p></div>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || (provider==='telegram'?!storageRuntimeReady:!rcloneRuntimeReady) || (provider==='rclone'&&!remoteTargetSelected) || (transferMode==='move'&&!confirmMove)} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
 </Modal>
 
 <Modal open={moveOpen} onclose={() => moveOpen=false} title="Pindahkan ke folder" size="md"><label class="text-sm font-bold">Folder tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => moveOpen=false}>Batal</button><button class="button" onclick={moveSelection}><Move size={16}/>Pindahkan</button></div></Modal>

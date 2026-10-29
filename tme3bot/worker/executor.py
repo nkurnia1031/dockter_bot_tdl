@@ -276,6 +276,40 @@ class WorkerJobExecutor(
                 if worker:
                     publisher.bind_job_worker(job_id, worker)
                 raw_items = store.storage_upload_items(command_id)
+                if command.get("provider") == "rclone":
+                    reconcile = getattr(self, "reconcile_rclone_storage_recovery", None)
+                    if callable(reconcile):
+                        raw_items = reconcile(
+                            command_id,
+                            str(command.get("folder_path") or ""),
+                            str(command.get("rclone_destination") or ""),
+                            raw_items,
+                        )
+                if command.get("transfer_mode") == "move":
+                    try:
+                        source_root = self._workspace_path(str(command.get("folder_path") or ""))
+                    except Exception:
+                        source_root = None
+                    persist_item = getattr(store, "record_storage_upload_item", None)
+                    if source_root is not None and callable(persist_item):
+                        for item in raw_items:
+                            uploaded = item.get("uploaded_item")
+                            if item.get("status") != "succeeded" or not isinstance(uploaded, dict):
+                                continue
+                            if uploaded.get("cleanup_status") != "pending":
+                                continue
+                            relative = str(item.get("path") or "")
+                            source = source_root / relative
+                            identity = uploaded.get("source_identity")
+                            if not isinstance(identity, dict):
+                                cleanup_status = "retained_unverified"
+                            else:
+                                cleanup_status = self._storage_move_cleanup(source, source_root, identity)
+                            uploaded = {**uploaded, "cleanup_status": cleanup_status}
+                            persist_item(command_id, relative, file_name=str(item.get("name") or ""),
+                                         status="succeeded", attempt=int(item.get("attempt") or 0),
+                                         retryable=False, result_item=uploaded)
+                        raw_items = store.storage_upload_items(command_id)
                 items = [
                     {
                         key: item.get(key)
@@ -283,6 +317,10 @@ class WorkerJobExecutor(
                             "path", "name", "status", "attempt", "profile", "retryable",
                             "error_code", "error", "message_id", "attempts",
                         )
+                    }
+                    | {
+                        key: (item.get("uploaded_item") or {}).get(key)
+                        for key in ("provider", "upload_status", "cleanup_status", "target_path")
                     }
                     for item in raw_items
                 ]
@@ -1727,13 +1765,15 @@ class WorkerJobExecutor(
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
         elif kind in {"storage_upload", "storage_reconcile"}:
-            keys = {
-                f"worker:{worker}:kind:storage_upload",
-                f"worker:{worker}:tdl:storage",
-            }
-            sender_profiles = (command.get("payload") or {}).get("_tdl_sender_profiles") or [profile]
-            for sender_profile in sender_profiles:
-                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+            keys = {f"worker:{worker}:kind:storage_upload"}
+            payload = command.get("payload") or {}
+            if kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone":
+                keys.add(f"worker:{worker}:rclone:storage")
+            else:
+                keys.add(f"worker:{worker}:tdl:storage")
+                sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+                for sender_profile in sender_profiles:
+                    keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         elif kind == "tts":
             # Lock every verified fallback profile because only explicit
             # pre-send permission denials may move this job to another one.
@@ -1828,6 +1868,9 @@ class WorkerJobExecutor(
         }.get(kind)
         profile = str(command.get("profile") or "")
         if kind == "storage_upload":
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
+                return
             if profile in self.available_storage_profiles():
                 return
             raise RuntimeError(
@@ -1867,6 +1910,7 @@ class WorkerJobExecutor(
             str(quick_settings.get("compress_password") or "")
             if isinstance(quick_settings, dict)
             else "",
+            str(Path(getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")).resolve()),
         ]
         self._job_log.audit = CommandMilestoneRecorder(
             self.publisher,

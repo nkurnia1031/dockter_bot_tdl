@@ -590,6 +590,36 @@ class WorkerHttpDispatcher:
             timeout=45,
         )
 
+    def rclone_storage_browse(
+        self, worker: str, rclone_destination: str, *, path: str = "", q: str = "",
+        sort: str = "name", order: str = "asc", limit: int = 100, offset: int = 0,
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/storage/rclone-browser",
+            {"rclone_destination": str(rclone_destination or ""), "path": str(path or ""),
+             "q": str(q or ""), "sort": str(sort or "name"), "order": str(order or "asc"),
+             "limit": int(limit), "offset": int(offset)},
+            timeout=45,
+        )
+
+    def storage_move_cleanup(
+        self, worker: str, source_job_id: str, folder_path: str, relative_path: str,
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/storage/move-cleanup",
+            {"source_job_id": str(source_job_id), "folder_path": str(folder_path),
+             "relative_path": str(relative_path)},
+            timeout=30,
+        )
+
     def safelink_runtime_readiness(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

@@ -67,11 +67,11 @@ describe('Storage file manager', () => {
 
   it('uses the saved Storage readiness snapshot and does not start a verification message/job', async () => {
     enableDialogMethods();
-    const requests: { url: string; method: string }[] = [];
+    const requests: { url: string; method: string; body?: string }[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = new URL(String(input), 'https://ui.test');
       const method = (init?.method || 'GET').toUpperCase();
-      requests.push({ url: url.pathname, method });
+      requests.push({ url: url.pathname, method, body: typeof init?.body==='string'?init.body:undefined });
       if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
         authenticated: true, profiles: ['default'], actor: { telegram_user_id: 1, profile: 'default', worker_route: 'local' },
       }), { status: 200 });
@@ -106,6 +106,11 @@ describe('Storage file manager', () => {
     expect((submit as HTMLButtonElement).disabled).toBe(false);
     await fireEvent.click(submit);
     expect(requests.some(({ url, method }) => url.endsWith('/storage/uploads') && method === 'POST')).toBe(true);
+    const uploadRequest=requests.find(({url,method})=>url.endsWith('/storage/uploads')&&method==='POST');
+    const uploadBody=JSON.parse(uploadRequest?.body||'{}');
+    expect(uploadBody.provider).toBe('telegram');
+    expect(uploadBody.transfer_mode).toBe('copy');
+    expect(uploadBody.rclone_upload).toBeUndefined();
     expect(requests.some(({ url, method }) => url.endsWith('/tdl-access/verification') && method === 'POST')).toBe(false);
   }, 15000);
 
@@ -191,4 +196,52 @@ describe('Storage file manager', () => {
     await fireEvent.keyDown(document.activeElement!, {key:'Tab'});
     expect(document.activeElement).toBe(closeButton);
   }, 15000);
+
+  it('browses rclone read-only under the selected worker and configured readiness snapshot', async () => {
+    const requests: { path:string; method:string; url:URL }[] = [];
+    const fetcher = vi.fn(async (input:string, init?:RequestInit) => {
+      const url = new URL(String(input), 'https://ui.test');
+      const method=(init?.method||'GET').toUpperCase();
+      requests.push({path:url.pathname,method,url});
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{name:'local',url:'http://worker',enabled:true}]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']}],runtime_readiness:{checked_at:'now',
+          workers:[{name:'local',status:'success',checked_at:'now',reason_code:''}],
+          cells:[{worker:'local',profile:null,runtime:'rclone_storage',status:'ready',checked_at:'now',reason_code:''}]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/browser')) {
+        const nested=url.searchParams.get('path')==='docs';
+        return new Response(JSON.stringify({path:nested?'docs':'',breadcrumbs:nested?['docs']:[],limit:100,offset:0,total:nested?1:1,
+          items:nested?[{name:'report.txt',path:'docs/report.txt',is_dir:false,size:12,updated_at:''}]:[{name:'docs',path:'docs',is_dir:true,size:0,updated_at:''}]}),{status:200});
+      }
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    });
+    vi.stubGlobal('fetch',fetcher);
+    await session.restore();
+    render(StoragePage);
+    await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
+    expect(await screen.findByText('Remote rclone')).toBeTruthy();
+    await fireEvent.click(await screen.findByRole('button',{name:'docs'}));
+    expect(await screen.findByText('report.txt')).toBeTruthy();
+    expect(requests.some(item=>item.path.endsWith('/storage/rclone/browser')&&item.url.searchParams.get('worker')==='local')).toBe(true);
+    expect(requests.some(item=>item.path.endsWith('/storage/rclone/browser')&&item.url.searchParams.get('path')==='docs')).toBe(true);
+    await fireEvent.click(screen.getByRole('button',{name:'Root'}));
+    await fireEvent.click(await screen.findByRole('button',{name:'Pilih tujuan'}));
+    await fireEvent.click(screen.getByRole('button',{name:'Upload ke folder ini'}));
+    expect(screen.getByText('Tujuan rclone').parentElement?.textContent).toContain('docs');
+    const transfer=screen.getByLabelText('Transfer') as HTMLSelectElement;
+    expect(transfer.value).toBe('copy');
+    await fireEvent.change(transfer,{target:{value:'move'}});
+    const moveConfirmation=screen.getByLabelText(/Saya memahami file Workspace akan dihapus/);
+    expect((moveConfirmation as HTMLInputElement).checked).toBe(false);
+    await fireEvent.click(moveConfirmation);
+    expect((moveConfirmation as HTMLInputElement).checked).toBe(true);
+    expect(requests.every(item=>item.method==='GET'||item.path.endsWith('/auth/browser/session')||item.path.endsWith('/profiles/local'))).toBe(true);
+  },15000);
 });

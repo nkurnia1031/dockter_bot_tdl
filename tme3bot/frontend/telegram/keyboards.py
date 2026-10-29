@@ -368,21 +368,6 @@ def storage_folders_markup(folders: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def storage_rclone_markup(enabled: bool = False) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    f"Google Drive: {'Aktif' if enabled else 'Tidak'}",
-                    callback_data="storage:rclone:toggle",
-                )
-            ],
-            [InlineKeyboardButton("Lanjutkan", callback_data="storage:rclone:continue")],
-            [InlineKeyboardButton("Batal", callback_data="storage:menu")],
-        ]
-    )
-
-
 def storage_item_markup(
     item_id: int, owner: bool = True
 ) -> InlineKeyboardMarkup:

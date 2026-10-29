@@ -10,6 +10,7 @@ _EXPORT_RUNTIME = "export"
 _QUICK_MODE_RUNTIME = "quick_mode"
 _RESOLVER_RUNTIME = "resolver"
 _RCLONE_STORAGE_RUNTIME = "rclone_storage"
+_RCLONE_STORAGE_FAILURES = frozenset({"RCLONE_ACCESS_FAILED", "RCLONE_RUNTIME_UNAVAILABLE"})
 _EXPORT_RUNTIME_FAILURES = frozenset({
     "PROFILE_SESSION_BUSY",
     "PROFILE_SESSION_DATABASE_MISSING",
@@ -250,6 +251,16 @@ class RuntimeReadinessGate:
                 .isoformat(),
             )
         )
+
+    def record_rclone_storage_failure(self, *, worker: str, error_code: str) -> bool:
+        code = str(error_code or "").strip().upper()
+        if code not in _RCLONE_STORAGE_FAILURES:
+            return False
+        return bool(self.store.invalidate(
+            worker=worker, profile=None, runtime=_RCLONE_STORAGE_RUNTIME,
+            reason_code=code,
+            checked_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        ))
 
     def require(
         self, *, runtime: str, profile: str | None, worker: str

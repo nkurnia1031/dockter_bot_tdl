@@ -98,11 +98,16 @@ def build_execution_plan(
         else:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
     elif kind == "storage_upload":
-        keys = {f"worker:{worker}:kind:storage_upload", f"worker:{worker}:tdl:storage"}
-        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
-        for sender_profile in sender_profiles:
-            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
-        lane = "tdl-storage"
+        keys = {f"worker:{worker}:kind:storage_upload"}
+        if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
+            keys.add(f"worker:{worker}:rclone:storage")
+            lane = "rclone-storage"
+        else:
+            keys.add(f"worker:{worker}:tdl:storage")
+            sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+            for sender_profile in sender_profiles:
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+            lane = "tdl-storage"
     elif kind == "storage_reconcile":
         keys = {
             f"worker:{worker}:kind:storage_reconcile",
@@ -182,6 +187,7 @@ def build_execution_plan(
         queue_group=(
             f"worker:{worker}:kind:{kind}"
             if kind in {"tts", "safelink_resolve"}
+            or (kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone")
             else f"profile:{profile}:worker:{worker}:kind:{kind}"
         ),
         lane=lane,

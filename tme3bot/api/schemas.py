@@ -438,12 +438,15 @@ class WorkerRouteRequest(BaseModel):
 
 class StorageUploadRequest(BaseModel):
     folder_path: str
+    provider: Literal["telegram", "rclone"] = "telegram"
     folder: str = ""
     destination_folder_id: int | None = None
+    rclone_path: str = ""
     preserve_structure: bool = True
     keywords: str = ""
     worker: str | None = None
-    rclone_upload: bool = False
+    transfer_mode: Literal["copy", "move"] = "copy"
+    move_confirmed: bool = False
 
 
 class StorageUpdateRequest(BaseModel):

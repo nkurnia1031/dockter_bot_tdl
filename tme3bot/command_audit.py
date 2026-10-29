@@ -64,6 +64,9 @@ def sanitize_command(command: Iterable[object], secrets: Iterable[str] = ()) -> 
         "--secret",
         "--credential",
         "--credentials",
+        "--config",
+        "--config-file",
+        "--config-path",
     }
     for raw in command:
         value = sanitize_text(raw, secret_values)

@@ -370,7 +370,7 @@ class WorkerCommandStore:
         now = _now()
         with self._lock, self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            if selected_attempt > 0 and selected_profile:
+            if selected_attempt > 0:
                 db.execute(
                     "INSERT INTO worker_storage_upload_attempts "
                     "(command_id,relative_path,attempt,profile,status,retryable,error_code,error_message,message_id,updated_at) "
@@ -441,6 +441,11 @@ class WorkerCommandStore:
                     result_item = decoded if isinstance(decoded, dict) else None
                 except (TypeError, ValueError, json.JSONDecodeError):
                     result_item = None
+            if result_item is not None and str(row["status"]) == "needs_reconciliation":
+                if result_item.get("upload_status") in {"sending", "pending"}:
+                    result_item["upload_status"] = "needs_reconciliation"
+                    if result_item.get("transfer_mode") == "move":
+                        result_item["cleanup_status"] = "retained_ambiguous"
             result.append(
                 {
                     "path": str(row["relative_path"]),
@@ -500,6 +505,7 @@ class WorkerCommandStore:
             except (TypeError, ValueError, json.JSONDecodeError):
                 job = None
             if isinstance(job, dict) and str(job.get("kind") or "") == "storage_upload":
+                payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
                 result.append(
                     {
                         "command_id": str(row["command_id"]),
@@ -507,6 +513,10 @@ class WorkerCommandStore:
                         "attempt": int(row["attempt"]),
                         "dispatch_token": str(row["dispatch_token"]),
                         "worker": str(job.get("worker") or ""),
+                        "provider": str(payload.get("provider") or "telegram"),
+                        "transfer_mode": str(payload.get("transfer_mode") or "copy"),
+                        "folder_path": str(payload.get("folder_path") or ""),
+                        "rclone_destination": str(payload.get("rclone_destination") or ""),
                     }
                 )
         return result

@@ -23,6 +23,82 @@ class FakeSubprocessRunner:
 
 
 class RcloneRunnerTests(unittest.TestCase):
+    def test_list_directory_is_read_only_searchable_sorted_and_paginated(self):
+        class ListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Name": "zeta.txt", "IsDir": False, "Size": 8},
+                    {"Name": "Folder", "IsDir": True, "Size": -1},
+                    {"Name": "alpha.txt", "IsDir": False, "Size": 3},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = ListingRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).list_directory(
+                    "remote:backup", "team", config, config_root=root,
+                    query="txt", sort="name", order="asc", limit=1, offset=1,
+                )
+            self.assertEqual(result["path"], "team")
+            self.assertEqual(result["total"], 2)
+            self.assertEqual([item["name"] for item in result["items"]], ["zeta.txt"])
+            command = fake.commands[0][0]
+            self.assertEqual(command[1:4], ["lsjson", "remote:backup/team", "--max-depth"])
+            self.assertFalse(any(part in {"copy", "copyto", "mkdir", "move", "delete"} for part in command))
+
+    def test_list_directory_rejects_traversal_before_remote_access(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = FakeSubprocessRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError):
+                    RcloneRunner(fake).list_directory(
+                        "remote:backup", "../outside", config, config_root=root,
+                    )
+            self.assertEqual(fake.commands, [])
+
+    def test_upload_rejects_absolute_remote_name_before_remote_access(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            source = root / "source.bin"
+            source.write_bytes(b"payload")
+            fake = FakeSubprocessRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError):
+                    RcloneRunner(fake).copy_files(
+                        [source], "remote:backup", config,
+                        workspace_root=root, config_root=root,
+                        remote_names=["/outside/source.bin"], ignore_existing=True,
+                    )
+            self.assertEqual(fake.commands, [])
+
+    def test_full_content_verification_uses_download_and_never_size_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            source = root / "source.bin"
+            source.write_bytes(b"full contents")
+            fake = FakeSubprocessRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).verify_complete_files(
+                    [source], "remote:backup", config, workspace_root=root,
+                    config_root=root, remote_names=["nested/source.bin"],
+                )
+            self.assertTrue(result["complete"])
+            command = fake.commands[0][0]
+            self.assertIn("--download", command)
+            self.assertNotIn("--size-only", command)
+            self.assertEqual(command[3], "remote:backup/nested/source.bin")
+
     def test_probe_access_reads_config_and_remote_without_mutating_or_exposing_secrets(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace = Path(temp_dir)
@@ -193,12 +269,14 @@ class RcloneRunnerTests(unittest.TestCase):
                     "googledrive:backup",
                     config,
                     workspace_root=workspace,
+                    ignore_existing=True,
                 )
 
             self.assertEqual(result["files"], ["result.7z.001"])
             self.assertEqual(len(subprocess_runner.commands), 1)
             command = subprocess_runner.commands[0][0]
             self.assertEqual(command[:4], ["rclone", "copyto", str(archive), "googledrive:backup/result.7z.001"])
+            self.assertIn("--ignore-existing", command)
             self.assertEqual(command[command.index("--config") + 1], str(config.resolve()))
             self.assertNotIn(str(thumbnail), command)
 

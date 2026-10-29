@@ -93,6 +93,17 @@
     return ({ busy: 'sibuk', stale: 'heartbeat terlambat', paused: 'dijeda', queued: 'antre', idle: 'idle', disabled: 'nonaktif' } as Record<string, string>)[status] || status;
   }
 
+  function storageStatusLabel(status: string): string {
+    return ({
+      succeeded: 'Berhasil', failed: 'Gagal', pending: 'Menunggu', sending: 'Mengirim',
+      needs_reconciliation: 'Perlu verifikasi', deleted: 'Dihapus',
+      retained_conflict: 'Disimpan · target bentrok', retained_ambiguous: 'Disimpan · hasil belum pasti',
+      retained_upload_failed: 'Disimpan · upload gagal', retained_unverified: 'Disimpan · belum terverifikasi',
+      skipped_source_changed: 'Dilewati · sumber berubah', cleanup_failed: 'Gagal menghapus',
+      retained_unsafe_path: 'Disimpan · path tidak aman'
+    } as Record<string, string>)[status] || status;
+  }
+
   async function load() {
     const request = ++loadGeneration;
     const previousActiveIds = new Set(jobs.filter(active).map((job) => String(job.id)));
@@ -167,6 +178,7 @@
   async function openLog(job: Job) { selected = job; events = []; liveLog = null; logOpen = true; await loadEvents(); }
   function requestTerminate(target: 'one'|'all', job?: Job) { if (job) selected = job; confirmTarget = target; confirmOpen = true; }
   function hasAmbiguousStorageFiles(job: Job): boolean {
+    if (job.payload?.provider === 'rclone') return false;
     const items = job.result?.value?.items || job.result?.items;
     return Array.isArray(items) && items.some((item) => item?.status === 'needs_reconciliation');
   }
@@ -396,7 +408,7 @@
 
 <Modal bind:open={reportOpen} title={selected ? `Detail ${selected.kind.replaceAll('_',' ')}` : 'Detail job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex max-h-[78dvh] min-h-0 flex-col">
-    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span></div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>{#if backupVerificationReport(selected)}<button class="button secondary" onclick={() => downloadBackupVerificationReport(selected!)}><Download size={15}/>Unduh JSON verifikasi</button>{/if}</div>
+    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span>{#if selected.kind==='storage_upload'}<span class="badge">{selected.payload?.provider || 'telegram'}</span><span class="muted text-sm">{selected.payload?.provider==='rclone'?`Tujuan rclone: ${selected.payload?.rclone_destination || 'root'}${selected.payload?.rclone_path?`/${selected.payload.rclone_path}`:''}`:`Tujuan Telegram: ${selected.payload?.destination_folder_path || 'My Drive'}`}</span><span class="muted text-sm">{selected.payload?.transfer_mode || 'copy'}</span>{/if}</div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>{#if backupVerificationReport(selected)}<button class="button secondary" onclick={() => downloadBackupVerificationReport(selected!)}><Download size={15}/>Unduh JSON verifikasi</button>{/if}</div>
     <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
       <div class="mb-4 flex gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'summary' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'summary'}>Ringkasan</button>
@@ -413,7 +425,9 @@
                 <article class="rounded-lg border border-[var(--line)] p-3">
                   <div class="flex flex-wrap items-center gap-2">
                     <b class="break-all text-sm">{item.name || item.path || `File ${index + 1}`}</b>
-                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'needs_reconciliation' || item.status === 'failed' ? 'failed' : 'queued'}`}>{item.status || 'unknown'}</span>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'needs_reconciliation' || item.status === 'failed' ? 'failed' : 'queued'}`}>{storageStatusLabel(item.status || 'unknown')}</span>
+                    {#if item.upload_status}<span class="muted text-xs">Upload: {storageStatusLabel(item.upload_status)}</span>{/if}
+                    {#if item.cleanup_status && item.cleanup_status!=='not_requested'}<span class={`text-xs font-semibold ${item.cleanup_status==='deleted'?'text-emerald-700':'text-amber-700'}`}>Sumber: {storageStatusLabel(item.cleanup_status)}</span>{/if}
                     {#if item.profile}<span class="muted text-xs">Upload {item.profile}</span>{/if}
                     <span class="muted text-xs">Percobaan {item.attempt || 0}</span>
                     {#if item.retryable}<span class="text-xs font-semibold text-amber-700">Bisa diulang dengan aman</span>{/if}

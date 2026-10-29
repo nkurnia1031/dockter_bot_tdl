@@ -34,7 +34,7 @@ from tme3bot.tdl_access_fingerprint import (
     normalize_session_fingerprints,
 )
 from tme3bot.url_parser import parse_tme3_url
-from tme3bot.utility import DEFAULT_UTILITY_SETTINGS
+from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, validate_rclone_destination
 from tme3bot.safelink import normalize_shortlink_url
 
 _DURABLE_JOB_KINDS = frozenset({
@@ -245,8 +245,14 @@ class ControlPlane:
         registry = getattr(self.profile_manager, "profile_registry", None)
         check_deletion = getattr(registry, "local_deletion_active", None)
         values = payload if isinstance(payload, dict) else {}
+        rclone_storage = (
+            kind == "storage_upload"
+            and str(values.get("provider") or "telegram").strip().lower() == "rclone"
+        )
         candidates = [profile]
-        if kind in {"storage_upload", "storage_reconcile", "tts"}:
+        if rclone_storage:
+            candidates = []
+        elif kind in {"storage_upload", "storage_reconcile", "tts"}:
             candidates = values.get("_tdl_sender_profiles") or candidates
         elif kind == "tdl_access_verify":
             candidates = values.get("candidate_profiles") or candidates
@@ -255,7 +261,7 @@ class ControlPlane:
             candidates = list_profiles() if callable(list_profiles) else candidates
         for candidate in candidates:
             normalized = str(candidate or "").strip().lower()
-            if normalized and kind in {
+            if normalized and not rclone_storage and kind in {
                 "export", "leave", "download", "download_clear_failed",
                 "artifact_inventory", "artifact_delete",
                 "storage_upload", "storage_reconcile", "tts",
@@ -318,9 +324,27 @@ class ControlPlane:
             _, selected_worker = self.resolve_target(
                 actor, worker=worker
             )
+            provider = str(internal_payload.get("provider") or "telegram").strip().lower()
+            if provider not in {"telegram", "rclone"}:
+                raise DomainError("STORAGE_PROVIDER_INVALID", "Tujuan upload Storage tidak valid.", status_code=422)
+            if provider == "rclone":
+                internal_payload["provider"] = provider
+                internal_payload["rclone_destination"] = str(
+                    internal_payload.get("rclone_destination")
+                    or self._utility_settings_snapshot().get("rclone_destination", "googledrive:backup")
+                )
+                try:
+                    validate_rclone_destination(internal_payload["rclone_destination"])
+                except ValueError as exc:
+                    raise DomainError("RCLONE_DESTINATION_INVALID", "Root rclone yang dikonfigurasi tidak valid.", status_code=409) from exc
+                internal_payload["_tdl_sender_profiles"] = []
+                internal_payload["_tdl_sender_session_fingerprints"] = {}
+                target_chat = ""
+            else:
+                target_chat = ""
             retry_source_id = str(internal_payload.get("_storage_retry_of") or "").strip()
             retry_source = self.jobs.get(retry_source_id) if retry_source_id else None
-            if retry_source_id:
+            if provider == "telegram" and retry_source_id:
                 if (
                     retry_source is None
                     or retry_source.kind != "storage_upload"
@@ -342,27 +366,44 @@ class ControlPlane:
                         "Snapshot tujuan upload asli tidak tersedia.",
                         status_code=409,
                     )
-            else:
+            elif provider == "telegram":
                 target_chat = self._tdl_access_target("storage")
                 if not target_chat:
                     raise DomainError("TDL_ACCESS_TARGET_UNAVAILABLE", "Tujuan TDL Storage belum dikonfigurasi.", status_code=503)
-            execution_profile, sender_profiles, session_fingerprints = (
-                self._storage_sender_snapshot(selected_worker, destination=target_chat)
-            )
-            internal_payload.update(
-                _tdl_sender_profile=execution_profile,
-                _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
-                _tdl_sender_session_fingerprints={
-                    profile: session_fingerprints[profile]
-                    for profile in sender_profiles
-                    if profile in session_fingerprints
-                },
-            )
-            private_values["tdl_storage_chat_ref"] = target_chat
-            private_values["tdl_sender_session_fingerprints"] = json.dumps(
-                internal_payload["_tdl_sender_session_fingerprints"],
-                separators=(",", ":"),
-            )
+                execution_profile, sender_profiles, session_fingerprints = (
+                    self._storage_sender_snapshot(selected_worker, destination=target_chat)
+                )
+                internal_payload.update(
+                    provider="telegram",
+                    _tdl_sender_profile=execution_profile,
+                    _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
+                    _tdl_sender_session_fingerprints={
+                        profile: session_fingerprints[profile]
+                        for profile in sender_profiles
+                        if profile in session_fingerprints
+                    },
+                )
+                private_values["tdl_storage_chat_ref"] = target_chat
+                private_values["tdl_sender_session_fingerprints"] = json.dumps(
+                    internal_payload["_tdl_sender_session_fingerprints"],
+                    separators=(",", ":"),
+                )
+            if provider == "telegram" and retry_source_id and retry_source is not None:
+                execution_profile, sender_profiles, session_fingerprints = (
+                    self._storage_sender_snapshot(selected_worker, destination=target_chat)
+                )
+                internal_payload.update(
+                    provider="telegram",
+                    _tdl_sender_profile=execution_profile,
+                    _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
+                    _tdl_sender_session_fingerprints={
+                        profile: session_fingerprints[profile]
+                        for profile in sender_profiles if profile in session_fingerprints
+                    },
+                )
+                private_values["tdl_sender_session_fingerprints"] = json.dumps(
+                    internal_payload["_tdl_sender_session_fingerprints"], separators=(",", ":")
+                )
         elif kind == "storage_reconcile":
             _, selected_worker = self.resolve_target(
                 actor, worker=worker
@@ -581,11 +622,16 @@ class ControlPlane:
                         error_code=failure.code,
                     )
                 elif kind == "storage_upload":
-                    self.runtime_readiness_gate.record_storage_failure(
-                        worker=selected_worker,
-                        profile=execution_profile,
-                        error_code=failure.code,
-                    )
+                    if str(internal_payload.get("provider") or "telegram") == "rclone":
+                        self.runtime_readiness_gate.record_rclone_storage_failure(
+                            worker=selected_worker, error_code=failure.code
+                        )
+                    else:
+                        self.runtime_readiness_gate.record_storage_failure(
+                            worker=selected_worker,
+                            profile=execution_profile,
+                            error_code=failure.code,
+                        )
             latest_job = self.jobs.get(job.id)
             sequence = (
                 latest_job.progress_sequence if latest_job is not None
@@ -689,25 +735,26 @@ class ControlPlane:
             )
         elif kind == "storage_upload":
             purpose = "storage"
-            destination = self._tdl_access_target(purpose)
-            if not destination:
-                raise DomainError(
-                    "TDL_ACCESS_TARGET_UNAVAILABLE",
-                    f"Tujuan TDL {purpose} belum dikonfigurasi.",
-                    status_code=503,
+            if str(payload.get("provider") or "telegram").strip().lower() == "telegram":
+                destination = self._tdl_access_target(purpose)
+                if not destination:
+                    raise DomainError(
+                        "TDL_ACCESS_TARGET_UNAVAILABLE",
+                        f"Tujuan TDL {purpose} belum dikonfigurasi.",
+                        status_code=503,
+                    )
+                execution_profile, sender_profiles, session_fingerprints = (
+                    self._storage_sender_snapshot(selected_worker, destination=destination)
                 )
-            execution_profile, sender_profiles, session_fingerprints = (
-                self._storage_sender_snapshot(selected_worker, destination=destination)
-            )
-            payload.update(
-                _tdl_sender_profile=execution_profile,
-                _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
-            )
-            payload["_tdl_sender_session_fingerprints"] = {
-                profile: session_fingerprints[profile]
-                for profile in sender_profiles
-                if profile in session_fingerprints
-            }
+                payload.update(
+                    _tdl_sender_profile=execution_profile,
+                    _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
+                )
+                payload["_tdl_sender_session_fingerprints"] = {
+                    profile: session_fingerprints[profile]
+                    for profile in sender_profiles
+                    if profile in session_fingerprints
+                }
         elif kind == "tdl_access_verify":
             purpose = str(payload.get("purpose") or "")
             destination = self._tdl_access_target(purpose)
@@ -852,8 +899,13 @@ class ControlPlane:
         elif kind == "download" and self.runtime_readiness_gate is not None:
             self.runtime_readiness_gate.require_download(profile, worker)
         elif kind == "storage_upload" and self.runtime_readiness_gate is not None:
-            self.runtime_readiness_gate.require_upload(profile, worker)
-            self.runtime_readiness_gate.require_storage(profile, worker)
+            if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
+                self.runtime_readiness_gate.require_rclone_storage(
+                    worker, str(payload.get("rclone_destination") or "")
+                )
+            else:
+                self.runtime_readiness_gate.require_upload(profile, worker)
+                self.runtime_readiness_gate.require_storage(profile, worker)
         elif kind == "safelink_resolve" and self.runtime_readiness_gate is not None:
             self.runtime_readiness_gate.require_resolver(worker)
 
@@ -915,6 +967,11 @@ class ControlPlane:
             payload = payload if isinstance(payload, dict) else (
                 command if isinstance(command, dict) else {}
             )
+            if str(payload.get("provider") or job.payload.get("provider") or "telegram") == "rclone":
+                self.runtime_readiness_gate.record_rclone_storage_failure(
+                    worker=job.worker, error_code=error_code
+                )
+                return
             sender_profile = str(payload.get("_tdl_sender_profile") or "").strip().lower()
             if sender_profile:
                 self.runtime_readiness_gate.record_storage_failure(
@@ -965,7 +1022,8 @@ class ControlPlane:
             "utility": {"utility", "folders", "password"},
             "storage_upload": {
                 "folder_path", "folder", "destination_folder_id",
-                "preserve_structure", "keywords", "rclone_upload",
+                "preserve_structure", "keywords", "provider", "rclone_path",
+                "transfer_mode", "move_confirmed",
             },
             "backup_verify": {"run_id"},
             "tts": {"title", "text"},
@@ -1080,40 +1138,59 @@ class ControlPlane:
             destination_id = payload.get("destination_folder_id")
             if destination_id is not None and (type(destination_id) is not int or destination_id < 1):
                 raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak valid.", status_code=422)
-            if self.storage_catalog is None:
-                raise DomainError("STORAGE_UNAVAILABLE", "Katalog Storage belum tersedia.", status_code=503)
-            if destination_id is None and str(payload.get("folder") or "").strip():
-                folder = self.storage_catalog.ensure_path(
-                    str(payload["folder"]).strip(), actor.telegram_user_id
-                )
-                destination_id = folder.id if folder else None
-            if destination_id is not None:
-                selected = self.storage_catalog.get_folder(destination_id)
-                if selected is None or selected.status != "active":
-                    raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak aktif.", status_code=409)
-            rclone_upload = payload.get("rclone_upload", False)
+            provider = str(payload.get("provider") or "telegram").strip().lower()
+            if provider not in {"telegram", "rclone"}:
+                raise DomainError("STORAGE_PROVIDER_INVALID", "Tujuan upload Storage tidak valid.", status_code=422)
             preserve_structure = payload.get("preserve_structure", True)
-            if type(rclone_upload) is not bool or type(preserve_structure) is not bool:
+            transfer_mode = str(payload.get("transfer_mode") or "copy").strip().lower()
+            move_confirmed = payload.get("move_confirmed", False)
+            if type(preserve_structure) is not bool or type(move_confirmed) is not bool or transfer_mode not in {"copy", "move"}:
                 raise DomainError("JOB_PAYLOAD_INVALID", "Opsi upload Storage harus berupa boolean.", status_code=422)
+            if transfer_mode == "move" and not move_confirmed:
+                raise DomainError("STORAGE_MOVE_CONFIRMATION_REQUIRED", "Move memerlukan konfirmasi eksplisit.", status_code=422)
             keywords = str(payload.get("keywords") or "")
             if len(keywords) > 600:
                 raise DomainError("JOB_PAYLOAD_INVALID", "Keywords Storage terlalu panjang.", status_code=422)
             values = {
-                "folder_path": str(source_path),
-                "folder": str(payload.get("folder") or ""),
-                "destination_folder_id": destination_id,
-                "destination_folder_path": self.storage_catalog.folder_path(destination_id),
-                "preserve_structure": preserve_structure,
-                "keywords": keywords,
-                "rclone_upload": rclone_upload,
-                "batch_id": str(uuid.uuid4()),
-                "owner_user_id": actor.telegram_user_id,
+                "folder_path": str(source_path), "provider": provider,
+                "preserve_structure": preserve_structure, "keywords": keywords,
+                "transfer_mode": transfer_mode, "move_confirmed": move_confirmed,
+                "batch_id": str(uuid.uuid4()), "owner_user_id": actor.telegram_user_id,
                 "owner_profile": actor.profile,
             }
-            if rclone_upload:
-                values["rclone_destination"] = self._utility_settings_snapshot().get(
-                    "rclone_destination", "googledrive:backup"
-                )
+            if provider == "telegram":
+                if payload.get("rclone_path"):
+                    raise DomainError("STORAGE_TARGET_INVALID", "Path rclone hanya berlaku untuk tujuan rclone.", status_code=422)
+                if self.storage_catalog is None:
+                    raise DomainError("STORAGE_UNAVAILABLE", "Katalog Storage belum tersedia.", status_code=503)
+                if destination_id is None and str(payload.get("folder") or "").strip():
+                    folder = self.storage_catalog.ensure_path(str(payload["folder"]).strip(), actor.telegram_user_id)
+                    destination_id = folder.id if folder else None
+                if destination_id is not None:
+                    selected = self.storage_catalog.get_folder(destination_id)
+                    if selected is None or selected.status != "active":
+                        raise DomainError("STORAGE_FOLDER_INVALID", "Folder tujuan tidak aktif.", status_code=409)
+                values.update({
+                    "folder": str(payload.get("folder") or ""),
+                    "destination_folder_id": destination_id,
+                    "destination_folder_path": self.storage_catalog.folder_path(destination_id),
+                })
+            else:
+                if destination_id is not None or str(payload.get("folder") or "").strip():
+                    raise DomainError("STORAGE_TARGET_INVALID", "Pilih tepat satu tujuan upload.", status_code=422)
+                raw_remote_path = str(payload.get("rclone_path") or "").replace("\\", "/")
+                if raw_remote_path.startswith("/"):
+                    raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
+                remote_path = raw_remote_path.strip("/")
+                parts = remote_path.split("/") if remote_path else []
+                if len(remote_path) > 2048 or any(ord(char) < 32 for char in remote_path) or any(not part or part in {".", ".."} or ":" in part for part in parts):
+                    raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
+                values["rclone_path"] = remote_path
+                values["rclone_destination"] = self._utility_settings_snapshot().get("rclone_destination", "googledrive:backup")
+                try:
+                    validate_rclone_destination(str(values["rclone_destination"] or "").strip())
+                except ValueError as exc:
+                    raise DomainError("RCLONE_DESTINATION_INVALID", "Root rclone yang dikonfigurasi tidak valid.", status_code=409) from exc
             return values
 
         if kind == "tts":
@@ -4015,6 +4092,29 @@ class ControlPlane:
                 current["error_code"] = error_code
             else:
                 current.pop("error_code", None)
+            if str(source.payload.get("transfer_mode") or "copy") == "move":
+                current["upload_status"] = state
+                if state == "succeeded" and str(source.payload.get("provider") or "telegram") == "telegram":
+                    cleanup = getattr(self.dispatcher, "storage_move_cleanup", None)
+                    try:
+                        if callable(cleanup):
+                            cleanup_result = cleanup(
+                                source.worker, source.id,
+                                str(source.payload.get("folder_path") or ""),
+                                str(current.get("path") or ""),
+                            )
+                            current["cleanup_status"] = str(
+                                cleanup_result.get("cleanup_status") or "retained_unverified"
+                            ) if isinstance(cleanup_result, dict) else "retained_unverified"
+                        else:
+                            current["cleanup_status"] = "retained_unverified"
+                    except Exception:
+                        current["cleanup_status"] = "cleanup_failed"
+                    current.pop("source_identity", None)
+                elif state == "succeeded":
+                    current["cleanup_status"] = str(current.get("cleanup_status") or "not_requested")
+                else:
+                    current["cleanup_status"] = "retained_ambiguous"
             updated_items[index] = current
         if not seen:
             return

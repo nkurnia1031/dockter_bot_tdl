@@ -63,6 +63,19 @@ class FakeProfiles:
 
 
 class JobDictionaryTests(unittest.TestCase):
+    def test_public_storage_results_hide_worker_file_identity(self):
+        job = Job(
+            id="move-job", kind="storage_upload", profile="default", actor_user_id=42,
+            worker="local", status=JobStatus.SUCCEEDED, payload={"provider": "telegram"},
+            result={"value": {"items": [{
+                "path": "file.bin", "status": "succeeded",
+                "source_identity": {"device": 10, "inode": 20, "size": 30, "mtime_ns": 40},
+            }]}},
+        )
+        public = job_dict(job)
+        self.assertEqual(public["result"]["value"]["items"][0]["path"], "file.bin")
+        self.assertNotIn("source_identity", str(public))
+
     def test_storage_retryable_requires_a_terminal_job_and_safe_file(self):
         base = {
             "id": "storage-job",
@@ -121,6 +134,7 @@ class FakeDispatcher:
         self.tts_health_calls = []
         self.tts_recoveries = []
         self.storage_fingerprint_overrides = {}
+        self.rclone_browse_calls = []
         self.profile_sync_requests = []
         self.profile_sync_snapshot = {
             "status": "waiting_worker",
@@ -174,6 +188,11 @@ class FakeDispatcher:
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
         return {"position": 1}
+
+    def rclone_storage_browse(self, worker, destination, **kwargs):
+        self.rclone_browse_calls.append((worker, destination, kwargs))
+        return {"path": kwargs.get("path", ""), "breadcrumbs": [], "items": [],
+                "total": 0, "limit": kwargs.get("limit", 100), "offset": kwargs.get("offset", 0)}
 
     def dispatch_command(self, worker, envelope):
         self.durable_commands.append(envelope)
@@ -3783,24 +3802,123 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotEqual(command["payload"]["quick_settings"]["compress_password"], "***")
         self.assertTrue(command["payload"]["quick_settings"]["compress_password"])
 
-    def test_storage_upload_can_snapshot_rclone_destination(self):
+    def test_storage_upload_selects_exactly_one_rclone_destination(self):
         headers = self.login()
-        self.seed_tdl_access(worker="local", purpose="storage")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(self.runtime_readiness_store)
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-29T00:00:00Z",
+            workers=[{"worker": "local", "status": "success"}], profiles={"local": []},
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="f" * 64,
+            destination_fingerprint=hashlib.sha256(b"googledrive:backup").hexdigest(),
+            checked_at="2026-10-29T00:00:00Z",
+        )
         created = self.client.post(
             "/api/v1/storage/uploads",
             headers=headers,
             json={
                 "folder_path": "/workspace/biasa",
                 "worker": "local",
-                "rclone_upload": True,
+                "provider": "rclone",
+                "rclone_path": "archive/2026",
+                "transfer_mode": "copy",
             },
         )
         self.assertEqual(created.status_code, 200)
         command = self.dispatcher.commands[-1][1]
-        self.assertTrue(command["payload"]["rclone_upload"])
+        self.assertEqual(command["payload"]["provider"], "rclone")
+        self.assertEqual(command["payload"]["rclone_path"], "archive/2026")
         self.assertEqual(
             command["payload"]["rclone_destination"], "googledrive:backup"
         )
+        self.assertNotIn("rclone_upload", command["payload"])
+
+    def test_rclone_storage_upload_requires_worker_root_snapshot_without_tdl_sessions(self):
+        headers = self.login()
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(self.runtime_readiness_store)
+        blocked = self.client.post(
+            "/api/v1/storage/uploads", headers=headers,
+            json={"folder_path": "/workspace/biasa", "worker": "local",
+                  "provider": "rclone", "rclone_path": "archive"},
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.json()["error"]["code"], "RUNTIME_NOT_READY")
+
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-29T00:00:00Z",
+            workers=[{"worker": "local", "status": "success"}], profiles={"local": []},
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="f" * 64,
+            destination_fingerprint=hashlib.sha256(b"googledrive:backup").hexdigest(),
+            checked_at="2026-10-29T00:00:00Z",
+        )
+        self.dispatcher.storage_fingerprint_overrides["default"] = ""
+        submitted = self.client.post(
+            "/api/v1/storage/uploads", headers=headers,
+            json={"folder_path": "/workspace/biasa", "worker": "local",
+                  "provider": "rclone", "rclone_path": "archive"},
+        )
+        self.assertEqual(submitted.status_code, 200, submitted.text)
+        self.assertEqual(self.dispatcher.commands[-1][1]["payload"]["provider"], "rclone")
+
+    def test_rclone_storage_admission_does_not_require_profile_worker_assignment(self):
+        verify_profile_worker = Mock(side_effect=AssertionError("unexpected TDL profile gate"))
+        self.control.assert_profile_worker_verified = verify_profile_worker
+        self.control._assert_profile_admission(
+            "storage_upload", "default", "local", {"provider": "rclone"}
+        )
+        verify_profile_worker.assert_not_called()
+
+    def test_storage_move_requires_explicit_confirmation(self):
+        headers = self.login()
+        response = self.client.post(
+            "/api/v1/storage/uploads", headers=headers,
+            json={"folder_path": "/workspace/biasa", "worker": "local",
+                  "provider": "telegram", "transfer_mode": "move"},
+        )
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(response.json()["error"]["code"], "STORAGE_MOVE_CONFIRMATION_REQUIRED")
+
+    def test_rclone_browser_requires_matching_readiness_root_before_dispatch(self):
+        headers = self.login()
+        self.context.utility_settings.set("rclone_destination", "remote:archive")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(self.runtime_readiness_store)
+        blocked = self.client.get(
+            "/api/v1/storage/rclone/browser?worker=local&path=docs", headers=headers,
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(self.dispatcher.rclone_browse_calls, [])
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-29T00:00:00Z",
+            workers=[{"worker": "local", "status": "success"}], profiles={"local": []},
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="a" * 64,
+            destination_fingerprint=hashlib.sha256(b"remote:archive").hexdigest(),
+            checked_at="2026-10-29T00:00:00Z",
+        )
+        response = self.client.get(
+            "/api/v1/storage/rclone/browser?worker=local&path=docs&limit=25&offset=50",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.dispatcher.rclone_browse_calls[0][0:2], ("local", "remote:archive"))
+        self.assertEqual(self.dispatcher.rclone_browse_calls[0][2]["path"], "docs")
+        self.assertEqual(self.dispatcher.rclone_browse_calls[0][2]["offset"], 50)
+        traversal = self.client.get(
+            "/api/v1/storage/rclone/browser?worker=local&path=..%2Foutside", headers=headers,
+        )
+        self.assertEqual(traversal.status_code, 422)
+        absolute = self.client.get(
+            "/api/v1/storage/rclone/browser?worker=local&path=%2Foutside", headers=headers,
+        )
+        self.assertEqual(absolute.status_code, 422)
+        self.assertEqual(len(self.dispatcher.rclone_browse_calls), 1)
 
     def test_storage_reconciliation_endpoint_uses_original_private_destination(self):
         headers = self.login()

@@ -31,7 +31,6 @@ from tme3bot.frontend.telegram.keyboards import (
     storage_folders_markup,
     storage_item_markup,
     storage_menu_markup,
-    storage_rclone_markup,
     utility_confirm_markup,
     utility_folders_markup,
     utility_menu_markup,
@@ -1045,38 +1044,16 @@ class TelegramFrontendApp:
             index = int(data.rsplit(":", 1)[1])
             folder_path = folders[index]
             self.pending[(message.chat_id, user_id)] = PendingInput(
-                "storage_rclone_choice", {"folder_path": folder_path, "rclone_upload": False}
+                "storage_folder_name", {
+                    "folder_path": folder_path, "provider": "telegram",
+                    "transfer_mode": "copy", "move_confirmed": False,
+                }
             )
             edit_menu_message(
                 message,
-                "Salin juga file Storage ke Google Drive dengan rclone?",
-                storage_rclone_markup(),
+                "Ketik nama folder logis storage.",
+                storage_menu_markup(),
             )
-        elif data.startswith("storage:rclone:"):
-            pending = self.pending.get((message.chat_id, user_id))
-            if not pending or pending.action != "storage_rclone_choice":
-                edit_menu_message(message, "Sesi upload sudah berakhir.", storage_menu_markup())
-                return
-            action = data.rsplit(":", 1)[1]
-            if action == "toggle":
-                enabled = not bool(pending.data.get("rclone_upload"))
-                self.pending[(message.chat_id, user_id)] = PendingInput(
-                    pending.action, {**pending.data, "rclone_upload": enabled}
-                )
-                edit_menu_message(
-                    message,
-                    "Salin juga file Storage ke Google Drive dengan rclone?",
-                    storage_rclone_markup(enabled),
-                )
-            elif action == "continue":
-                self.pending[(message.chat_id, user_id)] = PendingInput(
-                    "storage_folder_name", dict(pending.data)
-                )
-                edit_menu_message(
-                    message,
-                    "Ketik nama folder logis storage.",
-                    storage_menu_markup(),
-                )
         elif data == "storage:search":
             self.pending[(message.chat_id, user_id)] = PendingInput("storage_search")
             edit_menu_message(

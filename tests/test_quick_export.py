@@ -190,6 +190,26 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
         self.assertTrue(result["output_truncated"])
         self.assertNotIn("secret-value", str(result))
 
+    def test_command_milestones_hide_local_rclone_config_path(self) -> None:
+        events = []
+
+        class Publisher:
+            def emit(self, *args, **kwargs):
+                events.append((args, kwargs))
+
+        recorder = CommandMilestoneRecorder(Publisher(), "job-rclone", ["/data/.config/rclone.conf"])
+        command = ["rclone", "lsjson", "remote:backup", "--config", "/data/.config/rclone.conf"]
+        command_id = recorder.command_started(command, "rclone-storage-browser")
+        recorder.command_completed(
+            command, 1, "failed to load config /data/.config/rclone.conf", 0.1,
+            "rclone-storage-browser", command_id,
+        )
+
+        for event in events:
+            persisted = event[1]["result"]["command"]
+            self.assertEqual(persisted[-2:], ["--config", "[redacted]"])
+            self.assertNotIn("rclone.conf", str(event))
+
     def test_command_milestone_is_started_then_completed_with_same_id(self) -> None:
         events = []
 

@@ -139,7 +139,8 @@ describe('JobTable', () => {
       created_at: '2026-10-14T00:00:00Z', updated_at: '2026-10-14T00:00:01Z', retryable: true,
       result: { value: { outcome: 'partial_failure', items: [
         { path: 'safe.txt', name: 'safe.txt', status: 'failed', attempt: 1, retryable: true, error: 'File gagal sebelum dikirim.' },
-        { path: 'ambiguous.txt', name: 'ambiguous.txt', status: 'needs_reconciliation', attempt: 2, profile: 'archive', retryable: false, error: 'Hasil belum pasti.' },
+        { path: 'ambiguous.txt', name: 'ambiguous.txt', status: 'needs_reconciliation', upload_status: 'needs_reconciliation', cleanup_status: 'retained_ambiguous', attempt: 2, profile: 'archive', retryable: false, error: 'Hasil belum pasti.' },
+        { path: 'changed.txt', name: 'changed.txt', status: 'succeeded', upload_status: 'succeeded', cleanup_status: 'skipped_source_changed', attempt: 1, retryable: false },
       ] } }
     };
     vi.stubGlobal('confirm', vi.fn(() => true));
@@ -168,7 +169,9 @@ describe('JobTable', () => {
     expect(await screen.findByText('Hasil per file')).toBeTruthy();
     expect(screen.getByText('safe.txt')).toBeTruthy();
     expect(screen.getByText('ambiguous.txt')).toBeTruthy();
-    expect(screen.getByText('needs_reconciliation')).toBeTruthy();
+    expect(screen.getByText('Perlu verifikasi')).toBeTruthy();
+    expect(screen.getByText('Upload: Perlu verifikasi')).toBeTruthy();
+    expect(screen.getByText('Sumber: Dilewati · sumber berubah')).toBeTruthy();
   });
 
   it('lists and reopens safe Storage reconciliation results without exposing caption or path', async () => {

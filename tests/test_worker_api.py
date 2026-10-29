@@ -26,6 +26,8 @@ class FakeExecutor:
         self.utility_probe_calls = 0
         self.quickmode_probe_destinations = []
         self.rclone_storage_probe_destinations = []
+        self.rclone_storage_browse_requests = []
+        self.storage_move_cleanup_requests = []
         self.safelink_probe_calls = 0
         self.profile_readiness_canary_requests = []
         self.profile_readiness_canary_status = {
@@ -95,6 +97,14 @@ class FakeExecutor:
             "fingerprint": "d" * 64,
             "destination_fingerprint": "e" * 64,
         }
+
+    def rclone_storage_browse(self, destination, path="", **kwargs):
+        self.rclone_storage_browse_requests.append((destination, path, kwargs))
+        return {"path": path, "items": [], "total": 0, "limit": kwargs.get("limit", 100), "offset": kwargs.get("offset", 0)}
+
+    def storage_move_cleanup_reconciled(self, source_job_id, folder_path, relative_path):
+        self.storage_move_cleanup_requests.append((source_job_id, folder_path, relative_path))
+        return {"cleanup_status": "deleted"}
 
     def safelink_runtime_readiness(self):
         self.safelink_probe_calls += 1
@@ -324,6 +334,28 @@ class WorkerApiTests(unittest.TestCase):
     def test_worker_has_no_openapi_surface(self):
         response = self.client.get("/openapi.json")
         self.assertEqual(response.status_code, 404)
+
+    def test_rclone_browser_is_authenticated_and_forwards_only_bounded_listing_options(self):
+        body = {"rclone_destination": "remote:backup", "path": "docs", "q": "report",
+                "sort": "name", "order": "asc", "limit": 25, "offset": 50}
+        denied = self.client.post("/internal/v1/storage/rclone-browser", json=body)
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.post(
+            "/internal/v1/storage/rclone-browser",
+            headers={"Authorization": "Bearer worker-secret"}, json=body,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.executor.rclone_storage_browse_requests[0][0:2], ("remote:backup", "docs"))
+        self.assertEqual(self.executor.rclone_storage_browse_requests[0][2]["offset"], 50)
+
+    def test_move_cleanup_endpoint_uses_worker_private_checkpoint_identity(self):
+        response = self.client.post(
+            "/internal/v1/storage/move-cleanup",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"source_job_id": "upload-job", "folder_path": "/workspace/files", "relative_path": "a.bin"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["cleanup_status"], "deleted")
 
     def test_quickmode_runtime_readiness_is_worker_authenticated_and_read_only_probe(self):
         denied = self.client.post(

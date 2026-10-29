@@ -23,6 +23,7 @@ from tme3bot.domain.worker_contract import (
 )
 from tme3bot.profile_diagnostics import PROFILE_TDL_DIAGNOSTIC_CODES
 from tme3bot.profile_provisioning import MAX_PROFILE_BUNDLE_BYTES, MAX_SESSION_ARCHIVE_BYTES
+from tme3bot.rclone import RcloneError
 from tme3bot.names import normalize_profile_name
 
 LOGGER = logging.getLogger(__name__)
@@ -183,6 +184,46 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 status_code=404,
             )
         return probe(body["rclone_destination"])
+
+    @app.post("/internal/v1/storage/rclone-browser", dependencies=[Depends(authorize)])
+    def rclone_storage_browser(body: dict[str, Any]):
+        allowed = {"rclone_destination", "path", "q", "sort", "order", "limit", "offset"}
+        if set(body) - allowed or not isinstance(body.get("rclone_destination"), str):
+            raise DomainError("RCLONE_BROWSER_REQUEST_INVALID", "Permintaan browser rclone tidak valid.", status_code=422)
+        for key in ("path", "q", "sort", "order"):
+            if key in body and not isinstance(body[key], str):
+                raise DomainError("RCLONE_BROWSER_REQUEST_INVALID", "Permintaan browser rclone tidak valid.", status_code=422)
+        for key, minimum, maximum in (("limit", 1, 200), ("offset", 0, 2_000_000)):
+            value = body.get(key, 100 if key == "limit" else 0)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise DomainError("RCLONE_BROWSER_REQUEST_INVALID", "Permintaan browser rclone tidak valid.", status_code=422)
+        browse = getattr(context.executor, "rclone_storage_browse", None)
+        if not callable(browse):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung browser rclone Storage.", status_code=404)
+        try:
+            return browse(
+                body["rclone_destination"], body.get("path", ""), query=body.get("q", ""),
+                sort=body.get("sort", "name"), order=body.get("order", "asc"),
+                limit=body.get("limit", 100), offset=body.get("offset", 0),
+            )
+        except RcloneError as exc:
+            status = 422 if "PATH" in exc.code or "path" in str(exc).casefold() else 503
+            code = "RCLONE_BROWSER_PATH_INVALID" if status == 422 else (exc.code or "RCLONE_BROWSER_FAILED")
+            raise DomainError(code, "Path rclone tidak valid." if status == 422 else "Worker tidak dapat membaca folder rclone.", status_code=status) from exc
+
+    @app.post("/internal/v1/storage/move-cleanup", dependencies=[Depends(authorize)])
+    def storage_move_cleanup(body: dict[str, Any]):
+        if set(body) != {"source_job_id", "folder_path", "relative_path"}:
+            raise DomainError("STORAGE_MOVE_CLEANUP_INVALID", "Permintaan cleanup Move tidak valid.", status_code=422)
+        if any(not isinstance(body.get(key), str) for key in ("source_job_id", "folder_path", "relative_path")):
+            raise DomainError("STORAGE_MOVE_CLEANUP_INVALID", "Permintaan cleanup Move tidak valid.", status_code=422)
+        cleanup = getattr(context.executor, "storage_move_cleanup_reconciled", None)
+        if not callable(cleanup):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung cleanup Move Storage.", status_code=404)
+        try:
+            return cleanup(body["source_job_id"], body["folder_path"], body["relative_path"])
+        except ValueError as exc:
+            raise DomainError("STORAGE_MOVE_PATH_INVALID", "Path sumber Move tidak valid.", status_code=422) from exc
 
     @app.get("/internal/v1/safelink/runtime-readiness", dependencies=[Depends(authorize)])
     def safelink_runtime_readiness():

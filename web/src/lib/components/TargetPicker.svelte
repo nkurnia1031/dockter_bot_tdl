@@ -26,7 +26,8 @@
     quickMode = false,
     requiresVerification = true,
     readinessRuntime = 'export',
-    showReadiness = true
+    showReadiness = true,
+    onWorkerChange
   }: {
     purpose?: 'export'|'utility'|'storage';
     requireProfile?: boolean;
@@ -36,8 +37,9 @@
     disabled?: boolean;
     quickMode?: boolean;
     requiresVerification?: boolean;
-    readinessRuntime?: 'export'|'utility'|'quick_mode'|'storage';
+    readinessRuntime?: 'export'|'utility'|'quick_mode'|'storage'|'rclone_storage';
     showReadiness?: boolean;
+    onWorkerChange?: (worker: string) => void;
   } = $props();
 
   let checking = $state(false);
@@ -52,7 +54,7 @@
       readinessRuntime
     ));
   const readinessRuntimeLabel = $derived(
-    readinessRuntime === 'utility' ? 'Utility' : readinessRuntime === 'quick_mode' ? 'Quick Mode' : readinessRuntime === 'storage' ? 'Storage' : 'Export'
+    readinessRuntime === 'utility' ? 'Utility' : readinessRuntime === 'quick_mode' ? 'Quick Mode' : readinessRuntime === 'rclone_storage' ? 'Storage rclone' : readinessRuntime === 'storage' ? 'Storage' : 'Export'
   );
   const readinessLabels = $derived({
     ready: `${readinessRuntimeLabel} siap`,
@@ -75,7 +77,7 @@
   );
 
   onMount(() => {
-    const tracksRuntimeReadiness = showReadiness && (requireProfile || readinessRuntime === 'storage');
+    const tracksRuntimeReadiness = showReadiness && (requireProfile || readinessRuntime === 'storage' || readinessRuntime === 'rclone_storage');
     if (tracksRuntimeReadiness) void session.refreshProfileCatalog();
     const onJobFinished = () => { void session.refreshProfileCatalog(); };
     if (tracksRuntimeReadiness) window.addEventListener('tme3:job-finished', onJobFinished);
@@ -143,7 +145,7 @@
       </label>
     {/if}
     <label class="min-w-[10rem] flex-1 text-sm font-bold">Worker target
-      <select class="field mt-2" bind:value={worker} onchange={invalidate} disabled={disabled || checking}>
+      <select class="field mt-2" bind:value={worker} onchange={() => { invalidate(); onWorkerChange?.(worker); }} disabled={disabled || checking}>
         <option value="" disabled>Pilih worker</option>
         {#each workerOptions as item}<option value={item.name} disabled={item.enabled === false}>{item.name}{item.enabled === false ? ' (nonaktif)' : ''}</option>{/each}
       </select>
