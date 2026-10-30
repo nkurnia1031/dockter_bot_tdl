@@ -7,6 +7,7 @@ __pycache__/
 .env.*
 !.env.example
 !.env.backend.example
+!.env.gateway-here.example
 !.env.telegram.example
 !.env.web.example
 !.env.worker.example

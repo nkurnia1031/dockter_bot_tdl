@@ -59,6 +59,17 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertNotIn("web:", gateway)
         self.assertIn("telegram:", gateway)
         self.assertEqual(gateway.count("target: gateway"), 1)
+        backend_publish = (
+            '"${BACKEND_BIND_HOST:-0.0.0.0}:'
+            '${BACKEND_HOST_PORT:-${BACKEND_PORT:-8080}}:'
+            '${BACKEND_PORT:-8080}"'
+        )
+        self.assertIn(backend_publish, gateway)
+        gateway_here = (PROJECT_ROOT / ".env.gateway-here.example").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("COMPOSE_PROJECT_NAME=tme3bot-gateway", gateway_here)
+        self.assertIn("BACKEND_HOST_PORT=8081", gateway_here)
         telegram_service = gateway.split("  telegram:", 1)[1].split(
             "  worker-local:", 1
         )[0]
