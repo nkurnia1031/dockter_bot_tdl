@@ -134,13 +134,14 @@ dan VPS sudah login ke GHCR, deploy hanya perlu pull lalu menjalankan container:
 python3 run.py deploy gateway --pull
 ```
 
-Perintah deploy gateway juga menjalankan worker lokal, tiga helper TTS, dan
-addon resolver. Deploy worker remote menjalankan worker beserta addon yang
-sama. Alurnya selalu backend → worker → helper TTS/resolver; backend hanya
-mengenal worker yang sudah terdaftar. Addon resolver memakai image Python
-ringan terpisah, melakukan request Livewire dengan HTTPX, hanya tersedia pada
-jaringan privat Compose, dan tidak memerlukan token atau berkas `.env`
-tersendiri. `COMPOSE_PROFILES` tidak perlu diatur.
+Deploy gateway menjalankan backend, Telegram, dan worker lokal tanpa helper
+TTS/Resolver. Deploy worker remote tetap menjalankan worker beserta helper
+TTS dan addon resolver. Dengan begitu, kemampuan TTS/Resolver pada gateway
+berasal dari worker remote yang siap; deploy gateway berikutnya menghapus
+container helper lama sebagai orphan Compose. Addon resolver memakai image
+Python ringan terpisah, melakukan request Livewire dengan HTTPX, hanya tersedia
+pada jaringan privat Compose, dan tidak memerlukan token atau berkas `.env`
+tersendiri.
 Build lokal dan `base-migrate.zip` masih tersedia sebagai fallback untuk
 recovery atau deployment offline.
 

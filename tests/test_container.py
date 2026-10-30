@@ -101,12 +101,17 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertNotIn("volumes", service)
         self.assertNotIn("env_file", service)
 
-    def test_tts_helpers_are_in_default_gateway_and_worker_stacks(self) -> None:
-        for filename in ("docker-compose.gateway.yml", "docker-compose.worker.yml"):
-            services = yaml.safe_load((PROJECT_ROOT / filename).read_text(encoding="utf-8"))["services"]
-            for name in ("tts-1", "tts-2", "tts-3"):
-                self.assertIn(name, services)
-                self.assertNotIn("profiles", services[name])
+    def test_tts_helpers_remain_only_in_remote_worker_stack(self) -> None:
+        gateway = yaml.safe_load(
+            (PROJECT_ROOT / "docker-compose.gateway.yml").read_text(encoding="utf-8")
+        )["services"]
+        worker = yaml.safe_load(
+            (PROJECT_ROOT / "docker-compose.worker.yml").read_text(encoding="utf-8")
+        )["services"]
+        for name in ("tts-1", "tts-2", "tts-3"):
+            self.assertNotIn(name, gateway)
+            self.assertIn(name, worker)
+            self.assertNotIn("profiles", worker[name])
 
     def test_gateway_queue_uses_private_persistent_redis_without_worker_mounts(self) -> None:
         for filename in ("docker-compose.gateway.yml", "docker-compose.yml"):

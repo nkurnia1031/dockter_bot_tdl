@@ -34,23 +34,17 @@ profile aktif; bot token tidak dipakai untuk delivery TTS.
 5. Pastikan direktori `/data/tts` termasuk dalam volume data worker agar
    artifact dan checkpoint tetap ada setelah container worker restart.
 
-## Aktifkan satu worker untuk uji coba
+## Aktifkan helper TTS pada worker
 
-Aktifkan profile Compose `tts` hanya pada satu host worker terlebih dahulu.
-Untuk gateway, jalankan deployment dengan profile tersebut:
-
-```bash
-COMPOSE_PROFILES=tts python3 run.py deploy gateway --pull
-```
-
-Untuk VPS worker terpisah, gunakan:
+Gateway saat ini tidak menjalankan helper TTS lokal. Aktifkan helper pada VPS
+worker terpisah dengan deployment berikut:
 
 ```bash
-COMPOSE_PROFILES=tts python3 run.py deploy worker --pull
+python3 run.py deploy worker --pull
 ```
 
 Gunakan perintah worker hanya pada host yang env worker-nya memiliki konfigurasi
-helper dan volume data TTS. Profile tersebut menjalankan tiga container helper
+helper dan volume data TTS. Deployment menjalankan tiga container helper
 beserta Tor. Hanya HTTP helper yang tersedia di jaringan internal Compose;
 control port Tor tetap loopback di dalam setiap helper dan tidak diekspos ke
 container lain atau port publik host. Jalur Tor memakai circuit terpisah

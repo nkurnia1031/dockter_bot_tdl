@@ -62,7 +62,7 @@ Commands:
 
 Notes:
   - Data lives in PROFILE_ROOT mounted to /data.
-  - Gateway/worker deploys include TTS helpers and the private resolver addon; no addon token or env file is needed.
+  - Worker deploys include TTS helpers and the private resolver addon; gateway-local helpers are temporarily disabled.
   - update/down will not remove .tdl, download, exports, or state.json.
   - Builds prefer the host tdl binary and use a fixed fallback when unavailable.
   - cleanup keeps tagged images and images used by containers.
@@ -560,7 +560,6 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
         required_names = [
             str(target_env.get("GATEWAY_IMAGE_NAME") or "tme3bot-gateway"),
             str(target_env.get("WORKER_IMAGE_NAME") or "tme3bot-worker"),
-            resolver_addon_image_name(target_env),
         ]
     else:
         required_names = [
@@ -858,11 +857,7 @@ def compose_base_command(dotenv: dict[str, str] | None = None) -> list[str]:
         path.strip() for path in compose_file.split(os.pathsep) if path.strip()
     ]
     names = {Path(path.replace("\\", "/")).name.lower() for path in compose_files}
-    if "docker-compose.gateway.yml" in names:
-        for path in ("docker-compose.resolver.yml",):
-            if path not in compose_files:
-                compose_files.append(path)
-    elif (
+    if (
         "docker-compose.worker.yml" in names
         and "docker-compose.resolver.yml" not in names
     ):
@@ -875,10 +870,7 @@ def compose_base_command(dotenv: dict[str, str] | None = None) -> list[str]:
 
 def compose_files_for_target(target: str) -> str:
     files = {
-        "gateway": [
-            "docker-compose.gateway.yml",
-            "docker-compose.resolver.yml",
-        ],
+        "gateway": ["docker-compose.gateway.yml"],
         "worker": ["docker-compose.worker.yml", "docker-compose.resolver.yml"],
     }
     try:

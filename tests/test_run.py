@@ -64,7 +64,7 @@ class RunScriptTests(unittest.TestCase):
         ):
             command = run.compose_base_command({"COMPOSE_FILE": "docker-compose.gateway.yml"})
         self.assertEqual(command[:2], ["docker-compose", "-f"])
-        self.assertIn("docker-compose.resolver.yml", command)
+        self.assertNotIn("docker-compose.resolver.yml", command)
         self.assertNotIn("docker-compose.resolver-gateway.yml", command)
 
     def test_cleanup_prunes_only_dangling_images(self) -> None:
@@ -136,7 +136,7 @@ class RunScriptTests(unittest.TestCase):
 
         self.assertEqual(subprocess_run.call_args.args[0], [
             "docker", "compose", "-f", "docker-compose.gateway.yml",
-            "-f", "docker-compose.resolver.yml", "ps"
+            "ps"
         ])
 
     def test_static_web_install_preserves_aapanel_files_and_replaces_managed_assets(self) -> None:
@@ -211,13 +211,10 @@ class RunScriptTests(unittest.TestCase):
             deploy_env["COMPOSE_FILE"], run.compose_files_for_target("worker")
         )
 
-    def test_gateway_and_worker_stacks_include_resolver_addon(self) -> None:
+    def test_only_remote_worker_stack_includes_resolver_addon(self) -> None:
         self.assertEqual(
             run.compose_files_for_target("gateway").split(run.os.pathsep),
-            [
-                "docker-compose.gateway.yml",
-                "docker-compose.resolver.yml",
-            ],
+            ["docker-compose.gateway.yml"],
         )
         self.assertEqual(
             run.compose_files_for_target("worker").split(run.os.pathsep),
