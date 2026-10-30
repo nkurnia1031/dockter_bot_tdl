@@ -10,7 +10,7 @@
 
   type Job = Record<string, any>;
   type JobEvent = Record<string, any>;
-  type PollingMode = 'active' | 'activity' | 'manual';
+  type PollingMode = 'active' | 'activity';
   let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false, view = 'all', pollingMode = 'active' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean; view?: 'all'|'active'|'history'; pollingMode?: PollingMode } = $props();
   let jobs = $state<Job[]>([]);
   let monitorMetrics = $state<Record<string, any> | null>(null);
@@ -112,7 +112,7 @@
 
   function schedulePolling() {
     stopPolling();
-    if (!mounted || view === 'history' || pollingMode === 'manual') return;
+    if (!mounted || view === 'history') return;
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
     const delay = pollingMode === 'activity'
       ? activeJobs.length ? 2500 : 10_000
