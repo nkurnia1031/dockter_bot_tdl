@@ -445,7 +445,10 @@ class ControlPlane:
                 "utility",
                 {
                     key: internal_payload.get(key)
-                    for key in ("utility", "folders", "password")
+                    for key in (
+                        "utility", "folders", "password", "flatten_action",
+                        "flatten_fingerprints",
+                    )
                     if key in internal_payload
                 },
                 owner_profile,
@@ -1020,7 +1023,10 @@ class ControlPlane:
             },
             "leave": {"chat_refs"},
             "download": {"artifact_ids", "priority"},
-            "utility": {"utility", "folders", "password"},
+            "utility": {
+                "utility", "folders", "password", "flatten_action",
+                "flatten_fingerprints",
+            },
             "storage_upload": {
                 "folder_path", "folder", "destination_folder_id",
                 "preserve_structure", "keywords", "provider", "rclone_path",
@@ -1111,7 +1117,7 @@ class ControlPlane:
         if kind == "utility":
             utility = str(payload.get("utility") or "").strip().lower()
             folders = payload.get("folders")
-            if utility not in {"extract", "compress", "export", "pindah"}:
+            if utility not in {"extract", "compress", "export", "pindah", "flatten"}:
                 raise DomainError("UTILITY_INVALID", "Jenis utility tidak dikenal.", status_code=422)
             if not isinstance(folders, list) or not folders or len(folders) > 500:
                 raise DomainError("JOB_PAYLOAD_INVALID", "Daftar folder utility tidak valid.", status_code=422)
@@ -1124,12 +1130,64 @@ class ControlPlane:
             password = payload.get("password")
             if password is not None and (not isinstance(password, str) or len(password) > 512):
                 raise DomainError("JOB_PAYLOAD_INVALID", "Password utility tidak valid.", status_code=422)
-            return {
+            flatten_action = payload.get("flatten_action")
+            flatten_fingerprints = payload.get("flatten_fingerprints")
+            if utility == "flatten":
+                if flatten_action not in {"preview", "apply"}:
+                    raise DomainError(
+                        "UTILITY_FLATTEN_ACTION_INVALID",
+                        "Tindakan Flatten harus berupa preview atau apply.",
+                        status_code=422,
+                    )
+                if len(set(normalized_folders)) != len(normalized_folders):
+                    raise DomainError(
+                        "UTILITY_FLATTEN_FOLDERS_INVALID",
+                        "Folder Flatten tidak boleh dipilih lebih dari sekali.",
+                        status_code=422,
+                    )
+                if flatten_action == "preview":
+                    if flatten_fingerprints not in (None, {}):
+                        raise DomainError(
+                            "UTILITY_FLATTEN_SNAPSHOT_INVALID",
+                            "Preview Flatten tidak menerima snapshot lama.",
+                            status_code=422,
+                        )
+                    flatten_fingerprints = None
+                else:
+                    if not isinstance(flatten_fingerprints, dict) or set(flatten_fingerprints) != set(normalized_folders):
+                        raise DomainError(
+                            "UTILITY_FLATTEN_SNAPSHOT_INVALID",
+                            "Apply Flatten memerlukan snapshot untuk semua folder pilihan.",
+                            status_code=422,
+                        )
+                    for fingerprint in flatten_fingerprints.values():
+                        if (
+                            not isinstance(fingerprint, str)
+                            or len(fingerprint) != 64
+                            or any(character not in "0123456789abcdef" for character in fingerprint)
+                        ):
+                            raise DomainError(
+                                "UTILITY_FLATTEN_SNAPSHOT_INVALID",
+                                "Fingerprint Preview Flatten tidak valid.",
+                                status_code=422,
+                            )
+            elif flatten_action is not None or flatten_fingerprints is not None:
+                raise DomainError(
+                    "UTILITY_FLATTEN_ACTION_INVALID",
+                    "Opsi preview hanya berlaku untuk Flatten.",
+                    status_code=422,
+                )
+            normalized = {
                 "utility": utility,
                 "folders": normalized_folders,
                 "password": password,
                 "settings": self._utility_settings_snapshot(),
             }
+            if utility == "flatten":
+                normalized["flatten_action"] = flatten_action
+                if flatten_fingerprints is not None:
+                    normalized["flatten_fingerprints"] = flatten_fingerprints
+            return normalized
 
         if kind == "storage_upload":
             folder_path = str(payload.get("folder_path") or "").strip()

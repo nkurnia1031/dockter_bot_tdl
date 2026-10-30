@@ -25,9 +25,15 @@ from tme3bot.tdl import (
     resume_process_group,
 )
 from tme3bot.tdl_output import parse_tdl_progress_line
+from tme3bot.utility_flatten import (
+    UtilityFlattenPreviewStaleError,
+    apply_flatten_batch,
+    plan_flatten,
+    validate_flatten_roots,
+)
 
 LOGGER = logging.getLogger(__name__)
-UTILITY_NAMES = ("extract", "compress", "export", "pindah")
+UTILITY_NAMES = ("extract", "compress", "export", "pindah", "flatten")
 DEFAULT_UTILITY_FOLDERS = ("/workspace/biasa", "/workspace/pilihan", "/workspace/downloads")
 DEFAULT_UTILITY_SETTINGS = {
     "move_size": "4g",
@@ -37,6 +43,7 @@ DEFAULT_UTILITY_SETTINGS = {
 }
 UTILITY_RUNTIME_SCRIPTS = (
     "extract/extract.py",
+    "flatten/flatten.py",
     "compress/compress.sh",
     "export/telegram_messages_to_json.py",
     "export/organize_media_from_json.py",
@@ -45,7 +52,7 @@ UTILITY_RUNTIME_SCRIPTS = (
     "pindah/pindah.py",
     "pindah/pindah2.py",
 )
-UTILITY_RUNTIME_COMMANDS = ("python3", "bash", "7z", "du", "cut")
+UTILITY_RUNTIME_COMMANDS = ("python3", "bash", "7z", "unar", "du", "cut")
 UTILITY_SETTING_SPECS = {
     "move_size": {
         "label": "Batas ukuran grup pindah",
@@ -107,6 +114,13 @@ def probe_utility_runtime(utility_root: Path, workspace_root: Path) -> dict[str,
                 return {"ready": False, "reason_code": "UTILITY_SCRIPT_MISSING", "fingerprint": ""}
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             script_hashes.append((relative, digest))
+        flatten_module = Path(__file__).with_name("utility_flatten.py")
+        script_hashes.append(
+            (
+                "tme3bot/utility_flatten.py",
+                hashlib.sha256(flatten_module.read_bytes()).hexdigest(),
+            )
+        )
     except OSError:
         return {"ready": False, "reason_code": "UTILITY_SCRIPT_UNREADABLE", "fingerprint": ""}
 
@@ -410,6 +424,8 @@ class UtilityResult:
     failed: dict[str, str]
     details: list[dict[str, object]]
     summary: dict[str, object] = field(default_factory=dict)
+    outcome: str | None = None
+    archive_results: list[dict[str, object]] = field(default_factory=list)
 
 
 class UtilityRunner:
@@ -420,8 +436,10 @@ class UtilityRunner:
         progress_callback: Callable[[dict[str, object]], None] | None = None,
         stall_timeout_seconds: int = 0,
         command_callback: CommandCallback | None = None,
+        workspace_root: Path = Path("/workspace"),
     ) -> None:
         self.root = utility_root
+        self.workspace = Path(workspace_root).resolve()
         self.log_callback = log_callback
         self.progress_callback = progress_callback
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
@@ -431,6 +449,8 @@ class UtilityRunner:
         self._pause_requested = False
         self._paused = False
         self._current_process: subprocess.Popen[str] | None = None
+        self._folder_index: int | None = None
+        self._folder_total: int | None = None
 
     def pause_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
@@ -477,18 +497,29 @@ class UtilityRunner:
             self._terminate_process(process)
         return True
 
-    def run(self, utility: str, folders: list[str], password: str | None = None, settings: dict[str, str] | None = None) -> UtilityResult:
+    def run(
+        self,
+        utility: str,
+        folders: list[str],
+        password: str | None = None,
+        settings: dict[str, str] | None = None,
+        *,
+        flatten_action: str | None = None,
+        flatten_fingerprints: dict[str, str] | None = None,
+    ) -> UtilityResult:
+        if utility == "flatten":
+            return self._run_flatten(
+                folders, flatten_action, flatten_fingerprints or {}
+            )
         succeeded: list[str] = []
         failed: dict[str, str] = {}
         details: list[dict[str, object]] = []
+        archive_results: list[dict[str, object]] = []
         for folder_index, folder in enumerate(folders, start=1):
+            self._folder_index = folder_index
+            self._folder_total = len(folders)
             try:
-                path = Path(folder)
-                if not path.is_absolute():
-                    raise UtilityPathError("Path utility harus absolut dan berasal dari folder pilihan workspace.")
-                path = path.resolve()
-                if not path.is_dir():
-                    raise UtilityPathError(f"Folder utility tidak ditemukan: {path}")
+                path = self._resolve_workspace_folder(folder)
                 self._progress(
                     {
                         "phase": f"{utility}_starting",
@@ -499,7 +530,9 @@ class UtilityRunner:
                     }
                 )
                 before = self._snapshot(path)
-                self._run_folder(utility, path, password, settings or DEFAULT_UTILITY_SETTINGS)
+                command_result = self._run_folder(
+                    utility, path, password, settings or DEFAULT_UTILITY_SETTINGS
+                )
                 temporary_json_removed = 0
                 if utility == "pindah":
                     temporary_json_removed = self._cleanup_pindah_outputs(path)
@@ -517,6 +550,52 @@ class UtilityRunner:
                     detail["temporary_json_removed"] = temporary_json_removed
                 if utility == "export":
                     detail["organizer"] = self._organizer_log_summary(path)
+                if utility == "extract":
+                    extracted = command_result if isinstance(command_result, dict) else {}
+                    folder_archives = extracted.get("archive_results")
+                    if isinstance(folder_archives, list):
+                        normalized_archives = [
+                            {"folder": str(path), **item}
+                            for item in folder_archives
+                            if isinstance(item, dict)
+                        ]
+                    else:
+                        normalized_archives = []
+                    archive_results.extend(normalized_archives)
+                    archive_failures = [
+                        item for item in normalized_archives if item.get("status") == "failed"
+                    ]
+                    detail["archive_results"] = normalized_archives
+                    detail["archives_succeeded"] = sum(
+                        item.get("status") == "succeeded" for item in normalized_archives
+                    )
+                    detail["archives_failed"] = len(archive_failures)
+                    details.append(detail)
+                    if archive_failures:
+                        failed[str(path)] = f"{len(archive_failures)} arsip gagal setelah retry."
+                        self._progress(
+                            {
+                                "phase": "extract_folder_failed",
+                                "folder": str(path),
+                                "folder_index": folder_index,
+                                "folder_total": len(folders),
+                                "error": failed[str(path)],
+                                "indeterminate": False,
+                            }
+                        )
+                    else:
+                        succeeded.append(str(path))
+                        self._progress(
+                            {
+                                "phase": "extract_folder_completed",
+                                "folder": str(path),
+                                "folder_index": folder_index,
+                                "folder_total": len(folders),
+                                "percent": 100,
+                                "indeterminate": False,
+                            }
+                        )
+                    continue
                 succeeded.append(str(path))
                 details.append(detail)
                 self._progress(
@@ -579,11 +658,160 @@ class UtilityRunner:
             summary["temporary_json_removed"] = sum(
                 int(item.get("temporary_json_removed", 0)) for item in details
             )
+        if utility == "extract":
+            failed_archives = [
+                item for item in archive_results if item.get("status") == "failed"
+            ]
+            summary.update(
+                {
+                    "archives_processed": len(archive_results),
+                    "archives_succeeded": len(archive_results) - len(failed_archives),
+                    "archives_failed": len(failed_archives),
+                    "failed_archives": failed_archives,
+                }
+            )
+            archive_successes = sum(
+                item.get("status") == "succeeded" for item in archive_results
+            )
+            outcome = "succeeded" if not failed else (
+                "partial_failure" if archive_successes or succeeded else "failed"
+            )
+            return UtilityResult(
+                utility, succeeded, failed, details, summary, outcome=outcome,
+                archive_results=archive_results,
+            )
         return UtilityResult(utility, succeeded, failed, details, summary)
+
+    def _run_flatten(
+        self,
+        folders: list[str],
+        action: str | None,
+        fingerprints: dict[str, str],
+    ) -> UtilityResult:
+        if action not in {"preview", "apply"}:
+            raise ValueError("Tindakan Flatten harus berupa preview atau apply.")
+        roots: list[Path] = []
+        for value in folders:
+            roots.append(self._resolve_workspace_folder(value))
+        roots = validate_flatten_roots(roots)
+
+        if action == "preview":
+            details: list[dict[str, object]] = []
+            for index, root in enumerate(roots, start=1):
+                self._folder_index = index
+                self._folder_total = len(roots)
+                self._progress(
+                    {
+                        "phase": "flatten_preview_started",
+                        "folder": str(root),
+                        "folder_index": index,
+                        "folder_total": len(roots),
+                        "indeterminate": True,
+                    }
+                )
+                plan = plan_flatten(root)
+                details.append({"folder": str(root), "flatten_preview": plan})
+                self._progress(
+                    {
+                        "phase": "flatten_preview_completed",
+                        "folder": str(root),
+                        "folder_index": index,
+                        "folder_total": len(roots),
+                        "moves": plan["moves"],
+                        "deleted": plan["deleted"],
+                        "skipped": plan["skipped"],
+                        "percent": 100,
+                        "indeterminate": False,
+                    }
+                )
+            summary = {
+                "folders_processed": len(roots),
+                "moves": sum(int(item["flatten_preview"]["moves"]) for item in details),
+                "deleted": sum(int(item["flatten_preview"]["deleted"]) for item in details),
+                "skipped": sum(int(item["flatten_preview"]["skipped"]) for item in details),
+                "action_count": sum(
+                    int(item["flatten_preview"]["action_count"]) for item in details
+                ),
+            }
+            return UtilityResult("flatten", [str(root) for root in roots], [], details, summary)
+
+        self._progress(
+            {
+                "phase": "flatten_preflight_started",
+                "folder_index": 0,
+                "folder_total": len(roots),
+                "indeterminate": True,
+            }
+        )
+
+        def action_progress(value: dict[str, Any]) -> None:
+            index = int(value.get("folder_index") or 0)
+            self._folder_index = index or None
+            self._folder_total = len(roots)
+            self._progress(
+                {
+                    "phase": "flatten_action_completed",
+                    "folder": value.get("root"),
+                    "folder_index": index,
+                    "folder_total": len(roots),
+                    "name": value.get("source") or value.get("folder"),
+                    "action": value.get("type"),
+                    "status": value.get("status"),
+                    "indeterminate": True,
+                }
+            )
+
+        applied = apply_flatten_batch(
+            roots, fingerprints, progress_callback=action_progress
+        )
+        details = []
+        for item in applied:
+            self._progress(
+                {
+                    "phase": "flatten_folder_completed",
+                    "folder": item["folder"],
+                    "folder_index": len(details) + 1,
+                    "folder_total": len(roots),
+                    "percent": 100,
+                    "indeterminate": False,
+                }
+            )
+            details.append(item)
+        summary = {
+            "folders_processed": len(details),
+            "moves": sum(int(item["moves"]) for item in details),
+            "deleted": sum(int(item["deleted"]) for item in details),
+            "skipped": sum(int(item["skipped"]) for item in details),
+        }
+        return UtilityResult("flatten", [str(root) for root in roots], [], details, summary)
+
+    def _resolve_workspace_folder(self, raw_path: str) -> Path:
+        path = Path(raw_path)
+        if not path.is_absolute():
+            raise UtilityPathError(
+                "Path utility harus absolut dan berasal dari folder pilihan workspace."
+            )
+        try:
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(self.workspace)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise UtilityPathError(
+                "Folder utility harus berada di dalam workspace yang dipilih."
+            ) from exc
+        if not relative.parts or not resolved.is_dir():
+            raise UtilityPathError(
+                "Folder utility harus berupa subfolder workspace yang tersedia."
+            )
+        return resolved
 
     def _progress(self, value: dict[str, object]) -> None:
         if self.progress_callback is not None:
-            self.progress_callback(value)
+            payload = dict(value)
+            if self._folder_index is not None:
+                payload.setdefault("folder_index", self._folder_index)
+            if self._folder_total is not None:
+                payload.setdefault("folder_total", self._folder_total)
+            self.progress_callback(payload)
 
     @staticmethod
     def _organizer_log_summary(folder: Path) -> dict[str, int | str]:
@@ -647,10 +875,17 @@ class UtilityRunner:
             ),
         }
 
-    def _run_folder(self, utility: str, folder: Path, password: str | None, settings: dict[str, str]) -> None:
+    def _run_folder(self, utility: str, folder: Path, password: str | None, settings: dict[str, str]) -> object:
         if utility == "extract":
-            command = ["python3", str(self.root / "extract" / "extract.py"), str(folder), "--no-prompt", "--password", password or folder.name]
-            self._command(command, folder, "utility-extract")
+            command = ["python3", str(self.root / "extract" / "extract.py"), str(folder)]
+            if password:
+                command.extend(["--password", password])
+            return self._command(
+                command,
+                folder,
+                "utility-extract",
+                allow_result_on_failure=True,
+            )
         elif utility == "compress":
             self._command(["bash", str(self.root / "compress" / "compress.sh")], folder, "utility-compress", settings)
         elif utility == "export":
@@ -670,7 +905,15 @@ class UtilityRunner:
         else:
             raise ValueError(f"Utility tidak dikenal: {utility}")
 
-    def _command(self, command: list[str], cwd: Path, prefix: str, settings: dict[str, str] | None = None) -> None:
+    def _command(
+        self,
+        command: list[str],
+        cwd: Path,
+        prefix: str,
+        settings: dict[str, str] | None = None,
+        *,
+        allow_result_on_failure: bool = False,
+    ) -> dict[str, object] | None:
         LOGGER.info("%s start folder=%s", prefix, cwd)
         self._wait_until_resumed()
         started_at = time.monotonic()
@@ -710,6 +953,7 @@ class UtilityRunner:
         assert process.stdout is not None
         lines: list[str] = []
         marker: dict[str, object] = {}
+        result_marker: dict[str, object] | None = None
         last_progress_at = time.monotonic()
         last_progress_signature: object = None
         stalled = threading.Event()
@@ -743,9 +987,17 @@ class UtilityRunner:
         watchdog_thread.start()
 
         def consume_line(raw_line: str) -> None:
-            nonlocal marker, last_progress_at, last_progress_signature
+            nonlocal marker, result_marker, last_progress_at, last_progress_signature
             clean = raw_line.strip()
             if not clean:
+                return
+            if clean.startswith("TME3_RESULT "):
+                try:
+                    decoded_result = json.loads(clean.removeprefix("TME3_RESULT "))
+                    if isinstance(decoded_result, dict):
+                        result_marker = decoded_result
+                except json.JSONDecodeError:
+                    LOGGER.warning("Invalid utility result marker for %s", prefix)
                 return
             lines.append(clean)
             LOGGER.info("%s | %s", prefix, clean)
@@ -833,7 +1085,10 @@ class UtilityRunner:
                 self.stall_timeout_seconds,
             )
         if code != 0:
+            if allow_result_on_failure and result_marker is not None:
+                return result_marker
             raise RuntimeError(f"{prefix} exit code {code}: {' | '.join(lines[-5:])}")
+        return result_marker
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[str]) -> None:

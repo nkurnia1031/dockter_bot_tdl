@@ -346,6 +346,8 @@ class UtilityJobRequest(BaseModel):
     utility: str
     folders: list[str]
     password: str | None = None
+    flatten_action: str | None = None
+    flatten_fingerprints: dict[str, str] | None = None
     worker: str | None = None
 
 

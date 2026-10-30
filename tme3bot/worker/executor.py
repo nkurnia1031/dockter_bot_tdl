@@ -2053,6 +2053,11 @@ class WorkerJobExecutor(
                     if kind in {"storage_upload", "storage_reconcile"} and isinstance(result, dict)
                     else ""
                 )
+                utility_outcome = (
+                    str(result.get("outcome") or "")
+                    if kind == "utility" and isinstance(result, dict)
+                    else ""
+                )
                 if storage_outcome and storage_outcome != "succeeded":
                     error_code = (
                         "STORAGE_UPLOAD_RECONCILIATION_REQUIRED"
@@ -2085,6 +2090,38 @@ class WorkerJobExecutor(
                         },
                         result={"value": json_value(result)},
                         error={"code": error_code, "message": error_message},
+                    )
+                    command_terminal_status = "failed"
+                elif utility_outcome in {"partial_failure", "failed"}:
+                    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+                    archive_total = int(summary.get("archives_processed") or 0)
+                    archive_succeeded = int(summary.get("archives_succeeded") or 0)
+                    archive_failed = int(summary.get("archives_failed") or 0)
+                    error_message = (
+                        f"{archive_failed} arsip gagal setelah semua kandidat password dicoba."
+                        if archive_failed
+                        else "Extract gagal pada folder pilihan."
+                    )
+                    self.publisher.emit(
+                        job_id,
+                        "failed",
+                        "utility.completed",
+                        progress={
+                            "phase": utility_outcome,
+                            "message": error_message,
+                            "finished_at": utc_now().isoformat(),
+                            "overall": {
+                                "current": archive_succeeded + archive_failed,
+                                "total": archive_total,
+                                "unit": "archives",
+                            },
+                            "counters": {
+                                "succeeded": archive_succeeded,
+                                "failed": archive_failed,
+                            },
+                        },
+                        result={"value": json_value(result)},
+                        error={"code": "UTILITY_EXTRACT_FAILED", "message": error_message},
                     )
                     command_terminal_status = "failed"
                 else:
@@ -2239,6 +2276,9 @@ class WorkerJobExecutor(
                         error_code
                         if str(command.get("kind") or "").strip().lower() == "safelink_resolve"
                         and error_code == "RESOLVER_RUNTIME_UNAVAILABLE"
+                        else error_code
+                        if str(command.get("kind") or "").strip().lower() == "utility"
+                        and error_code == "UTILITY_FLATTEN_PREVIEW_STALE"
                         else "WORKER_JOB_FAILED"
                     ),
                     "message": message,

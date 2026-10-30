@@ -18,6 +18,7 @@ describe('UtilityPage access controls', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
     sessionStorage.clear();
   });
 
@@ -82,5 +83,76 @@ describe('UtilityPage access controls', () => {
     await waitFor(() => expect(submit.disabled).toBe(false));
     await fireEvent.click(submit);
     expect(requests.some((url) => url.endsWith('/utility/jobs'))).toBe(true);
+  });
+
+  it('previews Flatten completely and submits a separate confirmed apply job', async () => {
+    const requests: { url: string; method: string; body?: any }[] = [];
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      requests.push({ url, method, body });
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', url: 'http://worker-local', enabled: true }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return readinessResponse();
+      if (url.endsWith('/utility/folders')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/utility/tree')) return new Response(JSON.stringify({ path: '/workspace', items: [
+        { name: 'demo', path: '/workspace/demo', kind: 'directory', files: 0, directories: 1, has_children: true }
+      ] }), { status: 200 });
+      if (url.endsWith('/utility/jobs') && method === 'POST') {
+        return new Response(JSON.stringify({
+          id: body.flatten_action === 'preview' ? 'preview-1' : 'apply-1',
+          kind: 'utility', status: 'dispatched'
+        }), { status: 200 });
+      }
+      if (url.endsWith('/jobs/preview-1')) return new Response(JSON.stringify({
+        id: 'preview-1', kind: 'utility', status: 'succeeded',
+        payload: { utility: 'flatten', flatten_action: 'preview' },
+        result: { value: {
+          summary: { moves: 1, deleted: 0, skipped: 1, action_count: 1 },
+          details: [{ folder: '/workspace/demo', flatten_preview: {
+            fingerprint: 'a'.repeat(64), action_count: 1, moves: 1, deleted: 0, skipped: 1,
+            passes: [{ index: 1, actions: [
+              { type: 'move', folder: 'single', source: 'single/file.txt', destination: 'file.txt', collision: false },
+              { type: 'skip_multiple', folder: 'many', item_count: 2 }
+            ] }]
+          } }]
+        } }
+      }), { status: 200 });
+      if (url.endsWith('/jobs/apply-1')) return new Response(JSON.stringify({
+        id: 'apply-1', kind: 'utility', status: 'succeeded', result: { value: {} }
+      }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    await session.restore();
+    render(UtilityPage);
+    await fireEvent.click(await screen.findByRole('checkbox', { name: 'Pilih demo' }));
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Jenis operasi' }), {
+      target: { value: 'flatten' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Preview Flatten' }));
+
+    expect(await screen.findByRole('region', { name: 'Preview Flatten' })).toBeTruthy();
+    expect(screen.getByText(/single\/file\.txt/)).toBeTruthy();
+    expect(screen.getByText(/many/)).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Terapkan Flatten' }));
+    await waitFor(() => expect(requests.some((item) =>
+      item.url.endsWith('/utility/jobs') && item.body?.flatten_action === 'apply'
+    )).toBe(true));
+    const applyRequest = requests.find((item) =>
+      item.url.endsWith('/utility/jobs') && item.body?.flatten_action === 'apply'
+    );
+    expect(applyRequest?.body?.folders).toEqual(['/workspace/demo']);
+    expect(applyRequest?.body?.flatten_fingerprints).toEqual({ '/workspace/demo': 'a'.repeat(64) });
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(await screen.findByText('Flatten selesai.')).toBeTruthy();
   });
 });

@@ -37,23 +37,45 @@ class UtilityExecutorMixin:
 
         def utility_progress(value: dict[str, object]) -> None:
             phase = str(value.get("phase") or utility_name)
-            if phase in {"item_completed", f"{utility_name}_folder_completed"}:
+            archive_phase = utility_name == "extract" and phase in {
+                "archive_completed", "archive_failed"
+            }
+            if archive_phase and phase == "archive_completed":
                 counters["succeeded"] += 1
-            elif phase in {"item_failed", f"{utility_name}_folder_failed"}:
+            elif archive_phase and phase == "archive_failed":
+                counters["failed"] += 1
+            elif not archive_phase and phase in {
+                "item_completed", f"{utility_name}_folder_completed"
+            }:
+                counters["succeeded"] += 1
+            elif not archive_phase and phase in {
+                "item_failed", f"{utility_name}_folder_failed"
+            }:
                 counters["failed"] += 1
             index = int(value.get("index") or value.get("folder_index") or 0)
             total = int(value.get("total") or value.get("folder_total") or len(folders))
+            folder_index = int(value.get("folder_index") or 1)
+            folder_total = int(value.get("folder_total") or len(folders))
             percent = value.get("percent")
-            item_name = str(
-                value.get("name")
-                or value.get("folder")
-                or (folders[min(max(index - 1, 0), len(folders) - 1)] if folders else "")
-            )
-            progress_payload = reporter.report(
-                phase=phase,
-                message=_utility_progress_message(utility_name, phase, item_name),
-                overall={
-                    "current": max(0, index - (0 if "completed" in phase else 1)),
+            if archive_phase:
+                archive_fraction = (
+                    index / total
+                    if total and phase in {"archive_completed", "archive_failed"}
+                    else 0.0
+                )
+                overall_current = max(0, folder_index - 1) + archive_fraction
+                overall_percent = (
+                    overall_current * 100 / folder_total if folder_total else None
+                )
+                overall = {
+                    "current": overall_current,
+                    "total": folder_total,
+                    "percent": overall_percent,
+                    "unit": "folders",
+                }
+            else:
+                overall = {
+                    "current": max(index - (0 if "completed" in phase else 1), 0),
                     "total": total,
                     "percent": (
                         float(percent)
@@ -65,13 +87,23 @@ class UtilityExecutorMixin:
                         )
                     ),
                     "unit": "folders",
-                },
+                }
+            item_name = str(
+                value.get("name")
+                or value.get("folder")
+                or (folders[min(max(index - 1, 0), len(folders) - 1)] if folders else "")
+            )
+            progress_payload = reporter.report(
+                phase=phase,
+                message=_utility_progress_message(utility_name, phase, item_name),
+                overall=overall,
                 item={
                     "name": item_name,
                     "index": index or None,
                     "total": total or None,
                     "size_bytes": value.get("size_bytes"),
                     "percent": percent,
+                    "pass_name": value.get("pass_name"),
                 },
                 transfer=reporter.transfer_metrics(
                     speed_bps=value.get("speed_bps"),
@@ -83,15 +115,24 @@ class UtilityExecutorMixin:
                 ),
                 counters=counters,
                 indeterminate=bool(value.get("indeterminate", percent is None)),
-                force=phase.endswith("_starting") or phase in {"item_completed", "item_failed"},
+                force=phase.endswith("_starting") or phase in {
+                    "item_completed", "item_failed", "archive_completed", "archive_failed",
+                    "extract_folder_completed", "extract_folder_failed",
+                    "flatten_preview_completed", "flatten_folder_completed",
+                },
             )
-            if phase in {"item_completed", "item_failed"}:
+            if phase in {
+                "item_completed", "item_failed", "archive_completed", "archive_failed"
+            }:
                 reporter.milestone(
                     phase,
                     progress=progress_payload,
                     error=(
-                        {"message": str(value.get("error")), "item": item_name}
-                        if phase == "item_failed"
+                        {
+                            "message": str(value.get("error") or "Arsip gagal setelah retry."),
+                            "item": item_name,
+                        }
+                        if phase in {"item_failed", "archive_failed"}
                         else None
                     ),
                 )
@@ -115,23 +156,36 @@ class UtilityExecutorMixin:
                     [str(item) for item in folders],
                     payload.get("password"),
                     payload.get("settings") or {},
+                    flatten_action=payload.get("flatten_action"),
+                    flatten_fingerprints=payload.get("flatten_fingerprints"),
                 )
             )
+            archive_mode = utility_name == "extract"
+            archive_succeeded = int(result.get("summary", {}).get("archives_succeeded", 0))
+            archive_failed = int(result.get("summary", {}).get("archives_failed", 0))
+            failed_outcome = result.get("outcome") in {"failed", "partial_failure"}
             reporter.report(
-                phase="completed",
+                phase="extract_failed" if archive_mode and failed_outcome else "completed",
                 message=(
-                    f"Utility selesai: {len(result.get('succeeded', []))} folder berhasil, "
-                    f"{len(result.get('failed', {}))} gagal"
+                    (
+                        f"Extract selesai: {archive_succeeded} arsip berhasil, "
+                        f"{archive_failed} gagal"
+                    )
+                    if archive_mode
+                    else (
+                        f"Utility selesai: {len(result.get('succeeded', []))} folder berhasil, "
+                        f"{len(result.get('failed', {}))} gagal"
+                    )
                 ),
                 overall={
-                    "current": len(folders),
-                    "total": len(folders),
+                    "current": archive_succeeded + archive_failed if archive_mode else len(folders),
+                    "total": result.get("summary", {}).get("archives_processed", 0) if archive_mode else len(folders),
                     "percent": 100,
-                    "unit": "folders",
+                    "unit": "archives" if archive_mode else "folders",
                 },
                 counters={
-                    "succeeded": len(result.get("succeeded", [])),
-                    "failed": len(result.get("failed", {})),
+                    "succeeded": archive_succeeded if archive_mode else len(result.get("succeeded", [])),
+                    "failed": archive_failed if archive_mode else len(result.get("failed", {})),
                 },
                 force=True,
             )

@@ -17,7 +17,7 @@ class UtilitySummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir) / "quick-stage"
             folder.mkdir()
-            runner = UtilityRunner(Path("utility"))
+            runner = UtilityRunner(Path("utility"), workspace_root=Path(temp_dir))
             with patch.object(
                 runner,
                 "_run_folder",
@@ -46,7 +46,7 @@ class UtilitySummaryTests(unittest.TestCase):
             before = list(workspace.iterdir())
             bin_root = root / "bin"
             bin_root.mkdir()
-            commands = ("bash", "python3", "7z", "du", "cut", "ffmpeg", "ffprobe", "rclone")
+            commands = ("bash", "python3", "7z", "unar", "du", "cut", "ffmpeg", "ffprobe", "rclone")
             command_paths = {}
             for command in commands:
                 path = bin_root / command
@@ -87,6 +87,7 @@ class UtilitySummaryTests(unittest.TestCase):
             workspace.mkdir()
             for relative in (
                 "extract/extract.py",
+                "flatten/flatten.py",
                 "compress/compress.sh",
                 "export/telegram_messages_to_json.py",
                 "export/organize_media_from_json.py",
@@ -137,6 +138,7 @@ class UtilitySummaryTests(unittest.TestCase):
             workspace.mkdir()
             for relative in (
                 "extract/extract.py",
+                "flatten/flatten.py",
                 "compress/compress.sh",
                 "export/telegram_messages_to_json.py",
                 "export/organize_media_from_json.py",
@@ -161,7 +163,7 @@ class UtilitySummaryTests(unittest.TestCase):
 
     def test_runner_classifies_process_start_failure_as_utility_runtime_failure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            runner = UtilityRunner(Path("utility"))
+            runner = UtilityRunner(Path("utility"), workspace_root=Path(temp_dir).parent)
             with patch("tme3bot.utility.subprocess.Popen", side_effect=OSError("missing executable")):
                 with self.assertRaises(UtilityRuntimeError) as raised:
                     runner._command(["missing-tool"], Path(temp_dir), "utility-test")
@@ -213,7 +215,7 @@ class UtilitySummaryTests(unittest.TestCase):
     def test_pindah_removes_intermediate_json_after_success(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             folder = Path(temp_dir)
-            runner = UtilityRunner(Path("utility"))
+            runner = UtilityRunner(Path("utility"), workspace_root=folder.parent)
 
             def fake_run_folder(utility, path, password, settings):
                 self.assertEqual(utility, "pindah")

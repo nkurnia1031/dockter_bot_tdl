@@ -416,6 +416,45 @@
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'raw' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'raw'}>Raw JSON</button>
       </div>
       {#if detailTab === 'summary'}
+        {@const utilityResult = selected.result?.value || selected.result || {}}
+        {#if selected.kind === 'utility' && selected.payload?.utility === 'extract' && Array.isArray(utilityResult.archive_results)}
+          <section class="record-card mb-4">
+            <h3 class="font-bold">Hasil Extract per arsip</h3>
+            <p class="muted mt-1 text-sm">{utilityResult.summary?.archives_succeeded || 0} berhasil · {utilityResult.summary?.archives_failed || 0} gagal</p>
+            <div class="mt-2 space-y-2">
+              {#each utilityResult.archive_results as item, index (`${item.folder || ''}:${item.path || item.name || index}`)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{item.name || `Arsip ${index + 1}`}</b>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : 'failed'}`}>{item.status === 'succeeded' ? 'Berhasil' : 'Gagal'}</span>
+                    <span class="muted text-xs">{item.pass === 'retry' ? 'Retry pool' : 'Password awal'} · {item.attempt_count || 0} percobaan</span>
+                    {#if item.cleanup_status === 'failed'}<span class="text-xs font-semibold text-amber-700">Hasil diekstrak, arsip sumber belum terhapus</span>{/if}
+                  </div>
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                </article>
+              {/each}
+            </div>
+          </section>
+        {/if}
+        {#if selected.kind === 'utility' && selected.payload?.utility === 'flatten' && selected.payload?.flatten_action === 'preview' && Array.isArray(utilityResult.details)}
+          <section class="record-card mb-4">
+            <h3 class="font-bold">Preview Flatten tersimpan</h3>
+            <p class="muted mt-1 text-sm">{utilityResult.summary?.moves || 0} pindah · {utilityResult.summary?.deleted || 0} hapus · {utilityResult.summary?.skipped || 0} dilewati</p>
+            {#each utilityResult.details as detail}
+              <article class="mt-3 rounded-lg border border-[var(--line)] p-3">
+                <h4 class="break-all font-mono text-xs font-bold">{detail.folder}</h4>
+                {#each detail.flatten_preview?.passes || [] as pass}
+                  <p class="muted mt-2 text-xs font-semibold">Putaran {pass.index}</p>
+                  <ul class="mt-1 space-y-1 text-sm">
+                    {#each pass.actions || [] as action, index (`${pass.index}:${index}`)}
+                      <li>{action.type === 'delete_empty' ? `Hapus folder kosong: ${action.folder}` : action.type === 'move' ? `Pindah ${action.source} → ${action.destination}${action.collision ? ' · nama bentrok, diberi prefix' : ''}` : `Lewati ${action.folder} (${action.item_count} item)`}</li>
+                    {/each}
+                  </ul>
+                {/each}
+              </article>
+            {/each}
+          </section>
+        {/if}
         {#if selected.kind === 'storage_upload' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
           {@const storageItems = selected.result?.value?.items || selected.result?.items || []}
           <section class="record-card mb-4">

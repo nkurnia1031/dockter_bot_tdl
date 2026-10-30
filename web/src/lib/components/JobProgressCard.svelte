@@ -54,7 +54,12 @@
             <span class="rounded bg-[var(--brand-soft)] px-1.5 py-0.5 text-xs font-bold text-[var(--brand)]">JSON {progress.batch.index}/{progress.batch.total || '?'}</span>
           {/if}
           {#if progress.item.index}
-            <span class="rounded bg-sky-100 px-1.5 py-0.5 text-xs font-bold text-sky-800 dark:bg-sky-950 dark:text-sky-200">File {progress.item.index}/{progress.item.total || '?'}</span>
+            <span class="rounded bg-sky-100 px-1.5 py-0.5 text-xs font-bold text-sky-800 dark:bg-sky-950 dark:text-sky-200">{job.kind === 'utility' && job.payload?.utility === 'extract' ? 'Arsip' : 'File'} {progress.item.index}/{progress.item.total || '?'}</span>
+          {/if}
+          {#if job.kind === 'utility' && job.payload?.utility === 'extract' && progress.item.pass_name}
+            <span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-bold text-amber-800 dark:bg-amber-950 dark:text-amber-200">
+              {progress.item.pass_name === 'retry' ? 'Retry pool' : 'Password awal'}
+            </span>
           {/if}
           {#if job.kind === 'storage_upload' && progress.activeItems.length > 1}
             <span class="rounded bg-violet-100 px-1.5 py-0.5 text-xs font-bold text-violet-800 dark:bg-violet-950 dark:text-violet-200">{progress.activeItems.length} file aktif</span>
@@ -213,7 +218,7 @@
         <div class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] p-3.5">
           <div class="flex justify-between gap-3 text-sm">
             <b class="min-w-0 truncate font-semibold">{progress.item.name}</b>
-            <span class="muted shrink-0 text-xs">{progress.item.index ? `File ${progress.item.index}/${progress.item.total || '?'}` : ''}</span>
+            <span class="muted shrink-0 text-xs">{progress.item.index ? `${job.kind === 'utility' && job.payload?.utility === 'extract' ? 'Arsip' : 'File'} ${progress.item.index}/${progress.item.total || '?'}` : ''}</span>
           </div>
           <div class={`progress-track mt-2.5 !h-2 ${progress.indeterminate && itemPercent === undefined ? 'indeterminate' : ''}`}>
             <div class="progress-fill" style={`width:${itemPercent ?? 0}%`}></div>
