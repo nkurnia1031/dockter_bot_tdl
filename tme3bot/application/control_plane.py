@@ -3592,7 +3592,7 @@ class ControlPlane:
         return self.jobs.get(job.id) or job
 
     def reconcile_storage_upload(self, actor: Actor, job_id: str) -> Job:
-        """Queue a read-only caption scan for ambiguous files in one upload job."""
+        """Queue a read-only filename scan for ambiguous files in one upload job."""
         original = self.jobs.get(job_id)
         if original is None:
             raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
@@ -3689,8 +3689,11 @@ class ControlPlane:
         created_at = original.created_at
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
+        completed_at = original.updated_at
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=timezone.utc)
         start_timestamp = max(0, int(created_at.timestamp()))
-        end_timestamp = max(start_timestamp, int(datetime.now(timezone.utc).timestamp()))
+        end_timestamp = max(start_timestamp, int(completed_at.timestamp()))
         payload = {
             "source_job_id": original.id,
             "start_timestamp": start_timestamp,

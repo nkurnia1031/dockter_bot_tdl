@@ -1,4 +1,3 @@
-import hashlib
 import threading
 import time
 import unittest
@@ -163,10 +162,6 @@ class _BatchUploader(StorageExecutorMixin):
 
     def _workspace_path(self, raw):
         return Path(raw)
-
-    @staticmethod
-    def _digest(path):
-        return hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size
 
     @staticmethod
     @contextmanager
@@ -637,7 +632,7 @@ class StorageUploadBatchTests(unittest.TestCase):
         }
         return uploader, upload_result, source_items, reconcile_command, store
 
-    def test_reconciliation_marks_zero_and_one_exact_caption_safely(self):
+    def test_reconciliation_matches_filename_within_job_time_range(self):
         uploader, upload_result, source_items, command, _store = self._prepare_reconcile(
             ["one.txt"], []
         )
@@ -653,30 +648,31 @@ class StorageUploadBatchTests(unittest.TestCase):
             ("-100123", 100, 200, True),
         )
 
-        caption = source_items[0]["caption"]
         uploader, _upload_result, _source_items, command, _store = self._prepare_reconcile(
-            ["one.txt"], [{"id": 7, "caption": caption}]
+            ["one.txt"], [{"id": 7, "file_name": "one.txt", "caption": "unrelated"}]
         )
         result = uploader._storage_reconcile(command)
         self.assertEqual(result["items"][0]["status"], "succeeded")
         self.assertFalse(result["items"][0]["retryable"])
         self.assertEqual(result["items"][0]["match_count"], 1)
 
-    def test_reconciliation_duplicate_captions_require_enough_exact_matches(self):
+    def test_reconciliation_duplicate_filenames_require_exact_match_count(self):
         uploader, _upload_result, _source_items, command, _store = self._prepare_reconcile(
             ["one.txt", "two.txt"],
-            [{"id": 7, "caption": "same exact caption"}],
+            [{"id": 7, "file_name": "one.txt", "caption": "same exact caption"}],
             caption_override=True,
         )
         result = uploader._storage_reconcile(command)
-        self.assertTrue(all(item["status"] == "needs_reconciliation" for item in result["items"]))
-        self.assertTrue(all(not item["retryable"] for item in result["items"]))
+        by_name = {item["name"]: item for item in result["items"]}
+        self.assertEqual(by_name["one.txt"]["status"], "succeeded")
+        self.assertEqual(by_name["two.txt"]["status"], "failed")
+        self.assertTrue(by_name["two.txt"]["retryable"])
 
         uploader, _upload_result, _source_items, command, _store = self._prepare_reconcile(
             ["one.txt", "two.txt"],
             [
-                {"id": 7, "caption": "same exact caption"},
-                {"id": 8, "caption": "same exact caption"},
+                {"id": 7, "file_name": "one.txt", "caption": "same exact caption"},
+                {"id": 8, "file_name": "two.txt", "caption": "same exact caption"},
             ],
             caption_override=True,
         )
@@ -686,7 +682,7 @@ class StorageUploadBatchTests(unittest.TestCase):
 
     def test_reconciliation_export_failure_and_incomplete_restart_stay_ambiguous(self):
         uploader, _upload_result, _source_items, command, store = self._prepare_reconcile(
-            ["one.txt"], [{"id": 7, "file_name": "one.txt"}]
+            ["one.txt"], [{"id": 7}]
         )
         reopened = WorkerCommandStore(store.path)
         reopened.recover_startup()

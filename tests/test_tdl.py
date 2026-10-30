@@ -55,9 +55,13 @@ class FakeRunner:
                 self.export_output_modes.append(output_path.stat().st_mode & 0o777)
             payload = {"messages": []}
             if self.mode == "time_export":
-                payload = {"messages": [{"id": 7, "caption": "exact caption"}]}
+                payload = {
+                    "messages": [
+                        {"id": 7, "type": "document", "file_name": "sample.txt"}
+                    ]
+                }
             if self.mode == "incomplete_time_export":
-                payload = {"messages": [{"id": 7, "file_name": "sample.txt"}]}
+                payload = {"messages": [{"id": 7}]}
             if self.mode in {"success", "download_failure"}:
                 payload = {
                     "messages": [
@@ -274,7 +278,7 @@ class TDLClientTests(unittest.TestCase):
             self.assertEqual(command[command.index("-T") + 1], "time")
             self.assertEqual(command[command.index("-i") + 1], "100,200")
             self.assertIn("--with-content", command)
-            self.assertEqual(result.messages[0]["caption"], "exact caption")
+            self.assertEqual(result.messages[0]["file_name"], "sample.txt")
 
             incomplete = TDLClient(
                 root / "upload", "upload", runner=FakeRunner("incomplete_time_export")

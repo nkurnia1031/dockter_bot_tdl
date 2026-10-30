@@ -2322,6 +2322,7 @@ class ControlPlaneTests(unittest.TestCase):
         payload = command["payload"]
         self.assertEqual(payload["tdl_access_target"], "-100123")
         self.assertEqual(payload["start_timestamp"], int(source.created_at.timestamp()))
+        self.assertEqual(payload["end_timestamp"], int(source.updated_at.timestamp()))
         self.assertNotIn("-100123", repr(reconciliation.payload))
         self.assertNotIn("matched.txt", repr(reconciliation.payload))
         self.assertEqual(payload["_tdl_sender_session_fingerprints"]["default"], "a" * 64)

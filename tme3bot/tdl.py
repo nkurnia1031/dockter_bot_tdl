@@ -746,11 +746,11 @@ class TDLClient:
         *,
         with_content: bool = True,
     ) -> ExportResult:
-        """Export a chat in a Unix-time range, requiring message content.
+        """Export a chat in a Unix-time range, including message filenames.
 
         Storage upload reconciliation uses this read-only export to compare
-        the exact captions Telegram accepted. A successful but structurally
-        incomplete export must not make an ambiguous file retryable.
+        filenames with the upload job's time range. A successful but
+        structurally incomplete export must not make an ambiguous file retryable.
         """
         try:
             start = int(start_timestamp)
@@ -801,12 +801,30 @@ class TDLClient:
             )
 
         messages = [message for message in messages_raw if isinstance(message, dict)]
+        detail_keys = {
+            "caption", "content", "file_name", "filename", "original_name",
+            "message", "text",
+        }
+
+        def has_message_details(message: dict[str, Any]) -> bool:
+            pending: list[Any] = [message]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    if any(str(key).lower() in detail_keys for key in value):
+                        return True
+                    pending.extend(
+                        child
+                        for child in value.values()
+                        if isinstance(child, (dict, list))
+                    )
+                elif isinstance(value, list):
+                    pending.extend(value)
+            return False
+
         if require_content and (
             len(messages) != len(messages_raw)
-            or any(
-                not any(key in message for key in ("caption", "content", "message", "text"))
-                for message in messages
-            )
+            or any(not has_message_details(message) for message in messages)
         ):
             raise TDLDataError("TDL export does not contain complete message content.")
         max_message_id = max(

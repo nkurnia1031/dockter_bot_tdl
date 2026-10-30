@@ -13,6 +13,7 @@ from pathlib import (
 from tme3bot.progress_reporter import (
     ProgressReporter,
 )
+from tme3bot.media import has_downloadable_media
 from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.tdl_access_fingerprint import normalize_session_fingerprints
 from tme3bot.rclone import (
@@ -39,11 +40,13 @@ from .executor_support import (
 class StorageExecutorMixin:
 
     @staticmethod
-    def _storage_reconcile_text_values(message: dict[str, Any]) -> tuple[bool, list[str]]:
-        """Read only TDL's message-content fields without fuzzy matching."""
-        content_keys = {"caption", "content", "message", "text"}
+    def _storage_reconcile_has_content(message: dict[str, Any]) -> bool:
+        """Check that a time-range export row contains enough message data."""
+        content_keys = {
+            "caption", "content", "file_name", "filename", "original_name",
+            "message", "text",
+        }
         found = False
-        values: list[str] = []
 
         def visit(value: Any) -> None:
             nonlocal found
@@ -51,9 +54,7 @@ class StorageExecutorMixin:
                 for key, child in value.items():
                     if str(key).lower() in content_keys:
                         found = True
-                        if isinstance(child, str):
-                            values.append(child)
-                        elif isinstance(child, (dict, list)):
+                        if isinstance(child, (dict, list)):
                             visit(child)
                     elif isinstance(child, (dict, list)):
                         visit(child)
@@ -63,7 +64,39 @@ class StorageExecutorMixin:
                         visit(child)
 
         visit(message)
-        return found, values
+        return found
+
+    @staticmethod
+    def _storage_reconcile_file_names(message: dict[str, Any]) -> list[str]:
+        """Return exact Telegram filenames from a time-range export row."""
+        name_keys = {"file_name", "filename", "original_name"}
+        caption_keys = {"caption", "content", "message", "text"}
+        names: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    selected_key = str(key).lower()
+                    if selected_key in name_keys and isinstance(child, str):
+                        normalized = child.strip().replace("\\", "/").rsplit("/", 1)[-1]
+                        if normalized:
+                            names.append(normalized)
+                    elif selected_key in caption_keys and isinstance(child, str):
+                        for line in child.splitlines():
+                            prefix = "📄 Name:"
+                            if line.strip().startswith(prefix):
+                                normalized = line.strip()[len(prefix):].strip()
+                                if normalized and normalized != "-":
+                                    names.append(normalized)
+                    if isinstance(child, (dict, list)):
+                        visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    if isinstance(child, (dict, list)):
+                        visit(child)
+
+        visit(message)
+        return names
 
     def _storage_reconcile(
         self,
@@ -71,7 +104,7 @@ class StorageExecutorMixin:
         *,
         upload_item_callback=None,
     ) -> dict[str, Any]:
-        """Check ambiguous upload captions with read-only time-range exports."""
+        """Check ambiguous upload filenames in the job's time range."""
         del upload_item_callback
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
         source_job_id = str(payload.get("source_job_id") or "").strip()
@@ -111,7 +144,8 @@ class StorageExecutorMixin:
                 not source_job_id
                 or not path
                 or (checkpoint or {}).get("status") != "needs_reconciliation"
-                or not str((checkpoint or {}).get("caption") or "")
+                or not name.strip()
+                or name == "File"
             ):
                 outputs[index] = {
                     "index": index,
@@ -121,7 +155,7 @@ class StorageExecutorMixin:
                     "match_count": 0,
                     "retryable": False,
                     "error_code": "STORAGE_RECONCILIATION_CHECKPOINT_UNAVAILABLE",
-                    "error": "Caption upload tidak tersedia pada checkpoint; hasil tetap ambigu.",
+                    "error": "Nama file upload tidak tersedia pada checkpoint; hasil tetap ambigu.",
                 }
                 continue
             candidates.append({
@@ -129,7 +163,6 @@ class StorageExecutorMixin:
                 "path": path,
                 "name": name,
                 "profile": profile,
-                "caption": str(checkpoint.get("caption") or ""),
             })
 
         fingerprints = normalize_session_fingerprints(
@@ -144,7 +177,7 @@ class StorageExecutorMixin:
         reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         reporter.report(
             phase="reconciling",
-            message="Memeriksa caption upload yang hasilnya ambigu",
+            message="Memeriksa nama file pada rentang waktu job",
             overall={"current": 0, "total": len(submitted_items), "unit": "files"},
             counters={"succeeded": 0, "retryable": 0, "ambiguous": len(submitted_items)},
             force=True,
@@ -200,7 +233,11 @@ class StorageExecutorMixin:
                 candidate_messages = getattr(exported, "messages", None)
                 if not isinstance(candidate_messages, list) or any(
                     not isinstance(message, dict)
-                    or not self._storage_reconcile_text_values(message)[0]
+                    or not self._storage_reconcile_has_content(message)
+                    or (
+                        has_downloadable_media(message)
+                        and not self._storage_reconcile_file_names(message)
+                    )
                     for message in candidate_messages
                 ):
                     raise ValueError("incomplete export")
@@ -229,28 +266,27 @@ class StorageExecutorMixin:
                     "error_code": error_code, "error": message_text,
                 }
         else:
-            caption_counts: dict[str, int] = {}
+            filename_counts: dict[str, int] = {}
             for message in messages:
-                _has_content, values = self._storage_reconcile_text_values(message)
-                for value in set(values):
-                    caption_counts[value] = caption_counts.get(value, 0) + 1
+                for value in set(self._storage_reconcile_file_names(message)):
+                    filename_counts[value] = filename_counts.get(value, 0) + 1
             grouped_candidates: dict[str, list[dict[str, Any]]] = {}
             for item in candidates:
-                grouped_candidates.setdefault(item["caption"], []).append(item)
-            for caption, matching_items in grouped_candidates.items():
-                match_count = caption_counts.get(caption, 0)
+                grouped_candidates.setdefault(item["name"], []).append(item)
+            for file_name, matching_items in grouped_candidates.items():
+                match_count = filename_counts.get(file_name, 0)
                 if match_count == 0:
                     status, retryable = "failed", True
                     code = "STORAGE_UPLOAD_NOT_FOUND"
-                    error = "Tidak ada caption yang cocok pada rentang waktu; file aman untuk Retry."
-                elif match_count >= len(matching_items):
+                    error = "Nama file tidak ditemukan pada rentang waktu job; file aman untuk Retry."
+                elif match_count == len(matching_items):
                     status, retryable = "succeeded", False
                     code = ""
-                    error = "Caption ditemukan pada ekspor Telegram; file tidak akan dikirim ulang."
+                    error = "Nama file ditemukan pada rentang waktu job; file tidak akan dikirim ulang."
                 else:
                     status, retryable = "needs_reconciliation", False
-                    code = "STORAGE_UPLOAD_DUPLICATE_CAPTION_AMBIGUOUS"
-                    error = "Jumlah caption cocok belum cukup untuk menentukan file yang terkirim."
+                    code = "STORAGE_UPLOAD_DUPLICATE_FILENAME_AMBIGUOUS"
+                    error = "Jumlah nama file cocok tidak sama dengan jumlah file ambigu pada job."
                 for item in matching_items:
                     outputs[item["index"]] = {
                         "index": item["index"], "name": item["name"],
@@ -285,7 +321,7 @@ class StorageExecutorMixin:
         outcome = "succeeded" if resolved else "needs_reconciliation"
         reporter.report(
             phase=outcome,
-            message="Pemeriksaan caption selesai" if resolved else "Sebagian file tetap ambigu",
+            message="Pemeriksaan nama file selesai" if resolved else "Sebagian file tetap ambigu",
             overall={"current": len(results), "total": len(submitted_items), "unit": "files"},
             counters={"succeeded": succeeded, "retryable": retryable, "ambiguous": unresolved},
             force=True,
@@ -1213,15 +1249,14 @@ class StorageExecutorMixin:
                                 ) from None
                         if result is None:
                             raise RuntimeError("TDL_WRITE_FORBIDDEN: tidak ada profil yang dapat mengirim.")
-                        # Telegram has accepted the file.  Failures while
-                        # hashing, publishing progress, or registering the
-                        # catalog event must not turn that physical upload
-                        # into a false failed file.
+                        # Telegram has accepted the file. Failures while
+                        # publishing progress or registering the catalog event
+                        # must not turn that physical upload into a false failure.
                         physical_upload_succeeded = True
                         last_message_id = int(result.message_id)
                         reporter.report(
-                            phase="hashing",
-                            message=f"Memverifikasi {path.name}",
+                            phase="registering",
+                            message=f"Mencatat {path.name}",
                             overall={
                                 "current": index - 1,
                                 "total": len(files),
@@ -1241,7 +1276,7 @@ class StorageExecutorMixin:
                             indeterminate=True,
                             force=True,
                         )
-                        digest, size = self._digest(path)
+                        size = int(file_sizes.get(path, 0))
                         item = {
                             "upload_id": upload_id,
                             "owner_user_id": int(payload["owner_user_id"]),
@@ -1258,7 +1293,7 @@ class StorageExecutorMixin:
                             "caption_override": caption_override,
                             "file_size": size,
                             "mime_type": mimetypes.guess_type(path.name)[0] or "",
-                            "sha256": digest,
+                            "sha256": "",
                             "status": "active",
                             "uploaded_at": None,
                         }
@@ -1416,7 +1451,7 @@ class StorageExecutorMixin:
                 base_attempts[relative] = max(0, int(raw_attempts.get(relative) or 0))
             except (TypeError, ValueError):
                 base_attempts[relative] = 0
-        metadata: dict[str, tuple[str, int]] = {}
+        metadata: dict[str, int] = {}
         source_identities: dict[str, dict[str, int]] = {}
         results_lock = threading.RLock()
         progress_lock = threading.RLock()
@@ -1471,8 +1506,8 @@ class StorageExecutorMixin:
                 result_item=result_item,
             )
 
-        # Hash before a send. If local file access fails here it is known that
-        # Telegram has not received the item and the item remains retryable.
+        # Capture only filesystem metadata before sending. TDL streams file
+        # contents; pre-hashing the whole batch delays every upload.
         tasks: queue.Queue[dict[str, Any]] = queue.Queue()
         for path in files:
             relative = path.relative_to(root).as_posix()
@@ -1485,9 +1520,10 @@ class StorageExecutorMixin:
                 retryable=True,
             )
             try:
-                digest, size = self._digest(path)
-                metadata[relative] = (digest, size)
-                source_identities[relative] = self._storage_source_identity(path)
+                identity = self._storage_source_identity(path)
+                size = identity["size"]
+                metadata[relative] = size
+                source_identities[relative] = identity
                 file_sizes[path] = size
                 tasks.put(
                     {
@@ -1752,7 +1788,7 @@ class StorageExecutorMixin:
                                 tasks.put(task)
                                 lane_condition.notify_all()
                             return
-                    digest, size = metadata[relative]
+                    size = metadata[relative]
                     base_folder = str(
                         payload.get("destination_folder_path") or payload.get("folder") or ""
                     )
@@ -2016,7 +2052,7 @@ class StorageExecutorMixin:
                         "caption_override": caption_override,
                         "file_size": size,
                         "mime_type": mimetypes.guess_type(path.name)[0] or "",
-                        "sha256": digest,
+                        "sha256": "",
                         "status": "active",
                         "uploaded_at": None,
                     }
