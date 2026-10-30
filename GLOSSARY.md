@@ -2,6 +2,20 @@
 
 Istilah ini menjelaskan profil Telegram lokal dan vault yang dipakai aplikasi serta worker.
 
+## Pemantauan
+
+**Pembaruan manual**:
+Memuat ulang data halaman saat pengguna membukanya, meminta refresh, atau menyelesaikan tindakan yang mengubah data. Data umum tidak diperbarui berulang kali tanpa tindakan pengguna.
+_Avoid_: polling halaman.
+
+**Polling progres operasi**:
+Pembaruan sementara untuk operasi aktif yang sedang ditunggu pengguna pada halaman fitur. Polling berhenti ketika operasi selesai atau pengguna meninggalkan halaman; operasi tetap berjalan di backend.
+_Avoid_: monitor global job.
+
+**Monitor Aktivitas**:
+Tampilan global job yang terus memperbarui status saat halaman terlihat, dengan pembaruan lebih sering ketika ada job aktif dan lebih jarang ketika idle.
+_Avoid_: riwayat pasif.
+
 ## Profil
 
 **Profil lokal**:
