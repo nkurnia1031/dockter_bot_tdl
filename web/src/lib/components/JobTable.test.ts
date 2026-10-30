@@ -4,15 +4,23 @@ import JobTable from './JobTable.svelte';
 
 describe('JobTable', () => {
   const dialogMethodDescriptors = Object.fromEntries(['showModal', 'close'].map((name) => [name, Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, name)]));
+  const visibilityStateDescriptor = Object.getOwnPropertyDescriptor(document, 'visibilityState');
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
+    if (visibilityStateDescriptor) Object.defineProperty(document, 'visibilityState', visibilityStateDescriptor);
+    else delete (document as any).visibilityState;
     for (const [name, descriptor] of Object.entries(dialogMethodDescriptors)) {
       if (descriptor) Object.defineProperty(HTMLDialogElement.prototype, name, descriptor);
       else delete (HTMLDialogElement.prototype as any)[name];
     }
   });
+
+  async function flushPromises() {
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  }
 
   it('shows an accessible empty state and global terminate action', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ items: [] }), { status: 200 })));
@@ -315,16 +323,134 @@ describe('JobTable', () => {
     expect(calls.some((call) => call.url.endsWith('/resume') && call.method === 'POST')).toBe(true);
   });
 
-  it('auto polls monitor views that also contain history', async () => {
-    const interval = vi.spyOn(globalThis, 'setInterval');
-    vi.stubGlobal('fetch', vi.fn(async () => {
-      return new Response(JSON.stringify({ items: [{ id: 'active-1', kind: 'utility', status: 'running', progress: { phase: 'compressing' } }] }), { status: 200 });
-    }));
+  it('keeps a feature job list manual while idle', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ items: [] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
 
-    render(JobTable, { kind: 'utility', title: 'Utility monitor' });
-    expect(await screen.findByText('Sedang berjalan')).toBeTruthy();
+    render(JobTable, { kind: 'utility', title: 'Riwayat utility' });
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
 
-    expect(interval).toHaveBeenCalledWith(expect.any(Function), 2500);
-    expect(screen.getByText('Live · 2,5 detik')).toBeTruthy();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh daftar job' }));
+    await flushPromises();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('refreshes feature job progress only while a relevant job is active', async () => {
+    vi.useFakeTimers();
+    let jobStatus = 'running';
+    let jobRequests = 0;
+    const metricsRequests: string[] = [];
+    const fetchMock = vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs/metrics?')) {
+        metricsRequests.push(url);
+        return new Response(JSON.stringify({ active_jobs: 1 }), { status: 200 });
+      }
+      if (url.includes('/jobs?')) {
+        jobRequests += 1;
+        const job = { id: 'active-1', kind: 'utility', status: jobStatus, progress: { phase: 'compressing' } };
+        return new Response(JSON.stringify({ items: jobStatus === 'running' ? [job] : [{ ...job, status: 'succeeded' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { kind: 'utility', title: 'Riwayat utility' });
+    await flushPromises();
+    expect(jobRequests).toBe(1);
+    expect(screen.getByText('Progress otomatis · job aktif')).toBeTruthy();
+
+    jobStatus = 'succeeded';
+    await vi.advanceTimersByTimeAsync(2500);
+    await flushPromises();
+    expect(jobRequests).toBe(2);
+    expect(metricsRequests).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(jobRequests).toBe(2);
+  });
+
+  it('stops feature job polling when the page is left', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs/metrics?')) return new Response(JSON.stringify({}), { status: 200 });
+      return new Response(JSON.stringify({ items: [{ id: 'active-1', kind: 'utility', status: 'running' }] }), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { unmount } = render(JobTable, { kind: 'utility', title: 'Riwayat utility' });
+    await flushPromises();
+    const initialRequests = fetchMock.mock.calls.length;
+    unmount();
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetchMock).toHaveBeenCalledTimes(initialRequests);
+  });
+
+  it('uses a faster Activity cadence for active jobs and slows down while idle', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    let jobRequests = 0;
+    const fetchMock = vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs/metrics?')) return new Response(JSON.stringify({}), { status: 200 });
+      if (url.includes('/jobs?')) {
+        jobRequests += 1;
+        const items = jobRequests === 1
+          ? [{ id: 'active-1', kind: 'export', status: 'running' }]
+          : [];
+        return new Response(JSON.stringify({ items }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { title: 'Daftar aktivitas', pollingMode: 'activity' });
+    await flushPromises();
+    expect(screen.getByText('Live · 2,5 dtk aktif / 10 dtk idle')).toBeTruthy();
+
+    await vi.advanceTimersByTimeAsync(2499);
+    expect(jobRequests).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(jobRequests).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(jobRequests).toBe(2);
+    await vi.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(jobRequests).toBe(3);
+  });
+
+  it('pauses the Activity monitor while its tab is hidden and refreshes when visible', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    let jobRequests = 0;
+    const fetchMock = vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs/metrics?')) return new Response(JSON.stringify({}), { status: 200 });
+      if (url.includes('/jobs?')) {
+        jobRequests += 1;
+        return new Response(JSON.stringify({ items: [{ id: 'active-1', kind: 'export', status: 'running' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { title: 'Daftar aktivitas', pollingMode: 'activity' });
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(jobRequests).toBe(1);
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    expect(jobRequests).toBe(2);
   });
 });

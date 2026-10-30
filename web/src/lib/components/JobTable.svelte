@@ -10,7 +10,8 @@
 
   type Job = Record<string, any>;
   type JobEvent = Record<string, any>;
-  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false, view = 'all' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean; view?: 'all'|'active'|'history' } = $props();
+  type PollingMode = 'active' | 'activity' | 'manual';
+  let { kind = '', title = 'Aktivitas terbaru', worker = '', profile = '', scope = 'current', status = '', quickMode = false, retryable = false, view = 'all', pollingMode = 'active' }: { kind?: string; title?: string; worker?: string; profile?: string; scope?: 'current'|'global'; status?: string; quickMode?: boolean; retryable?: boolean; view?: 'all'|'active'|'history'; pollingMode?: PollingMode } = $props();
   let jobs = $state<Job[]>([]);
   let monitorMetrics = $state<Record<string, any> | null>(null);
   let error = $state('');
@@ -31,7 +32,7 @@
   let lastRefreshed = $state<Date | null>(null);
   let mounted = false;
   let loadGeneration = 0;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
   let hasLoaded = false;
 
   const activeStates = ['queued', 'dispatched', 'running', 'paused'];
@@ -104,7 +105,24 @@
     } as Record<string, string>)[status] || status;
   }
 
-  async function load() {
+  function stopPolling() {
+    if (pollTimer !== undefined) clearTimeout(pollTimer);
+    pollTimer = undefined;
+  }
+
+  function schedulePolling() {
+    stopPolling();
+    if (!mounted || view === 'history' || pollingMode === 'manual') return;
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+    const delay = pollingMode === 'activity'
+      ? activeJobs.length ? 2500 : 10_000
+      : activeJobs.length ? 2500 : undefined;
+    if (delay === undefined) return;
+    pollTimer = setTimeout(() => { void load({ scheduled: true }); }, delay);
+  }
+
+  async function load({ scheduled = false }: { scheduled?: boolean } = {}) {
+    if (!scheduled) stopPolling();
     const request = ++loadGeneration;
     const previousActiveIds = new Set(jobs.filter(active).map((job) => String(job.id)));
     try {
@@ -128,10 +146,11 @@
       const metricsParams = new URLSearchParams({ scope });
       if (profile) metricsParams.set('profile', profile);
       if (worker) metricsParams.set('worker', worker);
+      const shouldRefreshMetrics = view !== 'history' && (!scheduled || pollingMode === 'activity');
       const [jobResponses, nextMetrics] = await Promise.all([
         Promise.all(jobRequests),
-        view === 'history'
-          ? Promise.resolve(null)
+        !shouldRefreshMetrics
+          ? Promise.resolve(undefined)
           : api<Record<string, any>>(`/jobs/metrics?${metricsParams.toString()}`).catch(() => null)
       ]);
       const next = jobResponses.flatMap((response) => response.items || [])
@@ -139,7 +158,7 @@
         .slice(0, 30);
       if (request !== loadGeneration) return;
       jobs = next;
-      monitorMetrics = nextMetrics;
+      if (nextMetrics !== undefined) monitorMetrics = nextMetrics;
       lastRefreshed = new Date();
       if (selected) selected = next.find((job) => job.id === selected?.id) || selected;
       if (view === 'active' && hasLoaded) {
@@ -151,9 +170,11 @@
       }
       hasLoaded = true;
       error = '';
+      schedulePolling();
     } catch (cause) {
       if (request !== loadGeneration) return;
       error = cause instanceof Error ? cause.message : 'Tidak dapat memuat job.';
+      schedulePolling();
     }
   }
   async function loadEvents() {
@@ -299,21 +320,27 @@
       liveLog = null;
       reportOpen = false;
       logOpen = false;
-      load();
+      void load();
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState !== 'visible') {
+        stopPolling();
+        return;
+      }
+      if (pollingMode === 'activity' || activeJobs.length) void load();
     };
     window.addEventListener('tme3:data-mutated', refresh);
     window.addEventListener('tme3:context-changed', contextRefresh);
     window.addEventListener('tme3:job-finished', jobFinished);
-    load();
-    // Every monitor view may contain active jobs. History-only remains an
-    // explicit read so opening old records does not create background traffic.
-    if (view !== 'history') pollTimer = setInterval(() => load(), 2500);
+    document.addEventListener('visibilitychange', visibilityChanged);
+    void load();
     return () => {
       mounted = false;
-      if (pollTimer) clearInterval(pollTimer);
+      stopPolling();
       window.removeEventListener('tme3:data-mutated', refresh);
       window.removeEventListener('tme3:context-changed', contextRefresh);
       window.removeEventListener('tme3:job-finished', jobFinished);
+      document.removeEventListener('visibilitychange', visibilityChanged);
     };
   });
 </script>
@@ -322,12 +349,20 @@
   <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-4 py-4 sm:px-5">
     <div><p class="eyebrow">{view === 'history' ? 'HISTORY' : 'JOB MONITOR'}</p><h2 class="mt-1 text-lg font-extrabold">{title}</h2></div>
     <div class="flex flex-wrap items-center gap-2">
-      {#if view !== 'history'}<span class="badge running">Live · 2,5 detik</span>{:else}<span class="muted text-xs">Refresh manual atau saat job selesai</span>{/if}
+      {#if view === 'history'}
+        <span class="muted text-xs">Refresh manual atau saat job selesai</span>
+      {:else if pollingMode === 'activity'}
+        <span class="badge running">Live · 2,5 dtk aktif / 10 dtk idle</span>
+      {:else if activeJobs.length}
+        <span class="badge running">Progress otomatis · job aktif</span>
+      {:else}
+        <span class="muted text-xs">Refresh manual</span>
+      {/if}
       {#if lastRefreshed}
         <span class="muted text-xs">Terakhir diperbarui: {formatClock(lastRefreshed)}</span>
       {/if}
       {#if view !== 'history'}<button class="button danger" onclick={() => requestTerminate('all')}><XCircle size={16}/>Terminate semua aktif</button>{/if}
-      <button class="button secondary" onclick={load} aria-label={view === 'active' ? 'Refresh monitor' : 'Refresh daftar job'}><RefreshCw size={16}/>Refresh</button>
+      <button class="button secondary" onclick={() => { void load(); }} aria-label={view === 'active' ? 'Refresh monitor' : 'Refresh daftar job'}><RefreshCw size={16}/>Refresh</button>
     </div>
   </div>
   {#if error}<p class="m-4 rounded-xl bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{error}</p>{/if}
