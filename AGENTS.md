@@ -5,6 +5,11 @@ lebih dahulu, lalu verifikasi keadaan aktual dengan `git status`, `git log`, dan
 source code. Jangan menganggap ringkasan ini menggantikan pemeriksaan kode jika
 branch sudah berubah.
 
+Untuk tugas kesehatan, pengukuran, atau insiden Redis/RQ di gateway, baca
+`docs/agents/redis-queue-audit.md` sebelum bertindak. Dokumen itu mencatat
+insiden AOF 2026-10-30, akses yang tersedia, dan cakupan audit/no-op production
+yang disetujui pengguna.
+
 ## Status handoff
 
 Diperbarui 2026-09-24 (Asia/Jakarta). Pada saat handoff:
@@ -126,10 +131,10 @@ nama key dan status configured/missing.
 - `APP_ROLE=backend` menjalankan FastAPI dan persistence; `APP_ROLE=telegram`
   menjalankan UI Telegram tanpa mount `/data`; `APP_ROLE=worker` menjalankan
   sesi `.tdl`, export, download, serta utility tanpa `BOT_TOKEN`.
-- `docker-compose.gateway.yml` menjalankan backend, Telegram frontend, dan
-  worker lokal di VPS utama; `docker-compose.worker.yml` menjalankan worker VPS
-  kedua. Backend menyimpan identity/state dan worker mengaksesnya lewat
-  `/internal/v1`.
+- `docker-compose.gateway.yml` menjalankan backend, backend-queue, Redis
+  internal, Telegram frontend, dan worker lokal di VPS utama;
+  `docker-compose.worker.yml` menjalankan worker VPS kedua. Backend menyimpan
+  identity/state dan worker mengaksesnya lewat `/internal/v1`.
 - Route worker dipilih per profile dan disimpan di `worker_routes.json`. Job
   menyimpan worker asalnya saat dibuat, sehingga perubahan route hanya berlaku
   untuk job baru dan tidak memindahkan job aktif. `state.json` gateway adalah
