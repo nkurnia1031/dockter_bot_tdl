@@ -119,7 +119,11 @@ class UtilityFeatureTests(unittest.TestCase):
                     "extract", [str(root)], password="form-password"
                 )
 
-            self.assertEqual(result.outcome, "succeeded")
+            self.assertEqual(
+                result.outcome,
+                "succeeded",
+                f"failed={result.failed}; archive_results={result.archive_results}",
+            )
             self.assertEqual(
                 [(item["name"], item["pass"]) for item in result.archive_results],
                 [("first.zip", "first"), ("second.zip", "retry")],

@@ -361,9 +361,8 @@ describe('JobTable', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     render(JobTable, { kind: 'utility', title: 'Riwayat utility' });
-    await flushPromises();
+    expect(await screen.findByText('Progress otomatis · job aktif')).toBeTruthy();
     expect(jobRequests).toBe(1);
-    expect(screen.getByText('Progress otomatis · job aktif')).toBeTruthy();
 
     jobStatus = 'succeeded';
     await vi.advanceTimersByTimeAsync(2500);

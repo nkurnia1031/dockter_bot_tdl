@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tme3bot.utility import (
+    UTILITY_RUNTIME_COMMANDS,
     UtilityRuntimeError,
     UtilityRunner,
     UtilitySettingsStore,
@@ -85,6 +86,14 @@ class UtilitySummaryTests(unittest.TestCase):
             utility_root = root / "utility"
             workspace = root / "workspace"
             workspace.mkdir()
+            bin_root = root / "bin"
+            bin_root.mkdir()
+            command_paths = {}
+            for command in UTILITY_RUNTIME_COMMANDS:
+                path = bin_root / command
+                path.write_text("#!/bin/sh\n", encoding="utf-8")
+                path.chmod(0o755)
+                command_paths[command] = str(path)
             for relative in (
                 "extract/extract.py",
                 "flatten/flatten.py",
@@ -101,7 +110,7 @@ class UtilitySummaryTests(unittest.TestCase):
                 path.write_text("# probe fixture\n", encoding="utf-8")
 
             before = sorted(str(path.relative_to(workspace)) for path in workspace.rglob("*"))
-            with patch("tme3bot.utility.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+            with patch("tme3bot.utility.shutil.which", side_effect=command_paths.get):
                 result = probe_utility_runtime(utility_root, workspace)
 
             after = sorted(str(path.relative_to(workspace)) for path in workspace.rglob("*"))
@@ -113,7 +122,7 @@ class UtilitySummaryTests(unittest.TestCase):
             (utility_root / "pindah" / "pindah.py").write_text(
                 "# changed runtime fixture\n", encoding="utf-8"
             )
-            with patch("tme3bot.utility.shutil.which", side_effect=lambda name: f"/usr/bin/{name}"):
+            with patch("tme3bot.utility.shutil.which", side_effect=command_paths.get):
                 changed = probe_utility_runtime(utility_root, workspace)
             self.assertNotEqual(result["fingerprint"], changed["fingerprint"])
 
