@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from contextlib import nullcontext
 from typing import Any
 
 from fastapi import Depends, Header, Request
@@ -385,16 +386,41 @@ def advance_profile_local_delete_command(command: dict[str, Any], context) -> di
         _finish_marker(context, payload)
         return {"status": "terminal", "reason": "worker_delete_failed"}
 
-    gate = getattr(
-        getattr(context, "control_plane", None), "runtime_readiness_gate", None
-    )
-    invalidate = getattr(gate, "invalidate_profile_mutation", None)
-    if callable(invalidate):
-        invalidate(
-            profile=profile,
-            worker=worker,
-            reason_code="PROFILE_SESSION_MISSING",
+    catalog = getattr(context, "local_profile_catalog", None)
+    scan_lock = getattr(catalog, "scan_lock", None)
+    lock_context = scan_lock if hasattr(scan_lock, "__enter__") else nullcontext()
+    try:
+        # Serialize the confirmed delete with scan commits. If the scan already
+        # committed, remove the item now; if it is still probing, its revision
+        # will no longer match and it cannot republish the deleted profile.
+        with lock_context:
+            mark_deleted = getattr(catalog, "mark_profile_deleted", None)
+            if callable(mark_deleted):
+                mark_deleted(worker, profile)
+
+            gate = getattr(
+                getattr(context, "control_plane", None),
+                "runtime_readiness_gate",
+                None,
+            )
+            invalidate = getattr(gate, "invalidate_profile_mutation", None)
+            if callable(invalidate):
+                invalidate(
+                    profile=profile,
+                    worker=worker,
+                    reason_code="PROFILE_SESSION_MISSING",
+                )
+    except Exception:
+        # The worker deletion is already confirmed. Retry so the durable
+        # catalog/readiness state cannot remain stale.
+        _transition(
+            context,
+            operation,
+            status=OperationStatus.WAITING_WORKER,
+            phase="waiting_worker",
+            progress={"profile": profile, "worker": worker, "result": "waiting_worker"},
         )
+        return {"status": "retry", "reason": "profile_catalog_update_failed"}
 
     try:
         _mark_distribution_removed(context, profile, worker)

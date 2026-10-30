@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -20,8 +21,11 @@ class LocalProfileCatalog:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._lock = threading.RLock()
-        self.scan_lock = threading.Lock()
+        # Serialize a scan's catalog/readiness commit with confirmed deletes.
+        # A scan holds this only while committing, never during worker probes.
+        self.scan_lock = threading.RLock()
         self._snapshot: dict[str, Any] | None = None
+        self._revision = 0
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -29,22 +33,82 @@ class LocalProfileCatalog:
             assert self._snapshot is not None
             return copy.deepcopy(self._snapshot)
 
+    def revision(self) -> int:
+        """Return the in-process generation used to reject stale scans."""
+        with self._lock:
+            self._load_locked()
+            return self._revision
+
     def replace_scan(
         self,
         *,
         checked_at: str,
         workers: list[dict[str, Any]],
         inventories: list[dict[str, Any]],
-    ) -> dict[str, Any]:
+        expected_revision: int | None = None,
+        after_commit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any] | None:
         """Replace the whole snapshot; only successful workers retain inventories."""
         snapshot = self._build_snapshot(
             checked_at=checked_at,
             workers=workers,
             inventories=inventories,
         )
-        with self._lock:
+        with self.scan_lock:
+            with self._lock:
+                self._load_locked()
+                if (
+                    expected_revision is not None
+                    and expected_revision != self._revision
+                ):
+                    return None
+                write_json_atomic(self.path, snapshot)
+                self._snapshot = snapshot
+                self._revision += 1
+                result = copy.deepcopy(snapshot)
+            if after_commit is not None:
+                after_commit(copy.deepcopy(result))
+            return result
+
+    def mark_profile_deleted(
+        self,
+        worker: str,
+        profile: str,
+    ) -> dict[str, Any]:
+        """Remove a confirmed worker-local profile and advance the scan revision."""
+        selected_worker = str(worker or "").strip().lower()
+        selected_profile = normalize_profile_name(str(profile or ""))
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", selected_worker):
+            raise ValueError("worker name is invalid")
+        if not selected_profile:
+            raise ValueError("profile name is invalid")
+
+        with self.scan_lock, self._lock:
+            self._load_locked()
+            assert self._snapshot is not None
+            inventories = []
+            for inventory in self._snapshot["inventories"]:
+                updated = copy.deepcopy(inventory)
+                if updated["worker"] == selected_worker:
+                    updated["items"] = [
+                        item for item in updated["items"]
+                        if not (
+                            isinstance(item, dict)
+                            and normalize_profile_name(str(item.get("name") or ""))
+                            == selected_profile
+                        )
+                    ]
+                inventories.append(updated)
+            snapshot = self._build_snapshot(
+                checked_at=self._snapshot["checked_at"],
+                workers=self._snapshot["workers"],
+                inventories=inventories,
+            )
             write_json_atomic(self.path, snapshot)
             self._snapshot = snapshot
+            # Bump even when the cached inventory did not contain this profile:
+            # an older in-flight scan may still return it.
+            self._revision += 1
             return copy.deepcopy(snapshot)
 
     def _load_locked(self) -> None:

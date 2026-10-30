@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -334,7 +335,11 @@ def register_workers(app, context, *, current_actor):
         }
 
     def _scan_profile_worker(
-        name: str, operation_id: str = ""
+        name: str,
+        operation_id: str = "",
+        *,
+        storage_target_override: str | None = None,
+        tts_target_override: str | None = None,
     ) -> tuple[str, dict | None, str, dict, dict, list[dict], list[dict], dict, dict, list[dict], list[dict]]:
         try:
             if operation_id:
@@ -414,8 +419,22 @@ def register_workers(app, context, *, current_actor):
                     tts_readiness["reason_code"] = "TTS_RUNTIME_UNAVAILABLE"
             control = getattr(context, "control_plane", None)
             target_resolver = getattr(control, "_tdl_access_target", None)
-            storage_target = str(target_resolver("storage") or "").strip() if callable(target_resolver) else ""
-            tts_target = str(target_resolver("tts") or "").strip() if callable(target_resolver) else ""
+            if storage_target_override is not None:
+                storage_target = storage_target_override
+            else:
+                storage_target = (
+                    str(target_resolver("storage") or "").strip()
+                    if callable(target_resolver)
+                    else ""
+                )
+            if tts_target_override is not None:
+                tts_target = tts_target_override
+            else:
+                tts_target = (
+                    str(target_resolver("tts") or "").strip()
+                    if callable(target_resolver)
+                    else ""
+                )
             access_store = getattr(control, "tdl_access_store", None)
             storage_destination_hash = (
                 access_store.destination_fingerprint(storage_target)
@@ -733,23 +752,6 @@ def register_workers(app, context, *, current_actor):
                     quickmode_cell["fingerprint"] = ""
                 item["_quickmode_readiness"] = quickmode_cell
 
-            if access_store is not None and callable(getattr(access_store, "replace_results", None)):
-                if storage_destination_hash:
-                    inventory_hash = access_store.inventory_fingerprint(
-                        storage_sender_profiles, storage_sender_fingerprints
-                    )
-                    access_store.replace_results(
-                        name,
-                        "storage",
-                        storage_destination_hash,
-                        inventory_hash,
-                        [
-                            {"profile": cell["profile"], "ready": cell["ready"], "error_code": cell.get("reason_code")}
-                            for cell in storage_cells
-                        ],
-                        session_fingerprints=storage_sender_fingerprints,
-                    )
-
             return (
                 name, inventory, "", tts_readiness, quick_runtime, tts_cells,
                 storage_cells, resolver_readiness, rclone_storage_readiness,
@@ -774,6 +776,20 @@ def register_workers(app, context, *, current_actor):
             return name, None, "WORKER_UNAVAILABLE", {}, {}, [], [], {}, {}, [], []
 
     def _perform_profile_catalog_scan(store, operation_id: str = "") -> dict:
+        revision_getter = getattr(store, "revision", None)
+        scan_revision = revision_getter() if callable(revision_getter) else None
+        control = getattr(context, "control_plane", None)
+        target_resolver = getattr(control, "_tdl_access_target", None)
+        scan_storage_target = (
+            str(target_resolver("storage") or "").strip()
+            if callable(target_resolver)
+            else ""
+        )
+        scan_tts_target = (
+            str(target_resolver("tts") or "").strip()
+            if callable(target_resolver)
+            else ""
+        )
         records = context.worker_registry.list()
         workers = []
         scan_names = []
@@ -808,7 +824,13 @@ def register_workers(app, context, *, current_actor):
         if scan_names:
             with ThreadPoolExecutor(max_workers=min(8, len(scan_names))) as executor:
                 futures = {
-                    executor.submit(_scan_profile_worker, name, operation_id): name
+                    executor.submit(
+                        _scan_profile_worker,
+                        name,
+                        operation_id,
+                        storage_target_override=scan_storage_target,
+                        tts_target_override=scan_tts_target,
+                    ): name
                     for name in scan_names
                 }
                 for future in as_completed(futures):
@@ -895,14 +917,63 @@ def register_workers(app, context, *, current_actor):
             })
 
         checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-        snapshot = store.replace_scan(
-            checked_at=checked_at,
-            workers=sorted(workers, key=lambda item: item["name"]),
-            inventories=inventories,
-        )
-        runtime_store = getattr(context, "runtime_readiness_store", None)
-        apply_scan = getattr(runtime_store, "apply_export_scan", None)
-        if callable(apply_scan):
+        def apply_committed_scan(_snapshot: dict) -> None:
+            # Keep every persisted scan result behind the same revision check.
+            # A confirmed delete cannot interleave and then be overwritten by
+            # readiness or sender-proof data from an older inventory.
+            storage_target = scan_storage_target
+            access_store = getattr(control, "tdl_access_store", None)
+            destination_fingerprint = getattr(
+                access_store, "destination_fingerprint", None
+            )
+            replace_access = getattr(access_store, "replace_results", None)
+            inventory_fingerprint = getattr(
+                access_store, "inventory_fingerprint", None
+            )
+            if (
+                storage_target
+                and callable(destination_fingerprint)
+                and callable(replace_access)
+                and callable(inventory_fingerprint)
+            ):
+                storage_destination_hash = destination_fingerprint(storage_target)
+                for name, cells in readiness_storage.items():
+                    sender_fingerprints = {
+                        cell["profile"]: cell["session_fingerprint"]
+                        for cell in cells
+                        if cell.get("ready") is True
+                        and cell.get("session_fingerprint")
+                    }
+                    sender_profiles = sorted(sender_fingerprints)
+                    inventory_hash = inventory_fingerprint(
+                        sender_profiles, sender_fingerprints
+                    )
+                    try:
+                        replace_access(
+                            name,
+                            "storage",
+                            storage_destination_hash,
+                            inventory_hash,
+                            [
+                                {
+                                    "profile": cell["profile"],
+                                    "ready": cell["ready"],
+                                    "error_code": cell.get("reason_code"),
+                                }
+                                for cell in cells
+                            ],
+                            session_fingerprints=sender_fingerprints,
+                        )
+                    except Exception:
+                        logging.getLogger(__name__).exception(
+                            "Could not persist Storage scan proof for worker %s",
+                            name,
+                        )
+
+            runtime_store = getattr(context, "runtime_readiness_store", None)
+            apply_scan = getattr(runtime_store, "apply_export_scan", None)
+            if not callable(apply_scan):
+                return
             apply_scan(
                 checked_at=checked_at,
                 workers=[
@@ -917,16 +988,16 @@ def register_workers(app, context, *, current_actor):
                 profiles=readiness_profiles,
             )
             apply_lane_scan = getattr(runtime_store, "apply_profile_lane_scan", None)
+            worker_states = [
+                {
+                    "worker": item["name"],
+                    "status": item["status"],
+                    "error_code": item.get("error_code"),
+                    "checked_at": item.get("checked_at"),
+                }
+                for item in workers
+            ]
             if callable(apply_lane_scan):
-                worker_states = [
-                    {
-                        "worker": item["name"],
-                        "status": item["status"],
-                        "error_code": item.get("error_code"),
-                        "checked_at": item.get("checked_at"),
-                    }
-                    for item in workers
-                ]
                 apply_lane_scan(
                     runtime="download",
                     checked_at=checked_at,
@@ -966,15 +1037,7 @@ def register_workers(app, context, *, current_actor):
             if callable(apply_quickmode_scan):
                 apply_quickmode_scan(
                     checked_at=checked_at,
-                    workers=[
-                        {
-                            "worker": item["name"],
-                            "status": item["status"],
-                            "error_code": item.get("error_code"),
-                            "checked_at": item.get("checked_at"),
-                        }
-                        for item in workers
-                    ],
+                    workers=worker_states,
                     profiles=readiness_quickmode,
                 )
             apply_storage_scan = getattr(runtime_store, "apply_storage_scan", None)
@@ -1004,6 +1067,16 @@ def register_workers(app, context, *, current_actor):
                     ),
                     checked_at=checked_at,
                 )
+
+        snapshot = store.replace_scan(
+            checked_at=checked_at,
+            workers=sorted(workers, key=lambda item: item["name"]),
+            inventories=inventories,
+            expected_revision=scan_revision,
+            after_commit=apply_committed_scan,
+        )
+        if snapshot is None:
+            raise RuntimeError("profile scan superseded by a profile mutation")
         return _profile_catalog_response(snapshot)
 
     profile_scan_store = getattr(context, "profile_scan_store", None)
