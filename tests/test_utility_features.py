@@ -111,7 +111,7 @@ class UtilityFeatureTests(unittest.TestCase):
             )
             runner = UtilityRunner(
                 Path(__file__).resolve().parents[1] / "utility",
-                workspace_root=root,
+                workspace_root=root.parent,
             )
 
             with patch.dict(os.environ, env):
