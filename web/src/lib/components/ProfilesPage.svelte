@@ -95,7 +95,6 @@ let savingProvisioning = $state(false);
   let progressGeneration = 0;
   let catalogGeneration = 0;
   let onJobFinished: (() => void) | undefined;
-  let readinessTimer: ReturnType<typeof setInterval> | undefined;
   const codeMessages: Record<string, string> = {
     PROFILE_IDENTITY_MISSING: 'File identitas tidak ditemukan.',
     PROFILE_IDENTITY_INVALID: 'Identitas profil tidak valid.',
@@ -899,13 +898,7 @@ async function cancelProfileProvisioning() {
     void loadWorkers();
     void loadProfileCatalog();
     void refreshScanOperation();
-  void loadProvisioningWorkers();
-    readinessTimer = setInterval(() => {
-      if (document.visibilityState === 'visible') {
-        void loadProfileCatalog();
-        void session.refreshProfileCatalog();
-      }
-    }, 15000);
+    void loadProvisioningWorkers();
     onJobFinished = () => {
       void loadProfileCatalog();
       void session.refreshProfileCatalog();
@@ -915,7 +908,6 @@ async function cancelProfileProvisioning() {
 
   onDestroy(() => {
     if (onJobFinished) window.removeEventListener('tme3:job-finished', onJobFinished);
-    if (readinessTimer !== undefined) clearInterval(readinessTimer);
     stopScanPolling();
     stopProgressRefresh();
     if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);

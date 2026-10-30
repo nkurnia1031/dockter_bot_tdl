@@ -26,6 +26,7 @@
   let selected = $state<string[]>([]);
   let pending = $state(false);
   let syncing = $state(false);
+  let catalogRefreshing = $state(false);
   let message = $state('');
   let profileFilter = $state('');
   let workerFilter = $state('');
@@ -83,6 +84,20 @@
     if (request !== generation) return;
     artifacts = [...current, ...archived.filter(item => !current.some(other => other.id === item.id))];
     selected = selected.filter(id => artifacts.some(item => item.id === id));
+  }
+  async function refreshCatalog() {
+    if (catalogRefreshing) return;
+    catalogRefreshing = true;
+    message = '';
+    const request = ++generation;
+    try {
+      await Promise.all([load(request), session.refreshProfileCatalog()]);
+      if (request === generation) message = 'Katalog unduhan dan status profil diperbarui.';
+    } catch (cause) {
+      if (request === generation) message = cause instanceof Error ? cause.message : 'Katalog unduhan gagal diperbarui.';
+    } finally {
+      catalogRefreshing = false;
+    }
   }
   function selectAll() {
     selected = allVisibleSelected ? selected.filter(id => !selectable.some(item => item.id === id)) : [...new Set([...selected, ...selectable.map(item => item.id)])];
@@ -160,9 +175,6 @@
   onMount(() => {
     let disposed=false;
     void session.refreshProfileCatalog();
-    const readinessTimer = setInterval(() => {
-      if (document.visibilityState === 'visible') void session.refreshProfileCatalog();
-    }, 15000);
     const onJobFinished = () => { void session.refreshProfileCatalog(); };
     window.addEventListener('tme3:job-finished', onJobFinished);
     void (async () => {
@@ -180,7 +192,6 @@
     return () => {
       disposed=true;
       generation += 1;
-      clearInterval(readinessTimer);
       window.removeEventListener('tme3:job-finished', onJobFinished);
     };
   });
@@ -189,7 +200,7 @@
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">DOWNLOAD</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Download manager</h1><p class="muted mt-2">Semua artifact lintas profile dan worker. Origin artifact menentukan runtime download secara otomatis.</p></div><div class="page-icon"><Boxes size={23}/></div></header>
 <section class="card mt-7 overflow-hidden">
   <div class="border-b border-[var(--line)] p-4 sm:p-5">
-    <div class="flex flex-wrap items-center justify-between gap-3"><div class="flex max-w-full gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">{#each tabs as tab}<button class={`rounded-lg px-3 py-2 text-sm font-bold ${activeTab===tab.key?'bg-[var(--panel-strong)] shadow-sm':'muted'}`} onclick={() => {activeTab=tab.key;selected=[];}}>{tab.label}</button>{/each}</div><div class="flex flex-wrap gap-2"><button class="button secondary" onclick={reconcile} disabled={pending}><RefreshCw class={syncing?'animate-spin':''} size={15}/>Reconcile global</button>{#if activeTab==='pending'}<button class="button secondary" onclick={clearFailed} disabled={pending||syncing}><Trash2 size={15}/>Clear failed</button><button class="button secondary" onclick={startAll} disabled={pending||syncing||!selectable.length}><Play size={15}/>Mulai semua</button>{/if}</div></div>
+    <div class="flex flex-wrap items-center justify-between gap-3"><div class="flex max-w-full gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">{#each tabs as tab}<button class={`rounded-lg px-3 py-2 text-sm font-bold ${activeTab===tab.key?'bg-[var(--panel-strong)] shadow-sm':'muted'}`} onclick={() => {activeTab=tab.key;selected=[];}}>{tab.label}</button>{/each}</div><div class="flex flex-wrap gap-2"><button class="button secondary" onclick={refreshCatalog} disabled={catalogRefreshing||pending||syncing} aria-label="Refresh katalog unduhan"><RefreshCw class={catalogRefreshing?'animate-spin':''} size={15}/>Refresh katalog</button><button class="button secondary" onclick={reconcile} disabled={pending}><RefreshCw class={syncing?'animate-spin':''} size={15}/>Reconcile global</button>{#if activeTab==='pending'}<button class="button secondary" onclick={clearFailed} disabled={pending||syncing}><Trash2 size={15}/>Clear failed</button><button class="button secondary" onclick={startAll} disabled={pending||syncing||!selectable.length}><Play size={15}/>Mulai semua</button>{/if}</div></div>
     <div class="mt-4 grid gap-2 md:grid-cols-2 xl:grid-cols-[1fr_1fr_1fr_1fr_auto]"><label class="text-xs font-bold uppercase text-[var(--muted)]">Profile<select class="field mt-1" bind:value={profileFilter} onchange={changeFilter}><option value="">Semua profile</option>{#each profileOptions as item}<option value={item.name}>{profileOptionLabel(item)}</option>{/each}</select></label><label class="text-xs font-bold uppercase text-[var(--muted)]">Worker / VPS<select class="field mt-1" bind:value={workerFilter} onchange={changeFilter}><option value="">Semua worker</option>{#each workerOptions as value}<option value={value}>{value}</option>{/each}</select></label><label class="text-xs font-bold uppercase text-[var(--muted)]">Label<input class="field mt-1" bind:value={labelFilter} onchange={changeFilter} placeholder="Cari label"/></label><label class="text-xs font-bold uppercase text-[var(--muted)]">Referensi chat<input class="field mt-1" bind:value={chatRefFilter} onchange={changeFilter} placeholder="@username, link, ID, atau telepon"/></label><button class="button secondary self-end" onclick={selectAll} disabled={pending||syncing||!selectable.length}><CheckSquare size={15}/>{allVisibleSelected?'Clear selection':'Select all'}</button></div>
   </div>
   {#if selected.length}<div class="flex flex-wrap items-center gap-2 border-b border-[var(--line)] bg-violet-50 p-3 dark:bg-violet-950"><b class="mr-auto text-sm">{selected.length} artifact dipilih</b><button class="button" onclick={() => start(selected)} disabled={pending||syncing}><Download size={15}/>Mulai terpilih</button><button class="button secondary" onclick={() => start(selected,'next')} disabled={pending||syncing}><FastForward size={15}/>Berikutnya</button><button class="button danger" onclick={() => confirm='delete'} disabled={pending||syncing}><Trash2 size={15}/>Hapus terpilih</button></div>{/if}

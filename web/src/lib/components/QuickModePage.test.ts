@@ -13,7 +13,46 @@ const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles
 describe('QuickModePage', () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  async function flushPromises() {
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  }
+
+  it('refreshes Quick Mode statistics and limits manually while idle', async () => {
+    vi.useFakeTimers();
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
+      if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/jobs') || url.includes('/quick-mode/limits') || url.includes('/quick-mode/staging')) {
+        return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(QuickModePage);
+    await flushPromises();
+    const statsQuery = '/jobs?limit=200&scope=global&kind=export&quick_mode=true&archived=false';
+    const statsInitial = calls.filter((url) => url.includes(statsQuery)).length;
+    const limitsInitial = calls.filter((url) => url.endsWith('/quick-mode/limits')).length;
+    expect(statsInitial).toBe(1);
+    expect(limitsInitial).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(calls.filter((url) => url.includes(statsQuery))).toHaveLength(statsInitial);
+    expect(calls.filter((url) => url.endsWith('/quick-mode/limits'))).toHaveLength(limitsInitial);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh statistik Quick Mode' }));
+    await flushPromises();
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh batas Quick Mode' }));
+    await flushPromises();
+    expect(calls.filter((url) => url.includes(statsQuery))).toHaveLength(statsInitial + 1);
+    expect(calls.filter((url) => url.endsWith('/quick-mode/limits'))).toHaveLength(limitsInitial + 1);
   });
 
   it('creates a job from Profile Quick Mode readiness without manual verification', async () => {

@@ -46,8 +46,9 @@
   let filterStatus = $state('');
   let lastStatsRefreshed = $state<Date | null>(null);
   let lastStagingRefreshed = $state<Date | null>(null);
-  let mounted = false;
   let lastProfile = '';
+  let quickLimitsLoading = $state(false);
+  let lastQuickLimitsRefreshed = $state<Date | null>(null);
 
   const activeStatuses = ['queued', 'dispatched', 'running', 'paused'];
   const statuses = ['failed', 'cancelled', 'succeeded'];
@@ -134,9 +135,11 @@
   }
 
   async function loadQuickLimits() {
+    quickLimitsLoading = true;
     try {
       const response = await api<{items: {worker: string; max_concurrent: number; active: number; queued: number}[]}>('/quick-mode/limits');
       quickLimits = response.items || [];
+      lastQuickLimitsRefreshed = new Date();
       const drafts = { ...quickLimitDrafts };
       for (const item of quickLimits) {
         if (drafts[item.worker] === undefined || !quickLimitSaving[item.worker]) {
@@ -146,6 +149,8 @@
       quickLimitDrafts = drafts;
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Batas Quick Mode tidak dapat dimuat.';
+    } finally {
+      quickLimitsLoading = false;
     }
   }
 
@@ -360,7 +365,7 @@
       await post('/exports', payload);
       beginCooldown();
       message = 'Quick Mode berhasil masuk antrean.';
-      await loadStats();
+      await Promise.all([loadStats(), loadQuickLimits()]);
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Quick Mode gagal dibuat.';
       if (cooldownTimer) clearTimeout(cooldownTimer);
@@ -382,17 +387,13 @@
   });
 
   onMount(() => {
-    mounted = true;
     loadSources(targetProfile);
     loadStats();
     loadQuickLimits();
-    const monitorTimer = setInterval(() => { loadStats(); loadQuickLimits(); }, 2500);
-    const jobFinished = () => { loadStats(); loadStaging(); };
+    const jobFinished = () => { void Promise.all([loadStats(), loadQuickLimits(), loadStaging()]); };
     window.addEventListener('tme3:job-finished', jobFinished);
     return () => {
-      mounted = false;
       if (cooldownTimer) clearTimeout(cooldownTimer);
-      clearInterval(monitorTimer);
       window.removeEventListener('tme3:job-finished', jobFinished);
     };
   });
@@ -404,7 +405,7 @@
 </header>
 
 <section class="card mt-6 p-4 sm:p-5">
-  <div class="mb-4"><p class="eyebrow">WORKER CONCURRENCY</p><h2 class="mt-1 text-lg font-extrabold">Batas job Quick Mode bersamaan</h2><p class="muted mt-1 text-sm">Batas berlaku untuk semua profile pada worker yang sama. Job yang di-resume masuk antrean FIFO.</p></div>
+  <div class="mb-4 flex flex-wrap items-end justify-between gap-3"><div><p class="eyebrow">WORKER CONCURRENCY</p><h2 class="mt-1 text-lg font-extrabold">Batas job Quick Mode bersamaan</h2><p class="muted mt-1 text-sm">Batas berlaku untuk semua profile pada worker yang sama. Job yang di-resume masuk antrean FIFO.</p>{#if lastQuickLimitsRefreshed}<p class="muted mt-1 text-xs">Terakhir diperbarui: {formatClock(lastQuickLimitsRefreshed)}</p>{/if}</div><button class="button secondary" onclick={() => { void loadQuickLimits(); }} disabled={quickLimitsLoading} aria-label="Refresh batas Quick Mode"><RefreshCw size={15} class={quickLimitsLoading ? 'animate-spin' : ''}/>Refresh batas</button></div>
   {#if quickLimits.length}
     <div class="grid gap-3 lg:grid-cols-2">
       {#each quickLimits as item (item.worker)}

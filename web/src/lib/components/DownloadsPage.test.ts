@@ -6,7 +6,48 @@ import { session } from '$lib/session.svelte';
 describe('DownloadsPage profile filter', () => {
   afterEach(() => {
     cleanup();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
+  });
+
+  async function flushPromises() {
+    for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  }
+
+  it('keeps artifact and profile catalogs manual while idle', async () => {
+    vi.useFakeTimers();
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles: [{ name: 'default', workers: ['local'], exclusive_worker: 'local' }]
+      }), { status: 200 });
+      if (url.includes('/downloads/artifacts?')) return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      if (url.includes('/jobs')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    await session.restore();
+    render(DownloadsPage);
+    await flushPromises();
+    const profileInitial = requests.filter((url) => url.endsWith('/profiles/local')).length;
+    const artifactsInitial = requests.filter((url) => url.includes('/downloads/artifacts?')).length;
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(requests.filter((url) => url.endsWith('/profiles/local'))).toHaveLength(profileInitial);
+    expect(requests.filter((url) => url.includes('/downloads/artifacts?'))).toHaveLength(artifactsInitial);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh katalog unduhan' }));
+    await flushPromises();
+    expect(requests.filter((url) => url.endsWith('/profiles/local'))).toHaveLength(profileInitial + 1);
+    expect(requests.filter((url) => url.includes('/downloads/artifacts?'))).toHaveLength(artifactsInitial + 2);
   });
 
   it('offers only verified catalog profiles and reloads with the selected catalog value', async () => {

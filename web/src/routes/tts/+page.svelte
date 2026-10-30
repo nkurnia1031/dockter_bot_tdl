@@ -32,7 +32,6 @@
   let submitting = $state(false);
   let error = $state('');
   let notice = $state('');
-  let readinessTimer: ReturnType<typeof setInterval> | undefined;
   const maxChars = 100_000;
   const readyWorkers = $derived(workers.filter((item) => item.ready));
   const workerReason = (code: string) => ({
@@ -72,7 +71,7 @@
   async function refreshWorkers() {
     if (workersRefreshing) return;
     workersRefreshing = true;
-    await loadWorkers();
+    await Promise.all([loadWorkers(), loadChatStatus()]);
   }
 
   async function loadChatStatus() {
@@ -138,13 +137,9 @@
 
   onMount(() => {
     void Promise.all([loadWorkers(), loadChatStatus()]);
-    readinessTimer = setInterval(() => {
-      if (document.visibilityState === 'visible') void loadWorkers();
-    }, 15000);
     const onJobFinished = () => { void loadWorkers(); };
     window.addEventListener('tme3:job-finished', onJobFinished);
     return () => {
-      if (readinessTimer !== undefined) clearInterval(readinessTimer);
       window.removeEventListener('tme3:job-finished', onJobFinished);
     };
   });
