@@ -1492,7 +1492,19 @@ class BackendApiTests(unittest.TestCase):
         self.local_profile_catalog.replace_scan(
             checked_at=checked_at,
             workers=[{"name": "local", "status": "success", "checked_at": checked_at}],
-            inventories=[{"worker": "local", "checked_at": checked_at, "items": [{"name": "default"}]}],
+            inventories=[{
+                "worker": "local",
+                "checked_at": checked_at,
+                "items": [{
+                    "name": "default",
+                    "ready": True,
+                    "reason_codes": [],
+                    "checks": [
+                        {"name": name, "ready": True, "code": "OK"}
+                        for name in ("identity", "root_session", "user1_session")
+                    ],
+                }],
+            }],
         )
         self.dispatcher.profile_local_inventory = lambda _worker: self.fail(
             "targeted Storage scan must not read the worker's full profile inventory"
@@ -1533,13 +1545,6 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "export")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "download")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["checked_at"], checked_at)
-        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
-            "name": "default", "ready": True, "reason_codes": [],
-            "checks": [
-                {"name": name, "ready": True, "code": "OK"}
-                for name in ("identity", "root_session", "user1_session")
-            ],
-        }]}
         public = self.client.get("/api/v1/profiles/local", headers=auth)
         self.assertEqual(public.status_code, 200, public.text)
         self.assertNotIn("a" * 64, public.text)
