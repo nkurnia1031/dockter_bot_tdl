@@ -98,6 +98,14 @@ _Avoid_: status online worker, verifikasi setiap job.
 Operasi eksplisit yang memeriksa service worker dan menguji lane profil melalui canary terisolasi. Hasil disimpan per worker, profil, service, lane, dan tujuan; pesan canary dihapus setelah verifikasi, sedangkan kegagalan cleanup ditampilkan terpisah dari kesiapan lane.
 _Avoid_: scan read-only, satu status global semua worker.
 
+**Scan terpilih**:
+Scan kesiapan profil yang hanya memeriksa satu service worker atau satu lane/service pada profil-worker yang dipilih operator, beserta dependency langsungnya. Sel readiness lain dan waktu pemeriksaannya tetap tersimpan.
+_Avoid_: scan parsial otomatis, scan semua worker.
+
+**Scan penuh**:
+Scan kesiapan profil eksplisit yang memeriksa semua worker aktif, profil lokal, service, dan lane.
+_Avoid_: scan otomatis, refresh readiness berkala.
+
 **Kesiapan lane**:
 Bukti bahwa lane Export, Download, atau Upload pada satu profil-worker berhasil melewati canary-nya. Kesiapan Download dicatat setelah kecepatan transfer terlihat lalu job canary dibatalkan; pembatalan itu tidak membatalkan hasil lane lain.
 _Avoid_: satu kesiapan gabungan profil, hasil job fitur lain.
