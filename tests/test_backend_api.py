@@ -1980,6 +1980,8 @@ class BackendApiTests(unittest.TestCase):
 
     def test_safelink_disabled_gate_blocks_direct_and_durable_submissions(self):
         self.context.config.safelink_resolver_enabled = False
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
         client = TestClient(create_backend_app(self.context))
         auth = self.login(42)
         before = self.jobs.list(profile="default", limit=20)

@@ -656,7 +656,7 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertFalse(result["items"][0]["retryable"])
         self.assertEqual(result["items"][0]["match_count"], 1)
 
-    def test_reconciliation_duplicate_filenames_require_exact_match_count(self):
+    def test_reconciliation_matches_each_filename_independently_of_caption(self):
         uploader, _upload_result, _source_items, command, _store = self._prepare_reconcile(
             ["one.txt", "two.txt"],
             [{"id": 7, "file_name": "one.txt", "caption": "same exact caption"}],
@@ -677,8 +677,11 @@ class StorageUploadBatchTests(unittest.TestCase):
             caption_override=True,
         )
         result = uploader._storage_reconcile(command)
-        self.assertTrue(all(item["status"] == "succeeded" for item in result["items"]))
-        self.assertTrue(all(item["match_count"] == 2 for item in result["items"]))
+        by_name = {item["name"]: item for item in result["items"]}
+        self.assertEqual(by_name["one.txt"]["status"], "succeeded")
+        self.assertEqual(by_name["two.txt"]["status"], "succeeded")
+        self.assertEqual(by_name["one.txt"]["match_count"], 1)
+        self.assertEqual(by_name["two.txt"]["match_count"], 1)
 
     def test_reconciliation_export_failure_and_incomplete_restart_stay_ambiguous(self):
         uploader, _upload_result, _source_items, command, store = self._prepare_reconcile(
