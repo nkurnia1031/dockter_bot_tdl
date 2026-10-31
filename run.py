@@ -62,7 +62,7 @@ Commands:
 
 Notes:
   - Data lives in PROFILE_ROOT mounted to /data.
-  - Worker deploys include TTS helpers. Resolver is disabled and excluded from every deployment path.
+  - Gateway and worker deploys include TTS helpers. Resolver is disabled and excluded from every deployment path.
   - update/down will not remove .tdl, download, exports, or state.json.
   - Builds prefer the host tdl binary and use a fixed fallback when unavailable.
   - cleanup keeps tagged images and images used by containers.

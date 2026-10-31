@@ -36,19 +36,30 @@ profile aktif; bot token tidak dipakai untuk delivery TTS.
 
 ## Aktifkan helper TTS pada worker
 
-Gateway saat ini tidak menjalankan helper TTS lokal. Aktifkan helper pada VPS
-worker terpisah dengan deployment berikut:
+Stack gateway dan worker menjalankan tiga helper TTS pada jaringan Compose
+internal masing-masing. `worker-local` memakai nama layanan `tts-1`, `tts-2`,
+dan `tts-3` secara default; worker remote memakai nama layanan yang sama pada
+stack remote-nya. Jangan mengisi `TTS_HELPER_URLS` dengan string kosong karena
+nilai kosong menimpa URL default dan membuat seluruh slot dilaporkan tidak
+terjangkau.
+
+Deploy gateway dengan:
+
+```bash
+python3 run.py deploy gateway --pull
+```
+
+Deploy worker remote dengan:
 
 ```bash
 python3 run.py deploy worker --pull
 ```
 
-Gunakan perintah worker hanya pada host yang env worker-nya memiliki konfigurasi
-helper dan volume data TTS. Deployment menjalankan tiga container helper
-beserta Tor. Hanya HTTP helper yang tersedia di jaringan internal Compose;
-control port Tor tetap loopback di dalam setiap helper dan tidak diekspos ke
-container lain atau port publik host. Jalur Tor memakai circuit terpisah
-sebagai upaya terbaik; alamat IP keluarnya tidak diperiksa atau dijamin berbeda.
+Kedua deployment menjalankan tiga container helper beserta Tor. Hanya HTTP
+helper yang tersedia di jaringan internal Compose; control port Tor tetap
+loopback di dalam setiap helper dan tidak diekspos ke container lain atau port
+publik host. Jalur Tor memakai circuit terpisah sebagai upaya terbaik; alamat
+IP keluarnya tidak diperiksa atau dijamin berbeda.
 
 Worker baru melaporkan capability `tts` setelah ketiga helper merespons
 `/readyz`. Gateway mengirim job hanya ke worker dengan capability itu. Job
@@ -70,5 +81,5 @@ pada container Telegram.
    dibersihkan dari volume worker. Jika job gagal, buka log job dan gunakan
    Retry setelah penyebabnya diperbaiki.
 
-Setelah satu worker berhasil diuji, aktifkan profile `tts` dan helper pada
-worker lain satu per satu. Job yang dibuat tetap melekat ke worker asalnya.
+Setelah satu worker berhasil diuji, readiness TTS berlaku hanya pada worker
+yang lolos probe dan canary. Job yang dibuat tetap melekat ke worker asalnya.
