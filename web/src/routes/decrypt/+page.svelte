@@ -47,6 +47,8 @@
   let resolverNotice = $state('');
   let resolverBusy = $state(false);
   let resolverCopied = $state(false);
+  let resolverEnabled = $state(false);
+  let resolverStatusError = $state('');
   let resolverJobs = $state<Record<string, any>[]>([]);
   let resolverWorkers = $state<Record<string, any>[]>([]);
   let selectedResolverWorker = $state('');
@@ -256,7 +258,6 @@
     resolverTimer = window.setTimeout(() => {
       resolverTimer = undefined;
       void loadResolverJobs();
-      void loadResolverWorkers();
     }, 2500);
   }
 
@@ -285,6 +286,7 @@
   }
 
   async function loadResolverWorkers() {
+    if (!resolverEnabled) return;
     try {
       const result = await api<{ items?: Record<string, any>[] }>('/safelink/workers');
       resolverWorkers = Array.isArray(result.items) ? result.items : [];
@@ -295,10 +297,33 @@
     }
   }
 
+  async function loadResolverStatus() {
+    try {
+      const status = await api<{ enabled?: boolean }>('/safelink/status');
+      resolverEnabled = status.enabled === true;
+      resolverStatusError = '';
+      if (resolverEnabled) {
+        void loadResolverWorkers();
+      } else {
+        resolverWorkers = [];
+        resolverWorkerError = '';
+      }
+    } catch {
+      resolverEnabled = false;
+      resolverWorkers = [];
+      resolverWorkerError = '';
+      resolverStatusError = 'Status Resolver tidak dapat dimuat; pengiriman dinonaktifkan sementara.';
+    }
+  }
+
   async function resolveShortlink() {
     resolverError = '';
     resolverNotice = '';
     resolverCopied = false;
+    if (!resolverEnabled) {
+      resolverError = 'Resolver dinonaktifkan sementara.';
+      return;
+    }
     if (!shortlink.trim()) {
       resolverError = 'Tempel URL shortlink terlebih dahulu.';
       return;
@@ -328,6 +353,10 @@
 
   async function resolverAction(job: Record<string, any>, action: 'cancel' | 'retry') {
     resolverError = '';
+    if (action === 'retry' && !resolverEnabled) {
+      resolverError = 'Resolver dinonaktifkan sementara.';
+      return;
+    }
     try {
       await api(`/safelink/jobs/${encodeURIComponent(String(job.id))}/${action}`, {
         method: 'POST',
@@ -355,10 +384,10 @@
 
   onMount(() => {
     resolverMounted = true;
-    const refresh = () => { void loadResolverJobs(); void loadResolverWorkers(); void loadDecryptHistory(); };
+    const refresh = () => { void loadResolverJobs(); void loadResolverStatus(); void loadDecryptHistory(); };
     window.addEventListener('tme3:data-mutated', refresh);
     void loadResolverJobs();
-    void loadResolverWorkers();
+    void loadResolverStatus();
     void loadDecryptHistory();
     return () => {
       resolverMounted = false;
@@ -512,35 +541,41 @@
     <div>
       <p class="eyebrow">JOB WORKER</p>
       <h2 id="resolver-title" class="mt-1 font-extrabold">Resolver shortlink</h2>
-      <p class="muted mt-1 max-w-2xl text-sm">Ikuti langkah shortlink pndk.to atau go.fakta.id di browser worker. Fitur ini hanya mencari URL tujuan dan tidak mengunduh file.</p>
+      <p class="muted mt-1 max-w-2xl text-sm">{resolverEnabled ? 'Ikuti langkah shortlink pndk.to atau go.fakta.id di browser worker. Fitur ini hanya mencari URL tujuan dan tidak mengunduh file.' : 'Lihat job Resolver yang sudah ada; hasil dan riwayatnya tetap tersimpan.'}</p>
     </div>
-    <button class="button secondary" type="button" onclick={() => { void loadResolverJobs(); void loadResolverWorkers(); }} disabled={resolverRequestActive}><RefreshCw size={15} class={resolverRequestActive ? 'animate-spin' : ''}/>Refresh job</button>
+    <button class="button secondary" type="button" onclick={() => { void loadResolverJobs(); void loadResolverStatus(); }} disabled={resolverRequestActive}><RefreshCw size={15} class={resolverRequestActive ? 'animate-spin' : ''}/>Refresh job</button>
   </div>
 
-  <label class="mt-4 block text-sm font-bold" for="shortlink-input">URL shortlink</label>
-  <textarea
-    id="shortlink-input"
-    class="field mt-2 min-h-24 resize-y font-mono text-sm leading-6"
-    bind:value={shortlink}
-    maxlength="2048"
-    placeholder="https://pndk.to/... atau https://go.fakta.id/..."
-    spellcheck="false"
-    autocomplete="off"
-    autocapitalize="off"
-  ></textarea>
-  <label class="mt-4 block text-sm font-bold" for="resolver-worker">Worker</label>
-  <select id="resolver-worker" class="field mt-2" bind:value={selectedResolverWorker}>
-    <option value="">Auto · antrean terpendek</option>
-    {#each resolverWorkers as worker (worker.name)}
-      {@const statusLabel = worker.status === 'ready' ? 'siap' : worker.status === 'offline' ? 'offline' : worker.status === 'disabled' ? 'nonaktif' : worker.status === 'not_ready' ? 'tidak siap' : 'belum dipindai'}
-      <option value={worker.name}>{worker.name} · {statusLabel} · antrean {worker.queued_jobs ?? 0}</option>
-    {/each}
-  </select>
-  {#if resolverWorkerError}<p class="muted mt-2 text-xs" role="status">{resolverWorkerError}</p>{/if}
-  <div class="mt-3 flex flex-wrap items-center gap-2">
-    <button class="button" type="button" onclick={resolveShortlink} disabled={resolverBusy}><Link size={16} class={resolverBusy ? 'animate-pulse' : ''}/>{resolverBusy ? 'Mengirim…' : 'Resolve'}</button>
-    <span class="muted text-xs">Input dibatasi ke domain yang didukung; URL tidak ditampilkan di log job.</span>
-  </div>
+  {#if resolverEnabled}
+    <label class="mt-4 block text-sm font-bold" for="shortlink-input">URL shortlink</label>
+    <textarea
+      id="shortlink-input"
+      class="field mt-2 min-h-24 resize-y font-mono text-sm leading-6"
+      bind:value={shortlink}
+      maxlength="2048"
+      placeholder="https://pndk.to/... atau https://go.fakta.id/..."
+      spellcheck="false"
+      autocomplete="off"
+      autocapitalize="off"
+    ></textarea>
+    <label class="mt-4 block text-sm font-bold" for="resolver-worker">Worker</label>
+    <select id="resolver-worker" class="field mt-2" bind:value={selectedResolverWorker}>
+      <option value="">Auto · antrean terpendek</option>
+      {#each resolverWorkers as worker (worker.name)}
+        {@const statusLabel = worker.status === 'ready' ? 'siap' : worker.status === 'offline' ? 'offline' : worker.status === 'disabled' ? 'nonaktif' : worker.status === 'not_ready' ? 'tidak siap' : 'belum dipindai'}
+        <option value={worker.name}>{worker.name} · {statusLabel} · antrean {worker.queued_jobs ?? 0}</option>
+      {/each}
+    </select>
+    {#if resolverWorkerError}<p class="muted mt-2 text-xs" role="status">{resolverWorkerError}</p>{/if}
+    <div class="mt-3 flex flex-wrap items-center gap-2">
+      <button class="button" type="button" onclick={resolveShortlink} disabled={resolverBusy}><Link size={16} class={resolverBusy ? 'animate-pulse' : ''}/>{resolverBusy ? 'Mengirim…' : 'Resolve'}</button>
+      <span class="muted text-xs">Input dibatasi ke domain yang didukung; URL tidak ditampilkan di log job.</span>
+    </div>
+  {:else}
+    <p class="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100" role="status">
+      {resolverStatusError || 'Resolver dinonaktifkan sementara. Job dan hasil sebelumnya tetap tersedia di bawah.'}
+    </p>
+  {/if}
 
   {#if resolverError}<p class="mt-4 rounded-xl border border-rose-300 bg-rose-50 p-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950/50 dark:text-rose-200" role="alert">{resolverError}</p>{/if}
   {#if resolverNotice}<p class="mt-4 flex items-center gap-2 text-sm text-emerald-700 dark:text-emerald-300" role="status"><Check size={16}/>{resolverNotice}</p>{/if}
@@ -581,7 +616,7 @@
             {#if job.error?.message}<p class="mt-2 text-sm text-rose-700 dark:text-rose-300">{job.error.message}</p>{/if}
             <div class="mt-3 flex flex-wrap gap-2">
               {#if active}<button class="button danger" type="button" onclick={() => resolverAction(job, 'cancel')}><XCircle size={14}/>Batalkan</button>{/if}
-              {#if ['failed','cancelled'].includes(String(job.status))}<button class="button secondary" type="button" onclick={() => resolverAction(job, 'retry')}><RefreshCw size={14}/>Coba lagi</button>{/if}
+              {#if resolverEnabled && ['failed','cancelled'].includes(String(job.status))}<button class="button secondary" type="button" onclick={() => resolverAction(job, 'retry')}><RefreshCw size={14}/>Coba lagi</button>{/if}
             </div>
           </article>
         {/each}

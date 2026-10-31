@@ -52,6 +52,25 @@ class ProfileTests(unittest.TestCase):
             log_level="INFO",
         )
 
+    def test_safelink_resolver_feature_switch_defaults_off_and_accepts_true(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_ROLE": "worker"}, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            disabled = AppConfig.from_env()
+        self.assertFalse(disabled.safelink_resolver_enabled)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ROLE": "worker", "SAFELINK_RESOLVER_ENABLED": "true"},
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            enabled = AppConfig.from_env()
+        self.assertTrue(enabled.safelink_resolver_enabled)
+
     def test_legacy_tdl_user_environment_variables_are_ignored(self) -> None:
         with (
             patch.dict(

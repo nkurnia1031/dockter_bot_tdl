@@ -1210,7 +1210,10 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     )
 
 
-    from tme3bot.api.routes.safelink import register_safelink
+    from tme3bot.api.routes.safelink import (
+        register_safelink,
+        require_safelink_resolver_enabled,
+    )
     register_safelink(
         app,
         context,
@@ -1278,6 +1281,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         register_profile_local_delete,
     )
     operations = context.operation_service
+
+    def guard_operation_retry(operation):
+        job = context.control_plane.jobs.get(str(operation.job_id or ""))
+        if job is not None and job.kind == "safelink_resolve":
+            require_safelink_resolver_enabled(context)
+
     if (
         operations is not None
         and context.queue_publisher is not None
@@ -1291,6 +1300,8 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
         def prepare_background_job(actor, target, input_data):
             job_kind = str(input_data.get("job_kind") or "").strip().lower()
+            if job_kind == "safelink_resolve":
+                require_safelink_resolver_enabled(context)
             if job_kind == "tts":
                 settings = (
                     context.runtime_settings.get()
@@ -1372,6 +1383,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             if context.profile_provisioner is not None
             else None
         ),
+        retry_guard=guard_operation_retry,
     )
     from tme3bot.api.routes.activity import register_activity
     register_activity(

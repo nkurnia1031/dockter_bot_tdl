@@ -101,6 +101,7 @@ class AppConfig:
     tts_retry_base_seconds: float = 2.0
     tts_newnym_after_retries: int = 3
     telegram_tts_chat_id: str = ""
+    safelink_resolver_enabled: bool = False
 
     def validate_runtime(self) -> None:
         """Fail fast when a production role is missing its trust boundary."""
@@ -366,6 +367,10 @@ class AppConfig:
             tts_retry_base_seconds=max(0.1, float(os.getenv("TTS_RETRY_BASE_SECONDS", "2"))),
             tts_newnym_after_retries=max(1, int(os.getenv("TTS_NEWNYM_AFTER_RETRIES", "3"))),
             telegram_tts_chat_id=os.getenv("TELEGRAM_TTS_CHAT_ID", "").strip(),
+            safelink_resolver_enabled=(
+                os.getenv("SAFELINK_RESOLVER_ENABLED", "false").strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
         )
 
 

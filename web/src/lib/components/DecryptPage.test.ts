@@ -71,6 +71,39 @@ describe('Decrypt page shortlink resolver', () => {
     expect(screen.getByText('Hasil dekripsi dimuat dari riwayat.')).toBeTruthy();
   });
 
+  it('keeps resolver history visible while the feature is disabled', async () => {
+    const requests: string[] = [];
+    const destination = 'https://files.example.test/previous-resolver-result.zip';
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const path = String(input);
+      requests.push(path);
+      if (path.includes('/safelink/status')) {
+        return new Response(JSON.stringify({ enabled: false }), { status: 200 });
+      }
+      if (path.includes('/jobs?kind=safelink_resolve')) {
+        return new Response(JSON.stringify({ items: [{
+          id: 'resolver-job-existing',
+          status: 'succeeded',
+          worker: 'remote-1',
+          result: { destination_url: destination }
+        }] }), { status: 200 });
+      }
+      if (path.includes('/decrypt/history')) {
+        return new Response(JSON.stringify({ items: [], total: 0, next_offset: null }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+    render(DecryptPage);
+
+    expect(await screen.findByText('Resolver dinonaktifkan sementara. Job dan hasil sebelumnya tetap tersedia di bawah.')).toBeTruthy();
+    expect(await screen.findByText('#resolver')).toBeTruthy();
+    expect(await screen.findByText('remote-1')).toBeTruthy();
+    expect(screen.queryByLabelText('URL shortlink')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Resolve' })).toBeNull();
+    expect(requests.some((path) => path.includes('/safelink/workers'))).toBe(false);
+    expect(await screen.findByRole('link', { name: destination })).toBeTruthy();
+  });
+
   it('submits a shortlink job, restores its result from job history, and does not open it', async () => {
     const shortlink = 'https://pndk.to/opaque-code';
     const destination = 'https://files.example.test/book.zip';
@@ -81,6 +114,9 @@ describe('Decrypt page shortlink resolver', () => {
       const method = (init?.method || 'GET').toUpperCase();
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined;
       requests.push({ path, method, body });
+      if (path.endsWith('/safelink/status')) {
+        return new Response(JSON.stringify({ enabled: true }), { status: 200 });
+      }
       if (path.includes('/jobs?kind=safelink_resolve')) {
         historyLoads += 1;
         return new Response(JSON.stringify({ items: historyLoads === 1 ? [] : [{

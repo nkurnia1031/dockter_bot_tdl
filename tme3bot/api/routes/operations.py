@@ -13,7 +13,14 @@ from tme3bot.api.schemas import (
 from tme3bot.domain.models import DomainError
 
 
-def register_operations(app, operations, *, current_actor, profile_sync_store=None) -> None:
+def register_operations(
+    app,
+    operations,
+    *,
+    current_actor,
+    profile_sync_store=None,
+    retry_guard=None,
+) -> None:
     def _require_operations():
         if operations is None:
             raise DomainError(
@@ -132,7 +139,11 @@ def register_operations(app, operations, *, current_actor, profile_sync_store=No
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
     ):
-        operation, _ = _require_operations().retry(actor, operation_id, idempotency_key)
+        service = _require_operations()
+        current = service.get(actor, operation_id)
+        if callable(retry_guard):
+            retry_guard(current)
+        operation, _ = service.retry(actor, operation_id, idempotency_key)
         return _public(operation, status_url=f"/api/v1/operations/{operation_id}")
 
     @app.put("/api/v1/operations/{operation_id}/visibility", response_model=OperationResponse)

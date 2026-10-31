@@ -558,6 +558,7 @@ class BackendApiTests(unittest.TestCase):
                 "web_cookie_secret": "w" * 48,
                 "web_cookie_secure": False,
                 "web_public_origin": "",
+                "safelink_resolver_enabled": True,
             },
         )()
         runtime_settings = BackendRuntimeSettings(
@@ -1976,6 +1977,80 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(completed.progress["identity_mapping_status"], "local_copy_remaining")
         self.assertEqual(self.profiles.profile_registry.profile_for_user(902), "archive")
         self.assertEqual(self.profiles.profile_registry.pending_identity_cleanups(), [])
+
+    def test_safelink_disabled_gate_blocks_direct_and_durable_submissions(self):
+        self.context.config.safelink_resolver_enabled = False
+        client = TestClient(create_backend_app(self.context))
+        auth = self.login(42)
+        before = self.jobs.list(profile="default", limit=20)
+
+        status = client.get("/api/v1/safelink/status", headers=auth)
+        workers = client.get("/api/v1/safelink/workers", headers=auth)
+        direct = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-disabled-direct"},
+            json={"url": "https://pndk.to/private-disabled-link"},
+        )
+        durable = client.post(
+            "/api/v1/operations",
+            headers={**auth, "Idempotency-Key": "safelink-disabled-operation"},
+            json={
+                "kind": "job.submit",
+                "target": {"profile": "default", "worker": "local"},
+                "input": {
+                    "job_kind": "safelink_resolve",
+                    "payload": {"url": "https://pndk.to/private-disabled-operation"},
+                },
+            },
+        )
+
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json(), {"enabled": False})
+        self.assertEqual(workers.status_code, 200)
+        self.assertEqual(workers.json(), {"items": []})
+        for response in (direct, durable):
+            self.assertEqual(response.status_code, 503, response.text)
+            self.assertEqual(response.json()["error"]["code"], "SAFELINK_RESOLVER_DISABLED")
+            self.assertNotIn("private-disabled", response.text)
+        self.assertEqual(self.jobs.list(profile="default", limit=20), before)
+
+    def test_safelink_operation_retry_is_blocked_when_disabled(self):
+        self.context.config.safelink_resolver_enabled = True
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        self.seed_resolver_readiness()
+        self.control.add_event_observer(self.operation_service.on_job_event)
+        client = TestClient(create_backend_app(self.context))
+        auth = self.login(42)
+
+        submitted = client.post(
+            "/api/v1/safelink/jobs",
+            headers={**auth, "Idempotency-Key": "safelink-retry-gate-submit"},
+            json={"url": "https://pndk.to/retry-after-disable"},
+        )
+        self.assertEqual(submitted.status_code, 202, submitted.text)
+        job_id = submitted.json()["id"]
+        failed = JobEvent(
+            job_id=job_id,
+            sequence=1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={"code": "RESOLVER_FAILED", "message": "Resolver gagal."},
+        )
+        self.jobs.append_event(failed)
+        self.operation_service.on_job_event(failed)
+        operation = self.operation_service.store.get_by_job_id(job_id)
+        self.assertEqual(operation.status.value, "failed")
+
+        self.context.config.safelink_resolver_enabled = False
+        retry = client.post(
+            f"/api/v1/operations/{operation.id}/retry",
+            headers={**auth, "Idempotency-Key": "safelink-retry-gate-disabled"},
+        )
+
+        self.assertEqual(retry.status_code, 503, retry.text)
+        self.assertEqual(retry.json()["error"]["code"], "SAFELINK_RESOLVER_DISABLED")
+        self.assertEqual(self.operation_service.store.get_by_job_id(job_id).status.value, "failed")
 
     def test_safelink_submit_is_persisted_and_does_not_echo_input_url(self):
         self.context.queue_publisher = object()
