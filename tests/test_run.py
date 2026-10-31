@@ -46,14 +46,6 @@ class RunScriptTests(unittest.TestCase):
             )
         inspect.assert_called_once_with("ghcr.io/example/gateway:abc123", {})
 
-    def test_resolver_addon_image_follows_worker_package_without_extra_env(self):
-        self.assertEqual(
-            run.resolver_addon_image_name(
-                {"WORKER_IMAGE_NAME": "ghcr.io/example/tme3bot-worker"}
-            ),
-            "ghcr.io/example/tme3bot-resolver",
-        )
-
     def test_gateway_data_root_is_accepted_by_preflight_helpers(self) -> None:
         self.assertEqual(run.data_root_value({"GATEWAY_DATA_ROOT": "/srv/gateway"}), "/srv/gateway")
 
@@ -67,31 +59,32 @@ class RunScriptTests(unittest.TestCase):
         self.assertNotIn("docker-compose.resolver.yml", command)
         self.assertNotIn("docker-compose.resolver-gateway.yml", command)
 
-    def test_resolver_addon_is_included_only_when_feature_is_enabled(self) -> None:
-        disabled_files = run.compose_files_for_target("worker", {})
-        enabled_files = run.compose_files_for_target(
-            "worker", {"SAFELINK_RESOLVER_ENABLED": "true"}
-        )
-        self.assertEqual(disabled_files.split(run.os.pathsep), ["docker-compose.worker.yml"])
+    def test_resolver_never_enters_worker_deploy_even_with_legacy_settings(self) -> None:
+        env = {
+            "COMPOSE_FILE": run.os.pathsep.join(
+                [
+                    "docker-compose.worker.yml",
+                    "docker-compose.resolver.yml",
+                    "docker-compose.resolver-gateway.yml",
+                ]
+            ),
+            "SAFELINK_RESOLVER_ENABLED": "true",
+        }
         self.assertEqual(
-            enabled_files.split(run.os.pathsep),
-            ["docker-compose.worker.yml", "docker-compose.resolver.yml"],
+            run.compose_files_for_target("worker", env).split(run.os.pathsep),
+            ["docker-compose.worker.yml"],
         )
-        default_images = run.image_names_for_release({"WORKER_IMAGE_NAME": "worker"})
-        enabled_images = run.image_names_for_release({
-            "WORKER_IMAGE_NAME": "worker",
-            "SAFELINK_RESOLVER_ENABLED": "true",
-        })
-        self.assertNotIn(run.resolver_addon_image_name({"WORKER_IMAGE_NAME": "worker"}), default_images)
-        self.assertIn(
-            run.resolver_addon_image_name({"WORKER_IMAGE_NAME": "worker"}),
-            enabled_images,
+        command = run.compose_base_command(env)
+        self.assertIn("docker-compose.worker.yml", command)
+        self.assertNotIn("docker-compose.resolver.yml", command)
+        self.assertNotIn("docker-compose.resolver-gateway.yml", command)
+        self.assertEqual(
+            run.image_names_for_release({
+                "WORKER_IMAGE_NAME": "worker",
+                "SAFELINK_RESOLVER_ENABLED": "true",
+            }),
+            ["tme3bot-gateway", "worker"],
         )
-        command = run.compose_base_command({
-            "COMPOSE_FILE": "docker-compose.worker.yml",
-            "SAFELINK_RESOLVER_ENABLED": "true",
-        })
-        self.assertIn("docker-compose.resolver.yml", command)
 
     def test_cleanup_prunes_only_dangling_images(self) -> None:
         env = {"DOCKER_CMD": "docker"}
@@ -247,7 +240,7 @@ class RunScriptTests(unittest.TestCase):
             ["docker-compose.worker.yml"],
         )
 
-    def test_migrate_builds_gateway_and_worker_stacks_with_addons_when_enabled(self) -> None:
+    def test_migrate_builds_gateway_and_worker_without_resolver_even_when_legacy_flag_enabled(self) -> None:
         env = {"SAFELINK_RESOLVER_ENABLED": "true"}
 
         def fake_docker(args, _env):
@@ -264,8 +257,8 @@ class RunScriptTests(unittest.TestCase):
             patch.object(run, "prepare_tdl_build_asset"),
             patch.object(run, "run_compose") as run_compose,
             patch.object(run, "capture_compose", side_effect=[
-                "gateway-image\nworker-image\nresolver-image\n",
-                "worker-image\nresolver-image\n",
+                "gateway-image\nworker-image\n",
+                "worker-image\n",
             ]),
             patch.object(run, "run_docker", side_effect=fake_docker) as run_docker,
             patch.object(run, "build_migration_archive", side_effect=fake_archive),
@@ -281,6 +274,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(
             worker_build_env["COMPOSE_FILE"], run.compose_files_for_target("worker", env)
         )
+        for build_env in [call.args[1] for call in run_compose.call_args_list]:
+            self.assertNotIn("docker-compose.resolver.yml", build_env["COMPOSE_FILE"])
         run_docker.assert_called_once()
         self.assertEqual(run_docker.call_args.args[0][:2], ["save", "-o"])
 

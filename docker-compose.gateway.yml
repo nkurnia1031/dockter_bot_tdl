@@ -12,7 +12,7 @@ services:
     environment:
       DURABLE_DISPATCH_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
-      SAFELINK_RESOLVER_ENABLED: ${SAFELINK_RESOLVER_ENABLED:-false}
+      SAFELINK_RESOLVER_ENABLED: "false"
     restart: unless-stopped
     ports:
       - "${BACKEND_BIND_HOST:-0.0.0.0}:${BACKEND_HOST_PORT:-${BACKEND_PORT:-8080}}:${BACKEND_PORT:-8080}"

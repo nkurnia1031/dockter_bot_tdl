@@ -62,7 +62,7 @@ Commands:
 
 Notes:
   - Data lives in PROFILE_ROOT mounted to /data.
-  - Worker deploys include TTS helpers. The private resolver addon is included only when SAFELINK_RESOLVER_ENABLED=true.
+  - Worker deploys include TTS helpers. Resolver is disabled and excluded from every deployment path.
   - update/down will not remove .tdl, download, exports, or state.json.
   - Builds prefer the host tdl binary and use a fixed fallback when unavailable.
   - cleanup keeps tagged images and images used by containers.
@@ -492,36 +492,11 @@ def image_names_for_release(env: dict[str, str]) -> list[str]:
         value = (env.get(key) or default).strip()
         if value and value not in names:
             names.append(value)
-    if resolver_addon_enabled(env):
-        addon_image = resolver_addon_image_name(env)
-        if addon_image not in names:
-            names.append(addon_image)
     if env.get("WEB_IMAGE_MODE", "").strip().lower() == "container":
         value = env.get("WEB_IMAGE_NAME", "").strip()
         if value and value not in names:
             names.append(value)
     return names
-
-
-def resolver_addon_image_name(env: dict[str, str]) -> str:
-    """Derive the HTTP resolver addon package from the worker image name."""
-    configured = env.get("RESOLVER_IMAGE_NAME", "").strip()
-    if configured:
-        return configured
-    worker = (env.get("WORKER_IMAGE_NAME") or "tme3bot-worker").strip()
-    name, separator, tag = worker.partition(":")
-    name = f"{name[:-7]}-resolver" if name.endswith("-worker") else "tme3bot-resolver"
-    return f"{name}{separator}{tag}" if separator else name
-
-
-def resolver_addon_enabled(env: dict[str, str] | None = None) -> bool:
-    """Return whether worker deploys should include the private resolver addon."""
-    values = env or {}
-    raw = values.get(
-        "SAFELINK_RESOLVER_ENABLED",
-        os.getenv("SAFELINK_RESOLVER_ENABLED", "false"),
-    )
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def docker_manifest_exists(image: str, tag: str, env: dict[str, str]) -> bool:
@@ -576,8 +551,6 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
         required_names = [
             str(target_env.get("WORKER_IMAGE_NAME") or "tme3bot-worker"),
         ]
-        if resolver_addon_enabled(target_env):
-            required_names.append(resolver_addon_image_name(target_env))
     required_statuses = [image_status.get(name, "MISSING") for name in required_names]
     if any(value == "MISSING" for value in required_statuses):
         revision = str(report.get("git_sha") or "unknown")
@@ -868,13 +841,16 @@ def compose_base_command(dotenv: dict[str, str] | None = None) -> list[str]:
     compose_files = [
         path.strip() for path in compose_file.split(os.pathsep) if path.strip()
     ]
-    names = {Path(path.replace("\\", "/")).name.lower() for path in compose_files}
-    if (
-        "docker-compose.worker.yml" in names
-        and resolver_addon_enabled(values)
-        and "docker-compose.resolver.yml" not in names
-    ):
-        compose_files.append("docker-compose.resolver.yml")
+    # Old .env files or command environments may still list the Resolver
+    # compose file. Filter it out centrally so up/update/deploy/publish cannot
+    # resurrect the retired addon through a stale COMPOSE_FILE value.
+    compose_files = [
+        path
+        for path in compose_files
+        if not Path(path.replace("\\", "/")).name.lower().startswith(
+            "docker-compose.resolver"
+        )
+    ]
     for path in compose_files:
         if path.strip():
             command.extend(["-f", path])
@@ -890,8 +866,6 @@ def compose_files_for_target(target: str, env: dict[str, str] | None = None) -> 
         selected = list(files[target])
     except KeyError as exc:
         raise RuntimeError("Target deploy harus gateway atau worker.") from exc
-    if target == "worker" and resolver_addon_enabled(env):
-        selected.append("docker-compose.resolver.yml")
     return os.pathsep.join(selected)
 
 
@@ -979,7 +953,6 @@ def find_host_tdl(env: dict[str, str]) -> Path | None:
 def compose_env(dotenv: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(dotenv)
-    merged.setdefault("RESOLVER_IMAGE_NAME", resolver_addon_image_name(merged))
     return merged
 
 
@@ -1265,7 +1238,6 @@ def login_registry(env: dict[str, str]) -> None:
     image = (
         env.get("GATEWAY_IMAGE_NAME")
         or env.get("WORKER_IMAGE_NAME")
-        or resolver_addon_image_name(env)
         or ""
     ).strip()
     registry = image.split("/", 1)[0] if "/" in image else ""

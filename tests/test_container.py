@@ -53,9 +53,14 @@ class ContainerBuildTests(unittest.TestCase):
     def test_split_compose_files_define_backend_telegram_and_worker_targets(self) -> None:
         gateway = (PROJECT_ROOT / "docker-compose.gateway.yml").read_text(encoding="utf-8")
         worker = (PROJECT_ROOT / "docker-compose.worker.yml").read_text(encoding="utf-8")
+        gateway_services = yaml.safe_load(gateway)["services"]
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
         self.assertIn("backend:", gateway)
+        self.assertEqual(
+            gateway_services["backend"]["environment"]["SAFELINK_RESOLVER_ENABLED"],
+            "false",
+        )
         self.assertNotIn("web:", gateway)
         self.assertIn("telegram:", gateway)
         self.assertEqual(gateway.count("target: gateway"), 1)
