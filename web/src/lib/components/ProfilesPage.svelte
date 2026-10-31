@@ -1271,7 +1271,7 @@ async function cancelProfileProvisioning() {
       <div class="flex items-start justify-between gap-3">
         <div>
           <p class="eyebrow">LOG UJI TERAKHIR</p>
-          <h2 id="runtime-scan-log-title" class="mt-1 text-lg font-extrabold">Log uji {workerRuntimeLabel(runtimeLogDialog.runtime)}{#if runtimeLogDialog.profile} profil {runtimeLogDialog.profile}{/if} worker {runtimeLogDialog.worker}</h2>
+          <h2 id="runtime-scan-log-title" class="mt-1 text-lg font-extrabold">Log uji {workerRuntimeLabel(runtimeLogDialog.runtime)}{#if runtimeLogDialog.profile}{' '}profil {runtimeLogDialog.profile}{/if} worker {runtimeLogDialog.worker}</h2>
         </div>
         <button class="button secondary" onclick={() => runtimeLogDialog = null} aria-label="Tutup log uji"><X size={16}/></button>
       </div>

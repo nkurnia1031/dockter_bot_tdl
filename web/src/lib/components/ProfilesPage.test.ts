@@ -237,13 +237,23 @@ describe('ProfilesPage', () => {
       if (url === '/api/v1/profiles/local/scan') return new Response(JSON.stringify({ operation: null }), { status: 200 });
       if (url === '/api/v1/profiles/local/scan/runtime' && method === 'POST') {
         return new Response(JSON.stringify({
+          id: 'runtime-scan-1', status: 'running', target: {
+            kind: 'worker_runtime', worker: 'local', runtime: 'resolver',
+          }, error_code: '', progress: { workers: [{
+            name: 'local', status: 'running', phase: 'runtime_probe', error_code: '',
+            runtime: 'resolver', checks: { resolver: { ready: true, reason_code: '' } }, profiles: [],
+          }], total_workers: 1, completed_workers: 0, total_profiles: 0, completed_profiles: 0 },
+        }), { status: 202 });
+      }
+      if (url === '/api/v1/profiles/local/scan/runtime-scan-1') {
+        return new Response(JSON.stringify({
           id: 'runtime-scan-1', status: 'succeeded', target: {
             kind: 'worker_runtime', worker: 'local', runtime: 'resolver',
           }, error_code: '', progress: { workers: [{
             name: 'local', status: 'succeeded', phase: 'complete', error_code: '',
             runtime: 'resolver', checks: { resolver: { ready: true, reason_code: '' } }, profiles: [],
           }], total_workers: 1, completed_workers: 1, total_profiles: 0, completed_profiles: 0 },
-        }), { status: 202 });
+        }), { status: 200 });
       }
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
@@ -258,7 +268,12 @@ describe('ProfilesPage', () => {
       method: 'POST',
       body: JSON.stringify({ worker: 'local', runtime: 'resolver' }),
     });
-    expect(screen.getByRole('status', { name: 'Progress Scan Profil' }).textContent).toContain('Resolver: Siap');
+    const progress = await screen.findByRole('article', { name: 'Progress worker local' });
+    expect(progress.textContent).toContain('Resolver: Siap');
+    await waitFor(() => expect(
+      requests.some((request) => request.url === '/api/v1/profiles/local/scan/runtime-scan-1')
+    ).toBe(true), { timeout: 2000 });
+    expect(await screen.findByText('Resolver pada worker local: Siap.')).toBeTruthy();
     const logButton = screen.getByRole('button', { name: 'Lihat log uji Resolver worker local' });
     await fireEvent.click(logButton);
     const dialog = screen.getByRole('dialog', { name: 'Log uji Resolver worker local' });
