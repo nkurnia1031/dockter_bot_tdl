@@ -1534,7 +1534,11 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "download")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["checked_at"], checked_at)
         self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
-            "name": "default", "ready": True, "reason_codes": [], "checks": [],
+            "name": "default", "ready": True, "reason_codes": [],
+            "checks": [
+                {"name": name, "ready": True, "code": "OK"}
+                for name in ("identity", "root_session", "user1_session")
+            ],
         }]}
         public = self.client.get("/api/v1/profiles/local", headers=auth)
         self.assertEqual(public.status_code, 200, public.text)
@@ -1561,17 +1565,18 @@ class BackendApiTests(unittest.TestCase):
         store = self.runtime_readiness_store
         store.upsert_cell(worker="local", profile=None, runtime="quick_mode_runtime", ready=True, fingerprint="a" * 64, checked_at=checked_at)
         store.upsert_cell(worker="local", profile=None, runtime="rclone_storage", ready=True, fingerprint="b" * 64, destination_fingerprint=hashlib.sha256(b"googledrive:backup").hexdigest(), checked_at=checked_at)
+        upload_session_fingerprint = self.dispatcher.capabilities("local")["storage_upload_fingerprints"]["default"]
         for runtime, fingerprint in (("export", "c"), ("download", "d"), ("upload", "e"), ("storage", "f")):
             store.upsert_cell(
                 worker="local", profile="default", runtime=runtime, ready=True,
                 fingerprint=fingerprint * 64,
-                session_fingerprint=("c" if runtime == "download" else "g") * 64 if runtime in {"download", "upload", "storage"} else "",
+                session_fingerprint="c" * 64 if runtime == "download" else upload_session_fingerprint if runtime in {"upload", "storage"} else "",
                 destination_fingerprint=self.control.tdl_access_store.destination_fingerprint("123") if runtime == "storage" else "",
                 checked_at=checked_at,
             )
         # Storage and Upload must refer to the same Upload lane session.
-        store.upsert_cell(worker="local", profile="default", runtime="storage", ready=True, fingerprint="f" * 64, session_fingerprint="g" * 64, destination_fingerprint=self.control.tdl_access_store.destination_fingerprint("123"), checked_at=checked_at)
-        store.upsert_cell(worker="local", profile="default", runtime="upload", ready=True, fingerprint="e" * 64, session_fingerprint="g" * 64, checked_at=checked_at)
+        store.upsert_cell(worker="local", profile="default", runtime="storage", ready=True, fingerprint="f" * 64, session_fingerprint=upload_session_fingerprint, destination_fingerprint=self.control.tdl_access_store.destination_fingerprint("123"), checked_at=checked_at)
+        store.upsert_cell(worker="local", profile="default", runtime="upload", ready=True, fingerprint="e" * 64, session_fingerprint=upload_session_fingerprint, checked_at=checked_at)
         self.dispatcher.quickmode_runtime_readiness = lambda *_args: self.fail("Quick Mode profile calculation must not probe workers")
         self.dispatcher.rclone_storage_runtime_readiness = lambda *_args: self.fail("Quick Mode profile calculation must not probe rclone")
         self.dispatcher.start_profile_readiness_canary = lambda *_args, **_kwargs: self.fail("Quick Mode profile calculation must not start a canary")
