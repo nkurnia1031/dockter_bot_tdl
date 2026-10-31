@@ -39,7 +39,9 @@ class ProfileScanOperationStoreTests(unittest.TestCase):
             saved = restored.get(operation["id"])
             progress = saved["progress"]["workers"][0]["profiles"][0]
             self.assertEqual(saved["target"], operation["target"])
-            self.assertEqual(progress["phase"], "verify_storage")
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(progress["phase"], "interrupted")
+            self.assertEqual(progress["error_code"], "PROFILE_SCAN_INTERRUPTED")
             self.assertEqual(progress["checks"]["upload"]["ready"], True)
             self.assertEqual(progress["checks"]["storage"]["reason_code"], "PROFILE_CANARY_STORAGE_VERIFY_FAILED")
             self.assertEqual(progress["dependencies"], ["export", "upload"])

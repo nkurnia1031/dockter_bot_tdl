@@ -1533,6 +1533,9 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "export")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "download")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["checked_at"], checked_at)
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default", "ready": True, "reason_codes": [], "checks": [],
+        }]}
         public = self.client.get("/api/v1/profiles/local", headers=auth)
         self.assertEqual(public.status_code, 200, public.text)
         self.assertNotIn("a" * 64, public.text)
@@ -1591,7 +1594,8 @@ class BackendApiTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(completed.status_code, 200, completed.text)
         self.assertEqual(completed.json()["status"], "succeeded")
-        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
+        quick_mode = store.cell("local", "default", "quick_mode")
+        self.assertEqual(quick_mode["status"], "ready", quick_mode)
 
     def test_targeted_tts_profile_scan_updates_helper_dependency_and_only_selected_profile(self):
         auth = self.login(42)
@@ -1969,6 +1973,9 @@ class BackendApiTests(unittest.TestCase):
         }
         self.dispatcher.quickmode_runtime_readiness = lambda _worker, _destination: {
             "ready": True, "reason_code": "", "fingerprint": "b" * 64,
+        }
+        self.dispatcher.rclone_storage_runtime_readiness = lambda _worker, _destination: {
+            "ready": True, "reason_code": "", "fingerprint": "c" * 64,
         }
         access_store = self.control.tdl_access_store
         destination = self.control._tdl_access_target("storage")
