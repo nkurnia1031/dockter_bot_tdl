@@ -126,6 +126,9 @@ describe('DecryptPage', () => {
         method,
         body: typeof init?.body === 'string' ? init.body : undefined,
       });
+      if (url === '/api/v1/safelink/status') {
+        return new Response(JSON.stringify({ enabled: true }), { status: 200 });
+      }
       if (url === '/api/v1/safelink/workers') {
         return new Response(JSON.stringify({ items: [
           { name: 'local', enabled: true, status: 'ready', reason_code: '', queued_jobs: 1 },
