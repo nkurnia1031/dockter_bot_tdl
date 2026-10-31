@@ -633,7 +633,12 @@ class WorkerHttpDispatcher:
         )
 
     def start_profile_readiness_canary(
-        self, worker: str, profile: str, storage_target: str, tts_target: str
+        self,
+        worker: str,
+        profile: str,
+        storage_target: str,
+        tts_target: str,
+        checks: list[str] | None = None,
     ) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:
@@ -641,16 +646,19 @@ class WorkerHttpDispatcher:
         self._require_capabilities(
             worker, {CAP_PROFILE_READINESS_CANARY}, record=record
         )
+        payload = {
+            "profile": str(profile),
+            "storage_target": str(storage_target or ""),
+            "tts_target": str(tts_target or ""),
+        }
+        if checks is not None:
+            payload["checks"] = list(checks)
         return request_json(
             str(record["url"]),
             str(record["token"]),
             "POST",
             "/internal/v1/profiles/readiness-canaries",
-            {
-                "profile": str(profile),
-                "storage_target": str(storage_target or ""),
-                "tts_target": str(tts_target or ""),
-            },
+            payload,
             timeout=15,
         )
 

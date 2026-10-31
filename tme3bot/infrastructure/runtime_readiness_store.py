@@ -14,6 +14,7 @@ _WORKER_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 _RUNTIME_RE = re.compile(r"^[a-z][a-z0-9_]{0,47}$")
 _REASON_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,79}$")
 _FINGERPRINT_RE = re.compile(r"^[a-f0-9]{64}$")
+_PHASE_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _EXPORT_RUNTIME = "export"
 _QUICK_MODE_RUNTIME = "quick_mode"
 _RESOLVER_RUNTIME = "resolver"
@@ -35,19 +36,31 @@ class RuntimeReadinessStore:
 
     def public_snapshot(self) -> dict[str, Any]:
         snapshot = self.snapshot()
+        cells = []
+        for cell in snapshot["cells"]:
+            safe_cell = {
+                key: cell[key]
+                for key in (
+                    "worker", "profile", "runtime", "status",
+                    "checked_at", "reason_code",
+                )
+            }
+            attempt = _safe_last_attempt(
+                cell.get("last_attempt"),
+                worker=cell["worker"],
+                profile=cell["profile"],
+                runtime=cell["runtime"],
+                checked_at=cell["checked_at"],
+                ready=cell["status"] == "ready",
+                reason_code=cell["reason_code"],
+            )
+            if attempt is not None:
+                safe_cell["last_attempt"] = attempt
+            cells.append(safe_cell)
         return {
             "checked_at": snapshot["checked_at"],
             "workers": copy.deepcopy(snapshot["workers"]),
-            "cells": [
-                {
-                    key: cell[key]
-                    for key in (
-                        "worker", "profile", "runtime", "status",
-                        "checked_at", "reason_code",
-                    )
-                }
-                for cell in snapshot["cells"]
-            ],
+            "cells": cells,
         }
 
     def worker(self, name: str) -> dict[str, Any] | None:
@@ -115,7 +128,15 @@ class RuntimeReadinessStore:
                     cell = self._export_cell(name, item, when)
                     if cell is None:
                         continue
-                    replacement[_cell_key(name, cell["profile"], _EXPORT_RUNTIME)] = cell
+                    key = _cell_key(name, cell["profile"], _EXPORT_RUNTIME)
+                    previous = cell_map.get(key)
+                    if (
+                        previous is not None
+                        and "last_attempt" not in cell
+                        and isinstance(previous.get("last_attempt"), dict)
+                    ):
+                        cell["last_attempt"] = previous["last_attempt"]
+                    replacement[key] = cell
                 for key in list(cell_map):
                     if key is not None and key[0] == name and key[2] == _EXPORT_RUNTIME:
                         del cell_map[key]
@@ -162,6 +183,7 @@ class RuntimeReadinessStore:
                 _cell_key(item["worker"], item["profile"], item["runtime"]): item
                 for item in snapshot["cells"]
             }
+            previous_cells = dict(cells)
             for key in list(cells):
                 if key is not None and key[0] in successful_workers and key[2] == lane:
                     del cells[key]
@@ -197,6 +219,8 @@ class RuntimeReadinessStore:
                         "session_fingerprint": session_fingerprint if ready else "",
                         "destination_fingerprint": "",
                     }
+                    previous = previous_cells.get(key)
+                    self._attach_last_attempt(cells[key], raw, previous, when)
             snapshot["cells"] = sorted(
                 cells.values(),
                 key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
@@ -254,6 +278,7 @@ class RuntimeReadinessStore:
                 _cell_key(item["worker"], item["profile"], item["runtime"]): item
                 for item in snapshot["cells"]
             }
+            previous_cells = dict(cells)
             for key in list(cells):
                 if key is not None and key[0] in successful_workers and key[2] == "tts":
                     del cells[key]
@@ -284,6 +309,9 @@ class RuntimeReadinessStore:
                             raw.get("destination_fingerprint")
                         ) if ready else "",
                     }
+                    self._attach_last_attempt(
+                        cells[key], raw, previous_cells.get(key), when
+                    )
             snapshot["cells"] = sorted(
                 cells.values(),
                 key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
@@ -313,6 +341,7 @@ class RuntimeReadinessStore:
                 _cell_key(item["worker"], item["profile"], item["runtime"]): item
                 for item in snapshot["cells"]
             }
+            previous_cells = dict(cells)
             for key in list(cells):
                 if key is not None and key[0] in successful_workers and key[2] == "storage":
                     del cells[key]
@@ -351,6 +380,9 @@ class RuntimeReadinessStore:
                         "session_fingerprint": session_fingerprint if ready else "",
                         "destination_fingerprint": destination_fingerprint if ready else "",
                     }
+                    self._attach_last_attempt(
+                        cells[key], raw, previous_cells.get(key), when
+                    )
             snapshot["cells"] = sorted(
                 cells.values(),
                 key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
@@ -383,6 +415,7 @@ class RuntimeReadinessStore:
                     continue
                 fingerprint = _safe_fingerprint(raw.get("fingerprint"))
                 ready = raw.get("ready") is True and bool(fingerprint)
+                previous = cells.get(key)
                 cells[key] = {
                     "worker": key[0],
                     "profile": None,
@@ -396,6 +429,19 @@ class RuntimeReadinessStore:
                     "session_fingerprint": "",
                     "destination_fingerprint": "",
                 }
+                attempt = _safe_last_attempt(
+                    raw.get("last_attempt"),
+                    worker=key[0],
+                    profile=None,
+                    runtime=_RESOLVER_RUNTIME,
+                    checked_at=str(raw.get("checked_at") or when)[:64],
+                    ready=ready,
+                    reason_code=cells[key]["reason_code"],
+                )
+                if attempt is not None:
+                    cells[key]["last_attempt"] = attempt
+                elif previous is not None and isinstance(previous.get("last_attempt"), dict):
+                    cells[key]["last_attempt"] = previous["last_attempt"]
             snapshot["cells"] = sorted(
                 cells.values(),
                 key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
@@ -427,6 +473,7 @@ class RuntimeReadinessStore:
                 _cell_key(item["worker"], item["profile"], item["runtime"]): item
                 for item in snapshot["cells"]
             }
+            previous_cells = dict(cells)
             successful_workers: set[str] = set()
             for raw in workers:
                 if not isinstance(raw, dict):
@@ -496,6 +543,9 @@ class RuntimeReadinessStore:
                         "sender_profiles": sender_profiles if ready else [],
                         "sender_session_fingerprints": sender_fingerprints if ready else {},
                     }
+                    self._attach_last_attempt(
+                        cells[key], raw, previous_cells.get(key), when
+                    )
 
             snapshot["workers"] = sorted(worker_map.values(), key=lambda item: item["name"])
             snapshot["cells"] = sorted(
@@ -518,6 +568,7 @@ class RuntimeReadinessStore:
         destination_fingerprint: str = "",
         reason_code: str = "",
         checked_at: str | None = None,
+        last_attempt: dict[str, Any] | None = None,
     ) -> bool:
         """Store one runtime cell, including worker-scoped cells without a profile."""
         key = _cell_key(worker, profile, runtime)
@@ -555,6 +606,20 @@ class RuntimeReadinessStore:
                 _cell_key(item["worker"], item["profile"], item["runtime"]): item
                 for item in snapshot["cells"]
             }
+            previous = cells.get(key)
+            attempt = _safe_last_attempt(
+                last_attempt,
+                worker=key[0],
+                profile=key[1],
+                runtime=key[2],
+                checked_at=when,
+                ready=is_ready,
+                reason_code=cell["reason_code"],
+            )
+            if attempt is not None:
+                cell["last_attempt"] = attempt
+            elif previous is not None and isinstance(previous.get("last_attempt"), dict):
+                cell["last_attempt"] = previous["last_attempt"]
             cells[key] = cell
             snapshot["cells"] = sorted(
                 cells.values(),
@@ -563,6 +628,89 @@ class RuntimeReadinessStore:
             snapshot["checked_at"] = when
             self._save_locked(snapshot)
             return True
+
+    def upsert_quick_mode_cell(
+        self,
+        *,
+        worker: str,
+        profile: str,
+        ready: bool,
+        fingerprint: str = "",
+        session_fingerprint: str = "",
+        destination_fingerprint: str = "",
+        rclone_destination_fingerprint: str = "",
+        sender_profiles: list[str] | None = None,
+        sender_session_fingerprints: dict[str, str] | None = None,
+        reason_code: str = "",
+        checked_at: str | None = None,
+        last_attempt: dict[str, Any] | None = None,
+    ) -> bool:
+        """Replace one derived Quick Mode cell without touching sibling profiles."""
+        key = _cell_key(worker, profile, _QUICK_MODE_RUNTIME)
+        if key is None or key[1] is None:
+            return False
+        when = str(checked_at or utc_now_iso())[:64]
+        normalized_fingerprint = _safe_fingerprint(fingerprint)
+        normalized_session = _safe_fingerprint(session_fingerprint)
+        normalized_destination = _safe_fingerprint(destination_fingerprint)
+        normalized_rclone = _safe_fingerprint(rclone_destination_fingerprint)
+        safe_senders = _safe_profile_list(sender_profiles)
+        safe_sender_fingerprints = _safe_fingerprint_map(sender_session_fingerprints)
+        is_ready = bool(
+            ready
+            and normalized_fingerprint
+            and normalized_session
+            and normalized_destination
+            and normalized_rclone
+            and safe_senders
+            and all(name in safe_sender_fingerprints for name in safe_senders)
+        )
+        cell = {
+            "worker": key[0],
+            "profile": key[1],
+            "runtime": _QUICK_MODE_RUNTIME,
+            "status": "ready" if is_ready else "not_ready",
+            "checked_at": when,
+            "reason_code": "" if is_ready else _reason(
+                reason_code, "QUICK_MODE_EVIDENCE_INCOMPLETE"
+            ),
+            "fingerprint": normalized_fingerprint if is_ready else "",
+            "session_fingerprint": normalized_session if is_ready else "",
+            "destination_fingerprint": normalized_destination if is_ready else "",
+            "rclone_destination_fingerprint": normalized_rclone if is_ready else "",
+            "sender_profiles": safe_senders if is_ready else [],
+            "sender_session_fingerprints": safe_sender_fingerprints if is_ready else {},
+        }
+        attempt = _safe_last_attempt(
+            last_attempt,
+            worker=key[0],
+            profile=key[1],
+            runtime=_QUICK_MODE_RUNTIME,
+            checked_at=when,
+            ready=is_ready,
+            reason_code=cell["reason_code"],
+        )
+        with self._lock:
+            self._load_locked()
+            assert self._snapshot is not None
+            snapshot = copy.deepcopy(self._snapshot)
+            cells = {
+                _cell_key(item["worker"], item["profile"], item["runtime"]): item
+                for item in snapshot["cells"]
+            }
+            previous = cells.get(key)
+            if attempt is not None:
+                cell["last_attempt"] = attempt
+            elif previous is not None and isinstance(previous.get("last_attempt"), dict):
+                cell["last_attempt"] = previous["last_attempt"]
+            cells[key] = cell
+            snapshot["cells"] = sorted(
+                cells.values(),
+                key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
+            )
+            snapshot["checked_at"] = when
+            self._save_locked(snapshot)
+        return True
 
     def invalidate(
         self,
@@ -651,7 +799,7 @@ class RuntimeReadinessStore:
         reason_code = "" if ready else _reason(raw.get("reason_code"), "PROFILE_SESSION_UNAVAILABLE")
         if raw.get("ready") is True and not fingerprint:
             reason_code = "PROFILE_FINGERPRINT_MISSING"
-        return {
+        cell = {
             "worker": worker,
             "profile": profile,
             "runtime": _EXPORT_RUNTIME,
@@ -662,6 +810,29 @@ class RuntimeReadinessStore:
             "session_fingerprint": "",
             "destination_fingerprint": "",
         }
+        self._attach_last_attempt(cell, raw, None, checked_at)
+        return cell
+
+    @staticmethod
+    def _attach_last_attempt(
+        cell: dict[str, Any],
+        raw: dict[str, Any],
+        previous: dict[str, Any] | None,
+        checked_at: str,
+    ) -> None:
+        attempt = _safe_last_attempt(
+            raw.get("last_attempt"),
+            worker=cell["worker"],
+            profile=cell["profile"],
+            runtime=cell["runtime"],
+            checked_at=str(raw.get("checked_at") or checked_at)[:64],
+            ready=cell["status"] == "ready",
+            reason_code=cell["reason_code"],
+        )
+        if attempt is not None:
+            cell["last_attempt"] = attempt
+        elif previous is not None and isinstance(previous.get("last_attempt"), dict):
+            cell["last_attempt"] = previous["last_attempt"]
 
     def _load_locked(self) -> None:
         if self._snapshot is not None:
@@ -721,7 +892,7 @@ def _normalize_snapshot(
         fingerprint = str(raw.get("fingerprint") or "").strip().lower()
         if ready and not _FINGERPRINT_RE.fullmatch(fingerprint):
             continue
-        safe_cells[key] = {
+        safe_cell = {
             "worker": key[0],
             "profile": key[1],
             "runtime": key[2],
@@ -741,6 +912,18 @@ def _normalize_snapshot(
                 ) if ready else {},
             } if key[2] == _QUICK_MODE_RUNTIME else {}),
         }
+        attempt = _safe_last_attempt(
+            raw.get("last_attempt"),
+            worker=key[0],
+            profile=key[1],
+            runtime=key[2],
+            checked_at=str(raw.get("checked_at") or "")[:64],
+            ready=ready,
+            reason_code=safe_cell["reason_code"],
+        )
+        if attempt is not None:
+            safe_cell["last_attempt"] = attempt
+        safe_cells[key] = safe_cell
     return {
         "checked_at": str(checked_at or "")[:64],
         "workers": sorted(safe_workers.values(), key=lambda item: item["name"]),
@@ -777,6 +960,64 @@ def _reason(value: Any, fallback: str) -> str:
 def _safe_fingerprint(value: Any) -> str:
     text = str(value or "").strip().lower()
     return text if _FINGERPRINT_RE.fullmatch(text) else ""
+
+
+def _safe_last_attempt(
+    value: Any,
+    *,
+    worker: str,
+    profile: str | None,
+    runtime: str,
+    checked_at: str,
+    ready: bool,
+    reason_code: str,
+) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    phase = str(value.get("phase") or "runtime_probe")
+    if not _PHASE_RE.fullmatch(phase):
+        phase = "runtime_probe"
+    checks = []
+    raw_checks = value.get("checks")
+    for raw in raw_checks[:12] if isinstance(raw_checks, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip().lower()
+        status = str(raw.get("status") or "")
+        if not _RUNTIME_RE.fullmatch(name) or status not in {"ready", "not_ready", "failed"}:
+            continue
+        code = str(raw.get("reason_code") or "")
+        checks.append({
+            "name": name,
+            "status": status,
+            "reason_code": code if _REASON_RE.fullmatch(code) else "",
+        })
+    dependencies = []
+    raw_dependencies = value.get("dependencies")
+    for item in raw_dependencies[:16] if isinstance(raw_dependencies, list) else []:
+        name = str(item or "").strip().lower()
+        if _RUNTIME_RE.fullmatch(name) and name not in dependencies:
+            dependencies.append(name)
+    raw_cleanup = value.get("cleanup")
+    cleanup = raw_cleanup if isinstance(raw_cleanup, dict) else {}
+    cleanup_status = str(cleanup.get("status") or "not_needed")
+    if cleanup_status not in {"not_needed", "succeeded", "failed"}:
+        cleanup_status = "failed"
+    cleanup_code = str(cleanup.get("reason_code") or "")
+    result_code = str(value.get("reason_code") or reason_code or "")
+    return {
+        "target": {"worker": worker, "profile": profile, "runtime": runtime},
+        "checked_at": str(value.get("checked_at") or checked_at)[:64],
+        "phase": phase,
+        "checks": checks,
+        "status": "ready" if ready else "not_ready",
+        "reason_code": result_code if _REASON_RE.fullmatch(result_code) else "",
+        "dependencies": dependencies,
+        "cleanup": {
+            "status": cleanup_status,
+            "reason_code": cleanup_code if _REASON_RE.fullmatch(cleanup_code) else "",
+        },
+    }
 
 
 def _safe_profile_list(value: Any) -> list[str]:

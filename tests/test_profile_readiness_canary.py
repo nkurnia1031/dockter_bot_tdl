@@ -67,7 +67,7 @@ class _DownloadClient:
 
 
 class ProfileReadinessCanaryTests(unittest.TestCase):
-    def _run(self, *, fail_tts_verification=False):
+    def _run(self, *, fail_tts_verification=False, checks=None):
         uploads = []
         counter = [700]
         export = _ExportClient(uploads, counter, fail_tts_verification=fail_tts_verification)
@@ -94,6 +94,7 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
                 "storage-chat",
                 "tts-chat",
                 lambda phase, _checks, _messages: phases.append(phase),
+                checks=checks,
             )
         return result, phases, runtime, download
 
@@ -123,6 +124,29 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
             result["checks"]["tts"]["reason_code"],
             "PROFILE_CANARY_TTS_FAILED",
         )
+
+    def test_selected_tts_canary_does_not_run_storage_or_download_canaries(self):
+        result, phases, _runtime, download = self._run(checks=["tts"])
+
+        self.assertTrue(result["checks"]["export"]["ready"])
+        self.assertTrue(result["checks"]["tts"]["ready"])
+        self.assertFalse(result["checks"]["upload"]["ready"])
+        self.assertFalse(result["checks"]["storage"]["ready"])
+        self.assertEqual([item["target"] for item in result["messages"]], ["tts"])
+        self.assertNotIn("download_canary", phases)
+        self.assertNotIn("upload_storage", phases)
+        self.assertFalse(download.interrupted.is_set())
+
+    def test_selected_storage_canary_does_not_run_tts_or_download_canaries(self):
+        result, phases, _runtime, download = self._run(checks=["storage"])
+
+        self.assertTrue(result["checks"]["export"]["ready"])
+        self.assertTrue(result["checks"]["upload"]["ready"])
+        self.assertTrue(result["checks"]["storage"]["ready"])
+        self.assertEqual([item["target"] for item in result["messages"]], ["storage"])
+        self.assertNotIn("download_canary", phases)
+        self.assertNotIn("upload_tts", phases)
+        self.assertFalse(download.interrupted.is_set())
 
 
 if __name__ == "__main__":

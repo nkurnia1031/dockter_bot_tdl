@@ -16,8 +16,14 @@ _CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,79}\Z")
 _PHASE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
 _WORKER_STATUSES = {"queued", "running", "succeeded", "failed", "disabled"}
 _PROFILE_STATUSES = {"queued", "running", "succeeded", "failed"}
-_PROFILE_CHECKS = {"export", "download", "upload", "storage", "tts"}
+_PROFILE_CHECKS = {
+    "export", "download", "upload", "storage", "tts", "tts_helper", "quick_mode"
+}
 _CLEANUP_STATUSES = {"not_needed", "succeeded", "failed"}
+_WORKER_RUNTIME_SCANS = {
+    "resolver", "tts_helper", "quick_mode_runtime", "rclone_storage"
+}
+_PROFILE_RUNTIME_SCANS = {"export", "download", "storage", "tts", "quick_mode"}
 _RETAINED_SCAN_OPERATIONS = 32
 
 
@@ -39,8 +45,32 @@ def _load(value: str | None) -> dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
+def _safe_target(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    worker = str(value.get("worker") or "").strip().lower()
+    runtime = str(value.get("runtime") or "").strip().lower()
+    kind = str(value.get("kind") or "")
+    if not _WORKER_RE.fullmatch(worker):
+        return None
+    if kind == "worker_runtime" and runtime in _WORKER_RUNTIME_SCANS:
+        return {"kind": kind, "worker": worker, "runtime": runtime}
+    if kind == "profile_runtime" and runtime in _PROFILE_RUNTIME_SCANS:
+        profile = str(value.get("profile") or "").strip().lower()
+        if _PROFILE_RE.fullmatch(profile):
+            return {
+                "kind": kind,
+                "worker": worker,
+                "profile": profile,
+                "runtime": runtime,
+            }
+    return None
+
+
 class ProfileScanOperationStore:
-    """Persist safe, resumable progress for the latest cross-worker profile scan."""
+    """Persist safe, resumable progress for full and targeted profile scans."""
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -112,29 +142,40 @@ class ProfileScanOperationStore:
         completed_profiles = sum(
             1 for item in profiles if item.get("status") in {"succeeded", "failed"}
         )
-        return {
+        summary = {
             "workers": workers,
             "total_workers": len(workers),
             "completed_workers": completed_workers,
             "total_profiles": len(profiles),
             "completed_profiles": completed_profiles,
         }
+        target = _safe_target(progress.get("target"))
+        if target is not None:
+            summary["target"] = target
+        return summary
 
     @classmethod
     def _public(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
         if row is None:
             return None
+        progress = cls._summarize(_load(row["progress_json"]))
         return {
             "id": str(row["id"]),
             "status": str(row["status"]),
-            "progress": cls._summarize(_load(row["progress_json"])),
+            "progress": progress,
+            "target": progress.get("target"),
             "error_code": str(row["error_code"] or ""),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),
             "finished_at": str(row["finished_at"] or ""),
         }
 
-    def create(self, started_by: int) -> tuple[dict[str, Any], bool]:
+    def create(
+        self, started_by: int, *, target: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], bool]:
+        safe_target = _safe_target(target)
+        if target is not None and safe_target is None:
+            raise ValueError("Target Scan Profil tidak valid.")
         now = _now()
         with self._lock, self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -148,10 +189,13 @@ class ProfileScanOperationStore:
                 assert public is not None
                 return public, False
             operation_id = str(uuid.uuid4())
+            progress = {"workers": []}
+            if safe_target is not None:
+                progress["target"] = safe_target
             db.execute(
                 "INSERT INTO profile_scan_operations(id,started_by,status,progress_json,created_at,updated_at) "
                 "VALUES(?,?,'queued',?,?,?)",
-                (operation_id, int(started_by), _dump({"workers": []}), now, now),
+                (operation_id, int(started_by), _dump(progress), now, now),
             )
             db.execute(
                 "DELETE FROM profile_scan_operations WHERE id NOT IN ("
@@ -201,6 +245,8 @@ class ProfileScanOperationStore:
         phase: str = "",
         error_code: str = "",
         profiles: list[str] | None = None,
+        runtime: str = "",
+        checks: dict[str, Any] | None = None,
     ) -> None:
         name = str(worker_name or "").strip().lower()
         if not _WORKER_RE.fullmatch(name) or status not in _WORKER_STATUSES:
@@ -226,6 +272,20 @@ class ProfileScanOperationStore:
                 current = {"name": name, "profiles": []}
                 workers.append(current)
             current.update({"status": status, "phase": safe_phase, "error_code": safe_code})
+            safe_runtime = str(runtime or "").strip().lower()
+            if safe_runtime in _WORKER_RUNTIME_SCANS:
+                current["runtime"] = safe_runtime
+            if checks is not None:
+                safe_checks: dict[str, dict[str, Any]] = {}
+                for check_name, raw_check in checks.items():
+                    if check_name not in _WORKER_RUNTIME_SCANS or not isinstance(raw_check, dict):
+                        continue
+                    reason = str(raw_check.get("reason_code") or "")
+                    safe_checks[check_name] = {
+                        "ready": raw_check.get("ready") is True,
+                        "reason_code": reason if _CODE_RE.fullmatch(reason) else "",
+                    }
+                current["checks"] = safe_checks
             if profiles is not None:
                 safe_profiles = []
                 seen: set[str] = set()
@@ -258,6 +318,7 @@ class ProfileScanOperationStore:
         error_code: str = "",
         checks: dict[str, Any] | None = None,
         cleanup: dict[str, Any] | None = None,
+        dependencies: list[str] | None = None,
     ) -> None:
         worker = str(worker_name or "").strip().lower()
         profile = str(profile_name or "").strip().lower()
@@ -309,6 +370,13 @@ class ProfileScanOperationStore:
                         ),
                     }
                 current_profile["checks"] = safe_checks
+            if dependencies is not None:
+                safe_dependencies = []
+                for item in dependencies[:16]:
+                    name = str(item or "").strip().lower()
+                    if re.fullmatch(r"[a-z][a-z0-9_]{0,47}", name) and name not in safe_dependencies:
+                        safe_dependencies.append(name)
+                current_profile["dependencies"] = safe_dependencies
             if cleanup is not None:
                 cleanup_status = str(cleanup.get("status") or "")
                 if cleanup_status not in _CLEANUP_STATUSES:

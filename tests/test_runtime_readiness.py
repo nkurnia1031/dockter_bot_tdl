@@ -62,6 +62,99 @@ class RuntimeReadinessStoreTests(unittest.TestCase):
                 "ready",
             )
 
+    def test_worker_runtime_attempt_is_safe_and_does_not_change_other_cells(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "runtime-readiness.json"
+            store = RuntimeReadinessStore(path)
+            store.upsert_cell(
+                worker="local",
+                profile=None,
+                runtime="tts_helper",
+                ready=True,
+                fingerprint="a" * 64,
+                checked_at="2026-10-31T10:00:00Z",
+            )
+
+            store.upsert_cell(
+                worker="local",
+                profile=None,
+                runtime="resolver",
+                ready=True,
+                fingerprint="b" * 64,
+                checked_at="2026-10-31T10:05:00Z",
+                last_attempt={
+                    "target": {"worker": "local", "profile": None, "runtime": "resolver"},
+                    "checked_at": "2026-10-31T10:05:00Z",
+                    "phase": "runtime_probe",
+                    "checks": [{"name": "resolver", "status": "ready", "reason_code": ""}],
+                    "reason_code": "",
+                    "dependencies": [],
+                    "cleanup": {"status": "not_needed", "reason_code": ""},
+                    "stdout": "must-not-be-stored",
+                    "session": "must-not-be-stored",
+                },
+            )
+
+            restored = RuntimeReadinessStore(path)
+            resolver = restored.cell("local", None, "resolver")
+            helper = restored.cell("local", None, "tts_helper")
+            self.assertEqual(resolver["last_attempt"]["phase"], "runtime_probe")
+            self.assertEqual(resolver["last_attempt"]["checks"][0]["name"], "resolver")
+            self.assertEqual(helper["checked_at"], "2026-10-31T10:00:00Z")
+            public_resolver = next(
+                item for item in restored.public_snapshot()["cells"]
+                if item["runtime"] == "resolver"
+            )
+            self.assertEqual(public_resolver["last_attempt"]["target"]["worker"], "local")
+            self.assertNotIn("stdout", public_resolver["last_attempt"])
+            self.assertNotIn("session", public_resolver["last_attempt"])
+            self.assertNotIn("fingerprint", public_resolver)
+
+    def test_quick_mode_targeted_upsert_preserves_sibling_cell_and_sanitizes_log(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "runtime-readiness.json"
+            store = RuntimeReadinessStore(path)
+            store.apply_export_scan(
+                checked_at="2026-10-31T10:00:00Z",
+                workers=[{"worker": "local", "status": "success"}],
+                profiles={"local": []},
+            )
+            store.upsert_quick_mode_cell(
+                worker="local",
+                profile="default",
+                ready=True,
+                fingerprint="a" * 64,
+                session_fingerprint="b" * 64,
+                destination_fingerprint="c" * 64,
+                rclone_destination_fingerprint="d" * 64,
+                sender_profiles=["default"],
+                sender_session_fingerprints={"default": "e" * 64},
+                checked_at="2026-10-31T10:01:00Z",
+                last_attempt={
+                    "checked_at": "2026-10-31T10:01:00Z",
+                    "phase": "derived_readiness",
+                    "checks": [{"name": "export", "status": "ready"}],
+                    "dependencies": ["export"],
+                    "stdout": "must-not-be-stored",
+                    "session": "must-not-be-stored",
+                },
+            )
+            store.upsert_quick_mode_cell(
+                worker="local",
+                profile="archive",
+                ready=False,
+                reason_code="QUICK_MODE_EVIDENCE_INCOMPLETE",
+                checked_at="2026-10-31T10:02:00Z",
+            )
+
+            restored = RuntimeReadinessStore(path)
+            self.assertEqual(restored.cell("local", "default", "quick_mode")["status"], "ready")
+            self.assertEqual(restored.cell("local", "archive", "quick_mode")["status"], "not_ready")
+            public = restored.public_snapshot()
+            self.assertIn("last_attempt", str(public))
+            self.assertNotIn("must-not-be-stored", str(public))
+            self.assertNotIn("a" * 64, str(public))
+
     def test_download_and_upload_cells_replace_only_successfully_scanned_workers(self):
         with tempfile.TemporaryDirectory() as raw:
             store = RuntimeReadinessStore(Path(raw) / "runtime-readiness.json")

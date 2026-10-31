@@ -2,7 +2,7 @@
   import { onDestroy, onMount } from 'svelte';
 import { api, post, remove } from '$lib/api';
 import { session } from '$lib/session.svelte';
-import { normalizeRuntimeReadiness, runtimeReadinessFor, runtimeReadinessForWorker, type RuntimeReadinessSnapshot } from '$lib/profile-catalog';
+import { normalizeRuntimeReadiness, runtimeReadinessFor, runtimeReadinessForWorker, type RuntimeReadinessAttempt, type RuntimeReadinessSnapshot } from '$lib/profile-catalog';
   import { profileDiagnosticLabel } from '$lib/tdl-lanes';
 import { CircleAlert, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, Upload, UserRoundPlus, X } from '@lucide/svelte';
 
@@ -23,10 +23,11 @@ type ProvisioningWorker = { name: string; enabled: boolean; online: boolean; sec
     checks?: Record<string, { ready: boolean; reason_code: string }>;
     cleanup?: { status: 'not_needed'|'succeeded'|'failed'; items: Array<{ target: string; message_id: number; status: string; error_code: string }> };
   };
-  type ScanWorkerProgress = { name: string; status: string; phase: string; error_code: string; profiles: ScanProfileProgress[] };
+  type ScanWorkerProgress = { name: string; status: string; phase: string; error_code: string; profiles: ScanProfileProgress[]; runtime?: string; checks?: Record<string, { ready: boolean; reason_code: string }> };
   type ProfileScanOperation = {
     id: string;
     status: string;
+    target?: { kind: 'worker_runtime' | 'profile_runtime'; worker: string; profile?: string; runtime: string };
     progress: { workers: ScanWorkerProgress[]; total_workers: number; completed_workers: number; total_profiles: number; completed_profiles: number };
     error_code: string;
     created_at: string;
@@ -55,6 +56,7 @@ type ProvisioningOperation = {
     error?: { code?: string; message?: string } | null;
     created_at: string;
   };
+  type RuntimeLogDialog = { worker: string; profile?: string; runtime: string; attempt?: RuntimeReadinessAttempt };
 
   let workers = $state<Worker[]>([]);
   let selectedWorker = $state('');
@@ -73,6 +75,7 @@ let provisioningNotice = $state('');
   let inventory = $state<Inventory | null>(null);
   let profileCatalog = $state<LocalProfileCatalog | null>(null);
   let scanOperation = $state<ProfileScanOperation | null>(null);
+  let runtimeLogDialog = $state<RuntimeLogDialog | null>(null);
   let catalogFailure = $state('');
   let vaultProfiles = $state<VaultProfile[]>([]);
   let vaultStatusLoaded = $state(false);
@@ -213,6 +216,13 @@ const provisioningStatusLabels: Record<string, string> = {
     const workers = Array.isArray(rawProgress.workers) ? rawProgress.workers.flatMap((rawWorker) => {
       if (!rawWorker || typeof rawWorker !== 'object') return [];
       const worker = rawWorker as Record<string, unknown>;
+      const checks = worker.checks && typeof worker.checks === 'object'
+        ? Object.fromEntries(Object.entries(worker.checks as Record<string, unknown>).flatMap(([runtime, rawCheck]) => {
+          if (!rawCheck || typeof rawCheck !== 'object') return [];
+          const check = rawCheck as Record<string, unknown>;
+          return [[runtime, { ready: check.ready === true, reason_code: String(check.reason_code || '') }]];
+        })) as Record<string, { ready: boolean; reason_code: string }>
+        : undefined;
       const profiles = Array.isArray(worker.profiles) ? worker.profiles.flatMap((rawProfile) => {
         if (!rawProfile || typeof rawProfile !== 'object') return [];
         const profile = rawProfile as Record<string, unknown>;
@@ -230,13 +240,27 @@ const provisioningStatusLabels: Record<string, string> = {
         status: String(worker.status || 'queued'),
         phase: String(worker.phase || ''),
         error_code: String(worker.error_code || ''),
-        profiles
+        profiles,
+        runtime: String(worker.runtime || ''),
+        checks
       }];
     }) : [];
     const count = (value: unknown) => Number.isFinite(Number(value)) ? Math.max(0, Number(value)) : 0;
+    const rawTarget = payload.target && typeof payload.target === 'object'
+      ? payload.target as Record<string, unknown>
+      : null;
+    const targetWorker = String(rawTarget?.worker || '').trim().toLowerCase();
+    const targetRuntime = String(rawTarget?.runtime || '').trim().toLowerCase();
+    const targetProfile = String(rawTarget?.profile || '').trim().toLowerCase();
+    const target = rawTarget?.kind === 'worker_runtime' && targetWorker && targetRuntime
+      ? { kind: 'worker_runtime' as const, worker: targetWorker, runtime: targetRuntime }
+      : rawTarget?.kind === 'profile_runtime' && targetWorker && targetProfile && targetRuntime
+        ? { kind: 'profile_runtime' as const, worker: targetWorker, profile: targetProfile, runtime: targetRuntime }
+        : undefined;
     return {
       id: payload.id,
       status: String(payload.status),
+      target,
       progress: {
         workers,
         total_workers: count(rawProgress.total_workers),
@@ -370,6 +394,28 @@ const provisioningStatusLabels: Record<string, string> = {
     }
     await loadProfileCatalog();
     await session.refreshProfileCatalog();
+    if (operation.target?.kind === 'worker_runtime') {
+      const result = runtimeReadinessFor(
+        profileCatalog?.runtime_readiness || normalizeRuntimeReadiness(undefined),
+        null,
+        operation.target.worker,
+        operation.target.runtime
+      );
+      const serviceLabel = workerRuntimeLabel(operation.target.runtime);
+      notice = `${serviceLabel} pada worker ${operation.target.worker}: ${readinessStatusLabel(result.status)}${result.reason_code ? ` · ${codeMessage(result.reason_code)}` : ''}.`;
+      return;
+    }
+    if (operation.target?.kind === 'profile_runtime') {
+      const target = operation.target;
+      const result = runtimeReadinessFor(
+        profileCatalog?.runtime_readiness || normalizeRuntimeReadiness(undefined),
+        target.profile || '',
+        target.worker,
+        target.runtime
+      );
+      notice = `${workerRuntimeLabel(target.runtime)} profil ${target.profile} pada worker ${target.worker}: ${readinessStatusLabel(result.status)}${result.reason_code ? ` · ${codeMessage(result.reason_code)}` : ''}.`;
+      return;
+    }
     inventory = selectedWorker
       ? profileCatalog?.inventories.find((item) => item.worker === selectedWorker) || null
       : null;
@@ -666,6 +712,81 @@ async function cancelProfileProvisioning() {
     } finally {
       if (!scanOperationIsActive(scanOperation)) scanning = false;
     }
+  }
+
+  function workerRuntimeLabel(runtime: string) {
+    return ({
+      resolver: 'Resolver',
+      tts_helper: 'TorTTS',
+      quick_mode_runtime: 'Quick Mode runtime',
+      rclone_storage: 'Storage rclone',
+      export: 'Export',
+      download: 'Download',
+      upload: 'Upload',
+      storage: 'Storage',
+      tts: 'TTS',
+      quick_mode: 'Quick Mode'
+    } as Record<string, string>)[runtime] || runtime;
+  }
+
+  async function scanWorkerRuntime(worker: string, runtime: string) {
+    if (scanning || loadingWorkers || !worker || !runtime) return;
+    stopScanPolling();
+    stopProgressRefresh();
+    catalogGeneration += 1;
+    const generation = progressGeneration;
+    scanning = true;
+    failure = '';
+    notice = '';
+    try {
+      const payload = await post<unknown>('/profiles/local/scan/runtime', { worker, runtime });
+      if (generation !== progressGeneration) return;
+      const operation = normalizeScanOperation(payload);
+      if (!operation) throw new Error('Operation scan runtime tidak valid.');
+      scanOperation = operation;
+      scanning = scanOperationIsActive(operation);
+      if (scanning) scheduleScanPolling(operation.id);
+      else if (operation.status === 'succeeded' || operation.status === 'failed') {
+        await finishScanOperation(operation);
+      }
+    } catch (cause) {
+      if (generation !== progressGeneration) return;
+      const error = cause as { message?: string };
+      failure = error.message || `Scan ${workerRuntimeLabel(runtime)} pada worker ${worker} gagal.`;
+      scanning = false;
+    }
+  }
+
+  async function scanProfileRuntime(worker: string, profile: string, runtime: string) {
+    if (scanning || loadingWorkers || !worker || !profile || !runtime) return;
+    stopScanPolling();
+    stopProgressRefresh();
+    catalogGeneration += 1;
+    const generation = progressGeneration;
+    scanning = true;
+    failure = '';
+    notice = '';
+    try {
+      const payload = await post<unknown>('/profiles/local/scan/service', { worker, profile, runtime });
+      if (generation !== progressGeneration) return;
+      const operation = normalizeScanOperation(payload);
+      if (!operation) throw new Error('Operation scan layanan profil tidak valid.');
+      scanOperation = operation;
+      scanning = scanOperationIsActive(operation);
+      if (scanning) scheduleScanPolling(operation.id);
+      else if (operation.status === 'succeeded' || operation.status === 'failed') {
+        await finishScanOperation(operation);
+      }
+    } catch (cause) {
+      if (generation !== progressGeneration) return;
+      const error = cause as { message?: string };
+      failure = error.message || `Scan ${workerRuntimeLabel(runtime)} profil ${profile} pada worker ${worker} gagal.`;
+      scanning = false;
+    }
+  }
+
+  function openRuntimeLog(worker: string, runtime: string, attempt?: RuntimeReadinessAttempt, profile?: string) {
+    runtimeLogDialog = { worker, profile, runtime, attempt };
   }
 
   function stopProgressRefresh() {
@@ -1087,6 +1208,11 @@ async function cancelProfileProvisioning() {
           <span class="muted text-xs">Worker {scanOperation.progress.completed_workers}/{scanOperation.progress.total_workers}</span>
         {/if}
       </div>
+      {#if scanOperation.target?.kind === 'worker_runtime'}
+        <p class="muted mt-1 text-xs">{workerRuntimeLabel(scanOperation.target.runtime)} · worker {scanOperation.target.worker}</p>
+      {:else if scanOperation.target?.kind === 'profile_runtime'}
+        <p class="muted mt-1 text-xs">{workerRuntimeLabel(scanOperation.target.runtime)} · profil {scanOperation.target.profile} · worker {scanOperation.target.worker}</p>
+      {/if}
       {#if scanOperation.error_code}
         <p class="mt-2 text-xs text-rose-600">{codeMessage(scanOperation.error_code)}</p>
       {/if}
@@ -1099,6 +1225,10 @@ async function cancelProfileProvisioning() {
             </div>
             {#if progressWorker.phase}<p class="muted mt-1 text-xs">{scanPhaseLabel(progressWorker.phase)}</p>{/if}
             {#if progressWorker.error_code}<p class="mt-1 text-xs text-rose-600">{codeMessage(progressWorker.error_code)}</p>{/if}
+            {#if progressWorker.runtime && progressWorker.checks?.[progressWorker.runtime]}
+              {@const runtimeCheck = progressWorker.checks[progressWorker.runtime]}
+              <p class="mt-1 text-xs">{workerRuntimeLabel(progressWorker.runtime)}: {runtimeCheck.ready ? 'Siap' : codeMessage(runtimeCheck.reason_code || 'RUNTIME_NOT_READY')}</p>
+            {/if}
             {#if progressWorker.profiles.length}
               <div class="mt-2 space-y-1 border-l border-[var(--line)] pl-3">
                 {#each progressWorker.profiles as progressProfile (`${progressWorker.name}:${progressProfile.name}`)}
@@ -1129,6 +1259,53 @@ async function cancelProfileProvisioning() {
       </div>
     </section>
   {/if}
+
+{#if runtimeLogDialog}
+  <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4">
+    <dialog
+      open
+      class="relative inset-auto m-0 max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-5 shadow-2xl"
+      aria-modal="true"
+      aria-labelledby="runtime-scan-log-title"
+    >
+      <div class="flex items-start justify-between gap-3">
+        <div>
+          <p class="eyebrow">LOG UJI TERAKHIR</p>
+          <h2 id="runtime-scan-log-title" class="mt-1 text-lg font-extrabold">Log uji {workerRuntimeLabel(runtimeLogDialog.runtime)}{#if runtimeLogDialog.profile} profil {runtimeLogDialog.profile}{/if} worker {runtimeLogDialog.worker}</h2>
+        </div>
+        <button class="button secondary" onclick={() => runtimeLogDialog = null} aria-label="Tutup log uji"><X size={16}/></button>
+      </div>
+      {#if runtimeLogDialog.attempt}
+        {@const attempt = runtimeLogDialog.attempt}
+        <dl class="mt-4 grid gap-3 text-sm sm:grid-cols-2">
+          <div><dt class="muted text-xs">Target</dt><dd class="mt-1 font-semibold">{#if attempt.target.profile}Profil {attempt.target.profile} · {/if}Worker {attempt.target.worker} · {workerRuntimeLabel(attempt.target.runtime)}</dd></div>
+          <div><dt class="muted text-xs">Waktu</dt><dd class="mt-1 font-semibold">{checkedAt(attempt.checked_at)}</dd></div>
+          <div><dt class="muted text-xs">Fase terakhir</dt><dd class="mt-1 font-semibold">{attempt.phase || '—'}</dd></div>
+          <div><dt class="muted text-xs">Hasil</dt><dd class={`mt-1 font-semibold ${attempt.status === 'ready' ? 'text-emerald-600' : 'text-rose-600'}`}>{attempt.status === 'ready' ? 'Siap' : 'Tidak siap'}{#if attempt.reason_code} · {codeMessage(attempt.reason_code)} <span class="font-mono text-xs">({attempt.reason_code})</span>{/if}</dd></div>
+        </dl>
+        <section class="mt-4 rounded-xl border border-[var(--line)] p-3" aria-label="Pemeriksaan runtime">
+          <h3 class="text-sm font-bold">Pemeriksaan</h3>
+          {#if attempt.checks.length}
+            <ul class="mt-2 space-y-1 text-sm">
+              {#each attempt.checks as check (`${check.name}:${check.status}`)}
+                <li class="flex items-start justify-between gap-3"><span>{workerRuntimeLabel(check.name)}</span><span class="text-right">{check.status === 'ready' ? 'Siap' : check.reason_code ? `${codeMessage(check.reason_code)} (${check.reason_code})` : 'Tidak siap'}</span></li>
+              {/each}
+            </ul>
+          {:else}
+            <p class="muted mt-2 text-sm">Tidak ada rincian pemeriksaan.</p>
+          {/if}
+        </section>
+        <div class="mt-3 grid gap-3 sm:grid-cols-2">
+          <div class="rounded-xl border border-[var(--line)] p-3"><p class="muted text-xs">Dependency diuji</p><p class="mt-1 text-sm">{attempt.dependencies.length ? attempt.dependencies.map(workerRuntimeLabel).join(', ') : 'Tidak ada'}</p></div>
+          <div class="rounded-xl border border-[var(--line)] p-3"><p class="muted text-xs">Cleanup</p><p class="mt-1 text-sm">{attempt.cleanup.status === 'not_needed' ? 'Tidak diperlukan' : attempt.cleanup.status === 'succeeded' ? 'Berhasil' : `Gagal${attempt.cleanup.reason_code ? ` · ${codeMessage(attempt.cleanup.reason_code)} (${attempt.cleanup.reason_code})` : ''}`}</p></div>
+        </div>
+      {:else}
+        <p class="muted mt-4 rounded-xl border border-dashed border-[var(--line)] p-4 text-sm">Belum ada log uji untuk runtime ini.</p>
+      {/if}
+      <div class="mt-5 flex justify-end"><button class="button" onclick={() => runtimeLogDialog = null}>Tutup</button></div>
+    </dialog>
+  </div>
+{/if}
   {#if profileCatalog?.checked_at}
     <section class="mt-4 rounded-xl border border-[var(--line)] p-3" aria-label="Status scan semua worker">
       <div class="flex flex-wrap items-center justify-between gap-2">
@@ -1156,10 +1333,10 @@ async function cancelProfileProvisioning() {
             {@const quickRuntime = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'quick_mode_runtime')}
             {@const rcloneStorage = runtimeReadinessFor(profileCatalog.runtime_readiness, null, worker.name, 'rclone_storage')}
             {@const workerServices = [
-              { name: 'Resolver', result: resolver },
-              { name: 'TorTTS', result: ttsHelper },
-              { name: 'Storage rclone', result: rcloneStorage },
-              { name: 'Quick Mode runtime', result: quickRuntime },
+              { name: 'Resolver', runtime: 'resolver', result: resolver },
+              { name: 'TorTTS', runtime: 'tts_helper', result: ttsHelper },
+              { name: 'Storage rclone', runtime: 'rclone_storage', result: rcloneStorage },
+              { name: 'Quick Mode runtime', runtime: 'quick_mode_runtime', result: quickRuntime },
             ]}
             <article class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3" aria-label={`Worker ${worker.name}`}>
               <div class="flex flex-wrap items-center justify-between gap-2">
@@ -1171,7 +1348,22 @@ async function cancelProfileProvisioning() {
                   <div class="rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 text-sm" aria-label={`${service.name} worker ${worker.name}`}>
                     <div class="flex items-center justify-between gap-2">
                       <span class="font-semibold">{service.name}</span>
-                      <span class={readinessTone(service.result.status)}>{readinessStatusLabel(service.result.status)}</span>
+                      <div class="flex items-center gap-1.5">
+                        <span class={readinessTone(service.result.status)}>{readinessStatusLabel(service.result.status)}</span>
+                        <button
+                          class="rounded p-1 text-violet-700 hover:bg-violet-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-violet-200 dark:hover:bg-violet-950"
+                          onclick={() => scanWorkerRuntime(worker.name, service.runtime)}
+                          disabled={scanning || loadingWorkers || workers.find((item) => item.name === worker.name)?.enabled === false}
+                          aria-label={`Scan ${service.name} worker ${worker.name}`}
+                          title="Scan runtime ini"
+                        ><RefreshCw size={14}/></button>
+                        <button
+                          class="rounded p-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                          onclick={() => openRuntimeLog(worker.name, service.runtime, service.result.last_attempt)}
+                          aria-label={`Lihat log uji ${service.name} worker ${worker.name}`}
+                          title="Lihat log uji terakhir"
+                        ><CircleAlert size={14}/></button>
+                      </div>
                     </div>
                     {#if service.result.status !== 'ready' && service.result.reason_code}
                       <p class="muted mt-1 text-xs">{codeMessage(service.result.reason_code)}</p>
@@ -1183,12 +1375,12 @@ async function cancelProfileProvisioning() {
                 <div class="mt-3 space-y-2 border-l-2 border-[var(--line)] pl-3">
                   {#each workerInventory.items as profile (profile.name)}
                     {@const profileServices = [
-                      { name: 'Export', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'export') },
-                      { name: 'Download', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'download') },
-                      { name: 'Upload', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'upload') },
-                      { name: 'Storage', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'storage') },
-                      { name: 'TTS', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'tts') },
-                      { name: 'Quick Mode', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'quick_mode') },
+                      { name: 'Export', runtime: 'export', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'export'), scannable: true },
+                      { name: 'Download', runtime: 'download', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'download'), scannable: true },
+                      { name: 'Upload', runtime: 'upload', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'upload'), scannable: false },
+                      { name: 'Storage', runtime: 'storage', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'storage'), scannable: true },
+                      { name: 'TTS', runtime: 'tts', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'tts'), scannable: true },
+                      { name: 'Quick Mode', runtime: 'quick_mode', result: runtimeReadinessFor(profileCatalog.runtime_readiness, profile.name, worker.name, 'quick_mode'), scannable: true },
                     ]}
                     <section class="rounded-lg border border-[var(--line)] bg-[var(--panel-strong)] p-3" aria-label={`Profil ${profile.name} pada worker ${worker.name}`}>
                       <div class="flex flex-wrap items-center justify-between gap-2">
@@ -1207,7 +1399,24 @@ async function cancelProfileProvisioning() {
                           <div class="rounded-md bg-[var(--panel)] px-2 py-1.5 text-xs" aria-label={`${service.name} profil ${profile.name} worker ${worker.name}`}>
                             <div class="flex items-center justify-between gap-2">
                               <span>{service.name}</span>
-                              <span class={readinessTone(service.result.status)}>{readinessStatusLabel(service.result.status)}</span>
+                              <div class="flex items-center gap-1.5">
+                                <span class={readinessTone(service.result.status)}>{readinessStatusLabel(service.result.status)}</span>
+                                {#if service.scannable}
+                                  <button
+                                    class="rounded p-1 text-violet-700 hover:bg-violet-100 disabled:cursor-not-allowed disabled:opacity-40 dark:text-violet-200 dark:hover:bg-violet-950"
+                                    onclick={() => scanProfileRuntime(worker.name, profile.name, service.runtime)}
+                                    disabled={scanning || loadingWorkers || workers.find((item) => item.name === worker.name)?.enabled === false}
+                                    aria-label={`Scan ${service.name} profil ${profile.name} worker ${worker.name}`}
+                                    title={service.runtime === 'quick_mode' ? 'Hitung dari bukti tersimpan' : 'Scan layanan profil ini'}
+                                  ><RefreshCw size={13}/></button>
+                                {/if}
+                                <button
+                                  class="rounded p-1 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                                  onclick={() => openRuntimeLog(worker.name, service.runtime, service.result.last_attempt, profile.name)}
+                                  aria-label={`Lihat log uji ${service.name} profil ${profile.name} worker ${worker.name}`}
+                                  title="Lihat log uji terakhir"
+                                ><CircleAlert size={13}/></button>
+                              </div>
                             </div>
                             {#if service.result.status !== 'ready' && service.result.reason_code}
                               <p class="muted mt-1">{codeMessage(service.result.reason_code)}</p>

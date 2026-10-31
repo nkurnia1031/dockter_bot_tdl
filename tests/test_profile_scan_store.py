@@ -6,6 +6,75 @@ from tme3bot.infrastructure.profile_scan_store import ProfileScanOperationStore
 
 
 class ProfileScanOperationStoreTests(unittest.TestCase):
+    def test_targeted_profile_operation_persists_scope_and_progress(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "storage.db"
+            store = ProfileScanOperationStore(path)
+            operation, created = store.create(
+                42,
+                target={
+                    "kind": "profile_runtime",
+                    "worker": "REMOTE-1",
+                    "profile": "IRANG",
+                    "runtime": "storage",
+                },
+            )
+            self.assertTrue(created)
+            self.assertEqual(operation["target"], {
+                "kind": "profile_runtime", "worker": "remote-1",
+                "profile": "irang", "runtime": "storage",
+            })
+            store.report_worker(
+                operation["id"], "remote-1", "running", phase="profile_probe",
+                profiles=["irang"],
+            )
+            store.report_profile(
+                operation["id"], "remote-1", "irang", "running",
+                phase="verify_storage",
+                checks={"upload": {"ready": True}, "storage": {"ready": False, "reason_code": "PROFILE_CANARY_STORAGE_VERIFY_FAILED"}},
+                dependencies=["export", "upload", "private/path"],
+            )
+
+            restored = ProfileScanOperationStore(path)
+            saved = restored.get(operation["id"])
+            progress = saved["progress"]["workers"][0]["profiles"][0]
+            self.assertEqual(saved["target"], operation["target"])
+            self.assertEqual(progress["phase"], "verify_storage")
+            self.assertEqual(progress["checks"]["upload"]["ready"], True)
+            self.assertEqual(progress["checks"]["storage"]["reason_code"], "PROFILE_CANARY_STORAGE_VERIFY_FAILED")
+            self.assertEqual(progress["dependencies"], ["export", "upload"])
+
+    def test_targeted_runtime_operation_persists_safe_target_and_check_progress(self):
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "storage.db"
+            store = ProfileScanOperationStore(path)
+            operation, created = store.create(
+                42,
+                target={
+                    "kind": "worker_runtime",
+                    "worker": "LOCAL",
+                    "runtime": "resolver",
+                },
+            )
+            self.assertTrue(created)
+            self.assertEqual(operation["target"], {
+                "kind": "worker_runtime", "worker": "local", "runtime": "resolver",
+            })
+            store.report_worker(
+                operation["id"],
+                "local",
+                "succeeded",
+                phase="complete",
+                runtime="resolver",
+                checks={"resolver": {"ready": True, "reason_code": ""}},
+            )
+
+            restored = ProfileScanOperationStore(path)
+            saved = restored.get(operation["id"])
+            self.assertEqual(saved["target"], operation["target"])
+            self.assertEqual(saved["progress"]["workers"][0]["runtime"], "resolver")
+            self.assertEqual(saved["progress"]["workers"][0]["checks"]["resolver"]["ready"], True)
+
     def test_completed_operation_progress_survives_store_recreation(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "storage.db"

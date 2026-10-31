@@ -1010,10 +1010,14 @@ class WorkerJobExecutor(
             export_lock.release()
 
     def start_profile_readiness_canary(
-        self, profile: str, storage_target: str, tts_target: str
+        self,
+        profile: str,
+        storage_target: str,
+        tts_target: str,
+        checks: list[str] | None = None,
     ) -> dict[str, Any]:
         return self.profile_readiness_canaries.start(
-            profile, storage_target, tts_target
+            profile, storage_target, tts_target, checks
         )
 
     def profile_readiness_canary(self, operation_id: str) -> dict[str, Any] | None:

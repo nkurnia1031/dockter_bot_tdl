@@ -154,6 +154,7 @@ class FakeDispatcher:
         }
         self.profile_tdl_diagnostic_calls = []
         self.profile_readiness_canary_calls = []
+        self.profile_readiness_canary_scopes = []
         self.profile_readiness_canaries = {}
         self.profile_readiness_canary_messages = []
         self.profile_tdl_diagnostic_result = {
@@ -260,10 +261,13 @@ class FakeDispatcher:
             "sessions": [dict(item) for item in self.profile_tdl_diagnostic_result["sessions"]],
         }
 
-    def start_profile_readiness_canary(self, worker, profile, storage_target, tts_target):
+    def start_profile_readiness_canary(
+        self, worker, profile, storage_target, tts_target, checks=None
+    ):
         from uuid import uuid4
 
         self.profile_readiness_canary_calls.append((worker, profile, storage_target, tts_target))
+        self.profile_readiness_canary_scopes.append(tuple(checks or ("full",)))
         diagnostic = self.profile_tdl_diagnostics(worker, profile)
         fingerprint = str(diagnostic.get("fingerprint") or "")
         upload_fingerprint = self.capabilities(worker)["storage_upload_fingerprints"].get(profile, "")
@@ -1376,6 +1380,272 @@ class BackendApiTests(unittest.TestCase):
             completed.json()["progress"]["workers"][0]["profiles"][0]["status"],
             "succeeded",
         )
+        cells = {
+            (cell["worker"], cell["profile"], cell["runtime"]): cell
+            for cell in self.runtime_readiness_store.public_snapshot()["cells"]
+        }
+        for runtime in ("export", "download", "upload", "storage", "tts", "quick_mode"):
+            with self.subTest(runtime=runtime):
+                self.assertIn(("local", "default", runtime), cells)
+                self.assertIn("last_attempt", cells[("local", "default", runtime)])
+                self.assertEqual(
+                    cells[("local", "default", runtime)]["last_attempt"]["target"],
+                    {"worker": "local", "profile": "default", "runtime": runtime},
+                )
+        storage_attempt = cells[("local", "default", "storage")]["last_attempt"]
+        self.assertEqual(storage_attempt["dependencies"], ["export", "upload"])
+        self.assertEqual(
+            {check["name"] for check in storage_attempt["checks"]},
+            {"export", "upload", "storage"},
+        )
+        quick_attempt = cells[("local", "default", "quick_mode")]["last_attempt"]
+        self.assertEqual(quick_attempt["phase"], "derived_readiness")
+        self.assertEqual(
+            quick_attempt["dependencies"],
+            ["quick_mode_runtime", "rclone_storage", "export", "download", "upload", "storage"],
+        )
+
+    def test_targeted_worker_runtime_scan_updates_only_selected_cell(self):
+        auth = self.login(42)
+        checked_at = "2026-10-31T10:00:00Z"
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at=checked_at,
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={},
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="tts_helper", ready=True,
+            fingerprint="a" * 64, checked_at=checked_at,
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="b" * 64, checked_at=checked_at,
+        )
+        calls = []
+
+        def resolver_probe(worker):
+            calls.append(("resolver", worker))
+            return {
+                "ready": True,
+                "fingerprint": "c" * 64,
+                "reason_code": "",
+                "stdout": "must-not-be-stored",
+                "session": "must-not-be-stored",
+            }
+
+        self.dispatcher.safelink_runtime_readiness = resolver_probe
+        self.dispatcher.profile_local_inventory = lambda worker: calls.append(("inventory", worker))
+        self.dispatcher.tts_health = lambda worker: calls.append(("tts_helper", worker))
+        self.dispatcher.quickmode_runtime_readiness = lambda worker, _destination: calls.append(("quick_mode_runtime", worker))
+        self.dispatcher.rclone_storage_runtime_readiness = lambda worker, _destination: calls.append(("rclone_storage", worker))
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/runtime",
+            headers=auth,
+            json={"worker": "local", "runtime": "resolver"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        self.assertEqual(response.json()["target"], {
+            "kind": "worker_runtime", "worker": "local", "runtime": "resolver",
+        })
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            completed = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            )
+            if completed.json()["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["status"], "succeeded")
+        self.assertEqual(calls, [("resolver", "local")])
+        resolver = self.runtime_readiness_store.cell("local", None, "resolver")
+        helper = self.runtime_readiness_store.cell("local", None, "tts_helper")
+        rclone = self.runtime_readiness_store.cell("local", None, "rclone_storage")
+        self.assertEqual(resolver["status"], "ready")
+        self.assertEqual(resolver["last_attempt"]["target"]["runtime"], "resolver")
+        self.assertEqual(helper["checked_at"], checked_at)
+        self.assertEqual(rclone["checked_at"], checked_at)
+        public = self.client.get("/api/v1/profiles/local", headers=auth)
+        self.assertEqual(public.status_code, 200, public.text)
+        self.assertIn("last_attempt", public.text)
+        self.assertNotIn("must-not-be-stored", public.text)
+        self.assertNotIn("c" * 64, public.text)
+
+    def test_targeted_worker_runtime_scan_rejects_unknown_runtime(self):
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/runtime",
+            headers=self.login(42),
+            json={"worker": "local", "runtime": "utility"},
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertEqual(response.json()["error"]["code"], "PROFILE_SCAN_TARGET_INVALID")
+        self.assertEqual(self.dispatcher.tts_health_calls, [])
+
+    def test_targeted_storage_profile_scan_updates_upload_and_storage_only(self):
+        auth = self.login(42)
+        checked_at = "2026-10-31T10:00:00Z"
+        self.local_profile_catalog.replace_scan(
+            checked_at=checked_at,
+            workers=[{"name": "local", "status": "success", "checked_at": checked_at}],
+            inventories=[{"worker": "local", "checked_at": checked_at, "items": [{"name": "default"}]}],
+        )
+        self.dispatcher.profile_local_inventory = lambda _worker: self.fail(
+            "targeted Storage scan must not read the worker's full profile inventory"
+        )
+        self.dispatcher.profile_tdl_diagnostic_result["fingerprint"] = "a" * 64
+        for runtime in ("export", "download", "tts"):
+            self.runtime_readiness_store.upsert_cell(
+                worker="local", profile="default", runtime=runtime, ready=True,
+                fingerprint=("b" if runtime == "export" else "c" if runtime == "download" else "d") * 64,
+                checked_at=checked_at,
+            )
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/service",
+            headers=auth,
+            json={"worker": "local", "profile": "default", "runtime": "storage"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        self.assertEqual(response.json()["target"], {
+            "kind": "profile_runtime", "worker": "local", "profile": "default", "runtime": "storage",
+        })
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            completed = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            )
+            if completed.json()["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["status"], "succeeded")
+        self.assertEqual(self.dispatcher.profile_readiness_canary_scopes[-1], ("storage",))
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "upload")["status"], "ready")
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "storage")["status"], "ready")
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "export")["checked_at"], checked_at)
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "download")["checked_at"], checked_at)
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["checked_at"], checked_at)
+        public = self.client.get("/api/v1/profiles/local", headers=auth)
+        self.assertEqual(public.status_code, 200, public.text)
+        self.assertNotIn("a" * 64, public.text)
+
+    def test_targeted_quick_mode_profile_scan_uses_saved_cells_without_worker_probe(self):
+        auth = self.login(42)
+        checked_at = "2026-10-31T10:00:00Z"
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default",
+            "ready": True,
+            "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+        }]}
+        self.local_profile_catalog.replace_scan(
+            checked_at=checked_at,
+            workers=[{"name": "local", "status": "success", "checked_at": checked_at}],
+            inventories=[{"worker": "local", "checked_at": checked_at, "items": [{"name": "default", "ready": True}]}],
+        )
+        store = self.runtime_readiness_store
+        store.upsert_cell(worker="local", profile=None, runtime="quick_mode_runtime", ready=True, fingerprint="a" * 64, checked_at=checked_at)
+        store.upsert_cell(worker="local", profile=None, runtime="rclone_storage", ready=True, fingerprint="b" * 64, destination_fingerprint=hashlib.sha256(b"googledrive:backup").hexdigest(), checked_at=checked_at)
+        for runtime, fingerprint in (("export", "c"), ("download", "d"), ("upload", "e"), ("storage", "f")):
+            store.upsert_cell(
+                worker="local", profile="default", runtime=runtime, ready=True,
+                fingerprint=fingerprint * 64,
+                session_fingerprint=("c" if runtime == "download" else "g") * 64 if runtime in {"download", "upload", "storage"} else "",
+                destination_fingerprint=self.control.tdl_access_store.destination_fingerprint("123") if runtime == "storage" else "",
+                checked_at=checked_at,
+            )
+        # Storage and Upload must refer to the same Upload lane session.
+        store.upsert_cell(worker="local", profile="default", runtime="storage", ready=True, fingerprint="f" * 64, session_fingerprint="g" * 64, destination_fingerprint=self.control.tdl_access_store.destination_fingerprint("123"), checked_at=checked_at)
+        store.upsert_cell(worker="local", profile="default", runtime="upload", ready=True, fingerprint="e" * 64, session_fingerprint="g" * 64, checked_at=checked_at)
+        self.dispatcher.quickmode_runtime_readiness = lambda *_args: self.fail("Quick Mode profile calculation must not probe workers")
+        self.dispatcher.rclone_storage_runtime_readiness = lambda *_args: self.fail("Quick Mode profile calculation must not probe rclone")
+        self.dispatcher.start_profile_readiness_canary = lambda *_args, **_kwargs: self.fail("Quick Mode profile calculation must not start a canary")
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/service",
+            headers=auth,
+            json={"worker": "local", "profile": "default", "runtime": "quick_mode"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            completed = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            )
+            if completed.json()["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["status"], "succeeded")
+        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
+
+    def test_targeted_tts_profile_scan_updates_helper_dependency_and_only_selected_profile(self):
+        auth = self.login(42)
+        checked_at = "2026-10-31T10:00:00Z"
+        self.local_profile_catalog.replace_scan(
+            checked_at=checked_at,
+            workers=[{"name": "local", "status": "success", "checked_at": checked_at}],
+            inventories=[{"worker": "local", "checked_at": checked_at, "items": [{"name": "default"}]}],
+        )
+        self.dispatcher.profile_local_inventory = lambda _worker: self.fail(
+            "targeted TTS scan must not read the worker's full profile inventory"
+        )
+        self.dispatcher.profile_tdl_diagnostic_result["fingerprint"] = "a" * 64
+        self.dispatcher.tts_health_result = {
+            "helpers_ready": True,
+            "available_profiles": ["default"],
+            "helpers": [
+                {"slot": slot, "status": "ready", "bootstrap_percent": 100, "checked_at": checked_at}
+                for slot in range(1, 4)
+            ],
+        }
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile="default", runtime="export", ready=True,
+            fingerprint="b" * 64, checked_at=checked_at,
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile="archive", runtime="tts", ready=True,
+            fingerprint="c" * 64, checked_at=checked_at,
+        )
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/service",
+            headers=auth,
+            json={"worker": "local", "profile": "default", "runtime": "tts"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            completed = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            )
+            if completed.json()["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+        self.assertEqual(completed.status_code, 200, completed.text)
+        self.assertEqual(completed.json()["status"], "succeeded")
+        self.assertEqual(self.dispatcher.profile_readiness_canary_scopes[-1], ("tts",))
+        self.assertEqual(self.dispatcher.tts_health_calls, ["local"])
+        self.assertEqual(self.runtime_readiness_store.cell("local", None, "tts_helper")["status"], "ready")
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["status"], "ready")
+        self.assertEqual(self.runtime_readiness_store.cell("local", "archive", "tts")["checked_at"], checked_at)
+        self.assertEqual(self.runtime_readiness_store.cell("local", "default", "export")["checked_at"], checked_at)
 
     def test_local_profile_scan_distinguishes_timeout_offline_and_worker_api_failure(self):
         from tme3bot.infrastructure.http_client import JsonHttpError

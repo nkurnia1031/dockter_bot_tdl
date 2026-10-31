@@ -420,6 +420,17 @@ class WorkerEnabledRequest(BaseModel):
     enabled: bool
 
 
+class WorkerRuntimeScanRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=48)
+    runtime: str = Field(min_length=1, max_length=48)
+
+
+class ProfileRuntimeScanRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=48)
+    profile: str = Field(min_length=1, max_length=48)
+    runtime: str = Field(min_length=1, max_length=48)
+
+
 class WorkerRuntimeSettingsRequest(BaseModel):
     worker_api_token: str | None = Field(default=None, min_length=16, max_length=512)
     job_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)

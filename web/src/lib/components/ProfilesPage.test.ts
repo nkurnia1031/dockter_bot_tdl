@@ -203,6 +203,145 @@ describe('ProfilesPage', () => {
     expect(hierarchy.textContent).toContain('Addon Resolver tidak dapat digunakan pada worker.');
   });
 
+  it('scans only the selected worker runtime and opens its safe attempt log', async () => {
+    const requests: { url: string; method: string; body?: string }[] = [];
+    const catalog = {
+      checked_at: '2026-10-31T10:00:00Z',
+      workers: [{ name: 'local', status: 'success', checked_at: '2026-10-31T10:00:00Z', error_code: '' }],
+      inventories: [{ worker: 'local', checked_at: '2026-10-31T10:00:00Z', items: [] }],
+      runtime_readiness: {
+        checked_at: '2026-10-31T10:00:00Z',
+        workers: [{ name: 'local', status: 'success', checked_at: '2026-10-31T10:00:00Z', reason_code: '' }],
+        cells: [{
+          worker: 'local', profile: null, runtime: 'resolver', status: 'ready',
+          checked_at: '2026-10-31T10:00:00Z', reason_code: '',
+          last_attempt: {
+            target: { worker: 'local', profile: null, runtime: 'resolver' },
+            checked_at: '2026-10-31T10:00:00Z', phase: 'runtime_probe',
+            checks: [{ name: 'resolver', status: 'ready', reason_code: '' }],
+            reason_code: '', dependencies: [],
+            cleanup: { status: 'not_needed', reason_code: '' },
+            stdout: 'NEVER-SHOW-RAW-OUTPUT',
+          },
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined });
+      if (url === '/api/v1/workers') {
+        return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local') return new Response(JSON.stringify(catalog), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan') return new Response(JSON.stringify({ operation: null }), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan/runtime' && method === 'POST') {
+        return new Response(JSON.stringify({
+          id: 'runtime-scan-1', status: 'succeeded', target: {
+            kind: 'worker_runtime', worker: 'local', runtime: 'resolver',
+          }, error_code: '', progress: { workers: [{
+            name: 'local', status: 'succeeded', phase: 'complete', error_code: '',
+            runtime: 'resolver', checks: { resolver: { ready: true, reason_code: '' } }, profiles: [],
+          }], total_workers: 1, completed_workers: 1, total_profiles: 0, completed_profiles: 0 },
+        }), { status: 202 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+
+    const scanButton = await screen.findByRole('button', { name: 'Scan Resolver worker local' });
+    await fireEvent.click(scanButton);
+
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/local/scan/runtime',
+      method: 'POST',
+      body: JSON.stringify({ worker: 'local', runtime: 'resolver' }),
+    });
+    expect(screen.getByRole('status', { name: 'Progress Scan Profil' }).textContent).toContain('Resolver: Siap');
+    const logButton = screen.getByRole('button', { name: 'Lihat log uji Resolver worker local' });
+    await fireEvent.click(logButton);
+    const dialog = screen.getByRole('dialog', { name: 'Log uji Resolver worker local' });
+    expect(dialog.textContent).toContain('runtime_probe');
+    expect(dialog.textContent).toContain('2026');
+    expect(dialog.textContent).toContain('Siap');
+    expect(dialog.textContent).not.toContain('NEVER-SHOW-RAW-OUTPUT');
+  });
+
+  it('targets profile service scans to one worker and profile and opens that cell log', async () => {
+    const requests: { url: string; method: string; body?: string }[] = [];
+    const catalog = {
+      checked_at: '2026-10-31T10:00:00Z',
+      workers: [{ name: 'local', status: 'success', checked_at: '2026-10-31T10:00:00Z', error_code: '' }],
+      inventories: [{ worker: 'local', checked_at: '2026-10-31T10:00:00Z', items: [{
+        name: 'default', ready: true, deletable: false, reason_codes: [], checks: [],
+        upload_lane: { status: 'ready', phase: 'ready', progress: 100, code: 'OK', updated_at: '' },
+      }] }],
+      runtime_readiness: {
+        checked_at: '2026-10-31T10:00:00Z',
+        workers: [{ name: 'local', status: 'success', checked_at: '2026-10-31T10:00:00Z', reason_code: '' }],
+        cells: [{
+          worker: 'local', profile: 'default', runtime: 'storage', status: 'ready',
+          checked_at: '2026-10-31T10:00:00Z', reason_code: '',
+          last_attempt: {
+            target: { worker: 'local', profile: 'default', runtime: 'storage' },
+            checked_at: '2026-10-31T10:00:00Z', phase: 'verify_storage',
+            checks: [{ name: 'upload', status: 'ready', reason_code: '' }, { name: 'storage', status: 'ready', reason_code: '' }],
+            reason_code: '', dependencies: ['export', 'upload'],
+            cleanup: { status: 'succeeded', reason_code: '' },
+            stdout: 'NEVER-SHOW-CANARY-OUTPUT',
+          },
+        }],
+      },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined });
+      if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      if (url === '/api/v1/profiles/local') return new Response(JSON.stringify(catalog), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan') return new Response(JSON.stringify({ operation: null }), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan/service' && method === 'POST') {
+        const target = JSON.parse(String(init?.body || '{}')) as { worker: string; profile: string; runtime: string };
+        return new Response(JSON.stringify({
+          id: `profile-${target.runtime}-scan-1`, status: 'succeeded', target: {
+            kind: 'profile_runtime', ...target,
+          }, error_code: '', progress: { workers: [{
+            name: 'local', status: 'succeeded', phase: 'complete', error_code: '',
+            profiles: [{ name: 'default', status: 'succeeded', phase: 'complete', error_code: '', checks: {
+              [target.runtime]: { ready: true, reason_code: '' },
+            } }],
+          }], total_workers: 1, completed_workers: 1, total_profiles: 1, completed_profiles: 1 },
+        }), { status: 202 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    await fireEvent.click(await screen.findByRole('button', { name: 'Scan Storage profil default worker local' }));
+
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/local/scan/service',
+      method: 'POST',
+      body: JSON.stringify({ worker: 'local', profile: 'default', runtime: 'storage' }),
+    });
+    const logButton = screen.getByRole('button', { name: 'Lihat log uji Storage profil default worker local' });
+    await fireEvent.click(logButton);
+    const dialog = screen.getByRole('dialog', { name: 'Log uji Storage profil default worker local' });
+    expect(dialog.textContent).toContain('Profil default');
+    expect(dialog.textContent).toContain('verify_storage');
+    expect(dialog.textContent).toContain('Export, Upload');
+    expect(dialog.textContent).toContain('Cleanup');
+    expect(dialog.textContent).not.toContain('NEVER-SHOW-CANARY-OUTPUT');
+    await fireEvent.click(screen.getByRole('button', { name: 'Tutup log uji' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan Quick Mode profil default worker local' }));
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/local/scan/service',
+      method: 'POST',
+      body: JSON.stringify({ worker: 'local', profile: 'default', runtime: 'quick_mode' }),
+    });
+  });
+
   it('shows worker-only rclone Storage readiness saved by Profile scan', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);

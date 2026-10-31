@@ -4,6 +4,17 @@ export type LocalProfileOption = {
   exclusive_worker: string;
 };
 
+export type RuntimeReadinessAttempt = {
+  target: { worker: string; profile: string | null; runtime: string };
+  checked_at: string;
+  phase: string;
+  checks: { name: string; status: 'ready' | 'not_ready' | 'failed'; reason_code: string }[];
+  status: 'ready' | 'not_ready';
+  reason_code: string;
+  dependencies: string[];
+  cleanup: { status: 'not_needed' | 'succeeded' | 'failed'; reason_code: string };
+};
+
 export type RuntimeReadinessCell = {
   worker: string;
   profile: string | null;
@@ -11,6 +22,7 @@ export type RuntimeReadinessCell = {
   status: 'ready' | 'not_ready';
   checked_at: string;
   reason_code: string;
+  last_attempt?: RuntimeReadinessAttempt;
 };
 
 export type RuntimeReadinessWorker = {
@@ -30,7 +42,47 @@ export type RuntimeReadinessResult = {
   status: 'ready' | 'not_ready' | 'offline' | 'disabled' | 'unscanned';
   checked_at: string;
   reason_code: string;
+  last_attempt?: RuntimeReadinessAttempt;
 };
+
+function normalizeRuntimeAttempt(
+  value: unknown,
+  target: RuntimeReadinessAttempt['target']
+): RuntimeReadinessAttempt | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Record<string, unknown>;
+  const status = String(raw.status || '');
+  if (!['ready', 'not_ready'].includes(status)) return undefined;
+  const checks = Array.isArray(raw.checks) ? raw.checks.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const check = item as Record<string, unknown>;
+    const checkStatus = String(check.status || '');
+    const name = String(check.name || '').trim().toLowerCase();
+    if (!name || !['ready', 'not_ready', 'failed'].includes(checkStatus)) return [];
+    return [{ name, status: checkStatus as 'ready' | 'not_ready' | 'failed', reason_code: String(check.reason_code || '') }];
+  }) : [];
+  const rawCleanup = raw.cleanup && typeof raw.cleanup === 'object'
+    ? raw.cleanup as Record<string, unknown>
+    : {};
+  const cleanupStatus = String(rawCleanup.status || 'not_needed');
+  return {
+    target,
+    checked_at: String(raw.checked_at || ''),
+    phase: String(raw.phase || ''),
+    checks,
+    status: status as RuntimeReadinessAttempt['status'],
+    reason_code: String(raw.reason_code || ''),
+    dependencies: Array.isArray(raw.dependencies)
+      ? raw.dependencies.map((item) => String(item || '').trim().toLowerCase()).filter(Boolean).slice(0, 16)
+      : [],
+    cleanup: {
+      status: ['not_needed', 'succeeded', 'failed'].includes(cleanupStatus)
+        ? cleanupStatus as RuntimeReadinessAttempt['cleanup']['status']
+        : 'failed',
+      reason_code: String(rawCleanup.reason_code || '')
+    }
+  };
+}
 
 export function normalizeRuntimeReadiness(value: unknown): RuntimeReadinessSnapshot {
   const payload = value && typeof value === 'object' ? value as Record<string, unknown> : {};
@@ -58,14 +110,17 @@ export function normalizeRuntimeReadiness(value: unknown): RuntimeReadinessSnaps
     const runtime = String(item.runtime || '').trim().toLowerCase();
     const status = String(item.status || '');
     if (!worker || !runtime || !['ready', 'not_ready'].includes(status)) return [];
-    return [{
+    const normalizedCell: RuntimeReadinessCell = {
       worker,
       profile,
       runtime,
       status: status as RuntimeReadinessCell['status'],
       checked_at: String(item.checked_at || ''),
       reason_code: String(item.reason_code || '')
-    }];
+    };
+    const attempt = normalizeRuntimeAttempt(item.last_attempt, { worker, profile, runtime });
+    if (attempt) normalizedCell.last_attempt = attempt;
+    return [normalizedCell];
   }) : [];
   return {
     checked_at: String(payload.checked_at || ''),
@@ -100,7 +155,8 @@ export function runtimeReadinessFor(
   return {
     status: cell.status,
     checked_at: cell.checked_at,
-    reason_code: cell.reason_code
+    reason_code: cell.reason_code,
+    last_attempt: cell.last_attempt
   };
 }
 

@@ -264,13 +264,29 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         dependencies=[Depends(authorize)],
     )
     def start_profile_readiness_canary(body: dict[str, Any]):
-        if set(body) != {"profile", "storage_target", "tts_target"} or any(
+        required = {"profile", "storage_target", "tts_target"}
+        if not required.issubset(body) or set(body) - (required | {"checks"}) or any(
             not isinstance(body.get(key), str)
-            for key in ("profile", "storage_target", "tts_target")
+            for key in required
         ):
             raise DomainError(
                 "PROFILE_CANARY_REQUEST_INVALID",
                 "Target canary profil tidak valid.",
+                status_code=422,
+            )
+        checks = body.get("checks")
+        if checks is not None and (
+            not isinstance(checks, list)
+            or not checks
+            or any(
+                not isinstance(item, str)
+                or item not in {"export", "download", "storage", "tts"}
+                for item in checks
+            )
+        ):
+            raise DomainError(
+                "PROFILE_CANARY_REQUEST_INVALID",
+                "Cakupan canary profil tidak valid.",
                 status_code=422,
             )
         start = getattr(context.executor, "start_profile_readiness_canary", None)
@@ -281,8 +297,12 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 status_code=404,
             )
         try:
+            if checks is None:
+                return start(
+                    body["profile"], body["storage_target"], body["tts_target"]
+                )
             return start(
-                body["profile"], body["storage_target"], body["tts_target"]
+                body["profile"], body["storage_target"], body["tts_target"], checks
             )
         except ValueError:
             raise DomainError(

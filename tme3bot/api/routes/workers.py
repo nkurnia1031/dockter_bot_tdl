@@ -16,9 +16,11 @@ from tme3bot.api.schemas import (
     WorkerRequest,
     WorkerRouteRequest,
     WorkerRuntimeSettingsRequest,
+    WorkerRuntimeScanRequest,
     WorkerTtsHealthResponse,
     WorkerTtsRecoveryResponse,
     WorkerUpdateRequest,
+    ProfileRuntimeScanRequest,
 )
 from tme3bot.domain.models import DomainError
 from tme3bot.application.profile_scan import ProfileScanOperations
@@ -32,6 +34,14 @@ from tme3bot.profile_diagnostics import (
     PROFILE_UPLOAD_LANE_STATUSES,
 )
 from tme3bot.worker_registry import WORKER_NAME_RE
+
+_WORKER_RUNTIME_SCAN_TARGETS = {
+    "resolver",
+    "tts_helper",
+    "quick_mode_runtime",
+    "rclone_storage",
+}
+_PROFILE_RUNTIME_SCAN_TARGETS = {"export", "download", "storage", "tts", "quick_mode"}
 
 
 def _safe_local_profile_inventory(payload, *, worker: str) -> dict:
@@ -695,6 +705,8 @@ def register_workers(app, context, *, current_actor):
                         checks=checks,
                     )
                 cleanup = cleanup_canary_messages(canary_state.get("messages"))
+                item["_profile_scan_checks"] = checks
+                item["_profile_scan_cleanup"] = cleanup
                 export_ready = ready and checks["export"]["ready"]
                 download_ready = ready and checks["download"]["ready"]
                 upload_ready = ready and checks["upload"]["ready"] and bool(upload_fingerprint)
@@ -728,6 +740,11 @@ def register_workers(app, context, *, current_actor):
                     quick_reason = checks["export"]["reason_code"] or "PROFILE_CANARY_EXPORT_FAILED"
                 elif not download_ready:
                     quick_reason = checks["download"]["reason_code"] or "PROFILE_CANARY_DOWNLOAD_FAILED"
+                elif not rclone_storage_readiness.get("ready"):
+                    quick_reason = str(
+                        rclone_storage_readiness.get("reason_code")
+                        or "RCLONE_ACCESS_FAILED"
+                    )
                 elif not storage_ready:
                     quick_reason = checks["storage"]["reason_code"] or checks["upload"]["reason_code"] or "PROFILE_CANARY_STORAGE_VERIFY_FAILED"
                 quickmode_cells.append((item, {"profile": profile, "ready": not quick_reason, "reason_code": quick_reason, "session_fingerprint": fingerprint, "destination_fingerprint": storage_destination_hash, "rclone_destination_fingerprint": rclone_destination_fingerprint}))
@@ -745,7 +762,7 @@ def register_workers(app, context, *, current_actor):
                 if quickmode_cell["ready"] and not storage_sender_profiles:
                     quickmode_cell.update(ready=False, reason_code="TDL_ACCESS_NOT_VERIFIED")
                 if quickmode_cell["ready"]:
-                    quick_evidence = {"runtime": "quick-mode-readiness-v1", "worker": name, "profile": quickmode_cell["profile"], "export_session": quickmode_cell["session_fingerprint"], "quick_runtime": str(quick_runtime.get("fingerprint") or ""), "storage_destination": storage_destination_hash, "senders": storage_sender_fingerprints, "rclone_destination": rclone_destination_fingerprint}
+                    quick_evidence = {"runtime": "quick-mode-readiness-v1", "worker": name, "profile": quickmode_cell["profile"], "export_session": quickmode_cell["session_fingerprint"], "quick_runtime": str(quick_runtime.get("fingerprint") or ""), "rclone_runtime": str(rclone_storage_readiness.get("fingerprint") or ""), "storage_destination": storage_destination_hash, "senders": storage_sender_fingerprints, "rclone_destination": rclone_destination_fingerprint}
                     quick_fingerprint = hashlib.sha256(json.dumps(quick_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
                     quickmode_cell["fingerprint"] = quick_fingerprint
                 else:
@@ -865,6 +882,31 @@ def register_workers(app, context, *, current_actor):
         readiness_rclone_storage: dict[str, dict] = {}
         readiness_download: dict[str, list[dict]] = {}
         readiness_upload: dict[str, list[dict]] = {}
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+        def profile_attempt(
+            worker: str,
+            profile: str,
+            runtime: str,
+            checks: dict,
+            dependencies: list[str],
+            cleanup: dict,
+            *,
+            phase: str = "complete",
+            extra_checks: list[dict] | None = None,
+        ) -> dict:
+            return _profile_readiness_attempt(
+                worker,
+                profile,
+                runtime,
+                checked_at,
+                phase,
+                checks,
+                dependencies,
+                cleanup,
+                extra_checks=extra_checks,
+            )
+
         for name in scan_names:
             (
                 inventory, error_code, tts_worker, quickmode_worker, tts_cells,
@@ -897,17 +939,144 @@ def register_workers(app, context, *, current_actor):
             safe_items = []
             readiness_profiles[name] = []
             for item in inventory.get("items", []):
+                profile = str(item.get("name") or "")
+                checks = item.get("_profile_scan_checks")
+                checks = checks if isinstance(checks, dict) else {}
+                cleanup = item.get("_profile_scan_cleanup")
+                cleanup = cleanup if isinstance(cleanup, dict) else {
+                    "status": "not_needed", "items": []
+                }
+
+                def selected_checks(*names: str) -> dict:
+                    return {
+                        check_name: checks.get(
+                            check_name,
+                            {"ready": False, "reason_code": "PROFILE_CANARY_NOT_RUN"},
+                        )
+                        for check_name in names
+                    }
+
                 readiness = item.get("_runtime_readiness")
                 if isinstance(readiness, dict):
+                    readiness["last_attempt"] = profile_attempt(
+                        name, profile, "export", selected_checks("export"), [], cleanup
+                    )
                     readiness_profiles[name].append(readiness)
+                download_readiness = item.get("_download_readiness")
+                if isinstance(download_readiness, dict):
+                    download_readiness["last_attempt"] = profile_attempt(
+                        name,
+                        profile,
+                        "download",
+                        selected_checks("export", "download"),
+                        ["export"],
+                        cleanup,
+                    )
+                upload_readiness = item.get("_upload_readiness")
+                if isinstance(upload_readiness, dict):
+                    upload_readiness["last_attempt"] = profile_attempt(
+                        name,
+                        profile,
+                        "upload",
+                        selected_checks("upload"),
+                        ["export"],
+                        cleanup,
+                    )
+                storage_readiness = item.get("_storage_readiness")
+                if isinstance(storage_readiness, dict):
+                    storage_readiness["last_attempt"] = profile_attempt(
+                        name,
+                        profile,
+                        "storage",
+                        selected_checks("export", "upload", "storage"),
+                        ["export", "upload"],
+                        cleanup,
+                    )
+                tts_readiness = next(
+                    (
+                        cell for cell in readiness_tts.get(name, [])
+                        if cell.get("profile") == profile
+                    ),
+                    None,
+                )
+                if tts_readiness is not None:
+                    tts_checks = selected_checks("export", "tts")
+                    helper = readiness_tts_workers.get(name, {})
+                    helper_ready = helper.get("ready") is True
+                    tts_checks["tts_helper"] = {
+                        "ready": helper_ready,
+                        "reason_code": "" if helper_ready else str(
+                            helper.get("reason_code") or "TTS_HELPER_UNAVAILABLE"
+                        ),
+                    }
+                    tts_readiness["last_attempt"] = profile_attempt(
+                        name,
+                        profile,
+                        "tts",
+                        tts_checks,
+                        ["export", "tts_helper"],
+                        cleanup,
+                    )
                 quickmode_readiness = item.get("_quickmode_readiness")
                 if isinstance(quickmode_readiness, dict):
+                    quick_runtime_ready = quickmode_worker.get("ready") is True
+                    rclone_ready = rclone_storage_readiness.get("ready") is True
+                    quick_checks = [
+                        {
+                            "name": "quick_mode_runtime",
+                            "status": "ready" if quick_runtime_ready else "not_ready",
+                            "reason_code": "" if quick_runtime_ready else str(
+                                quickmode_worker.get("reason_code")
+                                or "QUICK_MODE_RUNTIME_UNAVAILABLE"
+                            ),
+                        },
+                        {
+                            "name": "rclone_storage",
+                            "status": "ready" if rclone_ready else "not_ready",
+                            "reason_code": "" if rclone_ready else str(
+                                rclone_storage_readiness.get("reason_code")
+                                or "RCLONE_ACCESS_FAILED"
+                            ),
+                        },
+                    ]
+                    for dependency_name in ("export", "download", "upload", "storage"):
+                        dependency = checks.get(dependency_name, {})
+                        quick_checks.append({
+                            "name": dependency_name,
+                            "status": "ready" if dependency.get("ready") is True else "not_ready",
+                            "reason_code": str(
+                                dependency.get("reason_code") or "PROFILE_CANARY_NOT_RUN"
+                            ),
+                        })
+                    quick_ready = quickmode_readiness.get("ready") is True
+                    quick_checks.append({
+                        "name": "quick_mode",
+                        "status": "ready" if quick_ready else "not_ready",
+                        "reason_code": "" if quick_ready else str(
+                            quickmode_readiness.get("reason_code")
+                            or "QUICK_MODE_EVIDENCE_INCOMPLETE"
+                        ),
+                    })
+                    quickmode_readiness["last_attempt"] = profile_attempt(
+                        name,
+                        profile,
+                        "quick_mode",
+                        {},
+                        [
+                            "quick_mode_runtime", "rclone_storage", "export",
+                            "download", "upload", "storage",
+                        ],
+                        cleanup,
+                        phase="derived_readiness",
+                        extra_checks=quick_checks,
+                    )
                     readiness_quickmode[name].append(quickmode_readiness)
                 safe_items.append({
                     key: value for key, value in item.items()
                     if key not in {
                         "_runtime_readiness", "_quickmode_readiness", "_storage_readiness",
-                        "_download_readiness", "_upload_readiness",
+                        "_download_readiness", "_upload_readiness", "_profile_scan_checks",
+                        "_profile_scan_cleanup",
                     }
                 })
             inventories.append({
@@ -916,7 +1085,23 @@ def register_workers(app, context, *, current_actor):
                 "items": safe_items,
             })
 
-        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        def runtime_attempt(worker: str, runtime: str, readiness: dict) -> dict:
+            ready = readiness.get("ready") is True
+            reason = str(readiness.get("reason_code") or "")
+            return {
+                "target": {"worker": worker, "profile": None, "runtime": runtime},
+                "checked_at": checked_at,
+                "phase": "runtime_probe",
+                "checks": [{
+                    "name": runtime,
+                    "status": "ready" if ready else "not_ready",
+                    "reason_code": "" if ready else reason,
+                }],
+                "reason_code": "" if ready else reason,
+                "dependencies": [],
+                "cleanup": {"status": "not_needed", "reason_code": ""},
+            }
+
         def apply_committed_scan(_snapshot: dict) -> None:
             # Keep every persisted scan result behind the same revision check.
             # A confirmed delete cannot interleave and then be overwritten by
@@ -1019,6 +1204,7 @@ def register_workers(app, context, *, current_actor):
                     fingerprint=str(readiness.get("fingerprint") or ""),
                     reason_code=str(readiness.get("reason_code") or "TTS_HELPER_UNAVAILABLE"),
                     checked_at=checked_at,
+                    last_attempt=runtime_attempt(name, "tts_helper", readiness),
                 )
             for name, readiness in readiness_quickmode_workers.items():
                 runtime_store.upsert_cell(
@@ -1029,6 +1215,7 @@ def register_workers(app, context, *, current_actor):
                     fingerprint=str(readiness.get("fingerprint") or ""),
                     reason_code=str(readiness.get("reason_code") or "QUICK_MODE_RUNTIME_UNAVAILABLE"),
                     checked_at=checked_at,
+                    last_attempt=runtime_attempt(name, "quick_mode_runtime", readiness),
                 )
             apply_tts_scan = getattr(runtime_store, "apply_tts_scan", None)
             if callable(apply_tts_scan):
@@ -1050,7 +1237,13 @@ def register_workers(app, context, *, current_actor):
             if callable(apply_resolver_scan):
                 apply_resolver_scan(
                     checked_at=checked_at,
-                    workers=readiness_resolver,
+                    workers={
+                        name: {
+                            **readiness,
+                            "last_attempt": runtime_attempt(name, "resolver", readiness),
+                        }
+                        for name, readiness in readiness_resolver.items()
+                    },
                 )
             for name, readiness in readiness_rclone_storage.items():
                 runtime_store.upsert_cell(
@@ -1066,6 +1259,7 @@ def register_workers(app, context, *, current_actor):
                         readiness.get("reason_code") or "RCLONE_ACCESS_FAILED"
                     ),
                     checked_at=checked_at,
+                    last_attempt=runtime_attempt(name, "rclone_storage", readiness),
                 )
 
         snapshot = store.replace_scan(
@@ -1079,6 +1273,631 @@ def register_workers(app, context, *, current_actor):
             raise RuntimeError("profile scan superseded by a profile mutation")
         return _profile_catalog_response(snapshot)
 
+    def _scan_worker_runtime(worker: str, runtime: str) -> dict:
+        defaults = {
+            "resolver": "RESOLVER_RUNTIME_UNAVAILABLE",
+            "tts_helper": "TTS_HELPER_UNAVAILABLE",
+            "quick_mode_runtime": "QUICK_MODE_RUNTIME_UNAVAILABLE",
+            "rclone_storage": "RCLONE_ACCESS_FAILED",
+        }
+        reason = defaults[runtime]
+        ready = False
+        fingerprint = ""
+        destination_fingerprint = ""
+        dispatcher = context.worker_dispatcher
+        utility_settings = getattr(context, "utility_settings", None)
+        settings_getter = getattr(utility_settings, "get", None)
+        settings = settings_getter() if callable(settings_getter) else {}
+        settings = settings if isinstance(settings, dict) else {}
+        rclone_destination = str(
+            settings.get("rclone_destination") or "googledrive:backup"
+        ).strip()
+
+        try:
+            if runtime == "resolver":
+                probe = getattr(dispatcher, "safelink_runtime_readiness", None)
+                if not callable(probe):
+                    reason = "WORKER_UPDATE_REQUIRED"
+                else:
+                    raw = probe(worker)
+                    raw_fingerprint = str(raw.get("fingerprint") or "").strip().lower() if isinstance(raw, dict) else ""
+                    raw_reason = str(raw.get("reason_code") or reason) if isinstance(raw, dict) else reason
+                    if isinstance(raw, dict) and type(raw.get("ready")) is bool:
+                        ready = raw["ready"] is True and bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
+                        fingerprint = raw_fingerprint if ready else ""
+                        reason = "" if ready else (
+                            "RESOLVER_FINGERPRINT_MISSING"
+                            if raw.get("ready") is True and not fingerprint
+                            else raw_reason
+                        )
+            elif runtime == "tts_helper":
+                probe = getattr(dispatcher, "tts_health", None)
+                if not callable(probe):
+                    reason = "WORKER_UPDATE_REQUIRED"
+                else:
+                    ready, reason, fingerprint = _tts_runtime_evidence(probe(worker))
+            elif runtime == "quick_mode_runtime":
+                probe = getattr(dispatcher, "quickmode_runtime_readiness", None)
+                if not callable(probe):
+                    reason = "WORKER_UPDATE_REQUIRED"
+                else:
+                    raw = probe(worker, rclone_destination)
+                    raw_fingerprint = str(raw.get("fingerprint") or "").strip().lower() if isinstance(raw, dict) else ""
+                    raw_reason = str(raw.get("reason_code") or reason) if isinstance(raw, dict) else reason
+                    if isinstance(raw, dict) and type(raw.get("ready")) is bool:
+                        has_fingerprint = bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
+                        ready = raw["ready"] is True and has_fingerprint
+                        fingerprint = raw_fingerprint if ready else ""
+                        reason = "" if ready else (
+                            "QUICK_MODE_FINGERPRINT_MISSING"
+                            if raw.get("ready") is True and not has_fingerprint
+                            else raw_reason
+                        )
+            elif runtime == "rclone_storage":
+                probe = getattr(dispatcher, "rclone_storage_runtime_readiness", None)
+                if not callable(probe):
+                    reason = "WORKER_UPDATE_REQUIRED"
+                else:
+                    raw = probe(worker, rclone_destination)
+                    raw_fingerprint = str(raw.get("fingerprint") or "").strip().lower() if isinstance(raw, dict) else ""
+                    raw_reason = str(raw.get("reason_code") or reason) if isinstance(raw, dict) else reason
+                    if isinstance(raw, dict) and type(raw.get("ready")) is bool:
+                        has_fingerprint = bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
+                        ready = raw["ready"] is True and has_fingerprint
+                        fingerprint = raw_fingerprint if ready else ""
+                        destination_fingerprint = (
+                            hashlib.sha256(rclone_destination.encode("utf-8")).hexdigest()
+                            if ready else ""
+                        )
+                        reason = "" if ready else (
+                            "RCLONE_FINGERPRINT_MISSING"
+                            if raw.get("ready") is True and not has_fingerprint
+                            else raw_reason
+                        )
+        except JsonHttpError as exc:
+            reason = "WORKER_UPDATE_REQUIRED" if exc.status == 404 else defaults[runtime]
+        except Exception:
+            reason = defaults[runtime]
+
+        if reason and not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", reason):
+            reason = defaults[runtime]
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        attempt = {
+            "target": {"worker": worker, "profile": None, "runtime": runtime},
+            "checked_at": checked_at,
+            "phase": "runtime_probe",
+            "checks": [{
+                "name": runtime,
+                "status": "ready" if ready else "not_ready",
+                "reason_code": "" if ready else reason,
+            }],
+            "reason_code": "" if ready else reason,
+            "dependencies": [],
+            "cleanup": {"status": "not_needed", "reason_code": ""},
+        }
+        store = getattr(context, "runtime_readiness_store", None)
+        upsert = getattr(store, "upsert_cell", None)
+        if not callable(upsert):
+            raise RuntimeError("Runtime readiness store tidak tersedia.")
+        upsert(
+            worker=worker,
+            profile=None,
+            runtime=runtime,
+            ready=ready,
+            fingerprint=fingerprint,
+            destination_fingerprint=destination_fingerprint,
+            reason_code=reason,
+            checked_at=checked_at,
+            last_attempt=attempt,
+        )
+        return {"ready": ready, "reason_code": "" if ready else reason}
+
+    def _scan_profile_runtime(
+        worker: str, profile: str, runtime: str, report
+    ) -> dict:
+        """Probe one profile service and persist only its result cells."""
+        checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        readiness_store = getattr(context, "runtime_readiness_store", None)
+        if not callable(getattr(readiness_store, "upsert_cell", None)):
+            raise RuntimeError("Runtime readiness store tidak tersedia.")
+        if runtime == "quick_mode":
+            report(
+                "derived_readiness",
+                {},
+                dependencies=[
+                    "quick_mode_runtime", "rclone_storage", "export", "download",
+                    "upload", "storage",
+                ],
+            )
+            return _recalculate_quick_mode(worker, profile, checked_at)
+
+        control = getattr(context, "control_plane", None)
+        target_resolver = getattr(control, "_tdl_access_target", None)
+        storage_target = (
+            str(target_resolver("storage") or "").strip()
+            if callable(target_resolver)
+            else ""
+        )
+        tts_target = (
+            str(target_resolver("tts") or "").strip()
+            if callable(target_resolver)
+            else ""
+        )
+        access_store = getattr(control, "tdl_access_store", None)
+
+        def destination_fingerprint(target: str) -> str:
+            if not target:
+                return ""
+            method = getattr(access_store, "destination_fingerprint", None)
+            return (
+                str(method(target) or "")
+                if callable(method)
+                else hashlib.sha256(target.encode("utf-8")).hexdigest()
+            )
+
+        dependencies = {
+            "export": [],
+            "download": ["export"],
+            "storage": ["export", "upload"],
+            "tts": ["export", "tts_helper"],
+        }[runtime]
+        relevant_check_names = {
+            "export": ("export",),
+            "download": ("export", "download"),
+            "storage": ("export", "upload", "storage"),
+            "tts": ("export", "tts"),
+        }[runtime]
+        report("session_probe", {}, dependencies=dependencies)
+        checks: dict[str, dict] = {}
+        cleanup = {"status": "not_needed", "items": []}
+        canary_state: dict = {}
+        helper_ready = True
+        helper_reason = ""
+        helper_fingerprint = ""
+        dispatcher = context.worker_dispatcher
+
+        if runtime == "tts":
+            tts_probe = getattr(dispatcher, "tts_health", None)
+            try:
+                if not callable(tts_probe):
+                    helper_ready, helper_reason = False, "WORKER_UPDATE_REQUIRED"
+                else:
+                    helper_ready, helper_reason, helper_fingerprint = _tts_runtime_evidence(
+                        tts_probe(worker)
+                    )
+            except JsonHttpError as exc:
+                helper_ready = False
+                helper_reason = "WORKER_UPDATE_REQUIRED" if exc.status == 404 else "TTS_RUNTIME_UNAVAILABLE"
+            except Exception:
+                helper_ready, helper_reason = False, "TTS_RUNTIME_UNAVAILABLE"
+            helper_attempt = {
+                "target": {"worker": worker, "profile": None, "runtime": "tts_helper"},
+                "checked_at": checked_at,
+                "phase": "runtime_probe",
+                "checks": [{
+                    "name": "tts_helper",
+                    "status": "ready" if helper_ready else "not_ready",
+                    "reason_code": "" if helper_ready else (helper_reason or "TTS_HELPER_UNAVAILABLE"),
+                }],
+                "reason_code": "" if helper_ready else (helper_reason or "TTS_HELPER_UNAVAILABLE"),
+                "dependencies": [],
+                "cleanup": {"status": "not_needed", "reason_code": ""},
+            }
+            readiness_store.upsert_cell(
+                worker=worker,
+                profile=None,
+                runtime="tts_helper",
+                ready=helper_ready,
+                fingerprint=helper_fingerprint,
+                reason_code="" if helper_ready else (helper_reason or "TTS_HELPER_UNAVAILABLE"),
+                checked_at=checked_at,
+                last_attempt=helper_attempt,
+            )
+            report(
+                "tts_helper_probe",
+                {"tts": {"ready": helper_ready, "reason_code": helper_reason}},
+                dependencies=dependencies,
+            )
+
+        canary_scope = {"export": "export", "download": "download", "storage": "storage", "tts": "tts"}[runtime]
+        canary_target = tts_target if runtime == "tts" else storage_target
+        if not canary_target:
+            reason = "TTS_CHAT_UNAVAILABLE" if runtime == "tts" else "TDL_ACCESS_TARGET_UNAVAILABLE"
+            checks = {runtime: {"ready": False, "reason_code": reason}}
+            if runtime == "storage":
+                checks["upload"] = {"ready": False, "reason_code": reason}
+        else:
+            start_canary = getattr(dispatcher, "start_profile_readiness_canary", None)
+            poll_canary = getattr(dispatcher, "profile_readiness_canary", None)
+            if not callable(start_canary) or not callable(poll_canary):
+                checks = {runtime: {"ready": False, "reason_code": "WORKER_UPDATE_REQUIRED"}}
+                if runtime == "storage":
+                    checks["upload"] = {"ready": False, "reason_code": "WORKER_UPDATE_REQUIRED"}
+            else:
+                try:
+                    canary_state = start_canary(
+                        worker,
+                        profile,
+                        storage_target,
+                        tts_target,
+                        checks=[canary_scope],
+                    )
+                    canary_id = str(canary_state.get("id") or "") if isinstance(canary_state, dict) else ""
+                    if not re.fullmatch(r"[0-9a-f-]{36}", canary_id):
+                        canary_state = {"status": "failed", "error_code": "PROFILE_CANARY_REQUEST_INVALID", "checks": {}, "messages": []}
+                    else:
+                        deadline = time.monotonic() + 900
+                        while True:
+                            phase = str(canary_state.get("phase") or "canary_running")
+                            raw_checks = _safe_profile_scan_checks(canary_state.get("checks"))
+                            checks = {key: raw_checks[key] for key in relevant_check_names}
+                            report(phase, checks, dependencies=dependencies)
+                            if str(canary_state.get("status") or "") in {"succeeded", "failed"}:
+                                break
+                            if time.monotonic() >= deadline:
+                                canary_state = {
+                                    **canary_state,
+                                    "status": "failed",
+                                    "error_code": "PROFILE_CANARY_TIMEOUT",
+                                }
+                                break
+                            time.sleep(1)
+                            canary_state = poll_canary(worker, canary_id)
+                            if not isinstance(canary_state, dict):
+                                canary_state = {"status": "failed", "error_code": "PROFILE_CANARY_FAILED", "checks": {}, "messages": []}
+                except JsonHttpError as exc:
+                    error_code = "WORKER_UPDATE_REQUIRED" if exc.status == 404 else "PROFILE_CANARY_FAILED"
+                    canary_state = {"status": "failed", "error_code": error_code, "checks": {}, "messages": []}
+                except Exception:
+                    canary_state = {"status": "failed", "error_code": "PROFILE_CANARY_FAILED", "checks": {}, "messages": []}
+                raw_checks = _safe_profile_scan_checks(canary_state.get("checks"))
+                checks = {key: raw_checks[key] for key in relevant_check_names}
+                canary_error = str(canary_state.get("error_code") or "PROFILE_CANARY_FAILED")
+                if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", canary_error):
+                    canary_error = "PROFILE_CANARY_FAILED"
+                for key, check in checks.items():
+                    if not check["ready"] and check["reason_code"] == "PROFILE_CANARY_NOT_RUN":
+                        check["reason_code"] = canary_error
+                raw_messages = canary_state.get("messages")
+                cleanup = _cleanup_profile_canary_messages(
+                    context,
+                    raw_messages,
+                    {"storage": storage_target, "tts": tts_target},
+                )
+
+        raw_session = str(canary_state.get("session_fingerprint") or "").strip().lower()
+        session_fingerprint = raw_session if re.fullmatch(r"[a-f0-9]{64}", raw_session) else ""
+        if checks.get("export", {}).get("ready") and not session_fingerprint:
+            checks["export"] = {"ready": False, "reason_code": "PROFILE_FINGERPRINT_MISSING"}
+            if runtime in {"download", "storage", "tts"}:
+                checks[runtime] = {"ready": False, "reason_code": "PROFILE_FINGERPRINT_MISSING"}
+        raw_upload_session = str(canary_state.get("upload_session_fingerprint") or "").strip().lower()
+        upload_session_fingerprint = raw_upload_session if re.fullmatch(r"[a-f0-9]{64}", raw_upload_session) else ""
+        if checks.get("upload", {}).get("ready") and not upload_session_fingerprint:
+            checks["upload"] = {"ready": False, "reason_code": "PROFILE_UPLOAD_SESSION_INVALID"}
+            checks["storage"] = {"ready": False, "reason_code": "PROFILE_UPLOAD_SESSION_INVALID"}
+
+        selected_check = "storage" if runtime == "storage" else runtime
+        selected = checks.get(selected_check, {"ready": False, "reason_code": "PROFILE_CANARY_NOT_RUN"})
+        ready = selected.get("ready") is True
+        reason = str(selected.get("reason_code") or "")
+        fingerprint = ""
+        current_session = session_fingerprint
+        destination_hash = destination_fingerprint(tts_target if runtime == "tts" else storage_target)
+        if runtime == "export" and ready:
+            fingerprint = session_fingerprint
+        elif runtime == "download" and ready:
+            fingerprint = _readiness_evidence_fingerprint(
+                runtime, worker, profile, session_fingerprint, destination_hash
+            )
+        elif runtime == "storage":
+            upload_check = checks.get("upload", {})
+            upload_ready = upload_check.get("ready") is True and bool(upload_session_fingerprint)
+            upload_reason = str(upload_check.get("reason_code") or "PROFILE_CANARY_UPLOAD_FAILED")
+            upload_fingerprint = _readiness_evidence_fingerprint(
+                "upload", worker, profile, upload_session_fingerprint, destination_fingerprint(storage_target)
+            ) if upload_ready else ""
+            storage_ready = ready and upload_ready and bool(destination_hash)
+            if not upload_ready:
+                reason = upload_reason
+            elif ready and not destination_hash:
+                storage_ready = False
+                reason = "TDL_ACCESS_TARGET_UNAVAILABLE"
+            checks["upload"] = {"ready": upload_ready, "reason_code": "" if upload_ready else upload_reason}
+            checks["storage"] = {"ready": storage_ready, "reason_code": "" if storage_ready else (reason or "PROFILE_CANARY_STORAGE_VERIFY_FAILED")}
+            upload_attempt = _profile_readiness_attempt(
+                worker, profile, "upload", checked_at, "complete",
+                {"upload": checks.get("upload", {"ready": False, "reason_code": upload_reason})},
+                ["export"], cleanup,
+            )
+            readiness_store.upsert_cell(
+                worker=worker,
+                profile=profile,
+                runtime="upload",
+                ready=upload_ready,
+                fingerprint=upload_fingerprint,
+                session_fingerprint=upload_session_fingerprint,
+                reason_code=upload_reason,
+                checked_at=checked_at,
+                last_attempt=upload_attempt,
+            )
+            ready = storage_ready
+            reason = "" if storage_ready else checks["storage"]["reason_code"]
+            fingerprint = _readiness_evidence_fingerprint(
+                "storage", worker, profile, upload_session_fingerprint,
+                destination_hash, upload_fingerprint,
+            ) if storage_ready else ""
+            current_session = upload_session_fingerprint
+        elif runtime == "tts":
+            ready = ready and helper_ready and bool(session_fingerprint) and bool(destination_hash)
+            if not helper_ready:
+                reason = helper_reason or "TTS_HELPER_UNAVAILABLE"
+            elif selected.get("ready") is True and not session_fingerprint:
+                reason = "PROFILE_FINGERPRINT_MISSING"
+            elif selected.get("ready") is True and not destination_hash:
+                reason = "TTS_CHAT_UNAVAILABLE"
+            if ready:
+                fingerprint = _readiness_evidence_fingerprint(
+                    "tts", worker, profile, session_fingerprint,
+                    destination_hash, helper_fingerprint,
+                )
+            checks["tts_helper"] = {
+                "ready": helper_ready,
+                "reason_code": "" if helper_ready else (helper_reason or "TTS_HELPER_UNAVAILABLE"),
+            }
+        readiness_store.upsert_cell(
+            worker=worker,
+            profile=profile,
+            runtime=runtime,
+            ready=ready,
+            fingerprint=fingerprint,
+            session_fingerprint=current_session if ready else "",
+            destination_fingerprint=destination_hash if ready and runtime in {"storage", "tts"} else "",
+            reason_code="" if ready else (reason or "PROFILE_CANARY_FAILED"),
+            checked_at=checked_at,
+            last_attempt=_profile_readiness_attempt(
+                worker, profile, runtime, checked_at,
+                "complete", checks, dependencies, cleanup,
+            ),
+        )
+        report("complete", checks, cleanup, dependencies)
+        return {
+            "ready": ready,
+            "reason_code": "" if ready else (reason or "PROFILE_CANARY_FAILED"),
+            "checks": checks,
+            "cleanup": cleanup,
+            "dependencies": dependencies,
+        }
+
+    def _recalculate_quick_mode(worker: str, profile: str, checked_at: str) -> dict:
+        store = getattr(context, "runtime_readiness_store", None)
+        snapshot = store.snapshot() if callable(getattr(store, "snapshot", None)) else {"cells": []}
+        cells = {
+            (str(item.get("worker") or ""), item.get("profile"), str(item.get("runtime") or "")): item
+            for item in snapshot.get("cells", []) if isinstance(item, dict)
+        }
+        worker_cells = {
+            key[2]: cells.get((worker, None, key[2]))
+            for key in ((worker, None, "quick_mode_runtime"), (worker, None, "rclone_storage"))
+        }
+        profile_cells = {
+            runtime: cells.get((worker, profile, runtime))
+            for runtime in ("export", "download", "upload", "storage")
+        }
+        utility_settings = getattr(context, "utility_settings", None)
+        settings_getter = getattr(utility_settings, "get", None)
+        settings = settings_getter() if callable(settings_getter) else {}
+        settings = settings if isinstance(settings, dict) else {}
+        rclone_destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
+        rclone_hash = hashlib.sha256(rclone_destination.encode("utf-8")).hexdigest()
+        control = getattr(context, "control_plane", None)
+        target_resolver = getattr(control, "_tdl_access_target", None)
+        storage_target = str(target_resolver("storage") or "").strip() if callable(target_resolver) else ""
+        access_store = getattr(control, "tdl_access_store", None)
+        storage_hash_fn = getattr(access_store, "destination_fingerprint", None)
+        storage_hash = str(storage_hash_fn(storage_target) or "") if storage_target and callable(storage_hash_fn) else (hashlib.sha256(storage_target.encode("utf-8")).hexdigest() if storage_target else "")
+        sender_fingerprints = {}
+        for (cell_worker, cell_profile, cell_runtime), cell in cells.items():
+            if cell_worker != worker or cell_runtime != "storage" or not cell_profile or cell.get("status") != "ready":
+                continue
+            upload_cell = cells.get((worker, cell_profile, "upload"))
+            if not upload_cell or upload_cell.get("status") != "ready":
+                continue
+            session = str(cell.get("session_fingerprint") or "")
+            if session and session == str(upload_cell.get("session_fingerprint") or "") and cell.get("destination_fingerprint") == storage_hash:
+                sender_fingerprints[cell_profile] = session
+
+        checks = []
+        dependencies = ["quick_mode_runtime", "rclone_storage", "export", "download", "upload", "storage"]
+        reason = ""
+        quick_runtime = worker_cells.get("quick_mode_runtime")
+        rclone = worker_cells.get("rclone_storage")
+        export_cell = profile_cells.get("export")
+        for name, cell in (("quick_mode_runtime", quick_runtime), ("rclone_storage", rclone), *profile_cells.items()):
+            ready = bool(cell and cell.get("status") == "ready" and cell.get("fingerprint"))
+            code = str(cell.get("reason_code") or "RUNTIME_NOT_SCANNED") if not ready else ""
+            if name == "rclone_storage" and ready and rclone.get("destination_fingerprint") != rclone_hash:
+                ready, code = False, "QUICK_MODE_SETTINGS_CHANGED"
+            if name == "download" and ready:
+                export_fingerprint = str(export_cell.get("fingerprint") or "") if export_cell else ""
+                if not export_fingerprint or cell.get("session_fingerprint") != export_fingerprint:
+                    ready, code = False, "PROFILE_SESSION_CHANGED"
+            if name == "storage" and ready and cell.get("destination_fingerprint") != storage_hash:
+                ready, code = False, "STORAGE_SETTINGS_CHANGED"
+            if name == "storage" and ready:
+                upload_cell = profile_cells.get("upload")
+                if not upload_cell or cell.get("session_fingerprint") != upload_cell.get("session_fingerprint"):
+                    ready, code = False, "PROFILE_UPLOAD_SESSION_CHANGED"
+            checks.append({"name": name, "status": "ready" if ready else "not_ready", "reason_code": code})
+            if not ready and not reason:
+                reason = code or "QUICK_MODE_EVIDENCE_INCOMPLETE"
+
+        ready_senders = sorted(sender_fingerprints)
+        if not ready_senders and not reason:
+            reason = "TDL_ACCESS_NOT_VERIFIED"
+        if not storage_hash and not reason:
+            reason = "TDL_ACCESS_TARGET_UNAVAILABLE"
+        if not rclone_hash and not reason:
+            reason = "RCLONE_ACCESS_FAILED"
+        if export_cell is None or export_cell.get("status") != "ready":
+            session_fingerprint = ""
+        else:
+            session_fingerprint = str(export_cell.get("fingerprint") or "")
+        worker_state = next(
+            (item for item in snapshot.get("workers", []) if item.get("name") == worker),
+            None,
+        )
+        if worker_state and worker_state.get("status") == "failed" and not reason:
+            reason = str(worker_state.get("reason_code") or "WORKER_UNAVAILABLE")
+        is_ready = not reason and bool(session_fingerprint)
+        if not session_fingerprint and not reason:
+            reason = "PROFILE_FINGERPRINT_MISSING"
+        evidence = {
+            "worker": worker,
+            "profile": profile,
+            "runtime_fingerprints": [
+                str(cell.get("fingerprint") or "")
+                for cell in (quick_runtime, rclone, *profile_cells.values()) if cell
+            ],
+            "storage_destination": storage_hash,
+            "rclone_destination": rclone_hash,
+            "senders": sender_fingerprints,
+        }
+        fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest() if is_ready else ""
+        attempt = _profile_readiness_attempt(
+            worker, profile, "quick_mode", checked_at, "derived_readiness",
+            {"quick_mode": {"ready": is_ready, "reason_code": "" if is_ready else reason}},
+            dependencies, {"status": "not_needed", "items": []},
+            extra_checks=checks,
+        )
+        store.upsert_quick_mode_cell(
+            worker=worker,
+            profile=profile,
+            ready=is_ready,
+            fingerprint=fingerprint,
+            session_fingerprint=session_fingerprint,
+            destination_fingerprint=storage_hash,
+            rclone_destination_fingerprint=rclone_hash,
+            sender_profiles=ready_senders,
+            sender_session_fingerprints=sender_fingerprints,
+            reason_code=reason or "QUICK_MODE_EVIDENCE_INCOMPLETE",
+            checked_at=checked_at,
+            last_attempt=attempt,
+        )
+        return {
+            "ready": is_ready,
+            "reason_code": "" if is_ready else reason,
+            "checks": {"quick_mode": {"ready": is_ready, "reason_code": "" if is_ready else reason}},
+            "dependencies": dependencies,
+            "cleanup": {"status": "not_needed", "items": []},
+        }
+
+    def _store_profile_probe_failure(store, worker, profile, runtime, reason, checked_at):
+        attempt = _profile_readiness_attempt(
+            worker,
+            profile,
+            runtime,
+            checked_at,
+            "session_probe",
+            {runtime: {"ready": False, "reason_code": reason}},
+            [],
+            {"status": "not_needed", "items": []},
+        )
+        store.upsert_cell(
+            worker=worker,
+            profile=profile,
+            runtime=runtime,
+            ready=False,
+            reason_code=reason,
+            checked_at=checked_at,
+            last_attempt=attempt,
+        )
+        return {
+            "ready": False,
+            "reason_code": reason,
+            "checks": {runtime: {"ready": False, "reason_code": reason}},
+            "dependencies": [],
+            "cleanup": {"status": "not_needed", "items": []},
+        }
+
+    def _safe_profile_scan_checks(raw_checks):
+        result = {}
+        for key in ("export", "download", "upload", "storage", "tts"):
+            raw = raw_checks.get(key) if isinstance(raw_checks, dict) else None
+            raw = raw if isinstance(raw, dict) else {}
+            code = str(raw.get("reason_code") or "PROFILE_CANARY_NOT_RUN")
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code):
+                code = "PROFILE_CANARY_FAILED"
+            result[key] = {"ready": raw.get("ready") is True, "reason_code": "" if raw.get("ready") is True else code}
+        return result
+
+    def _profile_readiness_attempt(
+        worker, profile, runtime, checked_at, phase, checks, dependencies, cleanup,
+        *, extra_checks=None,
+    ):
+        combined = dict(checks or {})
+        if extra_checks:
+            for item in extra_checks:
+                if isinstance(item, dict):
+                    combined[str(item.get("name") or "unknown")] = {
+                        "ready": item.get("status") == "ready",
+                        "reason_code": str(item.get("reason_code") or ""),
+                    }
+        safe_checks = []
+        for name, raw in combined.items():
+            if not isinstance(raw, dict):
+                continue
+            safe_checks.append({
+                "name": name,
+                "status": "ready" if raw.get("ready") is True else "not_ready",
+                "reason_code": str(raw.get("reason_code") or ""),
+            })
+        ready = bool(safe_checks) and all(item["status"] == "ready" for item in safe_checks)
+        cleanup_items = cleanup.get("items", []) if isinstance(cleanup, dict) else []
+        cleanup_failed = any(
+            isinstance(item, dict) and item.get("status") == "failed"
+            for item in cleanup_items
+        )
+        return {
+            "target": {"worker": worker, "profile": profile, "runtime": runtime},
+            "checked_at": checked_at,
+            "phase": phase,
+            "checks": safe_checks,
+            "reason_code": "" if ready else next((item["reason_code"] for item in safe_checks if item["reason_code"]), "RUNTIME_NOT_READY"),
+            "dependencies": list(dependencies or []),
+            "cleanup": {
+                "status": "not_needed" if not cleanup_items else "failed" if cleanup_failed else "succeeded",
+                "reason_code": "CANARY_CLEANUP_FAILED" if cleanup_failed else "",
+            },
+        }
+
+    def _readiness_evidence_fingerprint(*parts) -> str:
+        evidence = json.dumps(parts, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(evidence.encode("utf-8")).hexdigest()
+
+    def _cleanup_profile_canary_messages(context, raw_messages, targets):
+        messages = raw_messages if isinstance(raw_messages, list) else []
+        items = []
+        bot = getattr(context, "bot", None)
+        for raw in messages[:8]:
+            if not isinstance(raw, dict):
+                continue
+            target = str(raw.get("target") or "")
+            message_id = raw.get("message_id")
+            chat = targets.get(target)
+            if not chat or isinstance(message_id, bool) or not isinstance(message_id, int) or message_id <= 0:
+                continue
+            if bot is None:
+                items.append({"target": target, "message_id": message_id, "status": "failed", "error_code": "BOT_API_UNAVAILABLE"})
+                continue
+            try:
+                bot.delete_message(chat_id=chat, message_id=message_id)
+                items.append({"target": target, "message_id": message_id, "status": "succeeded", "error_code": ""})
+            except Exception:
+                items.append({"target": target, "message_id": message_id, "status": "failed", "error_code": "CANARY_CLEANUP_FAILED"})
+        status = "not_needed" if not items else "succeeded" if all(item["status"] == "succeeded" for item in items) else "failed"
+        return {"status": status, "items": items}
+
     profile_scan_store = getattr(context, "profile_scan_store", None)
     if callable(getattr(profile_scan_store, "create", None)):
         profile_scan_operations = ProfileScanOperations(
@@ -1086,6 +1905,8 @@ def register_workers(app, context, *, current_actor):
             lambda operation_id: _perform_profile_catalog_scan(
                 getattr(context, "local_profile_catalog", None), operation_id
             ),
+            scan_worker_runtime=_scan_worker_runtime,
+            scan_profile_runtime=_scan_profile_runtime,
         )
         app.add_event_handler("shutdown", profile_scan_operations.close)
 
@@ -1159,6 +1980,106 @@ def register_workers(app, context, *, current_actor):
             )
         return profile_scan_operations.start(
             int(getattr(actor, "telegram_user_id", 0))
+        )
+
+    @app.post("/api/v1/profiles/local/scan/runtime", status_code=202)
+    def scan_worker_runtime(
+        body: WorkerRuntimeScanRequest, actor=Depends(current_actor)
+    ):
+        worker = str(body.worker or "").strip().lower()
+        runtime = str(body.runtime or "").strip().lower()
+        if not WORKER_NAME_RE.fullmatch(worker) or runtime not in _WORKER_RUNTIME_SCAN_TARGETS:
+            raise DomainError(
+                "PROFILE_SCAN_TARGET_INVALID",
+                "Target scan runtime worker tidak valid.",
+                status_code=422,
+            )
+        record = context.worker_registry.get(worker)
+        if record is None:
+            raise DomainError(
+                "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
+            )
+        if not bool(record.get("enabled", True)):
+            raise DomainError(
+                "WORKER_DISABLED",
+                "Worker nonaktif tidak dapat dipindai untuk job baru.",
+                status_code=409,
+            )
+        runtime_store = getattr(context, "runtime_readiness_store", None)
+        if not callable(getattr(runtime_store, "upsert_cell", None)):
+            raise DomainError(
+                "PROFILE_SCAN_UNAVAILABLE",
+                "Penyimpanan readiness runtime belum tersedia.",
+                status_code=503,
+            )
+        if profile_scan_operations is None:
+            raise DomainError(
+                "PROFILE_SCAN_UNAVAILABLE",
+                "Operation Scan Profil belum tersedia.",
+                status_code=503,
+            )
+        return profile_scan_operations.start_worker_runtime(
+            int(getattr(actor, "telegram_user_id", 0)), worker, runtime
+        )
+
+    @app.post("/api/v1/profiles/local/scan/service", status_code=202)
+    def scan_profile_runtime(
+        body: ProfileRuntimeScanRequest, actor=Depends(current_actor)
+    ):
+        worker = str(body.worker or "").strip().lower()
+        profile = normalize_profile_name(str(body.profile or ""))
+        runtime = str(body.runtime or "").strip().lower()
+        if (
+            not WORKER_NAME_RE.fullmatch(worker)
+            or not profile
+            or runtime not in _PROFILE_RUNTIME_SCAN_TARGETS
+        ):
+            raise DomainError(
+                "PROFILE_SCAN_TARGET_INVALID",
+                "Target scan layanan profil tidak valid.",
+                status_code=422,
+            )
+        record = context.worker_registry.get(worker)
+        if record is None:
+            raise DomainError(
+                "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
+            )
+        if not bool(record.get("enabled", True)):
+            raise DomainError(
+                "WORKER_DISABLED",
+                "Worker nonaktif tidak dapat dipindai untuk job baru.",
+                status_code=409,
+            )
+        catalog = getattr(context, "local_profile_catalog", None)
+        snapshot = catalog.snapshot() if callable(getattr(catalog, "snapshot", None)) else {}
+        inventory = next(
+            (
+                item for item in snapshot.get("inventories", [])
+                if isinstance(item, dict) and item.get("worker") == worker
+            ),
+            None,
+        )
+        if not inventory or not any(
+            isinstance(item, dict)
+            and str(item.get("name") or "").strip().lower() == profile
+            for item in inventory.get("items", [])
+        ):
+            raise DomainError(
+                "PROFILE_NOT_FOUND",
+                "Profil belum tercatat pada hasil Scan Profil.",
+                status_code=404,
+            )
+        if profile_scan_operations is None:
+            raise DomainError(
+                "PROFILE_SCAN_UNAVAILABLE",
+                "Operation Scan Profil belum tersedia.",
+                status_code=503,
+            )
+        return profile_scan_operations.start_profile_runtime(
+            int(getattr(actor, "telegram_user_id", 0)),
+            worker,
+            profile,
+            runtime,
         )
 
     def _local_profiles_for_worker(name: str, actor, *, start_upload_prep: bool):
