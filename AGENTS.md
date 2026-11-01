@@ -376,6 +376,16 @@ git pull --ff-only origin main
 python3 run.py deploy worker --pull
 ```
 
+Root production yang saat ini dipakai: gateway `/www/wwwroot/dockter_bot_tdl`
+dengan Compose project `tme3bot-gateway`, dan worker `remote-1`
+`/www/wwwroot/downloads/bot` dengan Compose project `bot`. Sebelum deploy,
+verifikasi `com.docker.compose.project.working_dir` dan `project` pada container
+yang sedang berjalan. Jalankan `run.py` dari root project tersebut agar Compose
+menggunakan stack dan volume data yang sama; jangan membuat clone/deployment
+project kedua. Gunakan SSH host trust dan agent/key yang sudah tersedia; deploy
+rutin tidak memerlukan enrollment atau pembuatan key baru. Jangan tampilkan
+private key atau passphrase.
+
 Static UI dipublish oleh GitHub Actions, lalu di VPS gateway/aaPanel dijalankan:
 
 ```bash
