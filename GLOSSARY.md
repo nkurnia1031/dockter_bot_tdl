@@ -130,6 +130,16 @@ _Avoid_: salinan state per worker.
 Pemulihan sesi lokal sebelumnya jika bundle baru gagal dipasang atau diuji. Sesi lama hanya boleh dipakai bila masih lolos pemeriksaan TDL dan identitasnya cocok.
 _Avoid_: fallback ke sumber profil lain.
 
+## Storage
+
+**Unduhan Storage**:
+Salinan file atau folder dari Telegram atau rclone ke folder `/workspace` pada worker yang dipilih, tanpa mengubah file sumber. Folder diunduh rekursif dengan struktur relatif tetap.
+_Avoid_: delivery Telegram, download artifact export.
+
+**Link unduhan publik**:
+URL per file pada domain worker yang dapat dipakai siapa pun yang memilikinya tanpa login dan tetap berlaku sampai dicabut manual. Link disimpan di halaman Storage; mencabutnya juga menghapus file di path worker terkait.
+_Avoid_: deep link Telegram, link sementara.
+
 ## Utility
 
 **Kumpulan kandidat password arsip**:
