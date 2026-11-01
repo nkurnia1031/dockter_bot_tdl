@@ -110,14 +110,24 @@ class TDLClientTests(unittest.TestCase):
                 del kwargs
                 self.commands.append(command)
                 output = Path(command[command.index("-o") + 1])
+                type_index = command.index("-T") + 1
+                selected_type = command[type_index]
                 selected_range = command[command.index("-i") + 1]
-                if selected_range == "1,50":
-                    messages = [
-                        {"id": 2, "type": "message", "text": "early"},
-                        {"id": 50, "type": "message", "text": "latest"},
-                    ]
+                if selected_type == "last":
+                    messages = [{"id": 181, "type": "message", "text": "latest"}]
                 else:
-                    messages = [{"id": 50, "type": "message", "text": "latest"}]
+                    by_range = {
+                        "1,90": [
+                            {"id": 2, "type": "message", "text": "early"},
+                            {"id": 90, "type": "message", "text": "boundary"},
+                        ],
+                        "91,180": [
+                            {"id": 91, "type": "message", "text": "boundary"},
+                            {"id": 180, "type": "message", "text": "middle"},
+                        ],
+                        "181,181": [{"id": 181, "type": "message", "text": "latest"}],
+                    }
+                    messages = by_range[selected_range]
                 output.write_text(
                     json.dumps({"id": self.peer_id, "messages": messages}),
                     encoding="utf-8",
@@ -133,14 +143,64 @@ class TDLClientTests(unittest.TestCase):
             )
 
         self.assertTrue(exported.history_complete)
-        self.assertEqual(exported.latest_message_id, 50)
-        self.assertEqual([item["id"] for item in exported.messages], [2, 50])
-        self.assertEqual(len(runner.commands), 3)
+        self.assertEqual(exported.latest_message_id, 181)
+        self.assertEqual([item["id"] for item in exported.messages], [2, 90, 91, 180, 181])
+        self.assertEqual(len(runner.commands), 5)
         for command in runner.commands:
             self.assertIn("--with-content", command)
             self.assertIn("--raw", command)
             self.assertIn("--all", command)
-        self.assertIn("1,50", runner.commands[1])
+        ranges = [
+            command[command.index("-i") + 1]
+            for command in runner.commands
+            if command[command.index("-T") + 1] == "id"
+        ]
+        self.assertEqual(ranges, ["1,90", "91,180", "181,181"])
+        self.assertEqual(
+            exported.coverage["completed_windows"],
+            [
+                {"start_id": 1, "end_id": 90},
+                {"start_id": 91, "end_id": 180},
+                {"start_id": 181, "end_id": 181},
+            ],
+        )
+
+    def test_storage_history_export_keeps_valid_windows_but_marks_failed_window_incomplete(self):
+        class PartialRunner:
+            def __init__(self):
+                self.commands = []
+
+            def run(self, command, **kwargs):
+                del kwargs
+                self.commands.append(command)
+                output = Path(command[command.index("-o") + 1])
+                selected_type = command[command.index("-T") + 1]
+                selected_range = command[command.index("-i") + 1]
+                if selected_type == "last":
+                    messages = [{"id": 181, "type": "message", "text": "latest"}]
+                    output.write_text(json.dumps({"id": 123, "messages": messages}), encoding="utf-8")
+                    return subprocess.CompletedProcess(command, 0, "ok", "")
+                if selected_range == "91,180":
+                    return subprocess.CompletedProcess(command, 1, "", "temporary failure")
+                messages = [{"id": 20, "type": "message", "text": "valid partial"}]
+                output.write_text(json.dumps({"id": 123, "messages": messages}), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = PartialRunner()
+            client = TDLClient(root / "upload", "upload", runner=runner)
+            exported = client.export_storage_history(
+                "-100123", root / "history.json", expected_channel_id=-100123
+            )
+
+        self.assertFalse(exported.history_complete)
+        self.assertEqual([item["id"] for item in exported.messages], [20])
+        self.assertEqual(exported.coverage["completed_windows"], [{"start_id": 1, "end_id": 90}])
+        self.assertEqual(
+            exported.coverage["failed_windows"],
+            [{"start_id": 91, "end_id": 180, "reason_code": "TDL_EXPORT_FAILED"}],
+        )
 
     def test_storage_history_export_rejects_wrong_channel_peer(self):
         class WrongPeerRunner:

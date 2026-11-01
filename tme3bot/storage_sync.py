@@ -11,6 +11,8 @@ from typing import Any
 
 
 _STORAGE_MARKER = re.compile(r"(?<![\w])#storage(?![\w])", re.IGNORECASE)
+STORAGE_SYNC_TDL_PAGE_LIMIT = 100
+STORAGE_SYNC_WINDOW_SIZE = STORAGE_SYNC_TDL_PAGE_LIMIT - 10
 _FIELDS = {
     "folder": re.compile(r"^\s*(?:📁\s*)?Folder:\s*(.*?)\s*$", re.IGNORECASE),
     "name": re.compile(r"^\s*(?:📄\s*)?Name:\s*(.*?)\s*$", re.IGNORECASE),
@@ -198,7 +200,7 @@ def full_history_proven(
     reported_message_count: int,
     reported_batch_count: int,
 ) -> bool:
-    """Validate explicit ID-range and stable high-water evidence for hard deletes."""
+    """Validate complete single-page ID windows and stable high-water evidence."""
     if not isinstance(coverage, dict):
         return False
     coverage_keys = (
@@ -218,11 +220,51 @@ def full_history_proven(
     range_end = coverage["range_end_id"]
     range_max = coverage["range_max_id"]
     range_start = coverage["range_start_id"]
+    page_limit = coverage.get("tdl_page_limit")
+    window_size = coverage.get("window_size")
+    expected_window_count = coverage.get("expected_window_count")
+    completed_windows = coverage.get("completed_windows")
+    failed_windows = coverage.get("failed_windows")
+    if (
+        type(window_size) is not int
+        or type(page_limit) is not int
+        or type(expected_window_count) is not int
+        or not isinstance(completed_windows, list)
+        or not isinstance(failed_windows, list)
+    ):
+        return False
+    expected_count = (
+        (latest_before + STORAGE_SYNC_WINDOW_SIZE - 1) // STORAGE_SYNC_WINDOW_SIZE
+        if latest_before >= 0 else -1
+    )
+    if expected_count != expected_window_count or len(completed_windows) != expected_count:
+        return False
+    if failed_windows:
+        return False
+    for index, window in enumerate(completed_windows):
+        if not isinstance(window, dict):
+            return False
+        start_id = window.get("start_id")
+        end_id = window.get("end_id")
+        expected_start = 1 + (index * STORAGE_SYNC_WINDOW_SIZE)
+        expected_end = min(expected_start + STORAGE_SYNC_WINDOW_SIZE - 1, latest_before)
+        if (
+            type(start_id) is not int
+            or type(end_id) is not int
+            or start_id != expected_start
+            or end_id != expected_end
+        ):
+            return False
+    if len(set(message_ids)) != len(message_ids):
+        return False
     return bool(
-        coverage.get("strategy") == "tdl_id_range"
+        coverage.get("strategy") == "tdl_bounded_id_windows_v1"
         and coverage.get("complete") is True
         and coverage.get("export_succeeded") is True
-        and coverage.get("pagination_finished") is True
+        and coverage.get("all_windows_complete") is True
+        and page_limit == STORAGE_SYNC_TDL_PAGE_LIMIT
+        and window_size < page_limit
+        and window_size == STORAGE_SYNC_WINDOW_SIZE
         and range_start == 1
         and latest_before >= 0
         and latest_before == latest_after == range_end == range_max

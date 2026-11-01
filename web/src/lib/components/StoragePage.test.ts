@@ -183,10 +183,10 @@ describe('Storage file manager', () => {
       if (url.pathname.endsWith('/jobs') && url.searchParams.get('kind')==='storage_sync') {
         return new Response(JSON.stringify({items:submitted?[syncJob]:[]}),{status:200});
       }
-      if (url.pathname.endsWith('/jobs/sync-job-1/events')) return new Response(JSON.stringify({items:[{sequence:3,event_type:'completed',status:'succeeded',result:{value:{catalog:{recovered:1,updated:2,deleted:0}}}}]}),{status:200});
+      if (url.pathname.endsWith('/jobs/sync-job-1/events')) return new Response(JSON.stringify({items:[{sequence:3,event_type:'completed',status:'succeeded',result:{value:{catalog:{recovered:1,updated:2,restored:3,deleted:0,deletion_held:4}}}}]}),{status:200});
       if (url.pathname.endsWith('/jobs/sync-job-1/log-snapshot')) return new Response(JSON.stringify({log:{lines:[]}}),{status:200});
       if (url.pathname.endsWith('/jobs/sync-job-1')) return new Response(JSON.stringify({
-        ...syncJob,status:'succeeded',result:{value:{messages_scanned:5,catalog:{recovered:1,updated:2,deleted:0}}},
+        ...syncJob,status:'succeeded',result:{value:{messages_scanned:5,history_complete:false,catalog:{recovered:1,updated:2,restored:3,deleted:0,deletion_held:4}}},
       }),{status:200});
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
@@ -200,6 +200,8 @@ describe('Storage file manager', () => {
 
     const syncRequest = requests.find((request)=>request.url.endsWith('/storage/sync')&&request.method==='POST');
     expect(JSON.parse(syncRequest?.body||'{}')).toEqual({worker:'local',profile:'default'});
+    window.dispatchEvent(new CustomEvent('tme3:job-finished',{detail:{jobIds:['sync-job-1']}}));
+    expect(await screen.findByText(/1 dipulihkan, 2 diperbarui, 3 dari Trash dipulihkan, 0 dihapus, 4 penghapusan ditahan/)).toBeTruthy();
     await fireEvent.click(screen.getByRole('button',{name:'Toggle detail progress'}));
     await fireEvent.click(screen.getByRole('button',{name:'Buka Report Lengkap'}));
     expect(await screen.findByText('Detail storage sync')).toBeTruthy();

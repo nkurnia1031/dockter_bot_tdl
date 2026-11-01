@@ -202,9 +202,12 @@
       if (job.status === 'succeeded') {
         await load();
         const catalog = job.result?.value?.catalog;
-        message = catalog
-          ? `Sinkronisasi selesai: ${catalog.recovered || 0} dipulihkan, ${catalog.updated || 0} diperbarui, ${catalog.deleted || 0} dihapus.`
-          : 'Sinkronisasi katalog Telegram selesai.';
+        if (catalog) {
+          const historyComplete = job.result?.value?.history_complete === true;
+          message = `Sinkronisasi selesai: ${catalog.recovered || 0} dipulihkan, ${catalog.updated || 0} diperbarui, ${catalog.restored || 0} dari Trash dipulihkan, ${catalog.deleted || 0} dihapus, ${catalog.deletion_held || 0} penghapusan ditahan. ${historyComplete ? 'Riwayat lengkap.' : 'Riwayat belum terbukti lengkap; item yang tidak ditemukan dipertahankan.'}`;
+        } else {
+          message = 'Sinkronisasi katalog Telegram selesai.';
+        }
       } else {
         message = job.error?.message || `Sinkronisasi berakhir dengan status ${job.status}.`;
       }

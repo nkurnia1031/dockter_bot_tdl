@@ -920,10 +920,26 @@ class StorageExecutorMixin:
         reporter = ProgressReporter(self.publisher, job_id)
         reporter.report(
             phase="exporting",
-            message="Mengekspor riwayat channel Storage",
+            message="Menyiapkan ekspor riwayat channel Storage",
             indeterminate=True,
             force=True,
         )
+
+        def report_history_window(completed: int, total: int, _start_id: int, _end_id: int) -> None:
+            if self._job_cancelled(job_id):
+                raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan sebelum apply.")
+            reporter.report(
+                phase="exporting",
+                message=(
+                    "Membaca batas riwayat channel Storage"
+                    if total == 0
+                    else f"Memeriksa rentang riwayat {completed} dari {total}"
+                ),
+                overall={"current": completed, "total": total, "unit": "ID windows"},
+                indeterminate=total == 0,
+                force=completed == 0 or completed == total,
+            )
+
         callback = getattr(client, "command_callback", None)
         with runtime.upload_operation_lock:
             with tempfile.TemporaryDirectory(prefix="storage-sync-") as temp_dir:
@@ -935,6 +951,7 @@ class StorageExecutorMixin:
                         target,
                         export_path,
                         expected_channel_id=channel_id,
+                        progress_callback=report_history_window,
                     )
                 finally:
                     if hasattr(client, "command_callback"):
@@ -985,20 +1002,25 @@ class StorageExecutorMixin:
             )
         if self._job_cancelled(job_id):
             raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan sebelum apply.")
+        coverage = getattr(exported, "coverage", {})
+        history_complete = bool(getattr(exported, "history_complete", False))
         reporter.report(
             phase="completed",
-            message="Ekspor channel Storage selesai",
+            message=(
+                "Riwayat channel Storage terbukti lengkap"
+                if history_complete
+                else "Temuan selesai; kelengkapan belum terbukti dan absensi dipertahankan"
+            ),
             overall={"current": total_messages, "total": total_messages, "unit": "messages"},
             counters={"recognized": len(parsed.items)},
             force=True,
         )
-        coverage = getattr(exported, "coverage", {})
         return {
             "channel_id": channel_id,
             "messages_scanned": total_messages,
             "items_recognized": len(parsed.items),
             "batch_count": batch_count,
-            "history_complete": bool(getattr(exported, "history_complete", False)),
+            "history_complete": history_complete,
             "history_coverage": coverage if isinstance(coverage, dict) else {},
             "deleted": 0,
             "deletion_held": 0,
