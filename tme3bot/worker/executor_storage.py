@@ -23,6 +23,7 @@ from tme3bot.rclone import (
 from tme3bot.storage_catalog import (
     build_storage_caption,
 )
+from tme3bot.storage_sync import parse_storage_export
 from tme3bot.worker.quick_export import (
     QuickModeError,
 )
@@ -878,6 +879,130 @@ class StorageExecutorMixin:
         finally:
             with self._lock:
                 self._rclone_runners.pop(job_id, None)
+
+    def _storage_sync(self, command: dict[str, Any]) -> dict[str, Any]:
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        profile = str(command.get("profile") or "").strip().lower()
+        job_id = str(command.get("job_id") or "")
+        try:
+            channel_id = int(payload.get("channel_id") or 0)
+        except (TypeError, ValueError):
+            raise RuntimeError("STORAGE_SYNC_CHANNEL_INVALID") from None
+        if not profile or not job_id or channel_id == 0:
+            raise RuntimeError("STORAGE_SYNC_REQUEST_INVALID")
+        if profile not in self.available_storage_profiles():
+            raise RuntimeError("STORAGE_PROFILE_UNAVAILABLE")
+        expected_fingerprint = str(
+            payload.get("_tdl_sender_session_fingerprint") or ""
+        ).strip().lower()
+        current_fingerprint = normalize_session_fingerprints(
+            self.available_storage_session_fingerprints([profile])
+        ).get(profile, "")
+        if not expected_fingerprint or current_fingerprint != expected_fingerprint:
+            raise RuntimeError("TDL_ACCESS_NOT_VERIFIED: sesi Upload berubah sejak Scan Profil.")
+
+        runtime = self.profile_manager.runtime(profile)
+        runtime_channel_id = int(getattr(runtime.config, "storage_channel_id", 0) or 0)
+        if runtime_channel_id != channel_id:
+            raise RuntimeError("STORAGE_SYNC_CHANNEL_MISMATCH")
+        target = str(
+            payload.get("tdl_access_target")
+            or getattr(runtime.config, "storage_channel_ref", "")
+            or ""
+        ).strip()
+        if not target:
+            raise RuntimeError("TDL_ACCESS_TARGET_UNAVAILABLE")
+        client = getattr(runtime, "upload_tdl_client", None)
+        exporter = getattr(client, "export_storage_history", None)
+        if not callable(exporter):
+            raise RuntimeError("WORKER_UPDATE_REQUIRED: TDL Storage sync export belum tersedia.")
+
+        reporter = ProgressReporter(self.publisher, job_id)
+        reporter.report(
+            phase="exporting",
+            message="Mengekspor riwayat channel Storage",
+            indeterminate=True,
+            force=True,
+        )
+        callback = getattr(client, "command_callback", None)
+        with runtime.upload_operation_lock:
+            with tempfile.TemporaryDirectory(prefix="storage-sync-") as temp_dir:
+                export_path = Path(temp_dir) / "storage-history.json"
+                try:
+                    if hasattr(client, "command_callback"):
+                        client.command_callback = None
+                    exported = exporter(
+                        target,
+                        export_path,
+                        expected_channel_id=channel_id,
+                    )
+                finally:
+                    if hasattr(client, "command_callback"):
+                        client.command_callback = callback
+
+        if int(getattr(exported, "channel_id", 0) or 0) != channel_id:
+            raise RuntimeError("STORAGE_SYNC_CHANNEL_MISMATCH")
+        parsed = parse_storage_export(getattr(exported, "messages", None))
+        total_messages = len(parsed.message_ids)
+        batch_size = 250
+        batch_count = 0
+        if self._job_cancelled(job_id):
+            raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan sebelum apply.")
+        recognized_so_far = 0
+        for offset in range(0, total_messages, batch_size):
+            if self._job_cancelled(job_id):
+                raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan sebelum apply.")
+            batch_ids = parsed.message_ids[offset : offset + batch_size]
+            id_set = set(batch_ids)
+            batch_items = [
+                item for item in parsed.items
+                if int(item["channel_message_id"]) in id_set
+            ]
+            recognized_so_far += len(batch_items)
+            batch_count += 1
+            current = min(offset + len(batch_ids), total_messages)
+            self.publisher.emit(
+                job_id,
+                "running",
+                "storage.sync_batch",
+                progress={
+                    "phase": "applying",
+                    "message": "Mencocokkan pesan Telegram dengan katalog Storage",
+                    "overall": {"current": current, "total": total_messages, "unit": "messages"},
+                },
+                result={
+                    "channel_id": channel_id,
+                    "message_ids": batch_ids,
+                    "items": batch_items,
+                },
+            )
+            reporter.report(
+                phase="applying",
+                message=f"Memproses {current} dari {total_messages} pesan",
+                overall={"current": current, "total": total_messages, "unit": "messages"},
+                counters={"recognized": recognized_so_far},
+                force=True,
+            )
+        if self._job_cancelled(job_id):
+            raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan sebelum apply.")
+        reporter.report(
+            phase="completed",
+            message="Ekspor channel Storage selesai",
+            overall={"current": total_messages, "total": total_messages, "unit": "messages"},
+            counters={"recognized": len(parsed.items)},
+            force=True,
+        )
+        coverage = getattr(exported, "coverage", {})
+        return {
+            "channel_id": channel_id,
+            "messages_scanned": total_messages,
+            "items_recognized": len(parsed.items),
+            "batch_count": batch_count,
+            "history_complete": bool(getattr(exported, "history_complete", False)),
+            "history_coverage": coverage if isinstance(coverage, dict) else {},
+            "deleted": 0,
+            "deletion_held": 0,
+        }
 
     def _storage_upload(
         self,

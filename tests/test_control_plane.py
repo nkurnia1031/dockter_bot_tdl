@@ -327,6 +327,32 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
 
+    def test_storage_sync_pins_one_ready_profile_and_keeps_target_private(self):
+        self.authorize_quick_mode_storage()
+        self.attach_storage_readiness(profiles=("default",))
+
+        def fail_if_probed(_worker):
+            raise AssertionError("Storage sync must use the saved Profile scan")
+
+        self.dispatcher.capabilities = fail_if_probed
+        job = self.control.submit_job(
+            self.actor,
+            "storage_sync",
+            {"channel_id": -100123},
+            profile="default",
+            worker="local",
+        )
+
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(job.kind, "storage_sync")
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(job.worker, "local")
+        self.assertEqual(payload["tdl_access_target"], "-100123")
+        self.assertEqual(payload["_tdl_sender_session_fingerprint"], "a" * 64)
+        self.assertEqual(payload["channel_id"], -100123)
+        self.assertNotIn("tdl_access_target", str(job.payload))
+        self.assertNotIn("session_fingerprint", str(job.payload))
+
     def test_storage_upload_omits_profiles_without_ready_upload_lane(self):
         self.authorize_quick_mode_storage()
         runtime_store = self.attach_storage_readiness()

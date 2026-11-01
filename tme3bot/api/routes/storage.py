@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from fastapi import Depends, Query
-from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, StorageBulkActionRequest, StorageDeliveryRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StorageSettingsResponse, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
+from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, StorageBulkActionRequest, StorageDeliveryRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StorageSettingsResponse, StorageSyncRequest, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
@@ -255,6 +255,24 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 actor, "storage_upload", payload, profile=actor.profile, worker=selected_worker
             )
         )
+
+    @app.post("/api/v1/storage/sync", response_model=JobResponse)
+    def submit_storage_sync(body: StorageSyncRequest, actor=Depends(current_actor)):
+        channel_id = int(getattr(context.config, "storage_channel_id", 0) or 0)
+        if channel_id == 0 or not str(getattr(context.config, "storage_channel_ref", "") or "").strip():
+            raise DomainError(
+                "STORAGE_SYNC_CHANNEL_UNAVAILABLE",
+                "Channel Storage belum dikonfigurasi.",
+                status_code=503,
+            )
+        job = context.control_plane.submit_job(
+            actor,
+            "storage_sync",
+            {"channel_id": channel_id},
+            profile=body.profile,
+            worker=body.worker,
+        )
+        return job_dict(job)
 
     @app.patch(
         "/api/v1/storage/items/{item_id}",

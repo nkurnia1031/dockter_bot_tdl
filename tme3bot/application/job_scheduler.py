@@ -117,6 +117,13 @@ def build_execution_plan(
         for sender_profile in sender_profiles:
             keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         lane = "tdl-storage-reconcile"
+    elif kind == "storage_sync":
+        keys = {
+            f"worker:{worker}:kind:storage_sync",
+            f"worker:{worker}:tdl:storage",
+            f"profile:{profile}:worker:{worker}:tdl:upload",
+        }
+        lane = "tdl-storage-sync"
     elif kind == "tts":
         # Keep one end-to-end TTS job per worker, including Telegram delivery.
         # Different workers remain independent and can each use three routes.

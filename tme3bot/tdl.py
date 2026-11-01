@@ -160,6 +160,17 @@ class ExportResult:
     exported_count: int
     max_message_id: int | None
     has_media: bool
+    peer_id: int | None = None
+
+
+@dataclass(frozen=True)
+class StorageHistoryExport:
+    channel_id: int
+    peer_id: int
+    messages: list[dict[str, Any]]
+    latest_message_id: int
+    history_complete: bool
+    coverage: dict[str, Any]
 
 
 @dataclass
@@ -723,6 +734,8 @@ class TDLClient:
         with_content: bool = False,
         last_count: int | None = None,
         end_id: int | None = None,
+        raw: bool = False,
+        all_messages: bool = False,
     ) -> ExportResult:
         export_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -735,7 +748,110 @@ class TDLClient:
         export_args.extend(["-o", str(export_path)])
         if with_content:
             export_args.append("--with-content")
-        return self._export_messages(export_path, export_args)
+        if raw:
+            export_args.append("--raw")
+        if all_messages:
+            export_args.append("--all")
+        return self._export_messages(
+            export_path, export_args, require_content=with_content, require_peer_id=raw
+        )
+
+    @staticmethod
+    def _expected_channel_peer_id(channel_id: int) -> int:
+        value = str(int(channel_id))
+        if value.startswith("-100") and value[4:].isdigit():
+            return int(value[4:])
+        if value.isdigit():
+            return int(value)
+        raise ValueError("Storage channel ID must be numeric")
+
+    @staticmethod
+    def _strict_export_message_ids(messages: list[dict[str, Any]]) -> list[int]:
+        ids: list[int] = []
+        seen: set[int] = set()
+        for message in messages:
+            value = message.get("id")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value in seen:
+                raise TDLDataError("TDL export has invalid or duplicate message IDs.")
+            seen.add(value)
+            ids.append(value)
+        return ids
+
+    def export_storage_history(
+        self, chat_ref: str, export_path: Path, *, expected_channel_id: int
+    ) -> StorageHistoryExport:
+        """Export a complete ID range and report conservative history coverage.
+
+        TDL's ID-range mode uses its paginated history iterator. We bracket that
+        export with last-message reads and only claim full coverage when the
+        channel peer and high-water ID remain stable and the range includes the
+        observed latest message. No media bytes are downloaded.
+        """
+        expected_peer_id = self._expected_channel_peer_id(expected_channel_id)
+        export_path = Path(export_path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        latest_path = export_path.with_name(f"{export_path.stem}-latest-before.json")
+        before = self.export_messages(
+            chat_ref, 1, latest_path, with_content=True, last_count=1,
+            raw=True, all_messages=True,
+        )
+        if before.peer_id != expected_peer_id:
+            raise TDLDataError("TDL export peer does not match configured Storage channel.")
+        before_ids = self._strict_export_message_ids(before.messages)
+        if len(before_ids) > 1:
+            raise TDLDataError("TDL latest-message export returned an invalid message count.")
+        latest_before = max(before_ids, default=0)
+
+        history = self.export_messages(
+            chat_ref, 1, export_path, with_content=True,
+            end_id=max(1, latest_before), raw=True, all_messages=True,
+        )
+        if history.peer_id != expected_peer_id:
+            raise TDLDataError("TDL export peer does not match configured Storage channel.")
+        message_ids = self._strict_export_message_ids(history.messages)
+        if any(message_id > latest_before for message_id in message_ids):
+            raise TDLDataError("TDL ID-range export exceeded its requested high-water mark.")
+        range_max = max(message_ids, default=0)
+
+        latest_after = -1
+        try:
+            after = self.export_messages(
+                chat_ref, 1, export_path.with_name(f"{export_path.stem}-latest-after.json"),
+                with_content=True, last_count=1, raw=True, all_messages=True,
+            )
+            if after.peer_id != expected_peer_id:
+                raise TDLDataError("TDL export peer does not match configured Storage channel.")
+            after_ids = self._strict_export_message_ids(after.messages)
+            if len(after_ids) > 1:
+                raise TDLDataError("TDL latest-message export returned an invalid message count.")
+            latest_after = max(after_ids, default=0)
+        except (TDLCommandError, OSError):
+            # The range export remains useful, but an unavailable end marker
+            # cannot authorize permanent deletion of missing catalog rows.
+            latest_after = -1
+
+        history_complete = (
+            latest_before == latest_after == range_max
+            and (latest_before == 0 or range_max == latest_before)
+        )
+        return StorageHistoryExport(
+            channel_id=int(expected_channel_id),
+            peer_id=expected_peer_id,
+            messages=history.messages,
+            latest_message_id=latest_before,
+            history_complete=history_complete,
+            coverage={
+                "strategy": "tdl_id_range",
+                "range_start_id": 1,
+                "range_end_id": latest_before,
+                "range_max_id": range_max,
+                "latest_before_id": latest_before,
+                "latest_after_id": latest_after,
+                "export_succeeded": True,
+                "pagination_finished": True,
+                "complete": history_complete,
+            },
+        )
 
     def export_messages_by_time(
         self,
@@ -774,6 +890,7 @@ class TDLClient:
         export_args: list[str],
         *,
         require_content: bool = False,
+        require_peer_id: bool = False,
     ) -> ExportResult:
         export_path.parent.mkdir(parents=True, exist_ok=True)
         command = self._base_command() + export_args
@@ -792,6 +909,8 @@ class TDLClient:
             raise TDLDataError(f"TDL tidak membuat file export: {export_path}")
 
         payload = json.loads(export_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TDLDataError("Format export TDL harus berupa object.")
         messages_raw = payload.get("messages", [])
         if require_content and "messages" not in payload:
             raise TDLDataError("TDL export does not contain a messages array.")
@@ -799,6 +918,15 @@ class TDLClient:
             raise TDLDataError(
                 "Format export tidak valid: 'messages' harus berupa array."
             )
+
+        raw_peer_id = payload.get("id")
+        peer_id = (
+            int(raw_peer_id)
+            if isinstance(raw_peer_id, int) and not isinstance(raw_peer_id, bool)
+            else None
+        )
+        if require_peer_id and (peer_id is None or peer_id <= 0):
+            raise TDLDataError("TDL export does not contain a valid Telegram peer ID.")
 
         messages = [message for message in messages_raw if isinstance(message, dict)]
         detail_keys = {
@@ -843,6 +971,7 @@ class TDLClient:
             exported_count=len(messages),
             max_message_id=max_message_id,
             has_media=has_media,
+            peer_id=peer_id,
         )
 
     def resolve_chat_peer(self, chat_ref: str) -> dict[str, str]:

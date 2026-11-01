@@ -146,6 +146,67 @@ describe('Storage file manager', () => {
     expect((screen.getByRole('button', { name: 'Mulai upload' }) as HTMLButtonElement).disabled).toBe(true);
   }, 15000);
 
+  it('syncs the selected worker using only a profile with ready Storage and Upload evidence', async () => {
+    enableDialogMethods();
+    const requests: {url:string;method:string;body?:string}[] = [];
+    let submitted = false;
+    const syncJob = {
+      id:'sync-job-1', kind:'storage_sync', profile:'default', worker:'local',
+      actor_user_id:1, status:'running', created_at:'2026-11-01T00:00:00Z',
+      payload:{channel_id:123}, progress:{phase:'exporting',message:'Mengekspor riwayat channel Storage',indeterminate:true},
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url = new URL(String(input), 'https://ui.test');
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({url:url.pathname,method,body:typeof init?.body==='string'?init.body:undefined});
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{name:'local',url:'http://worker',enabled:true}]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']},{name:'archive',workers:['local']}],
+        runtime_readiness:{checked_at:'2026-11-01T00:00:00Z',workers:[{name:'local',status:'success',checked_at:'2026-11-01T00:00:00Z',reason_code:''}],cells:[
+          {worker:'local',profile:'default',runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'local',profile:'default',runtime:'upload',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'local',profile:'archive',runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'local',profile:'archive',runtime:'upload',status:'not_ready',checked_at:'now',reason_code:'TDL_ACCESS_NOT_VERIFIED'},
+        ]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/sync') && method==='POST') {
+        submitted = true;
+        return new Response(JSON.stringify({id:syncJob.id}),{status:200});
+      }
+      if (url.pathname.endsWith('/jobs/metrics')) return new Response(JSON.stringify({}),{status:200});
+      if (url.pathname.endsWith('/jobs') && url.searchParams.get('kind')==='storage_sync') {
+        return new Response(JSON.stringify({items:submitted?[syncJob]:[]}),{status:200});
+      }
+      if (url.pathname.endsWith('/jobs/sync-job-1/events')) return new Response(JSON.stringify({items:[{sequence:3,event_type:'completed',status:'succeeded',result:{value:{catalog:{recovered:1,updated:2,deleted:0}}}}]}),{status:200});
+      if (url.pathname.endsWith('/jobs/sync-job-1/log-snapshot')) return new Response(JSON.stringify({log:{lines:[]}}),{status:200});
+      if (url.pathname.endsWith('/jobs/sync-job-1')) return new Response(JSON.stringify({
+        ...syncJob,status:'succeeded',result:{value:{messages_scanned:5,catalog:{recovered:1,updated:2,deleted:0}}},
+      }),{status:200});
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+
+    const profileSelect = await screen.findByLabelText('Profil sumber') as HTMLSelectElement;
+    expect([...profileSelect.options].map((option)=>option.value)).toEqual(['default']);
+    await fireEvent.click(screen.getByRole('button',{name:'Sinkronkan sekarang'}));
+    expect(await screen.findByText('Mengekspor riwayat channel Storage')).toBeTruthy();
+
+    const syncRequest = requests.find((request)=>request.url.endsWith('/storage/sync')&&request.method==='POST');
+    expect(JSON.parse(syncRequest?.body||'{}')).toEqual({worker:'local',profile:'default'});
+    await fireEvent.click(screen.getByRole('button',{name:'Toggle detail progress'}));
+    await fireEvent.click(screen.getByRole('button',{name:'Buka Report Lengkap'}));
+    expect(await screen.findByText('Detail storage sync')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button',{name:'Raw JSON'}));
+    expect(await screen.findByText(/"recovered": 1/)).toBeTruthy();
+  }, 15000);
+
   it('closes file details from the close button, backdrop, and Escape', async () => {
     stubStorageFile();
     render(StoragePage);

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import re
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from tme3bot.storage_sync import full_history_proven
 
 CAPTION_LIMIT = 1024
 
@@ -65,6 +68,9 @@ class StorageItem:
     trashed_by: int | None = None
     caption_sync_status: str = "synced"
     purge_error: str | None = None
+    recovered_at: str | None = None
+    recovered_by_user_id: int | None = None
+    recovered_from_profile: str | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +198,12 @@ class StorageCatalog:
                     last_error TEXT,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS storage_sync_runs (
+                    job_id TEXT PRIMARY KEY,
+                    channel_id INTEGER NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    result_json TEXT NOT NULL
+                );
                 """
             )
             self._ensure_column(db, "storage_items", "folder_id", "INTEGER")
@@ -199,6 +211,9 @@ class StorageCatalog:
             self._ensure_column(db, "storage_items", "trashed_by", "INTEGER")
             self._ensure_column(db, "storage_items", "caption_sync_status", "TEXT NOT NULL DEFAULT 'synced'")
             self._ensure_column(db, "storage_items", "purge_error", "TEXT")
+            self._ensure_column(db, "storage_items", "recovered_at", "TEXT")
+            self._ensure_column(db, "storage_items", "recovered_by_user_id", "INTEGER")
+            self._ensure_column(db, "storage_items", "recovered_from_profile", "TEXT")
             try:
                 db.execute(
                     """CREATE VIRTUAL TABLE IF NOT EXISTS storage_items_trigram
@@ -373,6 +388,207 @@ class StorageCatalog:
     def get_by_upload_id(self, upload_id: str) -> StorageItem | None:
         with self._lock, self._db() as db:
             return self._item(db.execute("SELECT * FROM storage_items WHERE upload_id = ?", (upload_id,)).fetchone())
+
+    def get_by_channel_message(
+        self, channel_id: int, channel_message_id: int, *, include_deleted: bool = False
+    ) -> StorageItem | None:
+        with self._lock, self._db() as db:
+            item = self._item(db.execute(
+                "SELECT * FROM storage_items WHERE channel_id=? AND channel_message_id=?",
+                (int(channel_id), int(channel_message_id)),
+            ).fetchone())
+            if item and item.status == "deleted" and not include_deleted:
+                return None
+            return item
+
+    def apply_channel_sync(
+        self,
+        *,
+        job_id: str,
+        channel_id: int,
+        message_ids: list[int],
+        items: list[dict[str, object]],
+        actor_user_id: int,
+        profile: str,
+        history_coverage: dict[str, object] | None,
+        reported_history_complete: bool,
+        reported_message_count: int,
+        batch_count: int,
+        reported_batch_count: int,
+    ) -> dict[str, int | bool]:
+        """Apply validated Telegram facts and delete absences only with full-history proof."""
+        selected_job = str(job_id or "").strip()
+        selected_channel = int(channel_id)
+        selected_profile = str(profile or "").strip().lower()
+        if not selected_job or selected_channel == 0 or not selected_profile:
+            raise ValueError("Storage sync identity is invalid")
+        history_complete = type(reported_history_complete) is bool and reported_history_complete and full_history_proven(
+            history_coverage,
+            message_ids=message_ids,
+            batch_count=batch_count,
+            reported_message_count=reported_message_count,
+            reported_batch_count=reported_batch_count,
+        )
+        seen: set[int] = set()
+        for raw_id in message_ids:
+            if isinstance(raw_id, bool):
+                raise ValueError("Storage sync message ID is invalid")
+            message_id = int(raw_id)
+            if message_id < 1 or message_id in seen:
+                raise ValueError("Storage sync message IDs must be unique positive integers")
+            seen.add(message_id)
+        records: dict[int, dict[str, object]] = {}
+        for raw in items:
+            if not isinstance(raw, dict):
+                raise ValueError("Storage sync item is invalid")
+            message_id = int(raw.get("channel_message_id") or 0)
+            if message_id < 1 or message_id not in seen or message_id in records:
+                raise ValueError("Storage sync item does not match an exported message")
+            records[message_id] = raw
+
+        with self._lock, self._db() as db:
+            previous_run = db.execute(
+                "SELECT result_json FROM storage_sync_runs WHERE job_id=?",
+                (selected_job,),
+            ).fetchone()
+            if previous_run is not None:
+                return json.loads(str(previous_run["result_json"]))
+
+            summary: dict[str, int | bool] = {
+                "messages_seen": len(seen),
+                "recognized_items": len(records),
+                "recovered": 0,
+                "updated": 0,
+                "restored": 0,
+                "matched": 0,
+                "deleted": 0,
+                "deletion_held": 0,
+                "history_complete": history_complete,
+            }
+            for message_id in sorted(records):
+                values = records[message_id]
+                existing = db.execute(
+                    "SELECT * FROM storage_items WHERE channel_id=? AND channel_message_id=?",
+                    (selected_channel, message_id),
+                ).fetchone()
+                raw_folder = str(values.get("folder") or "")
+                folder_id = self._ensure_path_locked(
+                    db, raw_folder, int(actor_user_id)
+                ) if raw_folder else None
+                folder = self._folder_path_locked(db, folder_id)
+                original_name = " ".join(str(values.get("original_name") or "").split()).strip()
+                display_name = " ".join(str(values.get("display_name") or original_name).split()).strip()
+                if not original_name or not display_name:
+                    raise ValueError("Storage sync item name is missing")
+                existing_id = int(existing["id"]) if existing is not None else None
+                caption = str(values.get("caption") or "")[:CAPTION_LIMIT]
+                updated_at = utc_now()
+                uploaded_at = str(values.get("uploaded_at") or "").strip()
+                file_size_value = values.get("file_size")
+                file_size = None if file_size_value is None else max(0, int(file_size_value))
+                mime_type = str(values.get("mime_type") or "").strip()[:255]
+                keywords = " ".join(str(values.get("keywords") or "").split()).strip()[:600]
+                if existing is None:
+                    db.execute(
+                        """INSERT INTO storage_items
+                           (upload_id,owner_user_id,owner_profile,channel_id,channel_message_id,
+                            original_name,display_name,folder,keywords,caption,file_size,mime_type,
+                            sha256,uploaded_at,updated_at,status,folder_id,trashed_at,trashed_by,
+                            caption_sync_status,purge_error,recovered_at,recovered_by_user_id,
+                            recovered_from_profile)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,'synced',NULL,?,?,?)""",
+                        (
+                            f"recovered:{selected_channel}:{message_id}",
+                            int(actor_user_id), selected_profile, selected_channel, message_id,
+                            original_name[:300], display_name[:300], folder, keywords, caption,
+                            file_size, mime_type, "", uploaded_at or updated_at, updated_at,
+                            "active", folder_id, updated_at, int(actor_user_id), selected_profile,
+                        ),
+                    )
+                    item_id = int(db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                    self._sync_fts_locked(db, item_id)
+                    summary["recovered"] = int(summary["recovered"]) + 1
+                    continue
+
+                was_trashed = str(existing["status"] or "") == "trashed" or bool(existing["trashed_at"])
+                next_values = {
+                    "original_name": original_name[:300],
+                    "display_name": display_name[:300],
+                    "folder": folder,
+                    "folder_id": folder_id,
+                    "keywords": keywords,
+                    "caption": caption,
+                    "file_size": file_size if file_size is not None else existing["file_size"],
+                    "mime_type": mime_type or str(existing["mime_type"] or ""),
+                    "uploaded_at": uploaded_at or str(existing["uploaded_at"] or updated_at),
+                    "updated_at": updated_at,
+                    "status": "active",
+                    "trashed_at": None,
+                    "trashed_by": None,
+                    "caption_sync_status": "synced",
+                    "purge_error": None,
+                }
+                changed = any(
+                    existing[key] != value
+                    for key, value in next_values.items()
+                    if key != "updated_at"
+                )
+                if not changed:
+                    next_values["updated_at"] = str(existing["updated_at"] or updated_at)
+                db.execute(
+                    """UPDATE storage_items SET original_name=?,display_name=?,folder=?,folder_id=?,
+                       keywords=?,caption=?,file_size=?,mime_type=?,uploaded_at=?,updated_at=?,status=?,
+                       trashed_at=NULL,trashed_by=NULL,caption_sync_status='synced',purge_error=NULL
+                       WHERE id=?""",
+                    (
+                        next_values["original_name"], next_values["display_name"], next_values["folder"],
+                        next_values["folder_id"], next_values["keywords"], next_values["caption"],
+                        next_values["file_size"], next_values["mime_type"], next_values["uploaded_at"],
+                        next_values["updated_at"], next_values["status"], existing_id,
+                    ),
+                )
+                db.execute("DELETE FROM storage_caption_queue WHERE item_id=?", (existing_id,))
+                self._sync_fts_locked(db, int(existing_id))
+                summary["matched"] = int(summary["matched"]) + 1
+                if was_trashed:
+                    summary["restored"] = int(summary["restored"]) + 1
+                elif changed:
+                    summary["updated"] = int(summary["updated"]) + 1
+
+            db.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS storage_sync_seen(message_id INTEGER PRIMARY KEY)"
+            )
+            db.execute("DELETE FROM storage_sync_seen")
+            db.executemany(
+                "INSERT INTO storage_sync_seen(message_id) VALUES(?)",
+                [(message_id,) for message_id in sorted(seen)],
+            )
+            missing_rows = db.execute(
+                """SELECT id FROM storage_items AS item WHERE channel_id=?
+                   AND NOT EXISTS(SELECT 1 FROM storage_sync_seen AS seen
+                                  WHERE seen.message_id=item.channel_message_id)""",
+                (selected_channel,),
+            ).fetchall()
+            missing_ids = [int(row["id"]) for row in missing_rows]
+            if history_complete:
+                for item_id in missing_ids:
+                    db.execute("DELETE FROM storage_caption_queue WHERE item_id=?", (item_id,))
+                    db.execute("DELETE FROM storage_items_fts WHERE item_id=?", (item_id,))
+                    if getattr(self, "_trigram_enabled", False):
+                        db.execute("DELETE FROM storage_items_trigram WHERE item_id=?", (item_id,))
+                db.executemany(
+                    "DELETE FROM storage_items WHERE id=?",
+                    [(item_id,) for item_id in missing_ids],
+                )
+                summary["deleted"] = len(missing_ids)
+            else:
+                summary["deletion_held"] = len(missing_ids)
+
+            db.execute(
+                "INSERT INTO storage_sync_runs(job_id,channel_id,applied_at,result_json) VALUES(?,?,?,?)",
+                (selected_job, selected_channel, utc_now(), json.dumps(summary, separators=(",", ":"))),
+            )
+            return summary
 
     def insert_item(self, **values) -> StorageItem:
         """Insert a callback result, returning the existing item on retry."""

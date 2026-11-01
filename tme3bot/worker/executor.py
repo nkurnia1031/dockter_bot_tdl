@@ -1247,7 +1247,7 @@ class WorkerJobExecutor(
                     interrupt("quick utility", utility_runner.cancel_current)
                 if rclone_runner is not None:
                     interrupt("quick rclone", rclone_runner.cancel_current)
-        elif kind in {"storage_upload", "storage_reconcile"}:
+        elif kind in {"storage_upload", "storage_reconcile", "storage_sync"}:
             if kind == "storage_upload":
                 try:
                     storage_runtime = self.profile_manager.runtime(self.storage_profile())
@@ -1259,6 +1259,15 @@ class WorkerJobExecutor(
                 )
                 if rclone_runner is not None:
                     interrupt("storage rclone", rclone_runner.cancel_current)
+            elif kind == "storage_sync":
+                try:
+                    storage_runtime = self.profile_manager.runtime(profile)
+                except Exception:
+                    storage_runtime = None
+                interrupt(
+                    "Storage sync",
+                    getattr(getattr(storage_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                )
             else:
                 for sender_profile in self.available_storage_profiles():
                     try:
@@ -1670,7 +1679,8 @@ class WorkerJobExecutor(
 
     def _storage_settings_busy(self) -> bool:
         storage_job_active = any(
-            kind == "storage_upload" for _, kind in self._active.values()
+            kind in {"storage_upload", "storage_sync"}
+            for _, kind in self._active.values()
         )
         quick_job_active = any(
             str(command.get("kind") or "") == "export"
@@ -1768,7 +1778,7 @@ class WorkerJobExecutor(
                     keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
-        elif kind in {"storage_upload", "storage_reconcile"}:
+        elif kind in {"storage_upload", "storage_reconcile", "storage_sync"}:
             keys = {f"worker:{worker}:kind:storage_upload"}
             payload = command.get("payload") or {}
             if kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone":
@@ -1880,6 +1890,22 @@ class WorkerJobExecutor(
             raise RuntimeError(
                 f"STORAGE_PROFILE_UNAVAILABLE: lane Upload profil {profile or '(kosong)'} "
                 "belum siap pada worker ini. Jalankan scan profil lalu coba lagi."
+            )
+        if kind == "storage_sync":
+            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+            fingerprints = normalize_session_fingerprints(
+                self.available_storage_session_fingerprints([profile])
+            )
+            expected = str(payload.get("_tdl_sender_session_fingerprint") or "").strip().lower()
+            if (
+                profile in self.available_storage_profiles()
+                and expected
+                and fingerprints.get(profile) == expected
+            ):
+                return
+            raise RuntimeError(
+                f"STORAGE_PROFILE_UNAVAILABLE: lane Upload profil {profile or '(kosong)'} "
+                "berubah atau belum siap pada worker ini. Jalankan scan profil lalu coba lagi."
             )
         if purpose is None:
             return
@@ -2467,6 +2493,7 @@ class WorkerJobExecutor(
             "utility": self._utility,
             "storage_upload": self._storage_upload,
             "storage_reconcile": self._storage_reconcile,
+            "storage_sync": self._storage_sync,
             "backup_node": self._backup,
             "backup_verify": self._backup_verify,
             "tts": self._tts,

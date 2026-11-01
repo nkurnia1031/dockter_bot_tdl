@@ -100,6 +100,106 @@ class FakeRunner:
 
 
 class TDLClientTests(unittest.TestCase):
+    def test_storage_history_export_uses_content_raw_all_and_stable_id_range(self):
+        class StorageHistoryRunner:
+            def __init__(self, peer_id=123):
+                self.peer_id = peer_id
+                self.commands = []
+
+            def run(self, command, **kwargs):
+                del kwargs
+                self.commands.append(command)
+                output = Path(command[command.index("-o") + 1])
+                selected_range = command[command.index("-i") + 1]
+                if selected_range == "1,50":
+                    messages = [
+                        {"id": 2, "type": "message", "text": "early"},
+                        {"id": 50, "type": "message", "text": "latest"},
+                    ]
+                else:
+                    messages = [{"id": 50, "type": "message", "text": "latest"}]
+                output.write_text(
+                    json.dumps({"id": self.peer_id, "messages": messages}),
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            runner = StorageHistoryRunner()
+            client = TDLClient(root / "upload", "upload", runner=runner)
+            exported = client.export_storage_history(
+                "-100123", root / "history.json", expected_channel_id=-100123
+            )
+
+        self.assertTrue(exported.history_complete)
+        self.assertEqual(exported.latest_message_id, 50)
+        self.assertEqual([item["id"] for item in exported.messages], [2, 50])
+        self.assertEqual(len(runner.commands), 3)
+        for command in runner.commands:
+            self.assertIn("--with-content", command)
+            self.assertIn("--raw", command)
+            self.assertIn("--all", command)
+        self.assertIn("1,50", runner.commands[1])
+
+    def test_storage_history_export_rejects_wrong_channel_peer(self):
+        class WrongPeerRunner:
+            def run(self, command, **kwargs):
+                del kwargs
+                output = Path(command[command.index("-o") + 1])
+                output.write_text(json.dumps({"id": 999, "messages": []}), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client = TDLClient(root / "upload", "upload", runner=WrongPeerRunner())
+            with self.assertRaisesRegex(TDLDataError, "peer does not match"):
+                client.export_storage_history(
+                    "-100123", root / "history.json", expected_channel_id=-100123
+                )
+
+    def test_storage_history_export_rejects_wrong_or_malformed_final_marker(self):
+        class FinalMarkerRunner:
+            def __init__(self, final_payload):
+                self.final_payload = final_payload
+                self.calls = 0
+
+            def run(self, command, **kwargs):
+                del kwargs
+                self.calls += 1
+                output = Path(command[command.index("-o") + 1])
+                if self.calls == 1:
+                    messages = [{"id": 50, "type": "message", "text": "latest"}]
+                    payload = {"id": 123, "messages": messages}
+                elif self.calls == 2:
+                    messages = [
+                        {"id": 2, "type": "message", "text": "early"},
+                        {"id": 50, "type": "message", "text": "latest"},
+                    ]
+                    payload = {"id": 123, "messages": messages}
+                else:
+                    payload = self.final_payload
+                output.write_text(json.dumps(payload), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        bad_final_payloads = (
+            {"id": 999, "messages": [{"id": 50, "text": "latest"}]},
+            {"id": 123, "messages": [{"id": 50, "text": "latest"}, {"id": 50, "text": "duplicate"}]},
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for index, final_payload in enumerate(bad_final_payloads):
+                with self.subTest(final_payload=final_payload):
+                    client = TDLClient(
+                        root / f"upload-{index}", "upload",
+                        runner=FinalMarkerRunner(final_payload),
+                    )
+                    with self.assertRaises(TDLDataError):
+                        client.export_storage_history(
+                            "-100123", root / f"history-{index}.json",
+                            expected_channel_id=-100123,
+                        )
+
     def test_resolve_chat_peer_uses_quiet_json_chat_listing(self):
         class ChatRunner:
             def __init__(self):

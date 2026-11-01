@@ -237,7 +237,7 @@ class ControlPlane:
     ) -> None:
         if kind not in {
             "export", "leave", "download", "download_clear_failed",
-            "storage_upload", "storage_reconcile", "tts",
+            "storage_upload", "storage_reconcile", "storage_sync", "tts",
             "tdl_access_verify", "backup_verify", "artifact_inventory",
             "artifact_delete", "backup_node",
         }:
@@ -252,7 +252,7 @@ class ControlPlane:
         candidates = [profile]
         if rclone_storage:
             candidates = []
-        elif kind in {"storage_upload", "storage_reconcile", "tts"}:
+        elif kind in {"storage_upload", "storage_reconcile", "storage_sync", "tts"}:
             candidates = values.get("_tdl_sender_profiles") or candidates
         elif kind == "tdl_access_verify":
             candidates = values.get("candidate_profiles") or candidates
@@ -264,7 +264,7 @@ class ControlPlane:
             if normalized and not rclone_storage and kind in {
                 "export", "leave", "download", "download_clear_failed",
                 "artifact_inventory", "artifact_delete",
-                "storage_upload", "storage_reconcile", "tts",
+                "storage_upload", "storage_reconcile", "storage_sync", "tts",
                 "tdl_access_verify", "backup_verify",
             }:
                 self.assert_profile_worker_verified(normalized, worker)
@@ -405,6 +405,76 @@ class ControlPlane:
                 private_values["tdl_sender_session_fingerprints"] = json.dumps(
                     internal_payload["_tdl_sender_session_fingerprints"], separators=(",", ":")
                 )
+        elif kind == "storage_sync":
+            selected_profile = owner_profile
+            _, selected_worker = self.resolve_target(
+                actor,
+                profile=selected_profile,
+                worker=worker,
+                check_readiness=False,
+            )
+            try:
+                channel_id = int(internal_payload.get("channel_id"))
+            except (TypeError, ValueError):
+                raise DomainError(
+                    "STORAGE_SYNC_CHANNEL_INVALID",
+                    "Channel Storage belum dikonfigurasi.",
+                    status_code=503,
+                ) from None
+            if channel_id == 0 or set(internal_payload) - {"channel_id"}:
+                raise DomainError(
+                    "STORAGE_SYNC_REQUEST_INVALID",
+                    "Target sinkronisasi Storage tidak valid.",
+                    status_code=422,
+                )
+            destination = self._tdl_access_target("storage")
+            gate = self.runtime_readiness_gate
+            access_store = self.tdl_access_store
+            if not destination or gate is None or access_store is None:
+                raise DomainError(
+                    "RUNTIME_NOT_READY",
+                    "Bukti akses Storage belum tersedia. Jalankan Scan Profil.",
+                    status_code=409,
+                )
+            storage_cell = gate.require_storage(selected_profile, selected_worker)
+            upload_cell = gate.require_upload(selected_profile, selected_worker)
+            fingerprint = str(upload_cell.get("session_fingerprint") or "").strip().lower()
+            if not fingerprint or fingerprint != str(
+                storage_cell.get("session_fingerprint") or ""
+            ).strip().lower():
+                raise DomainError(
+                    "RUNTIME_NOT_READY",
+                    "Lane Upload dan Storage memakai fingerprint profil yang berbeda. Jalankan Scan Profil.",
+                    status_code=409,
+                    details={
+                        "worker": selected_worker,
+                        "profile": selected_profile,
+                        "runtime": "storage",
+                        "reason_code": "PROFILE_UPLOAD_SESSION_CHANGED",
+                    },
+                )
+            destination_hash = access_store.destination_fingerprint(destination)
+            if storage_cell.get("destination_fingerprint") != destination_hash:
+                raise DomainError(
+                    "TDL_ACCESS_NOT_VERIFIED",
+                    "Profil terpilih tidak memiliki bukti akses Storage yang cocok.",
+                    status_code=409,
+                    details={
+                        "worker": selected_worker,
+                        "profile": selected_profile,
+                        "runtime": "storage",
+                        "reason_code": "TDL_ACCESS_NOT_VERIFIED",
+                    },
+                )
+            execution_profile = selected_profile
+            internal_payload = {
+                "channel_id": channel_id,
+                "_tdl_sender_profile": selected_profile,
+                "_tdl_sender_profiles": [selected_profile],
+                "_tdl_sender_session_fingerprints": {selected_profile: fingerprint},
+            }
+            private_values["tdl_storage_chat_ref"] = destination
+            private_values["storage_sync_session_fingerprint"] = fingerprint
         elif kind == "storage_reconcile":
             _, selected_worker = self.resolve_target(
                 actor, worker=worker
@@ -902,7 +972,7 @@ class ControlPlane:
             self.runtime_readiness_gate.require_tts(profile, worker)
         elif kind == "download" and self.runtime_readiness_gate is not None:
             self.runtime_readiness_gate.require_download(profile, worker)
-        elif kind == "storage_upload" and self.runtime_readiness_gate is not None:
+        elif kind in {"storage_upload", "storage_sync"} and self.runtime_readiness_gate is not None:
             if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
                 self.runtime_readiness_gate.require_rclone_storage(
                     worker, str(payload.get("rclone_destination") or "")
@@ -918,7 +988,7 @@ class ControlPlane:
             return
         job = self.jobs.get(event.job_id)
         if job is None or job.kind not in {
-            "export", "download", "tts", "storage_upload", "safelink_resolve"
+            "export", "download", "tts", "storage_upload", "storage_sync", "safelink_resolve"
         }:
             return
         error = event.error if isinstance(event.error, dict) else {}
@@ -965,7 +1035,7 @@ class ControlPlane:
                     profile=sender_profile,
                     error_code=error_code,
                 )
-        elif job.kind == "storage_upload":
+        elif job.kind in {"storage_upload", "storage_sync"}:
             command = self.jobs.command_payload(job.id)
             payload = command.get("payload") if isinstance(command, dict) else None
             payload = payload if isinstance(payload, dict) else (
@@ -1854,7 +1924,14 @@ class ControlPlane:
             )
         result: dict[str, bytes] = {}
         for key, value in values.items():
-            if key not in {"telegram_tts_chat_id", "tdl_access_target", "tdl_storage_chat_ref", "tdl_sender_session_fingerprints", "backup_archive_password"} or not isinstance(value, str) or not value.strip():
+            if key not in {
+                "telegram_tts_chat_id",
+                "tdl_access_target",
+                "tdl_storage_chat_ref",
+                "tdl_sender_session_fingerprints",
+                "storage_sync_session_fingerprint",
+                "backup_archive_password",
+            } or not isinstance(value, str) or not value.strip():
                 raise DomainError(
                     "JOB_PRIVATE_VALUE_INVALID",
                     "Snapshot privat job tidak valid.",
@@ -2625,6 +2702,16 @@ class ControlPlane:
                     fingerprints = {}
                 result["_tdl_sender_session_fingerprints"] = fingerprints
             return result
+        if kind == "storage_sync":
+            target = self.private_job_value(job_id, "tdl_storage_chat_ref")
+            fingerprint = self.private_job_value(
+                job_id, "storage_sync_session_fingerprint"
+            )
+            return {
+                **payload,
+                **({"tdl_access_target": target} if target else {}),
+                **({"_tdl_sender_session_fingerprint": fingerprint} if fingerprint else {}),
+            }
         if kind != "export":
             return payload
         result = dict(payload)
@@ -2921,6 +3008,12 @@ class ControlPlane:
         latest_sequence = current.progress_sequence
         if event.sequence <= latest_sequence:
             return current
+        if (
+            current.kind == "storage_sync"
+            and event.status == JobStatus.SUCCEEDED
+            and event.event_type == "completed"
+        ):
+            event = self._apply_storage_sync_completion(current, event)
         event = self._with_observability(current, event)
         job, inserted = self.jobs.append_event(event)
         self._stale_cancel_requested.pop(event.job_id, None)
@@ -2976,6 +3069,95 @@ class ControlPlane:
             elif event.status == JobStatus.PAUSED:
                 self._dispatch_pending_jobs()
         return job
+
+    def _apply_storage_sync_completion(self, job: Job, event: JobEvent) -> JobEvent:
+        """Apply worker-exported channel facts once, deleting only with proof."""
+        if self.storage_catalog is None:
+            return replace(
+                event,
+                status=JobStatus.FAILED,
+                event_type="storage.sync_apply_failed",
+                error={
+                    "code": "STORAGE_SYNC_CATALOG_UNAVAILABLE",
+                    "message": "Katalog Storage tidak tersedia untuk menerapkan hasil sinkronisasi.",
+                },
+            )
+        try:
+            terminal = event.result if isinstance(event.result, dict) else {}
+            summary = terminal.get("value") if isinstance(terminal.get("value"), dict) else {}
+            channel_id = int(summary.get("channel_id") or 0)
+            if channel_id == 0 or channel_id != int(job.payload.get("channel_id") or 0):
+                raise ValueError("STORAGE_SYNC_CHANNEL_MISMATCH")
+            message_ids: list[int] = []
+            items: list[dict[str, Any]] = []
+            seen: set[int] = set()
+            batches = [
+                stored
+                for stored in self.jobs.events(job.id)
+                if stored.event_type == "storage.sync_batch"
+            ]
+            for batch in batches:
+                batch_result = batch.result if isinstance(batch.result, dict) else {}
+                batch_channel = int(batch_result.get("channel_id") or 0)
+                raw_ids = batch_result.get("message_ids")
+                raw_items = batch_result.get("items")
+                if batch_channel != channel_id or not isinstance(raw_ids, list) or not isinstance(raw_items, list):
+                    raise ValueError("STORAGE_SYNC_BATCH_INVALID")
+                batch_ids: set[int] = set()
+                for raw_id in raw_ids:
+                    if isinstance(raw_id, bool):
+                        raise ValueError("STORAGE_SYNC_MESSAGE_ID_INVALID")
+                    message_id = int(raw_id)
+                    if message_id < 1 or message_id in seen:
+                        raise ValueError("STORAGE_SYNC_MESSAGE_ID_INVALID")
+                    seen.add(message_id)
+                    batch_ids.add(message_id)
+                    message_ids.append(message_id)
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        raise ValueError("STORAGE_SYNC_ITEM_INVALID")
+                    item_id = int(item.get("channel_message_id") or 0)
+                    if item_id not in batch_ids:
+                        raise ValueError("STORAGE_SYNC_ITEM_INVALID")
+                    items.append(item)
+
+            coverage = summary.get("history_coverage")
+            catalog_result = self.storage_catalog.apply_channel_sync(
+                job_id=job.id,
+                channel_id=channel_id,
+                message_ids=message_ids,
+                items=items,
+                actor_user_id=job.actor_user_id,
+                profile=job.profile,
+                history_coverage=coverage if isinstance(coverage, dict) else None,
+                reported_history_complete=summary.get("history_complete"),
+                reported_message_count=summary.get("messages_scanned"),
+                batch_count=len(batches),
+                reported_batch_count=summary.get("batch_count"),
+            )
+            return replace(
+                event,
+                result={
+                    "value": {
+                        **summary,
+                        "history_complete": bool(catalog_result["history_complete"]),
+                        "catalog": catalog_result,
+                    }
+                },
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not apply Storage sync result for job %s", job.id
+            )
+            return replace(
+                event,
+                status=JobStatus.FAILED,
+                event_type="storage.sync_apply_failed",
+                error={
+                    "code": "STORAGE_SYNC_APPLY_FAILED",
+                    "message": "Hasil ekspor tidak valid; katalog tidak diubah.",
+                },
+            )
 
     def _shared_export_cursor_enabled(self) -> bool:
         return bool(
@@ -3819,6 +4001,8 @@ class ControlPlane:
             if sender_profile:
                 public["sender_profile"] = sender_profile
             return public
+        if kind == "storage_sync":
+            return {"channel_id": int(payload.get("channel_id") or 0)}
         if kind not in {"backup_node", "utility", "export"}:
             return dict(payload)
         if kind == "export" and not bool(payload.get("quick_mode")):

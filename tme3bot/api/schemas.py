@@ -223,6 +223,9 @@ class StorageItemResponse(ApiResponse):
     trashed_by: int | None = None
     caption_sync_status: str = "synced"
     purge_error: str | None = None
+    recovered_at: datetime | None = None
+    recovered_by_user_id: int | None = None
+    recovered_from_profile: str | None = None
     folder_path: str = ""
     purge_at: datetime | None = None
 
@@ -460,6 +463,11 @@ class StorageUploadRequest(BaseModel):
     worker: str | None = None
     transfer_mode: Literal["copy", "move"] = "copy"
     move_confirmed: bool = False
+
+
+class StorageSyncRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=48)
+    profile: str = Field(min_length=1, max_length=48)
 
 
 class StorageUpdateRequest(BaseModel):

@@ -24,7 +24,8 @@
     folder_id?:number|null; keywords?:string; file_size?:number; mime_type?:string;
     owner_user_id?:number; owner_profile?:string; uploaded_at?:string;
     updated_at?:string; status?:string; trashed_at?:string|null;
-    caption_sync_status?:string
+    caption_sync_status?:string; recovered_at?:string|null;
+    recovered_by_user_id?:number|null; recovered_from_profile?:string|null
   };
   type BrowserResponse = {
     current_folder:FolderEntry|null; breadcrumbs:{id:number;name:string}[];
@@ -75,6 +76,9 @@
   let displayName = $state('');
   let editKeywords = $state('');
   let worker = $state('');
+  let syncProfile = $state('');
+  let syncJobId = $state('');
+  let syncSubmitting = $state(false);
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
   const storageReadiness = $derived(
@@ -84,6 +88,15 @@
     session.runtimeReadiness.cells.filter((cell) =>
       cell.worker === worker && cell.runtime === 'storage'
     )
+  );
+  const storageSyncProfiles = $derived(
+    session.profileCatalog
+      .filter((profile) => profile.workers.includes(worker))
+      .filter((profile) =>
+        runtimeReadinessFor(session.runtimeReadiness, profile.name, worker, 'storage').status === 'ready'
+        && runtimeReadinessFor(session.runtimeReadiness, profile.name, worker, 'upload').status === 'ready'
+      )
+      .map((profile) => profile.name)
   );
   const storageRuntimeReady = $derived(storageReadiness.status === 'ready');
   const rcloneReadiness = $derived(runtimeReadinessFor(session.runtimeReadiness, null, worker, 'rclone_storage'));
@@ -164,6 +177,40 @@
     } catch (cause) {
       message = cause instanceof Error ? cause.message : 'Storage tidak dapat dimuat.';
     } finally { loading = false; }
+  }
+  async function syncTelegramCatalog() {
+    if (!worker || !storageSyncProfiles.includes(syncProfile) || syncSubmitting) return;
+    syncSubmitting = true;
+    message = '';
+    try {
+      const job = await post<{id:string}>('/storage/sync', {worker, profile:syncProfile});
+      syncJobId = job.id;
+      message = `Sinkronisasi channel Telegram masuk antrean untuk profil ${syncProfile}.`;
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Sinkronisasi Storage gagal dibuat.';
+    } finally {
+      syncSubmitting = false;
+    }
+  }
+  async function handleJobFinished(event: Event) {
+    void session.refreshProfileCatalog();
+    const finishedIds = (event as CustomEvent<{jobIds?:string[]}>).detail?.jobIds || [];
+    if (!syncJobId || !finishedIds.includes(syncJobId)) return;
+    const finishedJobId = syncJobId;
+    try {
+      const job = await api<{status:string; result?:Record<string, any>; error?:{message?:string}}>(`/jobs/${encodeURIComponent(finishedJobId)}`);
+      if (job.status === 'succeeded') {
+        await load();
+        const catalog = job.result?.value?.catalog;
+        message = catalog
+          ? `Sinkronisasi selesai: ${catalog.recovered || 0} dipulihkan, ${catalog.updated || 0} diperbarui, ${catalog.deleted || 0} dihapus.`
+          : 'Sinkronisasi katalog Telegram selesai.';
+      } else {
+        message = job.error?.message || `Sinkronisasi berakhir dengan status ${job.status}.`;
+      }
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Hasil sinkronisasi tidak dapat dimuat.';
+    }
   }
   function openFolder(id:number|null) {
     folderId = id; scope = 'current'; clearSelection(); load();
@@ -302,10 +349,12 @@
     view=(localStorage.getItem('storage-view') as 'list'|'grid') || 'grid';
     sort=localStorage.getItem('storage-sort') || 'name';
     void session.refreshProfileCatalog();
-    const onJobFinished = () => { void session.refreshProfileCatalog(); };
-    window.addEventListener('tme3:job-finished', onJobFinished);
+    window.addEventListener('tme3:job-finished', handleJobFinished);
     load();
-    return () => window.removeEventListener('tme3:job-finished', onJobFinished);
+    return () => window.removeEventListener('tme3:job-finished', handleJobFinished);
+  });
+  $effect(() => {
+    if (!storageSyncProfiles.includes(syncProfile)) syncProfile = storageSyncProfiles[0] || '';
   });
   $effect(() => {
     const activeProvider=provider;
@@ -356,6 +405,23 @@
   {#if storageReadiness.status !== 'ready'}
     <a class="mt-3 inline-flex text-sm font-semibold text-violet-700 underline dark:text-violet-300" href="/profiles">Buka Profil untuk menjalankan Scan Profil</a>
   {/if}
+  <div class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-3 sm:p-4">
+    <div class="flex flex-wrap items-end justify-between gap-3">
+      <div class="min-w-[220px] flex-1">
+        <h3 class="font-bold">Sinkronkan katalog dari Telegram</h3>
+        <p class="muted mt-1 text-sm">Ekspor metadata channel Storage, cocokkan message ID, lalu perbarui katalog. Tidak mengunduh media.</p>
+      </div>
+      <label class="text-sm font-semibold">Profil sumber
+        <select class="field mt-1 min-w-44" bind:value={syncProfile} disabled={!storageSyncProfiles.length}>
+          {#each storageSyncProfiles as profile (profile)}<option value={profile}>{profile}</option>{/each}
+        </select>
+      </label>
+      <button class="button" onclick={syncTelegramCatalog} disabled={!worker || !storageSyncProfiles.includes(syncProfile) || syncSubmitting}>
+        <RefreshCw size={16} class={syncSubmitting?'animate-spin':''}/>{syncSubmitting?'Menyiapkan…':'Sinkronkan sekarang'}
+      </button>
+    </div>
+    {#if !storageSyncProfiles.length}<p class="muted mt-2 text-xs">Pilih worker dan pastikan lane Upload serta Storage profil sudah berstatus siap.</p>{/if}
+  </div>
 </section>
 {/if}
 
@@ -492,6 +558,7 @@
 {/if}
 
 <JobTable kind="storage_upload" title="Transfer upload" retryable={true}/>
+{#if provider==='telegram'}<JobTable kind="storage_sync" title="Sinkronisasi katalog Telegram"/>{/if}
 
 {#if detail}
   {@const DetailIcon=iconFor(detail)}
@@ -500,7 +567,7 @@
     <dialog open bind:this={detailPanel} aria-modal="true" aria-labelledby="storage-detail-title" tabindex="-1" onkeydown={handleDetailKeydown} class="absolute inset-y-0 left-auto right-0 m-0 w-full max-w-md overflow-auto border-0 border-l border-solid border-[var(--line)] bg-[var(--panel)] p-6 shadow-2xl">
       <div class="sticky top-0 -mx-6 -mt-6 z-10 flex items-center justify-between border-b border-[var(--line)] bg-[var(--panel)] px-6 py-4"><h2 id="storage-detail-title" class="text-xl font-black">Detail file</h2><button bind:this={detailCloseButton} type="button" class="button ghost" aria-label="Tutup detail file" onclick={closeDetail}><X size={18}/></button></div>
       <div class="my-8 text-center"><DetailIcon class="mx-auto text-violet-500" size={68}/><h3 class="mt-4 break-words text-lg font-black">{detail.display_name}</h3><p class="muted mt-1 text-sm">{detail.original_name}</p></div>
-      <dl class="grid grid-cols-[110px_1fr] gap-y-3 text-sm"><dt class="muted">Lokasi</dt><dd>{detail.folder||'My Drive'}</dd><dt class="muted">Ukuran</dt><dd>{formatBytes(detail.file_size)}</dd><dt class="muted">Keywords</dt><dd>{detail.keywords||'-'}</dd><dt class="muted">Uploader</dt><dd>{detail.owner_profile||'-'}</dd><dt class="muted">Upload</dt><dd>{formatDate(detail.uploaded_at)}</dd><dt class="muted">Caption</dt><dd>{detail.caption_sync_status||'synced'}</dd></dl>
+      <dl class="grid grid-cols-[110px_1fr] gap-y-3 text-sm"><dt class="muted">Lokasi</dt><dd>{detail.folder||'My Drive'}</dd><dt class="muted">Ukuran</dt><dd>{formatBytes(detail.file_size)}</dd><dt class="muted">Keywords</dt><dd>{detail.keywords||'-'}</dd><dt class="muted">{detail.recovered_at?'Profil sumber':'Uploader'}</dt><dd>{detail.owner_profile||'-'}</dd><dt class="muted">Upload</dt><dd>{formatDate(detail.uploaded_at)}</dd><dt class="muted">Caption</dt><dd>{detail.caption_sync_status||'synced'}</dd>{#if detail.recovered_at}<dt class="muted">Pemulihan</dt><dd>Dipulihkan dari profil {detail.recovered_from_profile||'-'} oleh operator {detail.recovered_by_user_id||'-'}</dd>{/if}</dl>
       <div class="mt-8 grid grid-cols-2 gap-2"><button class="button" onclick={() => deliver(detail!)}><Send size={15}/>Kirim Telegram</button><button class="button secondary" onclick={() => copyFileCode(detail!)}><Copy size={15}/>Salin kode file</button><button class="button secondary" onclick={() => beginItemEdit(detail!)}><Pencil size={15}/>Rename / keyword</button><button class="button secondary" onclick={() => {selectedItems=[detail!.id];detail=null;startMove()}}><FolderInput size={15}/>Move</button><button class="button danger col-span-2" onclick={() => {selectedItems=[detail!.id];detail=null;confirmAction=isTrash?'purge':'trash'}}><Trash2 size={15}/>{isTrash?'Purge permanen':'Pindahkan ke Trash'}</button></div>
     </dialog>
   </div>
