@@ -140,6 +140,10 @@ _Avoid_: delivery Telegram, download artifact export.
 URL per file pada domain worker yang dapat dipakai siapa pun yang memilikinya tanpa login dan tetap berlaku sampai dicabut manual. Link disimpan di halaman Storage; mencabutnya juga menghapus file di path worker terkait.
 _Avoid_: deep link Telegram, link sementara.
 
+**Ringkasan folder Storage**:
+Jumlah file dan subfolder serta ukuran seluruh file di folder dan semua turunannya. Ukuran ditandai tidak lengkap bila ada ukuran file yang tidak diketahui.
+_Avoid_: hitungan isi langsung, total ukuran parsial tanpa penanda.
+
 ## Utility
 
 **Kumpulan kandidat password arsip**:
