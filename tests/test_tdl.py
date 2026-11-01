@@ -133,7 +133,7 @@ class TDLClientTests(unittest.TestCase):
                 "-100123", root / "history.json", expected_channel_id=-100123
             )
 
-        self.assertTrue(exported.history_complete)
+        self.assertFalse(exported.history_complete)
         self.assertEqual(exported.latest_message_id, 181)
         self.assertEqual([item["id"] for item in exported.messages], [2, 90, 181])
         self.assertEqual(len(runner.commands), 3)
@@ -146,6 +146,9 @@ class TDLClientTests(unittest.TestCase):
         self.assertNotIn("-i", history_command)
         self.assertEqual(exported.coverage["export_mode"], "all_messages")
         self.assertTrue(exported.coverage["iterator_completed"])
+        self.assertTrue(exported.coverage["high_water_matches"])
+        self.assertFalse(exported.coverage["pagination_verified"])
+        self.assertFalse(exported.coverage["complete"])
 
     def test_unbounded_storage_export_keeps_high_water_mismatch_incomplete(self):
         class PartialRunner:

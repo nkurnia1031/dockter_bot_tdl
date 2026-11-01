@@ -856,14 +856,19 @@ class TDLClient:
                 raise TDLDataError("TDL latest-message export returned an invalid message count.")
             latest_after = max(after_ids, default=0)
         except (TDLCommandError, OSError):
-            # The range export remains useful, but an unavailable end marker
+            # The all-message export remains useful, but an unavailable end marker
             # cannot authorize permanent deletion of missing catalog rows.
             latest_after = -1
 
-        history_complete = bool(
+        high_water_matches = bool(
             latest_before == latest_after == range_max
             and (latest_before == 0 or range_max == latest_before)
         )
+        # TDL's JSON export has no page/count receipt. A successful unbounded
+        # command plus a matching final ID cannot prove that an interior page
+        # was not skipped, so it must not authorize deleting absent catalog rows.
+        pagination_verified = latest_before == 0 and high_water_matches
+        history_complete = high_water_matches and pagination_verified
         return StorageHistoryExport(
             channel_id=int(expected_channel_id),
             peer_id=expected_peer_id,
@@ -878,6 +883,8 @@ class TDLClient:
                 "latest_after_id": latest_after,
                 "export_succeeded": True,
                 "iterator_completed": True,
+                "high_water_matches": high_water_matches,
+                "pagination_verified": pagination_verified,
                 "complete": history_complete,
             },
         )

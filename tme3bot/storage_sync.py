@@ -222,6 +222,7 @@ def full_history_proven(
         and coverage.get("complete") is True
         and coverage.get("export_succeeded") is True
         and coverage.get("iterator_completed") is True
+        and coverage.get("pagination_verified") is True
         and latest_before >= 0
         and latest_before == latest_after == range_max
         and len(message_ids) == reported_message_count

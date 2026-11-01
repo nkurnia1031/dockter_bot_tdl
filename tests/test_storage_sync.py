@@ -32,7 +32,8 @@ def complete_coverage(latest_message_id):
         "strategy": "tdl_unbounded_export_v1", "export_mode": "all_messages",
         "range_max_id": latest_message_id,
         "latest_before_id": latest_message_id, "latest_after_id": latest_message_id,
-        "export_succeeded": True, "iterator_completed": True, "complete": True,
+        "export_succeeded": True, "iterator_completed": True,
+        "pagination_verified": True, "complete": True,
     }
 
 
@@ -62,7 +63,8 @@ class StorageExportParsingTests(unittest.TestCase):
         coverage = {
             "strategy": "tdl_unbounded_export_v1", "export_mode": "all_messages",
             "range_max_id": 8, "latest_before_id": 8, "latest_after_id": 8,
-            "export_succeeded": True, "iterator_completed": True, "complete": True,
+            "export_succeeded": True, "iterator_completed": True,
+            "pagination_verified": True, "complete": True,
         }
         self.assertTrue(full_history_proven(
             coverage, message_ids=[3, 8], batch_count=1,
@@ -84,6 +86,11 @@ class StorageExportParsingTests(unittest.TestCase):
         ))
         self.assertFalse(full_history_proven(
             {**coverage, "iterator_completed": False},
+            message_ids=[3, 8], batch_count=1,
+            reported_message_count=2, reported_batch_count=1,
+        ))
+        self.assertFalse(full_history_proven(
+            {**coverage, "pagination_verified": False},
             message_ids=[3, 8], batch_count=1,
             reported_message_count=2, reported_batch_count=1,
         ))
