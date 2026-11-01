@@ -17,6 +17,7 @@ from tme3bot.infrastructure.operation_store import SqliteOperationStore
 from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.settings_store import SqliteSettingsStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
+from tme3bot.storage_catalog import StorageCatalog
 
 
 class FakeProfiles:
@@ -269,6 +270,48 @@ class DurableDispatchTests(unittest.TestCase):
                 "SELECT settings_version FROM jobs WHERE id=?", (job.id,)
             ).fetchone()
         self.assertEqual(int(row["settings_version"]), 1)
+
+    def test_storage_sync_submission_encrypts_and_forwards_session_fingerprint(self):
+        destination = "-100123"
+        session_fingerprint = "a" * 64
+        destination_fingerprint = self.tdl_access.destination_fingerprint(destination)
+        for runtime in ("storage", "upload"):
+            self.runtime_readiness.upsert_cell(
+                worker="local",
+                profile="default",
+                runtime=runtime,
+                ready=True,
+                fingerprint="f" * 64,
+                session_fingerprint=session_fingerprint,
+                destination_fingerprint=(
+                    destination_fingerprint if runtime == "storage" else ""
+                ),
+            )
+        self.control.storage_catalog = StorageCatalog(
+            Path(self.temp.name) / "storage-catalog.db"
+        )
+        self.control.tdl_access_target_resolver = (
+            lambda purpose: destination if purpose == "storage" else "123456789"
+        )
+
+        job = self.control.submit_job(
+            self.actor,
+            "storage_sync",
+            {"channel_id": 123},
+            profile="default",
+            worker="local",
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertNotIn(session_fingerprint, str(job.payload))
+        command = self.dispatcher.legacy_commands[-1][1]
+        self.assertEqual(command["worker"], "local")
+        self.assertEqual(command["profile"], "default")
+        self.assertEqual(command["payload"]["tdl_access_target"], destination)
+        self.assertEqual(
+            command["payload"]["_tdl_sender_session_fingerprint"],
+            session_fingerprint,
+        )
 
     def test_client_cannot_override_internal_settings_or_quickmode_checkpoint(self):
         with self.assertRaises(DomainError) as utility_error:

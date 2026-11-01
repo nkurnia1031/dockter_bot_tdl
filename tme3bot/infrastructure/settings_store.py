@@ -58,6 +58,7 @@ _JOB_SECRET_KEYS = frozenset(
         "tdl_access_target",
         "tdl_storage_chat_ref",
         "tdl_sender_session_fingerprints",
+        "storage_sync_session_fingerprint",
         "backup_archive_password",
     }
 )
