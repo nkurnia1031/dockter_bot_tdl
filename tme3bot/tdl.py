@@ -171,6 +171,8 @@ class StorageHistoryExport:
     latest_message_id: int
     history_complete: bool
     coverage: dict[str, Any]
+    confirmed_missing_message_ids: list[int]
+    verification_failed_message_ids: list[int]
 
 
 @dataclass
@@ -804,19 +806,34 @@ class TDLClient:
         return ids
 
     def export_storage_history(
-        self, chat_ref: str, export_path: Path, *, expected_channel_id: int
+        self,
+        chat_ref: str,
+        export_path: Path,
+        *,
+        expected_channel_id: int,
+        candidate_message_ids: list[int] | None = None,
+        verification_callback: Callable[[int, int, int], None] | None = None,
     ) -> StorageHistoryExport:
         """Export the entire channel in one unbounded TDL command.
 
-        Stable last-message reads bracket the unbounded export. TDL's export
-        iterator fetches subsequent API pages itself and checks its terminal
-        iterator error before returning success. If the exported high-water ID
-        does not match the stable marker, findings remain useful but cannot
-        authorize deletion. No media bytes are downloaded.
+        Stable last-message reads bracket the unbounded export. Existing
+        catalog IDs absent from that result are re-exported as exact ID ranges;
+        only successful, valid lookups returning no message confirm absence.
+        No media bytes are downloaded.
         """
         expected_peer_id = self._expected_channel_peer_id(expected_channel_id)
         export_path = Path(export_path)
         export_path.parent.mkdir(parents=True, exist_ok=True)
+        candidates: list[int] = []
+        seen_candidates: set[int] = set()
+        for raw_id in candidate_message_ids or []:
+            if isinstance(raw_id, bool):
+                raise TDLDataError("Storage sync candidate message ID is invalid.")
+            message_id = int(raw_id)
+            if message_id < 1 or message_id in seen_candidates:
+                raise TDLDataError("Storage sync candidate message IDs must be unique and positive.")
+            seen_candidates.add(message_id)
+            candidates.append(message_id)
         latest_path = export_path.with_name(f"{export_path.stem}-latest-before.json")
         before = self.export_messages(
             chat_ref, 1, latest_path, with_content=True, last_count=1,
@@ -842,6 +859,46 @@ class TDLClient:
         if any(message_id > latest_before for message_id in message_ids):
             raise TDLDataError("TDL all-message export exceeded its observed high-water mark.")
         range_max = max(message_ids, default=0)
+
+        messages_by_id = {
+            message_id: message
+            for message_id, message in zip(message_ids, history.messages)
+        }
+        confirmed_missing: list[int] = []
+        verification_failed: list[int] = []
+        missing_candidates = [
+            message_id for message_id in candidates if message_id not in messages_by_id
+        ]
+        for index, message_id in enumerate(missing_candidates, start=1):
+            if verification_callback is not None:
+                verification_callback(index, len(missing_candidates), message_id)
+            verification_path = export_path.with_name(
+                f"{export_path.stem}-verify-{message_id}{export_path.suffix}"
+            )
+            try:
+                verified = self.export_messages(
+                    chat_ref,
+                    message_id,
+                    verification_path,
+                    with_content=True,
+                    end_id=message_id,
+                    raw=True,
+                    all_messages=True,
+                )
+                if verified.peer_id != expected_peer_id:
+                    raise TDLDataError(
+                        "TDL targeted export peer does not match configured Storage channel."
+                    )
+                verified_ids = self._strict_export_message_ids(verified.messages)
+                if any(verified_id != message_id for verified_id in verified_ids):
+                    raise TDLDataError("TDL targeted export returned an unexpected message ID.")
+                if verified_ids:
+                    messages_by_id[message_id] = verified.messages[verified_ids.index(message_id)]
+                else:
+                    confirmed_missing.append(message_id)
+            except (TDLCommandError, OSError, TDLDataError):
+                # A failed or malformed lookup is not proof of absence.
+                verification_failed.append(message_id)
 
         latest_after = -1
         try:
@@ -872,7 +929,7 @@ class TDLClient:
         return StorageHistoryExport(
             channel_id=int(expected_channel_id),
             peer_id=expected_peer_id,
-            messages=history.messages,
+            messages=[messages_by_id[message_id] for message_id in sorted(messages_by_id)],
             latest_message_id=latest_before,
             history_complete=history_complete,
             coverage={
@@ -885,8 +942,13 @@ class TDLClient:
                 "iterator_completed": True,
                 "high_water_matches": high_water_matches,
                 "pagination_verified": pagination_verified,
+                "targeted_candidate_count": len(candidates),
+                "targeted_missing_count": len(confirmed_missing),
+                "targeted_failure_count": len(verification_failed),
                 "complete": history_complete,
             },
+            confirmed_missing_message_ids=confirmed_missing,
+            verification_failed_message_ids=verification_failed,
         )
 
     def export_messages_by_time(

@@ -401,6 +401,16 @@ class StorageCatalog:
                 return None
             return item
 
+    def channel_message_ids(self, channel_id: int) -> list[int]:
+        """Snapshot catalog message IDs for targeted verification during sync."""
+        with self._lock, self._db() as db:
+            rows = db.execute(
+                "SELECT channel_message_id FROM storage_items "
+                "WHERE channel_id=? AND channel_message_id>0 ORDER BY channel_message_id",
+                (int(channel_id),),
+            ).fetchall()
+            return [int(row["channel_message_id"]) for row in rows]
+
     def apply_channel_sync(
         self,
         *,
@@ -415,8 +425,9 @@ class StorageCatalog:
         reported_message_count: int,
         batch_count: int,
         reported_batch_count: int,
+        confirmed_missing_message_ids: list[int] | None = None,
     ) -> dict[str, int | bool]:
-        """Apply validated Telegram facts and delete absences only with full-history proof."""
+        """Apply Telegram facts; delete an absent row only after its targeted lookup."""
         selected_job = str(job_id or "").strip()
         selected_channel = int(channel_id)
         selected_profile = str(profile or "").strip().lower()
@@ -437,6 +448,14 @@ class StorageCatalog:
             if message_id < 1 or message_id in seen:
                 raise ValueError("Storage sync message IDs must be unique positive integers")
             seen.add(message_id)
+        confirmed_missing: set[int] = set()
+        for raw_id in confirmed_missing_message_ids or []:
+            if isinstance(raw_id, bool):
+                raise ValueError("Storage sync confirmed-missing ID is invalid")
+            message_id = int(raw_id)
+            if message_id < 1 or message_id in seen or message_id in confirmed_missing:
+                raise ValueError("Storage sync confirmed-missing IDs must be unique absent IDs")
+            confirmed_missing.add(message_id)
         records: dict[int, dict[str, object]] = {}
         for raw in items:
             if not isinstance(raw, dict):
@@ -564,25 +583,34 @@ class StorageCatalog:
                 [(message_id,) for message_id in sorted(seen)],
             )
             missing_rows = db.execute(
-                """SELECT id FROM storage_items AS item WHERE channel_id=?
+                """SELECT id,channel_message_id FROM storage_items AS item WHERE channel_id=?
                    AND NOT EXISTS(SELECT 1 FROM storage_sync_seen AS seen
                                   WHERE seen.message_id=item.channel_message_id)""",
                 (selected_channel,),
             ).fetchall()
-            missing_ids = [int(row["id"]) for row in missing_rows]
-            if history_complete:
-                for item_id in missing_ids:
+            missing_by_message_id = {
+                int(row["channel_message_id"]): int(row["id"])
+                for row in missing_rows
+            }
+            delete_message_ids = confirmed_missing.intersection(missing_by_message_id)
+            delete_item_ids = [
+                missing_by_message_id[message_id]
+                for message_id in sorted(delete_message_ids)
+            ]
+            held_count = len(missing_rows) - len(delete_item_ids)
+            if delete_item_ids:
+                for item_id in delete_item_ids:
                     db.execute("DELETE FROM storage_caption_queue WHERE item_id=?", (item_id,))
                     db.execute("DELETE FROM storage_items_fts WHERE item_id=?", (item_id,))
                     if getattr(self, "_trigram_enabled", False):
                         db.execute("DELETE FROM storage_items_trigram WHERE item_id=?", (item_id,))
                 db.executemany(
                     "DELETE FROM storage_items WHERE id=?",
-                    [(item_id,) for item_id in missing_ids],
+                    [(item_id,) for item_id in delete_item_ids],
                 )
-                summary["deleted"] = len(missing_ids)
-            else:
-                summary["deletion_held"] = len(missing_ids)
+            summary["deleted"] = len(delete_item_ids)
+            summary["confirmed_missing"] = len(delete_message_ids)
+            summary["deletion_held"] = held_count
 
             db.execute(
                 "INSERT INTO storage_sync_runs(job_id,channel_id,applied_at,result_json) VALUES(?,?,?,?)",

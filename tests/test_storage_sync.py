@@ -106,14 +106,22 @@ class StorageSyncWorkerTests(unittest.TestCase):
         class FakeTdlClient:
             command_callback = object()
 
-            def export_storage_history(self, target, path, *, expected_channel_id):
+            def export_storage_history(
+                self, target, path, *, expected_channel_id,
+                candidate_message_ids, verification_callback,
+            ):
                 self.target = target
                 self.expected_channel_id = expected_channel_id
                 self.export_path = path
+                self.candidate_message_ids = candidate_message_ids
+                self.verification_callback = verification_callback
+                verification_callback(1, 1, 22)
                 return StorageHistoryExport(
                     channel_id=123, peer_id=123, messages=messages,
                     latest_message_id=21, history_complete=False,
                     coverage={"strategy": "tdl_id_range", "complete": False},
+                    confirmed_missing_message_ids=[22],
+                    verification_failed_message_ids=[],
                 )
 
         class FakePublisher:
@@ -151,13 +159,21 @@ class StorageSyncWorkerTests(unittest.TestCase):
                 "channel_id": 123,
                 "tdl_access_target": "-100123",
                 "_tdl_sender_session_fingerprint": "a" * 64,
+                "_storage_sync_candidate_message_ids": [22],
             },
         })
 
         self.assertEqual(executor.client.target, "-100123")
         self.assertEqual(executor.client.expected_channel_id, 123)
+        self.assertEqual(executor.client.candidate_message_ids, [22])
+        self.assertTrue(any(
+            kwargs["progress"].get("phase") == "verifying_missing"
+            for _args, kwargs in executor.publisher.events
+            if isinstance(kwargs.get("progress"), dict)
+        ))
         self.assertEqual(result["messages_scanned"], 2)
         self.assertEqual(result["items_recognized"], 1)
+        self.assertEqual(result["confirmed_missing_message_ids"], [22])
         self.assertNotIn("skipped_unrecognized", result)
         progress_counters = [
             kwargs["progress"].get("counters", {})
@@ -167,7 +183,7 @@ class StorageSyncWorkerTests(unittest.TestCase):
         self.assertTrue(all(counters.get("skipped", 0) == 0 for counters in progress_counters))
         self.assertTrue(any(
             kwargs["progress"].get("phase") == "completed"
-            and "kelengkapan belum terbukti" in kwargs["progress"].get("message", "")
+            and "dikonfirmasi hilang" in kwargs["progress"].get("message", "")
             for _args, kwargs in executor.publisher.events
             if isinstance(kwargs.get("progress"), dict)
         ))
@@ -252,8 +268,57 @@ class StorageSyncControlPlaneTests(unittest.TestCase):
 
             complete_job = jobs.get("storage-sync-control-complete")
             self.assertTrue(complete_job.result["value"]["history_complete"])
-            self.assertEqual(complete_job.result["value"]["catalog"]["deleted"], 1)
+            self.assertEqual(complete_job.result["value"]["catalog"]["deleted"], 0)
+            self.assertIsNotNone(catalog.get_by_channel_message(123, 8))
+
+    def test_targeted_confirmation_deletes_only_confirmed_catalog_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = StorageCatalog(root / "storage.db")
+            for message_id in (8, 9, 10):
+                catalog.insert_item(
+                    upload_id=f"targeted-{message_id}", owner_user_id=5,
+                    owner_profile="default", channel_id=123,
+                    channel_message_id=message_id, original_name=f"{message_id}.txt",
+                    display_name=f"{message_id}.txt", folder="", keywords="",
+                    caption="", file_size=1, mime_type="text/plain", sha256="",
+                )
+            jobs = SqliteJobRepository(root / "jobs.db")
+            jobs.create_with_private_values(Job(
+                id="storage-sync-targeted", kind="storage_sync", profile="default",
+                actor_user_id=42, worker="local", status=JobStatus.QUEUED,
+                payload={"channel_id": 123},
+            ), {}, execution_plan={}, command_payload={
+                "channel_id": 123,
+                "_storage_sync_candidate_message_ids": [8, 10],
+            })
+            control = ControlPlane(jobs, object(), object(), storage_catalog=catalog)
+            control.append_worker_event(JobEvent(
+                job_id="storage-sync-targeted", sequence=1, status=JobStatus.RUNNING,
+                event_type="storage.sync_batch", result={
+                    "channel_id": 123, "message_ids": [9], "items": [],
+                },
+            ))
+            control.append_worker_event(JobEvent(
+                job_id="storage-sync-targeted", sequence=2, status=JobStatus.SUCCEEDED,
+                event_type="completed", result={"value": {
+                    "channel_id": 123, "messages_scanned": 1, "batch_count": 1,
+                    "history_complete": False,
+                    "confirmed_missing_message_ids": [8],
+                    "verification_failed_message_ids": [10],
+                    "history_coverage": {"complete": False},
+                }},
+            ))
+
             self.assertIsNone(catalog.get_by_channel_message(123, 8))
+            self.assertIsNotNone(catalog.get_by_channel_message(123, 9))
+            self.assertIsNotNone(catalog.get_by_channel_message(123, 10))
+            result = jobs.get("storage-sync-targeted").result["value"]
+            self.assertEqual(result["catalog"]["deleted"], 1)
+            self.assertEqual(result["catalog"]["deletion_held"], 1)
+            self.assertEqual(result["confirmed_missing_count"], 1)
+            self.assertEqual(result["verification_failed_count"], 1)
+            self.assertNotIn("confirmed_missing_message_ids", result)
 
 
 class StorageCatalogSyncTests(unittest.TestCase):
@@ -374,7 +439,7 @@ class StorageCatalogSyncTests(unittest.TestCase):
             self.assertEqual(result["restored"], 1)
             self.assertGreaterEqual(result["deletion_held"], 1)
 
-    def test_only_complete_history_proof_permanently_deletes_absent_rows(self):
+    def test_full_history_proof_alone_does_not_delete_without_targeted_confirmation(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = StorageCatalog(Path(temp_dir) / "storage.db")
             for message_id in (20, 21):
@@ -409,8 +474,36 @@ class StorageCatalogSyncTests(unittest.TestCase):
                 reported_history_complete=True, reported_message_count=1,
                 batch_count=1, reported_batch_count=1,
             )
-            self.assertIsNone(catalog.get_by_channel_message(-100123, 21))
-            self.assertEqual(complete["deleted"], 1)
+            self.assertIsNotNone(catalog.get_by_channel_message(-100123, 21))
+            self.assertEqual(complete["history_complete"], True)
+            self.assertEqual(complete["deleted"], 0)
+            self.assertEqual(complete["deletion_held"], 1)
+
+    def test_targeted_missing_confirmation_deletes_only_explicit_absent_row(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            for message_id in (30, 31):
+                catalog.insert_item(
+                    upload_id=f"confirm-{message_id}", owner_user_id=7,
+                    owner_profile="default", channel_id=-100123,
+                    channel_message_id=message_id, original_name=f"{message_id}.txt",
+                    display_name=f"{message_id}.txt", folder="", keywords="",
+                    caption="", file_size=1, mime_type="text/plain", sha256="",
+                )
+
+            result = catalog.apply_channel_sync(
+                job_id="sync-targeted-confirmation", channel_id=-100123,
+                message_ids=[], items=[], confirmed_missing_message_ids=[30],
+                actor_user_id=99, profile="default", history_coverage=None,
+                reported_history_complete=False, reported_message_count=0,
+                batch_count=0, reported_batch_count=0,
+            )
+
+            self.assertIsNone(catalog.get_by_channel_message(-100123, 30))
+            self.assertIsNotNone(catalog.get_by_channel_message(-100123, 31))
+            self.assertEqual(result["confirmed_missing"], 1)
+            self.assertEqual(result["deleted"], 1)
+            self.assertEqual(result["deletion_held"], 1)
 
     def test_sync_keeps_channel_names_even_when_duplicate_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as temp_dir:

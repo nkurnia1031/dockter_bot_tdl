@@ -427,6 +427,20 @@ class ControlPlane:
                     "Target sinkronisasi Storage tidak valid.",
                     status_code=422,
                 )
+            catalog_ids = getattr(self.storage_catalog, "channel_message_ids", None)
+            if not callable(catalog_ids):
+                raise DomainError(
+                    "STORAGE_SYNC_CATALOG_UNAVAILABLE",
+                    "Katalog Storage tidak tersedia untuk memverifikasi pesan yang hilang.",
+                    status_code=503,
+                )
+            candidate_message_ids = catalog_ids(channel_id)
+            if not isinstance(candidate_message_ids, list):
+                raise DomainError(
+                    "STORAGE_SYNC_CANDIDATES_INVALID",
+                    "Daftar pesan katalog tidak valid untuk verifikasi sinkronisasi.",
+                    status_code=503,
+                )
             destination = self._tdl_access_target("storage")
             gate = self.runtime_readiness_gate
             access_store = self.tdl_access_store
@@ -469,6 +483,7 @@ class ControlPlane:
             execution_profile = selected_profile
             internal_payload = {
                 "channel_id": channel_id,
+                "_storage_sync_candidate_message_ids": candidate_message_ids,
                 "_tdl_sender_profile": selected_profile,
                 "_tdl_sender_profiles": [selected_profile],
                 "_tdl_sender_session_fingerprints": {selected_profile: fingerprint},
@@ -3071,7 +3086,7 @@ class ControlPlane:
         return job
 
     def _apply_storage_sync_completion(self, job: Job, event: JobEvent) -> JobEvent:
-        """Apply worker-exported channel facts once, deleting only with proof."""
+        """Apply channel facts and only delete rows confirmed missing by ID lookup."""
         if self.storage_catalog is None:
             return replace(
                 event,
@@ -3121,12 +3136,61 @@ class ControlPlane:
                         raise ValueError("STORAGE_SYNC_ITEM_INVALID")
                     items.append(item)
 
+            raw_confirmed_missing = summary.get("confirmed_missing_message_ids", [])
+            raw_verification_failed = summary.get("verification_failed_message_ids", [])
+            if (
+                not isinstance(raw_confirmed_missing, list)
+                or not isinstance(raw_verification_failed, list)
+            ):
+                raise ValueError("STORAGE_SYNC_CONFIRMATION_RESULT_INVALID")
+            confirmed_missing: list[int] = []
+            verification_failed: list[int] = []
+            for raw_ids, normalized in (
+                (raw_confirmed_missing, confirmed_missing),
+                (raw_verification_failed, verification_failed),
+            ):
+                seen_ids: set[int] = set()
+                for raw_id in raw_ids:
+                    if isinstance(raw_id, bool):
+                        raise ValueError("STORAGE_SYNC_CONFIRMATION_RESULT_INVALID")
+                    message_id = int(raw_id)
+                    if message_id < 1 or message_id in seen_ids or message_id in seen:
+                        raise ValueError("STORAGE_SYNC_CONFIRMATION_RESULT_INVALID")
+                    seen_ids.add(message_id)
+                    normalized.append(message_id)
+            if set(confirmed_missing).intersection(verification_failed):
+                raise ValueError("STORAGE_SYNC_CONFIRMATION_RESULT_INVALID")
+
+            stored_command = self.jobs.command_payload(job.id)
+            if isinstance(stored_command, dict):
+                nested_payload = stored_command.get("payload")
+                stored_payload = nested_payload if isinstance(nested_payload, dict) else stored_command
+            else:
+                stored_payload = job.payload
+            raw_candidates = stored_payload.get("_storage_sync_candidate_message_ids", [])
+            if not isinstance(raw_candidates, list):
+                raise ValueError("STORAGE_SYNC_CANDIDATES_INVALID")
+            candidate_ids: set[int] = set()
+            for raw_id in raw_candidates:
+                if isinstance(raw_id, bool):
+                    raise ValueError("STORAGE_SYNC_CANDIDATES_INVALID")
+                message_id = int(raw_id)
+                if message_id < 1 or message_id in candidate_ids:
+                    raise ValueError("STORAGE_SYNC_CANDIDATES_INVALID")
+                candidate_ids.add(message_id)
+            if (
+                not set(confirmed_missing).issubset(candidate_ids)
+                or not set(verification_failed).issubset(candidate_ids)
+            ):
+                raise ValueError("STORAGE_SYNC_CONFIRMATION_OUTSIDE_SNAPSHOT")
+
             coverage = summary.get("history_coverage")
             catalog_result = self.storage_catalog.apply_channel_sync(
                 job_id=job.id,
                 channel_id=channel_id,
                 message_ids=message_ids,
                 items=items,
+                confirmed_missing_message_ids=confirmed_missing,
                 actor_user_id=job.actor_user_id,
                 profile=job.profile,
                 history_coverage=coverage if isinstance(coverage, dict) else None,
@@ -3139,7 +3203,16 @@ class ControlPlane:
                 event,
                 result={
                     "value": {
-                        **summary,
+                        **{
+                            key: value
+                            for key, value in summary.items()
+                            if key not in {
+                                "confirmed_missing_message_ids",
+                                "verification_failed_message_ids",
+                            }
+                        },
+                        "confirmed_missing_count": len(confirmed_missing),
+                        "verification_failed_count": len(verification_failed),
                         "history_complete": bool(catalog_result["history_complete"]),
                         "catalog": catalog_result,
                     }

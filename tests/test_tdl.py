@@ -113,10 +113,11 @@ class TDLClientTests(unittest.TestCase):
                 selected_type = command[command.index("-T") + 1] if "-T" in command else None
                 if selected_type == "last":
                     messages = [{"id": 181, "type": "message", "text": "latest"}]
+                elif selected_type == "id":
+                    messages = [{"id": 90, "type": "message", "text": "rechecked"}]
                 else:
                     messages = [
                         {"id": 2, "type": "message", "text": "early"},
-                        {"id": 90, "type": "message", "text": "middle"},
                         {"id": 181, "type": "message", "text": "latest"},
                     ]
                 output.write_text(
@@ -129,14 +130,19 @@ class TDLClientTests(unittest.TestCase):
             root = Path(temp_dir)
             runner = StorageHistoryRunner()
             client = TDLClient(root / "upload", "upload", runner=runner)
+            verification_progress = []
             exported = client.export_storage_history(
-                "-100123", root / "history.json", expected_channel_id=-100123
+                "-100123", root / "history.json", expected_channel_id=-100123,
+                candidate_message_ids=[90],
+                verification_callback=lambda current, total, message_id: verification_progress.append(
+                    (current, total, message_id)
+                ),
             )
 
         self.assertFalse(exported.history_complete)
         self.assertEqual(exported.latest_message_id, 181)
         self.assertEqual([item["id"] for item in exported.messages], [2, 90, 181])
-        self.assertEqual(len(runner.commands), 3)
+        self.assertEqual(len(runner.commands), 4)
         for command in runner.commands:
             self.assertIn("--with-content", command)
             self.assertIn("--raw", command)
@@ -149,6 +155,54 @@ class TDLClientTests(unittest.TestCase):
         self.assertTrue(exported.coverage["high_water_matches"])
         self.assertFalse(exported.coverage["pagination_verified"])
         self.assertFalse(exported.coverage["complete"])
+        self.assertEqual(exported.confirmed_missing_message_ids, [])
+        self.assertEqual(exported.verification_failed_message_ids, [])
+        self.assertEqual(verification_progress, [(1, 1, 90)])
+        targeted_command = runner.commands[2]
+        self.assertEqual(targeted_command[targeted_command.index("-T") + 1], "id")
+        self.assertEqual(targeted_command[targeted_command.index("-i") + 1], "90,90")
+
+    def test_targeted_retry_confirms_absence_only_after_successful_exact_export(self):
+        class TargetedRunner:
+            def __init__(self, fail_targeted=False):
+                self.fail_targeted = fail_targeted
+                self.commands = []
+
+            def run(self, command, **kwargs):
+                del kwargs
+                self.commands.append(command)
+                output = Path(command[command.index("-o") + 1])
+                selected_type = command[command.index("-T") + 1] if "-T" in command else None
+                if selected_type == "id" and self.fail_targeted:
+                    raise TDLCommandError(command, 1, "", "temporary network error")
+                if selected_type == "last":
+                    messages = [{"id": 181, "type": "message", "text": "latest"}]
+                elif selected_type == "id":
+                    messages = []
+                else:
+                    messages = [{"id": 181, "type": "message", "text": "latest"}]
+                output.write_text(json.dumps({"id": 123, "messages": messages}), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            absent = TDLClient(root / "upload", "upload", runner=TargetedRunner())
+            exported_absent = absent.export_storage_history(
+                "-100123", root / "absent.json", expected_channel_id=-100123,
+                candidate_message_ids=[90],
+            )
+            failed = TDLClient(
+                root / "upload-fail", "upload", runner=TargetedRunner(fail_targeted=True)
+            )
+            exported_failed = failed.export_storage_history(
+                "-100123", root / "failed.json", expected_channel_id=-100123,
+                candidate_message_ids=[90],
+            )
+
+        self.assertEqual(exported_absent.confirmed_missing_message_ids, [90])
+        self.assertEqual(exported_absent.verification_failed_message_ids, [])
+        self.assertEqual(exported_failed.confirmed_missing_message_ids, [])
+        self.assertEqual(exported_failed.verification_failed_message_ids, [90])
 
     def test_unbounded_storage_export_keeps_high_water_mismatch_incomplete(self):
         class PartialRunner:

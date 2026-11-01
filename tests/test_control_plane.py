@@ -331,6 +331,13 @@ class ControlPlaneTests(unittest.TestCase):
         self.authorize_quick_mode_storage()
         self.attach_storage_readiness(profiles=("default",))
 
+        class CatalogSnapshot:
+            def channel_message_ids(self, channel_id):
+                self.channel_id = channel_id
+                return [71, 90]
+
+        self.control.storage_catalog = CatalogSnapshot()
+
         def fail_if_probed(_worker):
             raise AssertionError("Storage sync must use the saved Profile scan")
 
@@ -350,8 +357,10 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(payload["tdl_access_target"], "-100123")
         self.assertEqual(payload["_tdl_sender_session_fingerprint"], "a" * 64)
         self.assertEqual(payload["channel_id"], -100123)
+        self.assertEqual(payload["_storage_sync_candidate_message_ids"], [71, 90])
         self.assertNotIn("tdl_access_target", str(job.payload))
         self.assertNotIn("session_fingerprint", str(job.payload))
+        self.assertNotIn("candidate_message_ids", str(job.payload))
 
     def test_storage_upload_omits_profiles_without_ready_upload_lane(self):
         self.authorize_quick_mode_storage()

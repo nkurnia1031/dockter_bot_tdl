@@ -890,6 +890,9 @@ class StorageExecutorMixin:
             raise RuntimeError("STORAGE_SYNC_CHANNEL_INVALID") from None
         if not profile or not job_id or channel_id == 0:
             raise RuntimeError("STORAGE_SYNC_REQUEST_INVALID")
+        candidate_message_ids = payload.get("_storage_sync_candidate_message_ids", [])
+        if not isinstance(candidate_message_ids, list):
+            raise RuntimeError("STORAGE_SYNC_CANDIDATES_INVALID")
         if profile not in self.available_storage_profiles():
             raise RuntimeError("STORAGE_PROFILE_UNAVAILABLE")
         expected_fingerprint = str(
@@ -925,6 +928,18 @@ class StorageExecutorMixin:
             force=True,
         )
         callback = getattr(client, "command_callback", None)
+
+        def report_targeted_verification(current: int, total: int, _message_id: int) -> None:
+            if self._job_cancelled(job_id):
+                raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan saat verifikasi pesan.")
+            reporter.report(
+                phase="verifying_missing",
+                message=f"Verifikasi ulang {current} dari {total} pesan katalog yang tidak ditemukan",
+                overall={"current": current, "total": total, "unit": "catalog messages"},
+                indeterminate=total == 0,
+                force=current == 1 or current == total,
+            )
+
         with runtime.upload_operation_lock:
             with tempfile.TemporaryDirectory(prefix="storage-sync-") as temp_dir:
                 export_path = Path(temp_dir) / "storage-history.json"
@@ -935,6 +950,8 @@ class StorageExecutorMixin:
                         target,
                         export_path,
                         expected_channel_id=channel_id,
+                        candidate_message_ids=candidate_message_ids,
+                        verification_callback=report_targeted_verification,
                     )
                 finally:
                     if hasattr(client, "command_callback"):
@@ -987,12 +1004,21 @@ class StorageExecutorMixin:
             raise RuntimeError("JOB_TERMINATED: Storage sync dibatalkan sebelum apply.")
         coverage = getattr(exported, "coverage", {})
         history_complete = bool(getattr(exported, "history_complete", False))
+        confirmed_missing = list(
+            getattr(exported, "confirmed_missing_message_ids", []) or []
+        )
+        verification_failed = list(
+            getattr(exported, "verification_failed_message_ids", []) or []
+        )
         reporter.report(
             phase="completed",
             message=(
                 "Riwayat channel Storage terbukti lengkap"
                 if history_complete
-                else "Temuan selesai; kelengkapan belum terbukti dan absensi dipertahankan"
+                else (
+                    f"Pemeriksaan selesai; {len(confirmed_missing)} pesan dikonfirmasi hilang, "
+                    f"{len(verification_failed)} gagal diverifikasi dan row-nya dipertahankan"
+                )
             ),
             overall={"current": total_messages, "total": total_messages, "unit": "messages"},
             counters={"recognized": len(parsed.items)},
@@ -1005,6 +1031,8 @@ class StorageExecutorMixin:
             "batch_count": batch_count,
             "history_complete": history_complete,
             "history_coverage": coverage if isinstance(coverage, dict) else {},
+            "confirmed_missing_message_ids": confirmed_missing,
+            "verification_failed_message_ids": verification_failed,
             "deleted": 0,
             "deletion_held": 0,
         }
