@@ -265,6 +265,12 @@ Profile default memakai `/data`; profile tambahan memakai `/data/profiles/<name>
 - Utility: folder berbeda paralel, folder sama serial.
 - Export: serial per profile-worker export lane.
 - Storage upload: serial per worker storage lane.
+- Storage upload mode `Move` menghapus sumber per file segera setelah upload file
+  itu terkonfirmasi: Telegram setelah TDL mengembalikan `message_id`, rclone
+  setelah verifikasi penuh file tujuan. Worker hanya menghapus file yang masih
+  berada di `/workspace` dan metadata identitasnya (device/inode/size/mtime_ns)
+  belum berubah. File gagal, ambigu, atau berubah tetap ada; `cleanup_status`
+  melaporkan hasil per file. Folder induk dibersihkan hanya jika kosong.
 - Jangan membuka database Bolt `.tdl` yang sama dari dua proses bersamaan.
 - Async panel wajib memakai `panel_view_token` agar panel lama tidak hidup kembali.
 - Metadata panel tidak boleh masuk payload job worker. Progress worker harus
