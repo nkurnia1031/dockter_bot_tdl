@@ -58,6 +58,14 @@ _Avoid_: sesi Storage bersama, storage Export.
 Penyimpanan yang dipilih untuk melihat atau mengunggah file, berupa katalog channel Telegram atau lokasi di remote rclone yang dikonfigurasi.
 _Avoid_: worker sebagai tujuan.
 
+**Sinkronisasi katalog Storage Telegram**:
+Membandingkan file dan metadata pada channel Telegram Storage dengan katalog aplikasi agar daftar file dan lokasi folder katalog mengikuti isi channel. Operasi ini memperbarui katalog aplikasi dan tidak mengubah pesan atau media Telegram.
+_Avoid_: pemulihan database identik, rekonsiliasi upload ambigu.
+
+**Item Storage hasil pemulihan**:
+Item katalog yang dibuat ulang dari pesan Telegram ketika data katalog asal tidak tersedia. Operator sync dan profil yang dipakai dicatat sebagai sumber pemulihan; keduanya tidak menyatakan siapa pengunggah asli.
+_Avoid_: metadata pengunggah asli, item upload baru.
+
 **Mode transfer Storage**:
 Pilihan salin atau pindah file dari worker ke Tujuan Storage. Salin mempertahankan file sumber; pindah menghapus file sumber hanya setelah upload dipastikan berhasil, sedangkan file gagal atau ambigu tetap disimpan.
 _Avoid_: pindah folder katalog.
