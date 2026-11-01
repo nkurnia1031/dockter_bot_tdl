@@ -23,6 +23,162 @@ class FakeSubprocessRunner:
 
 
 class RcloneRunnerTests(unittest.TestCase):
+    def test_recursive_folder_summary_aggregates_metadata_in_one_listing(self):
+        class RecursiveListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Path": "Projects/readme.txt", "Name": "readme.txt", "IsDir": False, "Size": 10},
+                    {"Path": "Projects/2026", "Name": "2026", "IsDir": True},
+                    {"Path": "Projects/2026/plan.pdf", "Name": "plan.pdf", "IsDir": False, "Size": 5},
+                    {"Path": "Projects/unknown.bin", "Name": "unknown.bin", "IsDir": False},
+                    {"Path": "Empty", "Name": "Empty", "IsDir": True},
+                    {"Path": "loose.txt", "Name": "loose.txt", "IsDir": False, "Size": 99},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = RecursiveListingRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).list_directory_summaries(
+                    "remote:backup", "", config, config_root=root,
+                )
+
+        self.assertEqual(result["path"], "")
+        self.assertEqual(result["summaries"], [
+            {"path": "Empty", "file_count": 0, "folder_count": 0, "size_bytes": 0, "size_complete": True},
+            {"path": "Projects", "file_count": 3, "folder_count": 1, "size_bytes": 15, "size_complete": False},
+        ])
+        self.assertEqual(len(fake.commands), 1)
+        command = fake.commands[0][0]
+        self.assertEqual(command[1:3], ["lsjson", "remote:backup"])
+        self.assertIn("--recursive", command)
+        self.assertIn("--no-modtime", command)
+        self.assertIn("--no-mimetype", command)
+        self.assertFalse(any("hash" in value.casefold() for value in command))
+
+    def test_rclone_upload_progress_parses_structured_stats_without_logging_raw_stats(self):
+        progress = []
+        log_lines = []
+
+        class StatsRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                line = json.dumps({
+                    "level": "notice", "msg": "transfer details", "stats": {
+                        "bytes": 42, "totalBytes": 100, "speed": 21.5, "eta": 3,
+                        "transferring": [{
+                            "name": "nested/archive.zip", "bytes": 42, "size": 100,
+                            "percentage": 42, "speed": 21.5, "speedAvg": 20.0, "eta": 3,
+                        }],
+                    },
+                })
+                kwargs["output_callback"](line)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            source = root / "archive.zip"
+            source.write_bytes(b"x" * 100)
+            fake = StatsRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                RcloneRunner(fake, transfer_callback=progress.append, log_callback=log_lines.append).copy_files(
+                    [source], "remote:backup", config,
+                    workspace_root=root, config_root=root,
+                    remote_names=["nested/archive.zip"],
+                )
+
+        self.assertEqual(progress, [{
+            "name": "nested/archive.zip", "bytes_current": 42,
+            "bytes_total": 100, "speed_bps": 21, "eta_seconds": 3,
+            "percent": 42.0, "index": 1, "total": 1,
+        }])
+        self.assertEqual(log_lines, [])
+        command, kwargs = fake.commands[0]
+        self.assertIn("--stats", command)
+        self.assertIn("--use-json-log", command)
+        self.assertEqual(command[command.index("--stats-log-level") + 1], "NOTICE")
+        self.assertEqual(command[command.index("--log-level") + 1], "NOTICE")
+        self.assertFalse(kwargs["output_filter"](json.dumps({"stats": {"bytes": 1}})))
+        self.assertTrue(kwargs["output_filter"](json.dumps({"level": "notice", "msg": "normal"})))
+
+    def test_rclone_download_reports_structured_file_progress(self):
+        progress = []
+
+        class StatsRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                kwargs["output_callback"](json.dumps({
+                    "stats": {"bytes": 8, "totalBytes": 16, "speed": 4, "eta": 2,
+                              "transferring": [{"name": "file.bin", "bytes": 8, "size": 16,
+                                                "percentage": 50, "speed": 4, "eta": 2}]}
+                }))
+                return SimpleNamespace(returncode=0)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = StatsRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                RcloneRunner(fake, transfer_callback=progress.append).download_file(
+                    "remote:backup/file.bin", root / "file.bin", config,
+                    config_root=root, file_name="file.bin", total_bytes=16,
+                )
+
+        self.assertEqual(progress[0]["bytes_current"], 8)
+        self.assertEqual(progress[0]["bytes_total"], 16)
+        self.assertEqual(progress[0]["speed_bps"], 4)
+        self.assertEqual(progress[0]["eta_seconds"], 2)
+        self.assertEqual(progress[0]["percent"], 50.0)
+
+    def test_quickmode_folder_creation_rejects_existing_name_and_reuses_owned_folder(self):
+        class ListingRunner(FakeSubprocessRunner):
+            entries = []
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps(self.entries), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            ListingRunner.entries = [{"Name": "batch", "IsDir": True}]
+            collision_runner = ListingRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(collision_runner).ensure_directory(
+                        "remote:backup", "archive/batch", config,
+                        config_root=root, create_new=True,
+                    )
+                self.assertEqual(raised.exception.code, "RCLONE_TARGET_EXISTS")
+                self.assertEqual(len(collision_runner.commands), 1)
+
+                ListingRunner.entries = []
+                create_runner = ListingRunner()
+                actual = RcloneRunner(create_runner).ensure_directory(
+                    "remote:backup", "archive/batch", config,
+                    config_root=root, create_new=True,
+                )
+                recovery_runner = ListingRunner()
+                recovered = RcloneRunner(recovery_runner).ensure_directory(
+                    "remote:backup", "archive/batch", config,
+                    config_root=root, create_new=True, created_by_job=True,
+                )
+
+        self.assertEqual(actual, "remote:backup/archive/batch")
+        self.assertEqual(recovered, actual)
+        self.assertEqual(len(create_runner.commands), 2)
+        self.assertEqual(create_runner.commands[0][0][1], "lsjson")
+        self.assertEqual(create_runner.commands[1][0][1], "mkdir")
+        self.assertEqual(len(recovery_runner.commands), 1)
+        self.assertEqual(recovery_runner.commands[0][0][1], "mkdir")
+
     def test_folder_download_expansion_keeps_structure_for_overlapping_file_selections(self):
         class RecursiveListingRunner(FakeSubprocessRunner):
             def run(self, command, **kwargs):

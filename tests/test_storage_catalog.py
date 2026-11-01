@@ -108,6 +108,41 @@ class StorageCatalogTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 catalog.move_folder(parent.id, child.id)
 
+    def test_browser_reports_recursive_folder_counts_and_incomplete_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            parent = catalog.create_folder("Projects", 10)
+            child = catalog.create_folder("2026", 10, parent.id)
+            grandchild = catalog.create_folder("Reports", 10, child.id)
+
+            for upload_id, message_id, name, folder_id, size in (
+                ("summary-root", 9101, "root.txt", parent.id, 11),
+                ("summary-child", 9102, "child.txt", child.id, 19),
+                ("summary-unknown", 9103, "unknown.bin", grandchild.id, None),
+            ):
+                values = item_values(upload_id)
+                values.update(
+                    channel_message_id=message_id,
+                    original_name=name,
+                    display_name=name,
+                    folder="",
+                    folder_id=folder_id,
+                    file_size=size,
+                )
+                catalog.insert_item(**values)
+
+            summary = catalog.browser(None)["folders"][0]
+            self.assertEqual(summary["file_count"], 3)
+            self.assertEqual(summary["folder_count"], 2)
+            self.assertEqual(summary["size_bytes"], 30)
+            self.assertFalse(summary["size_complete"])
+
+            nested_summary = catalog.browser(parent.id)["folders"][0]
+            self.assertEqual(nested_summary["file_count"], 2)
+            self.assertEqual(nested_summary["folder_count"], 1)
+            self.assertEqual(nested_summary["size_bytes"], 19)
+            self.assertFalse(nested_summary["size_complete"])
+
     def test_download_selection_deduplicates_file_and_folder_with_folder_structure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = StorageCatalog(Path(temp_dir) / "storage.db")

@@ -17,7 +17,8 @@
 
   type FolderEntry = {
     id:number; parent_id:number|null; name:string; path:string; status:string;
-    updated_at:string; trashed_at?:string|null
+    updated_at:string; trashed_at?:string|null; file_count?:number;
+    folder_count?:number; size_bytes?:number; size_complete?:boolean
   };
   type Item = {
     id:number; display_name:string; original_name:string; folder?:string;
@@ -31,8 +32,9 @@
     current_folder:FolderEntry|null; breadcrumbs:{id:number;name:string}[];
     folders:FolderEntry[]; items:Item[]; total_folders:number; total_items:number
   };
-  type RcloneEntry = {name:string; path:string; is_dir:boolean; size:number; updated_at:string};
+  type RcloneEntry = {name:string; path:string; is_dir:boolean; size:number; updated_at:string; file_count?:number; folder_count?:number; size_bytes?:number; size_complete?:boolean};
   type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number};
+  type RcloneSummary = {path:string; file_count:number; folder_count:number; size_bytes:number; size_complete:boolean};
   type PublicDownloadLink = {id:string; worker:string; relative_path:string; file_name:string; provider:string; job_id:string; created_at:string; url:string};
 
   let provider = $state<'telegram'|'rclone'>('telegram');
@@ -43,13 +45,13 @@
   let order = $state('asc');
   let view = $state<'list'|'grid'>('grid');
   let data = $state<BrowserResponse>({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0});
-  let tree = $state<FolderEntry[]>([]);
+  let folderOptions = $state<FolderEntry[]>([]);
   let selectedItems = $state<number[]>([]);
   let selectedFolders = $state<number[]>([]);
   let selectedRclone = $state<RcloneEntry[]>([]);
   let loading = $state(false);
   let message = $state('');
-  let mobileTree = $state(false);
+  let mobileNavOpen = $state(false);
   let createOpen = $state(false);
   let uploadOpen = $state(false);
   let downloadOpen = $state(false);
@@ -82,6 +84,12 @@
   let remoteOrder = $state('asc');
   let remoteOffset = $state(0);
   let remoteLoading = $state(false);
+  let remoteSummaryLoading = $state(false);
+  let remoteSummaryReady = $state(false);
+  let remoteSummaryFailed = $state(false);
+  let remoteGeneration = 0;
+  let remoteSummaryGeneration = 0;
+  let remoteSummaries = $state<Record<string, RcloneSummary>>({});
   let remoteData = $state<RcloneBrowserResponse>({path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0});
   let transferMode = $state<'copy'|'move'>('copy');
   let confirmMove = $state(false);
@@ -194,7 +202,7 @@
         sort, order, limit: '100', offset: '0'
       });
       data = await api<BrowserResponse>(`/storage/browser?${params}`);
-      tree = (await api<{items:FolderEntry[]}>('/storage/folders/tree')).items || [];
+      folderOptions = (await api<{items:FolderEntry[]}>('/storage/folders/tree')).items || [];
       message = '';
       updateUrl();
     } catch (cause) {
@@ -360,7 +368,7 @@
     try {
       const body = provider === 'telegram'
         ? {provider, worker, profile:downloadProfile, item_ids:selectedItems, folder_ids:selectedFolders, destination_path:destinationPath, publish_public_links:publishPublicLinks}
-        : {provider, worker, rclone_sources:selectedRclone.map(({path,is_dir})=>({path,is_dir})), destination_path:destinationPath, publish_public_links:publishPublicLinks};
+        : {provider, worker, rclone_sources:selectedRclone.map(({path,is_dir,size})=>({path,is_dir,size})), destination_path:destinationPath, publish_public_links:publishPublicLinks};
       const job = await post<{id:string}>('/storage/downloads', body);
       downloadJobWorkers = {...downloadJobWorkers, [job.id]:worker};
       downloadOpen = false;
@@ -406,29 +414,75 @@
       message = cause instanceof Error ? cause.message : 'Link publik tidak dapat dicabut.';
     } finally { revokeSubmitting = false; }
   }
-  async function loadRclone() {
+  async function loadRclone({refreshSummaries=false}:{refreshSummaries?:boolean}={}) {
     if (!worker || provider !== 'rclone' || !rcloneRuntimeReady) return;
+    const request=++remoteGeneration;
+    const selectedWorker=worker;
+    const selectedPath=rclonePath;
     remoteLoading=true;
     try {
-      const params=new URLSearchParams({worker,path:rclonePath,q:remoteQuery,sort:remoteSort,order:remoteOrder,limit:'100',offset:String(remoteOffset)});
-      remoteData=await api<RcloneBrowserResponse>(`/storage/rclone/browser?${params}`);
+      const params=new URLSearchParams({worker:selectedWorker,path:selectedPath,q:remoteQuery,sort:remoteSort,order:remoteOrder,limit:'100',offset:String(remoteOffset)});
+      const response=await api<RcloneBrowserResponse>(`/storage/rclone/browser?${params}`);
+      if (request!==remoteGeneration || provider!=='rclone' || worker!==selectedWorker || rclonePath!==selectedPath) return;
+      remoteData=response;
       message='';
+      if (refreshSummaries) void loadRcloneSummaries(selectedWorker, selectedPath);
     } catch (cause) { message=cause instanceof Error?cause.message:'Remote rclone tidak dapat dimuat.'; }
-    finally { remoteLoading=false; }
+    finally { if (request===remoteGeneration) remoteLoading=false; }
+  }
+  async function loadRcloneSummaries(selectedWorker:string, selectedPath:string) {
+    const request=++remoteSummaryGeneration;
+    remoteSummaries={};
+    remoteSummaryFailed=false;
+    remoteSummaryReady=false;
+    remoteSummaryLoading=true;
+    try {
+      const params=new URLSearchParams({worker:selectedWorker,path:selectedPath});
+      const response=await api<{summaries:RcloneSummary[]}>(`/storage/rclone/folder-summaries?${params}`);
+      if (request!==remoteSummaryGeneration || provider!=='rclone' || worker!==selectedWorker || rclonePath!==selectedPath) return;
+      remoteSummaries=Object.fromEntries((response.summaries||[]).map((item)=>[item.path,item]));
+      remoteSummaryReady=true;
+    } catch {
+      if (request===remoteSummaryGeneration) remoteSummaryFailed=true;
+    } finally {
+      if (request===remoteSummaryGeneration) remoteSummaryLoading=false;
+    }
   }
   function setProvider(next:'telegram'|'rclone') {
     provider=next;
+    remoteGeneration++;
+    remoteSummaryGeneration++;
+    remoteSummaries={};
+    remoteSummaryLoading=false;
+    remoteSummaryFailed=false;
+    remoteSummaryReady=false;
     clearSelection(); clearRcloneSelection();
     if (next==='rclone') { rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false; }
     else void load();
   }
   function handleWorkerChange() {
+    remoteGeneration++;
+    remoteSummaryGeneration++;
+    remoteSummaries={};
+    remoteSummaryLoading=false;
+    remoteSummaryFailed=false;
+    remoteSummaryReady=false;
     rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false;
     clearRcloneSelection();
     publicLinks=[];
     remoteData={path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0};
   }
-  function openRemoteFolder(path:string) { rclonePath=path; remoteOffset=0; remoteTarget=path; void loadRclone(); }
+  function openRemoteFolder(path:string) {
+    remoteSummaryGeneration++;
+    remoteSummaries={};
+    remoteSummaryLoading=false;
+    remoteSummaryReady=false;
+    remoteSummaryFailed=false;
+    rclonePath=path;
+    remoteOffset=0;
+    remoteTarget=path;
+    void loadRclone({refreshSummaries:true});
+  }
   async function deliver(item:Item) {
     await post(`/storage/items/${item.id}/deliveries`, {method:'telegram'});
     message=`${item.display_name} dikirim ke Telegram.`;
@@ -484,7 +538,7 @@
     const activeProvider=provider;
     const activeWorker=worker;
     const ready=rcloneRuntimeReady;
-    if (activeProvider==='rclone' && activeWorker && ready) untrack(() => void loadRclone());
+    if (activeProvider==='rclone' && activeWorker && ready) untrack(() => void loadRclone({refreshSummaries:true}));
   });
   $effect(() => {
     const selectedWorker=worker;
@@ -590,13 +644,13 @@
     <input class="field min-w-[180px] flex-1" bind:value={remoteQuery} placeholder="Cari di folder ini" onkeydown={(e)=>e.key==='Enter'&&(remoteOffset=0,loadRclone())}/>
     <select class="field !w-auto" bind:value={remoteSort} onchange={()=>{remoteOffset=0;loadRclone()}}><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select>
     <button class="button ghost" onclick={()=>{remoteOrder=remoteOrder==='asc'?'desc':'asc';loadRclone()}} title="Balik urutan"><ArrowUp class={remoteOrder==='desc'?'rotate-180':''} size={17}/></button>
-    <button class="button ghost" disabled={remoteLoading||!rcloneRuntimeReady} onclick={loadRclone}><RefreshCw class={remoteLoading?'animate-spin':''} size={17}/></button>
+    <button class="button ghost" disabled={remoteLoading||!rcloneRuntimeReady} onclick={()=>loadRclone({refreshSummaries:true})} aria-label="Refresh rclone"><RefreshCw class={remoteLoading||remoteSummaryLoading?'animate-spin':''} size={17}/></button>
   </div>
   <div class="mt-4 divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
     {#each remoteData.items as entry (entry.path)}
       <div class="flex items-center gap-3 p-3 text-sm">
         <input type="checkbox" checked={selectedRclone.some((item)=>item.path===entry.path)} onchange={()=>toggleRcloneEntry(entry)} aria-label={`Pilih ${entry.is_dir?'folder':'file'} ${entry.name}`}/>
-        {#if entry.is_dir}<Folder class="shrink-0 text-amber-500" size={19}/><button class="min-w-0 flex-1 truncate text-left font-bold" onclick={()=>openRemoteFolder(entry.path)}>{entry.name}</button><button class="button secondary !py-1" onclick={()=>{remoteTarget=entry.path;remoteTargetSelected=true;message=`Tujuan upload dipilih: ${entry.path}`}}>Pilih tujuan</button>
+        {#if entry.is_dir}<Folder class="shrink-0 text-amber-500" size={19}/><button class="min-w-0 flex-1 truncate text-left font-bold" onclick={()=>openRemoteFolder(entry.path)}><span class="block truncate">{entry.name}</span><small class="muted block truncate font-normal">{#if remoteSummaries[entry.path]}{remoteSummaries[entry.path].file_count} file · {remoteSummaries[entry.path].folder_count} folder · {remoteSummaries[entry.path].size_complete?formatBytes(remoteSummaries[entry.path].size_bytes):'Ukuran tidak lengkap'}{:else if remoteSummaryLoading}Menghitung…{:else if remoteSummaryFailed}Ringkasan gagal dihitung{:else if remoteSummaryReady}0 file · 0 folder · 0 B{:else}Belum dihitung{/if}</small></button><button class="button secondary !py-1" onclick={()=>{remoteTarget=entry.path;remoteTargetSelected=true;message=`Tujuan upload dipilih: ${entry.path}`}}>Pilih tujuan</button>
         {:else}<File class="shrink-0 text-violet-500" size={19}/><span class="min-w-0 flex-1 truncate">{entry.name}</span><span class="muted">{formatBytes(entry.size)}</span>{/if}
       </div>
     {/each}
@@ -607,24 +661,15 @@
 {:else}
 <section class="card mt-6 overflow-hidden">
   <div class="grid min-h-[650px] lg:grid-cols-[250px_minmax(0,1fr)]">
-    <aside class={`${mobileTree ? 'fixed inset-0 z-40 block bg-black/35 lg:static lg:bg-transparent' : 'hidden lg:block'}`}>
+    <aside class={`${mobileNavOpen ? 'fixed inset-0 z-40 block bg-black/35 lg:static lg:bg-transparent' : 'hidden lg:block'}`}>
       <div class="h-full w-[280px] border-r border-[var(--line)] bg-[var(--panel)] p-4 lg:w-auto">
-        <div class="mb-4 flex items-center justify-between"><b class="text-sm">Storage</b><button class="button ghost lg:hidden" onclick={() => mobileTree=false}><X size={17}/></button></div>
+        <div class="mb-4 flex items-center justify-between"><b class="text-sm">Storage</b><button class="button ghost lg:hidden" onclick={() => mobileNavOpen=false}><X size={17}/></button></div>
         <nav class="space-y-1 text-sm">
           <button class:active={scope==='current'&&folderId===null} class="storage-nav" onclick={() => chooseScope('current')}><HardDrive size={17}/>My Drive</button>
           <button class:active={scope==='global'} class="storage-nav" onclick={() => chooseScope('global')}><FolderOpen size={17}/>All Files</button>
           <button class:active={scope==='recent'} class="storage-nav" onclick={() => chooseScope('recent')}><Download size={17}/>Recent</button>
           <button class:active={scope==='trash'} class="storage-nav text-rose-600" onclick={() => chooseScope('trash')}><Trash2 size={17}/>Recycle Bin</button>
         </nav>
-        <div class="my-4 border-t border-[var(--line)]"></div>
-        <p class="muted mb-2 px-2 text-[11px] font-black uppercase tracking-wider">Folder bersama</p>
-        <div class="max-h-[55vh] space-y-1 overflow-auto">
-          {#each tree as folder}
-            <button class:active={folder.id===folderId} class="storage-nav" style={`padding-left:${8 + Math.max(0,folder.path.split('/').length-1)*14}px`} onclick={() => {openFolder(folder.id);mobileTree=false}} ondragover={(e)=>e.preventDefault()} ondrop={(e)=>dropOnFolder(e,folder.id)}>
-              <Folder size={16} class="shrink-0 text-amber-500"/><span class="truncate">{folder.name}</span>
-            </button>
-          {/each}
-        </div>
       </div>
     </aside>
 
@@ -632,7 +677,7 @@
       <div class="border-b border-[var(--line)] p-4 sm:p-5">
         <div class="flex flex-wrap items-center justify-between gap-3">
           <div class="flex min-w-0 items-center gap-1">
-            <button class="button ghost lg:hidden" onclick={() => mobileTree=true}><Folder size={17}/></button>
+            <button class="button ghost lg:hidden" onclick={() => mobileNavOpen=true}><Folder size={17}/></button>
             <button class="button ghost !px-2" onclick={() => openFolder(null)}>Drive</button>
             {#each data.breadcrumbs as crumb}
               <ChevronRight class="muted shrink-0" size={15}/><button class="max-w-36 truncate rounded-lg px-2 py-1 text-sm font-bold hover:bg-[var(--brand-soft)]" onclick={() => openFolder(crumb.id)}>{crumb.name}</button>
@@ -647,8 +692,8 @@
           <div class="relative min-w-[190px] flex-1"><Search class="muted absolute left-3 top-1/2 -translate-y-1/2" size={16}/><input class="field !pl-10" bind:value={query} placeholder="Cari file atau folder..." onkeydown={(e)=>e.key==='Enter'&&load()}/></div>
           <select class="field !w-auto" value={sort} onchange={(e)=>setSort(e.currentTarget.value)}><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select>
           <button class="button ghost" onclick={() => {order=order==='asc'?'desc':'asc';load()}} title="Balik urutan"><ArrowUp class={order==='desc'?'rotate-180':''} size={17}/></button>
-          <button class:active={view==='list'} class="view-button" onclick={() => setView('list')}><LayoutList size={17}/></button>
-          <button class:active={view==='grid'} class="view-button" onclick={() => setView('grid')}><Grid2X2 size={17}/></button>
+          <button class:active={view==='list'} class="view-button" aria-label="Tampilan daftar" onclick={() => setView('list')}><LayoutList size={17}/></button>
+          <button class:active={view==='grid'} class="view-button" aria-label="Tampilan grid" onclick={() => setView('grid')}><Grid2X2 size={17}/></button>
           <button class="button ghost" onclick={load}><RefreshCw class={loading?'animate-spin':''} size={17}/></button>
         </div>
       </div>
@@ -691,7 +736,7 @@
           <div class="divide-y divide-[var(--line)] overflow-hidden rounded-2xl border border-[var(--line)]">
             {#each data.folders as folder}
               <div class="storage-row" role="listitem" draggable="true" ondragstart={(e)=>drag(e,'folder',folder.id)} ondragover={(e)=>e.preventDefault()} ondrop={(e)=>dropOnFolder(e,folder.id)}>
-                <input type="checkbox" checked={selectedFolders.includes(folder.id)} onchange={() => toggleFolder(folder.id)}/><button class="flex min-w-0 flex-1 items-center gap-3 text-left" onclick={() => openFolder(folder.id)}><Folder class="shrink-0 text-amber-500" size={24} fill="currentColor"/><span class="truncate font-bold">{folder.name}</span></button><span class="muted hidden text-xs sm:block">Folder</span><button class="button ghost" onclick={() => beginFolderEdit(folder)}><Pencil size={15}/></button>
+                <input type="checkbox" checked={selectedFolders.includes(folder.id)} onchange={() => toggleFolder(folder.id)}/><button class="flex min-w-0 flex-1 items-center gap-3 text-left" onclick={() => openFolder(folder.id)}><Folder class="shrink-0 text-amber-500" size={24} fill="currentColor"/><span class="min-w-0"><b class="block truncate">{folder.name}</b><small class="muted block truncate">{folder.file_count || 0} file · {folder.folder_count || 0} folder · {folder.size_complete === false ? 'Ukuran tidak lengkap' : formatBytes(folder.size_bytes || 0)}</small></span></button><span class="muted hidden text-xs sm:block">Folder</span><button class="button ghost" onclick={() => beginFolderEdit(folder)}><Pencil size={15}/></button>
               </div>
             {/each}
             {#each data.items as item}
@@ -755,14 +800,14 @@
 
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
   <p class="muted mb-4 text-sm">{provider==='telegram'?'Pilih worker dengan lane Upload siap.':'Pilih worker dengan akses rclone siap.'} Semua subfolder sumber dipertahankan.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange}/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
-  <div class="mt-4 grid gap-3 sm:grid-cols-2">{#if provider==='telegram'}<label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label>{:else}<div class="rounded-xl border border-[var(--line)] p-3 text-sm"><b>Tujuan rclone</b><p class="mt-1 break-all">{remoteTargetSelected?(remoteTarget||'root'):'Pilih folder dari tab Rclone'}</p></div>{/if}<label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
+  <div class="mt-4 grid gap-3 sm:grid-cols-2">{#if provider==='telegram'}<label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each folderOptions as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label>{:else}<div class="rounded-xl border border-[var(--line)] p-3 text-sm"><b>Tujuan rclone</b><p class="mt-1 break-all">{remoteTargetSelected?(remoteTarget||'root'):'Pilih folder dari tab Rclone'}</p></div>{/if}<label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
   <label class="mt-4 block text-sm font-bold">Transfer<select class="field mt-2" bind:value={transferMode}><option value="copy">Copy · sumber tetap ada</option><option value="move">Move · hapus sumber setelah upload terkonfirmasi</option></select></label>
   {#if transferMode==='move'}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"><input class="mt-1" type="checkbox" bind:checked={confirmMove}/><span>Saya memahami file Workspace akan dihapus satu per satu hanya setelah upload terverifikasi dan file sumber tidak berubah.</span></label>{/if}
   <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>{provider==='telegram'?'Batch ini hanya dikirim ke Telegram Storage.':'Batch ini hanya dikirim ke rclone; kegagalan tidak dialihkan ke Telegram.'} File yang bertabrakan di remote tidak akan ditimpa.</p></div>
   <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || (provider==='telegram'?!storageRuntimeReady:!rcloneRuntimeReady) || (provider==='rclone'&&!remoteTargetSelected) || (transferMode==='move'&&!confirmMove)} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
 </Modal>
 
-<Modal open={moveOpen} onclose={() => moveOpen=false} title="Pindahkan ke folder" size="md"><label class="text-sm font-bold">Folder tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each tree as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => moveOpen=false}>Batal</button><button class="button" onclick={moveSelection}><Move size={16}/>Pindahkan</button></div></Modal>
+<Modal open={moveOpen} onclose={() => moveOpen=false} title="Pindahkan ke folder" size="md"><label class="text-sm font-bold">Folder tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each folderOptions as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => moveOpen=false}>Batal</button><button class="button" onclick={moveSelection}><Move size={16}/>Pindahkan</button></div></Modal>
 
 <Modal open={Boolean(editFolder)} onclose={() => editFolder=null} title="Rename folder" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120"/></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => editFolder=null}>Batal</button><button class="button" onclick={renameFolder}>Simpan</button></div></Modal>
 

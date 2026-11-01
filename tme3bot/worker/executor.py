@@ -2776,6 +2776,16 @@ class WorkerJobExecutor(
                 or "exporting"
             ).strip().lower() if isinstance(retry, dict) else str(payload.get("quick_phase") or "exporting").strip().lower()
             if resume_phase == "exporting" and requested_phase != "exporting":
+                destination_fields = {
+                    key: quick_manifest[key]
+                    for key in (
+                        "rclone_destination_root", "rclone_destination",
+                        "quick_rclone_path", "quick_rclone_create",
+                        "quick_rclone_destination_prepared",
+                        "quick_rclone_create_pending", "quick_rclone_destination_created",
+                    )
+                    if key in quick_manifest
+                }
                 self._clear_quick_stage(stage_root)
                 quick_manifest = {
                     "version": 2,
@@ -2783,7 +2793,13 @@ class WorkerJobExecutor(
                     "quick_operation_id": str(quick_manifest.get("quick_operation_id") or command["job_id"]),
                     "phase": "exporting",
                 }
+                quick_manifest.update(destination_fields)
                 write_quick_manifest(stage_root, quick_manifest)
+            if resume_phase != "cleanup":
+                quick_rclone_destination = self._prepare_quick_rclone_destination(
+                    command, stage_root, quick_manifest
+                )
+                payload["quick_rclone_destination"] = quick_rclone_destination
             restored = self._quick_manifest_export(quick_manifest)
             can_resume = resume_phase != "exporting" and (
                 restored is not None

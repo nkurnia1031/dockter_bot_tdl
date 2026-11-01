@@ -101,6 +101,25 @@ class WorkerContractTests(unittest.TestCase):
         )
 
     @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_rclone_folder_summary_dispatch_uses_one_recursive_worker_request(self, request):
+        request.return_value = {"path": "docs", "summaries": []}
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        result = dispatcher.rclone_storage_folder_summaries(
+            "remote", "googledrive:storage", path="docs",
+        )
+
+        self.assertEqual(result["path"], "docs")
+        request.assert_called_once_with(
+            "http://worker.test",
+            "worker-token",
+            "POST",
+            "/internal/v1/storage/rclone-folder-summaries",
+            {"rclone_destination": "googledrive:storage", "path": "docs"},
+            timeout=180,
+        )
+
+    @patch("tme3bot.infrastructure.http_client.request_json")
     def test_public_download_link_dispatch_uses_authenticated_worker_routes(self, request):
         request.return_value = {"items": []}
         dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())

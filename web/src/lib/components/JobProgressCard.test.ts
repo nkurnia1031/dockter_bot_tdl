@@ -37,6 +37,31 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('1')).toBeTruthy();
   });
 
+  it('shows rclone transfer bytes and per-file plus batch progress', () => {
+    render(JobProgressCard, {
+      job: {
+        kind:'storage_upload', status:'running', profile:'default', worker:'remote-1',
+        created_at:new Date().toISOString(),
+        progress:{
+          phase:'uploading', message:'Mengupload archive.zip ke rclone',
+          overall:{current:1,total:3,percent:42,files_current:1,files_total:3,bytes_current:1048576,bytes_total:4194304},
+          item:{name:'archive.zip',index:2,total:3,percent:50,size_bytes:2097152},
+          transfer:{bytes_current:1048576,bytes_total:2097152,speed_bps:524288,eta_seconds:2},
+          counters:{succeeded:1,failed:0,skipped:0},
+        },
+      },
+      onReport:vi.fn(), onLog:vi.fn(), onTerminate:vi.fn(),
+    });
+
+    expect(screen.getByText('File 2/3')).toBeTruthy();
+    expect(screen.getByText('Batch 1/3 file')).toBeTruthy();
+    expect(screen.getByText('1.0 MB / 4.0 MB batch')).toBeTruthy();
+    expect(screen.getAllByText('archive.zip').length).toBeGreaterThan(0);
+    expect(screen.getByText('1.0 MB / 2.0 MB')).toBeTruthy();
+    expect(screen.getByText('512.0 KB/dtk')).toBeTruthy();
+    expect(screen.getByText('2 dtk')).toBeTruthy();
+  });
+
   it('shows every active Storage upload with its profile and file', () => {
     render(JobProgressCard, {
       job: {

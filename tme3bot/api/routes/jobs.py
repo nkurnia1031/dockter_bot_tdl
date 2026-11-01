@@ -462,6 +462,11 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
                 "quick_operation_id": str(item.get("quick_operation_id") or stage_id),
             },
         }
+        saved_rclone_root = str(item.get("rclone_destination_root") or "").strip()
+        if saved_rclone_root:
+            payload["quick_settings"]["rclone_destination"] = saved_rclone_root
+        payload["quick_rclone_path"] = str(item.get("quick_rclone_path") or "")
+        payload["quick_rclone_create"] = item.get("quick_rclone_create") is True
         for key in ("url", "chat_ref", "start_id", "label", "save_source", "use_url_message_id"):
             if body.get(key) is not None:
                 payload[key] = body[key]

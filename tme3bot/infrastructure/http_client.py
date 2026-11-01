@@ -606,6 +606,19 @@ class WorkerHttpDispatcher:
             timeout=45,
         )
 
+    def rclone_storage_folder_summaries(
+        self, worker: str, rclone_destination: str, *, path: str = "",
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/storage/rclone-folder-summaries",
+            {"rclone_destination": str(rclone_destination or ""), "path": str(path or "")},
+            timeout=180,
+        )
+
     def public_download_links(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

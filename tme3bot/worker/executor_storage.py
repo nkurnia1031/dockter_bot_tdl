@@ -379,29 +379,95 @@ class StorageExecutorMixin:
             getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
         ).resolve()
         config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        try:
+            file_sizes = [int(path.stat().st_size) for path in files]
+        except OSError:
+            file_sizes = []
+        total_bytes = sum(file_sizes) if len(file_sizes) == len(files) else None
+        completed_bytes = 0
+
+        def report_transfer(index: int, name: str, transfer: dict[str, object]) -> None:
+            size = file_sizes[index - 1] if len(file_sizes) == len(files) else None
+            try:
+                current = max(0, int(transfer.get("bytes_current") or 0))
+            except (TypeError, ValueError):
+                current = 0
+            try:
+                percent = float(transfer["percent"]) if transfer.get("percent") is not None else None
+            except (TypeError, ValueError):
+                percent = None
+            batch_bytes = completed_bytes + current
+            reporter.report(
+                phase="uploading",
+                message=f"Mengupload {name} ke rclone",
+                overall={
+                    "current": index - 1,
+                    "total": len(files),
+                    "percent": (
+                        min(100.0, batch_bytes * 100 / total_bytes)
+                        if total_bytes
+                        else ((index - 1) + (percent or 0) / 100) * 100 / len(files)
+                        if files
+                        else 100,
+                    ),
+                    "unit": "files",
+                    "files_current": index - 1,
+                    "files_total": len(files),
+                    "bytes_current": batch_bytes,
+                    "bytes_total": total_bytes,
+                },
+                item={"name": name, "index": index, "total": len(files), "percent": percent, "size_bytes": size},
+                transfer=reporter.transfer_metrics(
+                    speed_bps=transfer.get("speed_bps"),
+                    current_bytes=current,
+                    total_bytes=size,
+                    eta_seconds=transfer.get("eta_seconds"),
+                    percent=percent,
+                ),
+                counters={"succeeded": index - 1, "failed": 0},
+            )
 
         def progress(index: int, total: int, name: str) -> None:
+            nonlocal completed_bytes
+            if len(file_sizes) == len(files):
+                completed_bytes += file_sizes[index - 1]
+            size = file_sizes[index - 1] if len(file_sizes) == len(files) else None
             # A telemetry outage must not turn an already completed remote
             # copy into a false physical upload failure.
             try:
                 reporter.report(
                     phase="uploading",
-                    message=f"Mengupload {name} ke Google Drive",
+                    message=f"Mengupload {name} ke rclone",
                     overall={
                         "current": index,
                         "total": total,
-                        "percent": index * 100 / total if total else 100,
+                        "percent": (
+                            completed_bytes * 100 / total_bytes
+                            if total_bytes
+                            else index * 100 / total if total else 100
+                        ),
                         "unit": "files",
+                        "files_current": index,
+                        "files_total": total,
+                        "bytes_current": completed_bytes,
+                        "bytes_total": total_bytes,
                     },
                     item={
                         "name": name,
                         "index": index,
                         "total": total,
                         "percent": 100,
+                        "size_bytes": size,
                     },
+                    transfer=reporter.transfer_metrics(
+                        current_bytes=size,
+                        total_bytes=size,
+                        percent=100,
+                    ),
                     counters={"succeeded": index, "failed": 0},
                     force=True,
                 )
+                reporter.reset_transfer()
             except Exception:
                 LOGGER.warning(
                     "Could not publish rclone progress for %s", job_id, exc_info=True
@@ -424,6 +490,10 @@ class StorageExecutorMixin:
             self._rclone_runners[job_id] = runner
         try:
             kwargs = {"remote_names": remote_names} if remote_names is not None else {}
+            runner.transfer_callback = lambda value: report_transfer(
+                max(1, int(value.get("index") or 1)),
+                str(value.get("name") or "File"), value,
+            )
             try:
                 return runner.copy_files(
                     files,
@@ -465,6 +535,19 @@ class StorageExecutorMixin:
         return runner.list_directory(
             destination, relative_path, config_path, config_root=config_root,
             query=query, sort=sort, order=order, limit=limit, offset=offset,
+        )
+
+    def rclone_storage_folder_summaries(
+        self, destination: str, relative_path: str = ""
+    ) -> dict[str, object]:
+        """Summarize current folder children from one metadata-only inventory."""
+        config_path = Path(
+            getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+        ).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        runner = RcloneRunner(stall_timeout_seconds=120)
+        return runner.list_directory_summaries(
+            destination, relative_path, config_path, config_root=config_root,
         )
 
     @staticmethod
@@ -720,21 +803,100 @@ class StorageExecutorMixin:
         failures: list[dict[str, Any]] = []
         output_items: list[dict[str, Any]] = []
         previous = {str(item.get("path") or ""): item for item in read_items(command_id) if isinstance(item, dict)}
-        total_bytes = sum(path.stat().st_size for path in files if path.exists())
+        file_sizes: list[int | None] = []
+        for path in files:
+            try:
+                file_sizes.append(max(0, int(path.stat().st_size)))
+            except OSError:
+                file_sizes.append(None)
+        total_bytes = (
+            sum(size for size in file_sizes if size is not None)
+            if all(size is not None for size in file_sizes)
+            else None
+        )
+        completed_bytes: int | None = 0 if total_bytes is not None else None
         reporter = ProgressReporter(self.publisher, job_id)
         reporter.report(phase="uploading", message=f"Menyiapkan {len(files)} file untuk rclone",
                         overall={"current": 0, "total": len(files), "percent": 0, "unit": "files", "bytes_total": total_bytes},
                         counters={"succeeded": 0, "failed": 0}, force=True)
+        active_file_index = 1
 
         def cancelled() -> bool:
             with self._lock:
                 return job_id in self._cancel_requested
 
         def progress(index: int, total: int, name: str) -> None:
+            del index, total
+            current_size = file_sizes[active_file_index - 1] if len(file_sizes) == len(files) else None
+            batch_bytes = (
+                completed_bytes + current_size
+                if completed_bytes is not None and current_size is not None
+                else None
+            )
+            percent = (
+                batch_bytes * 100 / total_bytes
+                if batch_bytes is not None and total_bytes
+                else active_file_index * 100 / len(files) if files else 100
+            )
             reporter.report(phase="uploading", message=f"Mengupload {name} ke rclone",
-                            overall={"current": index, "total": total, "percent": index * 100 / total if total else 100, "unit": "files"},
-                            item={"name": name, "target_path": name, "index": index, "total": total, "percent": 100},
+                            overall={"current": active_file_index, "total": len(files), "percent": percent,
+                                     "unit": "files", "files_current": active_file_index, "files_total": len(files),
+                                     "bytes_current": batch_bytes, "bytes_total": total_bytes},
+                            item={"name": name, "target_path": name, "index": active_file_index, "total": len(files),
+                                  "percent": 100, "size_bytes": current_size},
+                            transfer=reporter.transfer_metrics(
+                                current_bytes=current_size, total_bytes=current_size, percent=100,
+                            ),
                             counters={"succeeded": successes, "failed": len(failures)}, force=True)
+
+        def transfer_progress(index: int, path: Path, value: dict[str, object]) -> None:
+            current_size = file_sizes[index - 1] if len(file_sizes) == len(files) else None
+            try:
+                current = max(0, int(value.get("bytes_current") or 0))
+            except (TypeError, ValueError):
+                current = 0
+            try:
+                percent = float(value["percent"]) if value.get("percent") is not None else None
+            except (TypeError, ValueError):
+                percent = None
+            batch_bytes = completed_bytes + current if completed_bytes is not None else None
+            batch_percent = (
+                min(100.0, batch_bytes * 100 / total_bytes)
+                if isinstance(batch_bytes, int) and total_bytes
+                else ((index - 1) + (percent or 0) / 100) * 100 / len(files)
+                if files
+                else 100
+            )
+            reporter.report(
+                phase="uploading",
+                message=f"Mengupload {path.name} ke rclone",
+                overall={
+                    "current": index - 1,
+                    "total": len(files),
+                    "percent": batch_percent,
+                    "unit": "files",
+                    "files_current": index - 1,
+                    "files_total": len(files),
+                    "bytes_current": batch_bytes,
+                    "bytes_total": total_bytes,
+                },
+                item={
+                    "name": path.name,
+                    "target_path": str(value.get("name") or path.name),
+                    "index": index,
+                    "total": len(files),
+                    "percent": percent,
+                    "size_bytes": current_size,
+                },
+                transfer=reporter.transfer_metrics(
+                    speed_bps=value.get("speed_bps"),
+                    current_bytes=current,
+                    total_bytes=current_size,
+                    eta_seconds=value.get("eta_seconds"),
+                    percent=percent,
+                ),
+                counters={"succeeded": successes, "failed": len(failures)},
+            )
 
         runner = RcloneRunner(log_callback=self._append_job_log, command_callback=self._command_callback(),
                               progress_callback=progress, cancel_check=cancelled,
@@ -745,6 +907,8 @@ class StorageExecutorMixin:
             for index, path in enumerate(files, start=1):
                 if cancelled():
                     raise QuickModeError("Upload dibatalkan oleh user.")
+                active_file_index = index
+                reporter.reset_transfer()
                 relative = path.relative_to(root).as_posix()
                 remote_name = "/".join(part for part in (rclone_path, relative if preserve else path.name) if part)
                 prior = previous.get(relative, {})
@@ -774,6 +938,10 @@ class StorageExecutorMixin:
                         item["cleanup_status"] = self._storage_move_cleanup(path, root, identity)
                         persist(command_id, relative, file_name=path.name, status="succeeded", attempt=int(prior.get("attempt") or attempt), retryable=False, result_item=item)
                     successes += 1
+                    if completed_bytes is not None and file_sizes[index - 1] is not None:
+                        completed_bytes += file_sizes[index - 1]
+                    else:
+                        completed_bytes = None
                     output_items.append(item)
                     completed += 1
                     continue
@@ -805,6 +973,9 @@ class StorageExecutorMixin:
                     item.update(status="sending", upload_status="sending")
                     persist(command_id, relative, file_name=path.name, status="sending", attempt=attempt, retryable=False, result_item=item)
                     try:
+                        runner.transfer_callback = lambda value, selected_index=index, selected_path=path: transfer_progress(
+                            selected_index, selected_path, value
+                        )
                         runner.copy_files([path], str(payload.get("rclone_destination") or ""), config_path,
                                           workspace_root=workspace, config_root=config_root,
                                           remote_names=[remote_name], ignore_existing=True)
@@ -858,6 +1029,10 @@ class StorageExecutorMixin:
                         item["cleanup_status"] = self._storage_move_cleanup(path, root, identity)
                         persist(command_id, relative, file_name=path.name, status="succeeded", attempt=attempt, retryable=False, result_item=item)
                     successes += 1
+                    if completed_bytes is not None and file_sizes[index - 1] is not None:
+                        completed_bytes += file_sizes[index - 1]
+                    else:
+                        completed_bytes = None
                 else:
                     item.update(status="needs_reconciliation", upload_status="needs_reconciliation", cleanup_status="retained_ambiguous" if transfer_mode == "move" else "not_requested",
                                 error_code=str(verified.get("reason_code") or "RCLONE_UPLOAD_AMBIGUOUS"),
@@ -870,7 +1045,7 @@ class StorageExecutorMixin:
                 try:
                     reporter.report(phase="uploading", message=f"Memproses file {completed}/{len(files)}",
                                     overall={"current": completed, "total": len(files), "percent": completed * 100 / len(files) if files else 100,
-                                             "unit": "files", "bytes_current": sum(int(output.get("source_identity", {}).get("size", 0)) for output in output_items),
+                                             "unit": "files", "bytes_current": completed_bytes,
                                              "bytes_total": total_bytes},
                                     item={"name": path.name, "target_path": remote_name, "index": index, "total": len(files), "status": item["upload_status"],
                                           "cleanup_status": item["cleanup_status"]},
@@ -1647,6 +1822,58 @@ class StorageExecutorMixin:
             files = []
 
         reporter = ProgressReporter(self.publisher, job_id)
+        rclone_transfer_state: dict[str, Any] = {}
+
+        def report_rclone_transfer(transfer: dict[str, object]) -> None:
+            if not rclone_transfer_state:
+                return
+            index = int(rclone_transfer_state.get("index") or 1)
+            transfer_total = int(rclone_transfer_state.get("total") or 1)
+            file_name = str(rclone_transfer_state.get("name") or transfer.get("name") or "File")
+            size = rclone_transfer_state.get("size")
+            try:
+                current = max(0, int(transfer.get("bytes_current") or 0))
+            except (TypeError, ValueError):
+                current = 0
+            try:
+                percent = float(transfer["percent"]) if transfer.get("percent") is not None else None
+            except (TypeError, ValueError):
+                percent = None
+            completed = int(rclone_transfer_state.get("completed_bytes") or 0)
+            batch_bytes = completed + current
+            batch_total = rclone_transfer_state.get("total_bytes")
+            batch_percent = (
+                min(100.0, batch_bytes * 100 / int(batch_total))
+                if isinstance(batch_total, int) and batch_total > 0
+                else ((index - 1) + (percent or 0) / 100) * 100 / transfer_total
+            )
+            reporter.report(
+                phase="downloading",
+                message=f"Mengunduh {file_name} dari rclone",
+                overall={
+                    "current": index - 1,
+                    "total": transfer_total,
+                    "percent": batch_percent,
+                    "unit": "files",
+                    "files_current": index - 1,
+                    "files_total": transfer_total,
+                    "bytes_current": batch_bytes,
+                    "bytes_total": batch_total,
+                },
+                item={"name": file_name, "index": index, "total": transfer_total, "percent": percent, "size_bytes": size},
+                transfer=reporter.transfer_metrics(
+                    speed_bps=transfer.get("speed_bps"),
+                    current_bytes=current,
+                    total_bytes=size if isinstance(size, int) else None,
+                    eta_seconds=transfer.get("eta_seconds"),
+                    percent=percent,
+                ),
+                counters={
+                    "succeeded": int(rclone_transfer_state.get("succeeded") or 0),
+                    "failed": int(rclone_transfer_state.get("failed") or 0),
+                },
+            )
+
         if provider == "rclone":
             reporter.report(
                 phase="listing",
@@ -1659,6 +1886,7 @@ class StorageExecutorMixin:
                 command_callback=self._command_callback(),
                 stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
                 cancel_check=lambda: self._storage_download_cancelled(job_id),
+                transfer_callback=report_rclone_transfer,
             )
             with self._lock:
                 self._rclone_runners[job_id] = runner
@@ -1686,9 +1914,18 @@ class StorageExecutorMixin:
             )
 
         total = len(files)
-        total_bytes = sum(
-            max(0, int(item.get("file_size") or item.get("size") or 0))
-            for item in files
+        file_sizes: list[int | None] = []
+        for item in files:
+            raw_size = item.get("file_size", item.get("size"))
+            file_sizes.append(
+                raw_size
+                if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size >= 0
+                else None
+            )
+        total_bytes = (
+            sum(size for size in file_sizes if size is not None)
+            if all(size is not None for size in file_sizes)
+            else None
         )
         succeeded = 0
         failed: list[dict[str, Any]] = []
@@ -1702,7 +1939,7 @@ class StorageExecutorMixin:
         reporter.report(
             phase="downloading",
             message=f"Menyiapkan {total} file untuk diunduh",
-            overall={"current": 0, "total": total, "percent": 0, "unit": "files", "bytes_total": total_bytes},
+            overall={"current": 0, "total": total, "percent": 0, "unit": "files", "files_current": 0, "files_total": total, "bytes_total": total_bytes},
             counters={"succeeded": 0, "failed": 0},
             force=True,
         )
@@ -1755,6 +1992,19 @@ class StorageExecutorMixin:
                     item_error_code = "STORAGE_DOWNLOAD_FILE_FAILED"
                     item_error_message = "File tidak dapat diunduh dari sumber."
                     cancelled_current = False
+                    file_size = file_sizes[index - 1]
+                    if provider == "rclone":
+                        rclone_transfer_state.update(
+                            index=index,
+                            total=total,
+                            name=name,
+                            size=file_size,
+                            total_bytes=total_bytes,
+                            completed_bytes=completed_bytes,
+                            succeeded=succeeded,
+                            failed=len(failed),
+                        )
+                        reporter.reset_transfer()
                     reporter.report(
                         phase="downloading",
                         message=f"Mengunduh {name}",
@@ -1765,6 +2015,8 @@ class StorageExecutorMixin:
                             "unit": "files",
                             "bytes_current": completed_bytes,
                             "bytes_total": total_bytes,
+                            "files_current": index - 1,
+                            "files_total": total,
                         },
                         item={"name": name, "index": index, "total": total, "percent": None},
                         counters={"succeeded": succeeded, "failed": len(failed)},
@@ -1847,6 +2099,8 @@ class StorageExecutorMixin:
                                 stage_file,
                                 config_path,
                                 config_root=config_root,
+                                file_name=name,
+                                total_bytes=file_size,
                             )
                             if not stage_file.is_file() or stage_file.is_symlink():
                                 raise RcloneError("rclone tidak menghasilkan file lokal.", code="RCLONE_DOWNLOAD_FAILED")
@@ -1886,6 +2140,38 @@ class StorageExecutorMixin:
                         actual_size = target.stat().st_size
                         completed_bytes += actual_size
                         succeeded += 1
+                        if provider == "rclone":
+                            rclone_transfer_state.update(
+                                completed_bytes=completed_bytes,
+                                succeeded=succeeded,
+                                failed=len(failed),
+                            )
+                            reporter.report(
+                                phase="downloading",
+                                message=f"File {name} selesai diunduh",
+                                overall={
+                                    "current": index,
+                                    "total": total,
+                                    "percent": (
+                                        completed_bytes * 100 / total_bytes
+                                        if total_bytes
+                                        else index * 100 / total if total else 100
+                                    ),
+                                    "unit": "files",
+                                    "files_current": index,
+                                    "files_total": total,
+                                    "bytes_current": completed_bytes,
+                                    "bytes_total": total_bytes,
+                                },
+                                item={"name": name, "index": index, "total": total, "percent": 100, "size_bytes": file_size},
+                                transfer=reporter.transfer_metrics(
+                                    current_bytes=actual_size,
+                                    total_bytes=file_size,
+                                    percent=100,
+                                ),
+                                counters={"succeeded": succeeded, "failed": len(failed)},
+                                force=True,
+                            )
                         record: dict[str, Any] = {
                             "name": name,
                             "relative_path": relative_path.as_posix(),

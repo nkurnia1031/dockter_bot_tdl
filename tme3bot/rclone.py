@@ -28,6 +28,7 @@ class RcloneRunner:
         *,
         log_callback: Callable[[str], None] | None = None,
         progress_callback: Callable[[int, int, str], None] | None = None,
+        transfer_callback: Callable[[dict[str, object]], None] | None = None,
         cancel_check: Callable[[], bool] | None = None,
         stall_timeout_seconds: int = 0,
         command_callback: CommandCallback | None = None,
@@ -35,6 +36,7 @@ class RcloneRunner:
         self.runner = runner or SubprocessRunner()
         self.log_callback = log_callback
         self.progress_callback = progress_callback
+        self.transfer_callback = transfer_callback
         self.cancel_check = cancel_check
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
         self.command_callback = command_callback
@@ -235,6 +237,287 @@ class RcloneRunner:
                 "items": entries[offset:offset + limit], "total": len(entries),
                 "limit": limit, "offset": offset}
 
+    def list_directory_summaries(
+        self,
+        destination: str,
+        relative_path: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+    ) -> dict[str, object]:
+        """Aggregate immediate-child folders from one recursive metadata listing."""
+        try:
+            validate_rclone_destination(destination)
+            remote, normalized = self._remote_path(destination, relative_path)
+        except ValueError as exc:
+            raise RcloneError("Root rclone tidak valid.") from exc
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        if not config.is_file() or shutil.which("rclone") is None:
+            raise RcloneError(
+                "Runtime rclone belum tersedia pada worker.",
+                code="RCLONE_RUNTIME_UNAVAILABLE",
+            )
+        command = [
+            "rclone", "lsjson", remote, "--recursive", "--no-modtime",
+            "--no-mimetype", "--config", str(config), "--log-level", "ERROR",
+        ]
+        try:
+            result = self.runner.run(
+                command,
+                log_prefix="rclone-storage-folder-summary",
+                output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except (TDLStalledError, TDLCommandError, OSError) as exc:
+            raise RcloneError(
+                "Worker tidak dapat menghitung isi folder rclone.",
+                code="RCLONE_ACCESS_FAILED",
+            ) from exc
+        if result.returncode != 0:
+            raise RcloneError(
+                "Worker tidak dapat menghitung isi folder rclone.",
+                code=self._access_error_code(result) or "RCLONE_ACCESS_FAILED",
+            )
+        try:
+            raw_entries = json.loads(getattr(result, "stdout", "") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RcloneError("Worker menerima inventaris rclone yang tidak valid.") from exc
+        if not isinstance(raw_entries, list):
+            raise RcloneError("Worker menerima inventaris rclone yang tidak valid.")
+
+        summaries: dict[str, dict[str, object]] = {}
+        directories: dict[str, set[str]] = {}
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                continue
+            raw_path = str(raw.get("Path") or raw.get("Name") or "").replace("\\", "/")
+            parts = raw_path.split("/")
+            if not raw_path or raw_path.startswith("/") or any(
+                not part or part in {".", ".."} or ":" in part for part in parts
+            ):
+                continue
+            top = parts[0]
+            if len(parts) < 2 and raw.get("IsDir") is not True:
+                continue
+            summary = summaries.setdefault(
+                top,
+                {"file_count": 0, "folder_count": 0, "size_bytes": 0, "size_complete": True},
+            )
+            directory_set = directories.setdefault(top, set())
+            if raw.get("IsDir") is True:
+                directory_set.add("/".join(parts))
+                continue
+            summary["file_count"] = int(summary["file_count"]) + 1
+            # Infer implicit object-store folders from file paths as well as
+            # counting explicit directory entries returned by the backend.
+            directory_set.update(
+                "/".join(parts[:index]) for index in range(2, len(parts))
+            )
+            size = raw.get("Size")
+            if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+                summary["size_bytes"] = int(summary["size_bytes"]) + size
+            else:
+                summary["size_complete"] = False
+        for top, summary in summaries.items():
+            summary["folder_count"] = len(directories.get(top, set()) - {top})
+        return {
+            "path": normalized,
+            "summaries": [
+                {"path": "/".join(part for part in (normalized, name) if part), **summary}
+                for name, summary in sorted(summaries.items())
+            ],
+        }
+
+    @staticmethod
+    def _transfer_log_callback(
+        callback: Callable[[dict[str, object]], None] | None,
+        *,
+        file_name: str,
+        file_size: int | None,
+        log_callback: Callable[[str], None] | None,
+    ) -> Callable[[str], None] | None:
+        if callback is None and log_callback is None:
+            return None
+
+        def on_line(line: str) -> None:
+            stats: object = None
+            try:
+                payload = json.loads(line)
+                if isinstance(payload, dict):
+                    stats = payload.get("stats")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(stats, dict):
+                if callback is not None:
+                    active_items = stats.get("transferring")
+                    active = active_items[0] if isinstance(active_items, list) and active_items and isinstance(active_items[0], dict) else {}
+                    current = active.get("bytes", stats.get("bytes"))
+                    total = active.get("size", file_size)
+                    percent = active.get("percentage")
+                    if percent is None and isinstance(current, (int, float)) and isinstance(total, (int, float)) and total > 0:
+                        percent = min(100.0, max(0.0, float(current) * 100 / float(total)))
+                    speed = active.get("speed", active.get("speedAvg", stats.get("speed")))
+                    eta = active.get("eta", stats.get("eta"))
+                    try:
+                        current_value = max(0, int(current))
+                    except (TypeError, ValueError):
+                        current_value = 0
+                    try:
+                        total_value = max(0, int(total)) if total is not None else None
+                    except (TypeError, ValueError):
+                        total_value = None
+                    try:
+                        speed_value = max(0, int(float(speed))) if speed is not None else None
+                    except (TypeError, ValueError):
+                        speed_value = None
+                    try:
+                        eta_value = max(0, int(float(eta))) if eta is not None else None
+                    except (TypeError, ValueError):
+                        eta_value = None
+                    try:
+                        percent_value = min(100.0, max(0.0, float(percent))) if percent is not None else None
+                    except (TypeError, ValueError):
+                        percent_value = None
+                try:
+                    if callback is not None:
+                        callback({
+                            "name": str(active.get("name") or file_name)[:512],
+                            "bytes_current": current_value,
+                            "bytes_total": total_value,
+                            "speed_bps": speed_value,
+                            "eta_seconds": eta_value,
+                            "percent": percent_value,
+                        })
+                except Exception:
+                    # Telemetry must never change the outcome of a transfer.
+                    pass
+                # Never copy raw rclone progress output into the worker log or
+                # job event; only the normalized fields above are user-facing.
+                return
+            if log_callback is not None:
+                log_callback(line)
+
+        return on_line
+
+    @staticmethod
+    def _keep_non_stats_output_line(line: str) -> bool:
+        try:
+            value = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return True
+        return not (isinstance(value, dict) and isinstance(value.get("stats"), dict))
+
+    def ensure_directory(
+        self,
+        destination: str,
+        relative_path: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+        create_new: bool,
+        created_by_job: bool = False,
+    ) -> str:
+        """Resolve an existing folder or safely create a job-owned child folder."""
+        try:
+            validate_rclone_destination(destination)
+            remote, normalized = RcloneRunner._remote_path(destination, relative_path)
+        except ValueError as exc:
+            raise RcloneError("Path tujuan Quick Mode tidak valid.", code="RCLONE_BROWSER_PATH_INVALID") from exc
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        if not config.is_file() or shutil.which("rclone") is None:
+            raise RcloneError("Runtime rclone belum tersedia pada worker.", code="RCLONE_RUNTIME_UNAVAILABLE")
+        if not normalized:
+            if create_new:
+                raise RcloneError("Nama subfolder Quick Mode wajib diisi.", code="RCLONE_TARGET_INVALID")
+            return remote
+
+        def run(command: list[str], log_prefix: str):
+            try:
+                result = self.runner.run(
+                    command,
+                    log_prefix=log_prefix,
+                    output_callback=self.log_callback,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
+                )
+            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                raise RcloneError("Worker tidak dapat memeriksa folder tujuan Quick Mode.", code="RCLONE_ACCESS_FAILED") from exc
+            if result.returncode != 0:
+                raise RcloneError("Worker tidak dapat memeriksa folder tujuan Quick Mode.", code="RCLONE_ACCESS_FAILED")
+            return result
+
+        if create_new and not created_by_job:
+            parent_name, _, child_name = normalized.rpartition("/")
+            parent, _ = self._remote_path(destination, parent_name)
+            listing = run(
+                [
+                    "rclone", "lsjson", parent, "--max-depth", "1", "--no-modtime",
+                    "--no-mimetype", "--config", str(config), "--log-level", "ERROR",
+                ],
+                "rclone-quickmode-target-check",
+            )
+            try:
+                entries = json.loads(getattr(listing, "stdout", "") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
+            if not isinstance(entries, list):
+                raise RcloneError("Worker menerima listing rclone yang tidak valid.")
+            if any(
+                isinstance(entry, dict) and str(entry.get("Name") or "") == child_name
+                for entry in entries
+            ):
+                raise RcloneError(
+                    "Nama folder tujuan Quick Mode sudah ada. Pilih folder lain.",
+                    code="RCLONE_TARGET_EXISTS",
+                )
+            run(
+                ["rclone", "mkdir", remote, "--config", str(config), "--log-level", "ERROR"],
+                "rclone-quickmode-target-create",
+            )
+        elif not create_new and not created_by_job:
+            # A selected existing folder must still be present when execution
+            # starts; don't silently create a missing path during upload.
+            parent_name, _, child_name = normalized.rpartition("/")
+            parent, _ = self._remote_path(destination, parent_name)
+            listing = run(
+                [
+                    "rclone", "lsjson", parent, "--max-depth", "1", "--no-modtime",
+                    "--no-mimetype", "--config", str(config), "--log-level", "ERROR",
+                ],
+                "rclone-quickmode-target-check",
+            )
+            try:
+                entries = json.loads(getattr(listing, "stdout", "") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
+            if not isinstance(entries, list) or not any(
+                isinstance(entry, dict)
+                and str(entry.get("Name") or "") == child_name
+                and entry.get("IsDir") is True
+                for entry in entries
+            ):
+                raise RcloneError(
+                    "Folder tujuan Quick Mode tidak lagi tersedia.",
+                    code="RCLONE_TARGET_NOT_FOUND",
+                )
+        elif created_by_job:
+            # Recovery after an interrupted mkdir/upload reuses the original
+            # path. The manifest is the durable proof this stage owns it.
+            run(
+                ["rclone", "mkdir", remote, "--config", str(config), "--log-level", "ERROR"],
+                "rclone-quickmode-target-recovery",
+            )
+        return remote
+
     def list_download_files(
         self,
         destination: str,
@@ -271,7 +554,13 @@ class RcloneRunner:
                     "remote_path": remote,
                     "relative_path": name,
                     "name": name,
-                    "size": None,
+                    "size": (
+                        max(0, int(selected["size"]))
+                        if isinstance(selected.get("size"), int)
+                        and not isinstance(selected.get("size"), bool)
+                        and int(selected["size"]) >= 0
+                        else None
+                    ),
                 }
                 previous = files.get(remote)
                 if previous is None or len(str(candidate["relative_path"])) > len(str(previous["relative_path"])):
@@ -341,6 +630,8 @@ class RcloneRunner:
         config_path: Path,
         *,
         config_root: Path,
+        file_name: str = "",
+        total_bytes: int | None = None,
     ) -> None:
         """Download one remote file to an isolated temporary path."""
         config = Path(config_path).resolve()
@@ -352,13 +643,20 @@ class RcloneRunner:
             raise RcloneError("Runtime rclone belum tersedia pada worker.", code="RCLONE_RUNTIME_UNAVAILABLE")
         command = [
             "rclone", "copyto", str(remote_path), str(destination_path),
-            "--config", str(config), "--log-level", "ERROR",
+            "--config", str(config), "--log-level", "NOTICE",
+            "--stats", "1s", "--stats-log-level", "NOTICE", "--use-json-log",
         ]
         try:
             result = self.runner.run(
                 command,
                 log_prefix="rclone-storage-download",
-                output_callback=self.log_callback,
+                output_callback=self._transfer_log_callback(
+                    self.transfer_callback,
+                    file_name=file_name or Path(destination_path).name,
+                    file_size=total_bytes,
+                    log_callback=self.log_callback,
+                ),
+                output_filter=self._keep_non_stats_output_line,
                 stall_timeout_seconds=self.stall_timeout_seconds,
                 command_callback=self.command_callback,
             )
@@ -556,6 +854,12 @@ class RcloneRunner:
             remote_parts = normalized_name.split("/") if normalized_name else []
             if not remote_parts:
                 raise RcloneError(f"Nama tujuan rclone tidak valid untuk {path.name}.")
+            file_size = path.stat().st_size
+
+            def on_transfer(value: dict[str, object]) -> None:
+                if self.transfer_callback is not None:
+                    self.transfer_callback({**value, "index": index, "total": len(paths)})
+
             command = [
                 "rclone",
                 "copyto",
@@ -564,7 +868,12 @@ class RcloneRunner:
                 "--config",
                 str(config),
                 "--log-level",
-                "ERROR",
+                "NOTICE",
+                "--stats",
+                "1s",
+                "--stats-log-level",
+                "NOTICE",
+                "--use-json-log",
             ]
             if ignore_existing:
                 command.extend(["--ignore-existing"])
@@ -572,7 +881,13 @@ class RcloneRunner:
                 result = self.runner.run(
                     command,
                     log_prefix="rclone-upload",
-                    output_callback=self.log_callback,
+                    output_callback=self._transfer_log_callback(
+                        on_transfer,
+                        file_name=normalized_name,
+                        file_size=file_size,
+                        log_callback=self.log_callback,
+                    ),
+                    output_filter=self._keep_non_stats_output_line,
                     stall_timeout_seconds=self.stall_timeout_seconds,
                     command_callback=self.command_callback,
                 )

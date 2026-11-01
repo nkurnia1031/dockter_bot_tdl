@@ -34,7 +34,7 @@ describe('Storage file manager', () => {
     localStorage.clear();
   });
 
-  it('renders folder tree, opens nested folder, and exposes recycle bin', async () => {
+  it('hides the shared folder tree but keeps navigation and recursive list summaries', async () => {
     const fetcher = vi.fn(async (input: string) => {
       const url = new URL(String(input), 'https://ui.test');
       if (url.pathname.endsWith('/storage/folders/tree')) {
@@ -48,7 +48,7 @@ describe('Storage file manager', () => {
         return new Response(JSON.stringify({
           current_folder:nested?{id:1,name:'Projects'}:null,
           breadcrumbs:nested?[{id:1,name:'Projects'}]:[],
-          folders:nested?[]:[{id:1,parent_id:null,name:'Projects',path:'Projects',status:'active'}],
+          folders:nested?[]:[{id:1,parent_id:null,name:'Projects',path:'Projects',status:'active',file_count:2,folder_count:1,size_bytes:30,size_complete:true}],
           items:nested?[{id:9,display_name:'report.pdf',original_name:'report.pdf',file_size:10,status:'active'}]:[],
           total_folders:nested?0:1,total_items:nested?1:0
         }), {status:200});
@@ -58,12 +58,70 @@ describe('Storage file manager', () => {
     vi.stubGlobal('fetch', fetcher);
     render(StoragePage);
 
-    expect(await screen.findByRole('button', {name:'Projects'})).toBeTruthy();
+    expect(await screen.findByRole('button', {name:/Projects/})).toBeTruthy();
     expect(screen.getByRole('button', {name:'Recycle Bin'})).toBeTruthy();
-    await fireEvent.click(screen.getAllByRole('button', {name:'Projects'})[0]);
-    expect(await screen.findByText('report.pdf')).toBeTruthy();
+    expect(screen.getByRole('button', {name:'All Files'})).toBeTruthy();
+    expect(screen.queryByText('Folder bersama')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', {name:'Tampilan daftar'}));
+    expect(await screen.findByText('2 file · 1 folder · 30 B')).toBeTruthy();
+    await fireEvent.click(screen.getAllByRole('button', {name:/^Projects/})[0]);
+    expect((await screen.findAllByText('report.pdf')).length).toBeGreaterThan(0);
     expect(fetcher.mock.calls.some(([url]) => String(url).includes('folder_id=1'))).toBe(true);
   }, 15000);
+
+  it('loads one recursive rclone summary per opened folder and refreshes it manually', async () => {
+    const summaryCalls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input:string) => {
+      const url = new URL(String(input), 'https://ui.test');
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true, profiles:['default'], actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{name:'local',url:'http://worker',enabled:true}]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']}], runtime_readiness:{checked_at:'2026-11-01T00:00:00Z',
+          workers:[{name:'local',status:'success',checked_at:'now',reason_code:''}],
+          cells:[{worker:'local',profile:null,runtime:'rclone_storage',status:'ready',checked_at:'now',reason_code:''}]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/browser')) {
+        const path=url.searchParams.get('path')||'';
+        return new Response(JSON.stringify({
+          path,breadcrumbs:[],items:path==='Archive'?
+            [{name:'Nested',path:'Archive/Nested',is_dir:true,size:0,updated_at:'now'}]:[
+              {name:'Archive',path:'Archive',is_dir:true,size:0,updated_at:'now'},
+              {name:'Media',path:'Media',is_dir:true,size:0,updated_at:'now'},
+            ],total:path==='Archive'?1:2,limit:100,offset:0,
+        }),{status:200});
+      }
+      if (url.pathname.endsWith('/storage/rclone/folder-summaries')) {
+        const path=url.searchParams.get('path')||'';
+        summaryCalls.push(path);
+        return new Response(JSON.stringify({path,summaries:path==='Archive'?
+          [{path:'Archive/Nested',file_count:4,folder_count:2,size_bytes:0,size_complete:true}]:[
+            {path:'Archive',file_count:2,folder_count:1,size_bytes:3145728,size_complete:false},
+            {path:'Media',file_count:1,folder_count:0,size_bytes:2097152,size_complete:true},
+          ]}),{status:200});
+      }
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+    await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
+
+    expect(await screen.findByText('2 file · 1 folder · Ukuran tidak lengkap')).toBeTruthy();
+    expect(screen.getByText('1 file · 0 folder · 2.0 MB')).toBeTruthy();
+    expect(summaryCalls).toEqual(['']);
+    await fireEvent.click(screen.getByRole('button',{name:/^Archive/}));
+    expect(await screen.findByText('4 file · 2 folder · 0 B')).toBeTruthy();
+    expect(summaryCalls).toEqual(['','Archive']);
+    await fireEvent.change(screen.getByDisplayValue('Nama'),{target:{value:'size'}});
+    await waitFor(()=>expect(screen.getByText('4 file · 2 folder · 0 B')).toBeTruthy());
+    expect(summaryCalls).toEqual(['','Archive']);
+    await fireEvent.click(screen.getByRole('button',{name:'Refresh rclone'}));
+    await waitFor(()=>expect(summaryCalls).toEqual(['','Archive','Archive']));
+  },15000);
 
   it('uses the saved Storage readiness snapshot and does not start a verification message/job', async () => {
     enableDialogMethods();
@@ -258,7 +316,7 @@ describe('Storage file manager', () => {
     await waitFor(() => expect(requests.some((request)=>request.url.endsWith('/storage/downloads')&&request.method==='POST')).toBe(true));
     const submitted=requests.find((request)=>request.url.endsWith('/storage/downloads')&&request.method==='POST');
     expect(JSON.parse(submitted?.body||'{}')).toEqual({
-      provider:'rclone',worker:'local',rclone_sources:[{path:'archive',is_dir:true}],
+      provider:'rclone',worker:'local',rclone_sources:[{path:'archive',is_dir:true,size:0}],
       destination_path:'/workspace/downloads',publish_public_links:true,
     });
 
@@ -476,7 +534,7 @@ describe('Storage file manager', () => {
     render(StoragePage);
     await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
     expect(await screen.findByText('Remote rclone')).toBeTruthy();
-    await fireEvent.click(await screen.findByRole('button',{name:'docs'}));
+    await fireEvent.click(await screen.findByRole('button',{name:/^docs/}));
     expect(await screen.findByText('report.txt')).toBeTruthy();
     expect(requests.some(item=>item.path.endsWith('/storage/rclone/browser')&&item.url.searchParams.get('worker')==='local')).toBe(true);
     expect(requests.some(item=>item.path.endsWith('/storage/rclone/browser')&&item.url.searchParams.get('path')==='docs')).toBe(true);

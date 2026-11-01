@@ -35,6 +35,7 @@ from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.utility import (
     DEFAULT_UTILITY_SETTINGS,
     UtilityRunner,
+    validate_rclone_destination,
 )
 from tme3bot.worker.quick_export import (
     QUICK_PHASES,
@@ -329,6 +330,16 @@ class QuickModeExecutorMixin:
         operation_id = str(retry.get("quick_operation_id") or stage_job_id)
         manifest = read_quick_manifest(stage_root)
         if requested_phase == "exporting":
+            destination_fields = {
+                key: manifest[key]
+                for key in (
+                    "rclone_destination_root", "rclone_destination",
+                    "quick_rclone_path", "quick_rclone_create",
+                    "quick_rclone_destination_prepared",
+                    "quick_rclone_create_pending", "quick_rclone_destination_created",
+                )
+                if key in manifest
+            }
             if retry:
                 self._clear_quick_stage(stage_root)
             manifest = {
@@ -340,6 +351,7 @@ class QuickModeExecutorMixin:
                 "phase": "exporting",
                 "retry_of": retry.get("retry_of"),
             }
+            manifest.update(destination_fields)
         else:
             manifest.setdefault("version", 2)
             manifest.setdefault("stage_job_id", stage_job_id)
@@ -366,6 +378,102 @@ class QuickModeExecutorMixin:
         # source of truth even when the backend record is incomplete.
         write_quick_manifest(stage_root, manifest)
         return stage_root, manifest, effective_phase, stage_job_id
+
+    def _prepare_quick_rclone_destination(
+        self,
+        command: dict[str, Any],
+        stage_root: Path,
+        manifest: dict[str, Any],
+    ) -> str:
+        """Persist and prepare this Quick Mode job's immutable rclone target."""
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        settings = payload.get("quick_settings")
+        settings = settings if isinstance(settings, dict) else DEFAULT_UTILITY_SETTINGS
+        configured_root = str(
+            manifest.get("rclone_destination_root")
+            or settings.get("rclone_destination")
+            or DEFAULT_UTILITY_SETTINGS["rclone_destination"]
+        ).strip()
+        try:
+            validate_rclone_destination(configured_root)
+        except ValueError as exc:
+            raise QuickModeError("Root rclone Quick Mode tidak valid.", code="RCLONE_RUNTIME_UNAVAILABLE") from exc
+
+        relative_path = str(
+            manifest.get("quick_rclone_path")
+            if "quick_rclone_path" in manifest
+            else payload.get("quick_rclone_path") or ""
+        ).replace("\\", "/").strip("/")
+        create_new = (
+            manifest.get("quick_rclone_create") is True
+            if "quick_rclone_create" in manifest
+            else payload.get("quick_rclone_create") is True
+        )
+        actual_path, _ = RcloneRunner._remote_path(configured_root, relative_path)
+        prepared = manifest.get("quick_rclone_destination_prepared") is True
+        created = manifest.get("quick_rclone_destination_created") is True
+
+        if prepared:
+            # The staging manifest is the source of truth for retries and
+            # orphan recovery, even if global settings changed afterward.
+            configured_root = str(manifest.get("rclone_destination_root") or configured_root)
+            relative_path = str(manifest.get("quick_rclone_path") or "")
+            actual_path = str(manifest.get("rclone_destination") or actual_path)
+            if created:
+                config_path = Path(getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")).resolve()
+                config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+                RcloneRunner(stall_timeout_seconds=30).ensure_directory(
+                    configured_root, relative_path, config_path,
+                    config_root=config_root, create_new=True, created_by_job=True,
+                )
+            return actual_path
+
+        config_path = Path(getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        runner = RcloneRunner(
+            log_callback=self._append_job_log,
+            command_callback=self._command_callback(),
+            stall_timeout_seconds=30,
+        )
+        if relative_path:
+            manifest.update(
+                rclone_destination_root=configured_root,
+                rclone_destination=actual_path,
+                quick_rclone_path=relative_path,
+                quick_rclone_create=create_new,
+            )
+            write_quick_manifest(stage_root, manifest)
+            if create_new:
+                pending_recovery = manifest.get("quick_rclone_create_pending") is True
+                manifest["quick_rclone_create_pending"] = True
+                write_quick_manifest(stage_root, manifest)
+                try:
+                    actual_path = runner.ensure_directory(
+                        configured_root, relative_path, config_path,
+                        config_root=config_root, create_new=True,
+                        created_by_job=pending_recovery,
+                    )
+                except Exception:
+                    manifest["quick_rclone_create_pending"] = False
+                    write_quick_manifest(stage_root, manifest)
+                    raise
+                created = True
+            else:
+                actual_path = runner.ensure_directory(
+                    configured_root, relative_path, config_path,
+                    config_root=config_root, create_new=False,
+                )
+        manifest.update(
+            rclone_destination_root=configured_root,
+            rclone_destination=actual_path,
+            quick_rclone_path=relative_path,
+            quick_rclone_create=create_new,
+            quick_rclone_destination_prepared=True,
+            quick_rclone_create_pending=False,
+            quick_rclone_destination_created=created,
+        )
+        write_quick_manifest(stage_root, manifest)
+        return actual_path
 
     @staticmethod
     def _clear_quick_stage(stage_root: Path) -> None:
@@ -1080,9 +1188,12 @@ class QuickModeExecutorMixin:
                 }
                 quick_settings = payload.get("quick_settings") or {}
                 rclone_destination = (
-                    quick_settings.get("rclone_destination", "googledrive:backup")
-                    if isinstance(quick_settings, dict)
-                    else "googledrive:backup"
+                    str(payload.get("quick_rclone_destination") or "").strip()
+                    or (
+                        quick_settings.get("rclone_destination", "googledrive:backup")
+                        if isinstance(quick_settings, dict)
+                        else "googledrive:backup"
+                    )
                 )
 
                 def persist_uploaded_items(items: list[dict[str, Any]]) -> None:

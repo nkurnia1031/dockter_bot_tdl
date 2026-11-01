@@ -103,6 +103,22 @@
             </div>
           </div>
         </div>
+        {#if progress.overall.files_total !== undefined || progress.overall.bytes_total !== undefined}
+          <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-semibold text-[var(--muted)]">
+            {#if progress.overall.files_total !== undefined}
+              <span>Batch {progress.overall.files_current ?? progress.overall.current ?? 0}/{progress.overall.files_total} file</span>
+            {/if}
+            {#if progress.overall.bytes_total !== undefined}
+              <span>{formatBytes(progress.overall.bytes_current || 0)} / {formatBytes(progress.overall.bytes_total)} batch</span>
+            {/if}
+          </div>
+        {/if}
+        {#if progress.item.name && progress.transfer.bytes_current !== undefined}
+          <div class="mt-1 flex flex-wrap justify-between gap-2 text-[11px] font-mono text-[var(--muted)]">
+            <span class="min-w-0 truncate">{progress.item.name}</span>
+            <span>{formatBytes(progress.transfer.bytes_current)}{progress.transfer.bytes_total !== undefined ? ` / ${formatBytes(progress.transfer.bytes_total)}` : ''}</span>
+          </div>
+        {/if}
         {#if job.kind === 'storage_upload' && progress.activeItems.length}
           <div class="mt-3 grid gap-2 sm:grid-cols-2" aria-label="Upload Storage aktif per profil">
             {#each progress.activeItems as active (String(active.profile || job.profile) + ':' + String(active.name || '') + ':' + String(active.attempt || 0))}

@@ -73,11 +73,35 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
             except ValueError as exc:
                 raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
         if bool(values.get("quick_mode")):
+            raw_rclone_path = str(values.get("quick_rclone_path") or "").replace("\\", "/")
+            normalized_rclone_path = raw_rclone_path.strip("/")
+            path_parts = normalized_rclone_path.split("/") if normalized_rclone_path else []
+            if raw_rclone_path.startswith(("/", "\\")) or len(normalized_rclone_path) > 2048 or any(
+                ord(char) < 32 for char in normalized_rclone_path
+            ) or any(not part or part in {".", ".."} or ":" in part for part in path_parts):
+                raise DomainError(
+                    "RCLONE_BROWSER_PATH_INVALID",
+                    "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                    status_code=422,
+                )
+            if values.get("quick_rclone_create") and not normalized_rclone_path:
+                raise DomainError(
+                    "RCLONE_TARGET_INVALID",
+                    "Pilih nama subfolder baru di bawah root rclone.",
+                    status_code=422,
+                )
+            values["quick_rclone_path"] = normalized_rclone_path
             # Snapshot settings at submission time. The password is retained
             # only in the internal worker command and redacted from the Job API.
             values["quick_settings"] = context.utility_settings.get()
             values["quick_settings"].setdefault(
                 "rclone_destination", "googledrive:backup"
+            )
+        elif values.get("quick_rclone_path") or values.get("quick_rclone_create"):
+            raise DomainError(
+                "QUICK_MODE_DESTINATION_REQUIRES_QUICK_MODE",
+                "Folder rclone per job hanya berlaku untuk Quick Mode.",
+                status_code=422,
             )
         return job_dict(
             context.control_plane.submit_job(

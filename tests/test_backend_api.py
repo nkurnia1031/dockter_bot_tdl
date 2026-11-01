@@ -135,6 +135,7 @@ class FakeDispatcher:
         self.tts_recoveries = []
         self.storage_fingerprint_overrides = {}
         self.rclone_browse_calls = []
+        self.rclone_summary_calls = []
         self.public_download_link_calls = []
         self.public_download_links_result = {"items": []}
         self.public_download_link_revocations = []
@@ -197,6 +198,10 @@ class FakeDispatcher:
         self.rclone_browse_calls.append((worker, destination, kwargs))
         return {"path": kwargs.get("path", ""), "breadcrumbs": [], "items": [],
                 "total": 0, "limit": kwargs.get("limit", 100), "offset": kwargs.get("offset", 0)}
+
+    def rclone_storage_folder_summaries(self, worker, destination, *, path=""):
+        self.rclone_summary_calls.append((worker, destination, path))
+        return {"path": path, "summaries": []}
 
     def public_download_links(self, worker):
         self.public_download_link_calls.append(worker)
@@ -4166,19 +4171,40 @@ class BackendApiTests(unittest.TestCase):
         created = self.client.post(
             "/api/v1/exports",
             headers=headers,
-            json={"url": "https://t.me/c/1/2", "quick_mode": True},
+            json={
+                "url": "https://t.me/c/1/2", "quick_mode": True,
+                "quick_rclone_path": "reports/november",
+                "quick_rclone_create": True,
+            },
         )
         self.assertEqual(created.status_code, 200)
         job = self.client.get(f"/api/v1/jobs/{created.json()['id']}", headers=headers).json()
         self.assertEqual(job["payload"]["quick_mode"], True)
+        self.assertEqual(job["payload"]["quick_rclone_path"], "reports/november")
+        self.assertTrue(job["payload"]["quick_rclone_create"])
         self.assertEqual(job["payload"]["quick_settings"]["compress_password"], "***")
         self.assertEqual(
             job["payload"]["quick_settings"]["rclone_destination"],
             "googledrive:backup",
         )
         command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["payload"]["quick_rclone_path"], "reports/november")
+        self.assertTrue(command["payload"]["quick_rclone_create"])
         self.assertNotEqual(command["payload"]["quick_settings"]["compress_password"], "***")
         self.assertTrue(command["payload"]["quick_settings"]["compress_password"])
+        self.assertEqual(self.context.utility_settings.get()["rclone_destination"], "googledrive:backup")
+
+        invalid = self.client.post(
+            "/api/v1/exports", headers=headers,
+            json={"url": "https://t.me/c/1/2", "quick_mode": True,
+                  "quick_rclone_path": "../escape"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        rejected_non_quick = self.client.post(
+            "/api/v1/exports", headers=headers,
+            json={"url": "https://t.me/c/1/2", "quick_rclone_path": "reports"},
+        )
+        self.assertEqual(rejected_non_quick.status_code, 422)
 
     def test_storage_upload_selects_exactly_one_rclone_destination(self):
         headers = self.login()
@@ -4471,6 +4497,33 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(absolute.status_code, 422)
         self.assertEqual(len(self.dispatcher.rclone_browse_calls), 1)
+
+    def test_rclone_folder_summary_uses_saved_worker_readiness_and_one_dispatch(self):
+        headers = self.login()
+        self.context.utility_settings.set("rclone_destination", "remote:archive")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(self.runtime_readiness_store)
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-29T00:00:00Z",
+            workers=[{"worker": "local", "status": "success"}], profiles={"local": []},
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="a" * 64,
+            destination_fingerprint=hashlib.sha256(b"remote:archive").hexdigest(),
+            checked_at="2026-10-29T00:00:00Z",
+        )
+        response = self.client.get(
+            "/api/v1/storage/rclone/folder-summaries?worker=local&path=docs",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.dispatcher.rclone_summary_calls, [("local", "remote:archive", "docs")])
+        invalid = self.client.get(
+            "/api/v1/storage/rclone/folder-summaries?worker=local&path=..%2Foutside",
+            headers=headers,
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(len(self.dispatcher.rclone_summary_calls), 1)
 
     def test_storage_reconciliation_endpoint_uses_original_private_destination(self):
         headers = self.login()

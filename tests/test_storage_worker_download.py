@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.rclone import RcloneError
+from tme3bot.progress_reporter import ProgressReporter
 from tme3bot.worker.executor_storage import StorageExecutorMixin
 from tme3bot.worker.executor_workspace import WorkspaceExecutorMixin
 from tme3bot.worker.public_download_links import PublicDownloadLinks
@@ -65,7 +66,22 @@ class FakeRcloneRunner:
     def list_download_files(self, destination, sources, config_path, *, config_root):
         return list(self.files)
 
-    def download_file(self, remote_path, destination_path, config_path, *, config_root):
+    def download_file(
+        self, remote_path, destination_path, config_path, *, config_root,
+        file_name="", total_bytes=None,
+    ):
+        del config_path, config_root
+        del file_name, total_bytes
+        callback = self.kwargs.get("transfer_callback")
+        if callback is not None:
+            callback({
+                "name": Path(destination_path).name,
+                "bytes_current": 3,
+                "bytes_total": 5,
+                "speed_bps": 50,
+                "eta_seconds": 2,
+                "percent": 60,
+            })
         Path(destination_path).write_bytes(f"from:{remote_path}".encode())
 
     def cancel_current(self):
@@ -200,6 +216,44 @@ class StorageWorkerDownloadTests(unittest.TestCase):
         self.assertEqual(links[0]["provider"], "rclone")
         self.assertFalse(worker._rclone_runners)
 
+    def test_rclone_download_publishes_active_file_and_batch_progress(self):
+        FakeRcloneRunner.files = [{
+            "remote_path": "drive:backup/report.bin",
+            "relative_path": "report.bin",
+            "name": "report.bin",
+            "size": 5,
+        }]
+        worker = StorageDownloadHarness(self.workspace)
+
+        def unthrottled_reporter(publisher, job_id):
+            return ProgressReporter(publisher, job_id, min_interval_seconds=0)
+
+        command = {
+            "job_id": "rclone-progress-job",
+            "payload": {
+                "provider": "rclone",
+                "destination_path": str(self.destination),
+                "rclone_destination": "drive:backup",
+                "rclone_sources": [{"path": "report.bin", "is_dir": False}],
+            },
+        }
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", FakeRcloneRunner), patch(
+            "tme3bot.worker.executor_storage.ProgressReporter", side_effect=unthrottled_reporter
+        ):
+            worker._storage_download(command)
+
+        progress = [
+            values["progress"] for _job_id, _status, _event_type, values in worker.publisher.events
+            if values.get("progress", {}).get("message", "").startswith("Mengunduh report.bin dari rclone")
+        ]
+        self.assertEqual(len(progress), 1)
+        self.assertEqual(progress[0]["item"]["name"], "report.bin")
+        self.assertEqual(progress[0]["overall"]["files_total"], 1)
+        self.assertEqual(progress[0]["overall"]["bytes_total"], 5)
+        self.assertEqual(progress[0]["transfer"]["bytes_current"], 3)
+        self.assertEqual(progress[0]["transfer"]["speed_bps"], 50)
+        self.assertEqual(progress[0]["transfer"]["eta_seconds"], 2)
+
     def test_rclone_publication_failure_keeps_downloaded_file(self):
         FakeRcloneRunner.files = [{
             "remote_path": "drive:backup/archive/ok.bin",
@@ -242,7 +296,11 @@ class StorageWorkerDownloadTests(unittest.TestCase):
         ]
 
         class CancelOnSecondRcloneFile(FakeRcloneRunner):
-            def download_file(self, remote_path, destination_path, config_path, *, config_root):
+            def download_file(
+                self, remote_path, destination_path, config_path, *, config_root,
+                file_name="", total_bytes=None,
+            ):
+                del config_path, config_root, file_name, total_bytes
                 Path(destination_path).write_bytes(b"partial" if remote_path.endswith("two.bin") else b"done")
                 if remote_path.endswith("two.bin"):
                     worker_ref["worker"]._cancel_requested.add("rclone-cancel")

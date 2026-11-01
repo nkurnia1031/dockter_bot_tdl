@@ -7,7 +7,10 @@ const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles
 ], runtime_readiness: {
   checked_at: '2026-10-23T10:00:00Z',
   workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }],
-  cells: [{ worker: 'local', profile: 'default', runtime: 'quick_mode', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }]
+  cells: [
+    { worker: 'local', profile: 'default', runtime: 'quick_mode', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' },
+    { worker: 'local', profile: null, runtime: 'rclone_storage', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }
+  ]
 } }), { status: 200 });
 
 describe('QuickModePage', () => {
@@ -82,6 +85,76 @@ describe('QuickModePage', () => {
     expect(requests.some((item) => item.url.includes('/context/verify'))).toBe(false);
     expect(requests.find((item) => item.url.endsWith('/exports'))?.body).toMatchObject({ chat_ref: 'example', quick_mode: true });
     await waitFor(() => expect(calls.some((item) => item.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true'))).toBe(true));
+  });
+
+  it('submits a selected existing rclone folder only for this Quick Mode job', async () => {
+    const requests: {url:string; body?:Record<string, unknown>}[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url = String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
+      if (url.includes('/storage/rclone/browser')) return new Response(JSON.stringify({
+        path:'', breadcrumbs:[], items:[{name:'reports',path:'reports',is_dir:true,size:0,updated_at:'now'}],
+        total:1,limit:100,offset:0,
+      }),{status:200});
+      if (url.includes('/sources') || url.includes('/labels') || url.includes('/jobs') || url.includes('/quick-mode/limits') || url.includes('/quick-mode/staging')) {
+        return new Response(JSON.stringify({items:[]}),{status:200});
+      }
+      if (url.endsWith('/exports') && init?.method==='POST') {
+        requests.push({url,body:JSON.parse(String(init.body))});
+        return new Response(JSON.stringify({id:'quick-existing-target',status:'queued'}),{status:200});
+      }
+      return new Response(JSON.stringify({}),{status:200});
+    }));
+
+    render(QuickModePage);
+    await screen.findByText('Quick Mode siap');
+    await fireEvent.click(screen.getByRole('button',{name:'Pilih folder'}));
+    await screen.findByRole('button',{name:'Pilih'});
+    await fireEvent.click(screen.getByRole('button',{name:'Pilih'}));
+    expect(await screen.findByText(/Folder terpilih: reports/)).toBeTruthy();
+    await fireEvent.input(screen.getByLabelText('Referensi chat'),{target:{value:'example'}});
+    await fireEvent.click(screen.getByRole('button',{name:'Tambah Quick Mode'}));
+
+    expect(requests[0]?.body).toMatchObject({
+      quick_mode:true, quick_rclone_path:'reports', quick_rclone_create:false,
+    });
+    expect(requests[0]?.body).not.toHaveProperty('quick_settings');
+    expect(requests[0]?.body).not.toHaveProperty('rclone_destination');
+  });
+
+  it('submits a new rclone child folder without changing global Quick Mode settings', async () => {
+    const requests: {body?:Record<string, unknown>}[] = [];
+    let browses = 0;
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url = String(input);
+      if (url.includes('/profiles/local')) return localProfileCatalogResponse();
+      if (url.includes('/storage/rclone/browser')) {
+        browses += 1;
+        return new Response(JSON.stringify({path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0}),{status:200});
+      }
+      if (url.includes('/sources') || url.includes('/labels') || url.includes('/jobs') || url.includes('/quick-mode/limits') || url.includes('/quick-mode/staging')) {
+        return new Response(JSON.stringify({items:[]}),{status:200});
+      }
+      if (url.endsWith('/exports') && init?.method==='POST') {
+        requests.push({body:JSON.parse(String(init.body))});
+        return new Response(JSON.stringify({id:'quick-new-target',status:'queued'}),{status:200});
+      }
+      return new Response(JSON.stringify({}),{status:200});
+    }));
+
+    render(QuickModePage);
+    await screen.findByText('Quick Mode siap');
+    await fireEvent.click(screen.getByRole('button',{name:'Pilih folder'}));
+    await screen.findByPlaceholderText('Nama subfolder baru');
+    await fireEvent.input(screen.getByPlaceholderText('Nama subfolder baru'),{target:{value:'November'}});
+    await fireEvent.click(screen.getByRole('button',{name:'Buat tujuan baru'}));
+    expect(await screen.findByText(/Subfolder baru: November/)).toBeTruthy();
+    await fireEvent.input(screen.getByLabelText('Referensi chat'),{target:{value:'example'}});
+    await fireEvent.click(screen.getByRole('button',{name:'Tambah Quick Mode'}));
+
+    expect(requests[0]?.body).toMatchObject({quick_mode:true,quick_rclone_path:'November',quick_rclone_create:true});
+    expect(requests[0]?.body).not.toHaveProperty('rclone_destination');
+    expect(browses).toBe(1);
   });
 
   it('hides physical staging actions while its backend job is active', async () => {

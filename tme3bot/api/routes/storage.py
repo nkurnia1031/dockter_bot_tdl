@@ -55,6 +55,38 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 raise DomainError("RCLONE_ACCESS_FAILED", "Worker tidak dapat membaca remote rclone.", status_code=503) from exc
             raise DomainError("RCLONE_BROWSER_FAILED", "Worker tidak dapat memuat folder rclone.", status_code=503) from exc
 
+    @app.get("/api/v1/storage/rclone/folder-summaries", response_model=ObjectResponse)
+    def rclone_storage_folder_summaries(worker: str, path: str = "", actor=Depends(current_actor)):
+        normalized_path = str(path or "").replace("\\", "/").strip("/")
+        path_parts = normalized_path.split("/") if normalized_path else []
+        if len(normalized_path) > 2048 or any(ord(char) < 32 for char in normalized_path) or str(path or "").startswith(("/", "\\")) or any(
+            not part or part in {".", ".."} or ":" in part for part in path_parts
+        ):
+            raise DomainError(
+                "RCLONE_BROWSER_PATH_INVALID",
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                status_code=422,
+            )
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=worker, check_readiness=False
+        )
+        settings = context.utility_settings.get()
+        destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
+        gate = getattr(context.control_plane, "runtime_readiness_gate", None)
+        if gate is None:
+            raise DomainError("RUNTIME_NOT_READY", "Snapshot readiness rclone belum tersedia. Jalankan Scan Profil.", status_code=409)
+        gate.require_rclone_storage(selected_worker, destination)
+        summarize = getattr(context.worker_dispatcher, "rclone_storage_folder_summaries", None)
+        if not callable(summarize):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung ringkasan folder rclone.", status_code=503)
+        try:
+            return summarize(selected_worker, destination, path=normalized_path)
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if code == "RCLONE_ACCESS_FAILED":
+                raise DomainError("RCLONE_ACCESS_FAILED", "Worker tidak dapat membaca remote rclone.", status_code=503) from exc
+            raise DomainError("RCLONE_FOLDER_SUMMARY_FAILED", "Worker tidak dapat menghitung isi folder rclone.", status_code=503) from exc
+
     @app.get("/api/v1/storage/items", response_model=StorageItemListResponse)
     def search_storage(
         q: str = "",

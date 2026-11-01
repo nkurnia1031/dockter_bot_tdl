@@ -27,6 +27,7 @@ class FakeExecutor:
         self.quickmode_probe_destinations = []
         self.rclone_storage_probe_destinations = []
         self.rclone_storage_browse_requests = []
+        self.rclone_storage_summary_requests = []
         self.storage_move_cleanup_requests = []
         self.safelink_probe_calls = 0
         self.profile_readiness_canary_requests = []
@@ -101,6 +102,10 @@ class FakeExecutor:
     def rclone_storage_browse(self, destination, path="", **kwargs):
         self.rclone_storage_browse_requests.append((destination, path, kwargs))
         return {"path": path, "items": [], "total": 0, "limit": kwargs.get("limit", 100), "offset": kwargs.get("offset", 0)}
+
+    def rclone_storage_folder_summaries(self, destination, path=""):
+        self.rclone_storage_summary_requests.append((destination, path))
+        return {"path": path, "summaries": []}
 
     def storage_move_cleanup_reconciled(self, source_job_id, folder_path, relative_path):
         self.storage_move_cleanup_requests.append((source_job_id, folder_path, relative_path))
@@ -347,6 +352,23 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.executor.rclone_storage_browse_requests[0][0:2], ("remote:backup", "docs"))
         self.assertEqual(self.executor.rclone_storage_browse_requests[0][2]["offset"], 50)
+
+    def test_rclone_folder_summaries_requires_worker_auth_and_forwards_path(self):
+        body = {"rclone_destination": "remote:backup", "path": "docs"}
+        denied = self.client.post("/internal/v1/storage/rclone-folder-summaries", json=body)
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.post(
+            "/internal/v1/storage/rclone-folder-summaries",
+            headers={"Authorization": "Bearer worker-secret"}, json=body,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.executor.rclone_storage_summary_requests, [("remote:backup", "docs")])
+        invalid = self.client.post(
+            "/internal/v1/storage/rclone-folder-summaries",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={**body, "unexpected": True},
+        )
+        self.assertEqual(invalid.status_code, 422)
 
     def test_move_cleanup_endpoint_uses_worker_private_checkpoint_identity(self):
         response = self.client.post(

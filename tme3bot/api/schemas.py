@@ -320,6 +320,8 @@ class ExportRequest(BaseModel):
     profile: str | None = None
     worker: str | None = None
     quick_mode: bool = False
+    quick_rclone_path: str = ""
+    quick_rclone_create: bool = False
 
 
 class DownloadRequest(BaseModel):

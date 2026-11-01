@@ -83,6 +83,7 @@ class _FakeRcloneRunner:
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
+        self.transfer_callback = kwargs.get("transfer_callback")
         self.copies = []
         self.verifications = []
         self.instances.append(self)
@@ -95,11 +96,29 @@ class _FakeRcloneRunner:
         self.copies.extend(path.name for path in files)
         if self.behavior.get("definite_failure"):
             raise RcloneError("simulated rclone startup failure", code="RCLONE_RUNTIME_UNAVAILABLE")
+        transfer_callback = self.transfer_callback
+        if transfer_callback is not None:
+            for path in files:
+                size = path.stat().st_size
+                transfer_callback({
+                    "name": path.name,
+                    "bytes_current": size // 2,
+                    "bytes_total": size,
+                    "speed_bps": 100,
+                    "eta_seconds": 2,
+                    "percent": 50,
+                    "index": 1,
+                    "total": 1,
+                })
         mutate = self.behavior.get("mutate")
         if mutate:
             Path(mutate).write_text("changed during upload", encoding="utf-8")
         if self.behavior.get("ambiguous"):
             raise RuntimeError("simulated timeout after transfer started")
+        completed = self.kwargs.get("progress_callback")
+        if callable(completed):
+            for path in files:
+                completed(1, len(files), path.name)
         return {"succeeded": len(files)}
 
     def verify_complete_files(self, files, _destination, _config, **kwargs):
@@ -261,6 +280,42 @@ class StorageUploadBatchTests(unittest.TestCase):
         persisted = {item["path"]: item for item in self.store.storage_upload_items("storage-command")}
         self.assertEqual(persisted["conflict.bin"]["status"], "failed")
         self.assertEqual(persisted["success.bin"]["status"], "succeeded")
+
+    def test_rclone_storage_upload_publishes_active_file_and_batch_transfer_metrics(self):
+        self._add_files("one.bin", "two.bin")
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {}
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader)
+        real_reporter = __import__("tme3bot.progress_reporter", fromlist=["ProgressReporter"]).ProgressReporter
+
+        def unthrottled_reporter(publisher, job_id):
+            return real_reporter(publisher, job_id, min_interval_seconds=0)
+
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner), patch(
+            "tme3bot.worker.executor_storage.ProgressReporter", side_effect=unthrottled_reporter
+        ):
+            uploader._storage_upload(command)
+
+        progress = [
+            values["progress"] for _args, values in uploader.events
+            if values.get("progress", {}).get("message", "").startswith("Mengupload ")
+        ]
+        active = next(value for value in progress if value["item"].get("percent") == 50)
+        self.assertEqual(active["item"]["name"], "one.bin")
+        self.assertEqual(active["overall"]["files_total"], 2)
+        self.assertEqual(active["overall"]["bytes_total"], 24)
+        self.assertEqual(active["transfer"]["bytes_current"], 6)
+        self.assertEqual(active["transfer"]["speed_bps"], 100)
+        self.assertEqual(active["transfer"]["eta_seconds"], 2)
+        completed = next(
+            value for value in progress
+            if value["item"].get("percent") == 100
+            and value["item"].get("name") == "two.bin"
+        )
+        self.assertEqual(completed["overall"]["files_current"], 2)
+        self.assertEqual(completed["overall"]["files_total"], 2)
+        self.assertEqual(completed["overall"]["bytes_current"], 24)
 
     def test_rclone_move_deletes_only_after_full_verification_and_unchanged_source(self):
         self._add_files("stable.bin", "changed.bin")

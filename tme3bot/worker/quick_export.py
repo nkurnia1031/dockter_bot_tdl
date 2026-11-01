@@ -319,6 +319,10 @@ def scan_quick_stages(workspace: Path, *, worker: str | None = None) -> list[dic
             "staging_path": str(stage),
             "manifest_version": manifest_version,
             "rclone_destination": str(manifest.get("rclone_destination") or ""),
+            "rclone_destination_root": str(manifest.get("rclone_destination_root") or ""),
+            "quick_rclone_path": str(manifest.get("quick_rclone_path") or ""),
+            "quick_rclone_create": manifest.get("quick_rclone_create") is True,
+            "quick_rclone_destination_created": manifest.get("quick_rclone_destination_created") is True,
             "rclone_archive_names": [
                 str(name)
                 for name in (

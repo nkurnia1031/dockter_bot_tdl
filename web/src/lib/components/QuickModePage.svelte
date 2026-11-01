@@ -7,10 +7,12 @@
   import type { LabelItem } from '$lib/presentation';
   import TargetPicker from './TargetPicker.svelte';
   import JobTable from './JobTable.svelte';
-  import { CheckCircle2, Clock3, Download, FileDown, FolderOpen, Gauge, Image, Plus, RefreshCw, ShieldCheck, Trash2, Upload, XCircle, Zap } from '@lucide/svelte';
+  import { CheckCircle2, ChevronRight, Clock3, Download, FileDown, Folder, FolderOpen, Gauge, Image, Plus, RefreshCw, ShieldCheck, Trash2, Upload, XCircle, Zap } from '@lucide/svelte';
 
   type Job = Record<string, any>;
   type Stage = Record<string, any>;
+  type RcloneEntry = {name:string; path:string; is_dir:boolean; size:number; updated_at:string};
+  type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number};
   let sources = $state<any[]>([]);
   let labels = $state<LabelItem[]>([]);
   let chatRef = $state('');
@@ -30,6 +32,19 @@
     runtimeReadinessFor(session.runtimeReadiness, targetProfile, targetWorker, 'quick_mode')
   );
   const quickModeRuntimeReady = $derived(quickModeReadiness.status === 'ready');
+  const quickModeRcloneReadiness = $derived(
+    runtimeReadinessFor(session.runtimeReadiness, null, targetWorker, 'rclone_storage')
+  );
+  const quickModeRcloneReady = $derived(quickModeRcloneReadiness.status === 'ready');
+  let quickRclonePath = $state('');
+  let quickRcloneCreate = $state(false);
+  let quickRcloneBrowserPath = $state('');
+  let quickRcloneBrowser = $state<RcloneBrowserResponse>({path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0});
+  let quickRclonePickerOpen = $state(false);
+  let quickRcloneLoading = $state(false);
+  let quickRcloneError = $state('');
+  let quickRcloneNewFolder = $state('');
+  let quickRcloneGeneration = 0;
   let sourceLoading = $state(false);
   let statsLoading = $state(false);
   let allJobs = $state<Job[]>([]);
@@ -333,6 +348,61 @@
     }, 500);
   }
 
+  async function loadQuickRcloneFolder(path:string) {
+    if (!targetWorker || !quickModeRcloneReady) {
+      quickRcloneError = 'Akses rclone belum siap pada worker ini. Jalankan scan Profil.';
+      return;
+    }
+    const request=++quickRcloneGeneration;
+    quickRcloneBrowserPath=path;
+    quickRcloneLoading=true;
+    quickRcloneError='';
+    try {
+      const params=new URLSearchParams({worker:targetWorker,path,limit:'100',offset:'0',sort:'name',order:'asc'});
+      const result=await api<RcloneBrowserResponse>(`/storage/rclone/browser?${params}`);
+      if (request!==quickRcloneGeneration || targetWorker!==params.get('worker')) return;
+      quickRcloneBrowser=result;
+    } catch (cause) {
+      if (request===quickRcloneGeneration) quickRcloneError=cause instanceof Error?cause.message:'Folder rclone tidak dapat dimuat.';
+    } finally {
+      if (request===quickRcloneGeneration) quickRcloneLoading=false;
+    }
+  }
+
+  function onQuickModeWorkerChange() {
+    quickRcloneGeneration++;
+    quickRclonePath='';
+    quickRcloneCreate=false;
+    quickRcloneBrowserPath='';
+    quickRcloneBrowser={path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0};
+    quickRcloneError='';
+    if (quickRclonePickerOpen) void loadQuickRcloneFolder('');
+  }
+
+  function toggleQuickRclonePicker() {
+    quickRclonePickerOpen=!quickRclonePickerOpen;
+    if (quickRclonePickerOpen) void loadQuickRcloneFolder(quickRcloneBrowserPath);
+  }
+
+  function chooseQuickRcloneFolder(path:string) {
+    quickRclonePath=path;
+    quickRcloneCreate=false;
+    quickRclonePickerOpen=false;
+    quickRcloneNewFolder='';
+  }
+
+  function chooseQuickRcloneNewFolder() {
+    const name=quickRcloneNewFolder.trim();
+    if (!name || name==='.' || name==='..' || /[\\/:\u0000-\u001f]/.test(name)) {
+      quickRcloneError='Nama subfolder tidak valid.';
+      return;
+    }
+    quickRclonePath=[quickRcloneBrowserPath,name].filter(Boolean).join('/');
+    quickRcloneCreate=true;
+    quickRclonePickerOpen=false;
+    quickRcloneError='';
+  }
+
   async function submit() {
     if (submitting || cooldown) return;
     if (!quickModeRuntimeReady) {
@@ -358,7 +428,9 @@
         use_url_message_id: overwriteStartId,
         profile: targetProfile,
         worker: targetWorker,
-        quick_mode: true
+        quick_mode: true,
+        quick_rclone_path: quickRclonePath,
+        quick_rclone_create: quickRcloneCreate
       };
       if (normalizedChatRef && isNumeric(normalizedChatRef)) payload.save_source = saveNumericSource;
       if (overwriteStartId) payload.start_id = manualStartId;
@@ -432,7 +504,26 @@
 
 <section class="card mt-6 p-5 sm:p-6">
   <div class="flex flex-wrap items-center justify-between gap-3"><div class="flex items-center gap-3"><div class="grid size-10 place-items-center rounded-xl bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-200"><Plus size={20}/></div><div><h2 class="font-extrabold">Tambah Quick Mode</h2><p class="muted text-sm">Form ini selalu mengirim job dengan Quick Mode aktif.</p></div></div><span class="badge running">Quick Mode aktif</span></div>
-  <div class="mt-5"><TargetPicker purpose="export" quickMode={true} requiresVerification={false} readinessRuntime="quick_mode" bind:profile={targetProfile} bind:worker={targetWorker}/></div>
+  <div class="mt-5"><TargetPicker purpose="export" quickMode={true} requiresVerification={false} readinessRuntime="quick_mode" bind:profile={targetProfile} bind:worker={targetWorker} onWorkerChange={onQuickModeWorkerChange}/></div>
+  <section class="mt-4 rounded-2xl border border-[var(--line)] p-4" aria-label="Tujuan rclone Quick Mode">
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div><b class="text-sm">Folder tujuan rclone</b><p class="muted mt-1 text-xs">{quickRcloneCreate?'Subfolder baru: ':quickRclonePath?'Folder terpilih: ':'Root terkonfigurasi: '}{quickRclonePath||'root rclone_destination'}</p></div>
+      <button type="button" class="button secondary" onclick={toggleQuickRclonePicker} disabled={!targetWorker||!quickModeRcloneReady}><FolderOpen size={15}/>{quickRclonePickerOpen?'Tutup pemilih':'Pilih folder'}</button>
+    </div>
+    {#if !quickModeRcloneReady}<p class="muted mt-2 text-xs">{quickModeRcloneReadiness.reason_code||'Scan akses rclone pada worker ini belum siap.'}</p>{/if}
+    {#if quickRclonePickerOpen}
+      <div class="mt-4 rounded-xl border border-[var(--line)] p-3">
+        <div class="flex flex-wrap items-center gap-1 text-sm"><button type="button" class="button ghost" onclick={()=>loadQuickRcloneFolder('')}>Root</button>{#each quickRcloneBrowserPath.split('/').filter(Boolean) as crumb,index}<ChevronRight size={14}/><button type="button" class="rounded px-2 py-1 font-semibold hover:bg-[var(--brand-soft)]" onclick={()=>loadQuickRcloneFolder(quickRcloneBrowserPath.split('/').filter(Boolean).slice(0,index+1).join('/'))}>{crumb}</button>{/each}</div>
+        <div class="mt-3 flex flex-wrap gap-2"><button type="button" class="button" onclick={()=>chooseQuickRcloneFolder(quickRcloneBrowserPath)}>Gunakan folder ini</button><label class="flex min-w-[220px] flex-1 gap-2"><input class="field" bind:value={quickRcloneNewFolder} placeholder="Nama subfolder baru"/><button type="button" class="button secondary shrink-0" onclick={chooseQuickRcloneNewFolder}>Buat tujuan baru</button></label></div>
+        {#if quickRcloneError}<p class="mt-2 text-sm text-rose-700">{quickRcloneError}</p>{/if}
+        <div class="mt-3 divide-y divide-[var(--line)] rounded-lg border border-[var(--line)]">
+          {#each quickRcloneBrowser.items.filter((entry)=>entry.is_dir) as entry (entry.path)}<div class="flex items-center gap-2 p-2 text-sm"><Folder size={16} class="text-amber-500"/><button type="button" class="min-w-0 flex-1 truncate text-left font-semibold" onclick={()=>loadQuickRcloneFolder(entry.path)}>{entry.name}</button><button type="button" class="button secondary !py-1" onclick={()=>chooseQuickRcloneFolder(entry.path)}>Pilih</button></div>{/each}
+          {#if !quickRcloneBrowser.items.some((entry)=>entry.is_dir)}<p class="muted p-4 text-center text-sm">{quickRcloneLoading?'Memuat folder…':'Tidak ada subfolder di lokasi ini.'}</p>{/if}
+        </div>
+      </div>
+    {/if}
+    <p class="muted mt-2 text-xs">Subfolder baru dibuat saat job mulai. Jika nama tujuan sudah ada, job berhenti sebelum upload.</p>
+  </section>
   <div class="mt-5 grid gap-4 lg:grid-cols-2">
     <label class="block text-sm font-bold">Pilih source tersimpan<select class="field mt-2" value={selected} onchange={(event) => choose((event.currentTarget as HTMLSelectElement).value)} disabled={sourceLoading}><option value="">Source baru...</option>{#each sources as source}<option value={source.chat_ref}>{source.label ? `${source.label} — ` : ''}{source.chat_ref} (berikutnya: {Number(source.last_id) + 1})</option>{/each}</select></label>
     <label class="block text-sm font-bold">Referensi chat<input class="field mt-2" value={chatRef} oninput={(event) => updateChatRef((event.currentTarget as HTMLInputElement).value)} placeholder="@iyear · 123456789 · https://t.me/iyear · +1 123456789" /></label>

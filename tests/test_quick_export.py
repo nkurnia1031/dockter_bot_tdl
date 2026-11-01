@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from tme3bot.progress import DownloadProgressTracker
 from tme3bot.progress_reporter import ProgressReporter
+from tme3bot.rclone import RcloneRunner
 from tme3bot.service import ExportJobResult, DownloadedJsonResult
 from tme3bot.utility import UtilityResult
 from tme3bot.domain.models import DomainError
@@ -1234,6 +1235,7 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                         "compress_password": "snapshot-secret",
                         "rclone_destination": "googledrive:backup",
                     },
+                    "quick_rclone_destination": "googledrive:backup/reports/november",
                     "_quick_storage_tdl_access_target": "-100123",
                     "_quick_storage_sender_profiles": ["storage"],
                     "_quick_storage_sender_session_fingerprints": {
@@ -1285,6 +1287,20 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                     self.config_path = config_path
                     self.workspace_root = workspace_root
                     self.config_root = config_root
+                    transfer = getattr(self, "transfer_callback", None)
+                    if callable(transfer):
+                        for index, path in enumerate(self.files, start=1):
+                            size = path.stat().st_size
+                            transfer({
+                                "name": path.name,
+                                "bytes_current": size // 2,
+                                "bytes_total": size,
+                                "speed_bps": 256,
+                                "eta_seconds": 4,
+                                "percent": 50,
+                                "index": index,
+                                "total": len(self.files),
+                            })
                     return {
                         "destination": destination,
                         "total": len(self.files),
@@ -1314,7 +1330,10 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                 [path.name for path in FakeRcloneRunner.instances[0].files],
                 ["batch.7z.001"],
             )
-            self.assertEqual(FakeRcloneRunner.instances[0].destination, "googledrive:backup")
+            self.assertEqual(
+                FakeRcloneRunner.instances[0].destination,
+                "googledrive:backup/reports/november",
+            )
             self.assertEqual(len(upload_client.calls), 2)
             self.assertEqual(storage_runtime.export_tdl_client.calls, [])
             self.assertEqual(
@@ -1334,3 +1353,95 @@ class QuickPipelineTests(WorkerExecutorTestCase):
             self.assertTrue(result["thumbnail_uploaded_as_photo"])
             self.assertTrue(result["staging_cleaned"])
             self.assertFalse((workspace / ".tme3bot-quick" / "quick-job").exists())
+            transfer_progress = [
+                values["progress"] for _args, values in publisher.events
+                if values.get("progress", {}).get("message", "").startswith("Mengupload ")
+                and values.get("progress", {}).get("transfer", {}).get("speed_bps")
+            ]
+            self.assertTrue(transfer_progress)
+            self.assertEqual(transfer_progress[0]["transfer"]["speed_bps"], 256)
+            self.assertEqual(transfer_progress[0]["transfer"]["eta_seconds"], 4)
+            self.assertEqual(transfer_progress[0]["overall"]["files_total"], 1)
+
+    def test_quickmode_rclone_target_is_persisted_and_reused_after_retry(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            config_path = root / "rclone.conf"
+            config_path.write_text("[drive]\n", encoding="utf-8")
+
+            class Publisher:
+                def emit(self, *args, **kwargs):
+                    del args, kwargs
+
+            class RecordingRcloneRunner(RcloneRunner):
+                ensure_calls = []
+
+                def ensure_directory(
+                    self, destination, relative_path, config_path, *, config_root,
+                    create_new, created_by_job=False,
+                ):
+                    self.__class__.ensure_calls.append((
+                        destination, relative_path, create_new, created_by_job,
+                    ))
+                    return RcloneRunner._remote_path(destination, relative_path)[0]
+
+            RecordingRcloneRunner.ensure_calls = []
+            executor = self.make_executor(
+                SimpleNamespace(
+                    utility_workspace_root=workspace,
+                    profile_root=root,
+                    rclone_config_path=config_path,
+                    backup_node_name="local",
+                ),
+                SimpleNamespace(runtime=lambda _profile: SimpleNamespace()),
+                Publisher(),
+            )
+            stage = workspace / "quickmode" / "stage-destination"
+            stage.mkdir(parents=True)
+            command = {
+                "job_id": "quick-destination-job",
+                "profile": "default",
+                "worker": "local",
+                "payload": {
+                    "quick_settings": {"rclone_destination": "drive:configured"},
+                    "quick_rclone_path": "reports/november",
+                    "quick_rclone_create": True,
+                },
+            }
+            manifest = {}
+            with patch("tme3bot.worker.executor_quickmode.RcloneRunner", RecordingRcloneRunner):
+                first_target = executor._prepare_quick_rclone_destination(command, stage, manifest)
+                command["payload"]["quick_settings"]["rclone_destination"] = "drive:changed"
+                retry_target = executor._prepare_quick_rclone_destination(command, stage, manifest)
+
+            self.assertEqual(first_target, "drive:configured/reports/november")
+            self.assertEqual(retry_target, first_target)
+            self.assertEqual(manifest["rclone_destination_root"], "drive:configured")
+            self.assertTrue(manifest["quick_rclone_destination_created"])
+            self.assertEqual(RecordingRcloneRunner.ensure_calls, [
+                ("drive:configured", "reports/november", True, False),
+                ("drive:configured", "reports/november", True, True),
+            ])
+
+            retry_command = {
+                "job_id": "quick-destination-retry",
+                "profile": "default",
+                "worker": "local",
+                "payload": {
+                    "quick_mode": True,
+                    "quick_retry": {
+                        "stage_job_id": "stage-destination",
+                        "resume_phase": "exporting",
+                        "quick_operation_id": "quick-destination-operation",
+                    },
+                },
+            }
+            stage_root, retry_manifest, _phase, _stage_id = executor._prepare_quick_stage(
+                retry_command, SimpleNamespace()
+            )
+            self.assertEqual(stage_root, stage)
+            self.assertEqual(retry_manifest["rclone_destination"], first_target)
+            self.assertEqual(retry_manifest["quick_rclone_path"], "reports/november")
+            self.assertTrue(retry_manifest["quick_rclone_destination_created"])

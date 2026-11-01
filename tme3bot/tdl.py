@@ -183,6 +183,7 @@ class UploadResult:
 
 ProgressCallback = Callable[[CommandProgress], None]
 OutputCallback = Callable[[str], None]
+OutputFilter = Callable[[str], bool]
 CommandCallback = Callable[[list[str], int, str, float, str], None]
 
 
@@ -263,6 +264,7 @@ class SubprocessRunner:
         output_callback: OutputCallback | None = None,
         command_callback: CommandCallback | None = None,
         quiet_output: bool = False,
+        output_filter: OutputFilter | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command_owner = str(getattr(command_callback, "job_id", "") or "") or None
         with self._pause_condition:
@@ -336,6 +338,7 @@ class SubprocessRunner:
                     log_prefix,
                     progress_callback,
                     output_callback,
+                    output_filter,
                     quiet_output=quiet_output,
                 )
                 if stall_timeout_seconds > 0 and self._is_stalled(
@@ -354,8 +357,14 @@ class SubprocessRunner:
             stdout_thread.join(timeout=2)
             stderr_thread.join(timeout=2)
             self._drain_output(
-                output_queue, stdout_lines, stderr_lines, log_prefix,
-                progress_callback, output_callback, quiet_output=quiet_output
+                output_queue,
+                stdout_lines,
+                stderr_lines,
+                log_prefix,
+                progress_callback,
+                output_callback,
+                output_filter,
+                quiet_output=quiet_output,
             )
             returncode = process.poll()
             if returncode is None:
@@ -508,6 +517,7 @@ class SubprocessRunner:
         log_prefix: str,
         progress_callback: ProgressCallback | None,
         output_callback: OutputCallback | None,
+        output_filter: OutputFilter | None,
         *,
         quiet_output: bool = False,
     ) -> None:
@@ -523,6 +533,13 @@ class SubprocessRunner:
 
             if output_callback is not None and not quiet_output:
                 output_callback(clean_line)
+
+            if output_filter is not None:
+                try:
+                    if not output_filter(clean_line):
+                        continue
+                except Exception:
+                    LOGGER.exception("Output filter failed; retaining subprocess line")
 
             target_lines = stderr_lines if stream_name == "stderr" else stdout_lines
             target_lines.append(clean_line + "\n")

@@ -1117,6 +1117,53 @@ class StorageCatalog:
                 restored.append(self._folder(db.execute("SELECT * FROM storage_folders WHERE id=?", (folder_id,)).fetchone()))
             return restored  # type: ignore[return-value]
 
+    @staticmethod
+    def _folder_summaries_locked(
+        db: sqlite3.Connection, folder_ids: list[int], *, status: str
+    ) -> dict[int, dict[str, int | bool]]:
+        if not folder_ids:
+            return {}
+        placeholders = ",".join("?" for _ in folder_ids)
+        rows = db.execute(
+            f"""WITH RECURSIVE subtree(root_id,folder_id,depth) AS (
+                   SELECT id,id,0 FROM storage_folders
+                   WHERE id IN ({placeholders}) AND status=?
+                   UNION ALL
+                   SELECT subtree.root_id,child.id,subtree.depth+1
+                   FROM subtree
+                   JOIN storage_folders child
+                     ON child.parent_id=subtree.folder_id AND child.status=?
+               ),
+               folder_totals AS (
+                   SELECT root_id,SUM(CASE WHEN depth>0 THEN 1 ELSE 0 END) AS folder_count
+                   FROM subtree GROUP BY root_id
+               ),
+               file_totals AS (
+                   SELECT subtree.root_id,COUNT(item.id) AS file_count,
+                          SUM(COALESCE(item.file_size,0)) AS size_bytes,
+                          SUM(CASE WHEN item.id IS NOT NULL AND item.file_size IS NULL THEN 1 ELSE 0 END)
+                              AS unknown_size_count
+                   FROM subtree
+                   LEFT JOIN storage_items item
+                     ON item.folder_id=subtree.folder_id AND item.status=?
+                   GROUP BY subtree.root_id
+               )
+               SELECT folder_totals.root_id,folder_totals.folder_count,
+                      file_totals.file_count,file_totals.size_bytes,
+                      file_totals.unknown_size_count
+               FROM folder_totals JOIN file_totals USING(root_id)""",
+            [*folder_ids, status, status, status],
+        ).fetchall()
+        return {
+            int(row["root_id"]): {
+                "file_count": int(row["file_count"] or 0),
+                "folder_count": int(row["folder_count"] or 0),
+                "size_bytes": int(row["size_bytes"] or 0),
+                "size_complete": int(row["unknown_size_count"] or 0) == 0,
+            }
+            for row in rows
+        }
+
     def browser(
         self, folder_id: int | None, *, scope: str = "current", query: str = "",
         sort: str = "name", order: str = "asc", limit: int = 50, offset: int = 0,
@@ -1166,11 +1213,29 @@ class StorageCatalog:
                 f"SELECT * FROM storage_folders WHERE {folder_where} ORDER BY name_key LIMIT ? OFFSET ?",
                 [*folder_params, limit, offset],
             ).fetchall()
+            folder_summaries = self._folder_summaries_locked(
+                db, [int(row["id"]) for row in folders], status=status
+            )
             current = None if folder_id is None else db.execute("SELECT * FROM storage_folders WHERE id=?", (folder_id,)).fetchone()
             return {
                 "current_folder": dict(current) if current else None,
                 "breadcrumbs": self.breadcrumbs(folder_id),
-                "folders": [{**dict(row), "path": self._folder_path_locked(db, int(row["id"]))} for row in folders],
+                "folders": [
+                    {
+                        **dict(row),
+                        "path": self._folder_path_locked(db, int(row["id"])),
+                        **folder_summaries.get(
+                            int(row["id"]),
+                            {
+                                "file_count": 0,
+                                "folder_count": 0,
+                                "size_bytes": 0,
+                                "size_complete": True,
+                            },
+                        ),
+                    }
+                    for row in folders
+                ],
                 "items": [storage_item_dict(self._item(row), retention_days) for row in rows],
                 "total_folders": total_folders,
                 "total_items": total_items,

@@ -230,6 +230,34 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             code = "RCLONE_BROWSER_PATH_INVALID" if status == 422 else (exc.code or "RCLONE_BROWSER_FAILED")
             raise DomainError(code, "Path rclone tidak valid." if status == 422 else "Worker tidak dapat membaca folder rclone.", status_code=status) from exc
 
+    @app.post("/internal/v1/storage/rclone-folder-summaries", dependencies=[Depends(authorize)])
+    def rclone_storage_folder_summaries(body: dict[str, Any]):
+        if set(body) - {"rclone_destination", "path"} or not isinstance(
+            body.get("rclone_destination"), str
+        ) or not isinstance(body.get("path", ""), str):
+            raise DomainError(
+                "RCLONE_BROWSER_REQUEST_INVALID",
+                "Permintaan ringkasan folder rclone tidak valid.",
+                status_code=422,
+            )
+        summarize = getattr(context.executor, "rclone_storage_folder_summaries", None)
+        if not callable(summarize):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung ringkasan folder rclone.",
+                status_code=404,
+            )
+        try:
+            return summarize(body["rclone_destination"], body.get("path", ""))
+        except RcloneError as exc:
+            status = 422 if "PATH" in exc.code or "path" in str(exc).casefold() else 503
+            code = "RCLONE_BROWSER_PATH_INVALID" if status == 422 else (exc.code or "RCLONE_BROWSER_FAILED")
+            raise DomainError(
+                code,
+                "Path rclone tidak valid." if status == 422 else "Worker tidak dapat menghitung isi folder rclone.",
+                status_code=status,
+            ) from exc
+
     @app.post("/internal/v1/storage/download-links", dependencies=[Depends(authorize)])
     def create_storage_download_link(body: dict[str, Any]):
         allowed = {"file_path", "public_base_url", "job_id", "provider"}
