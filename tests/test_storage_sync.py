@@ -28,18 +28,11 @@ def storage_message(message_id, *, folder="", name="report.pdf", keywords=""):
 
 
 def complete_coverage(latest_message_id):
-    windows = [
-        {"start_id": start, "end_id": min(start + 89, latest_message_id)}
-        for start in range(1, latest_message_id + 1, 90)
-    ]
     return {
-        "strategy": "tdl_bounded_id_windows_v1", "range_start_id": 1,
-        "range_end_id": latest_message_id, "range_max_id": latest_message_id,
+        "strategy": "tdl_unbounded_export_v1", "export_mode": "all_messages",
+        "range_max_id": latest_message_id,
         "latest_before_id": latest_message_id, "latest_after_id": latest_message_id,
-        "tdl_page_limit": 100, "window_size": 90,
-        "expected_window_count": len(windows),
-        "completed_windows": windows, "failed_windows": [],
-        "export_succeeded": True, "all_windows_complete": True, "complete": True,
+        "export_succeeded": True, "iterator_completed": True, "complete": True,
     }
 
 
@@ -65,14 +58,11 @@ class StorageExportParsingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_storage_export(messages)
 
-    def test_complete_history_requires_stable_explicit_bounded_window_proof(self):
+    def test_complete_history_requires_stable_unbounded_export_proof(self):
         coverage = {
-            "strategy": "tdl_bounded_id_windows_v1", "range_start_id": 1, "range_end_id": 8,
+            "strategy": "tdl_unbounded_export_v1", "export_mode": "all_messages",
             "range_max_id": 8, "latest_before_id": 8, "latest_after_id": 8,
-            "tdl_page_limit": 100, "window_size": 90, "expected_window_count": 1,
-            "completed_windows": [{"start_id": 1, "end_id": 8}],
-            "failed_windows": [], "export_succeeded": True,
-            "all_windows_complete": True, "complete": True,
+            "export_succeeded": True, "iterator_completed": True, "complete": True,
         }
         self.assertTrue(full_history_proven(
             coverage, message_ids=[3, 8], batch_count=1,
@@ -88,22 +78,12 @@ class StorageExportParsingTests(unittest.TestCase):
             reported_message_count=2, reported_batch_count=1,
         ))
         self.assertFalse(full_history_proven(
-            {
-                **coverage,
-                "strategy": "tdl_id_range",
-                "completed_windows": [],
-                "all_windows_complete": False,
-            },
+            {**coverage, "strategy": "tdl_id_range"},
             message_ids=[3, 8], batch_count=1,
             reported_message_count=2, reported_batch_count=1,
         ))
         self.assertFalse(full_history_proven(
-            {**coverage, "completed_windows": []},
-            message_ids=[3, 8], batch_count=1,
-            reported_message_count=2, reported_batch_count=1,
-        ))
-        self.assertFalse(full_history_proven(
-            {**coverage, "tdl_page_limit": 90},
+            {**coverage, "iterator_completed": False},
             message_ids=[3, 8], batch_count=1,
             reported_message_count=2, reported_batch_count=1,
         ))
@@ -119,13 +99,10 @@ class StorageSyncWorkerTests(unittest.TestCase):
         class FakeTdlClient:
             command_callback = object()
 
-            def export_storage_history(self, target, path, *, expected_channel_id, progress_callback=None):
+            def export_storage_history(self, target, path, *, expected_channel_id):
                 self.target = target
                 self.expected_channel_id = expected_channel_id
                 self.export_path = path
-                if progress_callback is not None:
-                    progress_callback(0, 1, 0, 0)
-                    progress_callback(1, 1, 1, 90)
                 return StorageHistoryExport(
                     channel_id=123, peer_id=123, messages=messages,
                     latest_message_id=21, history_complete=False,
@@ -181,17 +158,6 @@ class StorageSyncWorkerTests(unittest.TestCase):
             if isinstance(kwargs.get("progress"), dict)
         ]
         self.assertTrue(all(counters.get("skipped", 0) == 0 for counters in progress_counters))
-        window_progress = [
-            kwargs["progress"]
-            for _args, kwargs in executor.publisher.events
-            if isinstance(kwargs.get("progress"), dict)
-            and kwargs["progress"].get("overall", {}).get("unit") == "ID windows"
-        ]
-        self.assertTrue(any(
-            progress["overall"].get("current") == 1
-            and progress["overall"].get("total") == 1
-            for progress in window_progress
-        ))
         self.assertTrue(any(
             kwargs["progress"].get("phase") == "completed"
             and "kelengkapan belum terbukti" in kwargs["progress"].get("message", "")

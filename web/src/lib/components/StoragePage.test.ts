@@ -153,7 +153,7 @@ describe('Storage file manager', () => {
     const syncJob = {
       id:'sync-job-1', kind:'storage_sync', profile:'default', worker:'local',
       actor_user_id:1, status:'running', created_at:'2026-11-01T00:00:00Z',
-      payload:{channel_id:123}, progress:{phase:'exporting',message:'Mengekspor riwayat channel Storage',indeterminate:true},
+      payload:{channel_id:123}, progress:{phase:'exporting',message:'Mengekspor seluruh riwayat channel Storage',indeterminate:true},
     };
     vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
       const url = new URL(String(input), 'https://ui.test');
@@ -196,7 +196,7 @@ describe('Storage file manager', () => {
     const profileSelect = await screen.findByLabelText('Profil sumber') as HTMLSelectElement;
     expect([...profileSelect.options].map((option)=>option.value)).toEqual(['default']);
     await fireEvent.click(screen.getByRole('button',{name:'Sinkronkan sekarang'}));
-    expect(await screen.findByText('Mengekspor riwayat channel Storage')).toBeTruthy();
+    expect(await screen.findByText('Mengekspor seluruh riwayat channel Storage')).toBeTruthy();
 
     const syncRequest = requests.find((request)=>request.url.endsWith('/storage/sync')&&request.method==='POST');
     expect(JSON.parse(syncRequest?.body||'{}')).toEqual({worker:'local',profile:'default'});

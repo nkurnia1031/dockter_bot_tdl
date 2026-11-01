@@ -16,10 +16,6 @@ from typing import Any, Callable
 
 from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.media import has_downloadable_media
-from tme3bot.storage_sync import (
-    STORAGE_SYNC_TDL_PAGE_LIMIT,
-    STORAGE_SYNC_WINDOW_SIZE,
-)
 from tme3bot.tdl_output import (
     CommandProgress,
     clean_tdl_output_line,
@@ -760,6 +756,32 @@ class TDLClient:
             export_path, export_args, require_content=with_content, require_peer_id=raw
         )
 
+    def export_all_messages(
+        self,
+        chat_ref: str,
+        export_path: Path,
+        *,
+        with_content: bool = False,
+        raw: bool = False,
+        all_messages: bool = False,
+    ) -> ExportResult:
+        """Export every message without applying a time, ID, or count bound."""
+        export_path = Path(export_path)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        export_args = ["chat", "export", "-c", chat_ref, "-o", str(export_path)]
+        if with_content:
+            export_args.append("--with-content")
+        if raw:
+            export_args.append("--raw")
+        if all_messages:
+            export_args.append("--all")
+        return self._export_messages(
+            export_path,
+            export_args,
+            require_content=with_content,
+            require_peer_id=raw,
+        )
+
     @staticmethod
     def _expected_channel_peer_id(channel_id: int) -> int:
         value = str(int(channel_id))
@@ -782,21 +804,15 @@ class TDLClient:
         return ids
 
     def export_storage_history(
-        self,
-        chat_ref: str,
-        export_path: Path,
-        *,
-        expected_channel_id: int,
-        progress_callback: Callable[[int, int, int, int], None] | None = None,
+        self, chat_ref: str, export_path: Path, *, expected_channel_id: int
     ) -> StorageHistoryExport:
-        """Export history in bounded ID windows with explicit coverage proof.
+        """Export the entire channel in one unbounded TDL command.
 
-        TDL returns no page cursor/count in its JSON export. Each ID window is
-        therefore smaller than one TDL API page, so one successful command
-        proves coverage for that bounded interval. Stable latest-message markers
-        bracket the window scan. A later command failure returns completed
-        windows as partial findings; malformed output still raises and cannot
-        be applied. No media bytes are downloaded.
+        Stable last-message reads bracket the unbounded export. TDL's export
+        iterator fetches subsequent API pages itself and checks its terminal
+        iterator error before returning success. If the exported high-water ID
+        does not match the stable marker, findings remain useful but cannot
+        authorize deletion. No media bytes are downloaded.
         """
         expected_peer_id = self._expected_channel_peer_id(expected_channel_id)
         export_path = Path(export_path)
@@ -813,52 +829,19 @@ class TDLClient:
             raise TDLDataError("TDL latest-message export returned an invalid message count.")
         latest_before = max(before_ids, default=0)
 
-        ranges = [
-            (start_id, min(start_id + STORAGE_SYNC_WINDOW_SIZE - 1, latest_before))
-            for start_id in range(1, latest_before + 1, STORAGE_SYNC_WINDOW_SIZE)
-        ]
-        messages: list[dict[str, Any]] = []
-        message_ids_seen: set[int] = set()
-        completed_windows: list[dict[str, int]] = []
-        failed_windows: list[dict[str, Any]] = []
-        if progress_callback is not None:
-            progress_callback(0, len(ranges), 0, 0)
-        for start_id, end_id in ranges:
-            window_path = export_path.with_name(
-                f"{export_path.stem}-{start_id}-{end_id}.json"
-            )
-            try:
-                window = self.export_messages(
-                    chat_ref, start_id, window_path, with_content=True,
-                    end_id=end_id, raw=True, all_messages=True,
-                )
-            except (TDLCommandError, OSError):
-                failed_windows.append({
-                    "start_id": start_id,
-                    "end_id": end_id,
-                    "reason_code": "TDL_EXPORT_FAILED",
-                })
-                break
-            if window.peer_id != expected_peer_id:
-                raise TDLDataError("TDL export peer does not match configured Storage channel.")
-            window_ids = self._strict_export_message_ids(window.messages)
-            if any(message_id < start_id or message_id > end_id for message_id in window_ids):
-                raise TDLDataError("TDL ID-window export exceeded its requested bounds.")
-            if any(message_id in message_ids_seen for message_id in window_ids):
-                raise TDLDataError("TDL ID-window export returned duplicate message IDs.")
-            if len(window_ids) >= STORAGE_SYNC_TDL_PAGE_LIMIT:
-                raise TDLDataError("TDL ID-window export exceeded one API page.")
-            message_ids_seen.update(window_ids)
-            messages.extend(window.messages)
-            completed_windows.append({"start_id": start_id, "end_id": end_id})
-            if progress_callback is not None:
-                progress_callback(len(completed_windows), len(ranges), start_id, end_id)
-
-        if failed_windows and not completed_windows:
-            raise TDLCommandError(
-                ["tdl", "chat", "export"], 1, "", "Storage history window export failed"
-            )
-        range_max = max(message_ids_seen, default=0)
+        history = self.export_all_messages(
+            chat_ref,
+            export_path,
+            with_content=True,
+            raw=True,
+            all_messages=True,
+        )
+        if history.peer_id != expected_peer_id:
+            raise TDLDataError("TDL export peer does not match configured Storage channel.")
+        message_ids = self._strict_export_message_ids(history.messages)
+        if any(message_id > latest_before for message_id in message_ids):
+            raise TDLDataError("TDL all-message export exceeded its observed high-water mark.")
+        range_max = max(message_ids, default=0)
 
         latest_after = -1
         try:
@@ -877,32 +860,24 @@ class TDLClient:
             # cannot authorize permanent deletion of missing catalog rows.
             latest_after = -1
 
-        all_windows_complete = len(completed_windows) == len(ranges) and not failed_windows
         history_complete = bool(
-            all_windows_complete
-            and latest_before == latest_after == range_max
+            latest_before == latest_after == range_max
             and (latest_before == 0 or range_max == latest_before)
         )
         return StorageHistoryExport(
             channel_id=int(expected_channel_id),
             peer_id=expected_peer_id,
-            messages=messages,
+            messages=history.messages,
             latest_message_id=latest_before,
             history_complete=history_complete,
             coverage={
-                "strategy": "tdl_bounded_id_windows_v1",
-                "range_start_id": 1,
-                "range_end_id": latest_before,
+                "strategy": "tdl_unbounded_export_v1",
+                "export_mode": "all_messages",
                 "range_max_id": range_max,
                 "latest_before_id": latest_before,
                 "latest_after_id": latest_after,
-                "tdl_page_limit": STORAGE_SYNC_TDL_PAGE_LIMIT,
-                "window_size": STORAGE_SYNC_WINDOW_SIZE,
-                "expected_window_count": len(ranges),
-                "completed_windows": completed_windows,
-                "failed_windows": failed_windows,
-                "export_succeeded": not failed_windows,
-                "all_windows_complete": all_windows_complete,
+                "export_succeeded": True,
+                "iterator_completed": True,
                 "complete": history_complete,
             },
         )
