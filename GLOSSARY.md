@@ -16,6 +16,10 @@ _Avoid_: monitor global job.
 Tampilan global job yang terus memperbarui status saat halaman terlihat, dengan pembaruan lebih sering ketika ada job aktif dan lebih jarang ketika idle.
 _Avoid_: riwayat pasif.
 
+**Progres transfer rclone**:
+Kemajuan file yang sedang ditransfer, termasuk jumlah byte, kecepatan, dan estimasi waktu, bersama hitungan file selesai dari seluruh batch. Progres byte batch ditampilkan bila ukuran semua file diketahui.
+_Avoid_: hanya status selesai per file, output mentah rclone.
+
 ## Profil
 
 **Profil lokal**:
@@ -57,6 +61,10 @@ _Avoid_: sesi Storage bersama, storage Export.
 **Tujuan Storage**:
 Penyimpanan yang dipilih untuk melihat atau mengunggah file, berupa katalog channel Telegram atau lokasi di remote rclone yang dikonfigurasi.
 _Avoid_: worker sebagai tujuan.
+
+**Folder tujuan Quick Mode**:
+Folder remote rclone tempat arsip hasil satu job Quick Mode disimpan, dipilih atau dibuat untuk job tersebut di bawah tujuan rclone terkonfigurasi.
+_Avoid_: tujuan global Quick Mode, tujuan Storage.
 
 **Sinkronisasi katalog Storage Telegram**:
 Membandingkan file dan metadata pada channel Telegram Storage dengan katalog aplikasi agar daftar file dan lokasi folder katalog mengikuti isi channel. Operasi ini memperbarui katalog aplikasi dan tidak mengubah pesan atau media Telegram.
