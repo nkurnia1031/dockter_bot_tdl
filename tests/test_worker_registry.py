@@ -53,6 +53,32 @@ class WorkerRegistryTests(unittest.TestCase):
             self.assertTrue(restored.set_enabled("remote-1", True))
             self.assertEqual(restored.enabled_names(), ["remote-1"])
 
+    def test_worker_public_download_origin_is_https_and_persists_separately_from_api_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "workers.json"
+            registry = WorkerRegistry(path)
+            registry.upsert(
+                "remote-1", "http://worker-api:8080", "token-1",
+                public_url="https://files.worker.example/",
+            )
+
+            restored = WorkerRegistry(path)
+            self.assertEqual(restored.get("remote-1")["url"], "http://worker-api:8080")
+            self.assertEqual(
+                restored.get("remote-1")["public_url"],
+                "https://files.worker.example",
+            )
+            with self.assertRaises(ValueError):
+                restored.upsert(
+                    "remote-1", "http://worker-api:8080", "token-1",
+                    public_url="http://files.worker.example",
+                )
+            with self.assertRaises(ValueError):
+                restored.upsert(
+                    "remote-1", "http://worker-api:8080", "token-1",
+                    public_url="https://files.worker.example:70000",
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

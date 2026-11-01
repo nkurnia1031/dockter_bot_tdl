@@ -118,6 +118,25 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             "profile_sync_status": status,
         }
 
+    @app.get("/public/download/{token}", include_in_schema=False)
+    def public_storage_download(token: str = ApiPath(..., min_length=40, max_length=80)):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{40,80}", token):
+            raise DomainError("PUBLIC_DOWNLOAD_NOT_FOUND", "Link unduhan tidak ditemukan.", status_code=404)
+        lookup = getattr(context.executor, "storage_download_public_file", None)
+        item = lookup(token) if callable(lookup) else None
+        if not isinstance(item, dict) or not item.get("path") or not item.get("file_name"):
+            raise DomainError("PUBLIC_DOWNLOAD_NOT_FOUND", "Link unduhan tidak ditemukan.", status_code=404)
+        return FileResponse(
+            str(item["path"]),
+            media_type="application/octet-stream",
+            filename=str(item["file_name"]),
+            headers={
+                "Cache-Control": "no-store",
+                "Referrer-Policy": "no-referrer",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
     @app.get("/internal/v1/capabilities", dependencies=[Depends(authorize)])
     def capabilities():
         details = context.executor.capabilities()
@@ -210,6 +229,43 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             status = 422 if "PATH" in exc.code or "path" in str(exc).casefold() else 503
             code = "RCLONE_BROWSER_PATH_INVALID" if status == 422 else (exc.code or "RCLONE_BROWSER_FAILED")
             raise DomainError(code, "Path rclone tidak valid." if status == 422 else "Worker tidak dapat membaca folder rclone.", status_code=status) from exc
+
+    @app.post("/internal/v1/storage/download-links", dependencies=[Depends(authorize)])
+    def create_storage_download_link(body: dict[str, Any]):
+        allowed = {"file_path", "public_base_url", "job_id", "provider"}
+        if set(body) != allowed or any(not isinstance(body.get(key), str) for key in allowed):
+            raise DomainError("PUBLIC_DOWNLOAD_REQUEST_INVALID", "Permintaan link publik tidak valid.", status_code=422)
+        create = getattr(context.executor, "create_storage_download_link", None)
+        if not callable(create):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung link publik Storage.", status_code=409)
+        try:
+            return create(
+                body["file_path"],
+                public_base_url=body["public_base_url"],
+                job_id=body["job_id"],
+                provider=body["provider"],
+            )
+        except ValueError as exc:
+            raise DomainError("PUBLIC_DOWNLOAD_CREATE_FAILED", "Link publik untuk file ini tidak dapat dibuat.", status_code=422) from exc
+
+    @app.get("/internal/v1/storage/download-links", dependencies=[Depends(authorize)])
+    def list_storage_download_links():
+        listing = getattr(context.executor, "storage_download_links", None)
+        if not callable(listing):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung link publik Storage.", status_code=409)
+        return {"items": listing()}
+
+    @app.delete("/internal/v1/storage/download-links/{link_id}", dependencies=[Depends(authorize)])
+    def revoke_storage_download_link(link_id: str):
+        if not re.fullmatch(r"[0-9a-f-]{36}", link_id):
+            raise DomainError("PUBLIC_DOWNLOAD_NOT_FOUND", "Link unduhan tidak ditemukan.", status_code=404)
+        revoke = getattr(context.executor, "revoke_storage_download_link", None)
+        if not callable(revoke):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung pencabutan link Storage.", status_code=409)
+        result = revoke(link_id)
+        if result.get("cleanup_status") == "not_found":
+            raise DomainError("PUBLIC_DOWNLOAD_NOT_FOUND", "Link unduhan tidak ditemukan.", status_code=404)
+        return result
 
     @app.post("/internal/v1/storage/move-cleanup", dependencies=[Depends(authorize)])
     def storage_move_cleanup(body: dict[str, Any]):

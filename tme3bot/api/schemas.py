@@ -166,6 +166,7 @@ class SourceListResponse(ApiResponse):
 class WorkerResponse(ApiResponse):
     name: str
     url: str
+    public_url: str = ""
     selected: bool = False
     enabled: bool = True
 
@@ -410,12 +411,14 @@ class WorkerRequest(BaseModel):
     name: str
     url: str
     token: str
+    public_url: str = ""
     enabled: bool = True
 
 
 class WorkerUpdateRequest(BaseModel):
     url: str
     token: str | None = None
+    public_url: str | None = None
     enabled: bool | None = None
 
 
@@ -463,6 +466,26 @@ class StorageUploadRequest(BaseModel):
     worker: str | None = None
     transfer_mode: Literal["copy", "move"] = "copy"
     move_confirmed: bool = False
+
+
+class StorageRcloneDownloadSource(BaseModel):
+    path: str = Field(min_length=1, max_length=2048)
+    is_dir: bool = False
+
+
+class StorageDownloadRequest(BaseModel):
+    provider: Literal["telegram", "rclone"]
+    worker: str = Field(min_length=1, max_length=48)
+    profile: str | None = Field(default=None, min_length=1, max_length=48)
+    item_ids: list[int] = Field(default_factory=list, max_length=500)
+    folder_ids: list[int] = Field(default_factory=list, max_length=100)
+    rclone_sources: list[StorageRcloneDownloadSource] = Field(default_factory=list, max_length=500)
+    destination_path: str = Field(min_length=9, max_length=4096)
+    publish_public_links: bool = False
+
+
+class StoragePublicLinkRevokeRequest(BaseModel):
+    confirmed: bool
 
 
 class StorageSyncRequest(BaseModel):

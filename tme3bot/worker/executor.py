@@ -75,6 +75,7 @@ from tme3bot.worker.profile_sync import ProfileSyncClient, ProfileSyncError
 from tme3bot.worker.upload_lane import UploadLanePreparer
 from tme3bot.worker.command_runner import WorkerCommandRunner
 from tme3bot.worker.command_store import WorkerCommandStore
+from tme3bot.worker.public_download_links import PublicDownloadLinks
 
 LOGGER = logging.getLogger(__name__)
 from .executor_support import (
@@ -213,6 +214,11 @@ class WorkerJobExecutor(
         self.command_store = WorkerCommandStore(
             config.state_file.parent / "worker-command-journal.sqlite3"
         )
+        self.public_download_links = PublicDownloadLinks(
+            config.state_file.parent / "public-download-links.sqlite3",
+            Path(getattr(config, "utility_workspace_root", "/workspace")),
+        )
+
         self.command_runner = WorkerCommandRunner(self.command_store, self)
         self.profile_sync = ProfileSyncClient(
             config,
@@ -240,6 +246,25 @@ class WorkerJobExecutor(
             error_handler=self._unhandled_resource,
             thread_name_prefix="tme3-domain-worker",
         )
+
+    def create_storage_download_link(
+        self, file_path: str, *, public_base_url: str, job_id: str, provider: str
+    ) -> dict[str, str]:
+        return self.public_download_links.create(
+            file_path,
+            public_base_url=public_base_url,
+            job_id=job_id,
+            provider=provider,
+        )
+
+    def storage_download_links(self) -> list[dict[str, str]]:
+        return self.public_download_links.active_links()
+
+    def storage_download_public_file(self, token: str) -> dict[str, str] | None:
+        return self.public_download_links.public_file(token)
+
+    def revoke_storage_download_link(self, link_id: str) -> dict[str, str | bool]:
+        return self.public_download_links.revoke(link_id)
 
     def start(self) -> None:
         # Vault bundles are distributed only by an explicit operator action.
@@ -1148,6 +1173,7 @@ class WorkerJobExecutor(
             return False
         with self._lock:
             active = self._active.get(job_id)
+            active_command = self._active_commands.get(job_id, {})
             utility_runner = self._utility_runners.get(job_id)
             rclone_runner = self._rclone_runners.get(job_id)
             quick_export_client = self._quick_export_clients.get(job_id)
@@ -1208,6 +1234,16 @@ class WorkerJobExecutor(
                 "download",
                 getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
             )
+        elif kind == "storage_download":
+            active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
+            if isinstance(active_payload, dict) and active_payload.get("provider") == "rclone":
+                if rclone_runner is not None:
+                    interrupt("Storage rclone download", rclone_runner.cancel_current)
+            else:
+                interrupt(
+                    "Storage Telegram download",
+                    getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
+                )
         elif kind in {"export", "backup_node", "backup_verify"}:
             interrupt(
                 "export",
@@ -1754,6 +1790,21 @@ class WorkerJobExecutor(
                 ack={"error_code": "WORKER_JOB_FAILED"},
             )
 
+    @staticmethod
+    def _workspace_resource_keys(worker: str, raw_paths: list[object]) -> set[str]:
+        keys: set[str] = set()
+        for raw_path in raw_paths:
+            normalized = str(raw_path or "").replace("\\", "/").rstrip("/")
+            parts = [part for part in normalized.split("/") if part]
+            start = 2 if parts and parts[0].casefold() == "workspace" else 1
+            if len(parts) < start:
+                parts = ["workspace"]
+                start = 1
+            for index in range(start, len(parts) + 1):
+                ancestor = "/" + "/".join(parts[:index])
+                keys.add(f"worker:{worker}:workspace:{ancestor}")
+        return keys
+
     def _resource_keys_for_command(self, command: dict[str, Any]) -> set[str]:
         profile = str(command.get("profile") or "default")
         kind = str(command.get("kind") or "unknown")
@@ -1781,6 +1832,9 @@ class WorkerJobExecutor(
         elif kind in {"storage_upload", "storage_reconcile", "storage_sync"}:
             keys = {f"worker:{worker}:kind:storage_upload"}
             payload = command.get("payload") or {}
+            workspace_path = payload.get("folder_path") or payload.get("folder")
+            if workspace_path and kind in {"storage_upload", "storage_reconcile"}:
+                keys.update(self._workspace_resource_keys(worker, [workspace_path]))
             if kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone":
                 keys.add(f"worker:{worker}:rclone:storage")
             else:
@@ -1808,6 +1862,16 @@ class WorkerJobExecutor(
             }
         elif kind == "safelink_resolve":
             keys = {f"worker:{worker}:kind:safelink_resolve"}
+        elif kind == "storage_download":
+            payload = command.get("payload") or {}
+            keys = {f"worker:{worker}:kind:storage_download"}
+            keys.update(
+                self._workspace_resource_keys(worker, [payload.get("destination_path")])
+            )
+            if str(payload.get("provider") or "") == "rclone":
+                keys.add(f"worker:{worker}:rclone:storage")
+            else:
+                keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         elif kind in {"download", "download_clear_failed"}:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         elif kind == "backup_node":
@@ -1876,6 +1940,7 @@ class WorkerJobExecutor(
             "export": "export",
             "leave": "export",
             "download": "download",
+            "storage_download": "download",
             "download_clear_failed": "download",
             "tts": "export",
             "backup_verify": "export",
@@ -2071,7 +2136,7 @@ class WorkerJobExecutor(
                     },
                     **(
                         {"result": {"value": json_value(result)}}
-                        if kind in {"storage_upload", "storage_reconcile"} and isinstance(result, dict)
+                        if kind in {"storage_upload", "storage_reconcile", "storage_download"} and isinstance(result, dict)
                         else {}
                     ),
                     error={"code": "JOB_TERMINATED", "message": self._cancel_error(command)},
@@ -2080,7 +2145,7 @@ class WorkerJobExecutor(
             else:
                 storage_outcome = (
                     str(result.get("outcome") or "")
-                    if kind in {"storage_upload", "storage_reconcile"} and isinstance(result, dict)
+                    if kind in {"storage_upload", "storage_reconcile", "storage_download"} and isinstance(result, dict)
                     else ""
                 )
                 utility_outcome = (
@@ -2090,13 +2155,19 @@ class WorkerJobExecutor(
                 )
                 if storage_outcome and storage_outcome != "succeeded":
                     error_code = (
-                        "STORAGE_UPLOAD_RECONCILIATION_REQUIRED"
+                        "STORAGE_DOWNLOAD_PARTIAL"
+                        if kind == "storage_download" and storage_outcome == "partial_failure"
+                        else "STORAGE_DOWNLOAD_FAILED"
+                        if kind == "storage_download"
+                        else "STORAGE_UPLOAD_RECONCILIATION_REQUIRED"
                         if storage_outcome == "needs_reconciliation"
                         else "STORAGE_UPLOAD_PARTIAL"
                         if storage_outcome == "partial_failure"
                         else "STORAGE_UPLOAD_FAILED"
                     )
                     error_message = {
+                        "STORAGE_DOWNLOAD_PARTIAL": "Sebagian file gagal diunduh. Periksa hasil per file sebelum mengulangi.",
+                        "STORAGE_DOWNLOAD_FAILED": "Semua file yang dipilih gagal diunduh.",
                         "STORAGE_UPLOAD_RECONCILIATION_REQUIRED": "Sebagian hasil upload belum dapat dipastikan dan perlu rekonsiliasi.",
                         "STORAGE_UPLOAD_PARTIAL": "Sebagian file gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
                         "STORAGE_UPLOAD_FAILED": "Semua file upload gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
@@ -2107,7 +2178,7 @@ class WorkerJobExecutor(
                     self.publisher.emit(
                         job_id,
                         "failed",
-                        "storage.reconciliation_completed" if kind == "storage_reconcile" else "storage.batch_completed",
+                        "storage.download_completed" if kind == "storage_download" else "storage.reconciliation_completed" if kind == "storage_reconcile" else "storage.batch_completed",
                         progress={
                             "phase": storage_outcome,
                             "message": error_message,
@@ -2275,6 +2346,7 @@ class WorkerJobExecutor(
         try:
             message = str(exc)[:1000]
             error_code = str(getattr(exc, "code", "") or "").strip().upper()
+            job_kind = str(command.get("kind") or "").strip().lower()
             command_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
             is_quick_mode = (
                 str(command.get("kind") or "").strip().lower() == "export"
@@ -2290,6 +2362,27 @@ class WorkerJobExecutor(
                 and not message.startswith(error_code + ":")
             ):
                 message = f"{error_code}: {message}"[:1000]
+            storage_download_failure_codes = {
+                "PROFILE_SESSION_UNAVAILABLE",
+                "TDL_ACCESS_TARGET_UNAVAILABLE",
+                "TDL_SESSION_UNAUTHORIZED",
+                "RCLONE_RUNTIME_UNAVAILABLE",
+                "RCLONE_ACCESS_FAILED",
+            }
+            storage_download_error = (
+                error_code
+                if job_kind == "storage_download"
+                and error_code in storage_download_failure_codes
+                else "WORKER_JOB_FAILED"
+            )
+            if storage_download_error != "WORKER_JOB_FAILED":
+                message = {
+                    "PROFILE_SESSION_UNAVAILABLE": "Lane Download profil Telegram tidak tersedia.",
+                    "TDL_ACCESS_TARGET_UNAVAILABLE": "Tujuan Telegram Storage tidak tersedia.",
+                    "TDL_SESSION_UNAUTHORIZED": "Sesi Telegram atau akses channel tidak lagi siap.",
+                    "RCLONE_RUNTIME_UNAVAILABLE": "Runtime rclone tidak tersedia pada worker.",
+                    "RCLONE_ACCESS_FAILED": "Worker tidak dapat mengakses sumber rclone.",
+                }[storage_download_error]
             self.publisher.emit(
                 str(command["job_id"]),
                 "failed",
@@ -2309,6 +2402,8 @@ class WorkerJobExecutor(
                         else error_code
                         if str(command.get("kind") or "").strip().lower() == "utility"
                         and error_code == "UTILITY_FLATTEN_PREVIEW_STALE"
+                        else storage_download_error
+                        if job_kind == "storage_download"
                         else "WORKER_JOB_FAILED"
                     ),
                     "message": message,
@@ -2492,6 +2587,7 @@ class WorkerJobExecutor(
             "artifact_delete": self._artifact_delete,
             "utility": self._utility,
             "storage_upload": self._storage_upload,
+            "storage_download": self._storage_download,
             "storage_reconcile": self._storage_reconcile,
             "storage_sync": self._storage_sync,
             "backup_node": self._backup,

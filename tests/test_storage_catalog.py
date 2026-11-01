@@ -108,6 +108,28 @@ class StorageCatalogTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 catalog.move_folder(parent.id, child.id)
 
+    def test_download_selection_deduplicates_file_and_folder_with_folder_structure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            parent = catalog.create_folder("Projects", 10)
+            child = catalog.create_folder("2026", 10, parent.id)
+            values = item_values("folder-download")
+            values.update(
+                channel_message_id=9003,
+                original_name=r"C:\Exports\report.pdf",
+                display_name="report.pdf",
+                folder="",
+                folder_id=child.id,
+            )
+            item = catalog.insert_item(**values)
+
+            selected = catalog.download_selection([item.id], [parent.id])
+
+            self.assertEqual(len(selected), 1)
+            self.assertEqual(selected[0]["name"], "report.pdf")
+            self.assertEqual(selected[0]["relative_path"], "Projects/2026/report.pdf")
+            self.assertEqual(selected[0]["channel_message_id"], 9003)
+
     def test_duplicate_names_suffix_and_trash_restore(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             catalog = StorageCatalog(Path(temp_dir) / "storage.db")

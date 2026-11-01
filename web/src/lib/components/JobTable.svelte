@@ -105,6 +105,16 @@
     } as Record<string, string>)[status] || status;
   }
 
+  function reportResultEntries(job: Job): Array<[string, string]> {
+    const result = job.result?.value || job.result;
+    if (job.kind !== 'storage_download' || !result || typeof result !== 'object' || Array.isArray(result)) {
+      return resultEntries(result);
+    }
+    const summary = { ...(result as Record<string, unknown>) };
+    delete summary.items;
+    return resultEntries(summary);
+  }
+
   function stopPolling() {
     if (pollTimer !== undefined) clearTimeout(pollTimer);
     pollTimer = undefined;
@@ -522,6 +532,31 @@
             </div>
           </section>
         {/if}
+        {#if selected.kind === 'storage_download' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
+          {@const downloadResult = selected.result?.value || selected.result || {}}
+          {@const downloadItems = downloadResult.items || []}
+          <section class="record-card mb-4" aria-label="Hasil download per file">
+            <h3 class="font-bold">Hasil download per file</h3>
+            <p class="muted mt-1 text-sm">{downloadResult.succeeded || 0} berhasil · {downloadResult.failed || 0} gagal · {downloadResult.cancelled_items || 0} dibatalkan · {downloadResult.public_links_failed || 0} link gagal</p>
+            <div class="mt-2 space-y-2">
+              {#each downloadItems as item, index (`${item.relative_path || item.name || 'file'}:${index}`)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{item.name || `File ${index + 1}`}</b>
+                    <span class={`badge ${item.download_status === 'succeeded' ? 'succeeded' : item.download_status === 'cancelled' ? 'queued' : 'failed'}`}>{item.download_status === 'succeeded' ? 'Download berhasil' : item.download_status === 'cancelled' ? 'Dibatalkan' : 'Download gagal'}</span>
+                    {#if item.link_status === 'succeeded'}<span class="text-xs font-semibold text-emerald-700">Link siap</span>
+                    {:else if item.link_status === 'failed'}<span class="text-xs font-semibold text-rose-700">Link gagal dibuat</span>
+                    {:else if item.link_status === 'not_created'}<span class="muted text-xs">Link tidak dibuat</span>
+                    {:else if item.link_status === 'not_requested'}<span class="muted text-xs">Tanpa link publik</span>{/if}
+                  </div>
+                  {#if item.relative_path && item.relative_path !== item.name}<p class="muted mt-1 break-all text-xs">{item.relative_path}</p>{/if}
+                  {#if item.public_url}<a class="mt-1 block break-all text-sm text-violet-700 underline dark:text-violet-300" href={item.public_url} target="_blank" rel="noopener noreferrer">{item.public_url}</a>{/if}
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                </article>
+              {/each}
+            </div>
+          </section>
+        {/if}
         {#if selected.kind === 'storage_reconcile' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
           {@const reconciliationItems = selected.result?.value?.items || selected.result?.items || []}
           <section class="record-card mb-4">
@@ -554,7 +589,7 @@
             </div>
           </div>
         {/if}
-        <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each resultEntries(selected.result?.value || selected.result) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
+        <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each reportResultEntries(selected) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
       {:else if detailTab === 'milestones'}
         <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div>{#if event.event_type === 'command.started' || event.event_type === 'command.completed'}<p class="mt-2 break-all font-mono text-xs">$ {(event.result?.command || []).join(' ')}</p>{#if event.event_type === 'command.started'}<p class="muted mt-2 text-sm">Command dikirim, menunggu hasil...</p>{:else}{#if event.result?.output_tail?.length}<pre class="terminal mt-2 max-h-48 overflow-auto whitespace-pre-wrap p-3 text-xs">{event.result.output_tail.join('\n')}</pre>{/if}<p class="muted mt-2 text-xs">exit {event.result?.returncode ?? '?'} · {event.result?.duration_seconds ?? 0}s{event.result?.output_truncated ? ' · output lama dipangkas' : ''}</p>{/if}{:else}<p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p>{/if}</article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
       {:else}

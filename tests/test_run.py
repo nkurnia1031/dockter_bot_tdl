@@ -150,7 +150,10 @@ class RunScriptTests(unittest.TestCase):
 
     def test_run_compose_accepts_compose_file_from_dotenv(self) -> None:
         env = {"COMPOSE_FILE": "docker-compose.gateway.yml", "COMPOSE_CMD": "docker compose"}
-        with patch.object(run.subprocess, "run") as subprocess_run:
+        with (
+            patch.object(run, "_compose_available", return_value=True),
+            patch.object(run.subprocess, "run") as subprocess_run,
+        ):
             run.run_compose(["ps"], env)
 
         self.assertEqual(subprocess_run.call_args.args[0], [

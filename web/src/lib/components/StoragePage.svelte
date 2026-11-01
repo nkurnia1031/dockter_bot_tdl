@@ -33,6 +33,7 @@
   };
   type RcloneEntry = {name:string; path:string; is_dir:boolean; size:number; updated_at:string};
   type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number};
+  type PublicDownloadLink = {id:string; worker:string; relative_path:string; file_name:string; provider:string; job_id:string; created_at:string; url:string};
 
   let provider = $state<'telegram'|'rclone'>('telegram');
   let folderId = $state<number|null>(null);
@@ -45,11 +46,13 @@
   let tree = $state<FolderEntry[]>([]);
   let selectedItems = $state<number[]>([]);
   let selectedFolders = $state<number[]>([]);
+  let selectedRclone = $state<RcloneEntry[]>([]);
   let loading = $state(false);
   let message = $state('');
   let mobileTree = $state(false);
   let createOpen = $state(false);
   let uploadOpen = $state(false);
+  let downloadOpen = $state(false);
   let moveOpen = $state(false);
   let editItem = $state<Item|null>(null);
   let editFolder = $state<FolderEntry|null>(null);
@@ -61,6 +64,15 @@
   let newFolderName = $state('');
   let destinationId = $state<number|null>(null);
   let workspaceFolders = $state<string[]>([]);
+  let downloadDestinationFolders = $state<string[]>([]);
+  let downloadProfile = $state('');
+  let publishPublicLinks = $state(false);
+  let downloadSubmitting = $state(false);
+  let downloadJobWorkers = $state<Record<string,string>>({});
+  let publicLinks = $state<PublicDownloadLink[]>([]);
+  let publicLinksLoading = $state(false);
+  let linkToRevoke = $state<PublicDownloadLink|null>(null);
+  let revokeSubmitting = $state(false);
   let keywords = $state('');
   let rclonePath = $state('');
   let remoteTarget = $state('');
@@ -81,6 +93,7 @@
   let syncSubmitting = $state(false);
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
+  const activeSelectionCount = $derived(provider === 'telegram' ? selectionCount : selectedRclone.length);
   const storageReadiness = $derived(
     runtimeReadinessForWorker(session.runtimeReadiness, worker, 'storage')
   );
@@ -88,6 +101,9 @@
     session.runtimeReadiness.cells.filter((cell) =>
       cell.worker === worker && cell.runtime === 'storage'
     )
+  );
+  const workerAdmissionEnabled = $derived(
+    session.workers.some((item) => item.name === worker && item.enabled !== false)
   );
   const storageSyncProfiles = $derived(
     session.profileCatalog
@@ -98,9 +114,16 @@
       )
       .map((profile) => profile.name)
   );
-  const storageRuntimeReady = $derived(storageReadiness.status === 'ready');
+  const storageRuntimeReady = $derived(workerAdmissionEnabled && storageReadiness.status === 'ready');
   const rcloneReadiness = $derived(runtimeReadinessFor(session.runtimeReadiness, null, worker, 'rclone_storage'));
-  const rcloneRuntimeReady = $derived(rcloneReadiness.status === 'ready');
+  const rcloneRuntimeReady = $derived(workerAdmissionEnabled && rcloneReadiness.status === 'ready');
+  const workerPublicUrl = $derived(session.workers.find((item) => item.name === worker)?.public_url || '');
+  const downloadReadyProfiles = $derived(
+    workerAdmissionEnabled ? session.profileCatalog
+      .filter((profile) => profile.workers.includes(worker))
+      .filter((profile) => runtimeReadinessFor(session.runtimeReadiness, profile.name, worker, 'download').status === 'ready')
+      .map((profile) => profile.name) : []
+  );
   const storageReadinessStyle = $derived(
     storageRuntimeReady
       ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200'
@@ -195,6 +218,23 @@
   async function handleJobFinished(event: Event) {
     void session.refreshProfileCatalog();
     const finishedIds = (event as CustomEvent<{jobIds?:string[]}>).detail?.jobIds || [];
+    const finishedDownloads = finishedIds.filter((id) => Boolean(downloadJobWorkers[id]));
+    if (finishedDownloads.length) {
+      const workersToRefresh = new Set(finishedDownloads.map((id) => downloadJobWorkers[id]));
+      const summaries = await Promise.all(finishedDownloads.map(async (id) => {
+        try {
+          const job = await api<{status:string; result?:{value?:{succeeded?:number;failed?:number;cancelled_items?:number;public_links_failed?:number}}; error?:{message?:string}}>(`/jobs/${encodeURIComponent(id)}`);
+          const result = job.result?.value;
+          return `Unduhan ${job.status}: ${result?.succeeded ?? 0} berhasil, ${result?.failed ?? 0} gagal, ${result?.cancelled_items ?? 0} dibatalkan. Link gagal: ${result?.public_links_failed ?? 0}.${job.error?.message ? ` ${job.error.message}` : ''}`;
+        } catch (cause) {
+          return cause instanceof Error ? cause.message : `Hasil unduhan ${id.slice(0, 8)} tidak dapat dimuat.`;
+        } finally {
+          delete downloadJobWorkers[id];
+        }
+      }));
+      if (workersToRefresh.has(worker)) await loadPublicLinks(worker);
+      message = summaries.join(' ');
+    }
     if (!syncJobId || !finishedIds.includes(syncJobId)) return;
     const finishedJobId = syncJobId;
     try {
@@ -222,6 +262,17 @@
     scope = next; folderId = null; clearSelection(); load();
   }
   function clearSelection() { selectedItems = []; selectedFolders = []; }
+  function clearRcloneSelection() { selectedRclone = []; }
+  function toggleRcloneEntry(entry:RcloneEntry) {
+    selectedRclone = selectedRclone.some((item) => item.path === entry.path)
+      ? selectedRclone.filter((item) => item.path !== entry.path)
+      : [...selectedRclone, entry];
+  }
+  function selectAllRclone() {
+    const selected = new Map(selectedRclone.map((entry) => [entry.path, entry]));
+    for (const entry of remoteData.items) selected.set(entry.path, entry);
+    selectedRclone = [...selected.values()];
+  }
   function toggleItem(id:number) {
     selectedItems = selectedItems.includes(id) ? selectedItems.filter(value => value !== id) : [...selectedItems,id];
   }
@@ -288,6 +339,73 @@
     uploadOpen=false; workspaceFolders=[]; keywords=''; transferMode='copy'; confirmMove=false;
     message=`Upload ${provider==='telegram'?'Telegram':'rclone'} masuk antrean sebagai ${selectedTransferMode}. Struktur subfolder akan dipertahankan.`;
   }
+  function startDownload() {
+    if (provider === 'telegram') downloadProfile = downloadReadyProfiles[0] || '';
+    downloadDestinationFolders = [];
+    publishPublicLinks = false;
+    downloadOpen = true;
+  }
+  async function downloadSelection() {
+    const destinationPath = downloadDestinationFolders[0];
+    if (!worker || !destinationPath || downloadSubmitting) return;
+    if (provider === 'telegram' && (!downloadProfile || !downloadReadyProfiles.includes(downloadProfile))) {
+      message = 'Pilih profil dengan lane Download siap pada worker ini.';
+      return;
+    }
+    if (provider === 'rclone' && (!rcloneRuntimeReady || !selectedRclone.length)) {
+      message = 'Pilih file/folder rclone dan pastikan readiness rclone worker siap.';
+      return;
+    }
+    downloadSubmitting = true;
+    try {
+      const body = provider === 'telegram'
+        ? {provider, worker, profile:downloadProfile, item_ids:selectedItems, folder_ids:selectedFolders, destination_path:destinationPath, publish_public_links:publishPublicLinks}
+        : {provider, worker, rclone_sources:selectedRclone.map(({path,is_dir})=>({path,is_dir})), destination_path:destinationPath, publish_public_links:publishPublicLinks};
+      const job = await post<{id:string}>('/storage/downloads', body);
+      downloadJobWorkers = {...downloadJobWorkers, [job.id]:worker};
+      downloadOpen = false;
+      downloadDestinationFolders = [];
+      clearSelection();
+      clearRcloneSelection();
+      message = `Unduhan masuk antrean pada worker ${worker}. Progress per file tersedia di bawah.`;
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Unduhan Storage gagal dibuat.';
+    } finally {
+      downloadSubmitting = false;
+    }
+  }
+  async function loadPublicLinks(selectedWorker = worker) {
+    if (!selectedWorker) { publicLinks = []; return; }
+    publicLinksLoading = true;
+    try {
+      const result = await api<{items:PublicDownloadLink[]}>(`/storage/download-links?worker=${encodeURIComponent(selectedWorker)}`);
+      if (worker === selectedWorker) publicLinks = Array.isArray(result.items) ? result.items : [];
+    } catch (cause) {
+      if (worker === selectedWorker) {
+        publicLinks = [];
+        message = cause instanceof Error ? cause.message : 'Daftar link publik tidak dapat dimuat.';
+      }
+    } finally { publicLinksLoading = false; }
+  }
+  async function copyPublicLink(link:PublicDownloadLink) {
+    await navigator.clipboard.writeText(link.url);
+    message = `Link ${link.file_name} disalin.`;
+  }
+  async function revokePublicLink() {
+    if (!linkToRevoke || revokeSubmitting) return;
+    revokeSubmitting = true;
+    try {
+      const link = linkToRevoke;
+      const result = await post<{cleanup_status:string}>(`/storage/download-links/${encodeURIComponent(link.id)}/revoke?worker=${encodeURIComponent(link.worker)}`, {confirmed:true});
+      linkToRevoke = null;
+      await loadPublicLinks(worker);
+      message = result.cleanup_status === 'deleted' || result.cleanup_status === 'already_missing'
+        ? 'Link dicabut dan file worker dihapus.'
+        : `Link dicabut; penghapusan file worker berstatus ${result.cleanup_status}.`;
+    } catch (cause) {
+      message = cause instanceof Error ? cause.message : 'Link publik tidak dapat dicabut.';
+    } finally { revokeSubmitting = false; }
+  }
   async function loadRclone() {
     if (!worker || provider !== 'rclone' || !rcloneRuntimeReady) return;
     remoteLoading=true;
@@ -300,11 +418,14 @@
   }
   function setProvider(next:'telegram'|'rclone') {
     provider=next;
+    clearSelection(); clearRcloneSelection();
     if (next==='rclone') { rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false; }
     else void load();
   }
   function handleWorkerChange() {
     rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false;
+    clearRcloneSelection();
+    publicLinks=[];
     remoteData={path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0};
   }
   function openRemoteFolder(path:string) { rclonePath=path; remoteOffset=0; remoteTarget=path; void loadRclone(); }
@@ -365,6 +486,10 @@
     const ready=rcloneRuntimeReady;
     if (activeProvider==='rclone' && activeWorker && ready) untrack(() => void loadRclone());
   });
+  $effect(() => {
+    const selectedWorker=worker;
+    if (selectedWorker) untrack(() => void loadPublicLinks(selectedWorker));
+  });
   function setView(next:'list'|'grid') { view=next; localStorage.setItem('storage-view',next); }
   function setSort(next:string) { sort=next; localStorage.setItem('storage-sort',next); load(); }
 </script>
@@ -374,12 +499,32 @@
   <div class="page-icon"><HardDrive size={23}/></div>
 </header>
 
-<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange} /></div>
+<div class="mt-5"><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} allowDisabledWorkerSelection bind:worker onWorkerChange={handleWorkerChange} /></div>
 
 <div class="mt-4 inline-flex rounded-xl border border-[var(--line)] p-1" role="tablist" aria-label="Sumber Storage">
   <button role="tab" aria-selected={provider==='telegram'} class={`rounded-lg px-4 py-2 text-sm font-bold ${provider==='telegram'?'bg-[var(--brand-soft)] text-[var(--brand)]':''}`} onclick={() => setProvider('telegram')}>Telegram</button>
   <button role="tab" aria-selected={provider==='rclone'} class={`rounded-lg px-4 py-2 text-sm font-bold ${provider==='rclone'?'bg-[var(--brand-soft)] text-[var(--brand)]':''}`} onclick={() => setProvider('rclone')}>Rclone</button>
 </div>
+
+<section class="card mt-4 p-4 sm:p-5" aria-label="Link publik Storage">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div><h2 class="font-extrabold">Link unduhan publik</h2><p class="muted mt-1 text-sm">Link aktif tidak kedaluwarsa. Cabut link untuk menonaktifkannya dan menghapus file dari worker.</p></div>
+    <button class="button secondary" disabled={!worker || publicLinksLoading} onclick={() => loadPublicLinks()}><RefreshCw size={15} class={publicLinksLoading?'animate-spin':''}/>Refresh link</button>
+  </div>
+  {#if publicLinks.length}
+    <ul class="mt-4 divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
+      {#each publicLinks as link (link.id)}
+        <li class="flex flex-wrap items-center gap-3 p-3 text-sm">
+          <div class="min-w-0 flex-1"><b class="block truncate">{link.file_name}</b><span class="muted">{link.provider} · {formatDate(link.created_at)} · {link.worker}</span><span class="muted mt-1 block break-all text-xs">{link.relative_path}</span><a class="mt-1 block truncate text-violet-700 underline dark:text-violet-300" href={link.url} target="_blank" rel="noreferrer">{link.url}</a></div>
+          <button class="button secondary" onclick={() => copyPublicLink(link)}><Copy size={15}/>Salin link</button>
+          <button class="button danger" onclick={() => linkToRevoke=link}>Cabut & hapus file</button>
+        </li>
+      {/each}
+    </ul>
+  {:else}
+    <p class="muted mt-4 rounded-xl border border-dashed border-[var(--line)] p-5 text-center text-sm">{publicLinksLoading?'Memuat link worker…':'Belum ada link publik aktif pada worker ini.'}</p>
+  {/if}
+</section>
 
 {#if provider==='telegram'}
 <section class="card mt-4 p-4 sm:p-5">
@@ -434,7 +579,10 @@
 <section class="card mt-6 overflow-hidden p-4 sm:p-5" aria-label="Browser rclone">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div><h2 class="text-xl font-black">Remote rclone</h2><p class="muted mt-1 text-sm">Worker {worker || 'belum dipilih'} · status {rcloneReadiness.status}</p></div>
-    <button class="button" disabled={!worker || !rcloneRuntimeReady} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
+    <div class="flex flex-wrap gap-2">
+      {#if selectedRclone.length}<button class="button secondary" disabled={!worker || !rcloneRuntimeReady} onclick={startDownload}><Download size={16}/>Download {selectedRclone.length} dipilih</button>{/if}
+      <button class="button" disabled={!worker || !rcloneRuntimeReady} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
+    </div>
   </div>
   {#if !rcloneRuntimeReady}<p class="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-100">{rcloneReadiness.reason_code || 'Akses rclone belum dipindai pada worker ini.'} · Jalankan Scan Profil sebelum membuka remote.</p>{/if}
   <div class="mt-4 flex flex-wrap items-center gap-2">
@@ -447,6 +595,7 @@
   <div class="mt-4 divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
     {#each remoteData.items as entry (entry.path)}
       <div class="flex items-center gap-3 p-3 text-sm">
+        <input type="checkbox" checked={selectedRclone.some((item)=>item.path===entry.path)} onchange={()=>toggleRcloneEntry(entry)} aria-label={`Pilih ${entry.is_dir?'folder':'file'} ${entry.name}`}/>
         {#if entry.is_dir}<Folder class="shrink-0 text-amber-500" size={19}/><button class="min-w-0 flex-1 truncate text-left font-bold" onclick={()=>openRemoteFolder(entry.path)}>{entry.name}</button><button class="button secondary !py-1" onclick={()=>{remoteTarget=entry.path;remoteTargetSelected=true;message=`Tujuan upload dipilih: ${entry.path}`}}>Pilih tujuan</button>
         {:else}<File class="shrink-0 text-violet-500" size={19}/><span class="min-w-0 flex-1 truncate">{entry.name}</span><span class="muted">{formatBytes(entry.size)}</span>{/if}
       </div>
@@ -509,7 +658,7 @@
           <b>{selectionCount} dipilih</b><button class="button ghost" onclick={selectAll}>Pilih semua</button>
           <span class="flex-1"></span>
           {#if isTrash}<button class="button secondary" onclick={restoreSelection}><ArchiveRestore size={15}/>Restore</button><button class="button danger" onclick={() => confirmAction='purge'}><Trash2 size={15}/>Purge</button>
-          {:else}<button class="button secondary" onclick={startMove}><Move size={15}/>Move</button><button class="button danger" onclick={() => confirmAction='trash'}><Trash2 size={15}/>Trash</button>{/if}
+          {:else}<button class="button secondary" disabled={!downloadReadyProfiles.length} onclick={startDownload}><Download size={15}/>Download</button><button class="button secondary" onclick={startMove}><Move size={15}/>Move</button><button class="button danger" onclick={() => confirmAction='trash'}><Trash2 size={15}/>Trash</button>{/if}
           <button class="button ghost" onclick={clearSelection}><X size={16}/></button>
         </div>
       {/if}
@@ -560,8 +709,34 @@
 </section>
 {/if}
 
+<JobTable kind="storage_download" title="Unduhan Storage"/>
 <JobTable kind="storage_upload" title="Transfer upload" retryable={true}/>
 {#if provider==='telegram'}<JobTable kind="storage_sync" title="Sinkronisasi katalog Telegram"/>{/if}
+
+<Modal open={downloadOpen} onclose={() => downloadOpen=false} title="Download ke worker" size="lg">
+  <p class="muted mb-4 text-sm">{activeSelectionCount} pilihan dari {provider==='telegram'?'Telegram Storage':'rclone'} akan diunduh rekursif ke worker {worker}. File yang sudah ada tidak ditimpa.</p>
+  {#if provider==='telegram'}
+    <label class="block text-sm font-bold">Profil dengan lane Download siap
+      <select class="field mt-2" bind:value={downloadProfile} disabled={!downloadReadyProfiles.length}>
+        {#each downloadReadyProfiles as profile (profile)}<option value={profile}>{profile}</option>{/each}
+      </select>
+    </label>
+    {#if !downloadReadyProfiles.length}<p class="mt-2 text-sm text-rose-700">Tidak ada profil Download-ready pada worker ini. Jalankan scan dari halaman Profil.</p>{/if}
+  {:else if !rcloneRuntimeReady}
+    <p class="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">Readiness rclone worker belum siap. Jalankan scan dari halaman Profil.</p>
+  {/if}
+  <div class="mt-4"><p class="mb-2 text-sm font-bold">Folder tujuan di /workspace</p><WorkspaceExplorer bind:selected={downloadDestinationFolders} single {worker}/></div>
+  <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--line)] p-3 text-sm" class:opacity-50={!workerPublicUrl}>
+    <input type="checkbox" bind:checked={publishPublicLinks} disabled={!workerPublicUrl}/>
+    <span><b>Buat link publik tanpa kedaluwarsa</b><small class="muted mt-1 block">Satu link per file berhasil. Atur domain HTTPS worker di Pengaturan Worker terlebih dahulu. Link dapat dicabut dari daftar di halaman Storage.</small></span>
+  </label>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => downloadOpen=false}>Batal</button><button class="button" disabled={!worker || !downloadDestinationFolders.length || !activeSelectionCount || downloadSubmitting || (provider==='telegram'&&!downloadReadyProfiles.includes(downloadProfile)) || (provider==='rclone'&&!rcloneRuntimeReady)} onclick={downloadSelection}><Download size={16}/>{downloadSubmitting?'Membuat job…':'Mulai download'}</button></div>
+</Modal>
+
+<Modal open={Boolean(linkToRevoke)} onclose={() => !revokeSubmitting&&(linkToRevoke=null)} title="Cabut link dan hapus file worker?" size="sm">
+  <p>Link tidak kedaluwarsa, jadi pencabutan menonaktifkannya. File <b>{linkToRevoke?.file_name}</b> akan dihapus dari worker {linkToRevoke?.worker}, termasuk bila file berubah sejak link dibuat.</p>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" disabled={revokeSubmitting} onclick={() => linkToRevoke=null}>Batal</button><button class="button danger" disabled={revokeSubmitting} onclick={revokePublicLink}>{revokeSubmitting?'Mencabut…':'Cabut & hapus file'}</button></div>
+</Modal>
 
 {#if detail}
   {@const DetailIcon=iconFor(detail)}

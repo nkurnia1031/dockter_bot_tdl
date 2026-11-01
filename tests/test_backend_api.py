@@ -135,6 +135,9 @@ class FakeDispatcher:
         self.tts_recoveries = []
         self.storage_fingerprint_overrides = {}
         self.rclone_browse_calls = []
+        self.public_download_link_calls = []
+        self.public_download_links_result = {"items": []}
+        self.public_download_link_revocations = []
         self.profile_sync_requests = []
         self.profile_sync_snapshot = {
             "status": "waiting_worker",
@@ -194,6 +197,14 @@ class FakeDispatcher:
         self.rclone_browse_calls.append((worker, destination, kwargs))
         return {"path": kwargs.get("path", ""), "breadcrumbs": [], "items": [],
                 "total": 0, "limit": kwargs.get("limit", 100), "offset": kwargs.get("offset", 0)}
+
+    def public_download_links(self, worker):
+        self.public_download_link_calls.append(worker)
+        return dict(self.public_download_links_result)
+
+    def revoke_public_download_link(self, worker, link_id):
+        self.public_download_link_revocations.append((worker, link_id))
+        return {"revoked": True, "cleanup_status": "deleted"}
 
     def dispatch_command(self, worker, envelope):
         self.durable_commands.append(envelope)
@@ -373,12 +384,15 @@ class FakeWorkers:
     def get(self, name):
         return self.values.get(name)
 
-    def upsert(self, name, url, token, enabled=None):
+    def upsert(self, name, url, token, enabled=None, public_url=None):
         current = self.values.get(name, {})
         self.values[name] = {
             "url": url,
             "token": token,
             "enabled": current.get("enabled", True) if enabled is None else bool(enabled),
+            "public_url": (
+                current.get("public_url", "") if public_url is None else public_url
+            ),
         }
         return name
 
@@ -4198,6 +4212,180 @@ class BackendApiTests(unittest.TestCase):
             command["payload"]["rclone_destination"], "googledrive:backup"
         )
         self.assertNotIn("rclone_upload", command["payload"])
+
+    def test_telegram_storage_download_requires_saved_download_readiness_and_worker_domain(self):
+        headers = self.login()
+        now = "2026-10-31T00:00:00Z"
+        self.local_profile_catalog.replace_scan(
+            checked_at=now,
+            workers=[{"name": "local", "status": "success", "checked_at": now}],
+            inventories=[{
+                "worker": "local", "checked_at": now,
+                "items": [{"name": "default", "ready": True}],
+            }],
+        )
+        item = self.catalog.insert_item(
+            upload_id="download-api-item",
+            owner_user_id=42,
+            owner_profile="default",
+            channel_id=-100123,
+            channel_message_id=9007,
+            original_name="report.pdf",
+            display_name="report.pdf",
+            folder="Reports",
+            keywords="",
+            caption="Storage file",
+            file_size=128,
+            mime_type="application/pdf",
+            sha256="",
+        )
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at=now,
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": []},
+        )
+        body = {
+            "provider": "telegram",
+            "worker": "local",
+            "profile": "default",
+            "item_ids": [item.id],
+            "destination_path": "/workspace/destination",
+        }
+
+        blocked = self.client.post(
+            "/api/v1/storage/downloads", headers=headers, json=body,
+        )
+        self.assertEqual(blocked.status_code, 409)
+        self.assertEqual(blocked.json()["error"]["code"], "RUNTIME_NOT_READY")
+        self.assertEqual(self.dispatcher.commands, [])
+
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile="default", runtime="download", ready=True,
+            fingerprint="d" * 64, checked_at=now,
+        )
+        missing_domain = self.client.post(
+            "/api/v1/storage/downloads",
+            headers=headers,
+            json={**body, "publish_public_links": True},
+        )
+        self.assertEqual(missing_domain.status_code, 409)
+        self.assertEqual(
+            missing_domain.json()["error"]["code"],
+            "PUBLIC_DOWNLOAD_ORIGIN_UNAVAILABLE",
+        )
+
+        self.workers.values["local"]["public_url"] = "https://worker.example.test/"
+        created = self.client.post(
+            "/api/v1/storage/downloads",
+            headers=headers,
+            json={**body, "publish_public_links": True},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["kind"], "storage_download")
+        self.assertEqual(command["profile"], "default")
+        self.assertEqual(command["worker"], "local")
+        self.assertEqual(command["payload"]["tdl_access_target"], "123")
+        self.assertEqual(command["payload"]["public_base_url"], "https://worker.example.test")
+        self.assertEqual(command["payload"]["files"][0]["channel_message_id"], 9007)
+        public_job = self.client.get(
+            f"/api/v1/jobs/{created.json()['id']}", headers=headers,
+        ).json()
+        self.assertEqual(public_job["payload"]["selection_count"], 1)
+        self.assertNotIn("public_base_url", public_job["payload"])
+        self.assertNotIn("channel_message_id", str(public_job["payload"]))
+
+    def test_rclone_storage_download_uses_worker_snapshot_without_tdl_profile_or_fallback(self):
+        headers = self.login()
+        now = "2026-10-31T00:00:00Z"
+        destination = "drive:archive"
+        self.control.utility_settings = self.context.utility_settings
+        self.context.utility_settings.set("rclone_destination", destination)
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at=now,
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": []},
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="a" * 64,
+            destination_fingerprint=hashlib.sha256(destination.encode()).hexdigest(),
+            checked_at=now,
+        )
+
+        created = self.client.post(
+            "/api/v1/storage/downloads",
+            headers=headers,
+            json={
+                "provider": "rclone",
+                "worker": "local",
+                "rclone_sources": [{"path": "archive/2026", "is_dir": True}],
+                "destination_path": "/workspace/destination",
+            },
+        )
+
+        self.assertEqual(created.status_code, 200, created.text)
+        command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["kind"], "storage_download")
+        self.assertEqual(command["payload"]["provider"], "rclone")
+        self.assertEqual(command["payload"]["rclone_destination"], destination)
+        self.assertEqual(command["payload"]["rclone_sources"], [{"path": "archive/2026", "is_dir": True}])
+        self.assertNotIn("tdl_access_target", command["payload"])
+
+    def test_public_download_link_list_and_revoke_are_worker_scoped_and_confirmed(self):
+        headers = self.login()
+        self.workers.values["local"]["enabled"] = False
+        self.dispatcher.public_download_links_result = {"items": [{
+            "id": "7d844860-0de4-4ef2-9f20-503b43cd9942",
+            "token": "a" * 43,
+            "relative_path": "archive/share.zip",
+            "file_name": "share.zip",
+            "public_base_url": "https://worker.example.test",
+            "job_id": "download-job",
+            "provider": "rclone",
+            "created_at": "2026-10-31T00:00:00Z",
+        }, {
+            "id": "bad-token",
+            "token": "not-a-valid-public-token",
+            "file_name": "ignored.zip",
+            "public_base_url": "https://worker.example.test",
+            "job_id": "download-job",
+            "provider": "rclone",
+            "created_at": "2026-10-31T00:00:00Z",
+        }]}
+
+        listed = self.client.get(
+            "/api/v1/storage/download-links?worker=local", headers=headers,
+        )
+        self.assertEqual(listed.status_code, 200, listed.text)
+        self.assertEqual(
+            listed.json()["items"][0]["url"],
+            "https://worker.example.test/public/download/" + "a" * 43,
+        )
+        self.assertEqual(len(listed.json()["items"]), 1)
+        self.assertEqual(listed.json()["items"][0]["relative_path"], "archive/share.zip")
+        link_id = self.dispatcher.public_download_links_result["items"][0]["id"]
+        unconfirmed = self.client.post(
+            f"/api/v1/storage/download-links/{link_id}/revoke?worker=local",
+            headers=headers,
+            json={"confirmed": False},
+        )
+        self.assertEqual(unconfirmed.status_code, 422)
+        self.assertEqual(self.dispatcher.public_download_link_revocations, [])
+        revoked = self.client.post(
+            f"/api/v1/storage/download-links/{link_id}/revoke?worker=local",
+            headers=headers,
+            json={"confirmed": True},
+        )
+        self.assertEqual(revoked.status_code, 200, revoked.text)
+        self.assertEqual(revoked.json()["cleanup_status"], "deleted")
+        self.assertEqual(self.dispatcher.public_download_link_revocations, [("local", link_id)])
 
     def test_rclone_storage_upload_requires_worker_root_snapshot_without_tdl_sessions(self):
         headers = self.login()

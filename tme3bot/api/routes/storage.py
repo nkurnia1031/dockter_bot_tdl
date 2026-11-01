@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import asdict
 from fastapi import Depends, Query
-from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, StorageBulkActionRequest, StorageDeliveryRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StorageSettingsResponse, StorageSyncRequest, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
+from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, StorageBulkActionRequest, StorageDeliveryRequest, StorageDownloadRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StoragePublicLinkRevokeRequest, StorageSettingsResponse, StorageSyncRequest, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
@@ -255,6 +256,111 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 actor, "storage_upload", payload, profile=actor.profile, worker=selected_worker
             )
         )
+
+    @app.post("/api/v1/storage/downloads", response_model=JobResponse)
+    def submit_storage_download(body: StorageDownloadRequest, actor=Depends(current_actor)):
+        payload = {
+            "provider": body.provider,
+            "item_ids": list(body.item_ids),
+            "folder_ids": list(body.folder_ids),
+            "rclone_sources": [_model_dict(item) for item in body.rclone_sources],
+            "destination_path": body.destination_path,
+            "publish_public_links": body.publish_public_links,
+        }
+        selected_profile = actor.profile
+        if body.provider == "telegram":
+            if not body.item_ids and not body.folder_ids:
+                raise DomainError("STORAGE_SELECTION_REQUIRED", "Pilih file atau folder Telegram untuk diunduh.", status_code=422)
+            if body.rclone_sources:
+                raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan rclone hanya berlaku untuk provider rclone.", status_code=422)
+            profile, selected_worker = context.control_plane.resolve_target(
+                actor, profile=body.profile, worker=body.worker, check_readiness=False
+            )
+            selected_profile = profile
+        else:
+            if not body.rclone_sources:
+                raise DomainError("STORAGE_SELECTION_REQUIRED", "Pilih file atau folder rclone untuk diunduh.", status_code=422)
+            if body.item_ids or body.folder_ids or body.profile is not None:
+                raise DomainError("STORAGE_SELECTION_INVALID", "Profil dan pilihan katalog Telegram tidak berlaku untuk provider rclone.", status_code=422)
+            _, selected_worker = context.control_plane.resolve_target(
+                actor, worker=body.worker, check_readiness=False
+            )
+        try:
+            return job_dict(
+                context.control_plane.submit_job(
+                    actor,
+                    "storage_download",
+                    payload,
+                    profile=selected_profile,
+                    worker=selected_worker,
+                )
+            )
+        except ValueError as exc:
+            raise DomainError("STORAGE_DOWNLOAD_SELECTION_INVALID", "Pilihan file atau folder tidak valid.", status_code=422) from exc
+
+    @app.get("/api/v1/storage/download-links", response_model=ObjectResponse)
+    def list_storage_download_links(worker: str, actor=Depends(current_actor)):
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=worker, check_readiness=False, allow_disabled_worker=True
+        )
+        listing = getattr(context.worker_dispatcher, "public_download_links", None)
+        if not callable(listing):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung daftar link unduhan.", status_code=503)
+        try:
+            result = listing(selected_worker)
+        except Exception as exc:
+            raise DomainError("WORKER_UNAVAILABLE", "Daftar link worker tidak dapat dimuat.", status_code=503) from exc
+        items = result.get("items") if isinstance(result, dict) else None
+        safe_items = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            token = str(item.get("token") or "")
+            base_url = str(item.get("public_base_url") or "").rstrip("/")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{40,80}", token):
+                continue
+            normalize_public_url = getattr(context.worker_registry, "_normalize_public_url", None)
+            if callable(normalize_public_url):
+                try:
+                    base_url = normalize_public_url(base_url)
+                except ValueError:
+                    continue
+            elif not base_url.startswith("https://"):
+                continue
+            safe_items.append({
+                "id": str(item.get("id") or ""),
+                "worker": selected_worker,
+                "relative_path": str(item.get("relative_path") or item.get("file_name") or "File"),
+                "file_name": str(item.get("file_name") or "File"),
+                "provider": str(item.get("provider") or ""),
+                "job_id": str(item.get("job_id") or ""),
+                "created_at": str(item.get("created_at") or ""),
+                "url": f"{base_url}/public/download/{token}",
+            })
+        return {"items": safe_items}
+
+    @app.post("/api/v1/storage/download-links/{link_id}/revoke", response_model=ObjectResponse)
+    def revoke_storage_download_link(
+        link_id: str,
+        body: StoragePublicLinkRevokeRequest,
+        worker: str = Query(..., min_length=1, max_length=48),
+        actor=Depends(current_actor),
+    ):
+        if body.confirmed is not True:
+            raise DomainError("PUBLIC_DOWNLOAD_CONFIRMATION_REQUIRED", "Pencabutan link dan penghapusan file perlu dikonfirmasi.", status_code=422)
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=worker, check_readiness=False, allow_disabled_worker=True
+        )
+        revoke = getattr(context.worker_dispatcher, "revoke_public_download_link", None)
+        if not callable(revoke):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung pencabutan link unduhan.", status_code=503)
+        try:
+            result = revoke(selected_worker, link_id)
+        except Exception as exc:
+            raise DomainError("WORKER_UNAVAILABLE", "Worker tidak dapat mencabut link unduhan.", status_code=503) from exc
+        if result.get("revoked") is not True:
+            raise DomainError("PUBLIC_DOWNLOAD_NOT_FOUND", "Link unduhan tidak ditemukan.", status_code=404)
+        return {"worker": selected_worker, **result}
 
     @app.post("/api/v1/storage/sync", response_model=JobResponse)
     def submit_storage_sync(body: StorageSyncRequest, actor=Depends(current_actor)):

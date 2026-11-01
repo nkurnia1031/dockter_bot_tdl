@@ -374,6 +374,27 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertEqual(first.priority, 100)
         self.assertEqual(second.priority, 100)
 
+    def test_storage_download_and_upload_share_workspace_path_locks(self):
+        download = build_execution_plan(
+            "storage_download", "default", "local",
+            {"provider": "telegram", "destination_path": "/workspace/shared/downloads"},
+        )
+        upload = build_execution_plan(
+            "storage_upload", "default", "local",
+            {"provider": "telegram", "folder_path": "/workspace/shared"},
+        )
+        utility = build_execution_plan(
+            "utility", "default", "local", {"folders": ["/workspace/shared"]},
+        )
+        sibling_upload = build_execution_plan(
+            "storage_upload", "default", "local",
+            {"provider": "telegram", "folder_path": "/workspace/other"},
+        )
+
+        self.assertTrue(download.resource_keys & upload.resource_keys)
+        self.assertTrue(download.resource_keys & utility.resource_keys)
+        self.assertFalse(download.resource_keys & sibling_upload.resource_keys)
+
     def test_durable_batch_runs_fifo_files_in_parallel_with_one_file_per_upload_lane(self):
         self._add_files("one.txt", "two.txt", "three.txt", "four.txt")
         uploader = _BatchUploader(self.workspace, self.store, parallel=True)

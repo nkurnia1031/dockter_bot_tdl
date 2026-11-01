@@ -100,6 +100,31 @@ class WorkerContractTests(unittest.TestCase):
             timeout=45,
         )
 
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_public_download_link_dispatch_uses_authenticated_worker_routes(self, request):
+        request.return_value = {"items": []}
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        self.assertEqual(dispatcher.public_download_links("remote"), {"items": []})
+        dispatcher.revoke_public_download_link("remote", "link id/with spaces")
+
+        self.assertEqual(request.call_args_list, [
+            call(
+                "http://worker.test",
+                "worker-token",
+                "GET",
+                "/internal/v1/storage/download-links",
+                timeout=30,
+            ),
+            call(
+                "http://worker.test",
+                "worker-token",
+                "DELETE",
+                "/internal/v1/storage/download-links/link%20id%2Fwith%20spaces",
+                timeout=30,
+            ),
+        ])
+
     def test_local_profile_inventory_dispatch_classifies_timeout_network_and_worker_error(self):
         dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
         with patch(

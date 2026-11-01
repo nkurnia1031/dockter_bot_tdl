@@ -67,6 +67,56 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('72%')).toBeTruthy();
   });
 
+  it('shows each Storage download result and its public link status', async () => {
+    render(JobProgressCard, {
+      job: {
+        id: 'storage-download-job',
+        kind: 'storage_download',
+        status: 'failed',
+        profile: 'default',
+        worker: 'remote-1',
+        created_at: new Date().toISOString(),
+        payload: { provider: 'telegram' },
+        result: { value: {
+          succeeded: 1,
+          failed: 1,
+          cancelled_items: 0,
+          items: [
+            {
+              name: 'report.pdf',
+              relative_path: 'Reports/2026/report.pdf',
+              download_status: 'succeeded',
+              link_status: 'succeeded',
+              public_url: 'https://files.example.test/public/download/' + 'a'.repeat(43),
+            },
+            {
+              name: 'existing.zip',
+              relative_path: 'Reports/existing.zip',
+              download_status: 'failed',
+              link_status: 'not_created',
+              error: 'File tujuan sudah ada; file tidak ditimpa.',
+            },
+          ],
+        } },
+        progress: { phase: 'partial_failure', overall: { current: 2, total: 2, percent: 100 } },
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn()
+    });
+
+    await fireEvent.click(screen.getByRole('button', { name: /toggle detail progress/i }));
+    expect(screen.getByRole('region', { name: 'Hasil download per file' })).toBeTruthy();
+    expect(screen.getByText('Reports/2026/report.pdf')).toBeTruthy();
+    expect(screen.getByText('Download berhasil')).toBeTruthy();
+    expect(screen.getByText('Link siap')).toBeTruthy();
+    expect(screen.getByRole('link', { name: /files\.example\.test\/public\/download/ })).toBeTruthy();
+    expect(screen.getByText('existing.zip')).toBeTruthy();
+    expect(screen.getByText('Download gagal')).toBeTruthy();
+    expect(screen.getByText('Link tidak dibuat')).toBeTruthy();
+    expect(screen.getByText('File tujuan sudah ada; file tidak ditimpa.')).toBeTruthy();
+  });
+
   it('toggles detail drawer when clicking Detail button', async () => {
     render(JobProgressCard, {
       job: {

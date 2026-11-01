@@ -235,6 +235,144 @@ class RcloneRunner:
                 "items": entries[offset:offset + limit], "total": len(entries),
                 "limit": limit, "offset": offset}
 
+    def list_download_files(
+        self,
+        destination: str,
+        selections: Iterable[dict[str, object]],
+        config_path: Path,
+        *,
+        config_root: Path,
+    ) -> list[dict[str, object]]:
+        """Expand selected rclone files and folders below the configured root."""
+        try:
+            validate_rclone_destination(destination)
+        except ValueError as exc:
+            raise RcloneError("Root rclone tidak valid.") from exc
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        if not config.is_file() or shutil.which("rclone") is None:
+            raise RcloneError("Runtime rclone belum tersedia pada worker.", code="RCLONE_RUNTIME_UNAVAILABLE")
+
+        files: dict[str, dict[str, object]] = {}
+        for selected in selections:
+            if not isinstance(selected, dict):
+                raise RcloneError("Pilihan sumber rclone tidak valid.")
+            raw_path = str(selected.get("path") or "")
+            is_dir = selected.get("is_dir") is True
+            remote, normalized = self._remote_path(destination, raw_path)
+            if not normalized:
+                raise RcloneError("Path sumber rclone tidak valid.")
+            if not is_dir:
+                name = normalized.rsplit("/", 1)[-1]
+                candidate = {
+                    "remote_path": remote,
+                    "relative_path": name,
+                    "name": name,
+                    "size": None,
+                }
+                previous = files.get(remote)
+                if previous is None or len(str(candidate["relative_path"])) > len(str(previous["relative_path"])):
+                    files[remote] = candidate
+                continue
+
+            command = ["rclone", "lsjson", remote, "--recursive", "--config", str(config), "--log-level", "ERROR"]
+            try:
+                result = self.runner.run(
+                    command,
+                    log_prefix="rclone-storage-download-list",
+                    output_callback=self.log_callback,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
+                )
+            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                raise RcloneError("Worker tidak dapat membaca folder rclone.", code="RCLONE_ACCESS_FAILED") from exc
+            if result.returncode != 0:
+                raise RcloneError("Worker tidak dapat membaca folder rclone.", code=self._access_error_code(result) or "RCLONE_ACCESS_FAILED")
+            try:
+                entries = json.loads(getattr(result, "stdout", "") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
+            if not isinstance(entries, list):
+                raise RcloneError("Worker menerima listing rclone yang tidak valid.")
+            if len(entries) > 2000:
+                raise RcloneError(
+                    "Pilihan melebihi batas 2000 file.", code="STORAGE_SELECTION_TOO_LARGE"
+                )
+            folder_name = normalized.rsplit("/", 1)[-1]
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("IsDir") is True:
+                    continue
+                relative = str(entry.get("Path") or entry.get("Name") or "").replace("\\", "/")
+                parts = relative.split("/")
+                if not relative or relative.startswith("/") or any(
+                    not part or part in {".", ".."} or ":" in part for part in parts
+                ):
+                    raise RcloneError("Pilihan folder rclone berisi path file yang tidak valid.")
+                child_remote, _ = self._remote_path(
+                    destination, f"{normalized}/{relative}"
+                )
+                try:
+                    size = max(0, int(entry.get("Size") or 0))
+                except (TypeError, ValueError):
+                    size = None
+                relative_target = "/".join((folder_name, relative))
+                candidate = {
+                    "remote_path": child_remote,
+                    "relative_path": relative_target,
+                    "name": parts[-1],
+                    "size": size,
+                }
+                previous = files.get(child_remote)
+                if previous is None or len(relative_target) > len(str(previous["relative_path"])):
+                    files[child_remote] = candidate
+                if len(files) > 2000:
+                    raise RcloneError(
+                        "Pilihan melebihi batas 2000 file.", code="STORAGE_SELECTION_TOO_LARGE"
+                    )
+        return [files[key] for key in sorted(files)]
+
+    def download_file(
+        self,
+        remote_path: str,
+        destination_path: Path,
+        config_path: Path,
+        *,
+        config_root: Path,
+    ) -> None:
+        """Download one remote file to an isolated temporary path."""
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError("Konfigurasi rclone tidak tersedia untuk worker ini.") from exc
+        if not config.is_file() or shutil.which("rclone") is None:
+            raise RcloneError("Runtime rclone belum tersedia pada worker.", code="RCLONE_RUNTIME_UNAVAILABLE")
+        command = [
+            "rclone", "copyto", str(remote_path), str(destination_path),
+            "--config", str(config), "--log-level", "ERROR",
+        ]
+        try:
+            result = self.runner.run(
+                command,
+                log_prefix="rclone-storage-download",
+                output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except TDLStalledError as exc:
+            raise RcloneError(
+                "rclone download berhenti merespons.", code="RCLONE_DOWNLOAD_FAILED"
+            ) from exc
+        except TDLCommandError as exc:
+            raise RcloneError("rclone gagal mengunduh file.", code=self._access_error_code(exc) or "RCLONE_DOWNLOAD_FAILED") from exc
+        except OSError as exc:
+            raise RcloneError("Worker tidak dapat memulai proses rclone.", code="RCLONE_RUNTIME_UNAVAILABLE") from exc
+        if result.returncode != 0:
+            raise RcloneError("rclone gagal mengunduh file.", code=self._access_error_code(result) or "RCLONE_DOWNLOAD_FAILED")
+
     def target_file_exists(
         self, destination: str, remote_name: str, config_path: Path, *, config_root: Path
     ) -> bool:

@@ -606,6 +606,25 @@ class WorkerHttpDispatcher:
             timeout=45,
         )
 
+    def public_download_links(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "GET",
+            "/internal/v1/storage/download-links", timeout=30,
+        )
+
+    def revoke_public_download_link(self, worker: str, link_id: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "DELETE",
+            "/internal/v1/storage/download-links/" + quote(str(link_id), safe=""),
+            timeout=30,
+        )
+
     def storage_move_cleanup(
         self, worker: str, source_job_id: str, folder_path: str, relative_path: str,
     ) -> dict[str, Any]:

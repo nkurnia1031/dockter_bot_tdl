@@ -7,7 +7,7 @@ import {
 } from './profile-catalog';
 
 export type Session = { authenticated: boolean; actor?: { telegram_user_id: number; profile: string; worker_route: string }; profiles: string[] };
-export type SessionWorker = { name: string; url: string; enabled?: boolean; selected?: boolean };
+export type SessionWorker = { name: string; url: string; public_url?: string; enabled?: boolean; selected?: boolean };
 type ProfileCatalogLoad = {
   profiles: LocalProfileOption[];
   runtimeReadiness: RuntimeReadinessSnapshot;

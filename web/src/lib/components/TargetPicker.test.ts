@@ -49,4 +49,36 @@ describe('TargetPicker verified profile targets', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     expect(await screen.findByText(/remote-only · remote-1/)).toBeTruthy();
   });
+
+  it('can select a disabled worker for management while showing it as unavailable', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', url: 'http://worker-local', enabled: true },
+        { name: 'remote-1', url: 'https://worker.example', enabled: false }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({ profiles: [] }), { status: 200 });
+      return new Response('{}', { status: 404 });
+    }));
+
+    await session.restore();
+    render(TargetPicker, { props: {
+      purpose: 'storage',
+      requireProfile: false,
+      requiresVerification: false,
+      allowDisabledWorkerSelection: true
+    } });
+
+    const workerPicker = await screen.findByLabelText('Worker target') as HTMLSelectElement;
+    const disabledWorker = [...workerPicker.options].find((option) => option.value === 'remote-1');
+    expect(disabledWorker?.disabled).toBe(false);
+    await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
+    expect(workerPicker.value).toBe('remote-1');
+    expect(await screen.findByText('Worker nonaktif')).toBeTruthy();
+  });
 });

@@ -1917,6 +1917,7 @@ def register_workers(app, context, *, current_actor):
                 {
                     "name": name,
                     "url": value["url"],
+                    "public_url": str(value.get("public_url") or ""),
                     "enabled": bool(value.get("enabled", True)),
                     "selected": name
                     == context.profile_manager.worker_route(actor.profile),
@@ -2120,9 +2121,13 @@ def register_workers(app, context, *, current_actor):
     def add_worker(body: WorkerRequest, actor=Depends(current_actor)):
         del actor
         _ensure_unique_worker_token(context, name=body.name.strip().lower(), token=body.token)
-        name = context.worker_registry.upsert(
-            body.name, body.url, body.token, enabled=body.enabled
-        )
+        try:
+            name = context.worker_registry.upsert(
+                body.name, body.url, body.token, enabled=body.enabled,
+                public_url=body.public_url,
+            )
+        except ValueError as exc:
+            raise DomainError("WORKER_CONFIGURATION_INVALID", str(exc), status_code=422) from exc
         return {"name": name}
 
     @app.put("/api/v1/workers/{name}", response_model=ObjectResponse)
@@ -2135,6 +2140,18 @@ def register_workers(app, context, *, current_actor):
             raise DomainError(
                 "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
             )
+        public_url = body.public_url
+        if public_url is not None:
+            normalize_public_url = getattr(
+                context.worker_registry, "_normalize_public_url", None
+            )
+            if callable(normalize_public_url):
+                try:
+                    public_url = normalize_public_url(public_url)
+                except ValueError as exc:
+                    raise DomainError(
+                        "WORKER_CONFIGURATION_INVALID", str(exc), status_code=422
+                    ) from exc
         new_token = str(body.token or "").strip()
         if new_token:
             _ensure_unique_worker_token(context, name=str(name).strip().lower(), token=new_token)
@@ -2171,9 +2188,13 @@ def register_workers(app, context, *, current_actor):
                     status_code=502,
                 ) from exc
         token = new_token or str(current.get("token") or "")
-        updated_name = context.worker_registry.upsert(
-            name, body.url, token, enabled=body.enabled
-        )
+        try:
+            updated_name = context.worker_registry.upsert(
+                name, body.url, token, enabled=body.enabled,
+                public_url=public_url,
+            )
+        except ValueError as exc:
+            raise DomainError("WORKER_CONFIGURATION_INVALID", str(exc), status_code=422) from exc
         if rotated_token:
             # The worker's vault client must recheck its manifest using the
             # newly rotated runtime token after the registry commit.

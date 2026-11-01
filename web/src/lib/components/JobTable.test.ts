@@ -182,6 +182,47 @@ describe('JobTable', () => {
     expect(screen.getByText('Sumber: Dilewati · sumber berubah')).toBeTruthy();
   });
 
+  it('shows completed Storage download results per file in the report', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const job = {
+      id: 'storage-download-1', kind: 'storage_download', status: 'failed', profile: 'default', worker: 'remote-1',
+      created_at: '2026-10-14T00:00:00Z', updated_at: '2026-10-14T00:00:01Z',
+      result: { value: {
+        outcome: 'partial_failure', succeeded: 1, failed: 1, cancelled_items: 0, public_links_failed: 0,
+        items: [
+          { name: 'report.pdf', relative_path: 'Reports/2026/report.pdf', download_status: 'succeeded', link_status: 'succeeded', public_url: 'https://files.example.test/public/download/' + 'a'.repeat(43) },
+          { name: 'existing.zip', relative_path: 'Reports/existing.zip', download_status: 'failed', link_status: 'not_created', error: 'File tujuan sudah ada; file tidak ditimpa.' },
+        ],
+      } },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [job] }), { status: 200 });
+      if (url.endsWith('/jobs/storage-download-1')) return new Response(JSON.stringify(job), { status: 200 });
+      if (url.includes('/events') || url.includes('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'storage_download', view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+
+    expect(await screen.findByRole('region', { name: 'Hasil download per file' })).toBeTruthy();
+    expect(screen.getByText('Reports/2026/report.pdf')).toBeTruthy();
+    expect(screen.getByText('Download berhasil')).toBeTruthy();
+    expect(screen.getByText('Link siap')).toBeTruthy();
+    expect(screen.getByRole('link', { name: /files\.example\.test\/public\/download/ })).toBeTruthy();
+    expect(screen.getByText('File tujuan sudah ada; file tidak ditimpa.')).toBeTruthy();
+    expect(screen.getByText('Download gagal')).toBeTruthy();
+    expect(screen.queryByText(/^items$/)).toBeNull();
+  });
+
   it('lists and reopens safe Storage reconciliation results without exposing caption or path', async () => {
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
       configurable: true,

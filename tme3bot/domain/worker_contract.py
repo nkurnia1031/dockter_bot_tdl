@@ -24,6 +24,8 @@ CAP_SAFELINK_RESOLVE = "safelink_resolve.v1"
 CAP_BACKUP_VERIFY = "backup_channel_verify.v2"
 CAP_SHARED_EXPORT_CURSOR = "shared_export_cursor_v1"
 CAP_PROFILE_READINESS_CANARY = "profile_readiness.canary.v1"
+CAP_STORAGE_DOWNLOAD = "storage.download.v1"
+CAP_PUBLIC_DOWNLOAD_LINKS = "storage.public_download_links.v1"
 
 WORKER_API_CAPABILITIES = frozenset(
     {
@@ -38,6 +40,8 @@ WORKER_API_CAPABILITIES = frozenset(
         CAP_QUICKMODE_DELETE,
         CAP_BACKUP_VERIFY,
         CAP_PROFILE_READINESS_CANARY,
+        CAP_STORAGE_DOWNLOAD,
+        CAP_PUBLIC_DOWNLOAD_LINKS,
     }
 )
 WORKER_JOB_CAPABILITIES = frozenset({CAP_JOB_DISPATCH, CAP_JOB_EVENTS})

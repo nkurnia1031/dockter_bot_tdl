@@ -34,6 +34,12 @@
   );
   const eventLatency = $derived(observability.event_latency?.average_ms);
   const stageId = $derived(job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null));
+  const storageDownloadResult = $derived(job.result?.value || job.result || {});
+  const storageDownloadItems = $derived(
+    job.kind === 'storage_download' && Array.isArray(storageDownloadResult.items)
+      ? storageDownloadResult.items
+      : []
+  );
 </script>
 
 <article class="idm-row">
@@ -228,6 +234,36 @@
             <span>{itemPercent !== undefined ? `${itemPercent.toFixed(1)}%` : 'Sedang diproses'}</span>
           </div>
         </div>
+      {/if}
+
+      {#if storageDownloadItems.length}
+        <section class="mt-4" aria-label="Hasil download per file">
+          <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <b class="text-sm font-extrabold">Hasil per file</b>
+            <span class="muted text-xs">{storageDownloadResult.succeeded || 0} berhasil · {storageDownloadResult.failed || 0} gagal · {storageDownloadResult.cancelled_items || 0} dibatalkan</span>
+          </div>
+          <ul class="divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
+            {#each storageDownloadItems as item, index (`${item.relative_path || item.name || 'file'}:${index}`)}
+              <li class="flex flex-wrap items-start gap-3 p-3 text-sm">
+                <div class="min-w-0 flex-1">
+                  <b class="block break-all">{item.name || 'File'}</b>
+                  {#if item.relative_path && item.relative_path !== item.name}<small class="muted block break-all">{item.relative_path}</small>{/if}
+                  {#if item.error}<small class="mt-1 block text-rose-700 dark:text-rose-300">{item.error}</small>{/if}
+                  {#if item.public_url}<a class="mt-1 block break-all text-violet-700 underline dark:text-violet-300" href={item.public_url} target="_blank" rel="noopener noreferrer">{item.public_url}</a>{/if}
+                </div>
+                <div class="flex shrink-0 flex-col items-end gap-1 text-xs">
+                  <span class={item.download_status === 'succeeded' ? 'font-bold text-emerald-700 dark:text-emerald-300' : item.download_status === 'cancelled' ? 'font-bold text-amber-700 dark:text-amber-300' : 'font-bold text-rose-700 dark:text-rose-300'}>
+                    {item.download_status === 'succeeded' ? 'Download berhasil' : item.download_status === 'cancelled' ? 'Dibatalkan' : 'Download gagal'}
+                  </span>
+                  {#if item.link_status === 'succeeded'}<span class="font-semibold text-emerald-700 dark:text-emerald-300">Link siap</span>
+                  {:else if item.link_status === 'failed'}<span class="font-semibold text-rose-700 dark:text-rose-300">Link gagal dibuat</span>
+                  {:else if item.link_status === 'not_created'}<span class="muted">Link tidak dibuat</span>
+                  {:else if item.link_status === 'not_requested'}<span class="muted">Tanpa link publik</span>{/if}
+                </div>
+              </li>
+            {/each}
+          </ul>
+        </section>
       {/if}
 
       <!-- Detailed 5 Metrics -->

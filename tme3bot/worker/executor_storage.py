@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import mimetypes
+import os
+import shutil
 import tempfile
 import queue
 import threading
@@ -9,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import (
     Path,
+    PurePosixPath,
 )
 from tme3bot.progress_reporter import (
     ProgressReporter,
@@ -37,6 +40,12 @@ from .executor_support import (
     storage_logical_folder,
     storage_relative_folders,
 )
+
+class _StorageDownloadFailure(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = str(code or "STORAGE_DOWNLOAD_FAILED").strip().upper()
+        super().__init__(message)
+
 
 class StorageExecutorMixin:
 
@@ -1571,6 +1580,485 @@ class StorageExecutorMixin:
             "provider": "telegram",
             "uploaded_items": uploaded_items,
         }
+
+    def _storage_download(self, command: dict[str, Any]) -> dict[str, Any]:
+        """Download a selected Telegram or rclone batch into Workspace safely."""
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        job_id = str(command.get("job_id") or "")
+        provider = str(payload.get("provider") or "").strip().lower()
+        if provider not in {"telegram", "rclone"}:
+            raise _StorageDownloadFailure("STORAGE_PROVIDER_INVALID", "Sumber unduhan tidak valid.")
+
+        try:
+            destination = self._workspace_path(
+                str(payload.get("destination_path") or ""), require_absolute=True
+            )
+        except (OSError, ValueError) as exc:
+            raise _StorageDownloadFailure(
+                "STORAGE_DOWNLOAD_DESTINATION_INVALID", "Folder tujuan Workspace tidak valid."
+            ) from exc
+        if not destination.is_dir() or destination.is_symlink():
+            raise _StorageDownloadFailure(
+                "STORAGE_DOWNLOAD_DESTINATION_INVALID", "Folder tujuan Workspace tidak tersedia."
+            )
+
+        if provider == "telegram":
+            profile = str(command.get("profile") or "").strip().lower()
+            if not profile:
+                raise _StorageDownloadFailure("PROFILE_REQUIRED", "Profil Telegram belum dipilih.")
+            available = getattr(self.profile_manager, "tdl_session_available", None)
+            if callable(available) and available(profile, "download") is not True:
+                raise _StorageDownloadFailure(
+                    "PROFILE_SESSION_UNAVAILABLE", "Lane Download profil tidak tersedia pada worker."
+                )
+            try:
+                runtime = self.profile_manager.runtime(profile)
+            except Exception as exc:
+                raise _StorageDownloadFailure(
+                    "PROFILE_SESSION_UNAVAILABLE", "Lane Download profil tidak tersedia pada worker."
+                ) from exc
+            target_chat = str(payload.get("tdl_access_target") or "").strip()
+            if not target_chat:
+                raise _StorageDownloadFailure(
+                    "TDL_ACCESS_TARGET_UNAVAILABLE", "Tujuan Telegram Storage tidak tersedia."
+                )
+            raw_files = payload.get("files")
+            files = [item for item in raw_files if isinstance(item, dict)] if isinstance(raw_files, list) else []
+            if not files:
+                raise _StorageDownloadFailure("STORAGE_SELECTION_EMPTY", "Pilihan tidak berisi file.")
+            client = runtime.download_tdl_client
+            config_path = None
+            config_root = None
+        else:
+            profile = ""
+            runtime = None
+            client = None
+            raw_sources = payload.get("rclone_sources")
+            sources = [item for item in raw_sources if isinstance(item, dict)] if isinstance(raw_sources, list) else []
+            if not sources:
+                raise _StorageDownloadFailure("STORAGE_SELECTION_EMPTY", "Pilih file atau folder rclone.")
+            config_path = Path(
+                getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+            ).resolve()
+            config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+            rclone_destination = str(payload.get("rclone_destination") or "").strip()
+            if not rclone_destination:
+                raise RcloneError("Root rclone tidak tersedia.", code="RCLONE_RUNTIME_UNAVAILABLE")
+            files = []
+
+        reporter = ProgressReporter(self.publisher, job_id)
+        if provider == "rclone":
+            reporter.report(
+                phase="listing",
+                message="Membaca file pilihan dari rclone",
+                indeterminate=True,
+                force=True,
+            )
+            runner = RcloneRunner(
+                log_callback=self._append_job_log,
+                command_callback=self._command_callback(),
+                stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
+                cancel_check=lambda: self._storage_download_cancelled(job_id),
+            )
+            with self._lock:
+                self._rclone_runners[job_id] = runner
+            try:
+                files = runner.list_download_files(
+                    rclone_destination,
+                    sources,
+                    config_path,
+                    config_root=config_root,
+                )
+            except RcloneError:
+                raise
+            except Exception as exc:
+                raise RcloneError(
+                    "Worker tidak dapat membaca pilihan rclone.", code="RCLONE_ACCESS_FAILED"
+                ) from exc
+            if not files:
+                raise _StorageDownloadFailure(
+                    "STORAGE_SELECTION_EMPTY", "Pilihan rclone tidak berisi file."
+                )
+
+        if len(files) > 2000:
+            raise _StorageDownloadFailure(
+                "STORAGE_SELECTION_TOO_LARGE", "Pilihan melebihi batas 2000 file."
+            )
+
+        total = len(files)
+        total_bytes = sum(
+            max(0, int(item.get("file_size") or item.get("size") or 0))
+            for item in files
+        )
+        succeeded = 0
+        failed: list[dict[str, Any]] = []
+        public_links_failed = 0
+        results: list[dict[str, Any]] = []
+        processed_indexes: set[int] = set()
+        publish_links = payload.get("publish_public_links") is True
+        public_base_url = str(payload.get("public_base_url") or "").strip()
+        completed_bytes = 0
+
+        reporter.report(
+            phase="downloading",
+            message=f"Menyiapkan {total} file untuk diunduh",
+            overall={"current": 0, "total": total, "percent": 0, "unit": "files", "bytes_total": total_bytes},
+            counters={"succeeded": 0, "failed": 0},
+            force=True,
+        )
+
+        with tempfile.TemporaryDirectory(prefix=".storage-download-", dir=destination) as raw_staging:
+            staging_root = Path(raw_staging)
+            tdl_lock = runtime.download_operation_lock if provider == "telegram" else None
+            lock_held = False
+            if tdl_lock is not None:
+                tdl_lock.acquire()
+                lock_held = True
+            previous_callbacks: tuple[Any, Any] | None = None
+            if client is not None:
+                previous_callbacks = (
+                    getattr(client, "output_callback", None),
+                    getattr(client, "command_callback", None),
+                )
+                client.output_callback = None
+                client.command_callback = None
+            try:
+                for index, item in enumerate(files, start=1):
+                    if self._storage_download_cancelled(job_id):
+                        break
+                    name = str(item.get("name") or "File")[:255]
+                    relative = str(item.get("relative_path") or name).replace("\\", "/")
+                    raw_parts = relative.split("/")
+                    relative_path = PurePosixPath(relative)
+                    if (
+                        not relative
+                        or relative_path.is_absolute()
+                        or any(part in {"", ".", ".."} or ":" in part for part in raw_parts)
+                        or "\\" in str(item.get("relative_path") or "")
+                        or any(ord(char) < 32 for char in relative)
+                    ):
+                        failed.append({
+                            "name": name,
+                            "relative_path": relative[:512],
+                            "download_status": "failed",
+                            "link_status": "not_requested" if not publish_links else "not_created",
+                            "error_code": "STORAGE_DOWNLOAD_PATH_INVALID",
+                        })
+                        results.append(failed[-1])
+                        processed_indexes.add(index)
+                        continue
+
+                    target = destination.joinpath(*relative_path.parts)
+                    stage = staging_root / f"{index:05d}"
+                    stage.mkdir(parents=True, exist_ok=True)
+                    stage_file: Path | None = None
+                    item_error_code = "STORAGE_DOWNLOAD_FILE_FAILED"
+                    item_error_message = "File tidak dapat diunduh dari sumber."
+                    cancelled_current = False
+                    reporter.report(
+                        phase="downloading",
+                        message=f"Mengunduh {name}",
+                        overall={
+                            "current": index - 1,
+                            "total": total,
+                            "percent": (index - 1) * 100 / total if total else 100,
+                            "unit": "files",
+                            "bytes_current": completed_bytes,
+                            "bytes_total": total_bytes,
+                        },
+                        item={"name": name, "index": index, "total": total, "percent": None},
+                        counters={"succeeded": succeeded, "failed": len(failed)},
+                        indeterminate=True,
+                        force=True,
+                    )
+                    try:
+                        if provider == "telegram":
+                            message_id = int(item.get("channel_message_id") or 0)
+                            if message_id < 1:
+                                raise _StorageDownloadFailure(
+                                    "STORAGE_MESSAGE_ID_INVALID", "ID pesan Telegram katalog tidak valid."
+                                )
+                            export_path = stage / "selected-message.json"
+                            exported = client.export_messages(
+                                target_chat,
+                                message_id,
+                                export_path,
+                                with_content=True,
+                                end_id=message_id,
+                            )
+                            message_rows = getattr(exported, "messages", None)
+                            if not isinstance(message_rows, list) or not any(
+                                isinstance(row, dict)
+                                and int(row.get("id") or 0) == message_id
+                                and has_downloadable_media(row)
+                                for row in message_rows
+                            ):
+                                raise _StorageDownloadFailure(
+                                    "STORAGE_MESSAGE_MEDIA_MISSING", "Pesan Telegram tidak berisi file yang dapat diunduh."
+                                )
+
+                            def tdl_progress(progress) -> None:
+                                try:
+                                    transfer = reporter.tdl_transfer(
+                                        progress,
+                                        total_bytes=int(item.get("file_size") or 0) or None,
+                                    )
+                                    reporter.report(
+                                        phase="downloading",
+                                        message=f"Mengunduh {name}",
+                                        overall={
+                                            "current": index - 1,
+                                            "total": total,
+                                            "percent": (index - 1) * 100 / total if total else 100,
+                                            "unit": "files",
+                                            "bytes_current": completed_bytes,
+                                            "bytes_total": total_bytes,
+                                        },
+                                        item={
+                                            "name": name,
+                                            "index": index,
+                                            "total": total,
+                                            "percent": getattr(progress, "percent", None),
+                                        },
+                                        transfer=transfer,
+                                        counters={"succeeded": succeeded, "failed": len(failed)},
+                                    )
+                                except Exception:
+                                    LOGGER.warning("Could not publish Storage download progress for %s", job_id, exc_info=True)
+
+                            with self._capture_tdl_progress(client, tdl_progress):
+                                client.download(export_path, stage)
+                            media_files = [
+                                path for path in stage.iterdir()
+                                if path.is_file() and not path.is_symlink() and path.name != export_path.name
+                            ]
+                            if len(media_files) != 1:
+                                raise _StorageDownloadFailure(
+                                    "STORAGE_DOWNLOAD_OUTPUT_INVALID", "TDL tidak menghasilkan tepat satu file untuk item ini."
+                                )
+                            stage_file = media_files[0]
+                        else:
+                            remote_path = str(item.get("remote_path") or "").strip()
+                            if not remote_path:
+                                raise RcloneError("Path rclone tidak valid.", code="RCLONE_DOWNLOAD_FAILED")
+                            stage_file = stage / "download.part"
+                            runner.download_file(
+                                remote_path,
+                                stage_file,
+                                config_path,
+                                config_root=config_root,
+                            )
+                            if not stage_file.is_file() or stage_file.is_symlink():
+                                raise RcloneError("rclone tidak menghasilkan file lokal.", code="RCLONE_DOWNLOAD_FAILED")
+
+                        if self._storage_download_cancelled(job_id):
+                            raise _StorageDownloadFailure(
+                                "JOB_CANCELLED", "Unduhan dihentikan oleh operator."
+                            )
+                        current_parent = destination
+                        for part in relative_path.parts[:-1]:
+                            current_parent = current_parent / part
+                            if current_parent.is_symlink():
+                                raise _StorageDownloadFailure(
+                                    "STORAGE_DOWNLOAD_PATH_UNSAFE", "Folder tujuan berisi symbolic link."
+                                )
+                            current_parent.mkdir(exist_ok=True)
+                            if not current_parent.is_dir():
+                                raise _StorageDownloadFailure(
+                                    "STORAGE_DOWNLOAD_PATH_UNSAFE", "Path tujuan bukan folder."
+                                )
+                        if target.is_symlink() or target.exists():
+                            raise FileExistsError
+                        try:
+                            os.link(stage_file, target)
+                        except FileExistsError:
+                            raise
+                        except OSError:
+                            # Exclusive creation is a safe fallback on filesystems
+                            # that do not support hard links.
+                            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                            try:
+                                with os.fdopen(descriptor, "wb") as output, stage_file.open("rb") as source:
+                                    shutil.copyfileobj(source, output, length=1024 * 1024)
+                            except Exception:
+                                target.unlink(missing_ok=True)
+                                raise
+                        actual_size = target.stat().st_size
+                        completed_bytes += actual_size
+                        succeeded += 1
+                        record: dict[str, Any] = {
+                            "name": name,
+                            "relative_path": relative_path.as_posix(),
+                            "download_status": "succeeded",
+                            "size": actual_size,
+                            "link_status": "not_requested" if not publish_links else "failed",
+                        }
+                        if publish_links:
+                            try:
+                                link = self.create_storage_download_link(
+                                    str(target),
+                                    public_base_url=public_base_url,
+                                    job_id=job_id,
+                                    provider=provider,
+                                )
+                                record.update(
+                                    link_status="succeeded",
+                                    public_url=f"{str(link['public_base_url']).rstrip('/')}/public/download/{link['token']}",
+                                    public_link_id=str(link["id"]),
+                                )
+                            except Exception:
+                                public_links_failed += 1
+                                record.update(
+                                    link_status="failed",
+                                    link_error_code="PUBLIC_DOWNLOAD_CREATE_FAILED",
+                                )
+                        results.append(record)
+                    except FileExistsError:
+                        if self._storage_download_cancelled(job_id):
+                            cancelled_current = True
+                        else:
+                            item_error_code = "STORAGE_DOWNLOAD_CONFLICT"
+                            item_error_message = "File tujuan sudah ada; file tidak ditimpa."
+                    except RcloneError as exc:
+                        if self._storage_download_cancelled(job_id):
+                            cancelled_current = True
+                        else:
+                            item_error_code = exc.code or "RCLONE_DOWNLOAD_FAILED"
+                            item_error_message = "File gagal diunduh dari rclone."
+                            if item_error_code in {"RCLONE_RUNTIME_UNAVAILABLE", "RCLONE_ACCESS_FAILED"}:
+                                raise
+                    except _StorageDownloadFailure as exc:
+                        if self._storage_download_cancelled(job_id):
+                            cancelled_current = True
+                        else:
+                            item_error_code = exc.code
+                            item_error_message = str(exc)
+                            if item_error_code in {
+                                "PROFILE_SESSION_UNAVAILABLE",
+                                "TDL_ACCESS_TARGET_UNAVAILABLE",
+                            }:
+                                raise
+                    except Exception as exc:
+                        if self._storage_download_cancelled(job_id):
+                            cancelled_current = True
+                        else:
+                            item_error_code = (
+                                tdl_session_denial_code(exc)
+                                or "STORAGE_DOWNLOAD_FILE_FAILED"
+                            )
+                            if item_error_code != "STORAGE_DOWNLOAD_FILE_FAILED":
+                                raise _StorageDownloadFailure(
+                                    item_error_code,
+                                    "Sesi Telegram atau akses channel tidak lagi siap.",
+                                ) from exc
+                    else:
+                        processed_indexes.add(index)
+                        reporter.milestone(
+                            "storage.download_item_completed",
+                            progress={
+                                "phase": "downloading",
+                                "overall": {"current": index, "total": total, "unit": "files"},
+                                "item": {"name": name, "index": index, "total": total, "percent": 100},
+                                "counters": {"succeeded": succeeded, "failed": len(failed)},
+                            },
+                            result={"name": name, "download_status": "succeeded"},
+                        )
+                        continue
+
+                    if cancelled_current:
+                        results.append({
+                            "name": name,
+                            "relative_path": relative_path.as_posix(),
+                            "download_status": "cancelled",
+                            "link_status": "not_created" if publish_links else "not_requested",
+                        })
+                        processed_indexes.add(index)
+                        break
+
+                    failed_item = {
+                        "name": name,
+                        "relative_path": relative_path.as_posix(),
+                        "download_status": "failed",
+                        "link_status": "not_created" if publish_links else "not_requested",
+                        "error_code": item_error_code,
+                        "error": item_error_message,
+                    }
+                    failed.append(failed_item)
+                    results.append(failed_item)
+                    processed_indexes.add(index)
+                    reporter.milestone(
+                        "storage.download_item_failed",
+                        progress={
+                            "phase": "downloading",
+                            "overall": {"current": index, "total": total, "unit": "files"},
+                            "item": {"name": name, "index": index, "total": total},
+                            "counters": {"succeeded": succeeded, "failed": len(failed)},
+                        },
+                        error={"code": item_error_code, "message": item_error_message},
+                    )
+            finally:
+                if client is not None and previous_callbacks is not None:
+                    client.output_callback, client.command_callback = previous_callbacks
+                if lock_held:
+                    tdl_lock.release()
+
+        cancelled = self._storage_download_cancelled(job_id)
+        if cancelled:
+            for index, item in enumerate(files, start=1):
+                if index in processed_indexes:
+                    continue
+                name = str(item.get("name") or "File")[:255]
+                relative = str(item.get("relative_path") or name).replace("\\", "/")
+                results.append({
+                    "name": name,
+                    "relative_path": relative[:512],
+                    "download_status": "cancelled",
+                    "link_status": "not_created" if publish_links else "not_requested",
+                })
+        cancelled_items = sum(
+            1 for item in results if item.get("download_status") == "cancelled"
+        )
+        if provider == "rclone":
+            with self._lock:
+                self._rclone_runners.pop(job_id, None)
+        outcome = (
+            "partial_failure" if failed and succeeded
+            else "failed" if failed
+            else "succeeded"
+        )
+        reporter.report(
+            phase="cancelled" if cancelled else "completed",
+            message=(
+                f"Dibatalkan: {succeeded} file selesai, {len(failed)} gagal"
+                if cancelled
+                else f"Unduhan selesai: {succeeded} berhasil, {len(failed)} gagal"
+            ),
+            overall={
+                "current": succeeded + len(failed) + cancelled_items,
+                "total": total,
+                "percent": (succeeded + len(failed) + cancelled_items) * 100 / total if total else 100,
+                "unit": "files",
+                "bytes_current": completed_bytes,
+                "bytes_total": total_bytes,
+            },
+            counters={"succeeded": succeeded, "failed": len(failed), "cancelled": cancelled_items},
+            force=True,
+        )
+        return {
+            "outcome": outcome,
+            "provider": provider,
+            "total": total,
+            "succeeded": succeeded,
+            "failed": len(failed),
+            "cancelled_items": cancelled_items,
+            "public_links_failed": public_links_failed,
+            "cancelled": cancelled,
+            "items": results,
+        }
+
+    def _storage_download_cancelled(self, job_id: str) -> bool:
+        with self._lock:
+            return job_id in self._cancel_requested
 
     def _storage_upload_parallel(
         self,

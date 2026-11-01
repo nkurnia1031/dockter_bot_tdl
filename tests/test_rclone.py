@@ -23,6 +23,69 @@ class FakeSubprocessRunner:
 
 
 class RcloneRunnerTests(unittest.TestCase):
+    def test_folder_download_expansion_keeps_structure_for_overlapping_file_selections(self):
+        class RecursiveListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([
+                        {"Path": "sub/part.bin", "Name": "part.bin", "IsDir": False, "Size": 7},
+                    ]),
+                    stderr="",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            expected = [{
+                "remote_path": "remote:backup/archive/sub/part.bin",
+                "relative_path": "archive/sub/part.bin",
+                "name": "part.bin",
+                "size": 7,
+            }]
+            for selections in (
+                [
+                    {"path": "archive", "is_dir": True},
+                    {"path": "archive/sub/part.bin", "is_dir": False},
+                ],
+                [
+                    {"path": "archive/sub/part.bin", "is_dir": False},
+                    {"path": "archive", "is_dir": True},
+                ],
+            ):
+                fake = RecursiveListingRunner()
+                with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                    result = RcloneRunner(fake).list_download_files(
+                        "remote:backup", selections, config, config_root=root,
+                    )
+                self.assertEqual(result, expected)
+                self.assertEqual(len(fake.commands), 1)
+                self.assertIn("--recursive", fake.commands[0][0])
+
+    def test_download_file_uses_copyto_for_one_exact_remote_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            target = root / "download.part"
+
+            class DownloadRunner(FakeSubprocessRunner):
+                def run(self, command, **kwargs):
+                    self.commands.append((command, kwargs))
+                    Path(command[3]).write_bytes(b"downloaded")
+                    return SimpleNamespace(returncode=0)
+
+            fake = DownloadRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                RcloneRunner(fake).download_file(
+                    "remote:backup/a.bin", target, config, config_root=root,
+                )
+
+            self.assertEqual(target.read_bytes(), b"downloaded")
+            self.assertEqual(fake.commands[0][0][1:4], ["copyto", "remote:backup/a.bin", str(target)])
+
     def test_list_directory_is_read_only_searchable_sorted_and_paginated(self):
         class ListingRunner(FakeSubprocessRunner):
             def run(self, command, **kwargs):

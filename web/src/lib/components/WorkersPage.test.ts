@@ -1,5 +1,5 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { apiMock, postMock } = vi.hoisted(() => ({
   apiMock: vi.fn(),
@@ -61,6 +61,8 @@ function setupApi() {
 }
 
 describe('WorkersPage TTS health controls', () => {
+  afterEach(cleanup);
+
   beforeEach(() => {
     vi.clearAllMocks();
     setupApi();
@@ -85,5 +87,26 @@ describe('WorkersPage TTS health controls', () => {
     ));
     expect(apiMock.mock.calls.filter(([path]) => path.endsWith('/tts/health'))).toHaveLength(1);
     expect(await screen.findByText(/Periksa ulang status secara manual/)).toBeTruthy();
+  });
+
+  it('stores a separate HTTPS public origin for file links', async () => {
+    render(WorkersPage);
+    await screen.findByText('remote-tts');
+
+    await fireEvent.input(screen.getByPlaceholderText('remote-1'), { target: { value: 'remote-files' } });
+    const urlInputs = screen.getAllByPlaceholderText('https://worker.example.com');
+    await fireEvent.input(urlInputs[0], { target: { value: 'http://worker-api:8080' } });
+    await fireEvent.input(urlInputs[1], { target: { value: 'https://files.example.test' } });
+    await fireEvent.input(screen.getByLabelText('Token'), { target: { value: 'worker-token-value' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Tambahkan worker' }));
+
+    await waitFor(() => expect(postMock).toHaveBeenCalledWith('/workers', {
+      name: 'remote-files',
+      url: 'http://worker-api:8080',
+      public_url: 'https://files.example.test',
+      token: 'worker-token-value',
+    }));
+    expect(await screen.findByText(/Domain link publik: belum diatur/)).toBeTruthy();
   });
 });

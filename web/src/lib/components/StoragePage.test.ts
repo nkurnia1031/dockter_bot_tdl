@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import StoragePage from './StoragePage.svelte';
 import { session } from '../session.svelte';
 
@@ -145,6 +145,191 @@ describe('Storage file manager', () => {
     expect(await screen.findByRole('heading', { name: 'Upload folder workspace' })).toBeTruthy();
     expect((screen.getByRole('button', { name: 'Mulai upload' }) as HTMLButtonElement).disabled).toBe(true);
   }, 15000);
+
+  it('submits a Telegram download only for a saved Download-ready profile and selected Workspace target', async () => {
+    enableDialogMethods();
+    const requests: {url:string;method:string;body?:string}[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url = new URL(String(input), 'https://ui.test');
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({url:url.pathname,method,body:typeof init?.body==='string'?init.body:undefined});
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{
+        name:'local',url:'http://worker',public_url:'https://files.worker.test',enabled:true,
+      }]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']}],runtime_readiness:{checked_at:'2026-11-01T00:00:00Z',workers:[
+          {name:'local',status:'success',checked_at:'2026-11-01T00:00:00Z',reason_code:''},
+        ],cells:[
+          {worker:'local',profile:null,runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'local',profile:'default',runtime:'download',status:'ready',checked_at:'now',reason_code:''},
+        ]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({
+        current_folder:null,breadcrumbs:[],folders:[],
+        items:[{id:9,display_name:'report.pdf',original_name:'report.pdf',file_size:10,status:'active'}],
+        total_folders:0,total_items:1,
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[
+        {name:'downloads',path:'/workspace/downloads',kind:'directory',files:0,directories:0},
+      ]}),{status:200});
+      if (url.pathname.endsWith('/storage/download-links')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/jobs/metrics')) return new Response(JSON.stringify({}),{status:200});
+      if (url.pathname.endsWith('/jobs')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/downloads') && method==='POST') return new Response(JSON.stringify({id:'telegram-download-job'}),{status:200});
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+
+    await screen.findByText('report.pdf');
+    await fireEvent.click(screen.getByRole('button',{name:'Pilih semua'}));
+    await fireEvent.click(screen.getByRole('button',{name:/Download/}));
+    expect(await screen.findByRole('heading',{name:'Download ke worker'})).toBeTruthy();
+    expect(screen.getByLabelText('Profil dengan lane Download siap')).toBeTruthy();
+    await fireEvent.click(await screen.findByRole('radio',{name:'Pilih downloads'}));
+    await fireEvent.click(screen.getByRole('checkbox',{name:/Buat link publik tanpa kedaluwarsa/}));
+    await fireEvent.click(screen.getByRole('button',{name:'Mulai download'}));
+
+    await waitFor(() => expect(requests.some((request)=>request.url.endsWith('/storage/downloads')&&request.method==='POST')).toBe(true));
+    const submitted=requests.find((request)=>request.url.endsWith('/storage/downloads')&&request.method==='POST');
+    expect(JSON.parse(submitted?.body||'{}')).toEqual({
+      provider:'telegram',worker:'local',profile:'default',item_ids:[9],folder_ids:[],
+      destination_path:'/workspace/downloads',publish_public_links:true,
+    });
+  },15000);
+
+  it('supports rclone folder downloads and confirmed revoke from the public link list', async () => {
+    enableDialogMethods();
+    const requests: {url:string;method:string;body?:string}[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url = new URL(String(input), 'https://ui.test');
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({url:url.pathname,method,body:typeof init?.body==='string'?init.body:undefined});
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{
+        name:'local',url:'http://worker',public_url:'https://files.worker.test',enabled:true,
+      }]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']}],runtime_readiness:{checked_at:'2026-11-01T00:00:00Z',workers:[
+          {name:'local',status:'success',checked_at:'2026-11-01T00:00:00Z',reason_code:''},
+        ],cells:[
+          {worker:'local',profile:null,runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'local',profile:null,runtime:'rclone_storage',status:'ready',checked_at:'now',reason_code:''},
+        ]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[
+        {name:'downloads',path:'/workspace/downloads',kind:'directory',files:0,directories:0},
+      ]}),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/browser')) return new Response(JSON.stringify({
+        path:'',breadcrumbs:[],items:[{name:'archive',path:'archive',is_dir:true,size:0,updated_at:'now'}],total:1,limit:100,offset:0,
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/download-links')) return new Response(JSON.stringify({items:[{
+        id:'7d844860-0de4-4ef2-9f20-503b43cd9942',worker:'local',relative_path:'archive/old.zip',file_name:'old.zip',provider:'rclone',job_id:'old-job',created_at:'2026-11-01T00:00:00Z',url:'https://files.worker.test/public/download/'+ 'a'.repeat(43),
+      }]}),{status:200});
+      if (url.pathname.endsWith('/jobs/metrics')) return new Response(JSON.stringify({}),{status:200});
+      if (url.pathname.endsWith('/jobs')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/downloads') && method==='POST') return new Response(JSON.stringify({id:'rclone-download-job'}),{status:200});
+      if (url.pathname.includes('/storage/download-links/') && method==='POST') return new Response(JSON.stringify({cleanup_status:'deleted'}),{status:200});
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+
+    expect(await screen.findByText('old.zip')).toBeTruthy();
+    expect(await screen.findByText('archive/old.zip')).toBeTruthy();
+    await fireEvent.click(screen.getByRole('tab',{name:'Rclone'}));
+    await screen.findByRole('checkbox',{name:'Pilih folder archive'});
+    await fireEvent.click(screen.getByRole('checkbox',{name:'Pilih folder archive'}));
+    await fireEvent.click(screen.getByRole('button',{name:'Download 1 dipilih'}));
+    expect(await screen.findByRole('heading',{name:'Download ke worker'})).toBeTruthy();
+    expect(screen.queryByLabelText('Profil dengan lane Download siap')).toBeNull();
+    await fireEvent.click(await screen.findByRole('radio',{name:'Pilih downloads'}));
+    await fireEvent.click(screen.getByRole('checkbox',{name:/Buat link publik tanpa kedaluwarsa/}));
+    await fireEvent.click(screen.getByRole('button',{name:'Mulai download'}));
+
+    await waitFor(() => expect(requests.some((request)=>request.url.endsWith('/storage/downloads')&&request.method==='POST')).toBe(true));
+    const submitted=requests.find((request)=>request.url.endsWith('/storage/downloads')&&request.method==='POST');
+    expect(JSON.parse(submitted?.body||'{}')).toEqual({
+      provider:'rclone',worker:'local',rclone_sources:[{path:'archive',is_dir:true}],
+      destination_path:'/workspace/downloads',publish_public_links:true,
+    });
+
+    await fireEvent.click(screen.getAllByRole('button',{name:'Cabut & hapus file'})[0]);
+    expect(await screen.findByRole('heading',{name:'Cabut link dan hapus file worker?'})).toBeTruthy();
+    await fireEvent.click(screen.getAllByRole('button',{name:'Cabut & hapus file'})[1]);
+    await waitFor(() => expect(requests.some((request)=>request.url.includes('/storage/download-links/')&&request.method==='POST')).toBe(true));
+    const revoke=requests.find((request)=>request.url.includes('/storage/download-links/')&&request.method==='POST');
+    expect(JSON.parse(revoke?.body||'{}')).toEqual({confirmed:true});
+  },15000);
+
+  it('keeps public link management available for a disabled worker without enabling downloads', async () => {
+    enableDialogMethods();
+    const requests: {url:string;method:string;body?:string}[] = [];
+    let revoked = false;
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url = new URL(String(input), 'https://ui.test');
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({url:url.pathname + url.search,method,body:typeof init?.body==='string'?init.body:undefined});
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[
+        {name:'local',url:'http://worker-local',public_url:'https://local.files.test',enabled:true},
+        {name:'remote-1',url:'http://worker-remote',public_url:'https://remote.files.test',enabled:false},
+      ]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local') || url.pathname.endsWith('/profiles/remote-1')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local','remote-1']}],
+        runtime_readiness:{checked_at:'2026-11-01T00:00:00Z',workers:[
+          {name:'local',status:'success',checked_at:'now',reason_code:''},
+          {name:'remote-1',status:'success',checked_at:'now',reason_code:''},
+        ],cells:[
+          {worker:'local',profile:null,runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'remote-1',profile:null,runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'remote-1',profile:null,runtime:'rclone_storage',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'remote-1',profile:'default',runtime:'download',status:'ready',checked_at:'now',reason_code:''},
+        ]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/download-links')) return new Response(JSON.stringify({items:
+        url.searchParams.get('worker')==='remote-1' && !revoked ? [{
+          id:'disabled-worker-link',worker:'remote-1',relative_path:'archive/retained.zip',file_name:'retained.zip',provider:'telegram',job_id:'old-job',created_at:'2026-11-01T00:00:00Z',url:'https://remote.files.test/public/download/token',
+        }] : []
+      }),{status:200});
+      if (url.pathname.includes('/storage/download-links/') && method==='POST') {
+        revoked = true;
+        return new Response(JSON.stringify({cleanup_status:'deleted'}),{status:200});
+      }
+      if (url.pathname.endsWith('/jobs/metrics')) return new Response(JSON.stringify({}),{status:200});
+      if (url.pathname.endsWith('/jobs')) return new Response(JSON.stringify({items:[]}),{status:200});
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+
+    const workerPicker = await screen.findByLabelText('Worker target') as HTMLSelectElement;
+    await fireEvent.change(workerPicker, {target:{value:'remote-1'}});
+    expect(await screen.findByText('retained.zip')).toBeTruthy();
+    expect(await screen.findByText('Worker nonaktif')).toBeTruthy();
+    expect(requests.some((request)=>request.url==='/api/v1/storage/download-links?worker=remote-1')).toBe(true);
+    await fireEvent.click(screen.getByRole('tab',{name:'Rclone'}));
+    expect((await screen.findByRole('button',{name:'Upload ke folder ini'}) as HTMLButtonElement).disabled).toBe(true);
+    expect(requests.some((request)=>request.url.startsWith('/api/v1/storage/downloads')&&request.method==='POST')).toBe(false);
+
+    await fireEvent.click(screen.getByRole('button',{name:'Cabut & hapus file'}));
+    expect(await screen.findByRole('heading',{name:'Cabut link dan hapus file worker?'})).toBeTruthy();
+    await fireEvent.click(screen.getAllByRole('button',{name:'Cabut & hapus file'})[1]);
+    await waitFor(() => expect(requests.some((request)=>request.url.includes('/storage/download-links/disabled-worker-link/revoke?worker=remote-1')&&request.method==='POST')).toBe(true));
+  },15000);
 
   it('syncs the selected worker using only a profile with ready Storage and Upload evidence', async () => {
     enableDialogMethods();

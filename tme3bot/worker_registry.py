@@ -4,6 +4,7 @@ import json
 import re
 import threading
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from tme3bot.persistence import write_json_atomic_private
 
@@ -56,7 +57,8 @@ class WorkerRegistry:
         return self.list().get(normalize_worker_name(name))
 
     def upsert(
-        self, name: str, url: str, token: str, enabled: bool | None = None
+        self, name: str, url: str, token: str, enabled: bool | None = None,
+        public_url: str | None = None,
     ) -> str:
         name = normalize_worker_name(name)
         url, token = url.strip().rstrip("/"), token.strip()
@@ -66,6 +68,9 @@ class WorkerRegistry:
             raise ValueError("URL worker harus dimulai http:// atau https://.")
         if not token:
             raise ValueError("Token worker wajib diisi.")
+        current_public_url = self._normalize_public_url(
+            str(public_url if public_url is not None else "").strip()
+        ) if public_url is not None else None
         with self._lock:
             workers = self._read_locked()
             current = workers.get(name, {})
@@ -74,6 +79,11 @@ class WorkerRegistry:
                 "token": token,
                 "enabled": bool(
                     current.get("enabled", True) if enabled is None else enabled
+                ),
+                "public_url": (
+                    current_public_url
+                    if current_public_url is not None
+                    else str(current.get("public_url") or "")
                 ),
             }
             self._write_locked(workers)
@@ -106,6 +116,7 @@ class WorkerRegistry:
                     "url": str(url).rstrip("/"),
                     "token": str(self.bootstrap_tokens.get(name, "")),
                     "enabled": True,
+                    "public_url": "",
                 }
                 for name, url in self.bootstrap_endpoints.items()
                 if str(url).strip()
@@ -125,6 +136,7 @@ class WorkerRegistry:
                 "url": str(value.get("url", "")).strip().rstrip("/"),
                 "token": str(value.get("token", "")).strip(),
                 "enabled": _as_enabled(value.get("enabled", True)),
+                "public_url": str(value.get("public_url", "")).strip().rstrip("/"),
             }
             for name, value in raw.items()
             if isinstance(value, dict) and str(value.get("url", "")).strip()
@@ -137,6 +149,7 @@ class WorkerRegistry:
                     "url": str(url).strip().rstrip("/"),
                     "token": str(self.bootstrap_tokens.get(name, "")),
                     "enabled": True,
+                    "public_url": "",
                 }
                 changed = True
         if changed:
@@ -145,3 +158,26 @@ class WorkerRegistry:
 
     def _write_locked(self, workers: dict[str, dict[str, object]]) -> None:
         write_json_atomic_private(self.path, {"workers": workers})
+
+    @staticmethod
+    def _normalize_public_url(value: str) -> str:
+        if not value:
+            return ""
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("URL publik worker harus berupa origin HTTPS.") from exc
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or port == 0
+            or any(char.isspace() or ord(char) < 32 for char in value)
+            or parsed.username
+            or parsed.password
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("URL publik worker harus berupa origin HTTPS.")
+        return f"https://{parsed.netloc}"

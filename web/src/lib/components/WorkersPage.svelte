@@ -5,7 +5,7 @@
   import { session } from '$lib/session.svelte';
   import { CheckCircle2, Pencil, Plus, RefreshCw, Server, Settings2, Trash2 } from '@lucide/svelte';
 
-  type Worker = { name: string; url: string; enabled?: boolean; selected?: boolean; healthy?: boolean; latency_ms?: number };
+  type Worker = { name: string; url: string; public_url?: string; enabled?: boolean; selected?: boolean; healthy?: boolean; latency_ms?: number };
   type WorkerSettings = {
     worker: string;
     worker_api_token_configured: boolean;
@@ -31,8 +31,8 @@
   type TtsHelper = { slot: number; status: TtsHelperStatus; bootstrap_percent: number | null; checked_at: string | null };
   type TtsHealth = { worker: string; ready: boolean; helpers_ready: boolean; capability_ready: boolean; profile_session_ready: boolean; profile_sync_ready: boolean; verified_profiles?: string[]; reason_code: string; helpers: TtsHelper[] };
   let workers = $state<Worker[]>([]);
-  let name = $state(''); let url = $state(''); let token = $state(''); let message = $state('');
-  let editing = $state<Worker|null>(null); let deleting = $state<Worker|null>(null); let editOpen = $state(false); let deleteOpen = $state(false); let editUrl = $state(''); let editToken = $state('');
+  let name = $state(''); let url = $state(''); let publicUrl = $state(''); let token = $state(''); let message = $state('');
+  let editing = $state<Worker|null>(null); let deleting = $state<Worker|null>(null); let editOpen = $state(false); let deleteOpen = $state(false); let editUrl = $state(''); let editPublicUrl = $state(''); let editToken = $state('');
   let settingsOpen = $state('');
   let workerSettings = $state<Record<string, WorkerSettings>>({});
   let storageProfileDrafts = $state<Record<string, string>>({});
@@ -44,7 +44,7 @@
   let ttsHealthLoading = $state<Record<string, boolean>>({});
   let ttsRecoveryLoading = $state<Record<string, number | null>>({});
   async function load() { try { workers = (await api<{items:Worker[]}>('/workers')).items || []; } catch (cause) { message = cause instanceof Error ? cause.message : 'Worker gagal dimuat.'; } }
-  async function add() { await post('/workers', { name, url, token }); name = url = token = ''; message = 'Worker ditambahkan.'; await load(); }
+  async function add() { await post('/workers', { name, url, public_url: publicUrl, token }); name = url = publicUrl = token = ''; message = 'Worker ditambahkan.'; await load(); }
   async function select(worker: Worker) {
     if (worker.enabled === false) return;
     await session.chooseWorker(worker.name);
@@ -206,7 +206,7 @@
       helper_unreachable: 'Helper tidak terjangkau',
     }[status];
   }
-  async function update() { if (!editing) return; await put(`/workers/${encodeURIComponent(editing.name)}`, { url: editUrl, token: editToken }); editing = null; editOpen = false; await load(); }
+  async function update() { if (!editing) return; await put(`/workers/${encodeURIComponent(editing.name)}`, { url: editUrl, public_url: editPublicUrl, token: editToken }); editing = null; editOpen = false; await load(); }
   async function destroy() { if (!deleting) return; await remove(`/workers/${encodeURIComponent(deleting.name)}`); deleting = null; deleteOpen = false; await load(); }
   onMount(() => {
     const refresh = () => load();
@@ -219,13 +219,13 @@
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">WORKERS</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Worker & routing</h1><p class="muted mt-2">Route baru hanya berlaku untuk job berikutnya; job lama tetap pada worker asal.</p></div><div class="page-icon"><Server size={23}/></div></header>
 {#if message}<p class="mt-5 rounded-xl bg-[var(--brand-soft)] p-3 text-sm">{message}</p>{/if}
 <div class="mt-7 grid gap-5 xl:grid-cols-[.72fr_1.28fr]">
-  <section class="card p-5 sm:p-6"><h2 class="font-extrabold">Tambah worker</h2><div class="mt-4 space-y-3"><label class="block text-sm font-bold">Nama<input class="field mt-2" bind:value={name} placeholder="remote-1"/></label><label class="block text-sm font-bold">URL API<input class="field mt-2" bind:value={url} placeholder="https://worker.example.com"/></label><label class="block text-sm font-bold">Token<input class="field mt-2" type="password" bind:value={token} autocomplete="new-password"/></label></div><button class="button mt-5 w-full" onclick={add} disabled={!name || !url || !token}><Plus size={16}/>Tambahkan worker</button></section>
+  <section class="card p-5 sm:p-6"><h2 class="font-extrabold">Tambah worker</h2><div class="mt-4 space-y-3"><label class="block text-sm font-bold">Nama<input class="field mt-2" bind:value={name} placeholder="remote-1"/></label><label class="block text-sm font-bold">URL API<input class="field mt-2" bind:value={url} placeholder="https://worker.example.com"/></label><label class="block text-sm font-bold">Domain link publik<input class="field mt-2" bind:value={publicUrl} placeholder="https://worker.example.com"/><small class="muted mt-1 block font-normal">Origin HTTPS yang melayani route unduhan publik worker.</small></label><label class="block text-sm font-bold">Token<input class="field mt-2" type="password" bind:value={token} autocomplete="new-password"/></label></div><button class="button mt-5 w-full" onclick={add} disabled={!name || !url || !token}><Plus size={16}/>Tambahkan worker</button></section>
   <section class="card overflow-hidden"><div class="border-b border-[var(--line)] px-5 py-4"><h2 class="font-extrabold">Registry worker</h2><p class="muted mt-1 text-sm">Profile aktif: {session.current.actor?.profile || '-'}</p></div><div class="divide-y divide-[var(--line)]">
     {#each workers as worker}
       <div class="border-b border-[var(--line)] last:border-0">
         <article class="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
-          <div class="min-w-0"><div class="flex items-center gap-2"><b>{worker.name}</b>{#if worker.selected}<span class="badge succeeded">Route aktif</span>{/if}{#if worker.enabled === false}<span class="badge failed">Nonaktif</span>{:else}<span class="badge">Aktif</span>{/if}</div><p class="muted mt-1 truncate text-sm">{worker.url}</p><p class="muted mt-1 text-xs">{worker.enabled === false ? 'Tidak menerima job baru; job lama tidak dihentikan.' : 'Admission job aktif; kesiapan TTS diperiksa terpisah.'}</p></div>
-          <div class="flex flex-wrap gap-2"><button class="button secondary" onclick={() => select(worker)} disabled={worker.selected || worker.enabled === false}><CheckCircle2 size={15}/>Pilih</button><button class={`button ${worker.enabled === false ? '' : 'danger'}`} onclick={() => toggle(worker)}>{worker.enabled === false ? 'Aktifkan' : 'Nonaktifkan'}</button><button class="button secondary" onclick={() => toggleSettings(worker)}><Settings2 size={15}/>{settingsOpen === worker.name ? 'Tutup' : 'Runtime'}</button><button class="button secondary" onclick={() => { editing = worker; editUrl = worker.url; editToken = ''; editOpen = true; }}><Pencil size={15}/>Edit</button><button class="button ghost text-rose-600" onclick={() => { deleting = worker; deleteOpen = true; }}><Trash2 size={15}/></button></div>
+          <div class="min-w-0"><div class="flex items-center gap-2"><b>{worker.name}</b>{#if worker.selected}<span class="badge succeeded">Route aktif</span>{/if}{#if worker.enabled === false}<span class="badge failed">Nonaktif</span>{:else}<span class="badge">Aktif</span>{/if}</div><p class="muted mt-1 truncate text-sm">{worker.url}</p><p class="muted mt-1 truncate text-xs">Domain link publik: {worker.public_url || 'belum diatur'}</p><p class="muted mt-1 text-xs">{worker.enabled === false ? 'Tidak menerima job baru; job lama tidak dihentikan.' : 'Admission job aktif; kesiapan TTS diperiksa terpisah.'}</p></div>
+          <div class="flex flex-wrap gap-2"><button class="button secondary" onclick={() => select(worker)} disabled={worker.selected || worker.enabled === false}><CheckCircle2 size={15}/>Pilih</button><button class={`button ${worker.enabled === false ? '' : 'danger'}`} onclick={() => toggle(worker)}>{worker.enabled === false ? 'Aktifkan' : 'Nonaktifkan'}</button><button class="button secondary" onclick={() => toggleSettings(worker)}><Settings2 size={15}/>{settingsOpen === worker.name ? 'Tutup' : 'Runtime'}</button><button class="button secondary" onclick={() => { editing = worker; editUrl = worker.url; editPublicUrl = worker.public_url || ''; editToken = ''; editOpen = true; }}><Pencil size={15}/>Edit</button><button class="button ghost text-rose-600" onclick={() => { deleting = worker; deleteOpen = true; }}><Trash2 size={15}/></button></div>
         </article>
         {#if settingsOpen === worker.name}
           <section class="border-t border-[var(--line)] bg-[var(--panel)] px-5 py-4">
@@ -305,5 +305,5 @@
   </div></section>
 </div>
 
-<Modal bind:open={editOpen} title={editing ? `Edit ${editing.name}` : 'Edit worker'} size="md">{#if editing}<div class="space-y-3"><label class="block text-sm font-bold">URL<input class="field mt-2" bind:value={editUrl}/></label><label class="block text-sm font-bold">Token API baru<input class="field mt-2" type="password" bind:value={editToken} autocomplete="new-password" placeholder="Kosongkan agar tetap sama"/></label><p class="muted text-xs">Token worker dirotasi melalui koneksi internal. Jika koneksi sama, perubahan langsung berlaku di worker dan gateway.</p></div><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => editOpen = false}>Batal</button><button class="button" onclick={update} disabled={!editUrl}>Simpan</button></div>{/if}</Modal>
+<Modal bind:open={editOpen} title={editing ? `Edit ${editing.name}` : 'Edit worker'} size="md">{#if editing}<div class="space-y-3"><label class="block text-sm font-bold">URL API<input class="field mt-2" bind:value={editUrl}/></label><label class="block text-sm font-bold">Domain link publik<input class="field mt-2" bind:value={editPublicUrl} placeholder="https://worker.example.com"/><small class="muted mt-1 block font-normal">Kosongkan untuk menonaktifkan penerbitan link baru.</small></label><label class="block text-sm font-bold">Token API baru<input class="field mt-2" type="password" bind:value={editToken} autocomplete="new-password" placeholder="Kosongkan agar tetap sama"/></label><p class="muted text-xs">Token worker dirotasi melalui koneksi internal. Jika koneksi sama, perubahan langsung berlaku di worker dan gateway.</p></div><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => editOpen = false}>Batal</button><button class="button" onclick={update} disabled={!editUrl}>Simpan</button></div>{/if}</Modal>
 <Modal bind:open={deleteOpen} title="Hapus worker?" size="sm"><p>Worker <b>{deleting?.name}</b> akan dihapus dari registry. Job yang sudah dibuat tidak dipindahkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => deleteOpen = false}>Batal</button><button class="button danger" onclick={destroy}>Hapus</button></div></Modal>

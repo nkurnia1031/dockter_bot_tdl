@@ -9,7 +9,7 @@ import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from tme3bot.storage_sync import full_history_proven
 
@@ -384,6 +384,107 @@ class StorageCatalog:
             if item and item.status == "deleted" and not include_deleted:
                 return None
             return item
+
+    def download_selection(
+        self, item_ids: list[int], folder_ids: list[int], *, max_items: int = 2000
+    ) -> list[dict[str, object]]:
+        """Expand active file/folder selections into stable Telegram message records."""
+        normalized_items = list(dict.fromkeys(int(value) for value in item_ids))
+        normalized_folders = list(dict.fromkeys(int(value) for value in folder_ids))
+        if (
+            not normalized_items
+            and not normalized_folders
+            or len(normalized_items) > 500
+            or len(normalized_folders) > 100
+            or any(value < 1 for value in [*normalized_items, *normalized_folders])
+        ):
+            raise ValueError("Pilihan unduhan Storage tidak valid.")
+
+        with self._lock, self._db() as db:
+            direct_rows = []
+            if normalized_items:
+                placeholders = ",".join("?" for _ in normalized_items)
+                direct_rows = db.execute(
+                    f"SELECT * FROM storage_items WHERE id IN ({placeholders}) AND status='active'",
+                    normalized_items,
+                ).fetchall()
+                if len(direct_rows) != len(normalized_items):
+                    raise ValueError("Salah satu file pilihan tidak lagi tersedia.")
+
+            roots: list[tuple[int, str]] = []
+            for folder_id in normalized_folders:
+                row = db.execute(
+                    "SELECT id,status FROM storage_folders WHERE id=?",
+                    (folder_id,),
+                ).fetchone()
+                if row is None or row["status"] != "active":
+                    raise ValueError("Salah satu folder pilihan tidak lagi tersedia.")
+                roots.append((folder_id, self._folder_path_locked(db, folder_id)))
+            roots.sort(key=lambda item: (item[1].count("/"), item[1].casefold()))
+            selected_roots: list[tuple[int, str]] = []
+            covered: set[int] = set()
+            for folder_id, folder_path in roots:
+                if folder_id in covered:
+                    continue
+                selected_roots.append((folder_id, folder_path))
+                covered.update(self._descendants_locked(db, folder_id))
+
+            by_id: dict[int, dict[str, object]] = {}
+
+            def add_item(row: sqlite3.Row, relative_path: str) -> None:
+                item_id = int(row["id"])
+                raw_name = str(row["original_name"] or row["display_name"])
+                safe_name = PurePosixPath(raw_name.replace("\\", "/")).name
+                if (
+                    not safe_name
+                    or safe_name in {".", ".."}
+                    or ":" in safe_name
+                    or any(ord(char) < 32 for char in safe_name)
+                ):
+                    raise ValueError("Nama file katalog tidak valid untuk unduhan.")
+                path = "/".join(part for part in (relative_path, safe_name) if part)
+                current = by_id.get(item_id)
+                if current is None or len(path) > len(str(current["relative_path"])):
+                    by_id[item_id] = {
+                        "catalog_item_id": item_id,
+                        "channel_id": int(row["channel_id"]),
+                        "channel_message_id": int(row["channel_message_id"]),
+                        "name": safe_name,
+                        "relative_path": path,
+                        "file_size": row["file_size"],
+                    }
+
+            for row in direct_rows:
+                add_item(row, "")
+
+            for folder_id, root_path in selected_roots:
+                descendant_ids = [
+                    value
+                    for value in self._descendants_locked(db, folder_id)
+                    if db.execute(
+                        "SELECT 1 FROM storage_folders WHERE id=? AND status='active'",
+                        (value,),
+                    ).fetchone()
+                ]
+                if not descendant_ids:
+                    continue
+                placeholders = ",".join("?" for _ in descendant_ids)
+                rows = db.execute(
+                    f"SELECT * FROM storage_items WHERE status='active' AND folder_id IN ({placeholders}) ORDER BY id",
+                    descendant_ids,
+                ).fetchall()
+                for row in rows:
+                    item_folder_id = int(row["folder_id"])
+                    item_folder_path = self._folder_path_locked(db, item_folder_id)
+                    suffix = item_folder_path[len(root_path):].strip("/")
+                    relative = "/".join(part for part in (root_path.rsplit("/", 1)[-1], suffix) if part)
+                    add_item(row, relative)
+                    if len(by_id) > max_items:
+                        raise ValueError(f"Pilihan melebihi batas {max_items} file.")
+
+            if len(by_id) > max_items:
+                raise ValueError(f"Pilihan melebihi batas {max_items} file.")
+            return [by_id[key] for key in sorted(by_id)]
 
     def get_by_upload_id(self, upload_id: str) -> StorageItem | None:
         with self._lock, self._db() as db:

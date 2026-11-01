@@ -1,3 +1,4 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,8 @@ from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.domain.models import Actor, DomainError, JobEvent, JobStatus
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
+    CAP_PUBLIC_DOWNLOAD_LINKS,
+    CAP_STORAGE_DOWNLOAD,
     CAP_TTS,
     WORKER_API_CAPABILITIES,
     WORKER_API_CONTRACT_VERSION,
@@ -380,6 +383,42 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertEqual(operation.status.value, "queued")
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(len(self.dispatcher.commands), 1)
+
+    def test_storage_download_dispatch_requires_worker_feature_capabilities(self):
+        destination = "googledrive:backup"
+        self.workers.get = lambda _worker: {
+            "enabled": True,
+            "public_url": "https://files.worker.example",
+        }
+        self.runtime_readiness.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage", ready=True,
+            fingerprint="a" * 64,
+            destination_fingerprint=hashlib.sha256(destination.encode()).hexdigest(),
+        )
+        operation = self.submit(
+            "storage_download",
+            {
+                "provider": "rclone",
+                "rclone_sources": [{"path": "archive", "is_dir": True}],
+                "destination_path": "/workspace/downloads",
+                "publish_public_links": True,
+            },
+        )
+
+        current_capabilities = self.dispatcher.capabilities("local")
+        missing = set(current_capabilities["capabilities"]) - {
+            CAP_STORAGE_DOWNLOAD, CAP_PUBLIC_DOWNLOAD_LINKS,
+        }
+        self.dispatcher.capabilities = lambda _worker: {
+            **current_capabilities,
+            "capabilities": sorted(missing),
+        }
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result, {"status": "terminal", "reason": "worker_incompatible"})
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.FAILED)
+        self.assertEqual(self.dispatcher.commands, [])
 
     def test_download_payload_is_rebuilt_from_artifacts_pinned_to_target_origin(self):
         artifact = {

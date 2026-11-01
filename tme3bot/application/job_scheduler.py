@@ -24,6 +24,22 @@ class JobExecutionPlan:
         }
 
 
+def _workspace_resource_keys(worker: str, raw_paths: Iterable[object]) -> set[str]:
+    """Lock each selected Workspace path together with its ancestors."""
+    keys: set[str] = set()
+    for raw_path in raw_paths:
+        normalized = str(raw_path or "").replace("\\", "/").rstrip("/")
+        parts = [part for part in normalized.split("/") if part]
+        start = 2 if parts and parts[0].casefold() == "workspace" else 1
+        if len(parts) < start:
+            parts = ["workspace"]
+            start = 1
+        for index in range(start, len(parts) + 1):
+            ancestor = "/" + "/".join(parts[:index])
+            keys.add(f"worker:{worker}:workspace:{ancestor}")
+    return keys
+
+
 def build_execution_plan(
     kind: str,
     profile: str,
@@ -99,6 +115,9 @@ def build_execution_plan(
             keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
     elif kind == "storage_upload":
         keys = {f"worker:{worker}:kind:storage_upload"}
+        workspace_path = payload.get("folder_path") or payload.get("folder")
+        if workspace_path:
+            keys.update(_workspace_resource_keys(worker, [workspace_path]))
         if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
             keys.add(f"worker:{worker}:rclone:storage")
             lane = "rclone-storage"
@@ -113,6 +132,9 @@ def build_execution_plan(
             f"worker:{worker}:kind:storage_reconcile",
             f"worker:{worker}:tdl:storage",
         }
+        workspace_path = payload.get("folder_path") or payload.get("folder")
+        if workspace_path:
+            keys.update(_workspace_resource_keys(worker, [workspace_path]))
         sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
         for sender_profile in sender_profiles:
             keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
@@ -124,6 +146,15 @@ def build_execution_plan(
             f"profile:{profile}:worker:{worker}:tdl:upload",
         }
         lane = "tdl-storage-sync"
+    elif kind == "storage_download":
+        keys = {f"worker:{worker}:kind:storage_download"}
+        keys.update(_workspace_resource_keys(worker, [payload.get("destination_path")]))
+        if str(payload.get("provider") or "") == "rclone":
+            keys.add(f"worker:{worker}:rclone:storage")
+            lane = "rclone-storage-download"
+        else:
+            keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
+            lane = "tdl-storage-download"
     elif kind == "tts":
         # Keep one end-to-end TTS job per worker, including Telegram delivery.
         # Different workers remain independent and can each use three routes.
@@ -195,6 +226,7 @@ def build_execution_plan(
             f"worker:{worker}:kind:{kind}"
             if kind in {"tts", "safelink_resolve"}
             or (kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone")
+            or (kind == "storage_download" and str(payload.get("provider") or "").strip().lower() == "rclone")
             else f"profile:{profile}:worker:{worker}:kind:{kind}"
         ),
         lane=lane,

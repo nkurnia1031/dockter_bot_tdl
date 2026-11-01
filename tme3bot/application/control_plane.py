@@ -22,8 +22,10 @@ from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_STAGING,
     CAP_DURABLE_COMMANDS_V1,
     CAP_BACKUP_VERIFY,
+    CAP_PUBLIC_DOWNLOAD_LINKS,
     CAP_SAFELINK_RESOLVE,
     CAP_SHARED_EXPORT_CURSOR,
+    CAP_STORAGE_DOWNLOAD,
     CAP_TTS,
     DURABLE_COMMAND_CAPABILITIES,
     require_worker_contract,
@@ -38,7 +40,7 @@ from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, validate_rclone_destinatio
 from tme3bot.safelink import normalize_shortlink_url
 
 _DURABLE_JOB_KINDS = frozenset({
-    "export", "leave", "download", "utility", "storage_upload", "tts",
+    "export", "leave", "download", "utility", "storage_upload", "storage_download", "tts",
     "safelink_resolve", "tdl_access_verify", "backup_verify",
 })
 _STORAGE_DURABLE_DISPATCH_KEY = "_storage_durable_dispatch"
@@ -189,6 +191,7 @@ class ControlPlane:
     def resolve_target(
         self, actor: Actor, *, profile: str | None = None, worker: str | None = None,
         check_readiness: bool = False, validate_catalog: bool = True,
+        allow_disabled_worker: bool = False,
     ) -> tuple[str, str]:
         selected_profile = self.require_profile(actor, profile)
         owners = (
@@ -212,7 +215,11 @@ class ControlPlane:
                 raise DomainError("WORKER_NOT_FOUND", "Worker target tidak ditemukan.", status_code=404)
             get_worker = getattr(self.worker_registry, "get", None)
             worker_record = get_worker(selected_worker) if callable(get_worker) else None
-            if worker_record is not None and not bool(worker_record.get("enabled", True)):
+            if (
+                worker_record is not None
+                and not bool(worker_record.get("enabled", True))
+                and not allow_disabled_worker
+            ):
                 raise DomainError(
                     "WORKER_DISABLED",
                     "Worker sedang dinonaktifkan dan tidak menerima job baru.",
@@ -237,7 +244,7 @@ class ControlPlane:
     ) -> None:
         if kind not in {
             "export", "leave", "download", "download_clear_failed",
-            "storage_upload", "storage_reconcile", "storage_sync", "tts",
+            "storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts",
             "tdl_access_verify", "backup_verify", "artifact_inventory",
             "artifact_delete", "backup_node",
         }:
@@ -246,13 +253,13 @@ class ControlPlane:
         check_deletion = getattr(registry, "local_deletion_active", None)
         values = payload if isinstance(payload, dict) else {}
         rclone_storage = (
-            kind == "storage_upload"
+            kind in {"storage_upload", "storage_download"}
             and str(values.get("provider") or "telegram").strip().lower() == "rclone"
         )
         candidates = [profile]
         if rclone_storage:
             candidates = []
-        elif kind in {"storage_upload", "storage_reconcile", "storage_sync", "tts"}:
+        elif kind in {"storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts"}:
             candidates = values.get("_tdl_sender_profiles") or candidates
         elif kind == "tdl_access_verify":
             candidates = values.get("candidate_profiles") or candidates
@@ -264,7 +271,7 @@ class ControlPlane:
             if normalized and not rclone_storage and kind in {
                 "export", "leave", "download", "download_clear_failed",
                 "artifact_inventory", "artifact_delete",
-                "storage_upload", "storage_reconcile", "storage_sync", "tts",
+                "storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts",
                 "tdl_access_verify", "backup_verify",
             }:
                 self.assert_profile_worker_verified(normalized, worker)
@@ -405,6 +412,26 @@ class ControlPlane:
                 private_values["tdl_sender_session_fingerprints"] = json.dumps(
                     internal_payload["_tdl_sender_session_fingerprints"], separators=(",", ":")
                 )
+        elif kind == "storage_download":
+            owner_profile, selected_worker = self.resolve_target(
+                actor,
+                profile=owner_profile,
+                worker=worker,
+                check_readiness=False,
+            )
+            internal_payload = self._prepare_durable_payload(
+                actor, kind, internal_payload, owner_profile, selected_worker
+            )
+            provider = str(internal_payload.get("provider") or "").strip().lower()
+            if provider == "telegram":
+                target_chat = self._tdl_access_target("storage")
+                if not target_chat:
+                    raise DomainError(
+                        "TDL_ACCESS_TARGET_UNAVAILABLE",
+                        "Tujuan TDL Storage belum dikonfigurasi.",
+                        status_code=503,
+                    )
+                private_values["tdl_storage_chat_ref"] = target_chat
         elif kind == "storage_sync":
             selected_profile = owner_profile
             _, selected_worker = self.resolve_target(
@@ -518,7 +545,7 @@ class ControlPlane:
                 actor,
                 profile=owner_profile if kind in {
                     "export", "leave", "download", "download_clear_failed",
-                    "artifact_inventory", "artifact_delete", "backup_verify",
+                    "storage_download", "artifact_inventory", "artifact_delete", "backup_verify",
                 } else None,
                 worker=worker,
             )
@@ -717,6 +744,17 @@ class ControlPlane:
                         )
                     else:
                         self.runtime_readiness_gate.record_storage_failure(
+                            worker=selected_worker,
+                            profile=execution_profile,
+                            error_code=failure.code,
+                        )
+                elif kind == "storage_download":
+                    if str(internal_payload.get("provider") or "") == "rclone":
+                        self.runtime_readiness_gate.record_rclone_storage_failure(
+                            worker=selected_worker, error_code=failure.code
+                        )
+                    else:
+                        self.runtime_readiness_gate.record_download_failure(
                             worker=selected_worker,
                             profile=execution_profile,
                             error_code=failure.code,
@@ -951,6 +989,17 @@ class ControlPlane:
                     separators=(",", ":"),
                 )
             private_job_values = self._encrypt_private_job_values(job_id, private_values)
+        elif kind == "storage_download" and str(payload.get("provider") or "") == "telegram":
+            destination = self._tdl_access_target("storage")
+            if not destination:
+                raise DomainError(
+                    "TDL_ACCESS_TARGET_UNAVAILABLE",
+                    "Tujuan TDL Storage belum dikonfigurasi.",
+                    status_code=503,
+                )
+            private_job_values = self._encrypt_private_job_values(
+                job_id, {"tdl_storage_chat_ref": destination}
+            )
         elif quick_storage_snapshot is not None:
             destination, session_fingerprints = quick_storage_snapshot
             private_job_values = self._encrypt_private_job_values(
@@ -987,6 +1036,13 @@ class ControlPlane:
             self.runtime_readiness_gate.require_tts(profile, worker)
         elif kind == "download" and self.runtime_readiness_gate is not None:
             self.runtime_readiness_gate.require_download(profile, worker)
+        elif kind == "storage_download" and self.runtime_readiness_gate is not None:
+            if str(payload.get("provider") or "") == "rclone":
+                self.runtime_readiness_gate.require_rclone_storage(
+                    worker, str(payload.get("rclone_destination") or "")
+                )
+            else:
+                self.runtime_readiness_gate.require_download(profile, worker)
         elif kind in {"storage_upload", "storage_sync"} and self.runtime_readiness_gate is not None:
             if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
                 self.runtime_readiness_gate.require_rclone_storage(
@@ -1003,7 +1059,7 @@ class ControlPlane:
             return
         job = self.jobs.get(event.job_id)
         if job is None or job.kind not in {
-            "export", "download", "tts", "storage_upload", "storage_sync", "safelink_resolve"
+            "export", "download", "tts", "storage_upload", "storage_download", "storage_sync", "safelink_resolve"
         }:
             return
         error = event.error if isinstance(event.error, dict) else {}
@@ -1025,6 +1081,16 @@ class ControlPlane:
                 profile=job.profile,
                 error_code=error_code,
             )
+            return
+        if job.kind == "storage_download":
+            if str(job.payload.get("provider") or "") == "rclone":
+                self.runtime_readiness_gate.record_rclone_storage_failure(
+                    worker=job.worker, error_code=error_code
+                )
+            else:
+                self.runtime_readiness_gate.record_download_failure(
+                    worker=job.worker, profile=job.profile, error_code=error_code
+                )
             return
         if job.kind == "export" and bool(job.payload.get("quick_mode")):
             candidates = [error_code]
@@ -1117,6 +1183,10 @@ class ControlPlane:
                 "preserve_structure", "keywords", "provider", "rclone_path",
                 "transfer_mode", "move_confirmed",
             },
+            "storage_download": {
+                "provider", "item_ids", "folder_ids", "rclone_sources",
+                "destination_path", "publish_public_links",
+            },
             "backup_verify": {"run_id"},
             "tts": {"title", "text"},
             "tdl_access_verify": {"purpose"},
@@ -1153,6 +1223,115 @@ class ControlPlane:
                 raise DomainError("JOB_PAYLOAD_INVALID", "Label export tidak valid.", status_code=422)
             if bool(values.get("quick_mode")):
                 values["quick_settings"] = self._utility_settings_snapshot()
+            return values
+
+        if kind == "storage_download":
+            provider = str(payload.get("provider") or "").strip().lower()
+            if provider not in {"telegram", "rclone"}:
+                raise DomainError("STORAGE_PROVIDER_INVALID", "Sumber Storage unduhan tidak valid.", status_code=422)
+            destination_raw = str(payload.get("destination_path") or "").strip()
+            destination = PurePosixPath(destination_raw)
+            if (
+                not destination.is_absolute()
+                or len(destination.parts) < 2
+                or destination.parts[1] != "workspace"
+                or ".." in destination.parts
+                or "\\" in destination_raw
+                or any(ord(char) < 32 for char in destination_raw)
+            ):
+                raise DomainError("STORAGE_DOWNLOAD_DESTINATION_INVALID", "Folder tujuan harus berada di dalam /workspace.", status_code=422)
+            publish = payload.get("publish_public_links", False)
+            if type(publish) is not bool:
+                raise DomainError("JOB_PAYLOAD_INVALID", "Opsi link publik harus berupa boolean.", status_code=422)
+
+            values: dict[str, Any] = {
+                "provider": provider,
+                "destination_path": str(destination),
+                "publish_public_links": publish,
+                "batch_id": str(uuid.uuid4()),
+                "public_base_url": "",
+            }
+            record = self.worker_registry.get(worker) if self.worker_registry is not None else None
+            if isinstance(record, dict):
+                values["public_base_url"] = str(record.get("public_url") or "").strip().rstrip("/")
+            if publish and not values["public_base_url"]:
+                raise DomainError(
+                    "PUBLIC_DOWNLOAD_ORIGIN_UNAVAILABLE",
+                    "Domain HTTPS publik belum diatur untuk worker yang dipilih.",
+                    status_code=409,
+                )
+            if publish:
+                normalize_public_url = getattr(
+                    self.worker_registry, "_normalize_public_url", None
+                )
+                if callable(normalize_public_url):
+                    try:
+                        values["public_base_url"] = normalize_public_url(
+                            values["public_base_url"]
+                        )
+                    except ValueError as exc:
+                        raise DomainError(
+                            "PUBLIC_DOWNLOAD_ORIGIN_INVALID",
+                            "Domain HTTPS publik worker tidak valid.",
+                            status_code=409,
+                        ) from exc
+
+            if provider == "telegram":
+                if payload.get("rclone_sources"):
+                    raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan rclone hanya berlaku untuk provider rclone.", status_code=422)
+                item_ids = payload.get("item_ids") or []
+                folder_ids = payload.get("folder_ids") or []
+                if (
+                    not isinstance(item_ids, list)
+                    or not isinstance(folder_ids, list)
+                    or any(type(value) is not int or value < 1 for value in [*item_ids, *folder_ids])
+                    or self.storage_catalog is None
+                ):
+                    raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan katalog Telegram tidak valid.", status_code=422)
+                selector = getattr(self.storage_catalog, "download_selection", None)
+                if not callable(selector):
+                    raise DomainError("STORAGE_UNAVAILABLE", "Katalog Storage belum mendukung unduhan.", status_code=503)
+                try:
+                    files = selector(item_ids, folder_ids)
+                except (ValueError, KeyError) as exc:
+                    raise DomainError("STORAGE_SELECTION_INVALID", str(exc), status_code=409) from exc
+                values["files"] = files
+                if not files:
+                    raise DomainError("STORAGE_SELECTION_EMPTY", "Pilihan tidak memiliki file untuk diunduh.", status_code=409)
+            else:
+                if payload.get("item_ids") or payload.get("folder_ids"):
+                    raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan katalog hanya berlaku untuk provider Telegram.", status_code=422)
+                raw_sources = payload.get("rclone_sources")
+                if not isinstance(raw_sources, list) or not raw_sources or len(raw_sources) > 500:
+                    raise DomainError("STORAGE_SELECTION_REQUIRED", "Pilih file atau folder rclone untuk diunduh.", status_code=422)
+                sources: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for raw in raw_sources:
+                    if not isinstance(raw, dict) or set(raw) != {"path", "is_dir"} or type(raw.get("is_dir")) is not bool:
+                        raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan rclone tidak valid.", status_code=422)
+                    source_path = str(raw.get("path") or "").replace("\\", "/")
+                    parts = source_path.split("/")
+                    if (
+                        not source_path
+                        or source_path.startswith("/")
+                        or len(source_path) > 2048
+                        or any(ord(char) < 32 for char in source_path)
+                        or any(not part or part in {".", ".."} or ":" in part for part in parts)
+                    ):
+                        raise DomainError("RCLONE_BROWSER_PATH_INVALID", "Path rclone harus berada di bawah root yang dikonfigurasi.", status_code=422)
+                    if source_path not in seen:
+                        sources.append({"path": source_path, "is_dir": raw["is_dir"]})
+                        seen.add(source_path)
+                if not sources:
+                    raise DomainError("STORAGE_SELECTION_EMPTY", "Pilihan rclone kosong.", status_code=422)
+                values["rclone_sources"] = sources
+                values["rclone_destination"] = str(
+                    self._utility_settings_snapshot().get("rclone_destination", "googledrive:backup")
+                ).strip()
+                try:
+                    validate_rclone_destination(values["rclone_destination"])
+                except ValueError as exc:
+                    raise DomainError("RCLONE_DESTINATION_INVALID", "Root rclone yang dikonfigurasi tidak valid.", status_code=409) from exc
             return values
 
         if kind == "leave":
@@ -2030,6 +2209,11 @@ class ControlPlane:
             required.add(CAP_SAFELINK_RESOLVE)
         if job.kind == "backup_verify":
             required.add(CAP_BACKUP_VERIFY)
+        stored_payload = stored.get("payload") if isinstance(stored.get("payload"), dict) else {}
+        if job.kind == "storage_download":
+            required.add(CAP_STORAGE_DOWNLOAD)
+            if stored_payload.get("publish_public_links") is True:
+                required.add(CAP_PUBLIC_DOWNLOAD_LINKS)
         if bool((stored.get("payload") or {}).get("quick_mode")):
             required.add(CAP_QUICKMODE_STAGING)
         try:
@@ -2038,7 +2222,7 @@ class ControlPlane:
                 worker_capabilities, job.worker, required_capabilities=required
             )
         except DomainError as exc:
-            if job.kind == "backup_verify" and exc.code == "WORKER_INCOMPATIBLE":
+            if job.kind in {"backup_verify", "storage_download"} and exc.code == "WORKER_INCOMPATIBLE":
                 self._fail_queued_job(job, exc.code, exc.message)
                 return {"status": "terminal", "reason": "worker_incompatible"}
             return {"status": "wait", "reason": "not_ready"}
@@ -2055,6 +2239,8 @@ class ControlPlane:
             "tts": "export_profiles",
             "backup_verify": "export_profiles",
         }.get(job.kind)
+        if job.kind == "storage_download" and str(stored_payload.get("provider") or "") == "telegram":
+            session_field = "download_profiles"
         if session_field:
             installed = worker_capabilities.get(session_field)
             if not isinstance(installed, list):
@@ -2726,6 +2912,12 @@ class ControlPlane:
                 **payload,
                 **({"tdl_access_target": target} if target else {}),
                 **({"_tdl_sender_session_fingerprint": fingerprint} if fingerprint else {}),
+            }
+        if kind == "storage_download":
+            target = self.private_job_value(job_id, "tdl_storage_chat_ref")
+            return {
+                **payload,
+                **({"tdl_access_target": target} if target else {}),
             }
         if kind != "export":
             return payload
@@ -4076,6 +4268,20 @@ class ControlPlane:
             return public
         if kind == "storage_sync":
             return {"channel_id": int(payload.get("channel_id") or 0)}
+        if kind == "storage_download":
+            provider = str(payload.get("provider") or "")
+            files = payload.get("files")
+            sources = payload.get("rclone_sources")
+            selection_count = (
+                len(files) if isinstance(files, list)
+                else len(sources) if isinstance(sources, list)
+                else len(payload.get("item_ids") or []) + len(payload.get("folder_ids") or [])
+            )
+            return {
+                "provider": provider,
+                "selection_count": int(selection_count),
+                "publish_public_links": payload.get("publish_public_links") is True,
+            }
         if kind not in {"backup_node", "utility", "export"}:
             return dict(payload)
         if kind == "export" and not bool(payload.get("quick_mode")):

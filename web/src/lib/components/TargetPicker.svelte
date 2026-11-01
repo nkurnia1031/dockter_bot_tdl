@@ -27,6 +27,7 @@
     requiresVerification = true,
     readinessRuntime = 'export',
     showReadiness = true,
+    allowDisabledWorkerSelection = false,
     onWorkerChange
   }: {
     purpose?: 'export'|'utility'|'storage';
@@ -39,13 +40,14 @@
     requiresVerification?: boolean;
     readinessRuntime?: 'export'|'utility'|'quick_mode'|'storage'|'rclone_storage';
     showReadiness?: boolean;
+    allowDisabledWorkerSelection?: boolean;
     onWorkerChange?: (worker: string) => void;
   } = $props();
 
   let checking = $state(false);
   let error = $state('');
   const selectedProfile = $derived(session.profileCatalog.find((item) => item.name === profile));
-  const readiness = $derived(readinessRuntime === 'storage'
+  const storedReadiness = $derived(readinessRuntime === 'storage'
     ? runtimeReadinessForWorker(session.runtimeReadiness, worker, readinessRuntime)
     : runtimeReadinessFor(
       session.runtimeReadiness,
@@ -53,6 +55,9 @@
       worker,
       readinessRuntime
     ));
+  const readiness = $derived(session.workers.find((item) => item.name === worker)?.enabled === false
+    ? { status: 'disabled' as const, checked_at: '', reason_code: 'WORKER_DISABLED' }
+    : storedReadiness);
   const readinessRuntimeLabel = $derived(
     readinessRuntime === 'utility' ? 'Utility' : readinessRuntime === 'quick_mode' ? 'Quick Mode' : readinessRuntime === 'rclone_storage' ? 'Storage rclone' : readinessRuntime === 'storage' ? 'Storage' : 'Export'
   );
@@ -147,7 +152,7 @@
     <label class="min-w-[10rem] flex-1 text-sm font-bold">Worker target
       <select class="field mt-2" bind:value={worker} onchange={() => { invalidate(); onWorkerChange?.(worker); }} disabled={disabled || checking}>
         <option value="" disabled>Pilih worker</option>
-        {#each workerOptions as item}<option value={item.name} disabled={item.enabled === false}>{item.name}{item.enabled === false ? ' (nonaktif)' : ''}</option>{/each}
+        {#each workerOptions as item}<option value={item.name} disabled={!allowDisabledWorkerSelection && item.enabled === false}>{item.name}{item.enabled === false ? ' (nonaktif)' : ''}</option>{/each}
       </select>
     </label>
     {#if requiresVerification}
