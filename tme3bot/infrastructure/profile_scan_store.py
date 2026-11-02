@@ -12,6 +12,7 @@ from typing import Any
 
 _WORKER_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 _PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
+_LOG_RUNTIME_RE = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
 _CODE_RE = re.compile(r"[A-Z][A-Z0-9_]{0,79}\Z")
 _PHASE_RE = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
 _WORKER_STATUSES = {"queued", "running", "succeeded", "failed", "disabled"}
@@ -55,6 +56,8 @@ def _safe_target(value: Any) -> dict[str, str] | None:
     kind = str(value.get("kind") or "")
     if not _WORKER_RE.fullmatch(worker):
         return None
+    if kind == "worker":
+        return {"kind": kind, "worker": worker}
     if kind == "worker_runtime" and runtime in _WORKER_RUNTIME_SCANS:
         return {"kind": kind, "worker": worker, "runtime": runtime}
     if kind == "profile_runtime" and runtime in _PROFILE_RUNTIME_SCANS:
@@ -82,6 +85,7 @@ class ProfileScanOperationStore:
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA busy_timeout=10000")
+        db.execute("PRAGMA foreign_keys=ON")
         return db
 
     def _initialize(self) -> None:
@@ -101,6 +105,26 @@ class ProfileScanOperationStore:
             db.execute(
                 "CREATE INDEX IF NOT EXISTS profile_scan_created "
                 "ON profile_scan_operations(created_at DESC)"
+            )
+            db.execute(
+                """CREATE TABLE IF NOT EXISTS profile_scan_log_events (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    operation_id TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    profile TEXT NOT NULL DEFAULT '',
+                    runtime TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    stream TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    exit_code INTEGER,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(operation_id) REFERENCES profile_scan_operations(id)
+                        ON DELETE CASCADE
+                )"""
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS profile_scan_log_cursor "
+                "ON profile_scan_log_events(operation_id, worker, sequence)"
             )
             rows = db.execute(
                 "SELECT id, progress_json FROM profile_scan_operations "
@@ -217,6 +241,127 @@ class ProfileScanOperationStore:
                 "SELECT * FROM profile_scan_operations WHERE id=?", (str(operation_id),)
             ).fetchone()
         return self._public(row)
+
+    def append_log(
+        self,
+        operation_id: str,
+        *,
+        worker: str,
+        profile: str = "",
+        runtime: str,
+        kind: str,
+        stream: str,
+        text: str,
+        exit_code: int | None = None,
+    ) -> int | None:
+        """Persist one already-redacted raw command/output event for a scan."""
+        operation_id = str(operation_id or "")
+        worker_name = str(worker or "").strip().lower()
+        profile_name = str(profile or "").strip().lower()
+        runtime_name = str(runtime or "").strip().lower()
+        if not _WORKER_RE.fullmatch(worker_name):
+            return None
+        if profile_name and not _PROFILE_RE.fullmatch(profile_name):
+            return None
+        if not _LOG_RUNTIME_RE.fullmatch(runtime_name):
+            return None
+        if kind not in {"command", "output", "exit", "error", "message"}:
+            return None
+        if stream not in {"system", "stdout", "stderr"}:
+            return None
+        if not isinstance(text, str):
+            return None
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            return None
+
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT progress_json FROM profile_scan_operations WHERE id=?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                db.rollback()
+                return None
+            progress = _load(row["progress_json"])
+            target = _safe_target(progress.get("target"))
+            if target is not None and target.get("worker") != worker_name:
+                db.rollback()
+                return None
+            if target is None and not any(
+                isinstance(item, dict) and item.get("name") == worker_name
+                for item in progress.get("workers", [])
+            ):
+                db.rollback()
+                return None
+            cursor = db.execute(
+                "INSERT INTO profile_scan_log_events(operation_id,worker,profile,runtime,kind,stream,text,exit_code,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    operation_id, worker_name, profile_name, runtime_name, kind,
+                    stream, text, exit_code, _now(),
+                ),
+            )
+            db.execute(
+                "UPDATE profile_scan_operations SET updated_at=? WHERE id=?",
+                (_now(), operation_id),
+            )
+            db.commit()
+            return int(cursor.lastrowid)
+
+    def get_logs(
+        self,
+        operation_id: str,
+        *,
+        worker: str,
+        after_sequence: int = 0,
+        limit: int = 500,
+    ) -> dict[str, Any] | None:
+        """Read one worker's persisted log stream after a monotonically increasing cursor."""
+        operation_id = str(operation_id or "")
+        worker_name = str(worker or "").strip().lower()
+        if not _WORKER_RE.fullmatch(worker_name):
+            return None
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+            return None
+        if after_sequence < 0:
+            return None
+        safe_limit = min(max(int(limit), 1), 1000)
+        with self._connect() as db:
+            exists = db.execute(
+                "SELECT 1 FROM profile_scan_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            if exists is None:
+                return None
+            rows = db.execute(
+                "SELECT sequence,worker,profile,runtime,kind,stream,text,exit_code,created_at "
+                "FROM profile_scan_log_events WHERE operation_id=? AND worker=? AND sequence>? "
+                "ORDER BY sequence ASC LIMIT ?",
+                (operation_id, worker_name, after_sequence, safe_limit + 1),
+            ).fetchall()
+        has_more = len(rows) > safe_limit
+        selected = rows[:safe_limit]
+        events = [
+            {
+                "sequence": int(row["sequence"]),
+                "worker": str(row["worker"]),
+                "profile": str(row["profile"]),
+                "runtime": str(row["runtime"]),
+                "kind": str(row["kind"]),
+                "stream": str(row["stream"]),
+                "text": str(row["text"]),
+                "exit_code": row["exit_code"],
+                "created_at": str(row["created_at"]),
+            }
+            for row in selected
+        ]
+        return {
+            "events": events,
+            "next_sequence": events[-1]["sequence"] if events else after_sequence,
+            "has_more": has_more,
+        }
 
     def latest(self) -> dict[str, Any] | None:
         with self._connect() as db:

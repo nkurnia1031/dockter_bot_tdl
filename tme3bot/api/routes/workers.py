@@ -20,6 +20,7 @@ from tme3bot.api.schemas import (
     WorkerTtsHealthResponse,
     WorkerTtsRecoveryResponse,
     WorkerUpdateRequest,
+    ProfileWorkerScanRequest,
     ProfileRuntimeScanRequest,
 )
 from tme3bot.domain.models import DomainError
@@ -282,6 +283,10 @@ def register_workers(app, context, *, current_actor):
                 operation_id, worker, profile, status, **details
             )
 
+    def _report_scan_log(operation_id: str, **event) -> None:
+        if profile_scan_operations is not None:
+            profile_scan_operations.report_log(operation_id, **event)
+
     def _profile_catalog_response(snapshot: dict) -> dict:
         raw_workers = snapshot.get("workers") if isinstance(snapshot, dict) else None
         raw_inventories = snapshot.get("inventories") if isinstance(snapshot, dict) else None
@@ -371,44 +376,8 @@ def register_workers(app, context, *, current_actor):
                         if isinstance(item, dict)
                     ],
                 )
-            resolver_readiness = {
-                "ready": False,
-                "reason_code": "WORKER_UPDATE_REQUIRED",
-                "fingerprint": "",
-            }
-            resolver_probe = getattr(
-                context.worker_dispatcher, "safelink_runtime_readiness", None
-            )
-            if callable(resolver_probe):
-                try:
-                    raw_resolver = resolver_probe(name)
-                    if isinstance(raw_resolver, dict) and type(raw_resolver.get("ready")) is bool:
-                        fingerprint = str(raw_resolver.get("fingerprint") or "").strip().lower()
-                        has_fingerprint = bool(re.fullmatch(r"[a-f0-9]{64}", fingerprint))
-                        reason_code = str(
-                            raw_resolver.get("reason_code") or "RESOLVER_RUNTIME_UNAVAILABLE"
-                        )
-                        if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", reason_code):
-                            reason_code = "RESOLVER_RUNTIME_UNAVAILABLE"
-                        ready = raw_resolver["ready"] is True and has_fingerprint
-                        resolver_readiness = {
-                            "ready": ready,
-                            "reason_code": "" if ready else (
-                                "RESOLVER_FINGERPRINT_MISSING"
-                                if raw_resolver["ready"] is True and not has_fingerprint
-                                else reason_code
-                            ),
-                            "fingerprint": fingerprint if ready else "",
-                        }
-                    else:
-                        resolver_readiness["reason_code"] = "RESOLVER_RUNTIME_UNAVAILABLE"
-                except JsonHttpError as exc:
-                    resolver_readiness["reason_code"] = (
-                        "WORKER_UPDATE_REQUIRED" if exc.status == 404
-                        else "RESOLVER_RUNTIME_UNAVAILABLE"
-                    )
-                except Exception:
-                    resolver_readiness["reason_code"] = "RESOLVER_RUNTIME_UNAVAILABLE"
+            # Resolver is intentionally disabled and is never probed by Profile scans.
+            resolver_readiness = {}
             tts_readiness = {"ready": False, "reason_code": "WORKER_UPDATE_REQUIRED", "fingerprint": ""}
             tts_probe = getattr(context.worker_dispatcher, "tts_health", None)
             if callable(tts_probe):
@@ -619,15 +588,53 @@ def register_workers(app, context, *, current_actor):
                 }
                 canary_state = {}
                 upload_fingerprint = ""
+                last_canary_log_sequence = [0]
+
+                def persist_canary_logs(state: object) -> None:
+                    if not operation_id or not isinstance(state, dict):
+                        return
+                    raw_logs = state.get("logs")
+                    if not isinstance(raw_logs, list):
+                        return
+                    for raw_log in raw_logs:
+                        if not isinstance(raw_log, dict):
+                            continue
+                        sequence = raw_log.get("sequence")
+                        if (
+                            isinstance(sequence, bool)
+                            or not isinstance(sequence, int)
+                            or sequence <= last_canary_log_sequence[0]
+                        ):
+                            continue
+                        runtime_name = str(raw_log.get("runtime") or "")
+                        event_type = str(raw_log.get("type") or "output")
+                        stream = str(raw_log.get("stream") or "system")
+                        raw_text = raw_log.get("text")
+                        if not isinstance(raw_text, str):
+                            continue
+                        _report_scan_log(
+                            operation_id,
+                            worker=name,
+                            profile=profile,
+                            runtime=runtime_name,
+                            kind=event_type,
+                            stream=stream,
+                            text=raw_text,
+                            exit_code=raw_log.get("exit_code"),
+                        )
+                        last_canary_log_sequence[0] = sequence
+
                 if inventory_ready and storage_target and callable(start_canary) and callable(poll_canary):
                     try:
                         canary_state = start_canary(name, profile, storage_target, tts_target)
+                        persist_canary_logs(canary_state)
                         canary_id = str(canary_state.get("id") or "") if isinstance(canary_state, dict) else ""
                         if not re.fullmatch(r"[0-9a-f-]{36}", canary_id):
                             canary_state = {"status": "failed", "error_code": "PROFILE_CANARY_REQUEST_INVALID", "checks": {}, "messages": []}
                         else:
                             deadline = time.monotonic() + 900
                             while True:
+                                persist_canary_logs(canary_state)
                                 phase = str(canary_state.get("phase") or "canary_running")
                                 checks = safe_checks(canary_state.get("checks"))
                                 if operation_id:
@@ -647,6 +654,7 @@ def register_workers(app, context, *, current_actor):
                         canary_state = {"status": "failed", "error_code": code, "checks": {}, "messages": []}
                     except Exception:
                         canary_state = {"status": "failed", "error_code": "PROFILE_CANARY_FAILED", "checks": {}, "messages": []}
+                    persist_canary_logs(canary_state)
                     checks = safe_checks(canary_state.get("checks"))
                     canary_error = str(canary_state.get("error_code") or "")
                     if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", canary_error):
@@ -792,7 +800,9 @@ def register_workers(app, context, *, current_actor):
                 )
             return name, None, "WORKER_UNAVAILABLE", {}, {}, [], [], {}, {}, [], []
 
-    def _perform_profile_catalog_scan(store, operation_id: str = "") -> dict:
+    def _perform_profile_catalog_scan(
+        store, operation_id: str = "", selected_worker: str | None = None
+    ) -> dict:
         revision_getter = getattr(store, "revision", None)
         scan_revision = revision_getter() if callable(revision_getter) else None
         control = getattr(context, "control_plane", None)
@@ -810,19 +820,32 @@ def register_workers(app, context, *, current_actor):
         records = context.worker_registry.list()
         workers = []
         scan_names = []
-        for raw_name, record in sorted(records.items()):
-            name = str(raw_name or "").strip().lower()
-            if not WORKER_NAME_RE.fullmatch(name):
-                continue
+        if selected_worker is not None:
+            name = str(selected_worker or "").strip().lower()
+            record = records.get(name)
+            if not WORKER_NAME_RE.fullmatch(name) or record is None:
+                raise DomainError(
+                    "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
+                )
             if not bool(record.get("enabled", True)):
-                workers.append({
-                    "name": name,
-                    "status": "disabled",
-                    "checked_at": "",
-                    "error_code": "",
-                })
-            else:
-                scan_names.append(name)
+                raise DomainError(
+                    "WORKER_DISABLED", "Worker nonaktif tidak dapat dipindai.", status_code=409
+                )
+            scan_names.append(name)
+        else:
+            for raw_name, record in sorted(records.items()):
+                name = str(raw_name or "").strip().lower()
+                if not WORKER_NAME_RE.fullmatch(name):
+                    continue
+                if not bool(record.get("enabled", True)):
+                    workers.append({
+                        "name": name,
+                        "status": "disabled",
+                        "checked_at": "",
+                        "error_code": "",
+                    })
+                else:
+                    scan_names.append(name)
 
         if operation_id:
             for item in workers:
@@ -1233,18 +1256,6 @@ def register_workers(app, context, *, current_actor):
                     checked_at=checked_at,
                     profiles=readiness_storage,
                 )
-            apply_resolver_scan = getattr(runtime_store, "apply_resolver_scan", None)
-            if callable(apply_resolver_scan):
-                apply_resolver_scan(
-                    checked_at=checked_at,
-                    workers={
-                        name: {
-                            **readiness,
-                            "last_attempt": runtime_attempt(name, "resolver", readiness),
-                        }
-                        for name, readiness in readiness_resolver.items()
-                    },
-                )
             for name, readiness in readiness_rclone_storage.items():
                 runtime_store.upsert_cell(
                     worker=name,
@@ -1262,13 +1273,34 @@ def register_workers(app, context, *, current_actor):
                     last_attempt=runtime_attempt(name, "rclone_storage", readiness),
                 )
 
-        snapshot = store.replace_scan(
-            checked_at=checked_at,
-            workers=sorted(workers, key=lambda item: item["name"]),
-            inventories=inventories,
-            expected_revision=scan_revision,
-            after_commit=apply_committed_scan,
-        )
+        if selected_worker is not None:
+            selected_status = next(
+                (item for item in workers if item.get("name") == selected_worker),
+                None,
+            )
+            selected_inventory = next(
+                (item for item in inventories if item.get("worker") == selected_worker),
+                None,
+            )
+            if selected_status is None:
+                raise RuntimeError("single-worker scan returned no worker result")
+            snapshot = store.replace_worker_scan(
+                worker=selected_worker,
+                checked_at=selected_status.get("checked_at") or checked_at,
+                status=selected_status["status"],
+                error_code=selected_status.get("error_code", ""),
+                inventory=selected_inventory,
+                expected_revision=scan_revision,
+                after_commit=apply_committed_scan,
+            )
+        else:
+            snapshot = store.replace_scan(
+                checked_at=checked_at,
+                workers=sorted(workers, key=lambda item: item["name"]),
+                inventories=inventories,
+                expected_revision=scan_revision,
+                after_commit=apply_committed_scan,
+            )
         if snapshot is None:
             raise RuntimeError("profile scan superseded by a profile mutation")
         return _profile_catalog_response(snapshot)
@@ -1907,6 +1939,11 @@ def register_workers(app, context, *, current_actor):
             ),
             scan_worker_runtime=_scan_worker_runtime,
             scan_profile_runtime=_scan_profile_runtime,
+            scan_worker=lambda operation_id, worker: _perform_profile_catalog_scan(
+                getattr(context, "local_profile_catalog", None),
+                operation_id,
+                selected_worker=worker,
+            ),
         )
         app.add_event_handler("shutdown", profile_scan_operations.close)
 
@@ -1967,6 +2004,41 @@ def register_workers(app, context, *, current_actor):
             )
         return operation
 
+    @app.get("/api/v1/profiles/local/scan/{operation_id}/logs")
+    def get_profile_scan_logs(
+        operation_id: str,
+        worker: str,
+        after_sequence: int = 0,
+        limit: int = 500,
+        actor=Depends(current_actor),
+    ):
+        del actor
+        if profile_scan_operations is None:
+            raise DomainError(
+                "PROFILE_SCAN_UNAVAILABLE",
+                "Operation Scan Profil belum tersedia.",
+                status_code=503,
+            )
+        if after_sequence < 0 or limit < 1:
+            raise DomainError(
+                "PROFILE_SCAN_LOG_QUERY_INVALID",
+                "Cursor log scan tidak valid.",
+                status_code=422,
+            )
+        page = profile_scan_operations.get_logs(
+            operation_id,
+            worker=str(worker or "").strip().lower(),
+            after_sequence=after_sequence,
+            limit=min(limit, 1000),
+        )
+        if page is None:
+            raise DomainError(
+                "PROFILE_SCAN_NOT_FOUND",
+                "Operation atau log Scan Profil tidak ditemukan.",
+                status_code=404,
+            )
+        return page
+
     @app.post("/api/v1/profiles/local/scan", status_code=202)
     def scan_all_local_profiles(actor=Depends(current_actor)):
         store = getattr(context, "local_profile_catalog", None)
@@ -1981,6 +2053,40 @@ def register_workers(app, context, *, current_actor):
             )
         return profile_scan_operations.start(
             int(getattr(actor, "telegram_user_id", 0))
+        )
+
+    @app.post("/api/v1/profiles/local/scan/worker", status_code=202)
+    def scan_one_worker_profiles(
+        body: ProfileWorkerScanRequest, actor=Depends(current_actor)
+    ):
+        worker = str(body.worker or "").strip().lower()
+        if not WORKER_NAME_RE.fullmatch(worker):
+            raise DomainError(
+                "WORKER_NAME_INVALID", "Nama worker tidak valid.", status_code=422
+            )
+        record = context.worker_registry.get(worker)
+        if record is None:
+            raise DomainError(
+                "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
+            )
+        if not bool(record.get("enabled", True)):
+            raise DomainError(
+                "WORKER_DISABLED",
+                "Worker nonaktif tidak dapat dipindai untuk job baru.",
+                status_code=409,
+            )
+        store = getattr(context, "local_profile_catalog", None)
+        if (
+            profile_scan_operations is None
+            or not callable(getattr(store, "replace_worker_scan", None))
+        ):
+            raise DomainError(
+                "PROFILE_SCAN_UNAVAILABLE",
+                "Katalog atau operation Scan Profil belum tersedia.",
+                status_code=503,
+            )
+        return profile_scan_operations.start_worker_scan(
+            int(getattr(actor, "telegram_user_id", 0)), worker
         )
 
     @app.post("/api/v1/profiles/local/scan/runtime", status_code=202)

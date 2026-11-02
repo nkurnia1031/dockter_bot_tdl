@@ -175,6 +175,160 @@ describe('ProfilesPage', () => {
     expect(hierarchy.textContent).toMatch(/Worker remote-1[\s\S]*Resolver Tidak siap[\s\S]*Profil irang[\s\S]*Export Tidak siap/);
   });
 
+  it('scans only the selected worker and streams its raw log in a worker modal', async () => {
+    const requests: { url: string; method: string; body?: string }[] = [];
+    let logReads = 0;
+    const scan = {
+      id: 'worker-scan-1', status: 'running', target: { kind: 'worker', worker: 'remote-1' },
+      error_code: '', created_at: '2026-11-02T09:00:00Z', updated_at: '2026-11-02T09:00:00Z',
+      progress: { workers: [{
+        name: 'remote-1', status: 'running', phase: 'profile_probe', error_code: '',
+        profiles: [{ name: 'default', status: 'running', phase: 'export_canary', error_code: '' }],
+      }], total_workers: 1, completed_workers: 0, total_profiles: 1, completed_profiles: 0 },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method, body: typeof init?.body === 'string' ? init.body : undefined });
+      if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [
+        { name: 'local', enabled: true }, { name: 'remote-1', enabled: true },
+      ] }), { status: 200 });
+      if (url === '/api/v1/profiles/local') return new Response(JSON.stringify({
+        checked_at: '2026-11-02T09:00:00Z',
+        workers: [{ name: 'local', status: 'success', checked_at: 'local-old', error_code: '' },
+          { name: 'remote-1', status: 'success', checked_at: 'remote-old', error_code: '' }],
+        inventories: [{ worker: 'local', checked_at: 'local-old', items: [] },
+          { worker: 'remote-1', checked_at: 'remote-old', items: [] }],
+        runtime_readiness: { checked_at: '2026-11-02T09:00:00Z', workers: [], cells: [] },
+      }), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan/worker' && method === 'POST') {
+        return new Response(JSON.stringify(scan), { status: 202 });
+      }
+      if (url.startsWith('/api/v1/profiles/local/scan/worker-scan-1/logs?')) {
+        logReads += 1;
+        const event = logReads === 1
+          ? { sequence: 1, worker: 'remote-1', profile: 'default', runtime: 'export', kind: 'command', stream: 'system', text: '$ tdl chat export -c 123', exit_code: null, created_at: '2026-11-02T09:00:01Z' }
+          : { sequence: 2, worker: 'remote-1', profile: 'default', runtime: 'export', kind: 'output', stream: 'stdout', text: '\u001b[32mExported 1\u001b[0m <script>raw</script>\r\n', exit_code: null, created_at: '2026-11-02T09:00:02Z' };
+        return new Response(JSON.stringify({ events: [event], next_sequence: event.sequence, has_more: false }), { status: 200 });
+      }
+      if (url === '/api/v1/profiles/local/scan/worker-scan-1') return new Response(JSON.stringify(scan), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    const workerPicker = await screen.findByRole('combobox', { name: 'Worker' });
+    await waitFor(() => expect(workerPicker.hasAttribute('disabled')).toBe(false));
+    await fireEvent.change(workerPicker, {
+      target: { value: 'remote-1' },
+    });
+    const scanButton = screen.getByRole('button', { name: 'Scan worker terpilih' });
+    await waitFor(() => expect(scanButton.hasAttribute('disabled')).toBe(false));
+    await fireEvent.click(scanButton);
+
+    expect(requests).toContainEqual({
+      url: '/api/v1/profiles/local/scan/worker', method: 'POST',
+      body: JSON.stringify({ worker: 'remote-1' }),
+    });
+    expect(requests.some((request) => request.url === '/api/v1/profiles/local/scan' && request.method === 'POST'))
+      .toBe(false);
+    const progress = await screen.findByRole('status', { name: 'Progress Scan Profil' });
+    expect(progress.textContent).toContain('worker remote-1');
+    await fireEvent.click(screen.getByRole('button', { name: 'Buka log realtime worker remote-1' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Worker remote-1' });
+    await waitFor(() => expect(dialog.textContent).toContain('$ tdl chat export -c 123'));
+    await waitFor(() => expect(dialog.textContent).toContain('Exported 1'), { timeout: 2500 });
+    expect(dialog.textContent).toContain('Log diperbarui realtime');
+    expect(dialog.textContent).toContain('<script>raw</script>');
+    expect(dialog.querySelector('script')).toBeNull();
+    expect(dialog.textContent).not.toContain('local-old');
+    expect(requests.some((request) => request.url.includes('worker-scan-1/logs?worker=remote-1')))
+      .toBe(true);
+  });
+
+  it('keeps worker scan logs available after the operation becomes terminal', async () => {
+    const requests: string[] = [];
+    const completedScan = {
+      id: 'worker-scan-done', status: 'succeeded', target: { kind: 'worker', worker: 'local' },
+      error_code: '', created_at: '2026-11-02T09:00:00Z', updated_at: '2026-11-02T09:01:00Z',
+      progress: { workers: [{ name: 'local', status: 'succeeded', phase: 'complete', error_code: '',
+        profiles: [{ name: 'default', status: 'succeeded', phase: 'complete', error_code: '' }] }],
+        total_workers: 1, completed_workers: 1, total_profiles: 1, completed_profiles: 1 },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      requests.push(url);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      if (url === '/api/v1/profiles/local') return new Response(JSON.stringify({
+        checked_at: '2026-11-02T09:00:00Z', workers: [], inventories: [],
+        runtime_readiness: { checked_at: '', workers: [], cells: [] },
+      }), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan/worker' && method === 'POST') return new Response(JSON.stringify(completedScan), { status: 202 });
+      if (url.startsWith('/api/v1/profiles/local/scan/worker-scan-done/logs?')) return new Response(JSON.stringify({
+        events: [{ sequence: 1, worker: 'local', profile: 'default', runtime: 'download', kind: 'exit', stream: 'system', text: 'process exited with code 1', exit_code: 1, created_at: '2026-11-02T09:00:02Z' }],
+        next_sequence: 1, has_more: false,
+      }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    const workerPicker = await screen.findByRole('combobox', { name: 'Worker' });
+    await waitFor(() => expect(workerPicker.hasAttribute('disabled')).toBe(false));
+    await fireEvent.change(workerPicker, { target: { value: 'local' } });
+    const scanButton = screen.getByRole('button', { name: 'Scan worker terpilih' });
+    await waitFor(() => expect(scanButton.hasAttribute('disabled')).toBe(false));
+    await fireEvent.click(scanButton);
+    await screen.findByText(/Scan worker local selesai/);
+    await fireEvent.click(screen.getByRole('button', { name: 'Buka log realtime worker local' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Worker local' });
+    expect(await screen.findByText('process exited with code 1')).toBeTruthy();
+    expect(dialog.textContent).toContain('exit 1');
+    expect(requests.some((url) => url.includes('worker-scan-done/logs?worker=local'))).toBe(true);
+  });
+
+  it('keeps the worker log action available after a failed scan', async () => {
+    const failedScan = {
+      id: 'worker-scan-failed', status: 'failed', target: { kind: 'worker', worker: 'local' },
+      error_code: 'PROFILE_SCAN_FAILED', created_at: '2026-11-02T09:00:00Z', updated_at: '2026-11-02T09:01:00Z',
+      progress: { workers: [{ name: 'local', status: 'failed', phase: 'failed', error_code: 'WORKER_UNAVAILABLE',
+        profiles: [{ name: 'default', status: 'failed', phase: 'failed', error_code: 'PROFILE_CANARY_FAILED' }] }],
+        total_workers: 1, completed_workers: 1, total_profiles: 1, completed_profiles: 1 },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      if (url === '/api/v1/workers') return new Response(JSON.stringify({ items: [{ name: 'local', enabled: true }] }), { status: 200 });
+      if (url === '/api/v1/profiles/local') return new Response(JSON.stringify({
+        checked_at: '2026-11-02T09:01:00Z',
+        workers: [{ name: 'local', status: 'failed', checked_at: '2026-11-02T09:01:00Z', error_code: 'WORKER_UNAVAILABLE' }],
+        inventories: [],
+        runtime_readiness: { checked_at: '', workers: [], cells: [] },
+      }), { status: 200 });
+      if (url === '/api/v1/profiles/local/scan/worker' && method === 'POST') return new Response(JSON.stringify(failedScan), { status: 202 });
+      if (url.startsWith('/api/v1/profiles/local/scan/worker-scan-failed/logs?')) return new Response(JSON.stringify({
+        events: [{ sequence: 1, worker: 'local', profile: 'default', runtime: 'export', kind: 'error', stream: 'stderr', text: 'tdl exited with code 1', exit_code: 1, created_at: '2026-11-02T09:00:02Z' }],
+        next_sequence: 1, has_more: false,
+      }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(ProfilesPage);
+    const workerPicker = await screen.findByRole('combobox', { name: 'Worker' });
+    await waitFor(() => expect(workerPicker.hasAttribute('disabled')).toBe(false));
+    await fireEvent.change(workerPicker, { target: { value: 'local' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Scan worker terpilih' }).hasAttribute('disabled')).toBe(false));
+    await fireEvent.click(screen.getByRole('button', { name: 'Scan worker terpilih' }));
+    await screen.findByRole('alert');
+    expect((await screen.findByLabelText('Status scan local')).textContent).toContain('Worker offline');
+    await fireEvent.click(screen.getByRole('button', { name: 'Buka log realtime worker local' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Worker local' });
+    expect(await screen.findByText('tdl exited with code 1')).toBeTruthy();
+    expect(dialog.textContent).toContain('exit 1');
+  });
+
   it('shows worker-only Resolver readiness saved by Profile scan', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);

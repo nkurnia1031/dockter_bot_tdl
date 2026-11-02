@@ -6,6 +6,49 @@ from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 
 
 class LocalProfileCatalogTests(unittest.TestCase):
+    def test_worker_scan_replaces_only_selected_worker_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            catalog = LocalProfileCatalog(Path(temp) / "catalog.json")
+            catalog.replace_scan(
+                checked_at="t1",
+                workers=[
+                    {"name": "local", "status": "success", "checked_at": "local-old"},
+                    {"name": "remote-1", "status": "success", "checked_at": "remote-old"},
+                ],
+                inventories=[
+                    {"worker": "local", "checked_at": "local-old", "items": [{"name": "default", "ready": True}]},
+                    {"worker": "remote-1", "checked_at": "remote-old", "items": [{"name": "irang", "ready": True}]},
+                ],
+            )
+            revision = catalog.revision()
+
+            updated = catalog.replace_worker_scan(
+                worker="local",
+                checked_at="t2",
+                status="success",
+                error_code="",
+                inventory={
+                    "worker": "local",
+                    "checked_at": "local-new",
+                    "items": [{"name": "default", "ready": False}],
+                },
+                expected_revision=revision,
+            )
+
+            self.assertIsNotNone(updated)
+            self.assertEqual(
+                {item["name"]: item["checked_at"] for item in updated["workers"]},
+                {"local": "t2", "remote-1": "remote-old"},
+            )
+            self.assertEqual(
+                {item["worker"]: item["checked_at"] for item in updated["inventories"]},
+                {"local": "local-new", "remote-1": "remote-old"},
+            )
+            self.assertEqual(
+                next(item for item in updated["inventories"] if item["worker"] == "remote-1")["items"],
+                [{"name": "irang", "ready": True}],
+            )
+
     def test_delete_invalidates_inflight_scan_revision(self):
         with tempfile.TemporaryDirectory() as temp:
             catalog = LocalProfileCatalog(Path(temp) / "catalog.json")

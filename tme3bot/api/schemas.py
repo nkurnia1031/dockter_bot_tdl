@@ -433,6 +433,10 @@ class WorkerRuntimeScanRequest(BaseModel):
     runtime: str = Field(min_length=1, max_length=48)
 
 
+class ProfileWorkerScanRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=48)
+
+
 class ProfileRuntimeScanRequest(BaseModel):
     worker: str = Field(min_length=1, max_length=48)
     profile: str = Field(min_length=1, max_length=48)

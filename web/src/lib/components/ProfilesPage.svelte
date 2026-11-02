@@ -24,10 +24,27 @@ type ProvisioningWorker = { name: string; enabled: boolean; online: boolean; sec
     cleanup?: { status: 'not_needed'|'succeeded'|'failed'; items: Array<{ target: string; message_id: number; status: string; error_code: string }> };
   };
   type ScanWorkerProgress = { name: string; status: string; phase: string; error_code: string; profiles: ScanProfileProgress[]; runtime?: string; checks?: Record<string, { ready: boolean; reason_code: string }> };
+  type ProfileScanLogEvent = {
+    sequence: number;
+    worker: string;
+    profile: string;
+    runtime: string;
+    kind: 'command'|'output'|'exit'|'error'|'message';
+    stream: 'system'|'stdout'|'stderr';
+    text: string;
+    exit_code: number|null;
+    created_at: string;
+  };
+  type ProfileScanLogPage = { events: ProfileScanLogEvent[]; next_sequence: number; has_more: boolean };
+  type WorkerScanLogDialog = { operationId: string; worker: string };
+  type ProfileScanTarget =
+    | { kind: 'worker'; worker: string }
+    | { kind: 'worker_runtime'; worker: string; runtime: string }
+    | { kind: 'profile_runtime'; worker: string; profile: string; runtime: string };
   type ProfileScanOperation = {
     id: string;
     status: string;
-    target?: { kind: 'worker_runtime' | 'profile_runtime'; worker: string; profile?: string; runtime: string };
+    target?: ProfileScanTarget;
     progress: { workers: ScanWorkerProgress[]; total_workers: number; completed_workers: number; total_profiles: number; completed_profiles: number };
     error_code: string;
     created_at: string;
@@ -76,6 +93,11 @@ let provisioningNotice = $state('');
   let profileCatalog = $state<LocalProfileCatalog | null>(null);
   let scanOperation = $state<ProfileScanOperation | null>(null);
   let runtimeLogDialog = $state<RuntimeLogDialog | null>(null);
+  let workerScanLogDialog = $state<WorkerScanLogDialog | null>(null);
+  let workerScanLogEvents = $state<ProfileScanLogEvent[]>([]);
+  let workerScanLogCursor = $state(0);
+  let workerScanLogLoading = $state(false);
+  let workerScanLogFailure = $state('');
   let catalogFailure = $state('');
   let vaultProfiles = $state<VaultProfile[]>([]);
   let vaultStatusLoaded = $state(false);
@@ -90,10 +112,13 @@ let savingProvisioning = $state(false);
   let notice = $state('');
   let progressTimer: ReturnType<typeof setTimeout> | undefined;
   let scanPollTimer: ReturnType<typeof setTimeout> | undefined;
+  let scanLogPollTimer: ReturnType<typeof setTimeout> | undefined;
   let provisioningTimer: ReturnType<typeof setTimeout> | undefined;
   let provisioningRequestActive = false;
   let progressRequestActive = false;
   let scanPollRequestActive = false;
+  let scanLogPollRequestActive = false;
+  let scanLogRefreshPending = false;
   let handledScanOperationId = '';
   let progressGeneration = 0;
   let catalogGeneration = 0;
@@ -252,7 +277,9 @@ const provisioningStatusLabels: Record<string, string> = {
     const targetWorker = String(rawTarget?.worker || '').trim().toLowerCase();
     const targetRuntime = String(rawTarget?.runtime || '').trim().toLowerCase();
     const targetProfile = String(rawTarget?.profile || '').trim().toLowerCase();
-    const target = rawTarget?.kind === 'worker_runtime' && targetWorker && targetRuntime
+    const target = rawTarget?.kind === 'worker' && targetWorker
+      ? { kind: 'worker' as const, worker: targetWorker }
+      : rawTarget?.kind === 'worker_runtime' && targetWorker && targetRuntime
       ? { kind: 'worker_runtime' as const, worker: targetWorker, runtime: targetRuntime }
       : rawTarget?.kind === 'profile_runtime' && targetWorker && targetProfile && targetRuntime
         ? { kind: 'profile_runtime' as const, worker: targetWorker, profile: targetProfile, runtime: targetRuntime }
@@ -388,6 +415,28 @@ const provisioningStatusLabels: Record<string, string> = {
     stopScanPolling();
     if (operation.id === handledScanOperationId) return;
     handledScanOperationId = operation.id;
+    if (operation.target?.kind === 'worker') {
+      await loadProfileCatalog();
+      await session.refreshProfileCatalog();
+      const targetWorker = operation.target.worker;
+      inventory = selectedWorker
+        ? profileCatalog?.inventories.find((item) => item.worker === selectedWorker) || null
+        : null;
+      const progressWorker = operation.progress.workers.find((item) => item.name === targetWorker);
+      if (operation.status !== 'succeeded') {
+        failure = codeMessage(
+          operation.error_code || progressWorker?.error_code || 'WORKER_SCAN_FAILED'
+        );
+      }
+      notice = `Scan worker ${targetWorker} selesai: ${progressStatusLabel(progressWorker?.status || 'succeeded')}${progressWorker?.error_code ? ` · ${codeMessage(progressWorker.error_code)}` : ''}.`;
+      if (selectedWorker && inventory) {
+        const generation = progressGeneration;
+        await refreshDeleteOperations(selectedWorker, generation);
+        await refreshVaultProfiles(selectedWorker, generation);
+        scheduleProgressRefresh();
+      }
+      return;
+    }
     if (operation.status !== 'succeeded') {
       failure = codeMessage(operation.error_code || 'WORKER_SCAN_FAILED');
       return;
@@ -455,6 +504,9 @@ const provisioningStatusLabels: Record<string, string> = {
       scanning = scanOperationIsActive(operation);
       if (scanning) scheduleScanPolling(operation.id);
       else if (operation.status === 'succeeded' || operation.status === 'failed') {
+        if (workerScanLogDialog?.operationId === operation.id) {
+          void refreshWorkerScanLogs(true);
+        }
         await finishScanOperation(operation);
       }
     } catch {
@@ -465,6 +517,81 @@ const provisioningStatusLabels: Record<string, string> = {
     } finally {
       scanPollRequestActive = false;
     }
+  }
+
+  function stopScanLogPolling() {
+    if (scanLogPollTimer !== undefined) clearTimeout(scanLogPollTimer);
+    scanLogPollTimer = undefined;
+  }
+
+  function scheduleScanLogPolling() {
+    stopScanLogPolling();
+    if (!workerScanLogDialog || !scanOperationIsActive(scanOperation)) return;
+    scanLogPollTimer = setTimeout(() => void refreshWorkerScanLogs(), 900);
+  }
+
+  function closeWorkerScanLogs() {
+    stopScanLogPolling();
+    workerScanLogDialog = null;
+    workerScanLogEvents = [];
+    workerScanLogCursor = 0;
+    workerScanLogFailure = '';
+  }
+
+  async function refreshWorkerScanLogs(force = false) {
+    const dialog = workerScanLogDialog;
+    if (!dialog) return;
+    if (scanLogPollRequestActive) {
+      if (force) scanLogRefreshPending = true;
+      return;
+    }
+    scanLogPollRequestActive = true;
+    workerScanLogLoading = workerScanLogEvents.length === 0;
+    workerScanLogFailure = '';
+    try {
+      let hasMore = true;
+      while (hasMore && workerScanLogDialog?.operationId === dialog.operationId
+        && workerScanLogDialog.worker === dialog.worker) {
+        const query = new URLSearchParams({
+          worker: dialog.worker,
+          after_sequence: String(workerScanLogCursor),
+          limit: '500'
+        });
+        const page = await api<ProfileScanLogPage>(
+          `/profiles/local/scan/${encodeURIComponent(dialog.operationId)}/logs?${query.toString()}`
+        );
+        if (workerScanLogDialog?.operationId !== dialog.operationId
+          || workerScanLogDialog.worker !== dialog.worker) return;
+        const events = Array.isArray(page.events) ? page.events : [];
+        if (events.length) {
+          workerScanLogEvents = [...workerScanLogEvents, ...events];
+          workerScanLogCursor = Math.max(workerScanLogCursor, Number(page.next_sequence) || 0);
+        }
+        hasMore = page.has_more === true;
+      }
+    } catch (cause) {
+      if (workerScanLogDialog?.operationId === dialog.operationId) {
+        workerScanLogFailure = cause instanceof Error ? cause.message : 'Log scan gagal dimuat.';
+      }
+    } finally {
+      scanLogPollRequestActive = false;
+      workerScanLogLoading = false;
+      if (scanLogRefreshPending && workerScanLogDialog) {
+        scanLogRefreshPending = false;
+        void refreshWorkerScanLogs(true);
+      } else {
+        scheduleScanLogPolling();
+      }
+    }
+  }
+
+  function openWorkerScanLogs(operation: ProfileScanOperation, worker: string) {
+    stopScanLogPolling();
+    workerScanLogDialog = { operationId: operation.id, worker };
+    workerScanLogEvents = [];
+    workerScanLogCursor = 0;
+    workerScanLogFailure = '';
+    void refreshWorkerScanLogs();
   }
 
 function setProvisioningWorkers(items: ProvisioningWorker[]) {
@@ -671,6 +798,7 @@ async function cancelProfileProvisioning() {
 
   async function scanProfiles() {
     if (scanning) return;
+    closeWorkerScanLogs();
     stopScanPolling();
     stopProgressRefresh();
     catalogGeneration += 1;
@@ -714,6 +842,33 @@ async function cancelProfileProvisioning() {
     }
   }
 
+  async function scanWorker(worker: string) {
+    if (scanning || loadingWorkers || !worker) return;
+    closeWorkerScanLogs();
+    stopScanPolling();
+    stopProgressRefresh();
+    catalogGeneration += 1;
+    const generation = progressGeneration;
+    scanning = true;
+    failure = '';
+    notice = '';
+    try {
+      const payload = await post<unknown>('/profiles/local/scan/worker', { worker });
+      if (generation !== progressGeneration) return;
+      const operation = normalizeScanOperation(payload);
+      if (!operation) throw new Error('Operation scan worker tidak valid.');
+      scanOperation = operation;
+      scanning = scanOperationIsActive(operation);
+      if (scanning) scheduleScanPolling(operation.id);
+      else await finishScanOperation(operation);
+    } catch (cause) {
+      if (generation !== progressGeneration) return;
+      const error = cause as { message?: string };
+      failure = error.message || `Scan profil pada worker ${worker} gagal.`;
+      scanning = false;
+    }
+  }
+
   function workerRuntimeLabel(runtime: string) {
     return ({
       resolver: 'Resolver',
@@ -731,6 +886,7 @@ async function cancelProfileProvisioning() {
 
   async function scanWorkerRuntime(worker: string, runtime: string) {
     if (scanning || loadingWorkers || !worker || !runtime) return;
+    closeWorkerScanLogs();
     stopScanPolling();
     stopProgressRefresh();
     catalogGeneration += 1;
@@ -759,6 +915,7 @@ async function cancelProfileProvisioning() {
 
   async function scanProfileRuntime(worker: string, profile: string, runtime: string) {
     if (scanning || loadingWorkers || !worker || !profile || !runtime) return;
+    closeWorkerScanLogs();
     stopScanPolling();
     stopProgressRefresh();
     catalogGeneration += 1;
@@ -1030,6 +1187,7 @@ async function cancelProfileProvisioning() {
   onDestroy(() => {
     if (onJobFinished) window.removeEventListener('tme3:job-finished', onJobFinished);
     stopScanPolling();
+    stopScanLogPolling();
     stopProgressRefresh();
     if (provisioningTimer !== undefined) clearTimeout(provisioningTimer);
   });
@@ -1041,7 +1199,7 @@ async function cancelProfileProvisioning() {
   <div>
     <p class="eyebrow">SESI WORKER</p>
     <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Profil lokal</h1>
-    <p class="muted mt-2">Scan memeriksa semua worker aktif. Pilih worker setelahnya untuk melihat profil TDL lokal dan aksi khusus worker.</p>
+        <p class="muted mt-2">Scan worker terpilih menguji profil dan service/lane pada worker itu. Scan semua worker tersedia sebagai aksi terpisah.</p>
   </div>
   <div class="flex items-center gap-2"><a class="button secondary" href="/profiles/vault/"><KeyRound size={16}/>Kelola Vault</a><div class="page-icon"><UserRoundPlus size={23}/></div></div>
 </header>
@@ -1187,13 +1345,16 @@ async function cancelProfileProvisioning() {
     <button class="button secondary" onclick={refreshWorkers} disabled={loadingWorkers || scanning} aria-label="Muat ulang worker">
       <RefreshCw size={16}/>{loadingWorkers ? 'Memuat...' : 'Muat ulang worker'}
     </button>
+    <button class="button secondary" onclick={() => scanWorker(selectedWorker)} disabled={scanning || loadingWorkers || !selectedWorker}>
+      <RefreshCw size={16}/>{scanning && scanOperation?.target?.kind === 'worker' ? `Memindai ${selectedWorker}...` : 'Scan worker terpilih'}
+    </button>
     <button class="button" onclick={scanProfiles} disabled={scanning || loadingWorkers}>
-      <RefreshCw size={16}/>{scanning ? 'Memindai semua worker...' : 'Scan semua worker'}
+      <RefreshCw size={16}/>{scanning && !scanOperation?.target ? 'Memindai semua worker...' : 'Scan semua worker'}
     </button>
   </div>
   <p class="muted mt-3 flex items-start gap-2 text-xs">
     <ShieldCheck size={15} class="mt-0.5 shrink-0"/>
-    Scan membaca inventaris profil pada semua worker aktif tanpa memilih worker terlebih dahulu atau memulai penyiapan lane Upload. Katalog berubah hanya saat Scan dijalankan; pilih worker setelahnya untuk melihat rincian dan aksi.
+    Scan worker terpilih memeriksa profil dan service/lane pada satu worker. Scan semua worker tetap tersedia terpisah. Resolver tidak dijalankan; katalog berubah hanya saat scan dimulai.
   </p>
   {#if catalogFailure}
     <p class="mt-3 text-sm text-rose-600" role="alert">{catalogFailure}</p>
@@ -1212,6 +1373,8 @@ async function cancelProfileProvisioning() {
         <p class="muted mt-1 text-xs">{workerRuntimeLabel(scanOperation.target.runtime)} · worker {scanOperation.target.worker}</p>
       {:else if scanOperation.target?.kind === 'profile_runtime'}
         <p class="muted mt-1 text-xs">{workerRuntimeLabel(scanOperation.target.runtime)} · profil {scanOperation.target.profile} · worker {scanOperation.target.worker}</p>
+      {:else if scanOperation.target?.kind === 'worker'}
+        <p class="muted mt-1 text-xs">Semua profil dan service/lane · worker {scanOperation.target.worker}</p>
       {/if}
       {#if scanOperation.error_code}
         <p class="mt-2 text-xs text-rose-600">{codeMessage(scanOperation.error_code)}</p>
@@ -1221,7 +1384,10 @@ async function cancelProfileProvisioning() {
           <article class="rounded-lg bg-[var(--panel)] p-3" aria-label={`Progress worker ${progressWorker.name}`}>
             <div class="flex items-center justify-between gap-2 text-sm">
               <span class="font-bold">{progressWorker.name}</span>
-              <span class={readinessTone(progressWorker.status === 'succeeded' ? 'ready' : progressWorker.status === 'failed' ? 'not_ready' : progressWorker.status === 'disabled' ? 'disabled' : 'unscanned')}>{progressStatusLabel(progressWorker.status)}</span>
+              <div class="flex items-center gap-2">
+                <span class={readinessTone(progressWorker.status === 'succeeded' ? 'ready' : progressWorker.status === 'failed' ? 'not_ready' : progressWorker.status === 'disabled' ? 'disabled' : 'unscanned')}>{progressStatusLabel(progressWorker.status)}</span>
+                <button class="rounded border border-[var(--line)] px-2 py-1 text-xs font-semibold hover:bg-[var(--panel-strong)]" onclick={() => openWorkerScanLogs(scanOperation!, progressWorker.name)} aria-label={`Buka log realtime worker ${progressWorker.name}`}>Log mentah</button>
+              </div>
             </div>
             {#if progressWorker.phase}<p class="muted mt-1 text-xs">{scanPhaseLabel(progressWorker.phase)}</p>{/if}
             {#if progressWorker.error_code}<p class="mt-1 text-xs text-rose-600">{codeMessage(progressWorker.error_code)}</p>{/if}
@@ -1303,6 +1469,46 @@ async function cancelProfileProvisioning() {
         <p class="muted mt-4 rounded-xl border border-dashed border-[var(--line)] p-4 text-sm">Belum ada log uji untuk runtime ini.</p>
       {/if}
       <div class="mt-5 flex justify-end"><button class="button" onclick={() => runtimeLogDialog = null}>Tutup</button></div>
+    </dialog>
+  </div>
+{/if}
+
+{#if workerScanLogDialog}
+  <div class="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 p-3 sm:p-5">
+    <dialog open class="relative inset-auto m-0 flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-0 shadow-2xl" aria-modal="true" aria-labelledby="worker-scan-log-title">
+      <header class="flex items-start justify-between gap-3 border-b border-[var(--line)] p-4 sm:p-5">
+        <div>
+          <p class="eyebrow">SCAN PROFIL · LOG RAW</p>
+          <h2 id="worker-scan-log-title" class="mt-1 text-lg font-extrabold">Worker {workerScanLogDialog.worker}</h2>
+          <p class="muted mt-1 text-xs">Command dan output tersusun menurut profil/lane. Rahasia disamarkan; teks ditampilkan sebagai teks biasa.</p>
+          {#if scanOperationIsActive(scanOperation)}<p class="mt-1 text-xs text-violet-700 dark:text-violet-200" role="status">Log diperbarui realtime selama scan berlangsung.</p>{/if}
+        </div>
+        <button class="button secondary" onclick={closeWorkerScanLogs} aria-label="Tutup log worker"><X size={16}/></button>
+      </header>
+      <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5" aria-label={`Log mentah worker ${workerScanLogDialog.worker}`}>
+        {#if workerScanLogFailure}<p class="mb-3 text-sm text-rose-600" role="alert">{workerScanLogFailure}</p>{/if}
+        {#if workerScanLogEvents.length}
+          <div class="space-y-2">
+            {#each workerScanLogEvents as event (event.sequence)}
+              <article class="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--panel-strong)]" aria-label={`Log ${event.kind} profil ${event.profile} ${event.runtime}`}>
+                <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] px-3 py-2 text-[11px]">
+                  <span class="font-bold">Profil {event.profile || 'worker'} · {workerRuntimeLabel(event.runtime)} · {event.kind}{event.kind === 'output' ? ` / ${event.stream}` : ''}{event.exit_code !== null ? ` · exit ${event.exit_code}` : ''}</span>
+                  <time class="muted">{checkedAt(event.created_at)}</time>
+                </div>
+                <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11px] leading-relaxed">{event.text}</pre>
+              </article>
+            {/each}
+          </div>
+        {:else if workerScanLogLoading}
+          <p class="muted rounded-lg border border-dashed border-[var(--line)] p-5 text-sm" role="status">Memuat log worker…</p>
+        {:else}
+          <p class="muted rounded-lg border border-dashed border-[var(--line)] p-5 text-sm" role="status">Belum ada command/output dari canary profil pada operasi ini.</p>
+        {/if}
+      </div>
+      <footer class="flex items-center justify-between border-t border-[var(--line)] p-3 text-xs">
+        <span class="muted">{workerScanLogEvents.length} event</span>
+        <button class="button" onclick={closeWorkerScanLogs}>Tutup</button>
+      </footer>
     </dialog>
   </div>
 {/if}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
@@ -18,11 +19,13 @@ class ProfileScanOperations:
         scan: Callable[[str], None],
         scan_worker_runtime: Callable[[str, str], dict] | None = None,
         scan_profile_runtime: Callable[..., dict] | None = None,
+        scan_worker: Callable[[str, str], dict] | None = None,
     ) -> None:
         self.store = store
         self.scan = scan
         self.scan_worker_runtime = scan_worker_runtime
         self.scan_profile_runtime = scan_profile_runtime
+        self.scan_worker = scan_worker
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="profile-scan")
 
     def start(self, actor_user_id: int) -> dict:
@@ -58,6 +61,52 @@ class ProfileScanOperations:
             )
         self.executor.submit(self._run_worker_runtime, operation["id"], worker, runtime)
         return operation
+
+    def start_worker_scan(self, actor_user_id: int, worker: str) -> dict:
+        if self.scan_worker is None:
+            raise DomainError(
+                "PROFILE_SCAN_UNAVAILABLE",
+                "Scan semua profil pada satu worker belum tersedia.",
+                status_code=503,
+            )
+        target = {"kind": "worker", "worker": worker}
+        operation, created = self.store.create(actor_user_id, target=target)
+        if not created:
+            if operation.get("target") == target:
+                return operation
+            raise DomainError(
+                "PROFILE_SCAN_BUSY",
+                "Scan Profil lain sedang berjalan. Tunggu sampai operasi selesai.",
+                status_code=409,
+            )
+        self.executor.submit(self._run_worker_scan, operation["id"], worker)
+        return operation
+
+    def _run_worker_scan(self, operation_id: str, worker: str) -> None:
+        self.store.set_status(operation_id, "running")
+        try:
+            result = self.scan_worker(operation_id, worker)
+        except Exception as exc:
+            LOGGER.warning("Single-worker profile scan failed (%s).", type(exc).__name__)
+            self.store.set_status(
+                operation_id, "failed", error_code="PROFILE_SCAN_FAILED"
+            )
+            return
+        worker_result = next(
+            (
+                item
+                for item in result.get("workers", [])
+                if isinstance(item, dict) and item.get("name") == worker
+            ),
+            None,
+        ) if isinstance(result, dict) else None
+        if isinstance(worker_result, dict) and worker_result.get("status") == "failed":
+            error_code = str(worker_result.get("error_code") or "PROFILE_SCAN_FAILED")
+            if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", error_code):
+                error_code = "PROFILE_SCAN_FAILED"
+            self.store.set_status(operation_id, "failed", error_code=error_code)
+            return
+        self.store.set_status(operation_id, "succeeded")
 
     def start_profile_runtime(
         self,
@@ -242,6 +291,24 @@ class ProfileScanOperations:
         self, operation_id: str, worker: str, profile: str, status: str, **details
     ) -> None:
         self.store.report_profile(operation_id, worker, profile, status, **details)
+
+    def report_log(self, operation_id: str, **event) -> int | None:
+        return self.store.append_log(operation_id, **event)
+
+    def get_logs(
+        self,
+        operation_id: str,
+        *,
+        worker: str,
+        after_sequence: int = 0,
+        limit: int = 500,
+    ) -> dict | None:
+        return self.store.get_logs(
+            operation_id,
+            worker=worker,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
 
     def close(self) -> None:
         self.executor.shutdown(wait=False, cancel_futures=True)

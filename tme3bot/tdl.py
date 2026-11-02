@@ -183,6 +183,7 @@ class UploadResult:
 
 ProgressCallback = Callable[[CommandProgress], None]
 OutputCallback = Callable[[str], None]
+RawOutputCallback = Callable[[dict[str, Any]], None]
 OutputFilter = Callable[[str], bool]
 CommandCallback = Callable[[list[str], int, str, float, str], None]
 
@@ -254,6 +255,17 @@ class SubprocessRunner:
         self._last_output_at: float | None = None
         self._last_progress_signature: tuple[Any, ...] | None = None
 
+    @staticmethod
+    def _emit_raw_output(
+        callback: RawOutputCallback | None, event: dict[str, Any]
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback(event)
+        except Exception:
+            LOGGER.warning("Raw subprocess log callback failed", exc_info=True)
+
     def run(
         self,
         command: list[str],
@@ -262,6 +274,7 @@ class SubprocessRunner:
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
         output_callback: OutputCallback | None = None,
+        raw_output_callback: RawOutputCallback | None = None,
         command_callback: CommandCallback | None = None,
         quiet_output: bool = False,
         output_filter: OutputFilter | None = None,
@@ -271,6 +284,14 @@ class SubprocessRunner:
             while self._pause_requested and self._pause_owner in {None, command_owner}:
                 self._pause_condition.wait(timeout=1.0)
         process_command = prepare_subprocess_command(command, env)
+        self._emit_raw_output(
+            raw_output_callback,
+            {
+                "type": "command",
+                "stream": "system",
+                "text": shlex.join(command),
+            },
+        )
         if not quiet_output:
             if process_command == command:
                 LOGGER.info("%s start: %s", log_prefix, " ".join(command))
@@ -295,7 +316,16 @@ class SubprocessRunner:
                 env=env,
                 start_new_session=os.name != "nt",
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
+            self._emit_raw_output(
+                raw_output_callback,
+                {
+                    "type": "error",
+                    "stream": "stderr",
+                    "text": str(exc),
+                    "exit_code": -1,
+                },
+            )
             if command_callback is not None:
                 notify_command_completed(
                     command_callback,
@@ -338,6 +368,7 @@ class SubprocessRunner:
                     log_prefix,
                     progress_callback,
                     output_callback,
+                    raw_output_callback,
                     output_filter,
                     quiet_output=quiet_output,
                 )
@@ -363,6 +394,7 @@ class SubprocessRunner:
                 log_prefix,
                 progress_callback,
                 output_callback,
+                raw_output_callback,
                 output_filter,
                 quiet_output=quiet_output,
             )
@@ -389,6 +421,15 @@ class SubprocessRunner:
                 log_prefix, returncode, stdout, stderr, quiet_output=quiet_output
             )
         LOGGER.info("%s finished with exit code %s", log_prefix, returncode)
+        self._emit_raw_output(
+            raw_output_callback,
+            {
+                "type": "exit",
+                "stream": "system",
+                "text": f"process exited with code {returncode}",
+                "exit_code": int(returncode),
+            },
+        )
         if output_callback is not None:
             output_callback(f"[process exited with code {returncode}]")
         if command_callback is not None:
@@ -517,6 +558,7 @@ class SubprocessRunner:
         log_prefix: str,
         progress_callback: ProgressCallback | None,
         output_callback: OutputCallback | None,
+        raw_output_callback: RawOutputCallback | None,
         output_filter: OutputFilter | None,
         *,
         quiet_output: bool = False,
@@ -526,6 +568,15 @@ class SubprocessRunner:
                 stream_name, line = output_queue.get_nowait()
             except queue.Empty:
                 return
+
+            self._emit_raw_output(
+                raw_output_callback,
+                {
+                    "type": "output",
+                    "stream": stream_name,
+                    "text": line,
+                },
+            )
 
             clean_line = clean_tdl_output_line(line)
             if not clean_line:
@@ -719,6 +770,7 @@ class TDLClient:
         stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
         output_callback: OutputCallback | None = None,
+        raw_output_callback: RawOutputCallback | None = None,
         command_callback: CommandCallback | None = None,
         upload_resolve_timeout_seconds: float | None = None,
         upload_resolve_interval_seconds: float | None = None,
@@ -732,6 +784,7 @@ class TDLClient:
         self.stall_timeout_seconds = stall_timeout_seconds
         self.progress_callback = progress_callback
         self.output_callback = output_callback
+        self.raw_output_callback = raw_output_callback
         self.command_callback = command_callback
         self.upload_resolve_timeout_seconds = (
             float(upload_resolve_timeout_seconds)
@@ -1016,6 +1069,7 @@ class TDLClient:
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
             output_callback=self.output_callback,
+            **({"raw_output_callback": self.raw_output_callback} if self.raw_output_callback is not None else {}),
             **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
         )
         self._ensure_success(command, result)
@@ -1198,6 +1252,7 @@ class TDLClient:
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
             output_callback=self.output_callback,
+            **({"raw_output_callback": self.raw_output_callback} if self.raw_output_callback is not None else {}),
             **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
         )
         self._ensure_success(command, result)
@@ -1225,6 +1280,7 @@ class TDLClient:
             stall_timeout_seconds=self.stall_timeout_seconds,
             progress_callback=self.progress_callback,
             output_callback=self.output_callback,
+            **({"raw_output_callback": self.raw_output_callback} if self.raw_output_callback is not None else {}),
             **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
         )
         self._ensure_success(command, result)
@@ -1272,6 +1328,7 @@ class TDLClient:
                 stall_timeout_seconds=self.stall_timeout_seconds,
                 progress_callback=self.progress_callback,
                 output_callback=self.output_callback,
+                **({"raw_output_callback": self.raw_output_callback} if self.raw_output_callback is not None else {}),
                 **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
             )
             self._ensure_success(command, result)

@@ -437,6 +437,57 @@ class TDLClientTests(unittest.TestCase):
         self.assertTrue(any("raw worker output" in line for line in captured))
         self.assertTrue(any("process exited with code 0" in line for line in captured))
 
+    def test_runner_emits_raw_command_streams_and_exit_status(self) -> None:
+        env = dict(os.environ)
+        env["TDL_FORCE_PTY"] = "0"
+        events: list[dict] = []
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import sys; "
+                "sys.stdout.write('out\\r\\n\\x1b[32mready\\x1b[0m\\r'); "
+                "sys.stdout.flush(); "
+                "sys.stderr.write('err\\n'); sys.stderr.flush(); "
+                "raise SystemExit(3)"
+            ),
+        ]
+
+        result = SubprocessRunner().run(
+            command,
+            env=env,
+            log_prefix="tdl-scan-test",
+            raw_output_callback=events.append,
+        )
+
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(events[0]["type"], "command")
+        self.assertIn("python", events[0]["text"])
+        self.assertEqual(
+            "".join(event["text"] for event in events if event["stream"] == "stdout"),
+            "out\r\n\x1b[32mready\x1b[0m\r",
+        )
+        self.assertEqual(
+            "".join(event["text"] for event in events if event["stream"] == "stderr"),
+            "err\n",
+        )
+        self.assertEqual(events[-1]["type"], "exit")
+        self.assertEqual(events[-1]["exit_code"], 3)
+
+    def test_runner_reports_command_start_failure_to_raw_log(self) -> None:
+        env = dict(os.environ)
+        env["TDL_FORCE_PTY"] = "0"
+        events: list[dict] = []
+        with self.assertRaises(TDLCommandError):
+            SubprocessRunner().run(
+                ["/definitely/missing/profile-scan-command"],
+                env=env,
+                raw_output_callback=events.append,
+            )
+        self.assertEqual(events[0]["type"], "command")
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1]["exit_code"], -1)
+
     def test_export_handles_empty_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tme3bot.chat_refs import normalize_tdl_chat_ref
+from tme3bot.persistence import utc_now_iso
 from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.tdl_output import parse_speed_bps
 
@@ -18,6 +19,28 @@ _PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
 _FINGERPRINT_RE = re.compile(r"[a-f0-9]{64}\Z")
 _RETAINED_CANARY_OPERATIONS = 128
 _PROFILE_CHECKS = {"export", "download", "storage", "tts"}
+_LOG_SECRET_PATTERNS = (
+    re.compile(r"\b\d{5,15}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?i)\b(?:https?|socks5h?)://[^\s/@:]+:[^\s/@]+(?=@)"),
+    re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+"),
+    re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)((?:cookie|set-cookie)\s*:\s*)[^\r\n]+"),
+    re.compile(
+        r'''(?i)(["'](?:token|access[_-]?token|refresh[_-]?token|bot[_-]?token|'''
+        r'''api[_-]?key|client[_-]?secret|secret|password|passwd|passphrase|'''
+        r'''session(?:[_ -]?(?:key|token|data|contents|string))?|auth[_ -]?key|'''
+        r'''private[_-]?key|cookie|set-cookie)["']\s*:\s*)(?:"[^"]*"|'[^']*'|[^\s,;}\]]+)'''
+    ),
+    re.compile(
+        r"(?i)(\b(?:token|access[_-]?token|refresh[_-]?token|bot[_-]?token|api[_-]?key|client[_-]?secret|secret|password|passwd|passphrase|session(?:[_ -]?(?:key|token|data|contents|string))|auth[_ -]?key|private[_ -]?key)\b\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    ),
+    re.compile(
+        r"(?i)(--(?:token|api-key|client-secret|secret|password|passwd|passphrase|session)\s+)(?:\"[^\"]*\"|'[^']*'|[^\s]+)"
+    ),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+    ),
+)
 
 
 def _failure_code(exc: BaseException, fallback: str) -> str:
@@ -36,6 +59,16 @@ def _contains_marker(value: Any, marker: str) -> bool:
     if isinstance(value, list):
         return any(_contains_marker(item, marker) for item in value)
     return False
+
+
+def _redact_scan_log_text(value: Any) -> str:
+    text = str(value or "")
+    for pattern in _LOG_SECRET_PATTERNS:
+        if pattern.groups:
+            text = pattern.sub(lambda match: f"{match.group(1)}[REDACTED]", text)
+        else:
+            text = pattern.sub("[REDACTED]", text)
+    return text
 
 
 class ProfileReadinessCanary:
@@ -60,6 +93,7 @@ class ProfileReadinessCanary:
         tts_target: str,
         report: Callable[[str, dict[str, Any], list[dict[str, Any]]], None],
         checks: list[str] | None = None,
+        log_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         selected_checks = set(_PROFILE_CHECKS if checks is None else checks)
         if not selected_checks or not selected_checks.issubset(_PROFILE_CHECKS):
@@ -92,6 +126,41 @@ class ProfileReadinessCanary:
 
         def emit(phase: str) -> None:
             report(phase, copy.deepcopy(checks), copy.deepcopy(messages))
+
+        def run_tdl(runtime_name: str, client: Any, action: Callable[[], Any]) -> Any:
+            if not callable(log_callback):
+                return action()
+            had_callback = hasattr(client, "raw_output_callback")
+            previous_callback = getattr(client, "raw_output_callback", None)
+
+            def capture(event: dict[str, Any]) -> None:
+                if not isinstance(event, dict):
+                    return
+                safe_event = {
+                    "runtime": runtime_name,
+                    "type": str(event.get("type") or "output"),
+                    "stream": str(event.get("stream") or "system"),
+                    "text": _redact_scan_log_text(event.get("text")),
+                }
+                code = event.get("exit_code")
+                if isinstance(code, int) and not isinstance(code, bool):
+                    safe_event["exit_code"] = code
+                try:
+                    log_callback(safe_event)
+                except Exception:
+                    LOGGER.warning("Profile scan raw-log reporter failed", exc_info=True)
+
+            client.raw_output_callback = capture
+            try:
+                return action()
+            finally:
+                if had_callback:
+                    client.raw_output_callback = previous_callback
+                else:
+                    try:
+                        delattr(client, "raw_output_callback")
+                    except AttributeError:
+                        pass
 
         try:
             for lock in locks:
@@ -154,11 +223,15 @@ class ProfileReadinessCanary:
                 if needs_export and storage_target:
                     emit("export_canary")
                     try:
-                        exported = export_client.export_messages(
-                            storage_target,
-                            1,
-                            export_json,
-                            last_count=1,
+                        exported = run_tdl(
+                            "export",
+                            export_client,
+                            lambda: export_client.export_messages(
+                                storage_target,
+                                1,
+                                export_json,
+                                last_count=1,
+                            ),
                         )
                         if exported.exported_count < 1 or not export_json.is_file():
                             checks["export"]["reason_code"] = "PROFILE_CANARY_EXPORT_EMPTY"
@@ -211,7 +284,11 @@ class ProfileReadinessCanary:
                     try:
                         download_client.progress_callback = on_download_progress
                         try:
-                            download_client.download(export_json, media_dir)
+                            run_tdl(
+                                "download",
+                                download_client,
+                                lambda: download_client.download(export_json, media_dir),
+                            )
                         except Exception as exc:
                             if not speed_seen.is_set():
                                 raise exc
@@ -233,7 +310,11 @@ class ProfileReadinessCanary:
                     emit("upload_storage")
                     upload_client = runtime.upload_tdl_client
                     try:
-                        uploaded = upload_client.upload(export_json, storage_target, marker)
+                        uploaded = run_tdl(
+                            "storage",
+                            upload_client,
+                            lambda: upload_client.upload(export_json, storage_target, marker),
+                        )
                         storage_message_id = int(uploaded.message_id)
                         checks["upload"] = {"ready": True, "reason_code": ""}
                         messages.append({"target": "storage", "message_id": storage_message_id})
@@ -245,12 +326,16 @@ class ProfileReadinessCanary:
                         checks["storage"]["reason_code"] = checks["upload"]["reason_code"]
                     else:
                         try:
-                            verified = export_client.export_messages(
-                                storage_target,
-                                storage_message_id,
-                                root / "verify-storage.json",
-                                with_content=True,
-                                end_id=storage_message_id,
+                            verified = run_tdl(
+                                "storage",
+                                export_client,
+                                lambda: export_client.export_messages(
+                                    storage_target,
+                                    storage_message_id,
+                                    root / "verify-storage.json",
+                                    with_content=True,
+                                    end_id=storage_message_id,
+                                ),
                             )
                             found = any(
                                 int(item.get("id") or 0) == storage_message_id
@@ -270,16 +355,24 @@ class ProfileReadinessCanary:
                     marker = f"[TME3BOT PROFILE SCAN {uuid.uuid4()}]"
                     emit("upload_tts")
                     try:
-                        uploaded = export_client.upload(export_json, tts_target, marker)
+                        uploaded = run_tdl(
+                            "tts",
+                            export_client,
+                            lambda: export_client.upload(export_json, tts_target, marker),
+                        )
                         tts_message_id = int(uploaded.message_id)
                         messages.append({"target": "tts", "message_id": tts_message_id})
                         emit("verify_tts")
-                        verified = export_client.export_messages(
-                            tts_target,
-                            tts_message_id,
-                            root / "verify-tts.json",
-                            with_content=True,
-                            end_id=tts_message_id,
+                        verified = run_tdl(
+                            "tts",
+                            export_client,
+                            lambda: export_client.export_messages(
+                                tts_target,
+                                tts_message_id,
+                                root / "verify-tts.json",
+                                with_content=True,
+                                end_id=tts_message_id,
+                            ),
                         )
                         found = any(
                             int(item.get("id") or 0) == tts_message_id
@@ -343,6 +436,8 @@ class ProfileReadinessCanaryOperations:
             "phase": "queued",
             "checks": {},
             "messages": [],
+            "logs": [],
+            "log_sequence": 0,
             "session_fingerprint": "",
             "upload_session_fingerprint": "",
             "error_code": "",
@@ -364,6 +459,25 @@ class ProfileReadinessCanaryOperations:
                     checks=copy.deepcopy(checks),
                     messages=copy.deepcopy(messages),
                 )
+
+    def _append_log(self, operation_id: str, event: dict[str, Any]) -> None:
+        with self._lock:
+            operation = self._operations.get(operation_id)
+            if operation is None:
+                return
+            sequence = int(operation.get("log_sequence") or 0) + 1
+            operation["log_sequence"] = sequence
+            operation.setdefault("logs", []).append({
+                "sequence": sequence,
+                "worker": "",
+                "profile": str(operation.get("profile") or ""),
+                "runtime": str(event.get("runtime") or ""),
+                "type": str(event.get("type") or "output"),
+                "stream": str(event.get("stream") or "system"),
+                "text": str(event.get("text") or ""),
+                "exit_code": event.get("exit_code"),
+            })
+            operation["updated_at"] = utc_now_iso()
 
     def _run(
         self,
@@ -387,6 +501,7 @@ class ProfileReadinessCanaryOperations:
                     operation_id, phase, checks, messages
                 ),
                 checks=checks,
+                log_callback=lambda event: self._append_log(operation_id, event),
             )
         except Exception:
             result = {

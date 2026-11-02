@@ -1424,6 +1424,249 @@ class BackendApiTests(unittest.TestCase):
             ["quick_mode_runtime", "rclone_storage", "export", "download", "upload", "storage"],
         )
 
+    def test_single_worker_profile_scan_preserves_other_workers_and_skips_resolver(self):
+        auth = self.login(42)
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test",
+            "token": "remote-secret",
+            "enabled": True,
+        }
+        self.local_profile_catalog.replace_scan(
+            checked_at="t1",
+            workers=[
+                {"name": "local", "status": "success", "checked_at": "local-old", "error_code": ""},
+                {"name": "remote-1", "status": "success", "checked_at": "remote-old", "error_code": ""},
+            ],
+            inventories=[
+                {"worker": "local", "checked_at": "local-old", "items": [{
+                    "name": "default", "ready": True, "reason_codes": [],
+                    "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": True, "code": "OK"},
+                    ],
+                }]},
+                {"worker": "remote-1", "checked_at": "remote-old", "items": [{
+                    "name": "stale", "ready": True, "reason_codes": [],
+                    "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": True, "code": "OK"},
+                    ],
+                }]},
+            ],
+        )
+        self.runtime_readiness_store.upsert_cell(
+            worker="local", profile="default", runtime="export", ready=True,
+            fingerprint="b" * 64, checked_at="local-readiness-old",
+        )
+        inventory_calls = []
+        resolver_calls = []
+        self.dispatcher.profile_local_inventory = lambda worker: inventory_calls.append(worker) or {
+            "items": [{
+                "name": "default",
+                "ready": True,
+                "reason_codes": [],
+                "checks": [
+                    {"name": "identity", "ready": True, "code": "OK"},
+                    {"name": "root_session", "ready": True, "code": "OK"},
+                    {"name": "user1_session", "ready": True, "code": "OK"},
+                ],
+            }],
+        }
+        self.dispatcher.profile_tdl_diagnostics = lambda worker, profile: {
+            "ready": True, "reason_codes": [], "fingerprint": "a" * 64,
+        }
+        self.dispatcher.safelink_runtime_readiness = lambda worker: resolver_calls.append(worker) or self.fail(
+            "Profile worker scan must not probe disabled Resolver"
+        )
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/worker",
+            headers=auth,
+            json={"worker": "remote-1"},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            operation = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            )
+            if operation.status_code == 200 and operation.json()["status"] in {
+                "succeeded", "failed"
+            }:
+                break
+            time.sleep(0.01)
+        self.assertEqual(operation.json()["status"], "succeeded", operation.text)
+        self.assertEqual(operation.json()["target"], {"kind": "worker", "worker": "remote-1"})
+        self.assertEqual(inventory_calls, ["remote-1"])
+        self.assertEqual(resolver_calls, [])
+
+        catalog = self.client.get("/api/v1/profiles/local", headers=auth).json()
+        worker_times = {item["name"]: item["checked_at"] for item in catalog["workers"]}
+        inventory_times = {item["worker"]: item["checked_at"] for item in catalog["inventories"]}
+        self.assertEqual(worker_times["local"], "local-old")
+        self.assertEqual(inventory_times["local"], "local-old")
+        self.assertNotEqual(worker_times["remote-1"], "remote-old")
+        self.assertEqual(
+            next(item for item in catalog["inventories"] if item["worker"] == "remote-1")["items"][0]["name"],
+            "default",
+        )
+        local_cell = self.runtime_readiness_store.cell("local", "default", "export")
+        self.assertEqual(local_cell["checked_at"], "local-readiness-old")
+
+    def test_single_worker_scan_operation_fails_when_worker_inventory_fails(self):
+        auth = self.login(42)
+        worker = "remote-1"
+        self.workers.values[worker] = {
+            "url": "https://remote-1.example.test",
+            "token": "remote-secret",
+            "enabled": True,
+        }
+
+        def unavailable(_worker):
+            raise RuntimeError("worker unavailable")
+
+        self.dispatcher.profile_local_inventory = unavailable
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/worker",
+            headers=auth,
+            json={"worker": worker},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            operation = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            ).json()
+            if operation["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.01)
+
+        self.assertEqual(operation["status"], "failed")
+        self.assertEqual(operation["error_code"], "WORKER_SCAN_FAILED")
+        worker_progress = operation["progress"]["workers"][0]
+        self.assertEqual(worker_progress["name"], worker)
+        self.assertEqual(worker_progress["status"], "failed")
+
+    def test_profile_scan_log_endpoint_is_authenticated_and_returns_worker_cursor_page(self):
+        operation, created = self.profile_scan_store.create(
+            42, target={"kind": "worker", "worker": "remote-1"}
+        )
+        self.assertTrue(created)
+        self.profile_scan_store.report_worker(
+            operation["id"], "remote-1", "running", phase="profile_probe",
+            profiles=["default"],
+        )
+        self.profile_scan_store.append_log(
+            operation["id"], worker="remote-1", profile="default",
+            runtime="export", kind="output", stream="stdout",
+            text="raw \x1b[32mline\x1b[0m\r\n",
+        )
+
+        path = f"/api/v1/profiles/local/scan/{operation['id']}/logs"
+        self.assertEqual(self.client.get(path, params={"worker": "remote-1"}).status_code, 401)
+        response = self.client.get(
+            path,
+            headers=self.login(42),
+            params={"worker": "remote-1", "after_sequence": 0, "limit": 10},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["events"][0]["text"], "raw \x1b[32mline\x1b[0m\r\n")
+        self.assertEqual(payload["next_sequence"], payload["events"][0]["sequence"])
+        self.assertFalse(payload["has_more"])
+
+    def test_worker_scan_persists_canary_logs_while_the_scan_is_running(self):
+        from uuid import uuid4
+
+        auth = self.login(42)
+        worker = "remote-1"
+        self.workers.values[worker] = {
+            "url": "https://remote-1.example.test", "token": "remote-secret",
+            "enabled": True,
+        }
+        self.dispatcher.profile_local_inventory = lambda _worker: {"items": [{
+            "name": "default", "ready": True, "reason_codes": [],
+            "checks": [
+                {"name": "identity", "ready": True, "code": "OK"},
+                {"name": "root_session", "ready": True, "code": "OK"},
+                {"name": "user1_session", "ready": True, "code": "OK"},
+            ],
+        }]}
+        self.dispatcher.profile_tdl_diagnostics = lambda _worker, _profile: {
+            "ready": True, "reason_codes": [], "fingerprint": "a" * 64,
+        }
+        canary_id = str(uuid4())
+        command_log = {
+            "sequence": 1, "runtime": "export", "type": "command",
+            "stream": "system", "text": "$ tdl chat export -c -1001234567890",
+            "exit_code": None,
+        }
+        output_log = {
+            "sequence": 2, "runtime": "export", "type": "output",
+            "stream": "stdout", "text": "\x1b[32mExported 1\x1b[0m\r\n",
+            "exit_code": None,
+        }
+        terminal_canary = {
+            "id": canary_id, "profile": "default", "status": "succeeded",
+            "phase": "complete", "checks": {
+                name: {"ready": True, "reason_code": ""}
+                for name in ("export", "download", "upload", "storage", "tts")
+            },
+            "messages": [], "session_fingerprint": "a" * 64,
+            "upload_session_fingerprint": "b" * 64,
+            "logs": [command_log, output_log], "error_code": "",
+        }
+        self.dispatcher.start_profile_readiness_canary = lambda *_args, **_kwargs: {
+            **terminal_canary, "status": "running", "phase": "export_canary",
+            "logs": [command_log],
+        }
+        self.dispatcher.profile_readiness_canary = lambda _worker, _id: terminal_canary
+
+        response = self.client.post(
+            "/api/v1/profiles/local/scan/worker", headers=auth,
+            json={"worker": worker},
+        )
+        self.assertEqual(response.status_code, 202, response.text)
+        operation_id = response.json()["id"]
+        logs_path = f"/api/v1/profiles/local/scan/{operation_id}/logs"
+        first_event = None
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            operation = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            ).json()
+            page = self.client.get(
+                logs_path, headers=auth,
+                params={"worker": worker, "after_sequence": 0},
+            ).json()
+            if page["events"]:
+                first_event = page["events"][0]
+                self.assertEqual(operation["status"], "running")
+                break
+            time.sleep(0.02)
+        self.assertIsNotNone(first_event, "worker command log should arrive before scan terminal")
+        self.assertEqual(first_event["text"], command_log["text"])
+
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            operation = self.client.get(
+                f"/api/v1/profiles/local/scan/{operation_id}", headers=auth
+            ).json()
+            if operation["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.02)
+        self.assertEqual(operation["status"], "succeeded", operation)
+        later = self.client.get(
+            logs_path, headers=auth,
+            params={"worker": worker, "after_sequence": first_event["sequence"]},
+        ).json()
+        self.assertEqual(later["events"][0]["text"], output_log["text"])
+        self.assertEqual(later["events"][0]["stream"], "stdout")
+
     def test_targeted_worker_runtime_scan_updates_only_selected_cell(self):
         auth = self.login(42)
         checked_at = "2026-10-31T10:00:00Z"
@@ -1797,7 +2040,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("/data", response.text)
         self.assertNotIn("must-not-leak", response.text)
         self.assertNotIn("fingerprint", response.text)
-        self.assertEqual(resolver_probe_calls, ["local"])
+        self.assertEqual(resolver_probe_calls, [])
         utility_cells = [
             item for item in body["runtime_readiness"]["cells"]
             if item["runtime"] == "utility"
@@ -1813,18 +2056,12 @@ class BackendApiTests(unittest.TestCase):
             self.runtime_readiness_store.cell("local", "incomplete", "export")["status"],
             "not_ready",
         )
-        self.assertEqual(
-            self.runtime_readiness_store.cell("local", None, "resolver")["fingerprint"],
-            "e" * 64,
-        )
+        self.assertIsNone(self.runtime_readiness_store.cell("local", None, "resolver"))
         resolver_cells = [
             item for item in body["runtime_readiness"]["cells"]
             if item["runtime"] == "resolver"
         ]
-        self.assertEqual(len(resolver_cells), 1)
-        self.assertEqual(resolver_cells[0]["worker"], "local")
-        self.assertEqual(resolver_cells[0]["profile"], None)
-        self.assertEqual(resolver_cells[0]["status"], "ready")
+        self.assertEqual(resolver_cells, [])
         self.assertEqual(body["runtime_readiness"]["workers"][1]["status"], "failed")
 
         before_read = list(calls)
@@ -1832,7 +2069,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(read.status_code, 200, read.text)
         self.assertEqual(read.json(), body)
         self.assertEqual(calls, before_read)
-        self.assertEqual(resolver_probe_calls, ["local"])
+        self.assertEqual(resolver_probe_calls, [])
         self.assertNotIn("stale", read.text)
 
     def test_profile_scan_uses_tts_canary_and_helper_probe_without_manual_marker(self):

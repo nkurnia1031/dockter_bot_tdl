@@ -70,6 +70,74 @@ class LocalProfileCatalog:
                 after_commit(copy.deepcopy(result))
             return result
 
+    def replace_worker_scan(
+        self,
+        *,
+        worker: str,
+        checked_at: str,
+        status: str,
+        error_code: str = "",
+        inventory: dict[str, Any] | None = None,
+        expected_revision: int | None = None,
+        after_commit: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any] | None:
+        """Replace one worker's catalog snapshot while preserving every other worker."""
+        selected_worker = str(worker or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", selected_worker):
+            raise ValueError("worker name is invalid")
+        if status not in {"success", "failed", "disabled"}:
+            raise ValueError("worker scan status is invalid")
+        if status == "success" and (
+            not isinstance(inventory, dict)
+            or str(inventory.get("worker") or "").strip().lower() != selected_worker
+        ):
+            raise ValueError("successful worker scan requires its inventory")
+
+        when = str(checked_at or "")[:40]
+        with self.scan_lock:
+            with self._lock:
+                self._load_locked()
+                assert self._snapshot is not None
+                if (
+                    expected_revision is not None
+                    and expected_revision != self._revision
+                ):
+                    return None
+                workers = {
+                    item["name"]: copy.deepcopy(item)
+                    for item in self._snapshot["workers"]
+                }
+                safe_error = str(error_code or "")
+                if status == "failed" and not re.fullmatch(
+                    r"[A-Z][A-Z0-9_]{0,79}", safe_error
+                ):
+                    safe_error = "WORKER_SCAN_FAILED"
+                workers[selected_worker] = {
+                    "name": selected_worker,
+                    "status": status,
+                    "checked_at": when,
+                    "error_code": safe_error if status == "failed" else "",
+                }
+                inventories = {
+                    item["worker"]: copy.deepcopy(item)
+                    for item in self._snapshot["inventories"]
+                    if item["worker"] != selected_worker
+                }
+                if status == "success":
+                    inventories[selected_worker] = copy.deepcopy(inventory)
+                snapshot = self._build_snapshot(
+                    checked_at=when,
+                    workers=list(workers.values()),
+                    inventories=list(inventories.values()),
+                )
+                write_json_atomic(self.path, snapshot)
+                self._snapshot = snapshot
+                self._revision += 1
+                result = copy.deepcopy(snapshot)
+            if after_commit is not None:
+                after_commit(copy.deepcopy(result))
+            return result
+
     def mark_profile_deleted(
         self,
         worker: str,
