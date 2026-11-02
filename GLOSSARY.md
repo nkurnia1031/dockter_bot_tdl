@@ -99,20 +99,28 @@ Akun sistem operasi yang menjalankan proses TDL; identitas ini terpisah dari aku
 _Avoid_: identitas profil, pengguna Telegram.
 
 **Identitas profil**:
-Satu ID numerik Telegram yang berlaku bagi seluruh pasangan sesi dan menentukan akun serta pemetaan actor profil.
-_Avoid_: identitas folder, identitas worker.
+ID numerik Telegram yang memetakan profil ke actor aplikasi. Identitas ini menetapkan kepemilikan profil di aplikasi, tetapi tidak menyatakan akun yang sedang dipakai sesi TDL.
+_Avoid_: akun sesi aktif, identitas folder, identitas worker.
 
 **Kesiapan profil worker**:
-Status apakah salinan lokal profil pada satu worker lolos pemeriksaan TDL dan cocok dengan identitas profil. Kesiapan dicatat per worker dan tidak menunggu worker lain.
-_Avoid_: kesiapan seluruh worker.
+Status operasional profil pada satu worker yang dicatat terpisah dari worker lain. Status lane ditentukan oleh kemampuan nyata mengakses tujuan fitur, bukan kecocokan akun sesi dengan metadata profil.
+_Avoid_: kesiapan seluruh worker, kecocokan identitas sebagai bukti akses.
 
 **Kesiapan runtime**:
-Bukti bahwa kemampuan fitur tertentu tersedia pada satu worker dan, bila diperlukan, satu profil. Bukti berasal dari probe runtime atau canary operasional yang sesuai dengan jalur fitur. Bukti tetap berlaku sampai fingerprint terkait berubah atau kegagalan akses/runtime yang cocok menginvalidasinya.
-_Avoid_: status online worker, verifikasi setiap job.
+Status operasional service atau lane pada worker, dan bila relevan pada profil, untuk membantu operator memilih tujuan kerja. Perubahan sidik sesi tidak memblokir operasi; keberhasilan atau kegagalan perintah nyata memperbarui status terkait.
+_Avoid_: status online worker, kecocokan fingerprint sebagai syarat job.
 
 **Scan kesiapan profil**:
-Operasi eksplisit yang memeriksa service worker dan menguji lane profil melalui canary terisolasi. Hasil disimpan per worker, profil, service, lane, dan tujuan; pesan canary dihapus setelah verifikasi, sedangkan kegagalan cleanup ditampilkan terpisah dari kesiapan lane.
+Operasi eksplisit yang memeriksa service worker dan menguji lane profil melalui canary. Hasil dipisahkan per worker, profil, service, dan lane; kegagalan cleanup canary dilaporkan terpisah dari hasil akses.
 _Avoid_: scan read-only, satu status global semua worker.
+
+**Scan worker**:
+Scan kesiapan profil yang mencakup seluruh profil dan service/lane pada satu worker terpilih, tanpa mengubah hasil worker lain.
+_Avoid_: scan semua worker, scan satu sel.
+
+**Scan Storage worker**:
+Pemeriksaan akses Storage pada worker terpilih yang menguji profil-profil lokal satu per satu dan melaporkan hasil tiap profil.
+_Avoid_: status Storage global, scan profil tanpa target worker.
 
 **Scan terpilih**:
 Scan kesiapan profil yang hanya memeriksa satu service worker atau satu lane/service pada profil-worker yang dipilih operator, beserta dependency langsungnya. Sel readiness lain dan waktu pemeriksaannya tetap tersimpan.
@@ -123,8 +131,8 @@ Scan kesiapan profil eksplisit yang memeriksa semua worker aktif, profil lokal, 
 _Avoid_: scan otomatis, refresh readiness berkala.
 
 **Kesiapan lane**:
-Bukti bahwa lane Export, Download, atau Upload pada satu profil-worker berhasil melewati canary-nya. Kesiapan Download dicatat setelah kecepatan transfer terlihat lalu job canary dibatalkan; pembatalan itu tidak membatalkan hasil lane lain.
-_Avoid_: satu kesiapan gabungan profil, hasil job fitur lain.
+Status operasional lane Export, Download, atau Upload pada satu profil-worker. Keberhasilan atau kegagalan perintah nyata memperbarui status lane itu; perubahan fingerprint saja tidak memblokir job.
+_Avoid_: satu kesiapan gabungan profil, kecocokan fingerprint sebagai syarat job.
 
 **Revision vault**:
 Versi tertentu dari bundle kanonis di backend yang hanya dipasang ke worker melalui operasi distribusi eksplisit.
