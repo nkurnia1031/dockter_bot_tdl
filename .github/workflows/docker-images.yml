@@ -22,7 +22,7 @@ jobs:
 
   base:
     name: Build runtime base image
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: test-suite
     outputs:
       owner: ${{ steps.meta.outputs.owner }}
@@ -30,7 +30,7 @@ jobs:
       base_ref: ${{ steps.meta.outputs.base_ref }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -46,10 +46,10 @@ jobs:
           echo "base_ref=${base_ref}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -101,7 +101,7 @@ jobs:
 
       - name: Build and publish base image
         if: steps.base_release.outputs.current_exists != 'true' && (steps.base_changes.outputs.changed == 'true' || steps.base_release.outputs.source_tag == '')
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile.base
@@ -125,7 +125,7 @@ jobs:
   application:
     name: Build ${{ matrix.image }} image
     needs: base
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -141,15 +141,15 @@ jobs:
             target: resolver
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -217,7 +217,7 @@ jobs:
 
       - name: Build and publish resolver addon image
         if: matrix.image == 'resolver' && steps.release.outputs.current_exists != 'true' && (steps.changes.outputs.changed == 'true' || steps.release.outputs.source_tag == '')
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./${{ matrix.dockerfile }}
@@ -232,7 +232,7 @@ jobs:
 
       - name: Build and publish gateway or worker image
         if: matrix.image != 'resolver' && steps.release.outputs.current_exists != 'true' && (steps.changes.outputs.changed == 'true' || steps.release.outputs.source_tag == '')
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./${{ matrix.dockerfile }}
