@@ -210,7 +210,7 @@ class SqliteTdlAccessStore:
         worker: str,
         destination_hash: str,
         profile: str,
-        session_fingerprint: str,
+        session_fingerprint: str | None,
         error_code: str,
         *,
         purpose: str = "storage",
@@ -227,18 +227,23 @@ class SqliteTdlAccessStore:
             or selected_purpose not in {"storage", "tts"}
             or not re.fullmatch(r"[a-f0-9]{64}", destination)
             or not _PROFILE.fullmatch(selected_profile)
-            or not re.fullmatch(r"[a-f0-9]{64}", fingerprint)
+            or (fingerprint and not re.fullmatch(r"[a-f0-9]{64}", fingerprint))
             or not code
         ):
             return False
         now = utc_now().isoformat()
         with self._lock, self._connect() as db:
-            cursor = db.execute(
+            sql = (
                 "UPDATE tdl_access_profiles SET ready=0,error_code=?,checked_at=? "
-                "WHERE worker=? AND purpose=? AND destination_hash=? "
-                "AND profile=? AND session_fingerprint=?",
-                (code, now, worker, selected_purpose, destination, selected_profile, fingerprint),
+                "WHERE worker=? AND purpose=? AND destination_hash=? AND profile=?"
             )
+            params: tuple[Any, ...] = (
+                code, now, worker, selected_purpose, destination, selected_profile,
+            )
+            if fingerprint:
+                sql += " AND session_fingerprint=?"
+                params += (fingerprint,)
+            cursor = db.execute(sql, params)
             return cursor.rowcount > 0
 
     def choose_next(

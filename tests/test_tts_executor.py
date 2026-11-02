@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tme3bot.worker.executor_tts import TtsExecutorMixin, tts_delivery_filename
+from tme3bot.worker.executor_tts import tts_delivery_filename
 from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.tts_pipeline import TtsError
 
@@ -54,7 +54,7 @@ class _FakeTdl:
             raise self.error
 
 
-class _Executor(TtsExecutorMixin):
+class _Executor(WorkerJobExecutor):
     def __init__(self, root):
         self.config = SimpleNamespace(
             tts_data_root=Path(root) / "tts",

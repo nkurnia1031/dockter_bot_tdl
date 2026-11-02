@@ -169,7 +169,12 @@ class DownloadExecutorMixin:
                 )
 
         with self._download_progress_operation(runtime, progress_event):
-            with self._capture_tdl_output(runtime.download_tdl_client):
+            with self._capture_tdl_output(
+                runtime.download_tdl_client,
+                command_callback=self._command_callback(
+                    profile=str(command.get("profile") or runtime.name), runtime="download"
+                ),
+            ):
                 if payload.get("retry_failed") and not artifact_refs:
                     result = runtime.download_service.retry_failed_exports()
                 elif artifact_refs:

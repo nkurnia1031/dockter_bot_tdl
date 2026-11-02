@@ -110,7 +110,8 @@ class StorageDownloadHarness(StorageExecutorMixin, WorkspaceExecutorMixin):
     def _append_job_log(self, line):
         return None
 
-    def _command_callback(self):
+    def _command_callback(self, *, profile=None, runtime=None):
+        del profile, runtime
         return None
 
     @contextmanager

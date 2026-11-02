@@ -76,30 +76,26 @@ class ProfileCatalogAdmissionTests(unittest.TestCase):
             ("shared", "remote-1"),
         )
 
-    def test_rejects_a_profile_worker_pair_missing_from_the_latest_catalog(self):
-        with self.assertRaises(DomainError) as raised:
-            self.control.resolve_target(self.actor, profile="remote-only", worker="local")
+    def test_profile_worker_pair_missing_from_catalog_is_still_dispatched_to_selected_worker(self):
+        self.assertEqual(
+            self.control.resolve_target(self.actor, profile="remote-only", worker="local"),
+            ("remote-only", "local"),
+        )
 
-        self.assertEqual(raised.exception.code, "PROFILE_WORKER_MISMATCH")
-        self.assertEqual(raised.exception.details["available_workers"], ["remote-1"])
+    def test_job_admission_does_not_use_catalog_as_a_worker_session_gate(self):
+        self.control._assert_profile_admission("export", "remote-only", "local", {})
 
-    def test_job_admission_rejects_a_profile_worker_pair_missing_from_the_catalog(self):
-        with self.assertRaises(DomainError) as raised:
-            self.control._assert_profile_admission("export", "remote-only", "local", {})
-
-        self.assertEqual(raised.exception.code, "PROFILE_WORKER_MISMATCH")
-
-    def test_rejects_a_known_identity_profile_missing_from_the_latest_scan(self):
+    def test_profile_missing_from_latest_scan_is_still_dispatchable(self):
         self.catalog.replace_scan(
             checked_at="2026-10-16T00:01:00Z",
             workers=[{"name": "local", "status": "success"}],
             inventories=[{"worker": "local", "items": [{"name": "default", "ready": True}]}],
         )
 
-        with self.assertRaises(DomainError) as raised:
-            self.control.resolve_target(self.actor, profile="stale", worker="local")
-
-        self.assertEqual(raised.exception.code, "PROFILE_NOT_VERIFIED")
+        self.assertEqual(
+            self.control.resolve_target(self.actor, profile="stale", worker="local"),
+            ("stale", "local"),
+        )
 
     def test_catalog_only_profile_can_be_targeted_without_changing_identity_registry(self):
         self.assertEqual(

@@ -33,23 +33,23 @@
   let error = $state('');
   let notice = $state('');
   const maxChars = 100_000;
-  const readyWorkers = $derived(workers.filter((item) => item.ready));
+  const activeWorkers = $derived(workers.filter((item) => item.enabled));
   const workerReason = (code: string) => ({
     ready: 'Siap menerima job',
-    runtime_not_scanned: 'Belum ada Scan Profil',
-    tts_destination_changed: 'Tujuan berubah; jalankan Scan Profil',
+    runtime_not_scanned: 'Belum ada hasil scan',
+    tts_destination_changed: 'Tujuan berubah; command aktual akan mengujinya',
     tts_chat_unavailable: 'Chat tujuan belum dikonfigurasi',
     tts_helper_unavailable: 'Helper TTS tidak siap',
     tts_runtime_unavailable: 'Runtime TTS tidak siap',
-    tdl_access_not_verified: 'Bukti akses belum cocok dengan sesi saat ini',
+    tdl_access_not_verified: 'Belum ada hasil command terbaru; job tetap dapat dicoba',
     tdl_session_unauthorized: 'Sesi TDL perlu diperiksa',
-    profile_session_changed: 'Sesi profil berubah; jalankan Scan Profil',
+    profile_session_changed: 'Snapshot lama; command aktual menentukan hasil',
     profile_session_unavailable: 'Sesi profil tidak siap',
     worker_disabled: 'Dinonaktifkan untuk job baru',
     worker_unavailable: 'Worker tidak dapat dihubungi',
     worker_update_required: 'Perlu update worker',
     helpers_not_ready: 'Helper gTTS atau Tor belum siap',
-    tdl_access_unverified: 'Belum ada profil yang terverifikasi ke chat tujuan',
+    tdl_access_unverified: 'Belum ada hasil command terbaru; job tetap dapat dicoba',
     tts_capability_missing: 'Capability TTS belum dilaporkan',
     capability_unavailable: 'Capability worker belum dapat diperiksa',
   } as Record<string, string>)[code] || code;
@@ -59,7 +59,7 @@
     try {
       const result = await api<{ items: TtsWorker[] }>('/tts/workers');
       workers = result.items || [];
-      if (worker && !workers.some((item) => item.name === worker && item.ready)) worker = '';
+      if (worker && !workers.some((item) => item.name === worker && item.enabled)) worker = '';
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Daftar worker TTS gagal dimuat.';
     } finally {
@@ -101,7 +101,7 @@
       chatDraft = '';
       chatMessage = clear
         ? 'ID chat dihapus. Job TTS berikutnya tidak akan dikirim sampai tujuan baru diatur.'
-        : 'ID chat tersimpan. Jalankan Scan Profil untuk memperbarui kesiapan TTS.';
+        : 'ID chat tersimpan. Status scan dapat diperbarui dari halaman Profil.';
       void loadWorkers();
     } catch (cause) {
       chatError = cause instanceof Error ? cause.message : 'ID chat gagal disimpan.';
@@ -174,7 +174,7 @@
     </div>
     {#if chatError}<p role="alert" class="mt-2 text-sm text-rose-600">{chatError}</p>{/if}
     {#if chatMessage}<p role="status" class="mt-2 text-sm text-emerald-700 dark:text-emerald-300">{chatMessage}</p>{/if}
-    <p class="muted mt-2 text-xs">Terima ID numeric, username, link publik t.me, dan nomor telepon internasional. Scan Profil menguji jalur kirim ke tujuan ini.</p>
+    <p class="muted mt-2 text-xs">Terima ID numeric, username, link publik t.me, dan nomor telepon internasional. Pengiriman job menguji jalur TDL yang dipakai.</p>
   </div>
   <div>
     <div class="flex items-center justify-between gap-3">
@@ -183,12 +183,12 @@
         <RefreshCw size={15}/>{workersRefreshing ? 'Memuat...' : 'Muat ulang status'}
       </button>
     </div>
-    <p class="muted mt-1 text-sm">Status berasal dari Scan Profil dan tetap berlaku sampai sesi, tujuan, atau runtime berubah.</p>
+    <p class="muted mt-1 text-sm">Hasil scan hanya informasi. Job dapat dicoba pada worker aktif; hasil command TDL dan TTS memperbarui status.</p>
     {#if workersLoading}
       <p class="muted mt-3 text-sm">Memeriksa worker...</p>
     {:else}
       {#if workers.length === 0}<p class="muted mt-3 text-sm">Belum ada worker terdaftar.</p>{/if}
-      {#if workers.length > 0 && readyWorkers.length === 0}<p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker dengan profil TTS siap. Periksa sesi dan tujuan, lalu jalankan Scan Profil.</p>{/if}
+      {#if workers.length > 0 && activeWorkers.length === 0}<p class="mt-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100">Belum ada worker aktif untuk menerima job TTS.</p>{/if}
       <div class="mt-3 space-y-2">
         {#each workers as option}
           <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] px-3 py-2 text-sm">
@@ -196,7 +196,7 @@
               <span class="font-bold">{option.name}</span>
               <span class={option.ready ? 'text-emerald-600' : 'text-amber-600'}>{workerReason(option.reason_code)}</span>
             </div>
-            <p class="muted mt-1 text-xs">Profil dari Scan Profil: {option.profiles?.length ? option.profiles.map((profile) => `${profile.profile}: ${profile.status === 'ready' ? 'siap' : workerReason(profile.reason_code)}`).join(' · ') : 'belum dipindai'}</p>
+            <p class="muted mt-1 text-xs">Hasil scan terakhir (informasi): {option.profiles?.length ? option.profiles.map((profile) => `${profile.profile}: ${profile.status === 'ready' ? 'siap' : workerReason(profile.reason_code)}`).join(' · ') : 'belum dipindai'}</p>
           </div>
         {/each}
       </div>
@@ -211,11 +211,11 @@
     <p class="muted mt-1 text-sm">Teks maksimal 100.000 karakter. Monitor hanya menampilkan judul, jumlah karakter, progress, dan status.</p>
   </div>
   <form class="grid gap-4" onsubmit={submit}>
-    {#if readyWorkers.length > 0 && !workersLoading}
+    {#if activeWorkers.length > 0 && !workersLoading}
       <label class="grid gap-1.5 text-sm font-semibold">Worker untuk job ini
         <select class="field" bind:value={worker}>
           <option value="">Otomatis — antrean terpendek</option>
-          {#each readyWorkers as option}<option value={option.name}>{option.name} · {option.queued_jobs} job dalam antrean</option>{/each}
+          {#each activeWorkers as option}<option value={option.name}>{option.name} · {option.queued_jobs} job dalam antrean</option>{/each}
         </select>
       </label>
     {/if}
@@ -232,7 +232,7 @@
     {#if notice}<p role="status" class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">{notice}</p>{/if}
     <div class="flex flex-wrap items-center justify-between gap-3">
       <p class="muted text-xs">Pause berlaku setelah batch aktif selesai. Resume melanjutkan dari checkpoint.</p>
-      <button class="button primary" type="submit" disabled={submitting || workersLoading || readyWorkers.length === 0 || !title.trim() || !text.trim() || text.length > maxChars}>
+      <button class="button primary" type="submit" disabled={submitting || workersLoading || activeWorkers.length === 0 || !title.trim() || !text.trim() || text.length > maxChars}>
         <Volume2 size={16}/>{submitting ? 'Mengirim...' : 'Buat job TTS'}
       </button>
     </div>

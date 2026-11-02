@@ -312,11 +312,17 @@ class TtsExecutorMixin:
                                 sender_runtime = self.profile_manager.runtime(sender_profile)
                                 try:
                                     with sender_runtime.export_operation_lock:
-                                        sender_runtime.export_tdl_client.upload(
-                                            upload_path,
-                                            target_chat,
-                                            caption,
-                                        )
+                                        with self._capture_tdl_output(
+                                            sender_runtime.export_tdl_client,
+                                            command_callback=self._command_callback(
+                                                profile=sender_profile, runtime="tts"
+                                            ),
+                                        ):
+                                            sender_runtime.export_tdl_client.upload(
+                                                upload_path,
+                                                target_chat,
+                                                caption,
+                                            )
                                     if sender_profile != selected_profile:
                                         self._append_job_log(
                                             f"[TTS] memakai profil pengirim cadangan={sender_profile} setelah penolakan izin eksplisit"
@@ -406,6 +412,7 @@ class TtsExecutorMixin:
                             "character_count": result["character_count"],
                             "part_count": result["part_count"],
                             "delivered_parts": delivered,
+                            "sender_profile": selected_profile,
                         }
                     continue
                 state = request_json(
@@ -423,6 +430,7 @@ class TtsExecutorMixin:
                         "character_count": result["character_count"],
                         "part_count": result["part_count"],
                         "delivered_parts": int(state.get("delivered_parts") or len(result["artifacts"])),
+                        "sender_profile": selected_profile,
                     }
                 if state.get("status") in {"cancelled", "failed"}:
                     raise TtsCancelled("Job TTS dibatalkan") if state.get("status") == "cancelled" else TtsError("Delivery TTS gagal")

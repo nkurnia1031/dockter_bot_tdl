@@ -601,57 +601,18 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         selected_profile, selected_worker = context.control_plane.resolve_target(
             actor, profile=profile if purpose == "export" else None, worker=worker
         )
-        health = "healthy"
-        capabilities: dict[str, Any] = {}
-        checker = getattr(context.worker_dispatcher, "check_worker", None)
-        if callable(checker):
-            try:
-                capabilities = checker(selected_worker) or {}
-            except DomainError as exc:
-                if exc.code == "WORKER_INCOMPATIBLE":
-                    raise
-                raise DomainError(
-                    "WORKER_OFFLINE",
-                    f"Worker {selected_worker} tidak dapat diverifikasi: {exc}",
-                    status_code=503,
-                ) from exc
-            except Exception as exc:
-                raise DomainError(
-                    "WORKER_OFFLINE",
-                    f"Worker {selected_worker} tidak dapat diverifikasi: {exc}",
-                    status_code=503,
-                ) from exc
-        if capabilities.get("healthy") is False:
-            raise DomainError(
-                "WORKER_OFFLINE",
-                f"Worker {selected_worker} tidak sehat.",
-                status_code=503,
-            )
-        health = "healthy" if capabilities.get("healthy", True) else "unknown"
-        available_profiles = capabilities.get("profiles")
-        if purpose == "export" and isinstance(available_profiles, list) and selected_profile not in available_profiles:
-            raise DomainError(
-                "PROFILE_SESSION_UNAVAILABLE",
-                f"Profile {selected_profile} belum tersedia pada worker {selected_worker}.",
-                status_code=409,
-            )
-        storage_profile = str(capabilities.get("storage_profile") or getattr(context.config, "worker_storage_profile", "storage"))
-        if purpose == "export" and quick_mode and (
-            not callable(checker) or not bool(capabilities.get("storage_profile_available"))
-        ):
-            raise DomainError(
-                "STORAGE_PROFILE_UNAVAILABLE",
-                f"Sesi Storage {storage_profile} belum tersedia pada worker {selected_worker} untuk Quick Mode.",
-                status_code=409,
-            )
-        if purpose == "utility" and capabilities and capabilities.get("workspace") is False:
-            raise DomainError("WORKSPACE_UNAVAILABLE", "Workspace worker tidak tersedia.", status_code=409)
+        # This legacy endpoint validates only the actor/profile and enabled
+        # worker selection. Session inventory and readiness snapshots are
+        # informational; the submitted feature command proves runtime access.
+        storage_profile = str(
+            getattr(context.config, "worker_storage_profile", "storage")
+        )
         return {
             "verified": True,
             "purpose": purpose,
             "profile": selected_profile if purpose == "export" else None,
             "worker": selected_worker,
-            "worker_health": health,
+            "worker_health": "unknown",
             "storage_profile": storage_profile if quick_mode else None,
             "quick_mode": bool(quick_mode),
             "checked_at": datetime.now(timezone.utc).isoformat(),

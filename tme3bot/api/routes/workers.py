@@ -357,6 +357,7 @@ def register_workers(app, context, *, current_actor):
         tts_target_override: str | None = None,
     ) -> tuple[str, dict | None, str, dict, dict, list[dict], list[dict], dict, dict, list[dict], list[dict]]:
         try:
+            checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             if operation_id:
                 _report_scan_worker(
                     operation_id, name, "running", phase="inventory"
@@ -447,11 +448,8 @@ def register_workers(app, context, *, current_actor):
                             quick_reason = "QUICK_MODE_RUNTIME_UNAVAILABLE"
                         has_fingerprint = bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
                         quick_runtime = {
-                            "ready": raw_quick["ready"] is True and has_fingerprint,
-                            "reason_code": "" if raw_quick["ready"] is True and has_fingerprint else (
-                                "QUICK_MODE_FINGERPRINT_MISSING"
-                                if raw_quick["ready"] is True and not has_fingerprint else quick_reason
-                            ),
+                            "ready": raw_quick["ready"] is True,
+                            "reason_code": "" if raw_quick["ready"] is True else quick_reason,
                             "fingerprint": raw_fingerprint if has_fingerprint else "",
                         }
                     else:
@@ -491,16 +489,11 @@ def register_workers(app, context, *, current_actor):
                         has_fingerprint = bool(
                             re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint)
                         )
-                        ready = raw_rclone_storage["ready"] is True and has_fingerprint
+                        ready = raw_rclone_storage["ready"] is True
                         rclone_storage_readiness = {
                             "ready": ready,
-                            "reason_code": "" if ready else (
-                                "RCLONE_FINGERPRINT_MISSING"
-                                if raw_rclone_storage["ready"] is True
-                                and not has_fingerprint
-                                else reason_code
-                            ),
-                            "fingerprint": raw_fingerprint if ready else "",
+                            "reason_code": "" if ready else reason_code,
+                            "fingerprint": raw_fingerprint if has_fingerprint else "",
                             "destination_fingerprint": (
                                 rclone_destination_fingerprint if ready else ""
                             ),
@@ -565,29 +558,27 @@ def register_workers(app, context, *, current_actor):
                 profile = str(item.get("name") or "")
                 if operation_id:
                     _report_scan_profile(operation_id, name, profile, "running", phase="session_probe")
-                inventory_ready = item.get("ready") is True
                 raw_reasons = item.get("reason_codes")
+                profile_reasons = {
+                    str(code)
+                    for code in (raw_reasons if isinstance(raw_reasons, list) else [])
+                    if isinstance(code, str)
+                }
+                # Inventory diagnostics and profile identity metadata do not
+                # decide whether a TDL lane works. Skip only a profile that is
+                # currently locked; the selected canary commands test access.
+                inventory_ready = bool(profile) and "PROFILE_SESSION_BUSY" not in profile_reasons
                 reason_code = (
-                    next(
-                        (
-                            str(code)
-                            for code in (raw_reasons if isinstance(raw_reasons, list) else [])
-                            if isinstance(code, str)
-                            and re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", code)
-                        ),
-                        "PROFILE_SESSION_UNAVAILABLE",
-                    )
-                    if not inventory_ready
-                    else ""
+                    "PROFILE_SESSION_BUSY" if not inventory_ready else ""
                 )
                 ready = False
                 fingerprint = ""
+                canary_succeeded = False
                 checks = {
                     key: {"ready": False, "reason_code": reason_code or "PROFILE_CANARY_NOT_RUN"}
                     for key in ("export", "download", "upload", "storage", "tts")
                 }
                 canary_state = {}
-                upload_fingerprint = ""
                 last_canary_log_sequence = [0]
 
                 def persist_canary_logs(state: object) -> None:
@@ -662,36 +653,14 @@ def register_workers(app, context, *, current_actor):
                     for check in checks.values():
                         if not check["ready"] and check["reason_code"] == "PROFILE_CANARY_NOT_RUN":
                             check["reason_code"] = canary_error
-                    fingerprint = str(canary_state.get("session_fingerprint") or "").strip().lower()
-                    ready = bool(re.fullmatch(r"[a-f0-9]{64}", fingerprint))
-                    if not ready:
-                        canary_reason = next(
-                            (
-                                check["reason_code"]
-                                for check in checks.values()
-                                if check["reason_code"]
-                                and check["reason_code"] != "PROFILE_CANARY_NOT_RUN"
-                            ),
-                            canary_error,
-                        )
-                        if any(check["ready"] for check in checks.values()):
-                            reason_code = "PROFILE_FINGERPRINT_MISSING"
-                            checks = {
-                                key: {"ready": False, "reason_code": reason_code}
-                                for key in checks
-                            }
-                        else:
-                            reason_code = canary_reason or "PROFILE_SESSION_UNAVAILABLE"
-                    upload_fingerprint = str(
-                        canary_state.get("upload_session_fingerprint") or ""
-                    ).strip().lower()
-                    if not re.fullmatch(r"[a-f0-9]{64}", upload_fingerprint):
-                        upload_fingerprint = ""
-                        if checks["upload"]["ready"]:
-                            checks["upload"] = {
-                                "ready": False,
-                                "reason_code": "PROFILE_UPLOAD_SESSION_INVALID",
-                            }
+                    # The canary result is the readiness evidence. Session
+                    # generation hashes are intentionally ignored so a
+                    # redeploy or profile sync cannot make a working lane
+                    # appear unavailable.
+                    fingerprint = ""
+                    canary_succeeded = canary_state.get("status") == "succeeded"
+                    if not canary_succeeded:
+                        reason_code = canary_error or "PROFILE_CANARY_FAILED"
                 elif inventory_ready:
                     reason_code = (
                         "TDL_ACCESS_TARGET_UNAVAILABLE"
@@ -715,31 +684,40 @@ def register_workers(app, context, *, current_actor):
                 cleanup = cleanup_canary_messages(canary_state.get("messages"))
                 item["_profile_scan_checks"] = checks
                 item["_profile_scan_cleanup"] = cleanup
-                export_ready = ready and checks["export"]["ready"]
-                download_ready = ready and checks["download"]["ready"]
-                upload_ready = ready and checks["upload"]["ready"] and bool(upload_fingerprint)
-                storage_ready = ready and upload_ready and checks["storage"]["ready"] and bool(storage_destination_hash)
-                tts_ready = ready and tts_readiness.get("ready") is True and checks["tts"]["ready"] and bool(tts_destination_hash)
+                export_ready = canary_succeeded and checks["export"]["ready"]
+                download_ready = canary_succeeded and checks["download"]["ready"]
+                upload_ready = canary_succeeded and checks["upload"]["ready"]
+                storage_ready = (
+                    canary_succeeded
+                    and upload_ready
+                    and checks["storage"]["ready"]
+                    and bool(storage_destination_hash)
+                )
+                tts_ready = (
+                    canary_succeeded
+                    and tts_readiness.get("ready") is True
+                    and checks["tts"]["ready"]
+                    and bool(tts_destination_hash)
+                )
 
                 export_cells.append({"profile": profile, "ready": export_ready, "reason_code": "" if export_ready else (checks["export"]["reason_code"] or reason_code or "PROFILE_CANARY_EXPORT_FAILED"), "fingerprint": fingerprint if export_ready else ""})
-                download_evidence = {"runtime": "download-canary-v1", "worker": name, "profile": profile, "session": fingerprint, "storage": storage_destination_hash}
+                download_evidence = {"runtime": "download-canary-v1", "worker": name, "profile": profile, "destination": storage_destination_hash, "checked_at": checked_at}
                 download_fingerprint = hashlib.sha256(json.dumps(download_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                download_cells.append({"profile": profile, "ready": download_ready, "reason_code": "" if download_ready else (checks["download"]["reason_code"] or reason_code or "PROFILE_CANARY_DOWNLOAD_FAILED"), "fingerprint": download_fingerprint if download_ready else "", "session_fingerprint": fingerprint if download_ready else ""})
-                upload_evidence = {"runtime": "upload-canary-v1", "worker": name, "profile": profile, "session": upload_fingerprint, "storage": storage_destination_hash}
+                download_cells.append({"profile": profile, "ready": download_ready, "reason_code": "" if download_ready else (checks["download"]["reason_code"] or reason_code or "PROFILE_CANARY_DOWNLOAD_FAILED"), "fingerprint": download_fingerprint if download_ready else ""})
+                upload_evidence = {"runtime": "upload-canary-v1", "worker": name, "profile": profile, "destination": storage_destination_hash, "checked_at": checked_at}
                 upload_fingerprint = hashlib.sha256(json.dumps(upload_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                upload_session_fingerprint = str(canary_state.get("upload_session_fingerprint") or "").strip().lower()
-                upload_cells.append({"profile": profile, "ready": upload_ready, "reason_code": "" if upload_ready else (checks["upload"]["reason_code"] or reason_code or "PROFILE_CANARY_UPLOAD_FAILED"), "fingerprint": upload_fingerprint if upload_ready else "", "session_fingerprint": upload_session_fingerprint if upload_ready else ""})
+                upload_cells.append({"profile": profile, "ready": upload_ready, "reason_code": "" if upload_ready else (checks["upload"]["reason_code"] or reason_code or "PROFILE_CANARY_UPLOAD_FAILED"), "fingerprint": upload_fingerprint if upload_ready else ""})
 
-                storage_evidence = {"runtime": "storage-canary-v1", "worker": name, "profile": profile, "session": upload_session_fingerprint, "destination": storage_destination_hash, "upload_fingerprint": upload_fingerprint}
+                storage_evidence = {"runtime": "storage-canary-v1", "worker": name, "profile": profile, "destination": storage_destination_hash, "checked_at": checked_at, "upload_fingerprint": upload_fingerprint}
                 storage_fingerprint = hashlib.sha256(json.dumps(storage_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-                storage_cell = {"profile": profile, "ready": storage_ready, "reason_code": "" if storage_ready else (checks["storage"]["reason_code"] or checks["upload"]["reason_code"] or reason_code or "PROFILE_CANARY_STORAGE_VERIFY_FAILED"), "fingerprint": storage_fingerprint if storage_ready else "", "session_fingerprint": upload_session_fingerprint if storage_ready else "", "destination_fingerprint": storage_destination_hash if storage_ready else ""}
+                storage_cell = {"profile": profile, "ready": storage_ready, "reason_code": "" if storage_ready else (checks["storage"]["reason_code"] or checks["upload"]["reason_code"] or reason_code or "PROFILE_CANARY_STORAGE_VERIFY_FAILED"), "fingerprint": storage_fingerprint if storage_ready else "", "destination_fingerprint": storage_destination_hash if storage_ready else ""}
                 storage_cells.append(storage_cell)
                 item["_storage_readiness"] = storage_cell
 
-                tts_evidence = {"runtime": "tts-canary-v1", "worker": name, "profile": profile, "session": fingerprint, "destination": tts_destination_hash, "helpers": str(tts_readiness.get("fingerprint") or "")}
+                tts_evidence = {"runtime": "tts-canary-v1", "worker": name, "profile": profile, "destination": tts_destination_hash, "helpers_ready": tts_readiness.get("ready") is True, "checked_at": checked_at}
                 tts_fingerprint = hashlib.sha256(json.dumps(tts_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
                 tts_reason = "" if tts_ready else (checks["tts"]["reason_code"] or str(tts_readiness.get("reason_code") or "TTS_HELPER_UNAVAILABLE"))
-                tts_cells.append({"profile": profile, "ready": tts_ready, "reason_code": tts_reason, "fingerprint": tts_fingerprint if tts_ready else "", "session_fingerprint": fingerprint if tts_ready else "", "destination_fingerprint": tts_destination_hash if tts_ready else ""})
+                tts_cells.append({"profile": profile, "ready": tts_ready, "reason_code": tts_reason, "fingerprint": tts_fingerprint if tts_ready else "", "destination_fingerprint": tts_destination_hash if tts_ready else ""})
 
                 quick_reason = ""
                 if not quick_runtime.get("ready"):
@@ -755,22 +733,22 @@ def register_workers(app, context, *, current_actor):
                     )
                 elif not storage_ready:
                     quick_reason = checks["storage"]["reason_code"] or checks["upload"]["reason_code"] or "PROFILE_CANARY_STORAGE_VERIFY_FAILED"
-                quickmode_cells.append((item, {"profile": profile, "ready": not quick_reason, "reason_code": quick_reason, "session_fingerprint": fingerprint, "destination_fingerprint": storage_destination_hash, "rclone_destination_fingerprint": rclone_destination_fingerprint}))
+                quickmode_cells.append((item, {"profile": profile, "ready": not quick_reason, "reason_code": quick_reason, "destination_fingerprint": storage_destination_hash, "rclone_destination_fingerprint": rclone_destination_fingerprint}))
                 item["_runtime_readiness"] = {"profile": profile, "ready": export_ready, "reason_code": "" if export_ready else export_cells[-1]["reason_code"], "fingerprint": fingerprint if export_ready else ""}
                 item["_download_readiness"] = download_cells[-1]
                 item["_upload_readiness"] = upload_cells[-1]
                 if operation_id:
                     _report_scan_profile(operation_id, name, profile, "succeeded", phase="complete", checks=checks, cleanup=cleanup)
 
-            storage_sender_fingerprints = {cell["profile"]: cell["session_fingerprint"] for cell in storage_cells if cell.get("ready") is True and cell.get("session_fingerprint")}
-            storage_sender_profiles = sorted(storage_sender_fingerprints)
+            storage_sender_profiles = sorted(
+                cell["profile"] for cell in storage_cells if cell.get("ready") is True
+            )
             for item, quickmode_cell in quickmode_cells:
                 quickmode_cell["sender_profiles"] = storage_sender_profiles if quickmode_cell["ready"] else []
-                quickmode_cell["sender_session_fingerprints"] = storage_sender_fingerprints if quickmode_cell["ready"] else {}
                 if quickmode_cell["ready"] and not storage_sender_profiles:
                     quickmode_cell.update(ready=False, reason_code="TDL_ACCESS_NOT_VERIFIED")
                 if quickmode_cell["ready"]:
-                    quick_evidence = {"runtime": "quick-mode-readiness-v1", "worker": name, "profile": quickmode_cell["profile"], "export_session": quickmode_cell["session_fingerprint"], "quick_runtime": str(quick_runtime.get("fingerprint") or ""), "rclone_runtime": str(rclone_storage_readiness.get("fingerprint") or ""), "storage_destination": storage_destination_hash, "senders": storage_sender_fingerprints, "rclone_destination": rclone_destination_fingerprint}
+                    quick_evidence = {"runtime": "quick-mode-readiness-v1", "worker": name, "profile": quickmode_cell["profile"], "quick_runtime_ready": quick_runtime.get("ready") is True, "rclone_ready": rclone_storage_readiness.get("ready") is True, "storage_destination": storage_destination_hash, "senders": storage_sender_profiles, "rclone_destination": rclone_destination_fingerprint, "checked_at": checked_at}
                     quick_fingerprint = hashlib.sha256(json.dumps(quick_evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
                     quickmode_cell["fingerprint"] = quick_fingerprint
                 else:
@@ -1146,15 +1124,13 @@ def register_workers(app, context, *, current_actor):
             ):
                 storage_destination_hash = destination_fingerprint(storage_target)
                 for name, cells in readiness_storage.items():
-                    sender_fingerprints = {
-                        cell["profile"]: cell["session_fingerprint"]
+                    sender_profiles = sorted(
+                        cell["profile"]
                         for cell in cells
                         if cell.get("ready") is True
-                        and cell.get("session_fingerprint")
-                    }
-                    sender_profiles = sorted(sender_fingerprints)
+                    )
                     inventory_hash = inventory_fingerprint(
-                        sender_profiles, sender_fingerprints
+                        sender_profiles, None
                     )
                     try:
                         replace_access(
@@ -1170,7 +1146,7 @@ def register_workers(app, context, *, current_actor):
                                 }
                                 for cell in cells
                             ],
-                            session_fingerprints=sender_fingerprints,
+                            session_fingerprints=None,
                         )
                     except Exception:
                         logging.getLogger(__name__).exception(
@@ -1335,13 +1311,9 @@ def register_workers(app, context, *, current_actor):
                     raw_fingerprint = str(raw.get("fingerprint") or "").strip().lower() if isinstance(raw, dict) else ""
                     raw_reason = str(raw.get("reason_code") or reason) if isinstance(raw, dict) else reason
                     if isinstance(raw, dict) and type(raw.get("ready")) is bool:
-                        ready = raw["ready"] is True and bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
-                        fingerprint = raw_fingerprint if ready else ""
-                        reason = "" if ready else (
-                            "RESOLVER_FINGERPRINT_MISSING"
-                            if raw.get("ready") is True and not fingerprint
-                            else raw_reason
-                        )
+                        ready = raw["ready"] is True
+                        fingerprint = raw_fingerprint if re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint) else ""
+                        reason = "" if ready else raw_reason
             elif runtime == "tts_helper":
                 probe = getattr(dispatcher, "tts_health", None)
                 if not callable(probe):
@@ -1357,14 +1329,9 @@ def register_workers(app, context, *, current_actor):
                     raw_fingerprint = str(raw.get("fingerprint") or "").strip().lower() if isinstance(raw, dict) else ""
                     raw_reason = str(raw.get("reason_code") or reason) if isinstance(raw, dict) else reason
                     if isinstance(raw, dict) and type(raw.get("ready")) is bool:
-                        has_fingerprint = bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
-                        ready = raw["ready"] is True and has_fingerprint
-                        fingerprint = raw_fingerprint if ready else ""
-                        reason = "" if ready else (
-                            "QUICK_MODE_FINGERPRINT_MISSING"
-                            if raw.get("ready") is True and not has_fingerprint
-                            else raw_reason
-                        )
+                        ready = raw["ready"] is True
+                        fingerprint = raw_fingerprint if re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint) else ""
+                        reason = "" if ready else raw_reason
             elif runtime == "rclone_storage":
                 probe = getattr(dispatcher, "rclone_storage_runtime_readiness", None)
                 if not callable(probe):
@@ -1374,18 +1341,13 @@ def register_workers(app, context, *, current_actor):
                     raw_fingerprint = str(raw.get("fingerprint") or "").strip().lower() if isinstance(raw, dict) else ""
                     raw_reason = str(raw.get("reason_code") or reason) if isinstance(raw, dict) else reason
                     if isinstance(raw, dict) and type(raw.get("ready")) is bool:
-                        has_fingerprint = bool(re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint))
-                        ready = raw["ready"] is True and has_fingerprint
-                        fingerprint = raw_fingerprint if ready else ""
+                        ready = raw["ready"] is True
+                        fingerprint = raw_fingerprint if re.fullmatch(r"[a-f0-9]{64}", raw_fingerprint) else ""
                         destination_fingerprint = (
                             hashlib.sha256(rclone_destination.encode("utf-8")).hexdigest()
                             if ready else ""
                         )
-                        reason = "" if ready else (
-                            "RCLONE_FINGERPRINT_MISSING"
-                            if raw.get("ready") is True and not has_fingerprint
-                            else raw_reason
-                        )
+                        reason = "" if ready else raw_reason
         except JsonHttpError as exc:
             reason = "WORKER_UPDATE_REQUIRED" if exc.status == 404 else defaults[runtime]
         except Exception:
@@ -1597,17 +1559,10 @@ def register_workers(app, context, *, current_actor):
                     {"storage": storage_target, "tts": tts_target},
                 )
 
-        raw_session = str(canary_state.get("session_fingerprint") or "").strip().lower()
-        session_fingerprint = raw_session if re.fullmatch(r"[a-f0-9]{64}", raw_session) else ""
-        if checks.get("export", {}).get("ready") and not session_fingerprint:
-            checks["export"] = {"ready": False, "reason_code": "PROFILE_FINGERPRINT_MISSING"}
-            if runtime in {"download", "storage", "tts"}:
-                checks[runtime] = {"ready": False, "reason_code": "PROFILE_FINGERPRINT_MISSING"}
-        raw_upload_session = str(canary_state.get("upload_session_fingerprint") or "").strip().lower()
-        upload_session_fingerprint = raw_upload_session if re.fullmatch(r"[a-f0-9]{64}", raw_upload_session) else ""
-        if checks.get("upload", {}).get("ready") and not upload_session_fingerprint:
-            checks["upload"] = {"ready": False, "reason_code": "PROFILE_UPLOAD_SESSION_INVALID"}
-            checks["storage"] = {"ready": False, "reason_code": "PROFILE_UPLOAD_SESSION_INVALID"}
+        # Readiness records describe the result of the command, not a
+        # generation of the local TDL session. Never persist session hashes.
+        session_fingerprint = ""
+        upload_session_fingerprint = ""
 
         selected_check = "storage" if runtime == "storage" else runtime
         selected = checks.get(selected_check, {"ready": False, "reason_code": "PROFILE_CANARY_NOT_RUN"})
@@ -1617,14 +1572,16 @@ def register_workers(app, context, *, current_actor):
         current_session = session_fingerprint
         destination_hash = destination_fingerprint(tts_target if runtime == "tts" else storage_target)
         if runtime == "export" and ready:
-            fingerprint = session_fingerprint
+            fingerprint = _readiness_evidence_fingerprint(
+                runtime, worker, profile, destination_hash, checked_at
+            )
         elif runtime == "download" and ready:
             fingerprint = _readiness_evidence_fingerprint(
                 runtime, worker, profile, session_fingerprint, destination_hash
             )
         elif runtime == "storage":
             upload_check = checks.get("upload", {})
-            upload_ready = upload_check.get("ready") is True and bool(upload_session_fingerprint)
+            upload_ready = upload_check.get("ready") is True
             upload_reason = str(upload_check.get("reason_code") or "PROFILE_CANARY_UPLOAD_FAILED")
             upload_fingerprint = _readiness_evidence_fingerprint(
                 "upload", worker, profile, upload_session_fingerprint, destination_fingerprint(storage_target)
@@ -1661,11 +1618,9 @@ def register_workers(app, context, *, current_actor):
             ) if storage_ready else ""
             current_session = upload_session_fingerprint
         elif runtime == "tts":
-            ready = ready and helper_ready and bool(session_fingerprint) and bool(destination_hash)
+            ready = ready and helper_ready and bool(destination_hash)
             if not helper_ready:
                 reason = helper_reason or "TTS_HELPER_UNAVAILABLE"
-            elif selected.get("ready") is True and not session_fingerprint:
-                reason = "PROFILE_FINGERPRINT_MISSING"
             elif selected.get("ready") is True and not destination_hash:
                 reason = "TTS_CHAT_UNAVAILABLE"
             if ready:
@@ -1728,16 +1683,13 @@ def register_workers(app, context, *, current_actor):
         access_store = getattr(control, "tdl_access_store", None)
         storage_hash_fn = getattr(access_store, "destination_fingerprint", None)
         storage_hash = str(storage_hash_fn(storage_target) or "") if storage_target and callable(storage_hash_fn) else (hashlib.sha256(storage_target.encode("utf-8")).hexdigest() if storage_target else "")
-        sender_fingerprints = {}
+        ready_senders = set()
         for (cell_worker, cell_profile, cell_runtime), cell in cells.items():
             if cell_worker != worker or cell_runtime != "storage" or not cell_profile or cell.get("status") != "ready":
                 continue
             upload_cell = cells.get((worker, cell_profile, "upload"))
-            if not upload_cell or upload_cell.get("status") != "ready":
-                continue
-            session = str(cell.get("session_fingerprint") or "")
-            if session and session == str(upload_cell.get("session_fingerprint") or "") and cell.get("destination_fingerprint") == storage_hash:
-                sender_fingerprints[cell_profile] = session
+            if upload_cell and upload_cell.get("status") == "ready":
+                ready_senders.add(cell_profile)
 
         checks = []
         dependencies = ["quick_mode_runtime", "rclone_storage", "export", "download", "upload", "storage"]
@@ -1746,44 +1698,23 @@ def register_workers(app, context, *, current_actor):
         rclone = worker_cells.get("rclone_storage")
         export_cell = profile_cells.get("export")
         for name, cell in (("quick_mode_runtime", quick_runtime), ("rclone_storage", rclone), *profile_cells.items()):
-            ready = bool(cell and cell.get("status") == "ready" and cell.get("fingerprint"))
+            ready = bool(cell and cell.get("status") == "ready")
             code = str(cell.get("reason_code") or "RUNTIME_NOT_SCANNED") if not ready else ""
-            if name == "rclone_storage" and ready and rclone.get("destination_fingerprint") != rclone_hash:
-                ready, code = False, "QUICK_MODE_SETTINGS_CHANGED"
-            if name == "download" and ready:
-                export_fingerprint = str(export_cell.get("fingerprint") or "") if export_cell else ""
-                if not export_fingerprint or cell.get("session_fingerprint") != export_fingerprint:
-                    ready, code = False, "PROFILE_SESSION_CHANGED"
-            if name == "storage" and ready and cell.get("destination_fingerprint") != storage_hash:
-                ready, code = False, "STORAGE_SETTINGS_CHANGED"
-            if name == "storage" and ready:
-                upload_cell = profile_cells.get("upload")
-                if not upload_cell or cell.get("session_fingerprint") != upload_cell.get("session_fingerprint"):
-                    ready, code = False, "PROFILE_UPLOAD_SESSION_CHANGED"
             checks.append({"name": name, "status": "ready" if ready else "not_ready", "reason_code": code})
             if not ready and not reason:
                 reason = code or "QUICK_MODE_EVIDENCE_INCOMPLETE"
 
-        ready_senders = sorted(sender_fingerprints)
+        ready_senders = sorted(ready_senders)
         if not ready_senders and not reason:
             reason = "TDL_ACCESS_NOT_VERIFIED"
-        if not storage_hash and not reason:
-            reason = "TDL_ACCESS_TARGET_UNAVAILABLE"
-        if not rclone_hash and not reason:
-            reason = "RCLONE_ACCESS_FAILED"
-        if export_cell is None or export_cell.get("status") != "ready":
-            session_fingerprint = ""
-        else:
-            session_fingerprint = str(export_cell.get("fingerprint") or "")
+        session_fingerprint = ""
         worker_state = next(
             (item for item in snapshot.get("workers", []) if item.get("name") == worker),
             None,
         )
         if worker_state and worker_state.get("status") == "failed" and not reason:
             reason = str(worker_state.get("reason_code") or "WORKER_UNAVAILABLE")
-        is_ready = not reason and bool(session_fingerprint)
-        if not session_fingerprint and not reason:
-            reason = "PROFILE_FINGERPRINT_MISSING"
+        is_ready = not reason
         evidence = {
             "worker": worker,
             "profile": profile,
@@ -1793,7 +1724,7 @@ def register_workers(app, context, *, current_actor):
             ],
             "storage_destination": storage_hash,
             "rclone_destination": rclone_hash,
-            "senders": sender_fingerprints,
+            "senders": ready_senders,
         }
         fingerprint = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest() if is_ready else ""
         attempt = _profile_readiness_attempt(
@@ -1811,7 +1742,7 @@ def register_workers(app, context, *, current_actor):
             destination_fingerprint=storage_hash,
             rclone_destination_fingerprint=rclone_hash,
             sender_profiles=ready_senders,
-            sender_session_fingerprints=sender_fingerprints,
+            sender_session_fingerprints={},
             reason_code=reason or "QUICK_MODE_EVIDENCE_INCOMPLETE",
             checked_at=checked_at,
             last_attempt=attempt,

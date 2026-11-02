@@ -16,8 +16,7 @@ from tme3bot.tdl_output import parse_speed_bps
 
 
 _PROFILE_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,47}\Z")
-_FINGERPRINT_RE = re.compile(r"[a-f0-9]{64}\Z")
-_RETAINED_CANARY_OPERATIONS = 128
+_RETAINED_CANARY_OPERATIONS = 32
 _PROFILE_CHECKS = {"export", "download", "storage", "tts"}
 _LOG_SECRET_PATTERNS = (
     re.compile(r"\b\d{5,15}:[A-Za-z0-9_-]{20,}\b"),
@@ -176,31 +175,11 @@ class ProfileReadinessCanary:
                     }
                 held.append(lock)
 
-            diagnostic = self.diagnose_profile_tdl(profile)
-            fingerprint = str(diagnostic.get("fingerprint") or "").strip().lower()
-            if diagnostic.get("ready") is not True or not _FINGERPRINT_RE.fullmatch(fingerprint):
-                reasons = diagnostic.get("reason_codes")
-                reason = next((str(code) for code in reasons if isinstance(code, str)), "PROFILE_SESSION_UNAVAILABLE") if isinstance(reasons, list) else "PROFILE_SESSION_UNAVAILABLE"
-                for check in checks.values():
-                    check["reason_code"] = reason
-                emit("complete")
-                return {
-                    "checks": checks,
-                    "messages": messages,
-                    "session_fingerprint": "",
-                    "upload_session_fingerprint": "",
-                }
-
+            # A session diagnostic or generation fingerprint is not evidence
+            # that the selected TDL operation can or cannot run. The actual
+            # canary commands below are the authority for each lane.
+            fingerprint = ""
             upload_fingerprint = ""
-            if callable(self.upload_session_fingerprint):
-                try:
-                    upload_fingerprint = str(
-                        self.upload_session_fingerprint(profile) or ""
-                    ).strip().lower()
-                except Exception:
-                    upload_fingerprint = ""
-            if not _FINGERPRINT_RE.fullmatch(upload_fingerprint):
-                upload_fingerprint = ""
 
             if not storage_target:
                 for key in selected_checks.intersection({"export", "download", "storage"}):

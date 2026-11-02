@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { post } from '$lib/api';
   import { session } from '$lib/session.svelte';
-  import { chooseProfileWorker, profileOptionLabel, runtimeReadinessFor, runtimeReadinessForWorker } from '$lib/profile-catalog';
+  import { runtimeReadinessFor, runtimeReadinessForWorker } from '$lib/profile-catalog';
   import { CheckCircle2, RefreshCw, ShieldCheck, TriangleAlert } from '@lucide/svelte';
 
   type Verification = {
@@ -46,7 +46,6 @@
 
   let checking = $state(false);
   let error = $state('');
-  const selectedProfile = $derived(session.profileCatalog.find((item) => item.name === profile));
   const storedReadiness = $derived(readinessRuntime === 'storage'
     ? runtimeReadinessForWorker(session.runtimeReadiness, worker, readinessRuntime)
     : runtimeReadinessFor(
@@ -62,11 +61,11 @@
     readinessRuntime === 'utility' ? 'Utility' : readinessRuntime === 'quick_mode' ? 'Quick Mode' : readinessRuntime === 'rclone_storage' ? 'Storage rclone' : readinessRuntime === 'storage' ? 'Storage' : 'Export'
   );
   const readinessLabels = $derived({
-    ready: `${readinessRuntimeLabel} siap`,
-    not_ready: `${readinessRuntimeLabel} belum siap`,
-    offline: 'Worker offline',
-    disabled: 'Worker nonaktif',
-    unscanned: 'Belum dipindai'
+    ready: `Scan terakhir: ${readinessRuntimeLabel} siap`,
+    not_ready: `Scan terakhir: ${readinessRuntimeLabel} belum siap`,
+    offline: 'Scan terakhir: worker offline',
+    disabled: 'Worker nonaktif untuk job baru',
+    unscanned: 'Belum pernah di-scan'
   });
   const readinessStyle = $derived(
     readiness.status === 'ready'
@@ -75,11 +74,7 @@
         ? 'border-rose-200 bg-rose-50 text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200'
         : 'border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100'
   );
-  const workerOptions = $derived(
-    requireProfile && selectedProfile
-      ? session.workers.filter((item) => selectedProfile.workers.includes(item.name))
-      : session.workers
-  );
+  const workerOptions = $derived(session.workers);
 
   onMount(() => {
     const tracksRuntimeReadiness = showReadiness && (requireProfile || readinessRuntime === 'storage' || readinessRuntime === 'rclone_storage');
@@ -101,16 +96,8 @@
   });
 
   $effect(() => {
-    if (requireProfile && !profile) profile = session.selectedTargetProfile || session.profileCatalog[0]?.name || '';
-    if (requireProfile && profile) {
-      const choice = session.profileCatalog.find((item) => item.name === profile);
-      if (choice) {
-        worker = chooseProfileWorker(
-          choice,
-          worker,
-          session.workers.find((item) => item.enabled !== false)?.name || ''
-        );
-      }
+    if (requireProfile && !profile) {
+      profile = session.selectedTargetProfile || session.current.actor?.profile || session.current.profiles[0] || '';
     }
     if (!worker) worker = session.workers.find((item) => item.enabled !== false)?.name || session.current.actor?.worker_route || 'local';
   });
@@ -145,7 +132,7 @@
       <label class="min-w-[10rem] flex-1 text-sm font-bold">Profile target
         <select class="field mt-2" bind:value={profile} onchange={invalidate} disabled={disabled || checking}>
           <option value="" disabled>Pilih profile</option>
-          {#each session.profileCatalog as item}<option value={item.name}>{profileOptionLabel(item)}</option>{/each}
+          {#each session.current.profiles as item}<option value={item}>{item}</option>{/each}
         </select>
       </label>
     {/if}
@@ -176,9 +163,8 @@
         <span class="text-xs opacity-75">{new Date(readiness.checked_at).toLocaleString('id-ID')}</span>
       {:else if readiness.reason_code && readiness.status !== 'unscanned'}
         <span class="text-xs opacity-75">{readiness.reason_code}</span>
-      {:else}
-        <span class="text-xs opacity-75">Jalankan Scan Profil untuk memperbarui status.</span>
       {/if}
+      <span class="w-full text-xs opacity-75">Status scan hanya informasi; command aktual menentukan hasil job.</span>
     </div>
   {/if}
   {#if error}<div class="mt-3 flex gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200"><TriangleAlert size={16} class="shrink-0"/><span>{error}</span></div>{/if}

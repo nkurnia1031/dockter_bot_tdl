@@ -422,7 +422,11 @@ class QuickModeExecutorMixin:
             if created:
                 config_path = Path(getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")).resolve()
                 config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
-                RcloneRunner(stall_timeout_seconds=30).ensure_directory(
+                RcloneRunner(
+                    log_callback=self._append_job_log,
+                    command_callback=self._command_callback(runtime="rclone_storage"),
+                    stall_timeout_seconds=30,
+                ).ensure_directory(
                     configured_root, relative_path, config_path,
                     config_root=config_root, create_new=True, created_by_job=True,
                 )
@@ -432,7 +436,7 @@ class QuickModeExecutorMixin:
         config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
         runner = RcloneRunner(
             log_callback=self._append_job_log,
-            command_callback=self._command_callback(),
+            command_callback=self._command_callback(runtime="rclone_storage"),
             stall_timeout_seconds=30,
         )
         if relative_path:
@@ -1181,9 +1185,6 @@ class QuickModeExecutorMixin:
                         "_tdl_sender_profiles": payload.get(
                             "_quick_storage_sender_profiles", []
                         ),
-                        "_tdl_sender_session_fingerprints": payload.get(
-                            "_quick_storage_sender_session_fingerprints", {}
-                        ),
                     },
                 }
                 quick_settings = payload.get("quick_settings") or {}
@@ -1435,11 +1436,6 @@ class QuickModeExecutorMixin:
             storage_profile = self.storage_profile()
             verify_root: Path | None = None
             try:
-                if storage_profile not in self.available_storage_profiles():
-                    raise QuickModeError(
-                        "Lane Upload profil Storage belum siap pada worker.",
-                        code="PROFILE_UPLOAD_LANE_UNSAFE",
-                    )
                 storage_runtime = self.profile_manager.runtime(storage_profile)
                 client = storage_runtime.upload_tdl_client
                 channel_ref = str(getattr(storage_runtime.config, "storage_channel_ref", "") or "")
@@ -1461,7 +1457,16 @@ class QuickModeExecutorMixin:
                     )
                 fallback_messages: list[dict[str, Any]] | None = None
                 with storage_runtime.upload_operation_lock:
-                    with self._capture_tdl_output(client, log_callback=verify_log):
+                    secrets = getattr(self._job_log, "secrets", None)
+                    if isinstance(secrets, list) and str(verify_root) not in secrets:
+                        secrets.append(str(verify_root))
+                    with self._capture_tdl_output(
+                        client,
+                        log_callback=verify_log,
+                        command_callback=self._command_callback(
+                            profile=storage_profile, runtime="upload"
+                        ),
+                    ):
                         for name in expected_names:
                             item = known_items.get(name)
                             raw_id = item.get("channel_message_id") if isinstance(item, dict) else None
@@ -1518,7 +1523,7 @@ class QuickModeExecutorMixin:
             try:
                 verify_runner = RcloneRunner(
                     log_callback=verify_log,
-                    command_callback=self._command_callback(),
+                    command_callback=self._command_callback(runtime="rclone_storage"),
                     stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
                 )
                 drive_result = verify_runner.verify_files(

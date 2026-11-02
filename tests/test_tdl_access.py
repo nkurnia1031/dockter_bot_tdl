@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -294,9 +295,18 @@ class _VerifyExecutor(TdlAccessExecutorMixin):
     def _job_cancelled(self, _job_id):
         return self._cancel
 
+    def _command_callback(self, *, profile=None, runtime=None):
+        del profile, runtime
+        return None
+
+    @contextmanager
+    def _capture_tdl_output(self, _client, *, command_callback=None):
+        del command_callback
+        yield
+
 
 class TdlAccessWorkerTests(unittest.TestCase):
-    def test_tts_verification_records_session_fingerprints_for_explicit_proof_refresh(self):
+    def test_tts_verification_uses_live_command_results_without_session_fingerprints(self):
         executor = _VerifyExecutor()
 
         with patch(
@@ -308,7 +318,7 @@ class TdlAccessWorkerTests(unittest.TestCase):
             )
 
         self.assertEqual(result["inventory_hash"], SqliteTdlAccessStore.inventory_fingerprint(["default", "archive"]))
-        self.assertEqual(result["session_fingerprints"], executor.session_fingerprints)
+        self.assertEqual(result["session_fingerprints"], {})
         self.assertTrue(all(item["ready"] for item in result["profiles"]))
 
     def test_worker_publishes_only_opaque_upload_fingerprints(self):
@@ -327,7 +337,7 @@ class TdlAccessWorkerTests(unittest.TestCase):
             {"default": "a" * 64},
         )
 
-    def test_storage_verification_aborts_when_upload_session_changes_before_send(self):
+    def test_storage_verification_ignores_session_fingerprint_changes(self):
         executor = _VerifyExecutor()
         executor.clients["default"] = _FakeTdlClient()
         calls = 0
@@ -351,9 +361,9 @@ class TdlAccessWorkerTests(unittest.TestCase):
             )
 
         outcomes = {item["profile"]: item for item in result["profiles"]}
-        self.assertEqual(outcomes["default"]["error_code"], "PROFILE_UPLOAD_SESSION_CHANGED")
-        self.assertFalse(outcomes["default"]["ready"])
-        self.assertFalse(executor.clients["default"].uploads)
+        self.assertTrue(outcomes["default"]["ready"])
+        self.assertTrue(outcomes["default"]["command_attempted"])
+        self.assertEqual(len(executor.clients["default"].uploads), 1)
         self.assertTrue(outcomes["archive"]["ready"])
 
     def test_tdl_authentication_error_is_visible_as_a_session_failure(self):
@@ -406,7 +416,7 @@ class TdlAccessWorkerTests(unittest.TestCase):
             )
 
         self.assertEqual(result["summary"]["ready"], 1)
-        self.assertEqual(result["session_fingerprints"], executor.session_fingerprints)
+        self.assertEqual(result["session_fingerprints"], {})
         self.assertNotIn("/data/", json.dumps(result))
         self.assertEqual(prepare.call_count, 2)
         self.assertTrue(all(len(call.args) == 1 for call in prepare.call_args_list))
@@ -439,7 +449,7 @@ class TdlAccessWorkerTests(unittest.TestCase):
             {"Worker tidak dapat menyiapkan file uji TDL."},
         )
 
-    def test_verification_reports_unavailable_profiles_and_redacted_command_contract(self):
+    def test_verification_tries_profiles_despite_diagnostic_unavailability(self):
         executor = _VerifyExecutor()
         executor.profile_manager = SimpleNamespace(
             list_profiles=lambda: ["default", "archive"],
@@ -467,8 +477,8 @@ class TdlAccessWorkerTests(unittest.TestCase):
 
         profiles = {item["profile"]: item for item in result["profiles"]}
         self.assertEqual(set(profiles), {"default", "archive"})
-        self.assertEqual(profiles["default"]["error_code"], "TDL_SESSION_DATABASE_MISSING")
-        self.assertFalse(profiles["default"]["command_attempted"])
+        self.assertEqual(profiles["default"]["error_code"], "CHAT_WRITE_FORBIDDEN")
+        self.assertTrue(profiles["default"]["command_attempted"])
         self.assertTrue(profiles["archive"]["command_attempted"])
         self.assertIn("tdl", result["command_template"])
         self.assertIn("--storage", result["command_template"])
@@ -485,16 +495,18 @@ class TdlAccessWorkerTests(unittest.TestCase):
             result = executor._tdl_access_verify(
                 {"job_id": "job-1", "worker": "local", "payload": {"purpose": "storage"}}
             )
-        self.assertTrue(result["profiles"][0]["ready"])
+        outcomes = {item["profile"]: item for item in result["profiles"]}
+        self.assertFalse(outcomes["default"]["ready"])
+        self.assertTrue(outcomes["archive"]["ready"])
         self.assertEqual(result["session"], "upload")
-        self.assertEqual(result["profiles"][1]["error_code"], "CHAT_WRITE_FORBIDDEN")
+        self.assertEqual(outcomes["default"]["error_code"], "CHAT_WRITE_FORBIDDEN")
         self.assertNotIn("-100123", json.dumps(result))
         self.assertEqual(len(executor.clients["default"].uploads), 1)
         self.assertEqual(len(executor.clients["archive"].uploads), 1)
         self.assertFalse(any(client.uploads for client in executor.export_clients.values()))
         self.assertIn("-100123", executor._job_log.secrets)
 
-    def test_storage_verification_fails_closed_when_upload_lane_is_not_ready(self):
+    def test_storage_verification_tests_local_profiles_without_scan_lane_proof(self):
         executor = _VerifyExecutor()
         executor.available_storage_profiles = lambda: []
 
@@ -507,9 +519,9 @@ class TdlAccessWorkerTests(unittest.TestCase):
             )
 
         self.assertEqual(result["session"], "upload")
-        self.assertEqual(result["summary"]["tested"], 0)
-        self.assertTrue(all(item["command_attempted"] is False for item in result["profiles"]))
-        self.assertFalse(any(client.uploads for client in executor.clients.values()))
+        self.assertEqual(result["summary"]["tested"], 2)
+        self.assertTrue(all(item["command_attempted"] is True for item in result["profiles"]))
+        self.assertTrue(all(client.uploads for client in executor.clients.values()))
         self.assertFalse(any(client.uploads for client in executor.export_clients.values()))
 
     def test_tts_verification_keeps_using_export_lane(self):

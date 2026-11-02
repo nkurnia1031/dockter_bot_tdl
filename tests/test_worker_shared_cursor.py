@@ -127,7 +127,7 @@ class WorkerSharedCursorTests(unittest.TestCase):
             executor.config = SimpleNamespace(backup_node_name="local")
             executor.profile_manager = SimpleNamespace(runtime=lambda _profile: runtime)
             executor.publisher = publisher
-            executor._capture_tdl_output = lambda _client: nullcontext()
+            executor._capture_tdl_output = lambda _client, **_kwargs: nullcontext()
             executor._capture_tdl_progress = lambda _client, _callback: nullcontext()
 
             executor._export({

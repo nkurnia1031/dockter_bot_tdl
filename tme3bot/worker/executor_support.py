@@ -252,7 +252,10 @@ class CommandMilestoneRecorder:
         self._counter = 0
         self._lock = threading.Lock()
 
-    def command_started(self, command: list[str], log_prefix: str) -> str:
+    def command_started(
+        self, command: list[str], log_prefix: str,
+        context: dict[str, str] | None = None,
+    ) -> str:
         """Create the pending milestone before a subprocess begins work."""
         if self.before_command is not None:
             self.before_command()
@@ -269,6 +272,7 @@ class CommandMilestoneRecorder:
                     "command": sanitize_command(command, self.secrets),
                     "log_prefix": str(log_prefix),
                     "status": "running",
+                    **(context or {}),
                 },
             )
         except Exception:
@@ -287,6 +291,7 @@ class CommandMilestoneRecorder:
         duration_seconds: float,
         log_prefix: str,
         command_id: object | None = None,
+        context: dict[str, str] | None = None,
     ) -> None:
         """Complete the pending milestone with bounded, sanitized output."""
         try:
@@ -301,6 +306,7 @@ class CommandMilestoneRecorder:
                     for line in tail
                 ],
                 "output_truncated": bool(truncated),
+                **(context or {}),
             }
             if command_id is not None:
                 result["command_id"] = str(command_id)
@@ -332,6 +338,50 @@ class CommandMilestoneRecorder:
             duration_seconds,
             log_prefix,
         )
+
+
+class ScopedCommandMilestoneRecorder:
+    """Add feature identity to an existing command recorder for one callsite."""
+
+    def __init__(self, recorder: CommandMilestoneRecorder, **context: str):
+        self.recorder = recorder
+        self.context = {
+            str(key): str(value)
+            for key, value in context.items()
+            if str(value).strip()
+        }
+
+    def command_started(self, command: list[str], log_prefix: str) -> str:
+        return self.recorder.command_started(command, log_prefix, self.context)
+
+    def command_completed(
+        self,
+        command: list[str],
+        returncode: int,
+        output: str,
+        duration_seconds: float,
+        log_prefix: str,
+        command_id: object | None = None,
+    ) -> None:
+        self.recorder.command_completed(
+            command,
+            returncode,
+            output,
+            duration_seconds,
+            log_prefix,
+            command_id,
+            self.context,
+        )
+
+    def __call__(
+        self,
+        command: list[str],
+        returncode: int,
+        output: str,
+        duration_seconds: float,
+        log_prefix: str,
+    ) -> None:
+        self.command_completed(command, returncode, output, duration_seconds, log_prefix)
 
 
 def json_value(value: Any) -> Any:

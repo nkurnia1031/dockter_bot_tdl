@@ -36,7 +36,7 @@ describe('TTS page target controls', () => {
       .toMatchObject({ title: 'Bab 1', text: 'Teks untuk dibacakan', worker: 'remote-tts' });
     expect(requests.some((request) => request.path.includes('/tdl-access/verification'))).toBe(false);
     expect(requests.some((request) => request.path.includes('/tts/health'))).toBe(false);
-    expect(await screen.findByText(/Profil dari Scan Profil: archive: siap/)).toBeTruthy();
+    expect(await screen.findByText(/Hasil scan terakhir \(informasi\): archive: siap/)).toBeTruthy();
   });
 
   it('uses Profile scan readiness without a per-page TDL access verification action', async () => {
@@ -56,7 +56,7 @@ describe('TTS page target controls', () => {
     }));
 
     render(TtsPage);
-    expect(await screen.findByText(/Profil dari Scan Profil: default: Belum ada profil yang terverifikasi ke chat tujuan/)).toBeTruthy();
+    expect(await screen.findByText(/Hasil scan terakhir \(informasi\): default: Belum ada hasil command terbaru; job tetap dapat dicoba/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Perbarui bukti akses' })).toBeNull();
     expect(requests.some((request) => request.path.includes('/tdl-access/verification'))).toBe(false);
   });
@@ -80,7 +80,7 @@ describe('TTS page target controls', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Simpan ID chat' }));
 
     await waitFor(() => expect(updates).toEqual([{ telegram_tts_chat_id: '-100123456789' }]));
-    expect(await screen.findByText(/ID chat tersimpan\. Jalankan Scan Profil untuk memperbarui kesiapan TTS/)).toBeTruthy();
+    expect(await screen.findByText(/ID chat tersimpan\. Status scan dapat diperbarui dari halaman Profil/)).toBeTruthy();
     expect(screen.queryByDisplayValue('-100123456789')).toBeNull();
   });
 

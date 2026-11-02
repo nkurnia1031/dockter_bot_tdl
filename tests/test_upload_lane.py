@@ -135,7 +135,7 @@ class UploadLanePreparerTests(unittest.TestCase):
             self.assertEqual(self._wait_terminal(preparer)["status"], "ready")
             self.assertNotEqual(preparer.session_fingerprint("irang"), first)
 
-    def test_identity_mismatch_keeps_existing_upload_and_both_source_lanes(self):
+    def test_upload_lane_accepts_a_valid_session_for_a_different_account(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             profile_root, export_db, download_db = self._profile(root)
@@ -168,17 +168,12 @@ class UploadLanePreparerTests(unittest.TestCase):
             preparer.ensure("irang")
             result = self._wait_terminal(preparer)
 
-            self.assertEqual(result["status"], "failed")
-            self.assertEqual(result["code"], "PROFILE_UPLOAD_IDENTITY_MISMATCH")
-            self.assertEqual(upload_db.read_bytes(), old_upload)
+            self.assertEqual(result["status"], "ready")
+            self.assertNotEqual(upload_db.read_bytes(), old_upload)
+            self.assertEqual(upload_db.read_bytes(), b"new export session")
             if old_modes is not None:
-                self.assertEqual(
-                    (
-                        stat.S_IMODE(upload_home.stat().st_mode),
-                        stat.S_IMODE(upload_db.stat().st_mode),
-                    ),
-                    old_modes,
-                )
+                self.assertEqual(stat.S_IMODE(upload_home.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(upload_db.stat().st_mode), 0o600)
             self.assertEqual(export_db.read_bytes(), b"new export session")
             self.assertEqual(download_db.read_bytes(), b"download bolt session")
             self.assertFalse(any(profile_root.glob(".upload-candidate-*")))

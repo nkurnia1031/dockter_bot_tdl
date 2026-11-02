@@ -53,7 +53,7 @@ describe('ExportPage labels', () => {
         runtime_readiness: {
           checked_at: '2026-10-23T10:00:00Z',
           workers: [{ name: 'local', status: 'success', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }],
-          cells: [{ worker: 'local', profile: 'default', runtime: 'export', status: 'ready', checked_at: '2026-10-23T10:00:00Z', reason_code: '' }]
+          cells: [{ worker: 'local', profile: 'default', runtime: 'export', status: 'not_ready', checked_at: '2026-10-23T10:00:00Z', reason_code: 'PROFILE_CANARY_EXPORT_FAILED' }]
         }
       }), { status: 200 });
       if (url.includes('/sources') || url.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
@@ -62,7 +62,7 @@ describe('ExportPage labels', () => {
     }));
 
     render(ExportPage);
-    expect(await screen.findByText('Export siap')).toBeTruthy();
+    expect(await screen.findByText('Scan terakhir: Export belum siap')).toBeTruthy();
     await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Mulai export' }));
 
@@ -93,7 +93,7 @@ describe('ExportPage labels', () => {
     }));
     render(ExportPage);
     await screen.findByText('Export baru');
-    await screen.findByText('Export siap');
+    await screen.findByText(/Export siap/);
     const input=screen.getByLabelText('Referensi chat');
     await fireEvent.input(input, {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
@@ -119,7 +119,7 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
-    await screen.findByText('Export siap');
+    await screen.findByText(/Export siap/);
     const source=await screen.findByLabelText('Pilih source tersimpan');
     await screen.findByRole('option', {name:/example/});
     await fireEvent.change(source, {target:{value:'example'}});
@@ -154,7 +154,7 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
-    await screen.findByText('Export siap');
+    await screen.findByText(/Export siap/);
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
 
@@ -190,10 +190,10 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
     render(ExportPage);
-    await screen.findByText('Export siap');
+    await screen.findByText(/Export siap/);
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
-    expect(await screen.findByText('Quick Mode siap')).toBeTruthy();
+    expect(await screen.findByText(/Quick Mode siap/)).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));
     expect(requests).toHaveLength(1);
     expect(requests[0].body).toMatchObject({chat_ref:'example',quick_mode:true});
@@ -213,7 +213,7 @@ describe('ExportPage labels', () => {
     }));
     render(ExportPage);
     await screen.findByText('Export baru');
-    await screen.findByText('Export siap');
+    await screen.findByText(/Export siap/);
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
     await fireEvent.click(screen.getByRole('switch', {name:/Quick Mode Export/}));
     await fireEvent.click(screen.getByRole('button', {name:'Mulai export'}));

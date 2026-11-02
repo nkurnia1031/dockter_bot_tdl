@@ -165,7 +165,8 @@ class _BatchUploader(StorageExecutorMixin):
         return Path(config.utility_workspace_root)
 
     @staticmethod
-    def _command_callback():
+    def _command_callback(*, profile=None, runtime=None):
+        del profile, runtime
         return None
 
     def available_storage_profiles(self):
@@ -184,7 +185,7 @@ class _BatchUploader(StorageExecutorMixin):
 
     @staticmethod
     @contextmanager
-    def _capture_tdl_output(_client):
+    def _capture_tdl_output(_client, **_kwargs):
         yield
 
     @staticmethod
@@ -553,7 +554,7 @@ class StorageUploadBatchTests(unittest.TestCase):
             "safe.txt": "failed",
         })
 
-    def test_changed_upload_session_is_recorded_as_safe_without_sending(self):
+    def test_changed_upload_session_does_not_block_a_real_upload_attempt(self):
         self._add_files("safe.txt")
         uploader = _BatchUploader(self.workspace, self.store)
         uploader.session_fingerprints["default"] = "c" * 64
@@ -563,9 +564,11 @@ class StorageUploadBatchTests(unittest.TestCase):
 
         result = uploader._storage_upload(command)
 
-        self.assertEqual(result["outcome"], "failed")
-        self.assertTrue(result["items"][0]["retryable"])
-        self.assertEqual(uploader.runtimes["default"].upload_tdl_client.uploads, [])
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertFalse(result["items"][0]["retryable"])
+        self.assertEqual(
+            uploader.runtimes["default"].upload_tdl_client.uploads, ["safe.txt"]
+        )
 
     def test_missing_verified_lane_keeps_every_file_safe_to_retry(self):
         self._add_files("one.txt", "two.txt")
@@ -574,10 +577,10 @@ class StorageUploadBatchTests(unittest.TestCase):
 
         result = uploader._storage_upload(uploader.command(self.workspace))
 
-        self.assertEqual(result["outcome"], "failed")
-        self.assertEqual(result["succeeded"], 0)
-        self.assertTrue(all(item["retryable"] for item in result["items"]))
-        self.assertTrue(all(item["profile"] == "" for item in result["items"]))
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["succeeded"], 2)
+        self.assertTrue(all(not item["retryable"] for item in result["items"]))
+        self.assertTrue(all(item["profile"] in {"default", "archive"} for item in result["items"]))
 
     def test_restart_reports_completed_and_pending_files_without_replaying_ambiguous_file(self):
         command_id = "recover-storage"

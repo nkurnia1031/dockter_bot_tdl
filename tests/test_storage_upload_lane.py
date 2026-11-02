@@ -84,14 +84,15 @@ class _StorageUploader(StorageExecutorMixin):
         return digest, path.stat().st_size
 
     @contextmanager
-    def _capture_tdl_output(self, _client):
+    def _capture_tdl_output(self, _client, **_kwargs):
         yield
 
     @contextmanager
     def _capture_tdl_progress(self, _client, _callback):
         yield
 
-    def _command_callback(self):
+    def _command_callback(self, *, profile=None, runtime=None):
+        del profile, runtime
         return None
 
     @staticmethod
@@ -120,21 +121,11 @@ class _StorageUploader(StorageExecutorMixin):
 
 
 class StorageUploadLaneTests(unittest.TestCase):
-    def test_storage_upload_session_guard_reads_the_selected_profile(self):
+    def test_storage_upload_session_is_checked_by_the_upload_command(self):
         executor = object.__new__(WorkerJobExecutor)
-        executor.available_storage_profiles = lambda: ["remote_profile"]
-
-        executor._require_local_job_session(
-            {"kind": "storage_upload", "profile": "remote_profile"}
-        )
-
-        executor.available_storage_profiles = lambda: []
-        with self.assertRaisesRegex(
-            RuntimeError, "STORAGE_PROFILE_UNAVAILABLE.*remote_profile"
-        ):
-            executor._require_local_job_session(
-                {"kind": "storage_upload", "profile": "remote_profile"}
-            )
+        executor._require_local_job_session({
+            "kind": "storage_upload", "profile": "remote_profile",
+        })
 
     def _workspace(self, root: Path) -> Path:
         workspace = root / "folder"
@@ -184,7 +175,7 @@ class StorageUploadLaneTests(unittest.TestCase):
                 for args, _kwargs in executor.events
             ))
 
-    def test_storage_skips_a_lane_whose_session_changed_after_dispatch(self):
+    def test_storage_tries_a_lane_whose_session_changed_after_dispatch(self):
         with TemporaryDirectory() as raw:
             root = Path(raw)
             workspace = self._workspace(root)
@@ -194,7 +185,11 @@ class StorageUploadLaneTests(unittest.TestCase):
             result = executor._storage_upload(executor._command(workspace))
 
             self.assertEqual(result["succeeded"], 1)
-            self.assertFalse(executor.runtimes["default"].upload_tdl_client.uploads)
+            self.assertEqual(len(executor.runtimes["default"].upload_tdl_client.uploads), 1)
+            self.assertEqual(
+                Path(executor.runtimes["default"].upload_tdl_client.uploads[0][0]).name,
+                "example.txt",
+            )
             self.assertEqual(len(executor.runtimes["archive"].upload_tdl_client.uploads), 1)
 
     def test_storage_session_denial_revokes_lane_and_uses_another_verified_profile(self):
@@ -250,18 +245,18 @@ class StorageUploadLaneTests(unittest.TestCase):
             self.assertEqual(len(runtime.upload_tdl_client.uploads), 1)
             self.assertFalse(runtime.export_tdl_client.uploads)
 
-    def test_storage_upload_rejects_an_unready_upload_lane_without_export_fallback(self):
+    def test_storage_upload_tries_live_profiles_without_scan_lane_proof(self):
         with TemporaryDirectory() as raw:
             root = Path(raw)
             workspace = self._workspace(root)
             executor = _StorageUploader(workspace)
             executor.available_storage_profiles = lambda: ["archive"]
 
-            with self.assertRaisesRegex(ValueError, "STORAGE_PROFILE_UNAVAILABLE"):
-                executor._storage_upload(executor._command(workspace))
+            result = executor._storage_upload(executor._command(workspace))
 
+            self.assertEqual(result["succeeded"], 1)
             self.assertFalse(any(
-                runtime.upload_tdl_client.uploads or runtime.export_tdl_client.uploads
+                runtime.export_tdl_client.uploads
                 for runtime in executor.runtimes.values()
             ))
 

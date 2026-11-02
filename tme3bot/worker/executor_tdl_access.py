@@ -7,10 +7,7 @@ from urllib.parse import quote
 
 from tme3bot.infrastructure.http_client import request_json
 from tme3bot.progress_reporter import ProgressReporter
-from tme3bot.tdl_access_fingerprint import (
-    normalize_session_fingerprints,
-    tdl_access_inventory_fingerprint,
-)
+from tme3bot.tdl_access_fingerprint import tdl_access_inventory_fingerprint
 from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
 
 LOGGER = logging.getLogger(__name__)
@@ -48,7 +45,6 @@ _UPLOAD_ACCESS_ERROR_MESSAGES = {
     "TDL_SESSION_UNAVAILABLE": "Lane Upload profil ini tidak tersedia untuk diuji.",
     "TDL_SESSION_UNAUTHORIZED": "Sesi pada lane Upload profil ini belum terotorisasi. Jalankan scan profil untuk menyiapkan ulang lane dari sesi Export.",
     "PROFILE_UPLOAD_LANE_NOT_READY": "Lane Upload profil ini belum siap. Jalankan scan profil lalu ulangi verifikasi.",
-    "PROFILE_UPLOAD_SESSION_CHANGED": "Sesi lane Upload berubah saat verifikasi. Jalankan verifikasi akses lagi.",
 }
 
 
@@ -61,14 +57,6 @@ def _tdl_access_error_code(exc: BaseException) -> str:
     if denial:
         return denial
 
-    sources = [str(exc)]
-    for name in ("stdout", "stderr"):
-        value = getattr(exc, name, None)
-        if isinstance(value, str):
-            sources.append(value)
-    details = "\n".join(sources).upper()
-    if details.startswith("PROFILE_UPLOAD_SESSION_CHANGED:"):
-        return "PROFILE_UPLOAD_SESSION_CHANGED"
     session_denial = tdl_session_denial_code(exc)
     if session_denial:
         return session_denial
@@ -110,70 +98,16 @@ class TdlAccessExecutorMixin:
         if isinstance(secrets, list) and destination not in secrets:
             secrets.append(destination)
 
-        availability_method = getattr(
-            self,
-            "available_storage_profiles" if purpose == "storage" else "available_export_profiles",
-            None,
-        )
-        if not callable(availability_method):
-            availability_method = getattr(self, "available_storage_profiles", None)
-        available_profiles = {
-            str(item).strip().lower()
-            for item in (availability_method() if callable(availability_method) else [])
-            if str(item).strip()
-        }
         list_profiles = getattr(self.profile_manager, "list_profiles", None)
         if callable(list_profiles):
             local_profiles = sorted(
                 {str(item).strip().lower() for item in list_profiles() if str(item).strip()}
             )
         else:
-            local_profiles = sorted(available_profiles)
-        session_diagnostic = getattr(self.profile_manager, "tdl_session_diagnostic", None)
-        diagnostics: dict[str, dict[str, object]] = {}
-        if callable(session_diagnostic):
-            session_purpose = "storage" if purpose == "storage" else "export"
-            for profile in local_profiles:
-                value = session_diagnostic(profile, session_purpose)
-                if isinstance(value, dict):
-                    diagnostics[profile] = value
-        normalized_profiles = sorted(
-            profile
-            for profile in available_profiles
-            if not diagnostics or diagnostics.get(profile, {}).get("available") is True
-        )
+            local_profiles = []
+        normalized_profiles = list(local_profiles)
         session_fingerprints: dict[str, str] = {}
-        if purpose == "storage":
-            fingerprint_method = getattr(self, "available_storage_session_fingerprints", None)
-            raw_fingerprints = (
-                fingerprint_method(normalized_profiles)
-                if callable(fingerprint_method)
-                else {}
-            )
-            session_fingerprints = normalize_session_fingerprints(raw_fingerprints)
-            normalized_profiles = [
-                profile for profile in normalized_profiles if profile in session_fingerprints
-            ]
-        elif purpose == "tts":
-            diagnose_profile = getattr(self, "diagnose_profile_tdl", None)
-            for profile in normalized_profiles:
-                try:
-                    diagnostic = diagnose_profile(profile) if callable(diagnose_profile) else {}
-                except Exception:
-                    diagnostic = {}
-                if isinstance(diagnostic, dict) and diagnostic.get("ready") is True:
-                    session_fingerprints.update(
-                        normalize_session_fingerprints(
-                            {profile: diagnostic.get("fingerprint")}
-                        )
-                    )
-            normalized_profiles = [
-                profile for profile in normalized_profiles if profile in session_fingerprints
-            ]
-        inventory_hash = tdl_access_inventory_fingerprint(
-            normalized_profiles,
-            session_fingerprints if purpose == "storage" else None,
-        )
+        inventory_hash = tdl_access_inventory_fingerprint(normalized_profiles, None)
         reporter = ProgressReporter(self.publisher, job_id)
         outcomes: list[dict[str, object]] = []
         if not local_profiles:
@@ -196,7 +130,6 @@ class TdlAccessExecutorMixin:
         marker_context = tempfile.TemporaryDirectory(prefix="tme3bot-tdl-verify-")
         try:
             marker = Path(marker_context.name) / f"tdl-access-check-{job_id[:8]}.txt"
-            tested_profiles = set(normalized_profiles)
             for index, profile in enumerate(local_profiles, start=1):
                 if self._job_cancelled(job_id):
                     raise RuntimeError("TDL_ACCESS_VERIFICATION_CANCELLED: verifikasi dibatalkan.")
@@ -211,55 +144,13 @@ class TdlAccessExecutorMixin:
                     },
                     force=True,
                 )
-                diagnostic = diagnostics.get(profile, {})
-                is_available = profile in tested_profiles
-                error_code = str(diagnostic.get("error_code") or "TDL_SESSION_UNAVAILABLE")
-                if (
-                    purpose == "storage"
-                    and not is_available
-                    and diagnostic.get("available") is True
-                ):
-                    error_code = "PROFILE_UPLOAD_LANE_NOT_READY"
                 outcome: dict[str, object] = {
                     "profile": profile,
                     "ready": False,
                     "session": "upload" if purpose == "storage" else "export",
-                    "session_status": "ready" if is_available else "unavailable",
+                    "session_status": "not_checked",
                     "command_attempted": False,
                 }
-                if not is_available:
-                    outcome["error_code"] = error_code
-                    messages = (
-                        {**_TDL_ACCESS_ERROR_MESSAGES, **_UPLOAD_ACCESS_ERROR_MESSAGES}
-                        if purpose == "storage"
-                        else _TDL_ACCESS_ERROR_MESSAGES
-                    )
-                    outcome["error_message"] = messages.get(
-                        error_code,
-                        messages.get(
-                            "TDL_SESSION_UNAVAILABLE",
-                            _TDL_ACCESS_ERROR_MESSAGES["TDL_SESSION_UNAVAILABLE"],
-                        ),
-                    )
-                    outcomes.append(outcome)
-                    reporter.report(
-                        phase="tdl_access_verify",
-                        message=f"Profil {profile} dilewati ({error_code}); perintah TDL tidak dijalankan.",
-                        overall={
-                            "current": index,
-                            "total": len(local_profiles),
-                            "unit": "profiles",
-                            "percent": round(index * 100 / len(local_profiles)),
-                        },
-                        counters={
-                            "succeeded": sum(item.get("ready") is True for item in outcomes),
-                            "failed": sum(item.get("ready") is not True for item in outcomes),
-                        },
-                        force=True,
-                    )
-                    continue
-
-                outcome["command_attempted"] = True
                 try:
                     runtime = self.profile_manager.runtime(profile)
                     if purpose == "storage":
@@ -268,48 +159,24 @@ class TdlAccessExecutorMixin:
                     else:
                         tdl_client = runtime.export_tdl_client
                         operation_lock = runtime.export_operation_lock
-                    if purpose == "tts":
-                        diagnose_profile = getattr(self, "diagnose_profile_tdl", None)
-                        current = diagnose_profile(profile) if callable(diagnose_profile) else {}
-                        current_fingerprint = normalize_session_fingerprints(
-                            {profile: current.get("fingerprint")}
-                            if isinstance(current, dict) and current.get("ready") is True
-                            else {}
-                        ).get(profile)
-                        if current_fingerprint != session_fingerprints.get(profile):
-                            raise RuntimeError(
-                                "PROFILE_SESSION_CHANGED: sesi Export berubah saat verifikasi."
-                            )
                     with operation_lock:
-                        if purpose == "storage":
-                            current_fingerprints = normalize_session_fingerprints(
-                                self.available_storage_session_fingerprints([profile])
-                            )
-                            if current_fingerprints.get(profile) != session_fingerprints.get(profile):
-                                raise RuntimeError(
-                                    "PROFILE_UPLOAD_SESSION_CHANGED: sesi Upload berubah saat verifikasi."
-                                )
                         marker.write_text(
                             "Pesan uji akses TDL. Pesan ini dapat dihapus manual setelah verifikasi.",
                             encoding="utf-8",
                         )
                         _prepare_tdl_access_marker(marker)
-                        tdl_client.upload(
-                            marker,
-                            destination,
-                            f"[TME3BOT TEST] Verifikasi akses kirim {purpose.upper()} - pesan uji, boleh dihapus.",
-                        )
-                    if purpose == "tts":
-                        diagnose_profile = getattr(self, "diagnose_profile_tdl", None)
-                        current = diagnose_profile(profile) if callable(diagnose_profile) else {}
-                        current_fingerprint = normalize_session_fingerprints(
-                            {profile: current.get("fingerprint")}
-                            if isinstance(current, dict) and current.get("ready") is True
-                            else {}
-                        ).get(profile)
-                        if current_fingerprint != session_fingerprints.get(profile):
-                            raise RuntimeError(
-                                "PROFILE_SESSION_CHANGED: sesi Export berubah saat verifikasi."
+                        outcome["command_attempted"] = True
+                        with self._capture_tdl_output(
+                            tdl_client,
+                            command_callback=self._command_callback(
+                                profile=profile,
+                                runtime="upload" if purpose == "storage" else "tts",
+                            ),
+                        ):
+                            tdl_client.upload(
+                                marker,
+                                destination,
+                                f"[TME3BOT TEST] Verifikasi akses kirim {purpose.upper()} - pesan uji, boleh dihapus.",
                             )
                     outcome["ready"] = True
                     LOGGER.info("TDL access verification succeeded job=%s purpose=%s profile=%s", job_id, purpose, profile)

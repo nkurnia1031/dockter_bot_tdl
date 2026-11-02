@@ -266,14 +266,12 @@ class ControlPlaneTests(unittest.TestCase):
             worker_payload["_quick_storage_sender_profiles"],
             ["archive", "default", "other"],
         )
-        self.assertEqual(
-            worker_payload["_quick_storage_sender_session_fingerprints"]["default"],
-            "a" * 64,
-        )
+        self.assertNotIn("_quick_storage_sender_session_fingerprints", worker_payload)
+        self.assertNotIn("session_fingerprint", str(worker_payload))
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
         self.assertNotIn("-100123", str(job.payload))
 
-    def test_quick_mode_requires_scanned_cell_without_live_capability_probe(self):
+    def test_quick_mode_dispatches_without_scan_snapshot_or_readiness_probe(self):
         self.authorize_quick_mode_storage()
         store = RuntimeReadinessStore(Path(self.temp.name) / "quick-readiness.json")
         store.apply_export_scan(
@@ -284,30 +282,28 @@ class ControlPlaneTests(unittest.TestCase):
         self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
 
         def fail_if_probed(_worker):
-            raise AssertionError("submit must use the Profile scan snapshot")
+            raise AssertionError("Quick Mode must not probe for readiness")
 
         self.dispatcher.capabilities = fail_if_probed
-        with self.assertRaises(DomainError) as raised:
-            self.control.submit_job(
-                self.actor,
-                "export",
-                {"url": "https://t.me/c/1/3", "quick_mode": True},
-            )
-
-        self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
-        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
+        quick_job = self.control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/3", "quick_mode": True},
+        )
+        self.assertEqual(quick_job.status, JobStatus.DISPATCHED)
+        self.assertTrue(self.dispatcher.commands[-1]["payload"]["quick_mode"])
 
         export_job = self.control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/4"}
         )
         self.assertEqual(export_job.payload["url"], "https://t.me/c/1/4")
 
-    def test_storage_upload_uses_saved_readiness_without_live_capability_probe(self):
+    def test_storage_upload_uses_local_profiles_without_scan_or_readiness_probe(self):
         self.authorize_quick_mode_storage()
         runtime_store = self.attach_storage_readiness()
 
         def fail_if_probed(_worker):
-            raise AssertionError("Storage submit must use the Profile scan snapshot")
+            raise AssertionError("Storage submit must not probe readiness")
 
         self.dispatcher.capabilities = fail_if_probed
         job = self.control.submit_job(
@@ -320,14 +316,11 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(job.worker, "local")
         self.assertEqual(runtime_store.cell("local", "archive", "storage")["status"], "ready")
         payload = self.dispatcher.commands[-1]["payload"]
-        self.assertEqual(payload["_tdl_sender_profile"], "archive")
-        self.assertEqual(
-            payload["_tdl_sender_session_fingerprints"],
-            {"archive": "b" * 64, "default": "a" * 64, "other": "c" * 64},
-        )
+        self.assertEqual(set(payload["_tdl_sender_profiles"]), {"archive", "default", "other"})
+        self.assertNotIn("_tdl_sender_session_fingerprints", payload)
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
 
-    def test_storage_sync_pins_one_ready_profile_and_keeps_target_private(self):
+    def test_storage_sync_uses_selected_profile_without_session_fingerprint_gate(self):
         self.authorize_quick_mode_storage()
         self.attach_storage_readiness(profiles=("default",))
 
@@ -355,14 +348,14 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(job.profile, "default")
         self.assertEqual(job.worker, "local")
         self.assertEqual(payload["tdl_access_target"], "-100123")
-        self.assertEqual(payload["_tdl_sender_session_fingerprint"], "a" * 64)
+        self.assertNotIn("_tdl_sender_session_fingerprints", payload)
         self.assertEqual(payload["channel_id"], -100123)
         self.assertEqual(payload["_storage_sync_candidate_message_ids"], [71, 90])
         self.assertNotIn("tdl_access_target", str(job.payload))
         self.assertNotIn("session_fingerprint", str(job.payload))
         self.assertNotIn("candidate_message_ids", str(job.payload))
 
-    def test_storage_upload_omits_profiles_without_ready_upload_lane(self):
+    def test_storage_upload_does_not_filter_local_senders_by_saved_readiness(self):
         self.authorize_quick_mode_storage()
         runtime_store = self.attach_storage_readiness()
         runtime_store.invalidate(
@@ -379,7 +372,7 @@ class ControlPlaneTests(unittest.TestCase):
         )
 
         sender_profiles = self.dispatcher.commands[-1]["payload"]["_tdl_sender_profiles"]
-        self.assertNotIn("archive", sender_profiles)
+        self.assertIn("archive", sender_profiles)
         self.assertIn("default", sender_profiles)
         self.assertEqual(job.status, JobStatus.DISPATCHED)
 
@@ -445,7 +438,39 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.commands[-1]["event_sequence_start"], 41)
         self.assertEqual(event_history_reads, [])
 
-    def test_storage_upload_rejects_without_storage_cell_before_creating_job(self):
+    def test_export_dispatch_ignores_stale_profile_worker_catalog(self):
+        class StaleCatalog:
+            @staticmethod
+            def snapshot():
+                return {"profiles": [{"name": "default", "workers": ["local"]}]}
+
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "stale-profile-worker-catalog.json",
+            {"local": "http://worker-local", "remote-1": "http://worker-remote"},
+            {"local": "local-token", "remote-1": "remote-token"},
+        )
+        dispatcher = FakeDispatcher()
+        control = ControlPlane(
+            self.jobs,
+            dispatcher,
+            self.profiles,
+            worker_registry=registry,
+            local_profile_catalog=StaleCatalog(),
+        )
+
+        job = control.submit_job(
+            self.actor,
+            "export",
+            {"url": "https://t.me/c/1/3"},
+            worker="remote-1",
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(job.worker, "remote-1")
+        self.assertEqual(dispatcher.commands[-1]["worker"], "remote-1")
+
+    def test_storage_upload_dispatches_without_storage_readiness_cell(self):
         self.authorize_quick_mode_storage()
         runtime_store = RuntimeReadinessStore(
             Path(self.temp.name) / "storage-no-cell-readiness.json"
@@ -458,20 +483,18 @@ class ControlPlaneTests(unittest.TestCase):
         self.control.runtime_readiness_gate = RuntimeReadinessGate(runtime_store)
 
         def fail_if_probed(_worker):
-            raise AssertionError("Storage submit must not check worker capabilities")
+            raise AssertionError("Storage submit must not probe readiness")
 
         self.dispatcher.capabilities = fail_if_probed
-        with self.assertRaises(DomainError) as raised:
-            self.control.submit_job(
-                self.actor,
-                "storage_upload",
-                {"folder_path": "/workspace/biasa", "batch_id": "storage-no-cell"},
-            )
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-no-cell"},
+        )
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(self.dispatcher.commands[-1]["payload"]["_tdl_sender_profiles"], ["archive", "default", "other"])
 
-        self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
-        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
-
-    def test_storage_upload_rejects_when_saved_access_proof_is_stale(self):
+    def test_storage_upload_dispatches_when_saved_access_proof_is_stale(self):
         self.authorize_quick_mode_storage()
         runtime_store = self.attach_storage_readiness(profiles=("default",))
         capabilities = self.dispatcher.capabilities("local")
@@ -492,18 +515,19 @@ class ControlPlaneTests(unittest.TestCase):
             raise AssertionError("Storage submit must not refresh access proof online")
 
         self.dispatcher.capabilities = fail_if_probed
-        with self.assertRaises(DomainError) as raised:
-            self.control.submit_job(
-                self.actor,
-                "storage_upload",
-                {"folder_path": "/workspace/biasa", "batch_id": "storage-stale-proof"},
-            )
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "storage-stale-proof"},
+        )
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(runtime_store.cell("local", "default", "storage")["status"], "ready")
+        self.assertEqual(
+            set(self.dispatcher.commands[-1]["payload"]["_tdl_sender_profiles"]),
+            {"archive", "default", "other"},
+        )
 
-        self.assertEqual(raised.exception.code, "RUNTIME_NOT_READY")
-        self.assertEqual(runtime_store.cell("local", "default", "storage")["status"], "not_ready")
-        self.assertEqual(self.jobs.list(profile="default", limit=20), [])
-
-    def test_storage_access_failure_invalidates_only_the_sender_profile(self):
+    def test_storage_command_failure_invalidates_only_the_sender_profile(self):
         self.authorize_quick_mode_storage()
         runtime_store = self.attach_storage_readiness()
         job = self.control.submit_job(
@@ -512,14 +536,28 @@ class ControlPlaneTests(unittest.TestCase):
             {"folder_path": "/workspace/biasa", "batch_id": "storage-denied-batch"},
         )
         sender_profile = self.dispatcher.commands[-1]["payload"]["_tdl_sender_profile"]
-        sequence = max(event.sequence for event in self.jobs.events(job.id)) + 1
-
-        self.control.append_worker_event(JobEvent(
+        self.control._invalidate_runtime_readiness_from_event(JobEvent(
             job_id=job.id,
-            sequence=sequence,
+            sequence=max(event.sequence for event in self.jobs.events(job.id)) + 1,
             status=JobStatus.FAILED,
             event_type="failed",
-            error={"code": "CHAT_WRITE_FORBIDDEN", "message": "write access denied"},
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "PROFILE_SESSION_UNAVAILABLE: lane belum ada",
+            },
+        ))
+        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "ready")
+        self.control.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=max(event.sequence for event in self.jobs.events(job.id)) + 1,
+            status=JobStatus.RUNNING,
+            event_type="command.completed",
+            result={
+                "runtime": "upload",
+                "profile": sender_profile,
+                "returncode": 1,
+                "output_tail": ["CHAT_WRITE_FORBIDDEN: write access denied"],
+            },
         ))
 
         self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "not_ready")
@@ -527,6 +565,35 @@ class ControlPlaneTests(unittest.TestCase):
         for profile in {"default", "archive", "other"} - {sender_profile}:
             self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
         self.assertEqual(runtime_store.cell("local", sender_profile, "export")["status"], "ready")
+
+        self.control.append_worker_event(JobEvent(
+            job_id=job.id,
+            sequence=max(event.sequence for event in self.jobs.events(job.id)) + 1,
+            status=JobStatus.RUNNING,
+            event_type="command.completed",
+            result={
+                "runtime": "upload",
+                "profile": sender_profile,
+                "returncode": 0,
+                "output_tail": ["Uploaded successfully"],
+            },
+        ))
+        self.assertEqual(runtime_store.cell("local", sender_profile, "upload")["status"], "ready")
+        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "ready")
+        self.control._invalidate_runtime_readiness_from_event(JobEvent(
+            job_id=job.id,
+            sequence=max(event.sequence for event in self.jobs.events(job.id)) + 1,
+            status=JobStatus.FAILED,
+            event_type="failed",
+            error={
+                "code": "WORKER_JOB_FAILED",
+                "message": "PROFILE_SESSION_UNAVAILABLE: later stage failed",
+            },
+        ))
+        self.assertEqual(runtime_store.cell("local", sender_profile, "upload")["status"], "ready")
+        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "ready")
+        for profile in {"default", "archive", "other"} - {sender_profile}:
+            self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
 
     def test_storage_dispatch_failure_marks_worker_offline_without_clearing_profile_cells(self):
         self.authorize_quick_mode_storage()
@@ -543,10 +610,10 @@ class ControlPlaneTests(unittest.TestCase):
                 {"folder_path": "/workspace/biasa", "batch_id": "storage-dispatch-failure"},
             )
 
-        self.assertEqual(runtime_store.worker("local")["status"], "failed")
+        self.assertEqual(runtime_store.worker("local")["status"], "success")
         self.assertEqual(runtime_store.cell("local", "archive", "storage")["status"], "ready")
 
-    def test_storage_item_session_change_invalidates_the_reported_profile(self):
+    def test_storage_session_fingerprint_diagnostic_does_not_invalidate_readiness(self):
         self.authorize_quick_mode_storage()
         runtime_store = self.attach_storage_readiness()
         job = self.control.submit_job(
@@ -570,7 +637,7 @@ class ControlPlaneTests(unittest.TestCase):
             error={"code": "STORAGE_UPLOAD_FAILED", "message": "All files failed."},
         ))
 
-        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "not_ready")
+        self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "ready")
         for profile in {"default", "archive", "other"} - {sender_profile}:
             self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
 
@@ -654,7 +721,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
         status = self.control.tdl_access_verification_status("local", "storage")
         self.assertNotIn("default", status["verified_profiles"])
-        self.assertIn("archive", status["verified_profiles"])
+        self.assertEqual(status["verified_profiles"], [])
 
     def test_quick_mode_terminal_runtime_failure_is_scoped_and_input_cancel_keep_cell(self):
         store = RuntimeReadinessStore(Path(self.temp.name) / "quick-terminal-readiness.json")
@@ -688,6 +755,10 @@ class ControlPlaneTests(unittest.TestCase):
             worker="local", profile=None, runtime="quick_mode_runtime",
             ready=True, fingerprint="e" * 64,
         )
+        store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage",
+            ready=True, fingerprint="f" * 64,
+        )
         self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
         job = Job(
             id="quick-terminal-failure",
@@ -703,16 +774,18 @@ class ControlPlaneTests(unittest.TestCase):
         self.control._invalidate_runtime_readiness_from_event(JobEvent(
             job_id=job.id,
             sequence=1,
-            status=JobStatus.FAILED,
-            event_type="failed",
-            error={
-                "code": "WORKER_JOB_FAILED",
-                "message": "UTILITY_PROCESS_STALLED: compression stopped",
+            status=JobStatus.RUNNING,
+            event_type="command.completed",
+            result={
+                "runtime": "rclone_storage",
+                "returncode": 1,
+                "output_tail": ["RCLONE_ACCESS_FAILED: copy failed"],
             },
         ))
-        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
         self.assertEqual(store.cell("local", "archive", "quick_mode")["status"], "ready")
         self.assertEqual(store.cell("local", None, "quick_mode_runtime")["status"], "not_ready")
+        self.assertEqual(store.cell("local", None, "rclone_storage")["status"], "not_ready")
+        self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "not_ready")
         self.assertEqual(store.cell("local", "default", "export")["status"], "ready")
 
         store.apply_quickmode_scan(
@@ -724,6 +797,10 @@ class ControlPlaneTests(unittest.TestCase):
             worker="local", profile=None, runtime="quick_mode_runtime",
             ready=True, fingerprint="e" * 64,
         )
+        store.upsert_cell(
+            worker="local", profile=None, runtime="rclone_storage",
+            ready=True, fingerprint="f" * 64,
+        )
         self.control._invalidate_runtime_readiness_from_event(JobEvent(
             job_id=job.id,
             sequence=2,
@@ -731,7 +808,7 @@ class ControlPlaneTests(unittest.TestCase):
             event_type="failed",
             error={
                 "code": "WORKER_JOB_FAILED",
-                "message": "INVALID_EXPORT_INPUT: file manifest is missing",
+                "message": "PROFILE_SESSION_UNAVAILABLE: data profil tidak ada",
             },
         ))
         self.control._invalidate_runtime_readiness_from_event(JobEvent(
@@ -742,6 +819,37 @@ class ControlPlaneTests(unittest.TestCase):
             error={"code": "JOB_TERMINATED", "message": "cancelled by user"},
         ))
         self.assertEqual(store.cell("local", "default", "quick_mode")["status"], "ready")
+
+    def test_storage_sync_does_not_change_write_lane_readiness(self):
+        store = RuntimeReadinessStore(Path(self.temp.name) / "storage-sync-readiness.json")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(store)
+        store.upsert_cell(worker="local", profile="default", runtime="upload", ready=True)
+        store.upsert_cell(worker="local", profile="default", runtime="storage", ready=True)
+        job = Job(
+            id="storage-sync-readonly",
+            kind="storage_sync",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.DISPATCHED,
+            payload={},
+        )
+        self.jobs.create(job)
+
+        for event in (
+            JobEvent(
+                job_id=job.id, sequence=1, status=JobStatus.SUCCEEDED,
+                event_type="completed", result={"value": {"scanned": 4}},
+            ),
+            JobEvent(
+                job_id=job.id, sequence=2, status=JobStatus.FAILED,
+                event_type="failed", error={"code": "PROFILE_SESSION_UNAVAILABLE"},
+            ),
+        ):
+            self.control._invalidate_runtime_readiness_from_event(event)
+
+        self.assertEqual(store.cell("local", "default", "upload")["status"], "ready")
+        self.assertEqual(store.cell("local", "default", "storage")["status"], "ready")
 
     def configure_tdl_access(self, control, dispatcher, registry, purposes=("tts", "storage")):
         store = SqliteTdlAccessStore(Path(self.temp.name) / f"tdl-access-{id(control)}.db")
@@ -936,7 +1044,7 @@ class ControlPlaneTests(unittest.TestCase):
             self.control.set_worker_route(self.actor, "local")
         self.assertEqual(route_error.exception.code, "WORKER_DISABLED")
 
-    def test_tts_routes_to_least_loaded_capable_worker_and_round_robins_ties(self):
+    def test_tts_routes_to_least_loaded_enabled_worker_and_round_robins_ties(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "tts-workers.json",
             {
@@ -972,7 +1080,7 @@ class ControlPlaneTests(unittest.TestCase):
             control.submit_job(self.actor, "tts", {"title": "C", "text": "private text"}),
         ]
 
-        self.assertEqual([job.worker for job in jobs], ["remote", "tts-ready", "remote"])
+        self.assertEqual([job.worker for job in jobs], ["remote", "tts-ready", "tts-off"])
         self.assertTrue(all(job.kind == "tts" for job in jobs))
         self.assertNotIn("text", jobs[0].payload)
         internal = self.jobs.command_payload(jobs[0].id)
@@ -1009,7 +1117,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(first.worker, second.worker)
         self.assertEqual(len(dispatcher.commands), 1)
 
-    def test_tts_rejects_workers_without_capability(self):
+    def test_tts_dispatches_to_enabled_worker_without_saved_capability_snapshot(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "no-tts-worker.json",
             {"local": "http://worker"},
@@ -1017,12 +1125,12 @@ class ControlPlaneTests(unittest.TestCase):
         )
         control = ControlPlane(self.jobs, FakeDispatcher(), self.profiles, worker_registry=registry)
         control.tdl_access_target_resolver = lambda _purpose: "123456789"
-        with self.assertRaises(DomainError) as error:
-            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
-        self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
-        self.assertEqual(self.jobs.count(kind="tts"), 0)
+        control.runtime_settings_store = FakeJobSecretStore()
+        job = control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(self.jobs.count(kind="tts"), 1)
 
-    def test_tts_rejects_snapshot_for_a_different_destination_before_job_creation(self):
+    def test_tts_dispatches_when_saved_destination_snapshot_is_stale(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "stale-tts-destination.json",
             {"local": "http://worker"},
@@ -1038,13 +1146,11 @@ class ControlPlaneTests(unittest.TestCase):
         self.configure_tdl_access(control, dispatcher, registry)
         control.tdl_access_target_resolver = lambda _purpose: "987654321"
 
-        with self.assertRaises(DomainError) as error:
-            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+        job = control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(self.jobs.count(kind="tts"), 1)
 
-        self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
-        self.assertEqual(self.jobs.count(kind="tts"), 0)
-
-    def test_tts_snapshot_fails_closed_when_export_session_cell_is_stale(self):
+    def test_tts_dispatches_when_export_session_snapshot_is_stale(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "stale-tts-session.json",
             {"local": "http://worker"},
@@ -1065,11 +1171,9 @@ class ControlPlaneTests(unittest.TestCase):
             reason_code="PROFILE_SESSION_CHANGED",
         )
 
-        with self.assertRaises(DomainError) as error:
-            control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
-
-        self.assertEqual(error.exception.code, "TTS_WORKER_UNAVAILABLE")
-        self.assertEqual(self.jobs.count(kind="tts"), 0)
+        job = control.submit_job(self.actor, "tts", {"title": "A", "text": "private text"})
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(self.jobs.count(kind="tts"), 1)
 
     def test_tts_helper_failure_invalidates_worker_runtime_not_profile_canaries(self):
         registry = WorkerRegistry(
@@ -1445,6 +1549,7 @@ class ControlPlaneTests(unittest.TestCase):
         dispatcher = FakeDispatcher()
         dispatcher.capabilities = lambda _worker: {
             "profiles": ["default"],
+            "local_profiles": ["default", "archive"],
             "export_profiles": ["default"],
             "available_storage_profiles": ["default", "archive"],
             "storage_upload_fingerprints": {"default": "a" * 64, "archive": "b" * 64},
@@ -1473,10 +1578,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(job.profile, "default")
         self.assertEqual(command["profile"], "archive")
         self.assertEqual(command["payload"]["tdl_access_target"], "-100123")
-        self.assertEqual(
-            command["payload"]["_tdl_sender_session_fingerprints"],
-            {"archive": fingerprints["archive"]},
-        )
+        self.assertNotIn("_tdl_sender_session_fingerprints", command["payload"])
         self.assertNotIn("_tdl_sender_session_fingerprints", job.payload)
         self.assertEqual(job.payload["sender_profile"], "archive")
 
@@ -1503,9 +1605,9 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(
             self.dispatcher.commands[0]["payload"]["tdl_access_target"], "-100123"
         )
-        self.assertEqual(
-            self.dispatcher.commands[0]["payload"]["_tdl_sender_session_fingerprints"],
-            {"default": "a" * 64, "archive": "b" * 64, "other": "c" * 64},
+        self.assertNotIn(
+            "_tdl_sender_session_fingerprints",
+            self.dispatcher.commands[0]["payload"],
         )
 
     def test_scheduler_does_not_claim_job_already_admitted_by_submitter(self):
@@ -1599,37 +1701,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertNotIn("ambiguous.txt", retry_payload["_storage_retry_paths"])
         self.assertEqual(self.jobs.get(original.id).status, JobStatus.FAILED)
 
-    def test_storage_rejects_profiles_without_a_fingerprinted_upload_lane_before_job_creation(self):
-        registry = WorkerRegistry(
-            Path(self.temp.name) / "storage-unfingerprinted-workers.json",
-            {"local": "http://worker-local"},
-            {"local": "worker-token"},
-        )
-        dispatcher = FakeDispatcher()
-        dispatcher.capabilities = lambda _worker: {
-            "profiles": ["default"],
-            "export_profiles": ["default"],
-            "available_storage_profiles": ["default"],
-        }
-        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
-        store = SqliteTdlAccessStore(Path(self.temp.name) / "storage-unfingerprinted.db")
-        control.tdl_access_store = store
-        control.tdl_access_target_resolver = lambda _purpose: "-100123"
-        control.runtime_settings_store = FakeJobSecretStore()
-
-        with self.assertRaises(DomainError) as error:
-            control.submit_job(
-                self.actor,
-                "storage_upload",
-                {"folder_path": "/workspace/source"},
-                worker="local",
-            )
-
-        self.assertEqual(error.exception.code, "TDL_ACCESS_NOT_VERIFIED")
-        self.assertEqual(self.jobs.count(kind="storage_upload"), 0)
-        self.assertEqual(dispatcher.commands, [])
-
-    def test_storage_permission_denial_revokes_only_the_rejected_profile_proof(self):
+    def test_storage_permission_denial_invalidates_only_the_rejected_readiness_cell(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "storage-denial-workers.json",
             {"local": "http://worker-local"},
@@ -1661,6 +1733,16 @@ class ControlPlaneTests(unittest.TestCase):
             ],
             session_fingerprints=fingerprints,
         )
+        readiness = RuntimeReadinessStore(
+            Path(self.temp.name) / "storage-denial-readiness.json"
+        )
+        for profile in ("default", "archive"):
+            for runtime in ("storage", "upload"):
+                readiness.upsert_cell(
+                    worker="local", profile=profile, runtime=runtime,
+                    ready=True, fingerprint="f" * 64,
+                )
+        control.runtime_readiness_gate = RuntimeReadinessGate(readiness)
         job = control.submit_job(
             self.actor,
             "storage_upload",
@@ -1678,10 +1760,12 @@ class ControlPlaneTests(unittest.TestCase):
             )
         )
 
-        status = control.tdl_access_verification_status("local", "storage")
-        self.assertEqual(status["verified_profiles"], ["archive"])
+        self.assertEqual(readiness.cell("local", "default", "storage")["status"], "not_ready")
+        self.assertEqual(readiness.cell("local", "default", "upload")["status"], "not_ready")
+        self.assertEqual(readiness.cell("local", "archive", "storage")["status"], "ready")
+        self.assertEqual(readiness.cell("local", "archive", "upload")["status"], "ready")
 
-    def test_storage_rejects_profiles_without_a_fingerprinted_upload_lane_before_job_creation(self):
+    def test_storage_upload_dispatches_without_fingerprinted_lane_or_access_proof(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "storage-unfingerprinted-workers.json",
             {"local": "http://worker-local"},
@@ -1699,17 +1783,19 @@ class ControlPlaneTests(unittest.TestCase):
         control.tdl_access_target_resolver = lambda _purpose: "-100123"
         control.runtime_settings_store = FakeJobSecretStore()
 
-        with self.assertRaises(DomainError) as error:
-            control.submit_job(
-                self.actor,
-                "storage_upload",
-                {"folder_path": "/workspace/source"},
-                worker="local",
-            )
+        job = control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/source"},
+            worker="local",
+        )
 
-        self.assertEqual(error.exception.code, "TDL_ACCESS_NOT_VERIFIED")
-        self.assertEqual(self.jobs.count(kind="storage_upload"), 0)
-        self.assertEqual(dispatcher.commands, [])
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(self.jobs.count(kind="storage_upload"), 1)
+        self.assertEqual(
+            dispatcher.commands[-1]["payload"]["_tdl_sender_profiles"],
+            ["default"],
+        )
 
     def test_quick_mode_other_profile_can_fill_worker_slot_behind_blocked_profile_queue(self):
         self.authorize_quick_mode_storage()
@@ -2360,7 +2446,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(payload["end_timestamp"], int(source.updated_at.timestamp()))
         self.assertNotIn("-100123", repr(reconciliation.payload))
         self.assertNotIn("matched.txt", repr(reconciliation.payload))
-        self.assertEqual(payload["_tdl_sender_session_fingerprints"]["default"], "a" * 64)
+        self.assertNotIn("_tdl_sender_session_fingerprints", payload)
 
         count = len(self.dispatcher.commands)
         duplicate = self.control.reconcile_storage_upload(self.actor, source.id)

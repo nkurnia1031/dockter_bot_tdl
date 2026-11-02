@@ -18,6 +18,23 @@ _PHASE_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
 _EXPORT_RUNTIME = "export"
 _QUICK_MODE_RUNTIME = "quick_mode"
 _RESOLVER_RUNTIME = "resolver"
+_INFORMATIONAL_LEGACY_REASONS = frozenset({
+    "PROFILE_FINGERPRINT_MISSING",
+    "PROFILE_SESSION_CHANGED",
+    "PROFILE_UPLOAD_SESSION_CHANGED",
+    "PROFILE_UPLOAD_SESSION_INVALID",
+    "PROFILE_EXPORT_IDENTITY_MISMATCH",
+    "PROFILE_UPLOAD_IDENTITY_MISMATCH",
+    "RESOLVER_FINGERPRINT_MISSING",
+    "RCLONE_FINGERPRINT_MISSING",
+    "RCLONE_DESTINATION_CHANGED",
+    "TTS_FINGERPRINT_MISSING",
+    "STORAGE_FINGERPRINT_MISSING",
+    "STORAGE_EVIDENCE_INCOMPLETE",
+    "QUICK_MODE_FINGERPRINT_MISSING",
+    "QUICK_MODE_EVIDENCE_INCOMPLETE",
+    "TDL_ACCESS_NOT_VERIFIED",
+})
 
 
 class RuntimeReadinessStore:
@@ -199,15 +216,13 @@ class RuntimeReadinessStore:
                     session_fingerprint = _safe_fingerprint(
                         raw.get("session_fingerprint")
                     )
-                    ready = raw.get("ready") is True and bool(fingerprint)
+                    ready = raw.get("ready") is True
                     reason = _reason(
                         raw.get("reason_code"),
                         "PROFILE_DOWNLOAD_LANE_UNAVAILABLE"
                         if lane == "download"
                         else "PROFILE_UPLOAD_LANE_UNAVAILABLE",
                     )
-                    if raw.get("ready") is True and not ready:
-                        reason = "PROFILE_LANE_EVIDENCE_INCOMPLETE"
                     cells[key] = {
                         "worker": worker,
                         "profile": key[1],
@@ -291,7 +306,7 @@ class RuntimeReadinessStore:
                     if key is None:
                         continue
                     fingerprint = _safe_fingerprint(raw.get("fingerprint"))
-                    ready = raw.get("ready") is True and bool(fingerprint)
+                    ready = raw.get("ready") is True
                     cells[key] = {
                         "worker": worker,
                         "profile": key[1],
@@ -360,15 +375,8 @@ class RuntimeReadinessStore:
                     destination_fingerprint = _safe_fingerprint(
                         raw.get("destination_fingerprint")
                     )
-                    ready = bool(
-                        raw.get("ready") is True
-                        and fingerprint
-                        and session_fingerprint
-                        and destination_fingerprint
-                    )
+                    ready = raw.get("ready") is True
                     reason = _reason(raw.get("reason_code"), "STORAGE_RUNTIME_UNAVAILABLE")
-                    if raw.get("ready") is True and not ready:
-                        reason = "STORAGE_EVIDENCE_INCOMPLETE"
                     cells[key] = {
                         "worker": worker,
                         "profile": key[1],
@@ -414,7 +422,7 @@ class RuntimeReadinessStore:
                 if key is None:
                     continue
                 fingerprint = _safe_fingerprint(raw.get("fingerprint"))
-                ready = raw.get("ready") is True and bool(fingerprint)
+                ready = raw.get("ready") is True
                 previous = cells.get(key)
                 cells[key] = {
                     "worker": key[0],
@@ -510,12 +518,7 @@ class RuntimeReadinessStore:
                         raw.get("sender_session_fingerprints")
                     )
                     sender_profiles = _safe_profile_list(raw.get("sender_profiles"))
-                    ready = (
-                        raw.get("ready") is True
-                        and bool(fingerprint)
-                        and bool(sender_profiles)
-                        and all(profile in sender_fingerprints for profile in sender_profiles)
-                    )
+                    ready = raw.get("ready") is True
                     session_fingerprint = _safe_fingerprint(raw.get("session_fingerprint"))
                     destination_fingerprint = _safe_fingerprint(
                         raw.get("destination_fingerprint")
@@ -523,12 +526,7 @@ class RuntimeReadinessStore:
                     rclone_fingerprint = _safe_fingerprint(
                         raw.get("rclone_destination_fingerprint")
                     )
-                    ready = ready and bool(
-                        session_fingerprint and destination_fingerprint and rclone_fingerprint
-                    )
                     reason = _reason(raw.get("reason_code"), "QUICK_MODE_RUNTIME_UNAVAILABLE")
-                    if raw.get("ready") is True and not ready:
-                        reason = "QUICK_MODE_EVIDENCE_INCOMPLETE"
                     cells[key] = {
                         "worker": worker,
                         "profile": key[1],
@@ -584,7 +582,8 @@ class RuntimeReadinessStore:
         normalized_destination_fingerprint = _safe_fingerprint(
             destination_fingerprint
         )
-        is_ready = bool(ready and _FINGERPRINT_RE.fullmatch(normalized_fingerprint))
+        normalized_fingerprint = _safe_fingerprint(normalized_fingerprint)
+        is_ready = bool(ready)
         cell = {
             "worker": key[0],
             "profile": key[1],
@@ -629,6 +628,84 @@ class RuntimeReadinessStore:
             self._save_locked(snapshot)
             return True
 
+    def record_command_result(
+        self,
+        *,
+        worker: str,
+        profile: str | None,
+        runtime: str,
+        succeeded: bool,
+        reason_code: str = "",
+        checked_at: str | None = None,
+    ) -> bool:
+        """Persist readiness observed from a real feature command.
+
+        A successful command is direct evidence even when the profile has no
+        scan fingerprint (for example after a worker deployment). The result
+        is informational and deliberately clears old fingerprints so they
+        cannot be mistaken for the evidence that produced this status.
+        """
+        key = _cell_key(worker, profile, runtime)
+        if key is None:
+            return False
+        when = str(checked_at or utc_now_iso())[:64]
+        normalized_reason = _reason(reason_code, "COMMAND_FAILED")
+        ready = bool(succeeded)
+        cell = {
+            "worker": key[0],
+            "profile": key[1],
+            "runtime": key[2],
+            "status": "ready" if ready else "not_ready",
+            "checked_at": when,
+            "reason_code": "" if ready else normalized_reason,
+            "fingerprint": "",
+            "session_fingerprint": "",
+            "destination_fingerprint": "",
+            "last_attempt": {
+                "target": {
+                    "worker": key[0],
+                    "profile": key[1],
+                    "runtime": key[2],
+                },
+                "checked_at": when,
+                "phase": "job_result",
+                "checks": [{
+                    "name": key[2],
+                    "status": "ready" if ready else "not_ready",
+                    "reason_code": "" if ready else normalized_reason,
+                }],
+                "status": "ready" if ready else "not_ready",
+                "reason_code": "" if ready else normalized_reason,
+                "dependencies": [],
+                "cleanup": {"status": "not_needed", "reason_code": ""},
+            },
+        }
+        with self._lock:
+            self._load_locked()
+            assert self._snapshot is not None
+            snapshot = copy.deepcopy(self._snapshot)
+            workers = {item["name"]: item for item in snapshot["workers"]}
+            cells = {
+                _cell_key(item["worker"], item["profile"], item["runtime"]): item
+                for item in snapshot["cells"]
+            }
+            if ready:
+                workers[key[0]] = {
+                    "name": key[0],
+                    "status": "success",
+                    "checked_at": when,
+                    "reason_code": "",
+                }
+            cells[key] = cell
+            snapshot["workers"] = sorted(workers.values(), key=lambda item: item["name"])
+            snapshot["cells"] = sorted(
+                cells.values(),
+                key=lambda item: (item["worker"], item["profile"] or "", item["runtime"]),
+            )
+            snapshot["checked_at"] = when
+            self._save_locked(snapshot)
+        return True
+
     def upsert_quick_mode_cell(
         self,
         *,
@@ -656,15 +733,7 @@ class RuntimeReadinessStore:
         normalized_rclone = _safe_fingerprint(rclone_destination_fingerprint)
         safe_senders = _safe_profile_list(sender_profiles)
         safe_sender_fingerprints = _safe_fingerprint_map(sender_session_fingerprints)
-        is_ready = bool(
-            ready
-            and normalized_fingerprint
-            and normalized_session
-            and normalized_destination
-            and normalized_rclone
-            and safe_senders
-            and all(name in safe_sender_fingerprints for name in safe_senders)
-        )
+        is_ready = bool(ready)
         cell = {
             "worker": key[0],
             "profile": key[1],
@@ -744,6 +813,38 @@ class RuntimeReadinessStore:
                 return True
             return False
 
+    def forget_profile(self, *, worker: str, profile: str) -> bool:
+        """Clear observations after profile data changes without reporting failure."""
+        normalized_worker = str(worker or "").strip().lower()
+        normalized_profile = normalize_profile_name(str(profile or ""))
+        if not _WORKER_RE.fullmatch(normalized_worker) or not normalized_profile:
+            return False
+        with self._lock:
+            self._load_locked()
+            assert self._snapshot is not None
+            snapshot = copy.deepcopy(self._snapshot)
+            retained = []
+            changed = False
+            for cell in snapshot["cells"]:
+                same_worker = cell.get("worker") == normalized_worker
+                same_profile = cell.get("profile") == normalized_profile
+                depends_on_sender = (
+                    cell.get("runtime") == _QUICK_MODE_RUNTIME
+                    and normalized_profile in _safe_profile_list(
+                        cell.get("sender_profiles")
+                    )
+                )
+                if same_worker and (same_profile or depends_on_sender):
+                    changed = True
+                    continue
+                retained.append(cell)
+            if not changed:
+                return False
+            snapshot["cells"] = retained
+            snapshot["checked_at"] = utc_now_iso()
+            self._save_locked(snapshot)
+            return True
+
     def invalidate_quick_mode_sender(
         self,
         *,
@@ -795,10 +896,9 @@ class RuntimeReadinessStore:
         if not profile:
             return None
         fingerprint = str(raw.get("fingerprint") or "").strip().lower()
-        ready = raw.get("ready") is True and bool(_FINGERPRINT_RE.fullmatch(fingerprint))
+        ready = raw.get("ready") is True
         reason_code = "" if ready else _reason(raw.get("reason_code"), "PROFILE_SESSION_UNAVAILABLE")
-        if raw.get("ready") is True and not fingerprint:
-            reason_code = "PROFILE_FINGERPRINT_MISSING"
+        fingerprint = _safe_fingerprint(fingerprint)
         cell = {
             "worker": worker,
             "profile": profile,
@@ -889,16 +989,20 @@ def _normalize_snapshot(
         if key is None or status not in {"ready", "not_ready"}:
             continue
         ready = status == "ready"
-        fingerprint = str(raw.get("fingerprint") or "").strip().lower()
-        if ready and not _FINGERPRINT_RE.fullmatch(fingerprint):
+        reason_code = _reason(raw.get("reason_code"), "RUNTIME_NOT_READY")
+        if not ready and reason_code in _INFORMATIONAL_LEGACY_REASONS:
+            # These historical outcomes came from preflight/fingerprint checks,
+            # not a failed feature command. Drop them so callers see unscanned.
             continue
+        fingerprint = str(raw.get("fingerprint") or "").strip().lower()
+        fingerprint = _safe_fingerprint(fingerprint)
         safe_cell = {
             "worker": key[0],
             "profile": key[1],
             "runtime": key[2],
             "status": status,
             "checked_at": str(raw.get("checked_at") or "")[:64],
-            "reason_code": "" if ready else _reason(raw.get("reason_code"), "RUNTIME_NOT_READY"),
+            "reason_code": "" if ready else reason_code,
             "fingerprint": fingerprint if ready else "",
             "session_fingerprint": _safe_fingerprint(raw.get("session_fingerprint")) if ready else "",
             "destination_fingerprint": _safe_fingerprint(raw.get("destination_fingerprint")) if ready else "",
@@ -957,6 +1061,11 @@ def _reason(value: Any, fallback: str) -> str:
     return code if _REASON_RE.fullmatch(code) else fallback
 
 
+def _informational_readiness_reason(value: Any, fallback: str) -> str:
+    code = _reason(value, fallback)
+    return "RUNTIME_NOT_SCANNED" if code in _INFORMATIONAL_LEGACY_REASONS else code
+
+
 def _safe_fingerprint(value: Any) -> str:
     text = str(value or "").strip().lower()
     return text if _FINGERPRINT_RE.fullmatch(text) else ""
@@ -986,7 +1095,7 @@ def _safe_last_attempt(
         status = str(raw.get("status") or "")
         if not _RUNTIME_RE.fullmatch(name) or status not in {"ready", "not_ready", "failed"}:
             continue
-        code = str(raw.get("reason_code") or "")
+        code = _informational_readiness_reason(raw.get("reason_code"), "")
         checks.append({
             "name": name,
             "status": status,
@@ -1004,7 +1113,9 @@ def _safe_last_attempt(
     if cleanup_status not in {"not_needed", "succeeded", "failed"}:
         cleanup_status = "failed"
     cleanup_code = str(cleanup.get("reason_code") or "")
-    result_code = str(value.get("reason_code") or reason_code or "")
+    result_code = _informational_readiness_reason(
+        value.get("reason_code") or reason_code, ""
+    )
     return {
         "target": {"worker": worker, "profile": profile, "runtime": runtime},
         "checked_at": str(value.get("checked_at") or checked_at)[:64],

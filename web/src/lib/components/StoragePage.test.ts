@@ -152,7 +152,7 @@ describe('Storage file manager', () => {
     await session.restore();
     render(StoragePage);
 
-    expect(await screen.findByText('Storage siap')).toBeTruthy();
+    expect(await screen.findByText(/Storage siap/)).toBeTruthy();
     expect(screen.queryByRole('button', { name: /verifikasi akses tdl/i })).toBeNull();
     expect(requests.some(({ url, method }) => url.endsWith('/tdl-access/verification') && method === 'POST')).toBe(false);
     expect(requests.some(({ url, method }) => url.endsWith('/context/verify') && method === 'POST')).toBe(false);
@@ -172,10 +172,12 @@ describe('Storage file manager', () => {
     expect(requests.some(({ url, method }) => url.endsWith('/tdl-access/verification') && method === 'POST')).toBe(false);
   }, 15000);
 
-  it('keeps Storage upload gated when the saved readiness snapshot has no ready profile', async () => {
+  it('submits Storage upload when the saved readiness snapshot is not ready', async () => {
     enableDialogMethods();
-    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+    const requests: { url: string; method: string }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = new URL(String(input), 'https://ui.test');
+      requests.push({ url: url.pathname, method: (init?.method || 'GET').toUpperCase() });
       if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
         authenticated: true, profiles: ['default'], actor: { telegram_user_id: 1, profile: 'default', worker_route: 'local' },
       }), { status: 200 });
@@ -198,13 +200,17 @@ describe('Storage file manager', () => {
     await session.restore();
     render(StoragePage);
 
-    expect(await screen.findByText('Storage belum siap')).toBeTruthy();
+    expect(await screen.findByText('Scan: tidak siap')).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Upload' }));
     expect(await screen.findByRole('heading', { name: 'Upload folder workspace' })).toBeTruthy();
-    expect((screen.getByRole('button', { name: 'Mulai upload' }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(screen.getByRole('button', { name: 'Pilih' }));
+    const submit = screen.getByRole('button', { name: 'Mulai upload' }) as HTMLButtonElement;
+    expect(submit.disabled).toBe(false);
+    await fireEvent.click(submit);
+    await waitFor(() => expect(requests.some(({ url, method }) => url.endsWith('/storage/uploads') && method === 'POST')).toBe(true));
   }, 15000);
 
-  it('submits a Telegram download only for a saved Download-ready profile and selected Workspace target', async () => {
+  it('submits a Telegram download when the saved Download scan is not ready', async () => {
     enableDialogMethods();
     const requests: {url:string;method:string;body?:string}[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
@@ -222,7 +228,7 @@ describe('Storage file manager', () => {
           {name:'local',status:'success',checked_at:'2026-11-01T00:00:00Z',reason_code:''},
         ],cells:[
           {worker:'local',profile:null,runtime:'storage',status:'ready',checked_at:'now',reason_code:''},
-          {worker:'local',profile:'default',runtime:'download',status:'ready',checked_at:'now',reason_code:''},
+          {worker:'local',profile:'default',runtime:'download',status:'not_ready',checked_at:'now',reason_code:'PROFILE_CANARY_DOWNLOAD_FAILED'},
         ]},
       }),{status:200});
       if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({
@@ -247,8 +253,11 @@ describe('Storage file manager', () => {
     await fireEvent.click(screen.getByRole('button',{name:'Pilih semua'}));
     await fireEvent.click(screen.getByRole('button',{name:/Download/}));
     expect(await screen.findByRole('heading',{name:'Download ke worker'})).toBeTruthy();
-    expect(screen.getByLabelText('Profil dengan lane Download siap')).toBeTruthy();
+    expect(screen.getByLabelText('Profil yang akan dicoba oleh TDL')).toBeTruthy();
+    expect((screen.getByRole('button',{name:'Mulai download'}) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/Scan terakhir: belum siap \(PROFILE_CANARY_DOWNLOAD_FAILED\)/)).toBeTruthy();
     await fireEvent.click(await screen.findByRole('radio',{name:'Pilih downloads'}));
+    expect((screen.getByRole('button',{name:'Mulai download'}) as HTMLButtonElement).disabled).toBe(false);
     await fireEvent.click(screen.getByRole('checkbox',{name:/Buat link publik tanpa kedaluwarsa/}));
     await fireEvent.click(screen.getByRole('button',{name:'Mulai download'}));
 
@@ -377,7 +386,7 @@ describe('Storage file manager', () => {
     const workerPicker = await screen.findByLabelText('Worker target') as HTMLSelectElement;
     await fireEvent.change(workerPicker, {target:{value:'remote-1'}});
     expect(await screen.findByText('retained.zip')).toBeTruthy();
-    expect(await screen.findByText('Worker nonaktif')).toBeTruthy();
+    expect(await screen.findByText(/Worker nonaktif untuk job baru/)).toBeTruthy();
     expect(requests.some((request)=>request.url==='/api/v1/storage/download-links?worker=remote-1')).toBe(true);
     await fireEvent.click(screen.getByRole('tab',{name:'Rclone'}));
     expect((await screen.findByRole('button',{name:'Upload ke folder ini'}) as HTMLButtonElement).disabled).toBe(true);

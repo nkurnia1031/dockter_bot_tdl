@@ -1,21 +1,21 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import TargetPicker from './TargetPicker.svelte';
 import { session } from '$lib/session.svelte';
 
-describe('TargetPicker verified profile targets', () => {
+describe('TargetPicker profile targets', () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
   });
 
-  it('shows catalog options and pins an exclusive profile to its owner', async () => {
+  it('shows authorized profiles without using catalog worker ownership as a gate', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
         authenticated: true,
         actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
-        profiles: ['default', 'archive']
+        profiles: ['default', 'archive', 'remote-only']
       }), { status: 200 });
       if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
         { name: 'local', url: 'http://worker-local' },
@@ -39,12 +39,12 @@ describe('TargetPicker verified profile targets', () => {
     await session.restore();
     render(TargetPicker);
 
-    const profilePicker = await screen.findByLabelText('Profile target');
-    expect(profilePicker.innerHTML).toContain('remote-only (remote-1)');
+    const profilePicker = await screen.findByLabelText('Profile target') as HTMLSelectElement;
+    expect([...profilePicker.options].map((option) => option.value)).toContain('remote-only');
     await fireEvent.change(profilePicker, { target: { value: 'remote-only' } });
     const workerPicker = screen.getByLabelText('Worker target') as HTMLSelectElement;
-    await waitFor(() => expect(workerPicker.value).toBe('remote-1'));
-    expect([...workerPicker.options].map((option) => option.value)).toEqual(['', 'remote-1']);
+    expect([...workerPicker.options].map((option) => option.value)).toEqual(['', 'local', 'remote-1']);
+    await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
 
     await fireEvent.click(screen.getByRole('button', { name: 'Verifikasi target' }));
     expect(await screen.findByText(/remote-only · remote-1/)).toBeTruthy();
@@ -79,6 +79,6 @@ describe('TargetPicker verified profile targets', () => {
     expect(disabledWorker?.disabled).toBe(false);
     await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
     expect(workerPicker.value).toBe('remote-1');
-    expect(await screen.findByText('Worker nonaktif')).toBeTruthy();
+    expect(await screen.findByText(/Worker nonaktif untuk job baru/)).toBeTruthy();
   });
 });

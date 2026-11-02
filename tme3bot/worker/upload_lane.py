@@ -193,21 +193,15 @@ class UploadLanePreparer:
             held_locks = self._acquire_profile_locks(profile)
             self._recover_interrupted_install(profile_root, upload_home)
 
-            expected_id, identity_code = self._read_profile_identity(profile_root)
-            if expected_id is None:
-                raise _PreparationFailure(identity_code)
-
             self._set_progress(profile, "validating_source", 15)
-            source_id = self._check_session(source_storage, namespace, source_home, "PROFILE_EXPORT_SESSION_INVALID")
-            if source_id != expected_id:
-                raise _PreparationFailure("PROFILE_EXPORT_IDENTITY_MISMATCH")
+            self._check_session(source_storage, namespace, source_home, "PROFILE_EXPORT_SESSION_INVALID")
             fingerprint = self._fingerprint(source_storage, namespace)
 
             if upload_home.is_symlink() or (upload_home.exists() and not upload_home.is_dir()):
                 raise _PreparationFailure("PROFILE_UPLOAD_LANE_UNSAFE")
             marker = self._read_marker(upload_home)
-            if marker == fingerprint and self._has_private_modes(upload_home) and self._lane_matches_identity(
-                upload_storage, namespace, upload_home, expected_id
+            if marker == fingerprint and self._has_private_modes(upload_home) and self._lane_session_valid(
+                upload_storage, namespace, upload_home
             ):
                 self._finish(profile, "ready", "ready", 100, "OK")
                 return
@@ -220,14 +214,12 @@ class UploadLanePreparer:
             self._set_private_tree(candidate_home)
 
             self._set_progress(profile, "validating_upload", 70)
-            candidate_id = self._check_session(
+            self._check_session(
                 candidate_storage,
                 namespace,
                 candidate_home,
                 "PROFILE_UPLOAD_SESSION_INVALID",
             )
-            if candidate_id != expected_id:
-                raise _PreparationFailure("PROFILE_UPLOAD_IDENTITY_MISMATCH")
             write_json_atomic_private(candidate_home / _MARKER_NAME, {
                 "format": _FORMAT_VERSION,
                 "source_fingerprint": fingerprint,
@@ -306,14 +298,13 @@ class UploadLanePreparer:
                 raise _PreparationFailure(safe_code) from None
             raise _PreparationFailure(code) from None
 
-    def _lane_matches_identity(
-        self, storage: Path, namespace: str, home: Path, expected_id: int
-    ) -> bool:
+    def _lane_session_valid(self, storage: Path, namespace: str, home: Path) -> bool:
         try:
             self._fingerprint(storage, namespace)
-            return self._check_session(
+            self._check_session(
                 storage, namespace, home, "PROFILE_UPLOAD_SESSION_INVALID"
-            ) == expected_id
+            )
+            return True
         except _PreparationFailure:
             return False
 

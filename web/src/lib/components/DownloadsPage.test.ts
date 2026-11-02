@@ -83,9 +83,12 @@ describe('DownloadsPage profile filter', () => {
     await waitFor(() => expect(requests.some((request) => request.includes('profile=remote-only'))).toBe(true));
   });
 
-  it('blocks artifacts until the saved Profile scan marks their download lane ready', async () => {
-    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+  it('keeps artifact actions available when the saved Profile scan is not ready', async () => {
+    const requests: { url: string; method: string }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method });
       if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
         authenticated: true,
         actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
@@ -106,6 +109,7 @@ describe('DownloadsPage profile filter', () => {
         { id: 'artifact-1', filename: 'backup.json', profile: 'default', worker: 'local', status: 'pending', available: true }
       ], total: 1 }), { status: 200 });
       if (url.includes('/downloads/artifacts?')) return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      if (url.endsWith('/downloads/batch') && method === 'POST') return new Response(JSON.stringify({ groups: [] }), { status: 200 });
       if (url.includes('/jobs')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
@@ -113,8 +117,10 @@ describe('DownloadsPage profile filter', () => {
     await session.restore();
     render(DownloadsPage);
 
-    expect(await screen.findByText('Download belum siap · Scan Profil')).toBeTruthy();
-    expect((screen.getByRole('button', { name: 'Mulai' }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(true);
+    expect(await screen.findByText('Scan terakhir: belum siap')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Mulai' }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole('checkbox') as HTMLInputElement).disabled).toBe(false);
+    await fireEvent.click(screen.getByRole('button', { name: 'Mulai' }));
+    await waitFor(() => expect(requests.some(({ url, method }) => url.endsWith('/downloads/batch') && method === 'POST')).toBe(true));
   });
 });

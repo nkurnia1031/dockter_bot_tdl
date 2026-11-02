@@ -573,7 +573,7 @@ describe('ProfilesPage', () => {
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
     expect(hierarchy.textContent).toMatch(/Profil default[\s\S]*Export Siap/);
     expect(hierarchy.textContent).toMatch(/Quick Mode Tidak siap/);
-    expect(hierarchy.textContent).toContain('Bukti akses kirim tidak ada atau sudah stale');
+    expect(hierarchy.textContent).toContain('Belum ada hasil command aktual untuk akses ini. Job tetap dapat dijalankan.');
   });
 
   it('shows Storage readiness per profile and worker from the saved scan', async () => {
@@ -611,7 +611,7 @@ describe('ProfilesPage', () => {
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
     expect(hierarchy.textContent).toMatch(/Profil default[\s\S]*Storage Siap/);
     expect(hierarchy.textContent).toMatch(/Profil archive[\s\S]*Storage Tidak siap/);
-    expect(hierarchy.textContent).toContain('Bukti akses kirim tidak ada atau sudah stale');
+    expect(hierarchy.textContent).toContain('Belum ada hasil command aktual untuk akses ini. Job tetap dapat dijalankan.');
   });
 
   it('starts a new profile login from the profile menu and displays the QR prompt', async () => {
@@ -766,7 +766,7 @@ describe('ProfilesPage', () => {
     expect(statuses).toMatch(/remote-2.*Berhasil/);
     const hierarchy = screen.getByRole('region', { name: 'Kesiapan per worker dan profil' });
     expect(hierarchy.textContent).toMatch(/Worker local Gagal.*Worker offline/);
-    expect(hierarchy.textContent).toMatch(/Worker remote-2[\s\S]*Profil irang[\s\S]*TTS Tidak siap.*Bukti akses kirim tidak ada atau sudah stale/);
+    expect(hierarchy.textContent).toMatch(/Worker remote-2[\s\S]*Profil irang[\s\S]*TTS Tidak siap.*Belum ada hasil command aktual untuk akses ini\. Job tetap dapat dijalankan\./);
     expect(screen.queryByRole('region', { name: 'Kesiapan Utility per worker' })).toBeNull();
     expect(hierarchy.getAttribute('aria-label')).toBe('Kesiapan per worker dan profil');
     expect(requests).toContainEqual({ url: '/api/v1/profiles/local/scan', method: 'POST' });

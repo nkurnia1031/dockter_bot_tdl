@@ -31,11 +31,9 @@
   const quickModeReadiness = $derived(
     runtimeReadinessFor(session.runtimeReadiness, targetProfile, targetWorker, 'quick_mode')
   );
-  const quickModeRuntimeReady = $derived(quickModeReadiness.status === 'ready');
   const quickModeRcloneReadiness = $derived(
     runtimeReadinessFor(session.runtimeReadiness, null, targetWorker, 'rclone_storage')
   );
-  const quickModeRcloneReady = $derived(quickModeRcloneReadiness.status === 'ready');
   let quickRclonePath = $state('');
   let quickRcloneCreate = $state(false);
   let quickRcloneBrowserPath = $state('');
@@ -349,8 +347,8 @@
   }
 
   async function loadQuickRcloneFolder(path:string) {
-    if (!targetWorker || !quickModeRcloneReady) {
-      quickRcloneError = 'Akses rclone belum siap pada worker ini. Jalankan scan Profil.';
+    if (!targetWorker) {
+      quickRcloneError = 'Pilih worker untuk membaca folder rclone.';
       return;
     }
     const request=++quickRcloneGeneration;
@@ -405,10 +403,6 @@
 
   async function submit() {
     if (submitting || cooldown) return;
-    if (!quickModeRuntimeReady) {
-      message = 'Runtime Quick Mode belum siap. Jalankan Scan semua worker di halaman Profil.';
-      return;
-    }
     const normalizedChatRef = url.trim() ? null : normalizeTdlChatRef(chatRef);
     if (!url.trim() && !normalizedChatRef) {
       message = 'Masukkan @username, username, ID numeric, link t.me publik, nomor telepon internasional, atau URL export.';
@@ -508,9 +502,9 @@
   <section class="mt-4 rounded-2xl border border-[var(--line)] p-4" aria-label="Tujuan rclone Quick Mode">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div><b class="text-sm">Folder tujuan rclone</b><p class="muted mt-1 text-xs">{quickRcloneCreate?'Subfolder baru: ':quickRclonePath?'Folder terpilih: ':'Root terkonfigurasi: '}{quickRclonePath||'root rclone_destination'}</p></div>
-      <button type="button" class="button secondary" onclick={toggleQuickRclonePicker} disabled={!targetWorker||!quickModeRcloneReady}><FolderOpen size={15}/>{quickRclonePickerOpen?'Tutup pemilih':'Pilih folder'}</button>
+      <button type="button" class="button secondary" onclick={toggleQuickRclonePicker} disabled={!targetWorker}><FolderOpen size={15}/>{quickRclonePickerOpen?'Tutup pemilih':'Pilih folder'}</button>
     </div>
-    {#if !quickModeRcloneReady}<p class="muted mt-2 text-xs">{quickModeRcloneReadiness.reason_code||'Scan akses rclone pada worker ini belum siap.'}</p>{/if}
+    {#if quickModeRcloneReadiness.status !== 'ready'}<p class="muted mt-2 text-xs">Status scan rclone terakhir: {quickModeRcloneReadiness.reason_code || quickModeRcloneReadiness.status}. Browser akan menguji akses worker saat dimuat.</p>{/if}
     {#if quickRclonePickerOpen}
       <div class="mt-4 rounded-xl border border-[var(--line)] p-3">
         <div class="flex flex-wrap items-center gap-1 text-sm"><button type="button" class="button ghost" onclick={()=>loadQuickRcloneFolder('')}>Root</button>{#each quickRcloneBrowserPath.split('/').filter(Boolean) as crumb,index}<ChevronRight size={14}/><button type="button" class="rounded px-2 py-1 font-semibold hover:bg-[var(--brand-soft)]" onclick={()=>loadQuickRcloneFolder(quickRcloneBrowserPath.split('/').filter(Boolean).slice(0,index+1).join('/'))}>{crumb}</button>{/each}</div>
@@ -534,7 +528,7 @@
   <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-[var(--line)] bg-[var(--surface-soft)] p-4"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" bind:checked={overwriteStartId}/><span><span class="block text-sm font-extrabold">Overwrite Start ID</span><span class="muted mt-1 block text-xs">Gunakan Start ID manual untuk job ini.</span></span></label>
   {#if isNumeric(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource}/><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Simpan Last ID numeric source untuk penggunaan berikutnya.</span></span></label>{/if}
   {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => { label = item.label; clearMessage(); }}>{item.label}</button>{/each}</div>{/if}
-  <div class="mt-5 flex flex-wrap justify-end gap-3"><button class="button secondary" onclick={resetForm} disabled={submitting}>Reset form</button><button class="button" onclick={submit} disabled={submitting || cooldown || !quickModeRuntimeReady}>{submitting ? 'Mengirim...' : cooldown ? 'Tunggu sebentar...' : 'Tambah Quick Mode'}<FileDown size={16}/></button></div>
+  <div class="mt-5 flex flex-wrap justify-end gap-3"><button class="button secondary" onclick={resetForm} disabled={submitting}>Reset form</button><button class="button" onclick={submit} disabled={submitting || cooldown}>{submitting ? 'Mengirim...' : cooldown ? 'Tunggu sebentar...' : 'Tambah Quick Mode'}<FileDown size={16}/></button></div>
   {#if message}<p class={`mt-3 rounded-xl px-3 py-2 text-sm ${message.includes('berhasil') ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200' : 'bg-rose-50 text-rose-700 dark:bg-rose-950 dark:text-rose-200'}`}>{message}</p>{/if}
 </section>
 

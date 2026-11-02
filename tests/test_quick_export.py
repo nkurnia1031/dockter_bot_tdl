@@ -1085,7 +1085,11 @@ class QuickPipelineTests(WorkerExecutorTestCase):
             export_tdl_client=Client("export", error=True),
             download_tdl_client=Client("download", result=True),
         )
-        storage_runtime = SimpleNamespace(export_tdl_client=Client("storage", error=True))
+        storage_runtime = SimpleNamespace(
+            export_tdl_client=Client("storage", error=True),
+            upload_tdl_client=Client("storage", error=True),
+            upload_operation_lock=threading.RLock(),
+        )
         config = SimpleNamespace(worker_storage_profile="storage", backup_node_name="local")
         executor = self.make_executor(config, Profiles(), SimpleNamespace())
         executor._active["quick-cancel"] = ("default", "export")
@@ -1184,8 +1188,10 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                 download_service=download_service,
                 download_tdl_client=download_client,
                 export_tdl_client=export_client,
+                upload_tdl_client=upload_client,
                 export_operation_lock=threading.RLock(),
                 download_operation_lock=threading.RLock(),
+                upload_operation_lock=threading.RLock(),
             )
             storage_runtime = SimpleNamespace(
                 config=runtime_config,

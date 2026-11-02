@@ -81,6 +81,7 @@ LOGGER = logging.getLogger(__name__)
 from .executor_support import (
     BAR_ONLY_PROGRESS_KEY,
     CommandMilestoneRecorder,
+    ScopedCommandMilestoneRecorder,
     JAKARTA_TZ,
     JobLogSnapshot,
     RUNTIME_STATS_KEY,
@@ -1503,7 +1504,11 @@ class WorkerJobExecutor(
         except Exception:
             tts_ready = False
         resolver_supported = callable(getattr(self, "_safelink_resolve", None))
+        profile_manager = getattr(self, "profile_manager", None)
+        list_local_profiles = getattr(profile_manager, "list_profiles", None)
+        local_profiles = list_local_profiles() if callable(list_local_profiles) else []
         return {
+            "local_profiles": sorted({str(item).strip().lower() for item in local_profiles if str(item).strip()}),
             "profiles": profiles,
             "export_profiles": export_profiles,
             "download_profiles": download_profiles,
@@ -1936,42 +1941,15 @@ class WorkerJobExecutor(
 
     def _require_local_job_session(self, command: dict[str, Any]) -> None:
         kind = str(command.get("kind") or "")
+        if kind in {
+            "export", "leave", "download", "download_clear_failed", "tts",
+            "storage_upload", "storage_download", "storage_sync", "storage_reconcile",
+        }:
+            return
         purpose = {
-            "export": "export",
-            "leave": "export",
-            "download": "download",
-            "storage_download": "download",
-            "download_clear_failed": "download",
-            "tts": "export",
             "backup_verify": "export",
         }.get(kind)
         profile = str(command.get("profile") or "")
-        if kind == "storage_upload":
-            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-            if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
-                return
-            if profile in self.available_storage_profiles():
-                return
-            raise RuntimeError(
-                f"STORAGE_PROFILE_UNAVAILABLE: lane Upload profil {profile or '(kosong)'} "
-                "belum siap pada worker ini. Jalankan scan profil lalu coba lagi."
-            )
-        if kind == "storage_sync":
-            payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
-            fingerprints = normalize_session_fingerprints(
-                self.available_storage_session_fingerprints([profile])
-            )
-            expected = str(payload.get("_tdl_sender_session_fingerprint") or "").strip().lower()
-            if (
-                profile in self.available_storage_profiles()
-                and expected
-                and fingerprints.get(profile) == expected
-            ):
-                return
-            raise RuntimeError(
-                f"STORAGE_PROFILE_UNAVAILABLE: lane Upload profil {profile or '(kosong)'} "
-                "berubah atau belum siap pada worker ini. Jalankan scan profil lalu coba lagi."
-            )
         if purpose is None:
             return
         checker = getattr(self.profile_manager, "tdl_session_available", None)
@@ -2502,8 +2480,14 @@ class WorkerJobExecutor(
             self._set_job_process_paused(job_id, True)
             time.sleep(0.25)
 
-    def _command_callback(self):
-        return getattr(self._job_log, "audit", None)
+    def _command_callback(self, *, profile: str | None = None, runtime: str | None = None):
+        recorder = getattr(getattr(self, "_job_log", None), "audit", None)
+        context = {}
+        if profile:
+            context["profile"] = str(profile).strip().lower()
+        if runtime:
+            context["runtime"] = str(runtime).strip().lower()
+        return ScopedCommandMilestoneRecorder(recorder, **context) if recorder and context else recorder
 
     def _publish_log_snapshot(self, job_id: str, snapshot: JobLogSnapshot) -> None:
         self.publisher.emit(
@@ -2520,7 +2504,8 @@ class WorkerJobExecutor(
 
     @contextmanager
     def _capture_tdl_output(self, client, *, log_callback=None, command_callback=None):
-        previous = client.output_callback
+        had_output_callback = hasattr(client, "output_callback")
+        previous = getattr(client, "output_callback", None)
         previous_command = getattr(client, "command_callback", None)
 
         def capture(line: str) -> None:
@@ -2535,7 +2520,13 @@ class WorkerJobExecutor(
         try:
             yield
         finally:
-            client.output_callback = previous
+            if had_output_callback:
+                client.output_callback = previous
+            else:
+                try:
+                    delattr(client, "output_callback")
+                except AttributeError:
+                    pass
             if hasattr(client, "command_callback"):
                 client.command_callback = previous_command
 
@@ -2756,6 +2747,7 @@ class WorkerJobExecutor(
 
     def _export(self, command: dict[str, Any]) -> Any:
         runtime = self.profile_manager.runtime(str(command["profile"]))
+        execution_profile = str(command.get("profile") or getattr(runtime, "name", "")).strip().lower()
         payload = command["payload"]
         reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         quick_mode = bool(payload.get("quick_mode"))
@@ -2988,7 +2980,12 @@ class WorkerJobExecutor(
                             }
                         )
                     try:
-                        with self._capture_tdl_output(export_client):
+                        with self._capture_tdl_output(
+                            export_client,
+                            command_callback=self._command_callback(
+                                profile=execution_profile, runtime="export"
+                            ),
+                        ):
                             with self._capture_tdl_progress(
                                 export_client, export_progress
                             ):

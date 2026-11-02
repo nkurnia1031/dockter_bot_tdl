@@ -38,20 +38,27 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         settings = context.utility_settings.get()
         destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
         gate = getattr(context.control_plane, "runtime_readiness_gate", None)
-        if gate is None:
-            raise DomainError("RUNTIME_NOT_READY", "Snapshot readiness rclone belum tersedia. Jalankan Scan Profil.", status_code=409)
-        gate.require_rclone_storage(selected_worker, destination)
         browser = getattr(context.worker_dispatcher, "rclone_storage_browse", None)
         if not callable(browser):
             raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung browser rclone Storage.", status_code=503)
         try:
-            return browser(
+            result = browser(
                 selected_worker, destination, path=normalized_path, q=q, sort=sort,
                 order=order, limit=limit, offset=offset,
             )
+            if gate is not None:
+                gate.record_command_result(
+                    worker=selected_worker, profile=None, runtime="rclone_storage", succeeded=True
+                )
+            return result
         except Exception as exc:
             code = str(getattr(exc, "code", "") or "")
             if code == "RCLONE_ACCESS_FAILED":
+                if gate is not None:
+                    gate.record_command_result(
+                        worker=selected_worker, profile=None, runtime="rclone_storage",
+                        succeeded=False, reason_code=code,
+                    )
                 raise DomainError("RCLONE_ACCESS_FAILED", "Worker tidak dapat membaca remote rclone.", status_code=503) from exc
             raise DomainError("RCLONE_BROWSER_FAILED", "Worker tidak dapat memuat folder rclone.", status_code=503) from exc
 
@@ -73,17 +80,24 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         settings = context.utility_settings.get()
         destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
         gate = getattr(context.control_plane, "runtime_readiness_gate", None)
-        if gate is None:
-            raise DomainError("RUNTIME_NOT_READY", "Snapshot readiness rclone belum tersedia. Jalankan Scan Profil.", status_code=409)
-        gate.require_rclone_storage(selected_worker, destination)
         summarize = getattr(context.worker_dispatcher, "rclone_storage_folder_summaries", None)
         if not callable(summarize):
             raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung ringkasan folder rclone.", status_code=503)
         try:
-            return summarize(selected_worker, destination, path=normalized_path)
+            result = summarize(selected_worker, destination, path=normalized_path)
+            if gate is not None:
+                gate.record_command_result(
+                    worker=selected_worker, profile=None, runtime="rclone_storage", succeeded=True
+                )
+            return result
         except Exception as exc:
             code = str(getattr(exc, "code", "") or "")
             if code == "RCLONE_ACCESS_FAILED":
+                if gate is not None:
+                    gate.record_command_result(
+                        worker=selected_worker, profile=None, runtime="rclone_storage",
+                        succeeded=False, reason_code=code,
+                    )
                 raise DomainError("RCLONE_ACCESS_FAILED", "Worker tidak dapat membaca remote rclone.", status_code=503) from exc
             raise DomainError("RCLONE_FOLDER_SUMMARY_FAILED", "Worker tidak dapat menghitung isi folder rclone.", status_code=503) from exc
 

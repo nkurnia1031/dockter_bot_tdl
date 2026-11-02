@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import { api, post, remove } from '$lib/api';
   import { session } from '$lib/session.svelte';
-  import { runtimeReadinessFor } from '$lib/profile-catalog';
   import { normalizeTdlChatRef } from '$lib/chatRef';
   import type { LabelItem } from '$lib/presentation';
   import JobTable from './JobTable.svelte';
@@ -38,10 +37,6 @@
   const EXPORT_COOLDOWN_MS=500;
   const activeStatuses=['queued','dispatched','running'];
   const activeNotice=$derived(notices.some(item => activeStatuses.includes(item.job.status)));
-  const exportReadiness=$derived(runtimeReadinessFor(session.runtimeReadiness, targetProfile, targetWorker));
-  const exportRuntimeReady=$derived(exportReadiness.status === 'ready');
-  const quickModeReadiness=$derived(runtimeReadinessFor(session.runtimeReadiness, targetProfile, targetWorker, 'quick_mode'));
-  const quickModeRuntimeReady=$derived(quickModeReadiness.status === 'ready');
 
   function clearExportCooldown() {
     if (exportCooldownTimer !== undefined) clearTimeout(exportCooldownTimer);
@@ -197,14 +192,6 @@
         message='Masukkan @username, username, ID numeric, link t.me publik, atau nomor telepon internasional.';
         return;
       }
-      if (quickMode && !quickModeRuntimeReady) {
-        message='Runtime Quick Mode belum siap. Jalankan Scan semua worker di halaman Profil.';
-        return;
-      }
-      if (!quickMode && !exportRuntimeReady) {
-        message='Runtime Export belum siap. Jalankan Scan semua worker di halaman Profil.';
-        return;
-      }
       const manualStartId=Number(startId);
       if (overwriteStartId && (!Number.isInteger(manualStartId) || manualStartId < 1)) {
         message='Start ID manual harus berupa angka minimal 1.';
@@ -302,7 +289,7 @@
     <label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-violet-200 bg-violet-50 p-4 text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100"><input class="mt-1 size-4 accent-violet-600" type="checkbox" role="switch" checked={quickMode} onchange={(event) => updateQuickMode((event.currentTarget as HTMLInputElement).checked)} /><span><span class="block text-sm font-extrabold">Quick Mode Export</span><span class="muted mt-1 block text-xs">Download, thumbnail, compress, dan upload otomatis ke ModeCepat/tahun.</span></span></label>
     {#if isNumericChatRef(chatRef)}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-amber-950 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-100"><input class="mt-1 size-4 accent-amber-600" type="checkbox" role="switch" bind:checked={saveNumericSource} /><span><span class="block text-sm font-extrabold">Simpan source numeric</span><span class="muted mt-1 block text-xs">Default mati agar ID sekali pakai tidak memenuhi daftar source. Aktifkan jika Last ID ingin disimpan.</span></span></label>{/if}
     {#if labels.length}<div class="mt-3 flex flex-wrap gap-2">{#each labels as item}<button class="rounded-full border border-violet-200 bg-violet-50 px-2.5 py-1 text-xs font-bold text-violet-700 transition hover:-translate-y-0.5 dark:border-violet-900 dark:bg-violet-950 dark:text-violet-200" onclick={() => label = item.label}>{item.label}</button>{/each}</div>{/if}
-    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={(quickMode ? !quickModeRuntimeReady : !exportRuntimeReady) || submitting || exportCooldown}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportCooldown ? 'Tunggu sebentar...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
+    <div class="mt-6 grid gap-3 sm:grid-cols-[1fr_auto]"><button class="button w-full" onclick={submit} disabled={submitting || exportCooldown}><FileDown size={16}/>{submitting ? 'Mengirim...' : exportCooldown ? 'Tunggu sebentar...' : 'Mulai export'}</button><button class="button secondary w-full sm:w-auto" onclick={resetForm} disabled={submitting}>Reset form</button></div>{#if message}<p class="mt-3 rounded-xl bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{message}</p>{/if}
   </section>
 
   <section class="card overflow-hidden"><div class="flex items-center justify-between border-b border-[var(--line)] px-5 py-4 sm:px-6"><div class="flex items-center gap-3"><div class="grid size-9 place-items-center rounded-xl bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300"><ListFilter size={18}/></div><div><h2 class="font-extrabold">Source tersimpan</h2><p class="muted text-sm">Klik source untuk memakai Last ID berikutnya.</p></div></div><span class="badge">{sources.length} source</span></div>

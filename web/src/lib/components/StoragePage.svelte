@@ -36,6 +36,8 @@
   type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number};
   type RcloneSummary = {path:string; file_count:number; folder_count:number; size_bytes:number; size_complete:boolean};
   type PublicDownloadLink = {id:string; worker:string; relative_path:string; file_name:string; provider:string; job_id:string; created_at:string; url:string};
+  type StorageScanOperation = {operation_id:string; status:string; phase:string; progress?:Record<string, any>; job_id?:string|null; error?:{code?:string;message?:string}|null};
+  type StorageScanProfile = {profile:string; ready:boolean; error_code?:string; checked_at?:string};
 
   let provider = $state<'telegram'|'rclone'>('telegram');
   let folderId = $state<number|null>(null);
@@ -99,6 +101,15 @@
   let syncProfile = $state('');
   let syncJobId = $state('');
   let syncSubmitting = $state(false);
+  let storageScanOperationId = $state('');
+  let storageScanWorker = $state('');
+  let storageScanStatus = $state('idle');
+  let storageScanMessage = $state('');
+  let storageScanError = $state('');
+  let storageScanProfiles = $state<StorageScanProfile[]>([]);
+  let storageScanTimer: ReturnType<typeof setTimeout> | undefined;
+  let storageScanGeneration = 0;
+  let storageScanRequestActive = false;
 
   const selectionCount = $derived(selectedItems.length + selectedFolders.length);
   const activeSelectionCount = $derived(provider === 'telegram' ? selectionCount : selectedRclone.length);
@@ -113,27 +124,17 @@
   const workerAdmissionEnabled = $derived(
     session.workers.some((item) => item.name === worker && item.enabled !== false)
   );
-  const storageSyncProfiles = $derived(
-    session.profileCatalog
-      .filter((profile) => profile.workers.includes(worker))
-      .filter((profile) =>
-        runtimeReadinessFor(session.runtimeReadiness, profile.name, worker, 'storage').status === 'ready'
-        && runtimeReadinessFor(session.runtimeReadiness, profile.name, worker, 'upload').status === 'ready'
-      )
-      .map((profile) => profile.name)
-  );
-  const storageRuntimeReady = $derived(workerAdmissionEnabled && storageReadiness.status === 'ready');
+  const storageWorkerAvailable = $derived(workerAdmissionEnabled);
+  const storageSyncProfiles = $derived(session.current.profiles);
   const rcloneReadiness = $derived(runtimeReadinessFor(session.runtimeReadiness, null, worker, 'rclone_storage'));
-  const rcloneRuntimeReady = $derived(workerAdmissionEnabled && rcloneReadiness.status === 'ready');
+  const rcloneWorkerAvailable = $derived(workerAdmissionEnabled);
   const workerPublicUrl = $derived(session.workers.find((item) => item.name === worker)?.public_url || '');
-  const downloadReadyProfiles = $derived(
-    workerAdmissionEnabled ? session.profileCatalog
-      .filter((profile) => profile.workers.includes(worker))
-      .filter((profile) => runtimeReadinessFor(session.runtimeReadiness, profile.name, worker, 'download').status === 'ready')
-      .map((profile) => profile.name) : []
+  const downloadProfiles = $derived(workerAdmissionEnabled ? session.current.profiles : []);
+  const downloadReadiness = $derived(
+    runtimeReadinessFor(session.runtimeReadiness, downloadProfile || null, worker, 'download')
   );
   const storageReadinessStyle = $derived(
-    storageRuntimeReady
+    storageReadiness.status === 'ready'
       ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-200'
       : storageReadiness.status === 'offline' || storageReadiness.status === 'not_ready'
         ? 'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-200'
@@ -221,6 +222,90 @@
       message = cause instanceof Error ? cause.message : 'Sinkronisasi Storage gagal dibuat.';
     } finally {
       syncSubmitting = false;
+    }
+  }
+  function stopStorageScanPolling() {
+    if (storageScanTimer !== undefined) clearTimeout(storageScanTimer);
+    storageScanTimer = undefined;
+    storageScanRequestActive = false;
+  }
+  function scheduleStorageScanPolling(operationId:string, selectedWorker:string, generation:number) {
+    if (storageScanTimer !== undefined) clearTimeout(storageScanTimer);
+    storageScanTimer = setTimeout(() => void refreshStorageScan(operationId, selectedWorker, generation), 900);
+  }
+  async function refreshStorageScan(operationId:string, selectedWorker:string, generation:number) {
+    if (storageScanRequestActive) {
+      scheduleStorageScanPolling(operationId, selectedWorker, generation);
+      return;
+    }
+    storageScanRequestActive = true;
+    try {
+      const operation = await api<StorageScanOperation>(`/operations/${encodeURIComponent(operationId)}`);
+      if (generation !== storageScanGeneration) return;
+      storageScanStatus = operation.status;
+      storageScanOperationId = operation.operation_id;
+      const overall = operation.progress?.overall && typeof operation.progress.overall === 'object'
+        ? operation.progress.overall as Record<string, unknown> : {};
+      const current = Number(overall.current || 0);
+      const total = Number(overall.total || 0);
+      storageScanMessage = total
+        ? `${operation.progress?.message || operation.phase}: ${current}/${total} profil`
+        : String(operation.progress?.message || operation.phase || 'Memeriksa profil worker…');
+      if (['succeeded','failed','cancelled'].includes(operation.status)) {
+        if (operation.status === 'succeeded') {
+          const result = await api<{profiles?:StorageScanProfile[]}>(`/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(selectedWorker)}`);
+          if (generation !== storageScanGeneration) return;
+          storageScanProfiles = Array.isArray(result.profiles) ? result.profiles : [];
+          storageScanError = '';
+          storageScanMessage = `Pemeriksaan selesai: ${storageScanProfiles.filter((item)=>item.ready).length}/${storageScanProfiles.length} profil dapat mengirim ke Storage.`;
+          void session.refreshProfileCatalog();
+        } else {
+          storageScanError = operation.error?.message || `Pemeriksaan berakhir dengan status ${operation.status}.`;
+        }
+        stopStorageScanPolling();
+      } else {
+        scheduleStorageScanPolling(operationId, selectedWorker, generation);
+      }
+    } catch (cause) {
+      if (generation === storageScanGeneration) {
+        storageScanError = cause instanceof Error ? cause.message : 'Progress scan Storage tidak dapat dimuat.';
+        scheduleStorageScanPolling(operationId, selectedWorker, generation);
+      }
+    } finally {
+      storageScanRequestActive = false;
+    }
+  }
+  async function scanStorageWorker() {
+    if (!worker || !storageWorkerAvailable || storageScanStatus === 'queued' || storageScanStatus === 'running') return;
+    stopStorageScanPolling();
+    const selectedWorker = worker;
+    const generation = ++storageScanGeneration;
+    storageScanWorker = selectedWorker;
+    storageScanStatus = 'queued';
+    storageScanProfiles = [];
+    storageScanError = '';
+    storageScanMessage = 'Menyiapkan pemeriksaan profil Storage…';
+    try {
+      const key = globalThis.crypto?.randomUUID?.() || `storage-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const operation = await api<StorageScanOperation>('/tdl-access/verification', {
+        method: 'POST',
+        headers: {'Idempotency-Key': key},
+        body: JSON.stringify({purpose:'storage',worker:selectedWorker})
+      });
+      if (generation !== storageScanGeneration) return;
+      storageScanOperationId = operation.operation_id;
+      storageScanStatus = operation.status;
+      if (['succeeded','failed','cancelled'].includes(operation.status)) {
+        await refreshStorageScan(operation.operation_id, selectedWorker, generation);
+      } else {
+        storageScanMessage = 'Scan worker berjalan; menguji profil satu per satu…';
+        scheduleStorageScanPolling(operation.operation_id, selectedWorker, generation);
+      }
+    } catch (cause) {
+      if (generation === storageScanGeneration) {
+        storageScanStatus = 'failed';
+        storageScanError = cause instanceof Error ? cause.message : 'Scan Storage gagal dimulai.';
+      }
     }
   }
   async function handleJobFinished(event: Event) {
@@ -329,12 +414,8 @@
   }
   async function upload() {
     if (!workspaceFolders[0]) return;
-    if (provider === 'telegram' && !storageRuntimeReady) {
-      message = 'Belum ada profil Upload siap pada worker ini. Jalankan Scan Profil.';
-      return;
-    }
-    if (provider === 'rclone' && !rcloneRuntimeReady) {
-      message = 'Akses rclone pada worker ini belum siap. Jalankan Scan Profil.';
+    if (!worker || !workerAdmissionEnabled) {
+      message = 'Pilih worker aktif untuk menjalankan upload.';
       return;
     }
     if (provider === 'rclone' && transferMode === 'move' && !confirmMove) return;
@@ -348,7 +429,7 @@
     message=`Upload ${provider==='telegram'?'Telegram':'rclone'} masuk antrean sebagai ${selectedTransferMode}. Struktur subfolder akan dipertahankan.`;
   }
   function startDownload() {
-    if (provider === 'telegram') downloadProfile = downloadReadyProfiles[0] || '';
+    if (provider === 'telegram') downloadProfile = downloadProfiles[0] || '';
     downloadDestinationFolders = [];
     publishPublicLinks = false;
     downloadOpen = true;
@@ -356,12 +437,16 @@
   async function downloadSelection() {
     const destinationPath = downloadDestinationFolders[0];
     if (!worker || !destinationPath || downloadSubmitting) return;
-    if (provider === 'telegram' && (!downloadProfile || !downloadReadyProfiles.includes(downloadProfile))) {
-      message = 'Pilih profil dengan lane Download siap pada worker ini.';
+    if (!workerAdmissionEnabled) {
+      message = 'Pilih worker aktif untuk menjalankan download.';
       return;
     }
-    if (provider === 'rclone' && (!rcloneRuntimeReady || !selectedRclone.length)) {
-      message = 'Pilih file/folder rclone dan pastikan readiness rclone worker siap.';
+    if (provider === 'telegram' && (!downloadProfile || !downloadProfiles.includes(downloadProfile))) {
+      message = 'Pilih profil yang dapat Anda gunakan untuk mencoba download.';
+      return;
+    }
+    if (provider === 'rclone' && !selectedRclone.length) {
+      message = 'Pilih file atau folder rclone.';
       return;
     }
     downloadSubmitting = true;
@@ -415,7 +500,7 @@
     } finally { revokeSubmitting = false; }
   }
   async function loadRclone({refreshSummaries=false}:{refreshSummaries?:boolean}={}) {
-    if (!worker || provider !== 'rclone' || !rcloneRuntimeReady) return;
+    if (!worker || provider !== 'rclone' || !rcloneWorkerAvailable) return;
     const request=++remoteGeneration;
     const selectedWorker=worker;
     const selectedPath=rclonePath;
@@ -461,6 +546,14 @@
     else void load();
   }
   function handleWorkerChange() {
+    storageScanGeneration++;
+    stopStorageScanPolling();
+    storageScanOperationId='';
+    storageScanWorker='';
+    storageScanStatus='idle';
+    storageScanMessage='';
+    storageScanError='';
+    storageScanProfiles=[];
     remoteGeneration++;
     remoteSummaryGeneration++;
     remoteSummaries={};
@@ -529,7 +622,11 @@
     void session.refreshProfileCatalog();
     window.addEventListener('tme3:job-finished', handleJobFinished);
     load();
-    return () => window.removeEventListener('tme3:job-finished', handleJobFinished);
+    return () => {
+      window.removeEventListener('tme3:job-finished', handleJobFinished);
+      storageScanGeneration++;
+      stopStorageScanPolling();
+    };
   });
   $effect(() => {
     if (!storageSyncProfiles.includes(syncProfile)) syncProfile = storageSyncProfiles[0] || '';
@@ -537,8 +634,8 @@
   $effect(() => {
     const activeProvider=provider;
     const activeWorker=worker;
-    const ready=rcloneRuntimeReady;
-    if (activeProvider==='rclone' && activeWorker && ready) untrack(() => void loadRclone({refreshSummaries:true}));
+    const available=rcloneWorkerAvailable;
+    if (activeProvider==='rclone' && activeWorker && available) untrack(() => void loadRclone({refreshSummaries:true}));
   });
   $effect(() => {
     const selectedWorker=worker;
@@ -585,27 +682,45 @@
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div>
       <h2 class="font-extrabold">Kesiapan Storage</h2>
-      <p class="muted mt-1 text-sm">Status lane Upload dan bukti akses kirim memakai hasil Scan Profil yang tersimpan.</p>
+      <p class="muted mt-1 text-sm">Status scan hanya informasi. Upload akan mencoba profil lokal pada worker ini dan menilai hasil command TDL.</p>
     </div>
+    <div class="flex items-center gap-2">
+    <button class="button secondary" onclick={scanStorageWorker} disabled={!storageWorkerAvailable || storageScanStatus==='queued' || storageScanStatus==='running'}>
+      <RefreshCw size={15} class={storageScanStatus==='queued' || storageScanStatus==='running'?'animate-spin':''}/>{storageScanStatus==='queued' || storageScanStatus==='running'?'Memindai worker…':'Scan worker'}
+    </button>
     <span class={`rounded-full px-3 py-1 text-xs font-bold ${storageReadinessStyle}`} role="status">
-      {storageReadiness.status === 'ready' ? 'Siap' : storageReadiness.status === 'offline' ? 'Worker offline' : storageReadiness.status === 'disabled' ? 'Worker nonaktif' : storageReadiness.status === 'not_ready' ? 'Tidak siap' : 'Belum dipindai'}
+      {storageReadiness.status === 'ready' ? 'Scan: siap' : storageReadiness.status === 'offline' ? 'Scan: worker offline' : storageReadiness.status === 'disabled' ? 'Worker nonaktif' : storageReadiness.status === 'not_ready' ? 'Scan: tidak siap' : 'Belum di-scan'}
     </span>
+    </div>
   </div>
+  {#if storageScanWorker===worker && storageScanStatus!=='idle'}
+    <div class="mt-3 rounded-xl border border-[var(--line)] p-3 text-sm" role="status" aria-label="Progress scan Storage">
+      <p>{storageScanMessage || 'Memeriksa worker…'}</p>
+      {#if storageScanError}<p class="mt-1 text-rose-700">{storageScanError}</p>{/if}
+      {#if storageScanProfiles.length}
+        <ul class="mt-2 grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
+          {#each storageScanProfiles as result (result.profile)}
+            <li class="flex justify-between gap-2 rounded-md bg-[var(--surface-soft)] px-2 py-1"><span>{result.profile}</span><b class={result.ready?'text-emerald-600':'text-rose-600'}>{result.ready?'Siap':result.error_code || 'Gagal'}</b></li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
   {#if storageReadinessCells.length}
     <ul class="mt-3 grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
       {#each storageReadinessCells as cell (`${cell.worker}:${cell.profile}:${cell.runtime}`)}
         {@const pair = runtimeReadinessFor(session.runtimeReadiness, cell.profile, cell.worker, 'storage')}
         <li class="flex items-center justify-between gap-2 rounded-lg border border-[var(--line)] p-2" aria-label={`Storage ${cell.profile} pada ${cell.worker}`}>
           <b>{cell.profile}</b>
-          <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>{pair.status === 'ready' ? 'Siap' : pair.status === 'not_ready' ? `Tidak siap · ${pair.reason_code}` : pair.status === 'offline' ? 'Worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : 'Belum dipindai'}</span>
+          <span class={pair.status === 'ready' ? 'font-bold text-emerald-600' : pair.status === 'offline' || pair.status === 'not_ready' ? 'font-bold text-rose-600' : 'muted font-bold'}>{pair.status === 'ready' ? 'Scan: siap' : pair.status === 'not_ready' ? `Scan: tidak siap · ${pair.reason_code}` : pair.status === 'offline' ? 'Scan: worker offline' : pair.status === 'disabled' ? 'Worker nonaktif' : 'Belum di-scan'}</span>
         </li>
       {/each}
     </ul>
   {:else}
-    <p class="muted mt-3 text-sm">Belum ada profil Upload yang dipindai pada worker ini. Jalankan Scan Profil untuk melihat status.</p>
+    <p class="muted mt-3 text-sm">Belum ada hasil scan Storage untuk worker ini.</p>
   {/if}
   {#if storageReadiness.status !== 'ready'}
-    <a class="mt-3 inline-flex text-sm font-semibold text-violet-700 underline dark:text-violet-300" href="/profiles">Buka Profil untuk menjalankan Scan Profil</a>
+    <p class="muted mt-3 text-xs">Hasil scan hanya informasi. Job tetap dapat dicoba; command TDL aktual menentukan hasilnya.</p>
   {/if}
   <div class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-3 sm:p-4">
     <div class="flex flex-wrap items-end justify-between gap-3">
@@ -622,7 +737,7 @@
         <RefreshCw size={16} class={syncSubmitting?'animate-spin':''}/>{syncSubmitting?'Menyiapkan…':'Sinkronkan sekarang'}
       </button>
     </div>
-    {#if !storageSyncProfiles.length}<p class="muted mt-2 text-xs">Pilih worker dan pastikan lane Upload serta Storage profil sudah berstatus siap.</p>{/if}
+    {#if !storageSyncProfiles.length}<p class="muted mt-2 text-xs">Tidak ada profil yang diizinkan untuk akun ini.</p>{/if}
   </div>
 </section>
 {/if}
@@ -634,17 +749,17 @@
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div><h2 class="text-xl font-black">Remote rclone</h2><p class="muted mt-1 text-sm">Worker {worker || 'belum dipilih'} · status {rcloneReadiness.status}</p></div>
     <div class="flex flex-wrap gap-2">
-      {#if selectedRclone.length}<button class="button secondary" disabled={!worker || !rcloneRuntimeReady} onclick={startDownload}><Download size={16}/>Download {selectedRclone.length} dipilih</button>{/if}
-      <button class="button" disabled={!worker || !rcloneRuntimeReady} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
+      {#if selectedRclone.length}<button class="button secondary" disabled={!rcloneWorkerAvailable} onclick={startDownload}><Download size={16}/>Download {selectedRclone.length} dipilih</button>{/if}
+      <button class="button" disabled={!rcloneWorkerAvailable} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
     </div>
   </div>
-  {#if !rcloneRuntimeReady}<p class="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-100">{rcloneReadiness.reason_code || 'Akses rclone belum dipindai pada worker ini.'} · Jalankan Scan Profil sebelum membuka remote.</p>{/if}
+  {#if rcloneReadiness.status !== 'ready'}<p class="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-100">Hasil scan rclone: {rcloneReadiness.reason_code || rcloneReadiness.status}. Daftar remote akan menguji command rclone aktual.</p>{/if}
   <div class="mt-4 flex flex-wrap items-center gap-2">
     <div class="flex min-w-0 flex-1 items-center gap-1"><button class="button ghost" onclick={() => openRemoteFolder('')}>Root</button>{#each rclonePath.split('/').filter(Boolean) as crumb,index}<ChevronRight size={14}/><button class="max-w-40 truncate rounded px-2 py-1 text-sm font-semibold hover:bg-[var(--brand-soft)]" onclick={() => openRemoteFolder(rclonePath.split('/').filter(Boolean).slice(0,index+1).join('/'))}>{crumb}</button>{/each}</div>
     <input class="field min-w-[180px] flex-1" bind:value={remoteQuery} placeholder="Cari di folder ini" onkeydown={(e)=>e.key==='Enter'&&(remoteOffset=0,loadRclone())}/>
     <select class="field !w-auto" bind:value={remoteSort} onchange={()=>{remoteOffset=0;loadRclone()}}><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select>
     <button class="button ghost" onclick={()=>{remoteOrder=remoteOrder==='asc'?'desc':'asc';loadRclone()}} title="Balik urutan"><ArrowUp class={remoteOrder==='desc'?'rotate-180':''} size={17}/></button>
-    <button class="button ghost" disabled={remoteLoading||!rcloneRuntimeReady} onclick={()=>loadRclone({refreshSummaries:true})} aria-label="Refresh rclone"><RefreshCw class={remoteLoading||remoteSummaryLoading?'animate-spin':''} size={17}/></button>
+    <button class="button ghost" disabled={remoteLoading||!rcloneWorkerAvailable} onclick={()=>loadRclone({refreshSummaries:true})} aria-label="Refresh rclone"><RefreshCw class={remoteLoading||remoteSummaryLoading?'animate-spin':''} size={17}/></button>
   </div>
   <div class="mt-4 divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
     {#each remoteData.items as entry (entry.path)}
@@ -703,7 +818,7 @@
           <b>{selectionCount} dipilih</b><button class="button ghost" onclick={selectAll}>Pilih semua</button>
           <span class="flex-1"></span>
           {#if isTrash}<button class="button secondary" onclick={restoreSelection}><ArchiveRestore size={15}/>Restore</button><button class="button danger" onclick={() => confirmAction='purge'}><Trash2 size={15}/>Purge</button>
-          {:else}<button class="button secondary" disabled={!downloadReadyProfiles.length} onclick={startDownload}><Download size={15}/>Download</button><button class="button secondary" onclick={startMove}><Move size={15}/>Move</button><button class="button danger" onclick={() => confirmAction='trash'}><Trash2 size={15}/>Trash</button>{/if}
+          {:else}<button class="button secondary" disabled={!downloadProfiles.length || !workerAdmissionEnabled} onclick={startDownload}><Download size={15}/>Download</button><button class="button secondary" onclick={startMove}><Move size={15}/>Move</button><button class="button danger" onclick={() => confirmAction='trash'}><Trash2 size={15}/>Trash</button>{/if}
           <button class="button ghost" onclick={clearSelection}><X size={16}/></button>
         </div>
       {/if}
@@ -761,21 +876,22 @@
 <Modal open={downloadOpen} onclose={() => downloadOpen=false} title="Download ke worker" size="lg">
   <p class="muted mb-4 text-sm">{activeSelectionCount} pilihan dari {provider==='telegram'?'Telegram Storage':'rclone'} akan diunduh rekursif ke worker {worker}. File yang sudah ada tidak ditimpa.</p>
   {#if provider==='telegram'}
-    <label class="block text-sm font-bold">Profil dengan lane Download siap
-      <select class="field mt-2" bind:value={downloadProfile} disabled={!downloadReadyProfiles.length}>
-        {#each downloadReadyProfiles as profile (profile)}<option value={profile}>{profile}</option>{/each}
+    <label class="block text-sm font-bold">Profil yang akan dicoba oleh TDL
+      <select class="field mt-2" bind:value={downloadProfile} disabled={!downloadProfiles.length}>
+        {#each downloadProfiles as profile (profile)}<option value={profile}>{profile}</option>{/each}
       </select>
     </label>
-    {#if !downloadReadyProfiles.length}<p class="mt-2 text-sm text-rose-700">Tidak ada profil Download-ready pada worker ini. Jalankan scan dari halaman Profil.</p>{/if}
-  {:else if !rcloneRuntimeReady}
-    <p class="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">Readiness rclone worker belum siap. Jalankan scan dari halaman Profil.</p>
+    <p class="muted mt-2 text-xs">Scan terakhir: {downloadReadiness.status === 'ready' ? 'siap' : downloadReadiness.status === 'not_ready' ? `belum siap (${downloadReadiness.reason_code})` : downloadReadiness.status}. Download tetap mencoba command TDL aktual.</p>
+    {#if !downloadProfiles.length}<p class="mt-2 text-sm text-rose-700">Tidak ada profil yang diizinkan untuk akun ini.</p>{/if}
+  {:else if rcloneReadiness.status !== 'ready'}
+    <p class="rounded-xl bg-amber-50 p-3 text-sm text-amber-900">Scan terakhir rclone: {rcloneReadiness.reason_code || rcloneReadiness.status}. Download tetap mencoba command rclone aktual.</p>
   {/if}
   <div class="mt-4"><p class="mb-2 text-sm font-bold">Folder tujuan di /workspace</p><WorkspaceExplorer bind:selected={downloadDestinationFolders} single {worker}/></div>
   <label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-[var(--line)] p-3 text-sm" class:opacity-50={!workerPublicUrl}>
     <input type="checkbox" bind:checked={publishPublicLinks} disabled={!workerPublicUrl}/>
     <span><b>Buat link publik tanpa kedaluwarsa</b><small class="muted mt-1 block">Satu link per file berhasil. Atur domain HTTPS worker di Pengaturan Worker terlebih dahulu. Link dapat dicabut dari daftar di halaman Storage.</small></span>
   </label>
-  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => downloadOpen=false}>Batal</button><button class="button" disabled={!worker || !downloadDestinationFolders.length || !activeSelectionCount || downloadSubmitting || (provider==='telegram'&&!downloadReadyProfiles.includes(downloadProfile)) || (provider==='rclone'&&!rcloneRuntimeReady)} onclick={downloadSelection}><Download size={16}/>{downloadSubmitting?'Membuat job…':'Mulai download'}</button></div>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => downloadOpen=false}>Batal</button><button class="button" disabled={!workerAdmissionEnabled || !downloadDestinationFolders.length || !activeSelectionCount || downloadSubmitting || (provider==='telegram'&&!downloadProfiles.includes(downloadProfile))} onclick={downloadSelection}><Download size={16}/>{downloadSubmitting?'Membuat job…':'Mulai download'}</button></div>
 </Modal>
 
 <Modal open={Boolean(linkToRevoke)} onclose={() => !revokeSubmitting&&(linkToRevoke=null)} title="Cabut link dan hapus file worker?" size="sm">
@@ -799,12 +915,12 @@
 <Modal open={createOpen} onclose={() => createOpen=false} title="Folder baru" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" placeholder="Dokumen 2026"/></label><p class="muted mt-2 text-xs">Maksimal 120 karakter. Slash, titik tunggal, dan karakter kontrol tidak diperbolehkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => createOpen=false}>Batal</button><button class="button" disabled={!newFolderName.trim()} onclick={createFolder}>Buat folder</button></div></Modal>
 
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
-  <p class="muted mb-4 text-sm">{provider==='telegram'?'Pilih worker dengan lane Upload siap.':'Pilih worker dengan akses rclone siap.'} Semua subfolder sumber dipertahankan.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange}/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
+  <p class="muted mb-4 text-sm">{provider==='telegram'?'Upload akan mencoba profil lokal worker ini.':'Upload akan menjalankan command rclone pada worker ini.'} Semua subfolder sumber dipertahankan.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange}/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>
   <div class="mt-4 grid gap-3 sm:grid-cols-2">{#if provider==='telegram'}<label class="text-sm font-bold">Tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each folderOptions as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label>{:else}<div class="rounded-xl border border-[var(--line)] p-3 text-sm"><b>Tujuan rclone</b><p class="mt-1 break-all">{remoteTargetSelected?(remoteTarget||'root'):'Pilih folder dari tab Rclone'}</p></div>{/if}<label class="text-sm font-bold">Keywords opsional<input class="field mt-2" bind:value={keywords} placeholder="archive, project"/></label></div>
   <label class="mt-4 block text-sm font-bold">Transfer<select class="field mt-2" bind:value={transferMode}><option value="copy">Copy · sumber tetap ada</option><option value="move">Move · hapus sumber setelah upload terkonfirmasi</option></select></label>
   {#if transferMode==='move'}<label class="mt-3 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"><input class="mt-1" type="checkbox" bind:checked={confirmMove}/><span>Saya memahami file Workspace akan dihapus satu per satu hanya setelah upload terverifikasi dan file sumber tidak berubah.</span></label>{/if}
   <div class="mt-4 flex gap-2 rounded-xl bg-[var(--brand-soft)] p-3 text-sm"><Info class="shrink-0 text-violet-600" size={18}/><p>{provider==='telegram'?'Batch ini hanya dikirim ke Telegram Storage.':'Batch ini hanya dikirim ke rclone; kegagalan tidak dialihkan ke Telegram.'} File yang bertabrakan di remote tidak akan ditimpa.</p></div>
-  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || (provider==='telegram'?!storageRuntimeReady:!rcloneRuntimeReady) || (provider==='rclone'&&!remoteTargetSelected) || (transferMode==='move'&&!confirmMove)} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => uploadOpen=false}>Batal</button><button class="button" disabled={!workspaceFolders.length || !workerAdmissionEnabled || (provider==='rclone'&&!remoteTargetSelected) || (transferMode==='move'&&!confirmMove)} onclick={upload}><CloudUpload size={16}/>Mulai upload</button></div>
 </Modal>
 
 <Modal open={moveOpen} onclose={() => moveOpen=false} title="Pindahkan ke folder" size="md"><label class="text-sm font-bold">Folder tujuan<select class="field mt-2" bind:value={destinationId}><option value={null}>My Drive</option>{#each folderOptions as folder}<option value={folder.id}>{folder.path}</option>{/each}</select></label><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => moveOpen=false}>Batal</button><button class="button" onclick={moveSelection}><Move size={16}/>Pindahkan</button></div></Modal>

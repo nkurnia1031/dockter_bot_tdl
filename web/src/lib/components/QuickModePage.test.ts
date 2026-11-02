@@ -78,13 +78,51 @@ describe('QuickModePage', () => {
     await screen.findByRole('button', { name: 'Tambah Quick Mode' });
     const profileFilter = await screen.findByLabelText('Profile') as HTMLSelectElement;
     await waitFor(() => expect([...profileFilter.options].map((option) => option.value)).toEqual(['', 'default']));
-    expect(await screen.findByText('Quick Mode siap')).toBeTruthy();
+    expect(await screen.findByText(/Quick Mode siap/)).toBeTruthy();
     await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Tambah Quick Mode' }));
 
     expect(requests.some((item) => item.url.includes('/context/verify'))).toBe(false);
     expect(requests.find((item) => item.url.endsWith('/exports'))?.body).toMatchObject({ chat_ref: 'example', quick_mode: true });
     await waitFor(() => expect(calls.some((item) => item.includes('/jobs?limit=200&scope=global&kind=export&quick_mode=true'))).toBe(true));
+  });
+
+  it('creates a Quick Mode job when the saved readiness snapshot is not ready', async () => {
+    const requests: { url: string; body?: Record<string, unknown> }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes('/profiles/local')) return new Response(JSON.stringify({
+        profiles: [{ name: 'default', workers: ['local'] }],
+        runtime_readiness: {
+          checked_at: '2026-10-23T10:00:00Z',
+          workers: [{ name: 'local', status: 'success' }],
+          cells: [
+            { worker: 'local', profile: 'default', runtime: 'quick_mode', status: 'not_ready', reason_code: 'PROFILE_CANARY_QUICK_MODE_FAILED' },
+            { worker: 'local', profile: null, runtime: 'rclone_storage', status: 'not_ready', reason_code: 'RCLONE_ACCESS_FAILED' },
+          ],
+        },
+      }), { status: 200 });
+      if (url.includes('/sources') || url.includes('/labels') || url.includes('/jobs') || url.includes('/quick-mode/limits') || url.includes('/quick-mode/staging')) {
+        return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      }
+      if (url.endsWith('/exports') && init?.method === 'POST') {
+        requests.push({ url, body: JSON.parse(String(init.body)) });
+        return new Response(JSON.stringify({ id: 'quick-not-ready-snapshot', status: 'queued' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(QuickModePage);
+    await screen.findByRole('button', { name: 'Tambah Quick Mode' });
+    const profileFilter = await screen.findByLabelText('Profile') as HTMLSelectElement;
+    await waitFor(() => expect([...profileFilter.options].map((option) => option.value)).toEqual(['', 'default']));
+    expect(await screen.findByText('Scan terakhir: Quick Mode belum siap')).toBeTruthy();
+    await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Tambah Quick Mode' }));
+
+    expect(requests.find((item) => item.url.endsWith('/exports'))?.body).toMatchObject({
+      chat_ref: 'example', quick_mode: true,
+    });
   });
 
   it('submits a selected existing rclone folder only for this Quick Mode job', async () => {
@@ -107,7 +145,7 @@ describe('QuickModePage', () => {
     }));
 
     render(QuickModePage);
-    await screen.findByText('Quick Mode siap');
+    await screen.findByText(/Quick Mode siap/);
     await fireEvent.click(screen.getByRole('button',{name:'Pilih folder'}));
     await screen.findByRole('button',{name:'Pilih'});
     await fireEvent.click(screen.getByRole('button',{name:'Pilih'}));
@@ -143,7 +181,7 @@ describe('QuickModePage', () => {
     }));
 
     render(QuickModePage);
-    await screen.findByText('Quick Mode siap');
+    await screen.findByText(/Quick Mode siap/);
     await fireEvent.click(screen.getByRole('button',{name:'Pilih folder'}));
     await screen.findByPlaceholderText('Nama subfolder baru');
     await fireEvent.input(screen.getByPlaceholderText('Nama subfolder baru'),{target:{value:'November'}});

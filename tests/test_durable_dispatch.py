@@ -274,7 +274,7 @@ class DurableDispatchTests(unittest.TestCase):
             ).fetchone()
         self.assertEqual(int(row["settings_version"]), 1)
 
-    def test_storage_sync_submission_encrypts_and_forwards_session_fingerprint(self):
+    def test_storage_sync_submission_uses_target_without_session_fingerprint(self):
         destination = "-100123"
         session_fingerprint = "a" * 64
         destination_fingerprint = self.tdl_access.destination_fingerprint(destination)
@@ -311,10 +311,7 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertEqual(command["worker"], "local")
         self.assertEqual(command["profile"], "default")
         self.assertEqual(command["payload"]["tdl_access_target"], destination)
-        self.assertEqual(
-            command["payload"]["_tdl_sender_session_fingerprint"],
-            session_fingerprint,
-        )
+        self.assertNotIn("session_fingerprint", str(command["payload"]))
 
     def test_client_cannot_override_internal_settings_or_quickmode_checkpoint(self):
         with self.assertRaises(DomainError) as utility_error:

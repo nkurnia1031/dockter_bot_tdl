@@ -116,10 +116,15 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
         )
         manager = SimpleNamespace(runtime=lambda _profile: runtime)
         phases = []
+        diagnose_calls = []
         with tempfile.TemporaryDirectory() as directory:
             canary = ProfileReadinessCanary(
                 manager,
-                lambda _profile: {"ready": True, "fingerprint": "a" * 64},
+                lambda profile: diagnose_calls.append(profile) or {
+                    "ready": False,
+                    "reason_codes": ["PROFILE_SESSION_IDENTITY_MISMATCH"],
+                    "fingerprint": "a" * 64,
+                },
                 Path(directory),
                 upload_session_fingerprint=lambda _profile: "b" * 64,
             )
@@ -130,6 +135,7 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
                 lambda phase, _checks, _messages: phases.append(phase),
                 checks=checks,
             )
+        self.diagnose_calls = diagnose_calls
         return result, phases, runtime, download
 
     def test_runs_export_download_upload_and_independent_channel_verifications(self):
@@ -140,8 +146,9 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
         self.assertTrue(result["checks"]["upload"]["ready"])
         self.assertTrue(result["checks"]["storage"]["ready"])
         self.assertTrue(result["checks"]["tts"]["ready"])
-        self.assertEqual(result["session_fingerprint"], "a" * 64)
-        self.assertEqual(result["upload_session_fingerprint"], "b" * 64)
+        self.assertEqual(result["session_fingerprint"], "")
+        self.assertEqual(result["upload_session_fingerprint"], "")
+        self.assertEqual(self.diagnose_calls, [])
         self.assertEqual({item["target"] for item in result["messages"]}, {"storage", "tts"})
         self.assertIn("download_canary", phases)
         self.assertIn("verify_storage", phases)

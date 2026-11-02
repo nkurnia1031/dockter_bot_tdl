@@ -18,7 +18,6 @@ from tme3bot.progress_reporter import (
 )
 from tme3bot.media import has_downloadable_media
 from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
-from tme3bot.tdl_access_fingerprint import normalize_session_fingerprints
 from tme3bot.rclone import (
     RcloneError,
     RcloneRunner,
@@ -175,9 +174,6 @@ class StorageExecutorMixin:
                 "profile": profile,
             })
 
-        fingerprints = normalize_session_fingerprints(
-            payload.get("_tdl_sender_session_fingerprints")
-        )
         requested_profiles = payload.get("_tdl_sender_profiles")
         requested_profiles = {
             str(item).strip().lower()
@@ -200,24 +196,12 @@ class StorageExecutorMixin:
             [item["profile"] for item in candidates]
             + [str(item).strip().lower() for item in requested_profiles]
         ))
-        available_profiles = set(self.available_storage_profiles())
         messages = None
         error_code = "STORAGE_RECONCILIATION_SESSION_UNAVAILABLE"
         for profile in candidate_profiles:
             with self._lock:
                 if str(command.get("job_id") or "") in self._cancel_requested:
                     break
-            if profile not in requested_profiles or not fingerprints.get(profile):
-                continue
-            if profile not in available_profiles:
-                error_code = "STORAGE_RECONCILIATION_SESSION_UNAVAILABLE"
-                continue
-            current_fingerprints = normalize_session_fingerprints(
-                self.available_storage_session_fingerprints([profile])
-            )
-            if current_fingerprints.get(profile) != fingerprints.get(profile):
-                error_code = "STORAGE_RECONCILIATION_SESSION_CHANGED"
-                continue
             try:
                 runtime = self.profile_manager.runtime(profile)
                 client = runtime.upload_tdl_client
@@ -360,7 +344,12 @@ class StorageExecutorMixin:
         with ExitStack() as stack:
             for profile in sorted(runtimes):
                 stack.enter_context(
-                    self._capture_tdl_output(runtimes[profile].upload_tdl_client)
+                    self._capture_tdl_output(
+                        runtimes[profile].upload_tdl_client,
+                        command_callback=self._command_callback(
+                            profile=profile, runtime="upload"
+                        ),
+                    )
                 )
             yield
 
@@ -479,7 +468,7 @@ class StorageExecutorMixin:
 
         runner = RcloneRunner(
             log_callback=self._append_job_log,
-            command_callback=self._command_callback(),
+            command_callback=self._command_callback(runtime="rclone_storage"),
             progress_callback=progress,
             cancel_check=cancelled,
             stall_timeout_seconds=getattr(
@@ -618,7 +607,7 @@ class StorageExecutorMixin:
             return items
         runner = RcloneRunner(
             log_callback=self._append_job_log,
-            command_callback=self._command_callback(),
+            command_callback=self._command_callback(runtime="rclone_storage"),
             stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
         )
         for checkpoint in items:
@@ -898,7 +887,7 @@ class StorageExecutorMixin:
                 counters={"succeeded": successes, "failed": len(failures)},
             )
 
-        runner = RcloneRunner(log_callback=self._append_job_log, command_callback=self._command_callback(),
+        runner = RcloneRunner(log_callback=self._append_job_log, command_callback=self._command_callback(runtime="rclone_storage"),
                               progress_callback=progress, cancel_check=cancelled,
                               stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600))
         with self._lock:
@@ -1077,17 +1066,6 @@ class StorageExecutorMixin:
         candidate_message_ids = payload.get("_storage_sync_candidate_message_ids", [])
         if not isinstance(candidate_message_ids, list):
             raise RuntimeError("STORAGE_SYNC_CANDIDATES_INVALID")
-        if profile not in self.available_storage_profiles():
-            raise RuntimeError("STORAGE_PROFILE_UNAVAILABLE")
-        expected_fingerprint = str(
-            payload.get("_tdl_sender_session_fingerprint") or ""
-        ).strip().lower()
-        current_fingerprint = normalize_session_fingerprints(
-            self.available_storage_session_fingerprints([profile])
-        ).get(profile, "")
-        if not expected_fingerprint or current_fingerprint != expected_fingerprint:
-            raise RuntimeError("TDL_ACCESS_NOT_VERIFIED: sesi Upload berubah sejak Scan Profil.")
-
         runtime = self.profile_manager.runtime(profile)
         runtime_channel_id = int(getattr(runtime.config, "storage_channel_id", 0) or 0)
         if runtime_channel_id != channel_id:
@@ -1235,50 +1213,24 @@ class StorageExecutorMixin:
             str(command.get("kind") or "") == "storage_upload"
             and bool(command.get("command_id"))
         )
-        local_profiles = set(self.profile_manager.list_profiles())
-        if not durable_batch and storage_profile not in local_profiles:
-            raise ValueError(
-                f"STORAGE_PROFILE_UNAVAILABLE: profile worker {storage_profile} belum memiliki sesi TDL."
-            )
-        available_profiles = set(self.available_storage_profiles())
-        if not durable_batch and storage_profile not in available_profiles:
-            raise ValueError(
-                f"STORAGE_PROFILE_UNAVAILABLE: lane Upload {storage_profile} belum siap. Jalankan scan profil lalu coba lagi."
-            )
+        local_profiles = {
+            str(item).strip().lower()
+            for item in self.profile_manager.list_profiles()
+            if str(item).strip()
+        }
         raw_sender_profiles = payload.get("_tdl_sender_profiles")
-        sender_profiles = [
+        preferred_profiles = [
             str(item).strip().lower()
             for item in raw_sender_profiles
             if str(item).strip()
         ] if isinstance(raw_sender_profiles, list) else []
+        sender_profiles = list(dict.fromkeys(
+            [profile for profile in preferred_profiles if profile in local_profiles]
+            + sorted(local_profiles - set(preferred_profiles))
+        ))
+        if not sender_profiles:
+            raise ValueError("PROFILE_SESSION_UNAVAILABLE: worker tidak memiliki profil lokal untuk upload TDL.")
         if storage_profile not in sender_profiles:
-            sender_profiles.insert(0, storage_profile)
-        sender_profiles = [
-            profile
-            for profile in dict.fromkeys(sender_profiles)
-            if profile in local_profiles and profile in available_profiles
-        ]
-        expected_fingerprints = normalize_session_fingerprints(
-            payload.get("_tdl_sender_session_fingerprints")
-        )
-        fingerprint_method = getattr(self, "available_storage_session_fingerprints", None)
-        current_fingerprints = normalize_session_fingerprints(
-            fingerprint_method(sender_profiles) if callable(fingerprint_method) else {}
-        )
-        sender_profiles = [
-            profile
-            for profile in sender_profiles
-            if expected_fingerprints.get(profile)
-            and (
-                durable_batch
-                or expected_fingerprints.get(profile) == current_fingerprints.get(profile)
-            )
-        ]
-        if not sender_profiles and not durable_batch:
-            raise ValueError(
-                "TDL_ACCESS_NOT_VERIFIED: bukti akses lane Upload sudah tidak cocok. Verifikasi akses Storage lagi."
-            )
-        if sender_profiles and storage_profile not in sender_profiles:
             storage_profile = sender_profiles[0]
         sender_runtimes = {
             profile: self.profile_manager.runtime(profile)
@@ -1391,7 +1343,6 @@ class StorageExecutorMixin:
                 preserve_structure=preserve_structure,
                 photo_names=photo_names,
                 sender_profiles=sender_profiles,
-                expected_fingerprints=expected_fingerprints,
                 sender_runtimes=sender_runtimes,
                 storage_profile=storage_profile,
                 target_chat=target_chat,
@@ -1399,19 +1350,6 @@ class StorageExecutorMixin:
                 upload_item_callback=upload_item_callback,
             )
         with self._storage_upload_lane_locks(sender_runtimes):
-            current_fingerprints = normalize_session_fingerprints(
-                fingerprint_method(sender_profiles) if callable(fingerprint_method) else {}
-            )
-            sender_profiles = [
-                profile
-                for profile in sender_profiles
-                if expected_fingerprints.get(profile)
-                and expected_fingerprints.get(profile) == current_fingerprints.get(profile)
-            ]
-            if not sender_profiles:
-                raise ValueError(
-                    "TDL_ACCESS_NOT_VERIFIED: sesi lane Upload berubah sebelum pengiriman. Verifikasi akses Storage lagi."
-                )
             if storage_profile not in sender_profiles:
                 storage_profile = sender_profiles[0]
                 runtime = sender_runtimes[storage_profile]
@@ -1781,11 +1719,6 @@ class StorageExecutorMixin:
             profile = str(command.get("profile") or "").strip().lower()
             if not profile:
                 raise _StorageDownloadFailure("PROFILE_REQUIRED", "Profil Telegram belum dipilih.")
-            available = getattr(self.profile_manager, "tdl_session_available", None)
-            if callable(available) and available(profile, "download") is not True:
-                raise _StorageDownloadFailure(
-                    "PROFILE_SESSION_UNAVAILABLE", "Lane Download profil tidak tersedia pada worker."
-                )
             try:
                 runtime = self.profile_manager.runtime(profile)
             except Exception as exc:
@@ -1883,7 +1816,7 @@ class StorageExecutorMixin:
             )
             runner = RcloneRunner(
                 log_callback=self._append_job_log,
-                command_callback=self._command_callback(),
+                command_callback=self._command_callback(runtime="rclone_storage"),
                 stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
                 cancel_check=lambda: self._storage_download_cancelled(job_id),
                 transfer_callback=report_rclone_transfer,
@@ -2358,7 +2291,6 @@ class StorageExecutorMixin:
         preserve_structure: bool,
         photo_names: set[str],
         sender_profiles: list[str],
-        expected_fingerprints: dict[str, str],
         sender_runtimes: dict[str, Any],
         storage_profile: str,
         target_chat: str,
@@ -2673,47 +2605,6 @@ class StorageExecutorMixin:
                     with self._lock:
                         if job_id in self._cancel_requested:
                             return
-                    current = normalize_session_fingerprints(
-                        self.available_storage_session_fingerprints([profile])
-                    )
-                    if current.get(profile) != expected_fingerprints.get(profile):
-                        with lanes_lock:
-                            active_lanes.discard(profile)
-                            has_alternative = bool(active_lanes)
-                        persist(
-                            relative,
-                            path.name,
-                            status="failed",
-                            attempt=attempt,
-                            profile=profile,
-                            retryable=True,
-                            error_code="PROFILE_UPLOAD_SESSION_CHANGED",
-                            error_message="Sesi Upload berubah sebelum file dikirim.",
-                        )
-                        if has_alternative:
-                            persist(
-                                relative,
-                                path.name,
-                                status="pending",
-                                attempt=attempt + 1,
-                                retryable=True,
-                                error_code="PROFILE_UPLOAD_SESSION_CHANGED",
-                                error_message="Sesi Upload berubah sebelum file dikirim.",
-                            )
-                            with lane_condition:
-                                tasks.put({**task, "attempt": attempt + 1})
-                                lane_condition.notify_all()
-                        else:
-                            finish_item(
-                                task,
-                                status="failed",
-                                profile=profile,
-                                retryable=True,
-                                error_code="PROFILE_UPLOAD_SESSION_CHANGED",
-                                error_message="Sesi Upload berubah sebelum file dikirim.",
-                            )
-                        continue
-
                     with lanes_lock:
                         if profile not in active_lanes:
                             with lane_condition:
@@ -2842,7 +2733,12 @@ class StorageExecutorMixin:
                         upload_kwargs["resolve_after_id"] = resolve_after_id
                     try:
                         with runtime.upload_operation_lock:
-                            with self._capture_tdl_output(client):
+                            with self._capture_tdl_output(
+                                client,
+                                command_callback=self._command_callback(
+                                    profile=profile, runtime="upload"
+                                ),
+                            ):
                                 with self._capture_tdl_progress(client, transfer_progress):
                                     uploaded = client.upload(
                                         path,
