@@ -455,8 +455,7 @@ class RcloneRunner:
                 raise RcloneError("Worker tidak dapat memeriksa folder tujuan Quick Mode.", code="RCLONE_ACCESS_FAILED")
             return result
 
-        if create_new and not created_by_job:
-            parent_name, _, child_name = normalized.rpartition("/")
+        def list_children(parent_name: str) -> list[object]:
             parent, _ = self._remote_path(destination, parent_name)
             listing = run(
                 [
@@ -471,6 +470,11 @@ class RcloneRunner:
                 raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
             if not isinstance(entries, list):
                 raise RcloneError("Worker menerima listing rclone yang tidak valid.")
+            return entries
+
+        if create_new and not created_by_job:
+            parent_name, _, child_name = normalized.rpartition("/")
+            entries = list_children(parent_name)
             if any(
                 isinstance(entry, dict) and str(entry.get("Name") or "") == child_name
                 for entry in entries
@@ -487,19 +491,8 @@ class RcloneRunner:
             # A selected existing folder must still be present when execution
             # starts; don't silently create a missing path during upload.
             parent_name, _, child_name = normalized.rpartition("/")
-            parent, _ = self._remote_path(destination, parent_name)
-            listing = run(
-                [
-                    "rclone", "lsjson", parent, "--max-depth", "1", "--no-modtime",
-                    "--no-mimetype", "--config", str(config), "--log-level", "ERROR",
-                ],
-                "rclone-quickmode-target-check",
-            )
-            try:
-                entries = json.loads(getattr(listing, "stdout", "") or "[]")
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
-            if not isinstance(entries, list) or not any(
+            entries = list_children(parent_name)
+            if not any(
                 isinstance(entry, dict)
                 and str(entry.get("Name") or "") == child_name
                 and entry.get("IsDir") is True
