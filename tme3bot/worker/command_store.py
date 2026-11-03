@@ -404,7 +404,7 @@ class WorkerCommandStore:
             raise ValueError("Storage upload checkpoint requires a safe relative file path.")
         if status not in {
             "pending", "sending", "resolving", "accepted", "succeeded",
-            "failed", "needs_reconciliation",
+            "failed", "needs_reconciliation", "skipped",
         }:
             raise ValueError("Unknown Storage upload item status")
         selected_attempt = max(0, int(attempt))

@@ -342,12 +342,15 @@ class WorkerJobExecutor(
                         key: item.get(key)
                         for key in (
                             "path", "name", "status", "attempt", "profile", "retryable",
-                            "error_code", "error", "message_id", "attempts",
+                            "error_code", "error", "reason_code", "reason", "message_id", "attempts",
                         )
                     }
                     | {
                         key: (item.get("uploaded_item") or {}).get(key)
-                        for key in ("provider", "upload_status", "cleanup_status", "target_path")
+                        for key in (
+                            "provider", "upload_status", "cleanup_status", "target_path",
+                            "reason_code", "reason",
+                        )
                     }
                     for item in raw_items
                 ]
@@ -360,7 +363,15 @@ class WorkerJobExecutor(
                             "storage.item_uploaded",
                             result={"item": uploaded_item},
                         )
+                    elif item.get("status") == "skipped" and isinstance(uploaded_item, dict):
+                        publisher.emit(
+                            job_id,
+                            "running",
+                            "storage.item_skipped",
+                            result={"item": uploaded_item},
+                        )
                 succeeded = sum(item.get("status") == "succeeded" for item in items)
+                skipped = sum(item.get("status") == "skipped" for item in items)
                 incomplete = any(
                     item.get("status") in {"pending", "failed", "needs_reconciliation"}
                     for item in items
@@ -375,7 +386,10 @@ class WorkerJobExecutor(
                 )
                 if items and not incomplete:
                     outcome = "succeeded"
-                    message = "Upload Storage pulih dari checkpoint; semua file sudah terkonfirmasi."
+                    message = (
+                        f"Upload Storage pulih dari checkpoint: {succeeded} berhasil, "
+                        f"{skipped} dilewati; semua item selesai."
+                    )
                     event_status = "succeeded"
                     error = None
                 else:
@@ -396,6 +410,7 @@ class WorkerJobExecutor(
                     "outcome": outcome,
                     "total": len(items),
                     "succeeded": succeeded,
+                    "skipped": skipped,
                     "failed": [
                         item for item in items
                         if item.get("status") in {"failed", "needs_reconciliation"}
@@ -411,9 +426,10 @@ class WorkerJobExecutor(
                     progress={
                         "phase": outcome,
                         "message": message,
-                        "overall": {"current": succeeded, "total": len(items), "unit": "files"},
+                        "overall": {"current": succeeded + skipped, "total": len(items), "unit": "files"},
                         "counters": {
                             "succeeded": succeeded,
+                            "skipped": skipped,
                             "failed": sum(
                                 item.get("status") in {"failed", "needs_reconciliation"}
                                 for item in items

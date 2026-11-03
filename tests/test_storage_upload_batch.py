@@ -265,7 +265,7 @@ class StorageUploadBatchTests(unittest.TestCase):
         })
         return command
 
-    def test_rclone_upload_is_per_file_durable_and_never_overwrites_existing_target(self):
+    def test_rclone_upload_skips_existing_target_and_continues_without_overwriting(self):
         self._add_files("conflict.bin", "success.bin")
         _FakeRcloneRunner.instances = []
         _FakeRcloneRunner.behavior = {"existing": {"nested/conflict.bin"}}
@@ -275,12 +275,34 @@ class StorageUploadBatchTests(unittest.TestCase):
             result = uploader._storage_upload(command)
         self.assertEqual(result["provider"], "rclone")
         self.assertEqual(result["succeeded"], 1)
-        self.assertEqual(result["items"][0]["status"], "failed")
-        self.assertEqual(result["items"][0]["error_code"], "STORAGE_TARGET_CONFLICT")
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["items"][0]["status"], "skipped")
+        self.assertEqual(result["items"][0]["upload_status"], "skipped")
+        self.assertEqual(result["items"][0]["reason_code"], "STORAGE_TARGET_EXISTS")
+        self.assertEqual(result["failed"], [])
         self.assertEqual(_FakeRcloneRunner.instances[0].copies, ["success.bin"])
         persisted = {item["path"]: item for item in self.store.storage_upload_items("storage-command")}
-        self.assertEqual(persisted["conflict.bin"]["status"], "failed")
+        self.assertEqual(persisted["conflict.bin"]["status"], "skipped")
         self.assertEqual(persisted["success.bin"]["status"], "succeeded")
+
+    def test_rclone_move_keeps_source_when_target_already_exists(self):
+        self._add_files("already-there.bin", "new.bin")
+        _FakeRcloneRunner.instances = []
+        _FakeRcloneRunner.behavior = {"existing": {"nested/already-there.bin"}}
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = self._rclone_command(uploader, transfer_mode="move")
+
+        with patch("tme3bot.worker.executor_storage.RcloneRunner", _FakeRcloneRunner):
+            result = uploader._storage_upload(command)
+
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(_FakeRcloneRunner.instances[0].copies, ["new.bin"])
+        self.assertTrue((self.workspace / "already-there.bin").exists())
+        skipped = next(item for item in result["items"] if item["name"] == "already-there.bin")
+        self.assertEqual(skipped["cleanup_status"], "retained_existing_target")
+        persisted = {item["path"]: item for item in self.store.storage_upload_items("storage-command")}
+        self.assertEqual(persisted["already-there.bin"]["status"], "skipped")
 
     def test_rclone_storage_upload_publishes_active_file_and_batch_transfer_metrics(self):
         self._add_files("one.bin", "two.bin")
@@ -689,6 +711,20 @@ class StorageUploadBatchTests(unittest.TestCase):
         )
         self.store.record_storage_upload_item(
             command_id,
+            "already-there.txt",
+            file_name="already-there.txt",
+            status="skipped",
+            attempt=1,
+            result_item={
+                "name": "already-there.txt",
+                "status": "skipped",
+                "upload_status": "skipped",
+                "reason_code": "STORAGE_TARGET_EXISTS",
+                "reason": "File sudah ada di tujuan.",
+            },
+        )
+        self.store.record_storage_upload_item(
+            command_id,
             "uncertain.txt",
             file_name="uncertain.txt",
             status="sending",
@@ -714,7 +750,7 @@ class StorageUploadBatchTests(unittest.TestCase):
             for event in emitted
             if event[0] == "emit"
             and len(event[1]) > 2
-            and event[1][2] == "storage.item_uploaded"
+            and event[1][2] in {"storage.item_uploaded", "storage.item_skipped"}
         ]
         terminal_events = [
             (event[1], event[2])
@@ -723,15 +759,19 @@ class StorageUploadBatchTests(unittest.TestCase):
             and len(event[1]) > 2
             and event[1][2] == "storage.batch_interrupted"
         ]
-        self.assertEqual(len(item_events), 1)
+        self.assertEqual(len(item_events), 2)
+        self.assertEqual({event[0][2] for event in item_events}, {"storage.item_uploaded", "storage.item_skipped"})
         self.assertEqual(len(terminal_events), 1)
         result_items = terminal_events[0][1]["result"]["value"]["items"]
         item_status = {item["name"]: item for item in result_items}
         self.assertEqual(item_status["done.txt"]["status"], "succeeded")
+        self.assertEqual(item_status["already-there.txt"]["status"], "skipped")
+        self.assertEqual(item_status["already-there.txt"]["reason_code"], "STORAGE_TARGET_EXISTS")
         self.assertEqual(item_status["waiting.txt"]["status"], "pending")
         self.assertTrue(item_status["waiting.txt"]["retryable"])
         self.assertEqual(item_status["uncertain.txt"]["status"], "needs_reconciliation")
         self.assertFalse(item_status["uncertain.txt"]["retryable"])
+        self.assertEqual(terminal_events[0][1]["result"]["value"]["skipped"], 1)
         self.assertEqual(self.store.list_storage_reconciliation_commands(), [])
 
     def _prepare_reconcile(self, names, messages, *, caption_override=False, export_failure=False):

@@ -97,6 +97,7 @@
   function storageStatusLabel(status: string): string {
     return ({
       succeeded: 'Berhasil', failed: 'Gagal', pending: 'Menunggu', sending: 'Mengirim',
+      skipped: 'Dilewati · target sudah ada', retained_existing_target: 'Sumber disimpan · target sudah ada',
       partial: 'Selesai sebagian', cancelled: 'Dibatalkan', deleted: 'Dihapus',
       needs_reconciliation: 'Perlu verifikasi',
       retained_conflict: 'Disimpan · target bentrok', retained_ambiguous: 'Disimpan · hasil belum pasti',
@@ -510,14 +511,14 @@
                 <article class="rounded-lg border border-[var(--line)] p-3">
                   <div class="flex flex-wrap items-center gap-2">
                     <b class="break-all text-sm">{item.name || item.path || `File ${index + 1}`}</b>
-                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'needs_reconciliation' || item.status === 'failed' ? 'failed' : 'queued'}`}>{storageStatusLabel(item.status || 'unknown')}</span>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'skipped' ? 'skipped' : item.status === 'needs_reconciliation' || item.status === 'failed' ? 'failed' : 'queued'}`}>{storageStatusLabel(item.status || 'unknown')}</span>
                     {#if item.upload_status}<span class="muted text-xs">Upload: {storageStatusLabel(item.upload_status)}</span>{/if}
                     {#if item.cleanup_status && item.cleanup_status!=='not_requested'}<span class={`text-xs font-semibold ${item.cleanup_status==='deleted'?'text-emerald-700':'text-amber-700'}`}>Sumber: {storageStatusLabel(item.cleanup_status)}</span>{/if}
                     {#if item.profile}<span class="muted text-xs">Upload {item.profile}</span>{/if}
                     <span class="muted text-xs">Percobaan {item.attempt || 0}</span>
                     {#if item.retryable}<span class="text-xs font-semibold text-amber-700">Bisa diulang dengan aman</span>{/if}
                   </div>
-                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{:else if item.reason}<p class="mt-1 break-words text-sm muted">{item.reason}</p>{/if}
                   {#if item.attempts?.length}
                     <details class="mt-2">
                       <summary class="muted cursor-pointer text-xs">Riwayat percobaan ({item.attempts.length})</summary>

@@ -986,7 +986,9 @@ class StorageExecutorMixin:
 
         completed = 0
         successes = 0
+        skipped = 0
         failures: list[dict[str, Any]] = []
+        skipped_items: list[dict[str, Any]] = []
         output_items: list[dict[str, Any]] = []
         previous = {str(item.get("path") or ""): item for item in read_items(command_id) if isinstance(item, dict)}
         file_sizes: list[int | None] = []
@@ -1004,7 +1006,7 @@ class StorageExecutorMixin:
         reporter = ProgressReporter(self.publisher, job_id)
         reporter.report(phase="uploading", message=f"Menyiapkan {len(files)} file untuk rclone",
                         overall={"current": 0, "total": len(files), "percent": 0, "unit": "files", "bytes_total": total_bytes},
-                        counters={"succeeded": 0, "failed": 0}, force=True)
+                        counters={"succeeded": 0, "failed": 0, "skipped": 0}, force=True)
         active_file_index = 1
 
         def cancelled() -> bool:
@@ -1033,7 +1035,7 @@ class StorageExecutorMixin:
                             transfer=reporter.transfer_metrics(
                                 current_bytes=current_size, total_bytes=current_size, percent=100,
                             ),
-                            counters={"succeeded": successes, "failed": len(failures)}, force=True)
+                            counters={"succeeded": successes, "failed": len(failures), "skipped": skipped}, force=True)
 
         def transfer_progress(index: int, path: Path, value: dict[str, object]) -> None:
             current_size = file_sizes[index - 1] if len(file_sizes) == len(files) else None
@@ -1081,7 +1083,7 @@ class StorageExecutorMixin:
                     eta_seconds=value.get("eta_seconds"),
                     percent=percent,
                 ),
-                counters={"succeeded": successes, "failed": len(failures)},
+                counters={"succeeded": successes, "failed": len(failures), "skipped": skipped},
             )
 
         runner = RcloneRunner(log_callback=self._append_job_log, command_callback=self._command_callback(runtime="rclone_storage"),
@@ -1148,11 +1150,44 @@ class StorageExecutorMixin:
                     failures.append(item); output_items.append(item); completed += 1
                     continue
                 if target_exists:
-                    item.update(status="failed", upload_status="failed", cleanup_status="retained_conflict" if transfer_mode == "move" else "not_requested",
-                                error_code="STORAGE_TARGET_CONFLICT", error="File dengan nama ini sudah ada di tujuan.")
-                    persist(command_id, relative, file_name=path.name, status="failed", attempt=attempt, retryable=False,
-                            error_code="STORAGE_TARGET_CONFLICT", error_message=item["error"], result_item=item)
-                    failures.append(item); output_items.append(item); completed += 1
+                    item.update(
+                        status="skipped",
+                        upload_status="skipped",
+                        cleanup_status="retained_existing_target" if transfer_mode == "move" else "not_requested",
+                        reason_code="STORAGE_TARGET_EXISTS",
+                        reason="File dengan nama ini sudah ada di tujuan; file dilewati tanpa menimpa.",
+                    )
+                    persist(
+                        command_id, relative, file_name=path.name, status="skipped",
+                        attempt=attempt, retryable=False, result_item=item,
+                    )
+                    skipped += 1
+                    skipped_items.append(item)
+                    output_items.append(item)
+                    completed += 1
+                    reporter.report(
+                        phase="uploading",
+                        message=f"Melewati {path.name} — sudah ada di tujuan",
+                        overall={
+                            "current": completed,
+                            "total": len(files),
+                            "percent": completed * 100 / len(files) if files else 100,
+                            "unit": "files",
+                            "files_current": completed,
+                            "files_total": len(files),
+                            "bytes_current": completed_bytes,
+                            "bytes_total": total_bytes,
+                        },
+                        item={
+                            "name": path.name,
+                            "target_path": remote_name,
+                            "index": index,
+                            "total": len(files),
+                            "status": "skipped",
+                        },
+                        counters={"succeeded": successes, "failed": len(failures), "skipped": skipped},
+                        force=True,
+                    )
                     continue
 
                 if not must_verify_only:
@@ -1235,16 +1270,17 @@ class StorageExecutorMixin:
                                              "bytes_total": total_bytes},
                                     item={"name": path.name, "target_path": remote_name, "index": index, "total": len(files), "status": item["upload_status"],
                                           "cleanup_status": item["cleanup_status"]},
-                                    counters={"succeeded": successes, "failed": len(failures)}, force=True)
+                                    counters={"succeeded": successes, "failed": len(failures), "skipped": skipped}, force=True)
                 except Exception:
                     LOGGER.warning("Could not publish rclone Storage progress for %s", job_id, exc_info=True)
             ambiguous = any(item.get("status") == "needs_reconciliation" or item.get("upload_status") == "needs_reconciliation" for item in failures)
-            outcome = "succeeded" if not failures else "partial_failure" if successes else "needs_reconciliation" if ambiguous else "failed"
-            reporter.report(phase=outcome, message=f"rclone selesai: {successes} berhasil, {len(failures)} belum terkonfirmasi",
+            outcome = "succeeded" if not failures else "partial_failure" if successes or skipped else "needs_reconciliation" if ambiguous else "failed"
+            reporter.report(phase=outcome, message=f"rclone selesai: {successes} berhasil, {skipped} dilewati, {len(failures)} belum terkonfirmasi",
                             overall={"current": len(files), "total": len(files), "percent": 100 if files else 100, "unit": "files"},
-                            counters={"succeeded": successes, "failed": len(failures)}, force=True)
+                            counters={"succeeded": successes, "failed": len(failures), "skipped": skipped}, force=True)
             return {"outcome": outcome, "provider": "rclone", "transfer_mode": transfer_mode,
                     "target_path": rclone_path, "total": len(files), "succeeded": successes,
+                    "skipped": skipped, "skipped_items": skipped_items,
                     "failed": failures, "items": output_items, "retryable": False}
         finally:
             with self._lock:

@@ -103,6 +103,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .badge.running,.badge.queued,.badge.dispatched { background: #fff3cf; color: #9b6400; }.dark .badge.running,.dark .badge.queued,.dark .badge.dispatched { background: #4c3910; color: #ffe083; }
 .badge.paused { background: #e9e8ff; color: #5144b6; }.dark .badge.paused { background: #302b63; color: #c9c4ff; }
 .badge.cancelled { background: #eceff3; color: #647084; }
+.badge.skipped { background: #e8edf7; color: #435779; }.dark .badge.skipped { background: #28354c; color: #c5d3ef; }
 
 .page-enter { animation: page-enter .34s ease-out both; }
 .record-card { border: 1px solid var(--line); border-radius: .9rem; background: color-mix(in srgb, var(--panel-strong) 82%, transparent); padding: 1rem; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }

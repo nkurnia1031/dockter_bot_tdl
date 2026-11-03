@@ -149,6 +149,7 @@ describe('JobTable', () => {
         { path: 'safe.txt', name: 'safe.txt', status: 'failed', attempt: 1, retryable: true, error: 'File gagal sebelum dikirim.' },
         { path: 'ambiguous.txt', name: 'ambiguous.txt', status: 'needs_reconciliation', upload_status: 'needs_reconciliation', cleanup_status: 'retained_ambiguous', attempt: 2, profile: 'archive', retryable: false, error: 'Hasil belum pasti.' },
         { path: 'changed.txt', name: 'changed.txt', status: 'succeeded', upload_status: 'succeeded', cleanup_status: 'skipped_source_changed', attempt: 1, retryable: false },
+        { path: 'exists.txt', name: 'exists.txt', status: 'skipped', upload_status: 'skipped', cleanup_status: 'retained_existing_target', reason_code: 'STORAGE_TARGET_EXISTS', reason: 'File sudah ada di tujuan; file dilewati tanpa menimpa.', attempt: 1, retryable: false },
       ] } }
     };
     vi.stubGlobal('confirm', vi.fn(() => true));
@@ -180,6 +181,10 @@ describe('JobTable', () => {
     expect(screen.getByText('Perlu verifikasi')).toBeTruthy();
     expect(screen.getByText('Upload: Perlu verifikasi')).toBeTruthy();
     expect(screen.getByText('Sumber: Dilewati · sumber berubah')).toBeTruthy();
+    expect(screen.getByText('exists.txt')).toBeTruthy();
+    expect(screen.getByText('Dilewati · target sudah ada')).toBeTruthy();
+    expect(screen.getByText('File sudah ada di tujuan; file dilewati tanpa menimpa.')).toBeTruthy();
+    expect(screen.getByText('Sumber: Sumber disimpan · target sudah ada')).toBeTruthy();
   });
 
   it('shows completed Storage download results per file in the report', async () => {
