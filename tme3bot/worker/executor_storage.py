@@ -46,6 +46,12 @@ class _StorageDownloadFailure(RuntimeError):
         super().__init__(message)
 
 
+def _storage_upload_target_path(root: Path, path: Path, preserve_structure: bool) -> str:
+    """Return the destination-relative file path used for duplicate checks."""
+    _, relative_parent = storage_logical_folder(root, path, "", preserve_structure)
+    return PurePosixPath(relative_parent, path.name).as_posix()
+
+
 class StorageExecutorMixin:
 
     @staticmethod
@@ -1545,6 +1551,12 @@ class StorageExecutorMixin:
         file_sizes = {path: path.stat().st_size for path in files}
         total_bytes = sum(file_sizes.values())
         failed, succeeded = [], 0
+        skipped_items: list[dict[str, Any]] = []
+        occupied_targets = {
+            str(item).replace("\\", "/").strip("/")
+            for item in payload.get("_existing_storage_target_paths", [])
+            if isinstance(item, str) and str(item).strip()
+        }
         uploaded_items: list[dict[str, Any]] = []
         completed_bytes = 0
         last_message_id: int | None = None
@@ -1592,6 +1604,59 @@ class StorageExecutorMixin:
                         if str(command["job_id"]) in self._cancel_requested:
                             raise QuickModeError("Upload dibatalkan oleh user.")
                     size = file_sizes[path]
+                    target_path = _storage_upload_target_path(
+                        root, path, preserve_structure
+                    )
+                    if target_path in occupied_targets:
+                        completed_bytes += size
+                        skipped_item = {
+                            "path": path.relative_to(root).as_posix(),
+                            "name": path.name,
+                            "provider": "telegram",
+                            "upload_status": "skipped",
+                            "target_path": target_path,
+                            "cleanup_status": (
+                                "retained_existing_target"
+                                if payload.get("transfer_mode") == "move"
+                                else "not_requested"
+                            ),
+                            "reason_code": "STORAGE_TARGET_EXISTS",
+                            "reason": "File dengan nama ini sudah ada di folder tujuan; file dilewati tanpa menimpa.",
+                        }
+                        skipped_items.append(skipped_item)
+                        progress_payload = reporter.report(
+                            phase="uploading",
+                            message=f"Melewati {path.name} — sudah ada di tujuan",
+                            overall={
+                                "current": index,
+                                "total": len(files),
+                                "percent": completed_bytes * 100 / total_bytes if total_bytes else 100,
+                                "unit": "files",
+                                "bytes_current": completed_bytes,
+                                "bytes_total": total_bytes,
+                            },
+                            item={
+                                "name": path.name,
+                                "path": skipped_item["path"],
+                                "target_path": target_path,
+                                "index": index,
+                                "total": len(files),
+                                "size_bytes": size,
+                            },
+                            counters={
+                                "succeeded": succeeded,
+                                "failed": len(failed),
+                                "skipped": len(skipped_items),
+                            },
+                            force=True,
+                        )
+                        reporter.milestone(
+                            "storage.item_skipped",
+                            progress=progress_payload,
+                            result={"item": skipped_item},
+                        )
+                        continue
+                    occupied_targets.add(target_path)
                     upload_state = {"phase": "uploading"}
                     reporter.reset_transfer()
 
@@ -1907,7 +1972,7 @@ class StorageExecutorMixin:
                         )
         reporter.report(
             phase="completed",
-            message=f"Upload selesai: {succeeded} berhasil, {len(failed)} gagal",
+            message=f"Upload selesai: {succeeded} berhasil, {len(skipped_items)} dilewati, {len(failed)} gagal",
             overall={
                 "current": len(files),
                 "total": len(files),
@@ -1916,12 +1981,14 @@ class StorageExecutorMixin:
                 "bytes_current": total_bytes,
                 "bytes_total": total_bytes,
             },
-            counters={"succeeded": succeeded, "failed": len(failed)},
+            counters={"succeeded": succeeded, "failed": len(failed), "skipped": len(skipped_items)},
             force=True,
         )
         return {
             "total": len(files),
             "succeeded": succeeded,
+            "skipped": len(skipped_items),
+            "skipped_items": skipped_items,
             "failed": failed,
             "provider": "telegram",
             "uploaded_items": uploaded_items,
@@ -2570,6 +2637,7 @@ class StorageExecutorMixin:
         completed_files = 0
         succeeded = 0
         failed_count = 0
+        skipped_count = 0
         in_flight = 0
         active_items: dict[str, dict[str, Any]] = {}
         lane_condition = threading.Condition(lanes_lock)
@@ -2606,6 +2674,12 @@ class StorageExecutorMixin:
         # Capture only filesystem metadata before sending. TDL streams file
         # contents; pre-hashing the whole batch delays every upload.
         tasks: queue.Queue[dict[str, Any]] = queue.Queue()
+        skipped_tasks: list[dict[str, Any]] = []
+        occupied_targets = {
+            str(item).replace("\\", "/").strip("/")
+            for item in payload.get("_existing_storage_target_paths", [])
+            if isinstance(item, str) and str(item).strip()
+        }
         for path in files:
             relative = path.relative_to(root).as_posix()
             base_attempt = base_attempts[relative]
@@ -2622,13 +2696,21 @@ class StorageExecutorMixin:
                 metadata[relative] = size
                 source_identities[relative] = identity
                 file_sizes[path] = size
-                tasks.put(
-                    {
-                        "path": path,
-                        "relative": relative,
-                        "attempt": base_attempt + 1,
-                    }
+                target_path = _storage_upload_target_path(
+                    root, path, preserve_structure
                 )
+                task = {
+                    "path": path,
+                    "relative": relative,
+                    "target_path": target_path,
+                    "attempt": base_attempt + 1,
+                }
+                if target_path in occupied_targets:
+                    task["attempt"] = base_attempt
+                    skipped_tasks.append(task)
+                else:
+                    occupied_targets.add(target_path)
+                    tasks.put(task)
             except Exception:
                 persist(
                     relative,
@@ -2705,6 +2787,7 @@ class StorageExecutorMixin:
                     current_bytes = completed_bytes + sum(active_bytes.values())
                     success_count = succeeded
                     failure_count = failed_count
+                    skipped_total = skipped_count
                     active_items_snapshot = sorted(
                         (dict(active) for active in active_items.values()),
                         key=lambda active: (
@@ -2726,7 +2809,11 @@ class StorageExecutorMixin:
                     overall=overall,
                     item=item,
                     transfer=transfer,
-                    counters={"succeeded": success_count, "failed": failure_count},
+                    counters={
+                        "succeeded": success_count,
+                        "failed": failure_count,
+                        "skipped": skipped_total,
+                    },
                     extra={"active_items": active_items_snapshot},
                     force=force,
                     indeterminate=item_percent is None and phase in {"sending", "resolving_message"},
@@ -2743,11 +2830,28 @@ class StorageExecutorMixin:
             message_id: int | None = None,
             uploaded_item: dict[str, Any] | None = None,
         ) -> None:
-            nonlocal completed_bytes, completed_files, succeeded, failed_count
+            nonlocal completed_bytes, completed_files, succeeded, failed_count, skipped_count
             path = task["path"]
             relative = task["relative"]
             attempt = int(task.get("attempt") or 0)
-            if status == "succeeded" and uploaded_item is not None:
+            if status == "skipped":
+                cleanup_status = (
+                    "retained_existing_target"
+                    if payload.get("transfer_mode") == "move"
+                    else "not_requested"
+                )
+                uploaded_item = {
+                    "path": relative,
+                    "name": path.name,
+                    "provider": "telegram",
+                    "upload_status": "skipped",
+                    "target_path": str(task.get("target_path") or relative),
+                    "cleanup_status": cleanup_status,
+                    "reason_code": error_code or "STORAGE_TARGET_EXISTS",
+                    "reason": error_message or "File dengan nama ini sudah ada di folder tujuan; file dilewati tanpa menimpa.",
+                    "source_identity": source_identities.get(relative, {}),
+                }
+            elif status == "succeeded" and uploaded_item is not None:
                 uploaded_item = {
                     **uploaded_item, "provider": "telegram", "upload_status": "succeeded",
                     "cleanup_status": "pending" if payload.get("transfer_mode") == "move" else "not_requested",
@@ -2773,6 +2877,8 @@ class StorageExecutorMixin:
                 result_item=uploaded_item,
             )
             cleanup_status = "not_requested"
+            if status == "skipped" and isinstance(uploaded_item, dict):
+                cleanup_status = str(uploaded_item.get("cleanup_status") or cleanup_status)
             if status == "succeeded" and payload.get("transfer_mode") == "move" and uploaded_item is not None:
                 cleanup_status = self._storage_move_cleanup(
                     path, root, source_identities.get(relative, {})
@@ -2789,6 +2895,8 @@ class StorageExecutorMixin:
                 completed_bytes += int(file_sizes.get(path, 0))
                 if status == "succeeded":
                     succeeded += 1
+                elif status == "skipped":
+                    skipped_count += 1
                 else:
                     failed_count += 1
                 outcome: dict[str, Any] = {
@@ -2800,10 +2908,12 @@ class StorageExecutorMixin:
                     "retryable": bool(retryable),
                     "error_code": error_code,
                     "error": error_message,
+                    "reason_code": error_code if status == "skipped" else "",
+                    "reason": error_message if status == "skipped" else "",
                     "message_id": message_id,
                     "attempts": [],
                     "upload_status": status,
-                    "cleanup_status": cleanup_status if status == "succeeded" else (
+                    "cleanup_status": cleanup_status if status in {"succeeded", "skipped"} else (
                         "retained_ambiguous" if status == "needs_reconciliation" and payload.get("transfer_mode") == "move"
                         else "retained_upload_failed" if payload.get("transfer_mode") == "move"
                         else "not_requested"
@@ -2811,8 +2921,32 @@ class StorageExecutorMixin:
                     "source_identity": source_identities.get(relative, {}),
                 }
                 outcomes[relative] = outcome
-                if uploaded_item is not None:
+                if status == "succeeded" and uploaded_item is not None:
                     uploaded_by_path[relative] = dict(uploaded_item)
+            if status == "skipped" and isinstance(uploaded_item, dict):
+                try:
+                    self.publisher.emit(
+                        job_id,
+                        "running",
+                        "storage.item_skipped",
+                        result={"item": uploaded_item, "file": outcome},
+                    )
+                except Exception:
+                    LOGGER.warning(
+                        "Storage file %s was skipped but its item event could not be queued",
+                        path.name,
+                        exc_info=True,
+                    )
+
+        for task in skipped_tasks:
+            finish_item(
+                task,
+                status="skipped",
+                profile="",
+                retryable=False,
+                error_code="STORAGE_TARGET_EXISTS",
+                error_message="File dengan nama ini sudah ada di folder tujuan; file dilewati tanpa menimpa.",
+            )
 
         def worker_for_lane(profile: str) -> None:
             runtime = sender_runtimes[profile]
@@ -3203,21 +3337,29 @@ class StorageExecutorMixin:
         result_items_raw = read_items(command_id)
         result_items = []
         for item in result_items_raw:
-            result_items.append(
-                {
-                    key: item.get(key)
-                    for key in (
-                        "path", "name", "status", "attempt", "profile", "retryable",
-                        "error_code", "error", "message_id", "attempts",
-                    )
-                }
-            )
+            result_item = {
+                key: item.get(key)
+                for key in (
+                    "path", "name", "status", "attempt", "profile", "retryable",
+                    "error_code", "error", "message_id", "attempts",
+                )
+            }
+            uploaded_item = item.get("uploaded_item")
+            if item.get("status") == "skipped" and isinstance(uploaded_item, dict):
+                result_item.update({
+                    "reason_code": str(item.get("error_code") or "STORAGE_TARGET_EXISTS"),
+                    "reason": str(item.get("error") or "File sudah ada di folder tujuan."),
+                    "target_path": uploaded_item.get("target_path"),
+                    "cleanup_status": uploaded_item.get("cleanup_status"),
+                })
+            result_items.append(result_item)
         result_items.sort(key=lambda item: str(item.get("path") or ""))
         uploaded_items = [
             uploaded_by_path[relative]
             for relative in sorted(uploaded_by_path)
         ]
         file_succeeded = sum(item.get("status") == "succeeded" for item in result_items)
+        file_skipped = sum(item.get("status") == "skipped" for item in result_items)
         failure_items = [
             item
             for item in result_items
@@ -3239,7 +3381,7 @@ class StorageExecutorMixin:
 
         reporter.report(
             phase=outcome,
-            message=f"Upload selesai: {file_succeeded} berhasil, {len(failure_items)} belum berhasil",
+            message=f"Upload selesai: {file_succeeded} berhasil, {file_skipped} dilewati, {len(failure_items)} belum berhasil",
             overall={
                 "current": len(result_items),
                 "total": len(files),
@@ -3248,13 +3390,14 @@ class StorageExecutorMixin:
                 "bytes_current": total_bytes,
                 "bytes_total": total_bytes,
             },
-            counters={"succeeded": file_succeeded, "failed": len(failure_items)},
+            counters={"succeeded": file_succeeded, "failed": len(failure_items), "skipped": file_skipped},
             force=True,
         )
         return {
             "outcome": outcome,
             "total": len(result_items),
             "succeeded": file_succeeded,
+            "skipped": file_skipped,
             "failed": failure_items,
             "items": result_items,
             "retryable": retryable,

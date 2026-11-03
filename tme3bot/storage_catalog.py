@@ -342,6 +342,63 @@ class StorageCatalog:
         with self._lock, self._db() as db:
             return self._folder_path_locked(db, folder_id)
 
+    def upload_target_paths(
+        self, folder_id: int | None, *, preserve_structure: bool
+    ) -> list[str]:
+        """List active file paths relative to a Telegram upload destination."""
+        with self._lock, self._db() as db:
+            base_path = ""
+            if folder_id is None:
+                if preserve_structure:
+                    rows = db.execute(
+                        "SELECT folder,display_name FROM storage_items WHERE status='active'"
+                    ).fetchall()
+                else:
+                    rows = db.execute(
+                        "SELECT folder,display_name FROM storage_items "
+                        "WHERE status='active' AND folder_id IS NULL"
+                    ).fetchall()
+            else:
+                folder = db.execute(
+                    "SELECT status FROM storage_folders WHERE id=?", (int(folder_id),)
+                ).fetchone()
+                if folder is None or folder["status"] != "active":
+                    raise KeyError("Folder tujuan upload tidak ditemukan.")
+                base_path = self._folder_path_locked(db, int(folder_id))
+                folder_ids = (
+                    self._descendants_locked(db, int(folder_id))
+                    if preserve_structure
+                    else [int(folder_id)]
+                )
+                placeholders = ",".join("?" for _ in folder_ids)
+                rows = db.execute(
+                    "SELECT folder,display_name FROM storage_items "
+                    f"WHERE status='active' AND folder_id IN ({placeholders})",
+                    folder_ids,
+                ).fetchall()
+
+            paths: set[str] = set()
+            for row in rows:
+                name = str(row["display_name"] or "").strip()
+                if not name or "/" in name or "\\" in name:
+                    continue
+                item_folder_path = str(row["folder"] or "").strip("/")
+                if not preserve_structure:
+                    relative_folder = ""
+                elif base_path:
+                    if item_folder_path == base_path:
+                        relative_folder = ""
+                    elif item_folder_path.startswith(f"{base_path}/"):
+                        relative_folder = item_folder_path[len(base_path) + 1 :]
+                    else:
+                        continue
+                else:
+                    relative_folder = item_folder_path
+                path = PurePosixPath(relative_folder, name).as_posix()
+                if path not in {"", "."}:
+                    paths.add(path)
+            return sorted(paths)
+
     def _folder_path_locked(self, db: sqlite3.Connection, folder_id: int | None) -> str:
         names: list[str] = []
         seen: set[int] = set()

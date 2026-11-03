@@ -179,6 +179,77 @@ class StorageCatalogTests(unittest.TestCase):
             self.assertEqual(restored.status, "active")
             self.assertEqual(restored.display_name, "laporan-final.pdf")
 
+    def test_upload_target_paths_are_scoped_to_destination_and_structure_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            catalog = StorageCatalog(Path(temp_dir) / "storage.db")
+            destination = catalog.create_folder("Destination", 10)
+            nested = catalog.create_folder("Nested", 10, destination.id)
+            other = catalog.create_folder("Other", 10)
+
+            direct_values = item_values("direct")
+            direct_values.update(
+                channel_message_id=9001,
+                display_name="same.txt",
+                folder_id=destination.id,
+            )
+            catalog.insert_item(**direct_values)
+
+            nested_values = item_values("nested")
+            nested_values.update(
+                channel_message_id=9002,
+                display_name="inside.txt",
+                folder_id=nested.id,
+            )
+            catalog.insert_item(**nested_values)
+
+            trashed_values = item_values("trashed")
+            trashed_values.update(
+                channel_message_id=9003,
+                display_name="removed.txt",
+                folder_id=nested.id,
+            )
+            trashed = catalog.insert_item(**trashed_values)
+            catalog.trash_items([trashed.id], 10)
+
+            other_values = item_values("other")
+            other_values.update(
+                channel_message_id=9004,
+                display_name="outside.txt",
+                folder_id=other.id,
+            )
+            catalog.insert_item(**other_values)
+
+            root_values = item_values("root")
+            root_values.update(
+                channel_message_id=9005,
+                display_name="root.txt",
+                folder="",
+                folder_id=None,
+            )
+            catalog.insert_item(**root_values)
+
+            self.assertEqual(
+                catalog.upload_target_paths(destination.id, preserve_structure=False),
+                ["same.txt"],
+            )
+            self.assertEqual(
+                catalog.upload_target_paths(destination.id, preserve_structure=True),
+                ["Nested/inside.txt", "same.txt"],
+            )
+            self.assertEqual(
+                catalog.upload_target_paths(None, preserve_structure=False),
+                ["root.txt"],
+            )
+            self.assertEqual(
+                catalog.upload_target_paths(None, preserve_structure=True),
+                [
+                    "Destination/Nested/inside.txt",
+                    "Destination/same.txt",
+                    "Other/outside.txt",
+                    "root.txt",
+                ],
+            )
+
     def test_legacy_folder_path_migrates_to_nested_tree(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "storage.db"

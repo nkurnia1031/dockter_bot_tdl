@@ -304,6 +304,80 @@ class StorageUploadBatchTests(unittest.TestCase):
         persisted = {item["path"]: item for item in self.store.storage_upload_items("storage-command")}
         self.assertEqual(persisted["already-there.bin"]["status"], "skipped")
 
+    def test_telegram_upload_skips_only_the_existing_file_in_the_same_folder(self):
+        for relative in ("nested/already.bin", "nested/new.bin", "other/other.txt"):
+            path = self.workspace / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"body:{relative}", encoding="utf-8")
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = uploader.command(self.workspace)
+        command["payload"].update({
+            "destination_folder_path": "destination",
+            "preserve_structure": True,
+            "transfer_mode": "move",
+            "_existing_storage_target_paths": ["nested/already.bin"],
+        })
+
+        result = uploader._storage_upload(command)
+
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["succeeded"], 2)
+        self.assertEqual(result["skipped"], 1)
+        uploaded_names = [
+            name
+            for runtime in uploader.runtimes.values()
+            for name in runtime.upload_tdl_client.uploads
+        ]
+        self.assertCountEqual(uploaded_names, ["new.bin", "other.txt"])
+        skipped = next(item for item in result["items"] if item["path"] == "nested/already.bin")
+        self.assertEqual(skipped["status"], "skipped")
+        self.assertEqual(skipped["reason_code"], "STORAGE_TARGET_EXISTS")
+        self.assertEqual(skipped["cleanup_status"], "retained_existing_target")
+        self.assertTrue((self.workspace / "nested/already.bin").exists())
+        self.assertFalse((self.workspace / "nested/new.bin").exists())
+        persisted = {
+            item["path"]: item
+            for item in self.store.storage_upload_items("storage-command")
+        }
+        self.assertEqual(persisted["nested/already.bin"]["status"], "skipped")
+
+    def test_telegram_upload_skips_duplicate_target_paths_within_flattened_batch(self):
+        for relative in ("a/same.txt", "b/same.txt", "b/other.txt"):
+            path = self.workspace / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"body:{relative}", encoding="utf-8")
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = uploader.command(self.workspace)
+        command["payload"]["preserve_structure"] = False
+
+        result = uploader._storage_upload(command)
+
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["succeeded"], 2)
+        self.assertEqual(result["skipped"], 1)
+        same_target = [item for item in result["items"] if item["name"] == "same.txt"]
+        self.assertEqual([item["status"] for item in same_target].count("succeeded"), 1)
+        self.assertEqual([item["status"] for item in same_target].count("skipped"), 1)
+
+    def test_legacy_telegram_upload_skips_existing_target_and_continues(self):
+        self._add_files("already-there.bin", "new.bin")
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = uploader.command(self.workspace)
+        command.pop("command_id")
+        command["payload"].update({
+            "_existing_storage_target_paths": ["already-there.bin"],
+        })
+
+        result = uploader._storage_upload(command)
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertTrue((self.workspace / "already-there.bin").exists())
+        self.assertTrue((self.workspace / "new.bin").exists())
+        skipped = result["skipped_items"][0]
+        self.assertEqual(skipped["reason_code"], "STORAGE_TARGET_EXISTS")
+        self.assertEqual(skipped["cleanup_status"], "not_requested")
+
     def test_rclone_storage_upload_publishes_active_file_and_batch_transfer_metrics(self):
         self._add_files("one.bin", "two.bin")
         _FakeRcloneRunner.instances = []

@@ -392,6 +392,15 @@ class ControlPlane:
                     _tdl_sender_profile=execution_profile,
                     _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
                 )
+            if provider == "telegram":
+                list_targets = getattr(self.storage_catalog, "upload_target_paths", None)
+                if callable(list_targets):
+                    internal_payload["_existing_storage_target_paths"] = list_targets(
+                        internal_payload.get("destination_folder_id"),
+                        preserve_structure=bool(
+                            internal_payload.get("preserve_structure", True)
+                        ),
+                    )
         elif kind == "storage_download":
             owner_profile, selected_worker = self.resolve_target(
                 actor,

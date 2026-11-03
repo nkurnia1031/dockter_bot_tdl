@@ -320,6 +320,37 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertNotIn("_tdl_sender_session_fingerprints", payload)
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
 
+    def test_telegram_upload_dispatch_includes_catalog_paths_for_the_selected_folder(self):
+        self.authorize_quick_mode_storage()
+
+        class UploadTargetCatalog:
+            def __init__(self):
+                self.request = None
+
+            def upload_target_paths(self, folder_id, *, preserve_structure):
+                self.request = (folder_id, preserve_structure)
+                return ["nested/already.bin"]
+
+        catalog = UploadTargetCatalog()
+        self.control.storage_catalog = catalog
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {
+                "folder_path": "/workspace/biasa",
+                "destination_folder_id": 17,
+                "preserve_structure": True,
+            },
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        self.assertEqual(catalog.request, (17, True))
+        self.assertEqual(
+            self.dispatcher.commands[-1]["payload"]["_existing_storage_target_paths"],
+            ["nested/already.bin"],
+        )
+        self.assertNotIn("_existing_storage_target_paths", job.payload)
+
     def test_storage_sync_uses_selected_profile_without_session_fingerprint_gate(self):
         self.authorize_quick_mode_storage()
         self.attach_storage_readiness(profiles=("default",))
