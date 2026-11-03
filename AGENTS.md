@@ -396,28 +396,30 @@ menggunakan IP:
 ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && git pull --ff-only origin main && python3 run.py deploy worker --pull'
 ```
 
-Web static juga dideploy melalui SSH ke `138.2.34.55`, dari root project yang
-sama. Bundle diambil dari release `web-latest` GitHub Actions dan dipasang ke
-`WEB_DEPLOY_ROOT` (default `/www/wwwroot/ui.utama.naufix.space`):
+Web static sekarang berada dan dideploy pada gateway yang sama dengan backend,
+bukan pada VPS `remote-1`. Setelah GitHub Actions mem-publish release
+`web-latest`, jalankan deploy Web secara lokal dari root gateway
+`/www/wwwroot/dockter_bot_tdl`:
 
 ```bash
-ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && python3 run.py deploy web'
+python3 run.py deploy web
 ```
 
-Sebelum deploy worker atau Web, verifikasi `com.docker.compose.project.working_dir`
-dan `project` pada container worker yang sedang berjalan. Jalankan perintah
-dari root di atas agar Compose menggunakan stack dan volume data yang sama;
-jangan membuat clone/deployment project kedua. Periksa `ssh-add -l` sebelum
-koneksi. Jika private key terenkripsi belum ada di agent, muat secara
-interaktif dengan `ssh-add ~/.ssh/id_ed25519_dockter_gateway`; ketik passphrase
-hanya pada prompt terminal. Deploy rutin tidak memerlukan enrollment atau
-pembuatan key baru. Jangan tampilkan private key atau passphrase.
+Sebelum deploy gateway, verifikasi label Compose `project.working_dir` dan
+`project` pada container gateway; sebelum deploy worker, verifikasi label yang
+sama pada container `remote-1`. Selalu jalankan setiap deploy dari root yang
+ditetapkan agar Compose memakai stack dan volume data yang benar; jangan
+membuat clone/deployment project kedua. Untuk SSH ke `remote-1`, gunakan host
+key tepercaya dan agent/key yang tersedia. Deploy rutin tidak memerlukan
+enrollment atau pembuatan key baru. Jangan tampilkan private key atau
+passphrase.
 
 Perintah static deploy mengambil release `web-latest`, memverifikasi checksum,
-dan mengekstrak bundle ke `/www/wwwroot/ui.utama.naufix.space`. Ia tidak
-menjalankan pnpm, Docker web, atau mengubah/reload Nginx. Untuk repository
-private, `WEB_RELEASE_TOKEN` adalah PAT GitHub dengan akses `Contents: Read`
-dan disimpan hanya di `.env` VPS; bukan di `.env.backend` dan bukan di Git.
+dan mengekstrak bundle ke `/www/wwwroot/ui.utama.naufix.space` pada gateway.
+Ia tidak menjalankan pnpm, Docker web, atau mengubah/reload Nginx. Untuk
+repository private, `WEB_RELEASE_TOKEN` adalah PAT GitHub dengan akses
+`Contents: Read` dan disimpan hanya di `.env` gateway; bukan di `.env.backend`
+dan bukan di Git.
 Rollback UI: `python3 run.py deploy web --rollback`.
 
 ## Verifikasi
