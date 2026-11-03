@@ -50,6 +50,7 @@ dijelaskan di [Pengaturan runtime lewat Web](docs/PENGATURAN_RUNTIME.md).
 ```bash
 cat > .env <<'EOF'
 GATEWAY_DATA_ROOT=/srv/tme3bot/gateway
+GATEWAY_DB_ROOT=/srv/tme3bot/gateway-db
 LOCAL_WORKER_DATA_ROOT=/srv/tme3bot/worker-local
 EOF
 cp .env.backend.example .env.backend
@@ -78,8 +79,10 @@ Isi:
   sebagai adapter storage/backup; Telegram menggunakannya untuk UI polling.
 - `BOT_USERNAME` tanpa `@` pada backend.
 
-Data lama tetap dapat dipakai dengan menunjuk `GATEWAY_DATA_ROOT` dan
-`LOCAL_WORKER_DATA_ROOT` ke direktori lama.
+Data gateway dan worker lama tetap dapat dipakai dengan menunjuk
+`GATEWAY_DATA_ROOT` dan `LOCAL_WORKER_DATA_ROOT` ke direktori lama. Database
+SQLite gateway disimpan terpisah di `GATEWAY_DB_ROOT` agar dapat memakai disk
+berlatensi rendah tanpa memindahkan Workspace atau profile worker.
 
 Jalankan:
 

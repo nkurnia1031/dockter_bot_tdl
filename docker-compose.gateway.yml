@@ -13,11 +13,13 @@ services:
       DURABLE_DISPATCH_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
       SAFELINK_RESOLVER_ENABLED: "false"
+      STORAGE_DB_FILE: /gateway-db/storage.db
     restart: unless-stopped
     ports:
       - "${BACKEND_BIND_HOST:-0.0.0.0}:${BACKEND_HOST_PORT:-${BACKEND_PORT:-8080}}:${BACKEND_PORT:-8080}"
     volumes:
       - ${GATEWAY_DATA_ROOT:-/srv/tme3bot/gateway}:/data
+      - ${GATEWAY_DB_ROOT:-/srv/tme3bot/gateway-db}:/gateway-db
       - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${BACKEND_PORT:-8080}/healthz"]

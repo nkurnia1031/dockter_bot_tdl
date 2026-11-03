@@ -139,6 +139,15 @@ nama key dan status configured/missing.
   menyimpan worker asalnya saat dibuat, sehingga perubahan route hanya berlaku
   untuk job baru dan tidak memindahkan job aktif. `state.json` gateway adalah
   sumber kebenaran lintas VPS untuk source, `last_id`, label, dan warmup.
+- Database SQLite gateway dipasang terpisah dari profile/state dan Workspace:
+  `GATEWAY_DB_ROOT` (production: `/srv/tme3bot/gateway-db`) di-mount ke
+  `/gateway-db`, dengan `STORAGE_DB_FILE=/gateway-db/storage.db`. Lokasi ini
+  harus tetap pada filesystem persisten gateway yang berlatensi rendah; jangan
+  memindahkan database ke Workspace atau writable layer container. Data profile
+  dan state tetap mengikuti `GATEWAY_DATA_ROOT`. Salinan lama di
+  `$GATEWAY_DATA_ROOT/storage.db` dipertahankan sebagai snapshot rollback beku;
+  jangan arahkan service kembali ke sana tanpa menyalin database aktif terbaru
+  terlebih dahulu.
 
 ### Model target fitur saat ini
 
