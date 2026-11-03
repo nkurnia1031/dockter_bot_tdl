@@ -361,7 +361,12 @@ Jika base image hilang, jalankan sekali `python run.py build-base` (atau
 `python run.py publish gateway --build-base`) pada builder besar. Jangan
 menjalankan `docker compose build` di VPS target jika base image tidak ada.
 
-Di VPS gateway:
+Setelah push ke `main`, GitHub Actions memvalidasi source, mem-publish image
+gateway/worker, dan mem-publish release static Web. Deploy dilakukan dari root
+production yang benar agar Compose project dan volume yang sudah ada tetap
+digunakan.
+
+Gateway lokal berada di `/www/wwwroot/dockter_bot_tdl`. Dari direktori itu:
 
 ```bash
 git pull --ff-only origin main
@@ -369,28 +374,31 @@ python3 run.py deploy gateway --pull
 ```
 
 Gateway compose hanya menjalankan `backend`, `telegram`, dan `worker-local`.
-Setiap VPS remote menjalankan:
+Worker `remote-1` berada di VPS `138.2.34.55` dan dideploy melalui SSH dari
+root `/www/wwwroot/downloads/bot` pada host tersebut. `HostKeyAlias` memakai
+hostname worker yang sudah dipercaya untuk memvalidasi host key saat koneksi
+menggunakan IP:
 
 ```bash
-git pull --ff-only origin main
-python3 run.py deploy worker --pull
+ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && git pull --ff-only origin main && python3 run.py deploy worker --pull'
 ```
 
-Root production yang saat ini dipakai: gateway `/www/wwwroot/dockter_bot_tdl`
-dengan Compose project `tme3bot-gateway`, dan worker `remote-1`
-`/www/wwwroot/downloads/bot` dengan Compose project `bot`. Sebelum deploy,
-verifikasi `com.docker.compose.project.working_dir` dan `project` pada container
-yang sedang berjalan. Jalankan `run.py` dari root project tersebut agar Compose
-menggunakan stack dan volume data yang sama; jangan membuat clone/deployment
-project kedua. Gunakan SSH host trust dan agent/key yang sudah tersedia; deploy
-rutin tidak memerlukan enrollment atau pembuatan key baru. Jangan tampilkan
-private key atau passphrase.
-
-Static UI dipublish oleh GitHub Actions, lalu di VPS gateway/aaPanel dijalankan:
+Web static juga dideploy melalui SSH ke `138.2.34.55`, dari root project yang
+sama. Bundle diambil dari release `web-latest` GitHub Actions dan dipasang ke
+`WEB_DEPLOY_ROOT` (default `/www/wwwroot/ui.utama.naufix.space`):
 
 ```bash
-python3 run.py deploy web
+ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && python3 run.py deploy web'
 ```
+
+Sebelum deploy worker atau Web, verifikasi `com.docker.compose.project.working_dir`
+dan `project` pada container worker yang sedang berjalan. Jalankan perintah
+dari root di atas agar Compose menggunakan stack dan volume data yang sama;
+jangan membuat clone/deployment project kedua. Periksa `ssh-add -l` sebelum
+koneksi. Jika private key terenkripsi belum ada di agent, muat secara
+interaktif dengan `ssh-add ~/.ssh/id_ed25519_dockter_gateway`; ketik passphrase
+hanya pada prompt terminal. Deploy rutin tidak memerlukan enrollment atau
+pembuatan key baru. Jangan tampilkan private key atau passphrase.
 
 Perintah static deploy mengambil release `web-latest`, memverifikasi checksum,
 dan mengekstrak bundle ke `/www/wwwroot/ui.utama.naufix.space`. Ia tidak
