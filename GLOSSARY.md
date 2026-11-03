@@ -160,6 +160,10 @@ _Avoid_: deep link Telegram, link sementara.
 Jumlah file dan subfolder serta ukuran seluruh file di folder dan semua turunannya. Ukuran ditandai tidak lengkap bila ada ukuran file yang tidak diketahui.
 _Avoid_: hitungan isi langsung, total ukuran parsial tanpa penanda.
 
+**Pengelolaan remote rclone**:
+Pengaturan file dan folder pada root `rclone_destination` di worker terpilih: membuat folder, rename, copy, move, Trash, restore, dan hapus permanen. Operasi batch atau folder rekursif melaporkan hasil per item; benturan tidak menimpa data.
+_Avoid_: akses ke remote atau path di luar root yang dikonfigurasi.
+
 ## Utility
 
 **Kumpulan kandidat password arsip**:
