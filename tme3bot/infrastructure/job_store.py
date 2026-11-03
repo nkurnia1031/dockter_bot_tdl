@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from tme3bot.domain.models import Job, JobEvent, JobStatus
+from tme3bot.resource_locks import first_resource_conflict
 
 
 def _dump(value) -> str:
@@ -163,10 +164,11 @@ class SqliteJobRepository:
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS job_resource_leases (
-                    resource_key TEXT PRIMARY KEY,
+                    resource_key TEXT NOT NULL,
                     job_id TEXT NOT NULL,
                     acquired_at TEXT NOT NULL,
                     worker TEXT NOT NULL,
+                    PRIMARY KEY(resource_key, job_id),
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS quickmode_worker_limits (
@@ -288,6 +290,51 @@ class SqliteJobRepository:
                        OR payload LIKE '%\"quick_mode\": true%')
                 """
             )
+            db.commit()
+            self._ensure_resource_lease_schema(db)
+
+    @staticmethod
+    def _ensure_resource_lease_schema(db: sqlite3.Connection) -> None:
+        """Allow multiple shared holders while preserving existing leases."""
+        db.execute("BEGIN IMMEDIATE")
+        columns = db.execute("PRAGMA table_info(job_resource_leases)").fetchall()
+        primary_key = [
+            str(row["name"])
+            for row in sorted(columns, key=lambda item: int(item["pk"]))
+            if int(row["pk"])
+        ]
+        if primary_key == ["resource_key"]:
+            db.execute(
+                "ALTER TABLE job_resource_leases RENAME TO job_resource_leases_legacy"
+            )
+            db.execute(
+                """
+                CREATE TABLE job_resource_leases (
+                    resource_key TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    acquired_at TEXT NOT NULL,
+                    worker TEXT NOT NULL,
+                    PRIMARY KEY(resource_key, job_id),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                )
+                """
+            )
+            db.execute(
+                """
+                INSERT INTO job_resource_leases(
+                    resource_key, job_id, acquired_at, worker
+                )
+                SELECT resource_key, job_id, acquired_at, worker
+                FROM job_resource_leases_legacy
+                """
+            )
+            db.execute("DROP TABLE job_resource_leases_legacy")
+        elif primary_key != ["resource_key", "job_id"]:
+            raise RuntimeError("Unsupported job resource lease schema.")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS job_resource_leases_job_id "
+            "ON job_resource_leases(job_id)"
+        )
 
     def create(self, job: Job) -> Job:
         return self.create_with_private_values(job, {})
@@ -1081,32 +1128,47 @@ class SqliteJobRepository:
                     (now, job_id),
                 )
                 return {"admitted": True, "position": 1, "blocked_reason": None}
-            placeholders = ",".join("?" for _ in keys)
-            conflicts = db.execute(
-                f"SELECT resource_key, job_id FROM job_resource_leases WHERE resource_key IN ({placeholders})",
-                tuple(keys),
+            active_leases = db.execute(
+                "SELECT resource_key, job_id FROM job_resource_leases "
+                "WHERE job_id != ? ORDER BY acquired_at, job_id, resource_key",
+                (job_id,),
             ).fetchall()
-            conflicts = [item for item in conflicts if str(item["job_id"]) != job_id]
-            if conflicts:
-                queued_rows = db.execute(
-                    """
-                    SELECT p.job_id, p.concurrency_keys
-                    FROM job_execution_plans p
-                    JOIN jobs j ON j.id = p.job_id
-                    WHERE j.status = 'queued' AND j.created_at <= (
-                        SELECT created_at FROM jobs WHERE id = ?
-                    )
-                    ORDER BY j.created_at, p.priority, p.job_id
-                    """,
-                    (job_id,),
-                ).fetchall()
-                position = 1
-                for queued in queued_rows:
-                    if set(_load(queued["concurrency_keys"], [])) & keys:
-                        if str(queued["job_id"]) == job_id:
-                            break
-                        position += 1
-                reason = f"Menunggu {str(conflicts[0]['resource_key'])}"
+            active_conflict: tuple[str, str] | None = None
+            for lease in active_leases:
+                active_conflict = first_resource_conflict(
+                    keys, {str(lease["resource_key"])}
+                )
+                if active_conflict is not None:
+                    break
+
+            queued_rows = db.execute(
+                """
+                SELECT p.job_id, p.concurrency_keys
+                FROM job_execution_plans p
+                JOIN jobs j ON j.id = p.job_id
+                WHERE j.status = 'queued' AND j.archived_at IS NULL
+                  AND j.worker = ?
+                ORDER BY COALESCE(p.queued_at, j.created_at), p.priority, p.job_id
+                """,
+                (worker_name,),
+            ).fetchall()
+            position = 1
+            earlier_conflict: tuple[str, str] | None = None
+            for queued in queued_rows:
+                queued_job_id = str(queued["job_id"])
+                if queued_job_id == job_id:
+                    break
+                queued_keys = set(_load(queued["concurrency_keys"], []))
+                queue_conflict = first_resource_conflict(keys, queued_keys)
+                if queue_conflict is not None:
+                    position += 1
+                    if earlier_conflict is None:
+                        earlier_conflict = queue_conflict
+
+            if active_conflict is not None or earlier_conflict is not None:
+                blocker = active_conflict or earlier_conflict
+                assert blocker is not None
+                reason = f"Menunggu {blocker[1]}"
                 db.execute(
                     "UPDATE job_execution_plans SET blocked_reason = ? WHERE job_id = ?",
                     (reason, job_id),
@@ -1190,15 +1252,17 @@ class SqliteJobRepository:
             ).fetchone()
             if row is None or plan is None:
                 return False
-            placeholders = ",".join("?" for _ in desired)
-            conflicts = []
-            if desired:
-                conflicts = db.execute(
-                    f"SELECT resource_key, job_id FROM job_resource_leases "
-                    f"WHERE resource_key IN ({placeholders}) AND job_id != ?",
-                    (*sorted(desired), job_id),
-                ).fetchall()
-            if conflicts:
+            active_leases = db.execute(
+                "SELECT resource_key FROM job_resource_leases WHERE job_id != ?",
+                (job_id,),
+            ).fetchall()
+            if any(
+                first_resource_conflict(
+                    desired, {str(lease["resource_key"])}
+                )
+                is not None
+                for lease in active_leases
+            ):
                 return False
             db.execute("DELETE FROM job_resource_leases WHERE job_id = ?", (job_id,))
             for key in sorted(desired):

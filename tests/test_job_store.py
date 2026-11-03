@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus
 from tme3bot.infrastructure.job_store import SqliteJobRepository
 
@@ -22,6 +23,161 @@ class JobStoreTests(unittest.TestCase):
             status=JobStatus.QUEUED,
             payload={"url": "https://t.me/c/1/2"},
         )
+
+    @staticmethod
+    def create_storage_upload(
+        store: SqliteJobRepository,
+        job_id: str,
+        provider: str,
+        transfer_mode: str,
+        created_at: datetime | None = None,
+    ) -> Job:
+        payload = {
+            "provider": provider,
+            "folder_path": "/workspace/best",
+            "transfer_mode": transfer_mode,
+        }
+        queued_at = created_at or datetime.now(timezone.utc)
+        job = Job(
+            id=job_id,
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=7,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload=payload,
+            created_at=queued_at,
+            updated_at=queued_at,
+        )
+        plan = build_execution_plan(
+            job.kind, job.profile, job.worker, payload
+        ).as_dict()
+        plan["queued_at"] = queued_at.isoformat()
+        store.create_with_private_values(
+            job,
+            {},
+            execution_plan=plan,
+            command_payload={"dispatch_mode": "durable"},
+        )
+        return job
+
+    def test_storage_copy_uploads_from_telegram_and_rclone_share_a_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            telegram = self.create_storage_upload(
+                store,
+                "telegram-copy",
+                "telegram",
+                "copy",
+                datetime(2026, 1, 1, tzinfo=timezone.utc),
+            )
+            rclone = self.create_storage_upload(
+                store,
+                "rclone-copy",
+                "rclone",
+                "copy",
+                datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+            )
+            move = self.create_storage_upload(
+                store,
+                "move-after-copies",
+                "rclone",
+                "move",
+                datetime(2026, 1, 1, 0, 0, 2, tzinfo=timezone.utc),
+            )
+
+            self.assertTrue(store.try_acquire_execution(telegram.id)["admitted"])
+            store.append_event(
+                JobEvent(telegram.id, 1, JobStatus.DISPATCHED, "dispatched")
+            )
+            self.assertTrue(store.try_acquire_execution(rclone.id)["admitted"])
+            store.append_event(
+                JobEvent(rclone.id, 1, JobStatus.DISPATCHED, "dispatched")
+            )
+            self.assertFalse(store.try_acquire_execution(move.id)["admitted"])
+
+            store.release_execution(telegram.id)
+            store.append_event(JobEvent(telegram.id, 2, JobStatus.RUNNING, "started"))
+            store.append_event(JobEvent(telegram.id, 3, JobStatus.SUCCEEDED, "completed"))
+            self.assertFalse(store.try_acquire_execution(move.id)["admitted"])
+
+            store.release_execution(rclone.id)
+            store.append_event(JobEvent(rclone.id, 2, JobStatus.RUNNING, "started"))
+            store.append_event(JobEvent(rclone.id, 3, JobStatus.SUCCEEDED, "completed"))
+            self.assertTrue(store.try_acquire_execution(move.id)["admitted"])
+
+    def test_storage_move_waits_for_copies_and_later_copy_does_not_overtake(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            first_created = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            first_copy = self.create_storage_upload(
+                store, "first-copy", "telegram", "copy", first_created
+            )
+            move = self.create_storage_upload(
+                store,
+                "move",
+                "rclone",
+                "move",
+                first_created + timedelta(seconds=1),
+            )
+            later_copy = self.create_storage_upload(
+                store,
+                "later-copy",
+                "rclone",
+                "copy",
+                first_created + timedelta(seconds=2),
+            )
+
+            self.assertTrue(store.try_acquire_execution(first_copy.id)["admitted"])
+            self.assertFalse(store.try_acquire_execution(move.id)["admitted"])
+            self.assertFalse(store.try_acquire_execution(later_copy.id)["admitted"])
+
+            store.release_execution(first_copy.id)
+            self.assertTrue(store.try_acquire_execution(move.id)["admitted"])
+            self.assertFalse(store.try_acquire_execution(later_copy.id)["admitted"])
+
+            store.release_execution(move.id)
+            self.assertTrue(store.try_acquire_execution(later_copy.id)["admitted"])
+
+    def test_existing_resource_lease_table_migrates_to_allow_shared_holders(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.db"
+            store = SqliteJobRepository(path)
+            store.create(self.make_job())
+            with store._db() as db:
+                db.execute("DROP TABLE job_resource_leases")
+                db.execute(
+                    """
+                    CREATE TABLE job_resource_leases (
+                        resource_key TEXT PRIMARY KEY,
+                        job_id TEXT NOT NULL,
+                        acquired_at TEXT NOT NULL,
+                        worker TEXT NOT NULL,
+                        FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+                db.execute(
+                    """
+                    INSERT INTO job_resource_leases(
+                        resource_key, job_id, acquired_at, worker
+                    ) VALUES(?, ?, ?, ?)
+                    """,
+                    (
+                        "shared:worker:local:workspace:/workspace/best",
+                        "job-1",
+                        "2026-11-03T00:00:00+00:00",
+                        "local",
+                    ),
+                )
+
+            migrated = SqliteJobRepository(path)
+            move = self.create_storage_upload(
+                migrated, "move-after-migration", "rclone", "move"
+            )
+            self.assertFalse(migrated.try_acquire_execution(move.id)["admitted"])
+            migrated.release_execution("job-1")
+            self.assertTrue(migrated.try_acquire_execution(move.id)["admitted"])
 
     def test_multi_status_listing_paginates_globally_with_stable_ties(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

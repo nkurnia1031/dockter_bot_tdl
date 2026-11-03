@@ -8,57 +8,14 @@ import heapq
 from dataclasses import dataclass
 from typing import Callable, Generic, Hashable, Iterable, TypeVar
 
+from tme3bot.resource_locks import resource_sets_conflict as _resource_sets_conflict
+
 LOGGER = logging.getLogger(__name__)
 
 KeyT = TypeVar("KeyT", bound=Hashable)
 JobT = TypeVar("JobT")
 JobHandler = Callable[[JobT, queue.Queue], None]
 ErrorHandler = Callable[[KeyT, JobT, Exception], None]
-
-
-def _resource_lock(resource: str) -> tuple[str, str]:
-    """Decode shared/exclusive tokens; unprefixed resources remain exclusive."""
-    if resource.startswith("shared:"):
-        return "shared", resource[len("shared:"):]
-    if resource.startswith("exclusive:"):
-        return "exclusive", resource[len("exclusive:"):]
-    return "exclusive", resource
-
-
-def _workspace_resource_scope(resource: str) -> tuple[str, str] | None:
-    _mode, key = _resource_lock(resource)
-    namespace, separator, path = key.partition(":workspace:")
-    if not separator or not namespace.startswith("worker:") or not path.startswith("/"):
-        return None
-    return namespace, path.rstrip("/") or "/"
-
-
-def _resource_locks_conflict(left: str, right: str) -> bool:
-    """Conflict on equal keys; workspace scopes also overlap by ancestry."""
-    left_mode, left_key = _resource_lock(left)
-    right_mode, right_key = _resource_lock(right)
-    if left_key == right_key:
-        return left_mode != "shared" or right_mode != "shared"
-
-    left_scope = _workspace_resource_scope(left)
-    right_scope = _workspace_resource_scope(right)
-    if left_scope is None or right_scope is None or left_scope[0] != right_scope[0]:
-        return False
-    left_path, right_path = left_scope[1], right_scope[1]
-    paths_overlap = (
-        left_path == right_path
-        or left_path.startswith(right_path.rstrip("/") + "/")
-        or right_path.startswith(left_path.rstrip("/") + "/")
-    )
-    return paths_overlap and (left_mode == "exclusive" or right_mode == "exclusive")
-
-
-def _resource_sets_conflict(left: Iterable[str], right: Iterable[str]) -> bool:
-    return any(
-        _resource_locks_conflict(left_key, right_key)
-        for left_key in left
-        for right_key in right
-    )
 
 
 @dataclass

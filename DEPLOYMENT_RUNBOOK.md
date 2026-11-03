@@ -880,7 +880,12 @@ kombinasi `profile + worker + download`. Export dan download pada origin yang
 sama dapat berjalan bersamaan karena memakai dua sesi `.tdl`; origin berbeda
 juga dapat berjalan paralel. Leave berbagi lane export. Utility memakai worker
 dan path workspace; path sibling dapat paralel, path yang overlap tetap serial.
-Storage memakai lane `worker + tdl:storage` dan tidak memakai profile actor.
+Storage Telegram memakai lane worker TDL-storage serta lane upload tiap profil;
+rclone memakai lane worker rclone-storage. Copy memegang kunci shared pada tree
+Workspace sehingga Copy Telegram dan rclone dapat berjalan bersama. Move
+memegang kunci exclusive, menunggu Copy/Move pada tree yang overlap, dan
+mencegah Copy berikutnya mendahului Move. Provider dan tree yang tidak berbagi
+kunci tetap dapat berjalan paralel.
 
 Quick Mode juga membutuhkan binary `rclone` dan file konfigurasi worker pada
 `/data/.config/rclone.conf`. Binary sudah dipasang pada `Dockerfile.base`;
