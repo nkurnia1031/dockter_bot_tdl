@@ -861,34 +861,37 @@ class WorkerCommandStore:
     def event_delivery_stats(self) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         with self._db(timeout=self._WRITE_BUSY_TIMEOUT_SECONDS) as db:
-            rows = db.execute(
-                """SELECT status,created_at,attempts,last_error,lease_until
-                FROM worker_event_outbox WHERE status IN ('pending','sending')"""
-            ).fetchall()
+            summary = db.execute(
+                """SELECT
+                    COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0) AS pending,
+                    COALESCE(SUM(CASE WHEN status='sending' THEN 1 ELSE 0 END),0) AS sending,
+                    COALESCE(SUM(CASE WHEN status='sending' AND
+                        (lease_until IS NULL OR lease_until<=?) THEN 1 ELSE 0 END),0) AS expired_leases,
+                    MIN(created_at) AS oldest_created_at,
+                    COALESCE(SUM(CASE WHEN attempts>1 THEN attempts-1 ELSE 0 END),0) AS retry_count
+                FROM worker_event_outbox WHERE status IN ('pending','sending')""",
+                (now.isoformat(),),
+            ).fetchone()
             last_error = db.execute(
                 "SELECT last_error FROM worker_event_outbox "
-                "WHERE last_error IS NOT NULL ORDER BY id DESC LIMIT 1"
+                "WHERE status IN ('pending','sending') AND last_error IS NOT NULL "
+                "ORDER BY id DESC LIMIT 1"
             ).fetchone()
-        oldest_age = 0.0
-        if rows:
-            timestamps = []
-            for row in rows:
-                try:
-                    timestamps.append(datetime.fromisoformat(str(row["created_at"])))
-                except (TypeError, ValueError):
-                    continue
-            if timestamps:
-                oldest_age = max(0.0, (now - min(timestamps)).total_seconds())
+        try:
+            oldest_created_at = (
+                datetime.fromisoformat(str(summary["oldest_created_at"]))
+                if summary["oldest_created_at"]
+                else now
+            )
+            oldest_age = max(0.0, (now - oldest_created_at).total_seconds())
+        except (TypeError, ValueError):
+            oldest_age = 0.0
         return {
-            "pending": sum(str(row["status"]) == "pending" for row in rows),
-            "sending": sum(str(row["status"]) == "sending" for row in rows),
-            "expired_leases": sum(
-                str(row["status"]) == "sending"
-                and (not row["lease_until"] or str(row["lease_until"]) <= now.isoformat())
-                for row in rows
-            ),
+            "pending": int(summary["pending"]),
+            "sending": int(summary["sending"]),
+            "expired_leases": int(summary["expired_leases"]),
             "oldest_age_seconds": round(oldest_age, 3),
-            "retry_count": sum(max(0, int(row["attempts"] or 0) - 1) for row in rows),
+            "retry_count": int(summary["retry_count"]),
             "last_error_type": str(last_error["last_error"] or "") if last_error else "",
         }
 
