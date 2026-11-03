@@ -129,14 +129,26 @@ class JobStoreTests(unittest.TestCase):
             )
 
             self.assertTrue(store.try_acquire_execution(first_copy.id)["admitted"])
+            store.append_event(
+                JobEvent(first_copy.id, 1, JobStatus.DISPATCHED, "dispatched")
+            )
             self.assertFalse(store.try_acquire_execution(move.id)["admitted"])
             self.assertFalse(store.try_acquire_execution(later_copy.id)["admitted"])
 
             store.release_execution(first_copy.id)
+            store.append_event(JobEvent(first_copy.id, 2, JobStatus.RUNNING, "started"))
+            store.append_event(
+                JobEvent(first_copy.id, 3, JobStatus.SUCCEEDED, "completed")
+            )
             self.assertTrue(store.try_acquire_execution(move.id)["admitted"])
+            store.append_event(
+                JobEvent(move.id, 1, JobStatus.DISPATCHED, "dispatched")
+            )
             self.assertFalse(store.try_acquire_execution(later_copy.id)["admitted"])
 
             store.release_execution(move.id)
+            store.append_event(JobEvent(move.id, 2, JobStatus.RUNNING, "started"))
+            store.append_event(JobEvent(move.id, 3, JobStatus.SUCCEEDED, "completed"))
             self.assertTrue(store.try_acquire_execution(later_copy.id)["admitted"])
 
     def test_existing_resource_lease_table_migrates_to_allow_shared_holders(self) -> None:
