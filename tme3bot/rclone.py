@@ -1060,9 +1060,21 @@ class RcloneRunner:
                 active_children = self._list_storage_children(
                     parent_remote, config, log_prefix="rclone-storage-restore-check"
                 )
-                if any(str(item.get("Name") or "") == source_relative.rsplit("/", 1)[-1] for item in active_children):
+                active_names = {
+                    str(item.get("Name") or "")
+                    for item in active_children
+                    if isinstance(item, dict)
+                }
+                conflicting_paths = [
+                    selected_path
+                    for selected_path, _selected_is_dir, _selected_id in selected_paths
+                    if selected_path.rsplit("/", 1)[-1] in active_names
+                ]
+                if conflicting_paths:
                     raise RcloneError(
-                        "Item aktif sudah memakai nama tujuan.", code="RCLONE_TARGET_EXISTS"
+                        "Item aktif sudah memakai nama tujuan untuk pilihan Trash dalam folder ini. "
+                        "Tidak ada item yang dipulihkan; ubah nama item aktif atau pilih ulang seluruh batch.",
+                        code="RCLONE_TARGET_EXISTS",
                     )
                 # rclone's Drive untrash command works at directory scope. The
                 # preflight above ensures this parent contains no other trashed

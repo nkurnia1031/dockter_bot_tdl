@@ -518,6 +518,48 @@ class RcloneRunnerTests(unittest.TestCase):
         self.assertIn("Pilih semua item Trash pada folder induk itu dalam satu batch", str(raised.exception))
         self.assertFalse(any(command[1:3] == ["backend", "untrash"] for command, _ in fake.commands))
 
+    def test_restore_batch_rejects_later_sibling_collision_before_untrash(self):
+        class BatchRestoreCollisionRunner(FakeSubprocessRunner):
+            def __init__(self):
+                super().__init__()
+                self.untrash_count = 0
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and "--drive-trashed-only" in command:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Path":"Archive/one.zip","Name":"one.zip","ID":"file-1","IsDir":False},
+                        {"Path":"Archive/two.zip","Name":"two.zip","ID":"file-2","IsDir":False},
+                    ]), stderr="")
+                if command[1] == "lsjson" and command[2] == "drive:backup/Archive":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Name":"two.zip","ID":"active-two","IsDir":False},
+                    ]), stderr="")
+                if command[1:3] == ["backend", "untrash"]:
+                    self.untrash_count += 1
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[drive]\ntype = drive\n", encoding="utf-8")
+            fake = BatchRestoreCollisionRunner()
+            selected = [
+                {"path":"Archive/one.zip","is_dir":False,"id":"file-1"},
+                {"path":"Archive/two.zip","is_dir":False,"id":"file-2"},
+            ]
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).manage_storage_item(
+                        "drive:backup", action="restore", path="Archive/one.zip", is_dir=False,
+                        trashed=True, item_id="file-1", selected_restore_sources=selected,
+                        config_path=config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_TARGET_EXISTS")
+        self.assertIn("Tidak ada item yang dipulihkan", str(raised.exception))
+        self.assertEqual(fake.untrash_count, 0)
+
     def test_restore_batch_untrashes_selected_siblings_once(self):
         class BatchRestoreRunner(FakeSubprocessRunner):
             def __init__(self):
