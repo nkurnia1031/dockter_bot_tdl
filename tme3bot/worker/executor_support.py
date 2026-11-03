@@ -411,6 +411,7 @@ class WorkerEventPublisher:
         self._sender_stop = threading.Event()
         self._sender_ready = threading.Event()
         self._sender_thread: threading.Thread | None = None
+        self._last_outbox_warning_at = time.monotonic()
 
     def attach_outbox(self, outbox) -> None:
         """Enable durable event delivery while retaining legacy test adapters."""
@@ -465,9 +466,11 @@ class WorkerEventPublisher:
                 self._sender_stop.wait(1.0)
                 continue
             if item is None:
+                self._log_outbox_backlog()
                 self._sender_stop.wait(0.2)
                 continue
-            event_id, job_id, sequence, payload = item
+            self._log_outbox_backlog()
+            event_id, job_id, sequence, payload, lease_token = item
             started = time.monotonic()
             try:
                 response = request_json(
@@ -482,39 +485,123 @@ class WorkerEventPublisher:
                     isinstance(response, dict) and response.get("accepted") is False
                 )
                 reason = "backend_rejected" if not accepted else ""
-                self._outbox.acknowledge_event(
-                    event_id, accepted=accepted, reason=reason
+                acknowledged = self._outbox.acknowledge_event(
+                    event_id,
+                    lease_token,
+                    accepted=accepted,
+                    reason=reason,
                 )
                 self._audit(
                     job_id,
                     "[telemetry] "
-                    f"{'delivered' if accepted else 'ignored'} sequence={sequence} "
+                    f"{'delivered' if accepted and acknowledged else 'ignored'} sequence={sequence} "
                     f"duration={time.monotonic() - started:.3f}s",
                 )
             except JsonHttpError as exc:
                 if exc.status == 409:
-                    self._outbox.acknowledge_event(
-                        event_id, accepted=False, reason="stale_terminal"
-                    )
+                    try:
+                        acknowledged = self._outbox.acknowledge_event(
+                            event_id,
+                            lease_token,
+                            accepted=False,
+                            reason="stale_terminal",
+                        )
+                    except Exception as ack_exc:
+                        # A local journal lock must not kill the sole sender
+                        # thread. The claim lease will recover this event.
+                        LOGGER.warning(
+                            "Could not acknowledge stale worker event sequence=%s (%s)",
+                            sequence,
+                            type(ack_exc).__name__,
+                        )
+                        self._audit(
+                            job_id,
+                            f"[telemetry] ack_schedule_failed sequence={sequence} "
+                            f"error_type={type(ack_exc).__name__}",
+                        )
+                        continue
                     self._audit(
                         job_id,
-                        f"[telemetry] ignored sequence={sequence} status=409 terminal",
+                        f"[telemetry] ignored sequence={sequence} status=409 terminal "
+                        f"claim_current={acknowledged}",
                     )
                 else:
-                    self._outbox.retry_event(event_id, type(exc).__name__)
-                    self._audit(
+                    self._reschedule_outbox_event(
+                        event_id,
+                        lease_token,
                         job_id,
-                        f"[telemetry] retry sequence={sequence} error_type={type(exc).__name__}",
+                        sequence,
+                        type(exc).__name__,
                     )
             except Exception as exc:
-                try:
-                    self._outbox.retry_event(event_id, type(exc).__name__)
-                except Exception:
-                    LOGGER.exception("Could not reschedule worker event %s", sequence)
-                self._audit(
+                self._reschedule_outbox_event(
+                    event_id,
+                    lease_token,
                     job_id,
-                    f"[telemetry] retry sequence={sequence} error_type={type(exc).__name__}",
+                    sequence,
+                    type(exc).__name__,
                 )
+
+    def _reschedule_outbox_event(
+        self,
+        event_id: int,
+        lease_token: str,
+        job_id: str,
+        sequence: int,
+        error_type: str,
+    ) -> None:
+        try:
+            rescheduled = self._outbox.retry_event(event_id, lease_token, error_type)
+            self._audit(
+                job_id,
+                f"[telemetry] {'retry' if rescheduled else 'retry_skipped'} "
+                f"sequence={sequence} error_type={error_type}",
+            )
+        except Exception as exc:
+            # Keep the sender alive. The lease will make this event eligible
+            # again even when SQLite could not persist this retry transition.
+            LOGGER.warning(
+                "Could not reschedule worker event sequence=%s (%s)",
+                sequence,
+                type(exc).__name__,
+            )
+            self._audit(
+                job_id,
+                f"[telemetry] retry_schedule_failed sequence={sequence} "
+                f"error_type={type(exc).__name__}",
+            )
+
+    def _log_outbox_backlog(self) -> None:
+        now = time.monotonic()
+        if now - self._last_outbox_warning_at < 60:
+            return
+        self._last_outbox_warning_at = now
+        try:
+            stats = self._outbox.event_delivery_stats()
+        except Exception as exc:
+            LOGGER.warning(
+                "Worker event outbox diagnostics unavailable (%s)",
+                type(exc).__name__,
+            )
+            return
+        if not (stats["pending"] or stats["sending"]):
+            return
+        if (
+            stats["oldest_age_seconds"] < 30
+            and stats["expired_leases"] == 0
+            and not stats["last_error_type"]
+        ):
+            return
+        LOGGER.warning(
+            "Worker event outbox backlog pending=%s sending=%s expired_leases=%s "
+            "oldest_age_seconds=%s retry_count=%s last_error_type=%s",
+            stats["pending"],
+            stats["sending"],
+            stats["expired_leases"],
+            stats["oldest_age_seconds"],
+            stats["retry_count"],
+            stats["last_error_type"] or "none",
+        )
 
     def bind_job_worker(self, job_id: str, worker: str) -> None:
         with self._lock:

@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -32,9 +34,13 @@ def _dump(value: Any) -> str:
 class WorkerCommandStore:
     """SQLite journal kept on the worker's persistent data volume."""
 
-    def __init__(self, path: Path) -> None:
+    _WRITE_BEGIN_ATTEMPTS = 3
+    _WRITE_BUSY_TIMEOUT_SECONDS = 0.25
+
+    def __init__(self, path: Path, *, event_lease_seconds: int = 30) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.event_lease_seconds = max(1, int(event_lease_seconds))
         self._lock = threading.RLock()
         self._initialize()
         try:
@@ -45,15 +51,38 @@ class WorkerCommandStore:
             pass
 
     @contextmanager
-    def _db(self):
-        db = sqlite3.connect(self.path, timeout=15, isolation_level=None)
+    def _db(self, *, timeout: float = 15):
+        db = sqlite3.connect(self.path, timeout=timeout, isolation_level=None)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=15000")
+        db.execute(f"PRAGMA busy_timeout={max(0, int(timeout * 1000))}")
         db.execute("PRAGMA foreign_keys=ON")
         try:
             yield db
         finally:
             db.close()
+
+    @contextmanager
+    def _write_transaction(self):
+        """Serialize short writes and retry a busy SQLite writer lock briefly."""
+        with self._lock, self._db(timeout=self._WRITE_BUSY_TIMEOUT_SECONDS) as db:
+            for attempt in range(self._WRITE_BEGIN_ATTEMPTS):
+                try:
+                    db.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    message = str(exc).lower()
+                    if not ("locked" in message or "busy" in message):
+                        raise
+                    if attempt + 1 >= self._WRITE_BEGIN_ATTEMPTS:
+                        raise
+                    time.sleep(0.05 * (2**attempt))
+            try:
+                yield db
+            except BaseException:
+                db.rollback()
+                raise
+            else:
+                db.commit()
 
     def _initialize(self) -> None:
         with self._lock, self._db() as db:
@@ -123,6 +152,8 @@ class WorkerCommandStore:
                     transient INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'pending',
                     attempts INTEGER NOT NULL DEFAULT 0,
+                    lease_token TEXT,
+                    lease_until TEXT,
                     available_at TEXT NOT NULL,
                     last_error TEXT,
                     created_at TEXT NOT NULL,
@@ -131,6 +162,22 @@ class WorkerCommandStore:
                 CREATE INDEX IF NOT EXISTS idx_worker_event_outbox_ready
                     ON worker_event_outbox(status, available_at, id);
                 """
+            )
+            event_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(worker_event_outbox)").fetchall()
+            }
+            if "lease_token" not in event_columns:
+                db.execute("ALTER TABLE worker_event_outbox ADD COLUMN lease_token TEXT")
+            if "lease_until" not in event_columns:
+                db.execute("ALTER TABLE worker_event_outbox ADD COLUMN lease_until TEXT")
+            db.execute(
+                "UPDATE worker_event_outbox SET lease_until='1970-01-01T00:00:00+00:00' "
+                "WHERE status='sending' AND lease_until IS NULL"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_event_outbox_lease "
+                "ON worker_event_outbox(status,available_at,lease_until,id)"
             )
             upload_columns = {
                 str(row["name"])
@@ -550,8 +597,7 @@ class WorkerCommandStore:
         return self._public(updated)
 
     def recover_startup(self) -> dict[str, int]:
-        with self._lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self._write_transaction() as db:
             now = _now()
             accepted = db.execute(
                 "UPDATE worker_commands SET status='accepted',phase='accepted',updated_at=? WHERE status IN ('claimed','queued')",
@@ -615,16 +661,15 @@ class WorkerCommandStore:
                 else:
                     uncertain += 1
             events = db.execute(
-                "UPDATE worker_event_outbox SET status='pending',available_at=? WHERE status='sending'",
+                "UPDATE worker_event_outbox SET status='pending',available_at=?,lease_token=NULL,lease_until=NULL WHERE status='sending'",
                 (now,),
             ).rowcount
-            db.commit()
         return {"requeued": accepted, "needs_reconciliation": uncertain, "events_recovered": events}
 
     def seed_sequence(self, job_id: str, sequence: int | None) -> None:
         if sequence is None:
             return
-        with self._db() as db:
+        with self._write_transaction() as db:
             db.execute(
                 "INSERT INTO worker_event_sequences(job_id,last_sequence) VALUES (?,?) "
                 "ON CONFLICT(job_id) DO UPDATE SET last_sequence=MAX(last_sequence,excluded.last_sequence)",
@@ -633,8 +678,7 @@ class WorkerCommandStore:
 
     def append_event(self, job_id: str, payload: dict[str, Any], *, transient: bool) -> int:
         now = _now()
-        with self._lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+        with self._write_transaction() as db:
             row = db.execute("SELECT last_sequence FROM worker_event_sequences WHERE job_id=?", (str(job_id),)).fetchone()
             sequence = int(row["last_sequence"]) + 1 if row else 2
             db.execute(
@@ -692,41 +736,71 @@ class WorkerCommandStore:
                         str(payload.get("dispatch_token") or ""),
                     ),
                 )
-            db.commit()
         return sequence
 
-    def claim_event(self) -> tuple[int, str, int, dict[str, Any]] | None:
+    def claim_event(self) -> tuple[int, str, int, dict[str, Any], str] | None:
         now = _now()
-        with self._lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+        lease_until = (
+            datetime.now(timezone.utc) + timedelta(seconds=self.event_lease_seconds)
+        ).isoformat()
+        lease_token = secrets.token_urlsafe(24)
+        with self._write_transaction() as db:
             row = db.execute(
                 """SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e
-                WHERE e.status='pending' AND e.available_at<=?
+                WHERE ((e.status='pending' AND e.available_at<=?)
+                    OR (e.status='sending' AND (e.lease_until IS NULL OR e.lease_until<=?)))
                   AND NOT EXISTS (SELECT 1 FROM worker_event_outbox p WHERE p.job_id=e.job_id AND p.sequence<e.sequence AND p.status IN ('pending','sending'))
                 ORDER BY e.id LIMIT 1""",
-                (now,),
+                (now, now),
             ).fetchone()
             if row is None:
-                db.commit()
                 return None
-            db.execute("UPDATE worker_event_outbox SET status='sending',attempts=attempts+1 WHERE id=? AND status='pending'", (row["id"],))
-            db.commit()
-        return int(row["id"]), str(row["job_id"]), int(row["sequence"]), json.loads(row["event_json"])
+            changed = db.execute(
+                """UPDATE worker_event_outbox
+                SET status='sending',attempts=attempts+1,lease_token=?,lease_until=?
+                WHERE id=? AND ((status='pending' AND available_at<=?)
+                    OR (status='sending' AND (lease_until IS NULL OR lease_until<=?)))""",
+                (lease_token, lease_until, row["id"], now, now),
+            ).rowcount
+            if not changed:
+                return None
+        return (
+            int(row["id"]),
+            str(row["job_id"]),
+            int(row["sequence"]),
+            json.loads(row["event_json"]),
+            lease_token,
+        )
 
-    def acknowledge_event(self, event_id: int, *, accepted: bool, reason: str = "") -> None:
-        with self._lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+    def acknowledge_event(
+        self,
+        event_id: int,
+        lease_token: str,
+        *,
+        accepted: bool,
+        reason: str = "",
+    ) -> bool:
+        with self._write_transaction() as db:
             row = db.execute(
-                "SELECT job_id,event_json FROM worker_event_outbox WHERE id=?",
-                (int(event_id),),
+                "SELECT job_id,event_json FROM worker_event_outbox "
+                "WHERE id=? AND status='sending' AND lease_token=?",
+                (int(event_id), str(lease_token)),
             ).fetchone()
             if row is None:
-                db.commit()
-                return
-            db.execute(
-                "UPDATE worker_event_outbox SET status=?,last_error=? WHERE id=?",
-                ("acked" if accepted else "ignored", str(reason)[:160] or None, int(event_id)),
-            )
+                return False
+            changed = db.execute(
+                """UPDATE worker_event_outbox
+                SET status=?,last_error=?,lease_token=NULL,lease_until=NULL
+                WHERE id=? AND status='sending' AND lease_token=?""",
+                (
+                    "acked" if accepted else "ignored",
+                    str(reason)[:160] or None,
+                    int(event_id),
+                    str(lease_token),
+                ),
+            ).rowcount
+            if not changed:
+                return False
             event = json.loads(row["event_json"])
             event_status = str(event.get("status") or "").lower()
             command_id = str(event.get("command_id") or "")
@@ -758,19 +832,65 @@ class WorkerCommandStore:
                         str(event.get("dispatch_token") or ""),
                     ),
                 )
-            db.commit()
+        return True
 
-    def retry_event(self, event_id: int, error_type: str) -> None:
-        with self._db() as db:
-            row = db.execute("SELECT attempts FROM worker_event_outbox WHERE id=?", (int(event_id),)).fetchone()
+    def retry_event(self, event_id: int, lease_token: str, error_type: str) -> bool:
+        with self._write_transaction() as db:
+            row = db.execute(
+                "SELECT attempts FROM worker_event_outbox "
+                "WHERE id=? AND status='sending' AND lease_token=?",
+                (int(event_id), str(lease_token)),
+            ).fetchone()
             if row is None:
-                return
+                return False
             delay = min(60, 2 ** min(max(0, int(row["attempts"]) - 1), 6))
             available = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
-            db.execute(
-                "UPDATE worker_event_outbox SET status='pending',available_at=?,last_error=? WHERE id=?",
-                (available, str(error_type)[:80], int(event_id)),
-            )
+            safe_error_type = "".join(
+                character
+                for character in str(error_type)
+                if character.isalnum() or character in "._-"
+            )[:80] or "UnknownError"
+            changed = db.execute(
+                """UPDATE worker_event_outbox
+                SET status='pending',available_at=?,last_error=?,lease_token=NULL,lease_until=NULL
+                WHERE id=? AND status='sending' AND lease_token=?""",
+                (available, safe_error_type, int(event_id), str(lease_token)),
+            ).rowcount
+        return bool(changed)
+
+    def event_delivery_stats(self) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        with self._db(timeout=self._WRITE_BUSY_TIMEOUT_SECONDS) as db:
+            rows = db.execute(
+                """SELECT status,created_at,attempts,last_error,lease_until
+                FROM worker_event_outbox WHERE status IN ('pending','sending')"""
+            ).fetchall()
+            last_error = db.execute(
+                "SELECT last_error FROM worker_event_outbox "
+                "WHERE last_error IS NOT NULL ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        oldest_age = 0.0
+        if rows:
+            timestamps = []
+            for row in rows:
+                try:
+                    timestamps.append(datetime.fromisoformat(str(row["created_at"])))
+                except (TypeError, ValueError):
+                    continue
+            if timestamps:
+                oldest_age = max(0.0, (now - min(timestamps)).total_seconds())
+        return {
+            "pending": sum(str(row["status"]) == "pending" for row in rows),
+            "sending": sum(str(row["status"]) == "sending" for row in rows),
+            "expired_leases": sum(
+                str(row["status"]) == "sending"
+                and (not row["lease_until"] or str(row["lease_until"]) <= now.isoformat())
+                for row in rows
+            ),
+            "oldest_age_seconds": round(oldest_age, 3),
+            "retry_count": sum(max(0, int(row["attempts"] or 0) - 1) for row in rows),
+            "last_error_type": str(last_error["last_error"] or "") if last_error else "",
+        }
 
     def pending_event_count(self) -> int:
         with self._db() as db:

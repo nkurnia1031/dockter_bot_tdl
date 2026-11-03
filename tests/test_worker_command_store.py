@@ -1,3 +1,4 @@
+import sqlite3
 import tempfile
 import threading
 import time
@@ -179,7 +180,7 @@ class WorkerCommandStoreTests(unittest.TestCase):
         claimed = self.store.claim_event()
         self.assertEqual(claimed[2], 9)
         self.assertEqual(claimed[3]["dispatch_token"], "fence")
-        self.store.retry_event(claimed[0], "TimeoutError")
+        self.assertTrue(self.store.retry_event(claimed[0], claimed[4], "TimeoutError"))
         with self.store._db() as db:
             db.execute("UPDATE worker_event_outbox SET available_at='2000-01-01T00:00:00+00:00'")
         recovered = WorkerCommandStore(self.path)
@@ -187,8 +188,228 @@ class WorkerCommandStoreTests(unittest.TestCase):
         resent = recovered.claim_event()
         self.assertEqual(resent[2], 9)
         self.assertEqual(resent[3], claimed[3])
-        recovered.acknowledge_event(resent[0], accepted=True)
+        self.assertTrue(
+            recovered.acknowledge_event(resent[0], resent[4], accepted=True)
+        )
         self.assertEqual(recovered.pending_event_count(), 0)
+
+    def test_retry_write_surfaces_sqlite_busy_then_commits_after_lock_releases(self):
+        self.store.append_event("busy-job", {"event_type": "progress"}, transient=False)
+        claimed = self.store.claim_event()
+        blocker = sqlite3.connect(self.path, timeout=0, isolation_level=None)
+        try:
+            blocker.execute("BEGIN IMMEDIATE")
+            started = time.monotonic()
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.retry_event(claimed[0], claimed[4], "TimeoutError")
+            self.assertLess(time.monotonic() - started, 2.0)
+        finally:
+            blocker.rollback()
+            blocker.close()
+
+        self.assertTrue(self.store.retry_event(claimed[0], claimed[4], "TimeoutError"))
+        with self.store._db() as db:
+            row = db.execute(
+                "SELECT status,last_error,lease_token,lease_until FROM worker_event_outbox WHERE id=?",
+                (claimed[0],),
+            ).fetchone()
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["last_error"], "TimeoutError")
+        self.assertIsNone(row["lease_token"])
+        self.assertIsNone(row["lease_until"])
+
+    def test_retry_after_ack_cannot_put_event_back_into_pending(self):
+        self.store.append_event("ack-job", {"event_type": "completed"}, transient=False)
+        claimed = self.store.claim_event()
+
+        self.assertTrue(
+            self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+        )
+        self.assertFalse(
+            self.store.retry_event(claimed[0], claimed[4], "TimeoutError")
+        )
+        with self.store._db() as db:
+            row = db.execute(
+                "SELECT status FROM worker_event_outbox WHERE id=?", (claimed[0],)
+            ).fetchone()
+        self.assertEqual(row["status"], "acked")
+
+    def test_concurrent_event_retry_and_append_keep_sequences_and_state_consistent(self):
+        self.store.append_event(
+            "concurrent-job", {"event_type": "started"}, transient=False
+        )
+        claimed = self.store.claim_event()
+        barrier = threading.Barrier(3)
+        failures = []
+
+        def retry():
+            try:
+                barrier.wait()
+                self.store.retry_event(claimed[0], claimed[4], "TimeoutError")
+            except Exception as exc:
+                failures.append(exc)
+
+        def append():
+            try:
+                barrier.wait()
+                self.store.append_event(
+                    "concurrent-job", {"event_type": "progress"}, transient=True
+                )
+            except Exception as exc:
+                failures.append(exc)
+
+        threads = [threading.Thread(target=retry), threading.Thread(target=append)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertFalse(failures)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        with self.store._db() as db:
+            rows = db.execute(
+                "SELECT sequence,status FROM worker_event_outbox WHERE job_id=? ORDER BY sequence",
+                ("concurrent-job",),
+            ).fetchall()
+        self.assertEqual([row["sequence"] for row in rows], [2, 3])
+        self.assertEqual(rows[0]["status"], "pending")
+        self.assertEqual(rows[1]["status"], "pending")
+
+    def test_event_delivery_stats_are_aggregate_and_do_not_include_event_payload(self):
+        self.store.append_event(
+            "stats-job",
+            {"event_type": "progress", "private_value": "must-not-appear"},
+            transient=False,
+        )
+        claimed = self.store.claim_event()
+        self.store.retry_event(claimed[0], claimed[4], "TimeoutError")
+
+        stats = self.store.event_delivery_stats()
+
+        self.assertEqual(stats["pending"], 1)
+        self.assertEqual(stats["sending"], 0)
+        self.assertEqual(stats["retry_count"], 0)
+        self.assertEqual(stats["last_error_type"], "TimeoutError")
+        self.assertNotIn("private_value", str(stats))
+        self.assertNotIn("must-not-appear", str(stats))
+
+    def test_expired_event_lease_is_reclaimed_without_restart_and_fences_old_ack(self):
+        self.store.append_event("lease-job", {"event_type": "started"}, transient=False)
+        old_claim = self.store.claim_event()
+        with self.store._db() as db:
+            db.execute(
+                "UPDATE worker_event_outbox SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?",
+                (old_claim[0],),
+            )
+
+        new_claim = self.store.claim_event()
+        self.assertIsNotNone(new_claim)
+        self.assertEqual(new_claim[:4], old_claim[:4])
+        self.assertNotEqual(new_claim[4], old_claim[4])
+        self.assertFalse(
+            self.store.acknowledge_event(old_claim[0], old_claim[4], accepted=True)
+        )
+        self.assertEqual(self.store.pending_event_count(), 1)
+        self.assertTrue(
+            self.store.acknowledge_event(new_claim[0], new_claim[4], accepted=True)
+        )
+        self.assertEqual(self.store.pending_event_count(), 0)
+
+    def test_startup_recovers_event_in_flight_with_a_new_lease_token(self):
+        self.store.append_event(
+            "restart-job", {"event_type": "completed"}, transient=False
+        )
+        old_claim = self.store.claim_event()
+
+        recovered = WorkerCommandStore(self.path)
+        report = recovered.recover_startup()
+        new_claim = recovered.claim_event()
+
+        self.assertEqual(report["events_recovered"], 1)
+        self.assertIsNotNone(new_claim)
+        self.assertEqual(new_claim[2:4], old_claim[2:4])
+        self.assertNotEqual(new_claim[4], old_claim[4])
+        self.assertFalse(
+            recovered.acknowledge_event(old_claim[0], old_claim[4], accepted=True)
+        )
+
+    def test_expired_predecessor_is_reclaimed_before_next_event_for_same_job(self):
+        first = self.store.append_event(
+            "ordered-job", {"event_type": "progress"}, transient=False
+        )
+        second = self.store.append_event(
+            "ordered-job",
+            {"event_type": "completed", "status": "succeeded"},
+            transient=False,
+        )
+        first_claim = self.store.claim_event()
+        with self.store._db() as db:
+            db.execute(
+                "UPDATE worker_event_outbox SET lease_until='2000-01-01T00:00:00+00:00' WHERE id=?",
+                (first_claim[0],),
+            )
+
+        reclaimed = self.store.claim_event()
+        self.assertEqual(reclaimed[2], first)
+        self.assertNotEqual(reclaimed[2], second)
+        self.assertTrue(
+            self.store.acknowledge_event(reclaimed[0], reclaimed[4], accepted=True)
+        )
+        terminal = self.store.claim_event()
+        self.assertEqual(terminal[2], second)
+        self.assertTrue(
+            self.store.acknowledge_event(terminal[0], terminal[4], accepted=True)
+        )
+
+    def test_same_outbox_delivers_events_for_distinct_worker_job_kinds(self):
+        job_kinds = ("export", "storage_upload", "tts", "utility", "quickmode")
+        for job_kind in job_kinds:
+            self.store.append_event(
+                f"{job_kind}-job",
+                {"job_kind": job_kind, "event_type": "completed", "status": "succeeded"},
+                transient=False,
+            )
+
+        delivered = []
+        while (claimed := self.store.claim_event()) is not None:
+            delivered.append(claimed[3]["job_kind"])
+            self.assertTrue(
+                self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+            )
+
+        self.assertCountEqual(delivered, job_kinds)
+        self.assertEqual(self.store.pending_event_count(), 0)
+
+    def test_event_outbox_schema_migrates_legacy_sending_rows(self):
+        legacy_path = Path(self.temp.name) / "legacy-worker-journal.sqlite3"
+        db = sqlite3.connect(legacy_path)
+        db.executescript(
+            """
+            CREATE TABLE worker_event_outbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                event_json TEXT NOT NULL,
+                transient INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                available_at TEXT NOT NULL,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(job_id, sequence)
+            );
+            INSERT INTO worker_event_outbox(job_id,sequence,event_json,status,available_at,created_at)
+            VALUES ('legacy-job',2,'{}','sending','2000-01-01T00:00:00+00:00','2000-01-01T00:00:00+00:00');
+            """
+        )
+        db.close()
+
+        migrated = WorkerCommandStore(legacy_path)
+        reclaimed = migrated.claim_event()
+        self.assertIsNotNone(reclaimed)
+        self.assertEqual(reclaimed[1], "legacy-job")
+        self.assertEqual(reclaimed[2], 2)
 
     def test_terminal_event_ack_resolves_a_recovered_uncertain_command(self):
         self.store.accept(job_envelope())
@@ -208,7 +429,7 @@ class WorkerCommandStoreTests(unittest.TestCase):
         )
         event = self.store.claim_event()
         self.assertEqual(event[2], sequence)
-        self.store.acknowledge_event(event[0], accepted=True)
+        self.store.acknowledge_event(event[0], event[4], accepted=True)
         self.assertEqual(self.store.get("command-1")["status"], "succeeded")
 
     def test_publisher_persists_terminal_event_without_waiting_for_backend(self):
@@ -250,6 +471,47 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertEqual(sent_sequences, [2, 2])
         self.assertEqual(self.store.pending_event_count(), 0)
 
+    def test_sender_survives_retry_write_failure_and_reclaims_expired_lease(self):
+        lease_store = WorkerCommandStore(
+            Path(self.temp.name) / "short-lease.sqlite3", event_lease_seconds=1
+        )
+        publisher = WorkerEventPublisher("http://backend.invalid", "token")
+        publisher.attach_outbox(lease_store)
+        publisher.emit("job-retry-lock", "running", "progress.snapshot")
+        delivered_after_reclaim = threading.Event()
+        request_count = []
+        retry_count = []
+        original_retry = lease_store.retry_event
+
+        def backend(*_args, **_kwargs):
+            request_count.append(1)
+            if len(request_count) == 1:
+                raise TimeoutError("simulated backend timeout")
+            delivered_after_reclaim.set()
+            return {"ok": True, "accepted": True}
+
+        def retry_with_one_transient_lock(event_id, lease_token, error_type):
+            retry_count.append(1)
+            if len(retry_count) == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return original_retry(event_id, lease_token, error_type)
+
+        with patch(
+            "tme3bot.worker.executor_support.request_json", side_effect=backend
+        ), patch.object(lease_store, "retry_event", side_effect=retry_with_one_transient_lock):
+            publisher.start_sender()
+            try:
+                self.assertTrue(delivered_after_reclaim.wait(4))
+                deadline = time.monotonic() + 1
+                while lease_store.pending_event_count() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            finally:
+                publisher.stop_sender()
+
+        self.assertEqual(len(request_count), 2)
+        self.assertEqual(len(retry_count), 1)
+        self.assertEqual(lease_store.pending_event_count(), 0)
+
     def test_only_unsent_transient_progress_is_coalesced(self):
         first = self.store.append_event("job-progress", {"event_type": "p1"}, transient=True)
         milestone = self.store.append_event("job-progress", {"event_type": "started"}, transient=False)
@@ -264,7 +526,11 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertEqual(statuses[first], "superseded")
         self.assertEqual(statuses[milestone], "pending")
         self.assertEqual(statuses[latest], "pending")
-        self.assertEqual(self.store.claim_event()[2], milestone)
+        claimed = self.store.claim_event()
+        self.assertEqual(claimed[2], milestone)
+        self.assertTrue(
+            self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+        )
 
     def test_runner_admits_duplicate_submit_once_through_existing_executor_queue(self):
         entered = threading.Event()
