@@ -549,16 +549,77 @@ class RcloneRunnerTests(unittest.TestCase):
                 {"path":"Archive/two.zip","is_dir":False,"id":"file-2"},
             ]
             with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
-                with self.assertRaises(RcloneError) as raised:
-                    RcloneRunner(fake).manage_storage_item(
-                        "drive:backup", action="restore", path="Archive/one.zip", is_dir=False,
-                        trashed=True, item_id="file-1", selected_restore_sources=selected,
-                        config_path=config, config_root=root,
-                    )
+                failures = []
+                for source in selected:
+                    with self.assertRaises(RcloneError) as raised:
+                        RcloneRunner(fake).manage_storage_item(
+                            "drive:backup", action="restore", path=str(source["path"]), is_dir=False,
+                            trashed=True, item_id=str(source["id"]), selected_restore_sources=selected,
+                            config_path=config, config_root=root,
+                        )
+                    failures.append(raised.exception)
 
-        self.assertEqual(raised.exception.code, "RCLONE_TARGET_EXISTS")
-        self.assertIn("Tidak ada item yang dipulihkan", str(raised.exception))
+        self.assertEqual([failure.code for failure in failures], ["RCLONE_TARGET_EXISTS"] * 2)
+        self.assertTrue(all("Seluruh grup restore pada folder induk ini dibatalkan" in str(failure) for failure in failures))
         self.assertEqual(fake.untrash_count, 0)
+
+    def test_restore_collision_cancels_only_its_parent_group(self):
+        class IndependentRestoreGroupsRunner(FakeSubprocessRunner):
+            def __init__(self):
+                super().__init__()
+                self.untrashed = []
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and "--drive-trashed-only" in command:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Path":"Archive/one.zip","Name":"one.zip","ID":"file-1","IsDir":False},
+                        {"Path":"Archive/two.zip","Name":"two.zip","ID":"file-2","IsDir":False},
+                        {"Path":"Other/three.zip","Name":"three.zip","ID":"file-3","IsDir":False},
+                    ]), stderr="")
+                if command[1] == "lsjson" and command[2] in {
+                    "drive:backup/Archive", "drive:backup/Other",
+                }:
+                    parent = command[2].rsplit("/", 1)[-1]
+                    if parent == "Archive":
+                        entries = [{"Name":"two.zip","ID":"active-two","IsDir":False}]
+                    elif "drive:backup/Other" in self.untrashed:
+                        entries = [{"Name":"three.zip","ID":"file-3","IsDir":False}]
+                    else:
+                        entries = []
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                if command[1:3] == ["backend", "untrash"]:
+                    self.untrashed.append(command[3])
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[drive]\ntype = drive\n", encoding="utf-8")
+            fake = IndependentRestoreGroupsRunner()
+            selected = [
+                {"path":"Archive/one.zip","is_dir":False,"id":"file-1"},
+                {"path":"Archive/two.zip","is_dir":False,"id":"file-2"},
+                {"path":"Other/three.zip","is_dir":False,"id":"file-3"},
+            ]
+            results = []
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"), \
+                    patch("tme3bot.rclone.subprocess.run", return_value=SimpleNamespace(
+                        returncode=0, stdout="[drive]\ntype = drive\n", stderr="")):
+                runner = RcloneRunner(fake)
+                for source in selected:
+                    try:
+                        results.append(runner.manage_storage_item(
+                            "drive:backup", action="restore", path=str(source["path"]),
+                            is_dir=False, trashed=True, item_id=str(source["id"]),
+                            selected_restore_sources=selected, config_path=config, config_root=root,
+                        ))
+                    except RcloneError as exc:
+                        results.append(exc)
+
+        self.assertEqual([result.code for result in results[:2]], ["RCLONE_TARGET_EXISTS"] * 2)
+        self.assertEqual(results[2]["status"], "succeeded")
+        self.assertEqual(fake.untrashed, ["drive:backup/Other"])
 
     def test_restore_batch_untrashes_selected_siblings_once(self):
         class BatchRestoreRunner(FakeSubprocessRunner):

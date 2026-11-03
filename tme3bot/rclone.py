@@ -1072,8 +1072,8 @@ class RcloneRunner:
                 ]
                 if conflicting_paths:
                     raise RcloneError(
-                        "Item aktif sudah memakai nama tujuan untuk pilihan Trash dalam folder ini. "
-                        "Tidak ada item yang dipulihkan; ubah nama item aktif atau pilih ulang seluruh batch.",
+                        "Item aktif sudah memakai nama tujuan. Seluruh grup restore pada folder induk ini dibatalkan; "
+                        "tidak ada item dalam grup yang dipulihkan. Ubah nama item aktif lalu coba lagi.",
                         code="RCLONE_TARGET_EXISTS",
                     )
                 # rclone's Drive untrash command works at directory scope. The

@@ -215,6 +215,7 @@ describe('Storage file manager', () => {
     await fireEvent.click(screen.getByLabelText('Pilih file old.zip'));
     await fireEvent.click(screen.getByRole('button',{name:'Pulihkan'}));
     expect(screen.getByText(/Google Drive hanya menyediakan restore seluruh item Trash di folder induk secara rekursif/)).toBeTruthy();
+    expect(screen.getByText(/Jika satu item pilihan berbenturan dengan item aktif, seluruh grup folder induk itu dibatalkan/)).toBeTruthy();
     await fireEvent.click(screen.getAllByRole('button',{name:'Pulihkan'}).at(-1)!);
     await waitFor(()=>expect(jobs).toHaveLength(2));
     expect(jobs[1]).toMatchObject({worker:'local',action:'restore',sources:[{path:'Archive/old.zip',is_dir:false,id:'file-1'}],destination_path:'',trashed:true,confirmed:false});
