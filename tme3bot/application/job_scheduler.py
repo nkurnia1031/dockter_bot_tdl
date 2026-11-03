@@ -40,6 +40,21 @@ def _workspace_resource_keys(worker: str, raw_paths: Iterable[object]) -> set[st
     return keys
 
 
+def _workspace_transfer_resource_key(
+    worker: str,
+    raw_path: object,
+    *,
+    transfer_mode: str,
+) -> set[str]:
+    """Use a shared folder-tree lock for Copy and exclusive lock for Move."""
+    keys = _workspace_resource_keys(worker, [raw_path])
+    if not keys:
+        return set()
+    leaf = max(keys, key=lambda key: (key.count("/"), len(key)))
+    lock_mode = "exclusive" if transfer_mode == "move" else "shared"
+    return {f"{lock_mode}:{leaf}"}
+
+
 def build_execution_plan(
     kind: str,
     profile: str,
@@ -114,10 +129,17 @@ def build_execution_plan(
         else:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
     elif kind == "storage_upload":
-        keys = {f"worker:{worker}:kind:storage_upload"}
+        keys = set()
         workspace_path = payload.get("folder_path") or payload.get("folder")
         if workspace_path:
-            keys.update(_workspace_resource_keys(worker, [workspace_path]))
+            transfer_mode = str(payload.get("transfer_mode") or "copy").strip().lower()
+            keys.update(
+                _workspace_transfer_resource_key(
+                    worker,
+                    workspace_path,
+                    transfer_mode=transfer_mode,
+                )
+            )
         if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
             keys.add(f"worker:{worker}:rclone:storage")
             lane = "rclone-storage"

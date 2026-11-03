@@ -264,7 +264,11 @@ Profile default memakai `/data`; profile tambahan memakai `/data/profiles/<name>
   `SerialPerKeyQueue`.
 - Utility: folder berbeda paralel, folder sama serial.
 - Export: serial per profile-worker export lane.
-- Storage upload: serial per worker storage lane.
+- Storage upload: serialize within each destination lane (TDL or rclone). Copy
+  holds a shared lock on the selected Workspace tree, so Telegram and rclone
+  copies can run together. Move holds an exclusive lock on that tree and waits
+  for overlapping copies/moves to finish; unrelated Workspace trees remain
+  independent.
 - Storage upload mode `Move` menghapus sumber per file segera setelah upload file
   itu terkonfirmasi: Telegram setelah TDL mengembalikan `message_id`, rclone
   setelah verifikasi penuh file tujuan. Worker hanya menghapus file yang masih

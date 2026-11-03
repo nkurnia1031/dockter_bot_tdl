@@ -6,7 +6,7 @@ import threading
 import itertools
 import heapq
 from dataclasses import dataclass
-from typing import Callable, Generic, Hashable, TypeVar
+from typing import Callable, Generic, Hashable, Iterable, TypeVar
 
 LOGGER = logging.getLogger(__name__)
 
@@ -14,6 +14,51 @@ KeyT = TypeVar("KeyT", bound=Hashable)
 JobT = TypeVar("JobT")
 JobHandler = Callable[[JobT, queue.Queue], None]
 ErrorHandler = Callable[[KeyT, JobT, Exception], None]
+
+
+def _resource_lock(resource: str) -> tuple[str, str]:
+    """Decode shared/exclusive tokens; unprefixed resources remain exclusive."""
+    if resource.startswith("shared:"):
+        return "shared", resource[len("shared:"):]
+    if resource.startswith("exclusive:"):
+        return "exclusive", resource[len("exclusive:"):]
+    return "exclusive", resource
+
+
+def _workspace_resource_scope(resource: str) -> tuple[str, str] | None:
+    _mode, key = _resource_lock(resource)
+    namespace, separator, path = key.partition(":workspace:")
+    if not separator or not namespace.startswith("worker:") or not path.startswith("/"):
+        return None
+    return namespace, path.rstrip("/") or "/"
+
+
+def _resource_locks_conflict(left: str, right: str) -> bool:
+    """Conflict on equal keys; workspace scopes also overlap by ancestry."""
+    left_mode, left_key = _resource_lock(left)
+    right_mode, right_key = _resource_lock(right)
+    if left_key == right_key:
+        return left_mode != "shared" or right_mode != "shared"
+
+    left_scope = _workspace_resource_scope(left)
+    right_scope = _workspace_resource_scope(right)
+    if left_scope is None or right_scope is None or left_scope[0] != right_scope[0]:
+        return False
+    left_path, right_path = left_scope[1], right_scope[1]
+    paths_overlap = (
+        left_path == right_path
+        or left_path.startswith(right_path.rstrip("/") + "/")
+        or right_path.startswith(left_path.rstrip("/") + "/")
+    )
+    return paths_overlap and (left_mode == "exclusive" or right_mode == "exclusive")
+
+
+def _resource_sets_conflict(left: Iterable[str], right: Iterable[str]) -> bool:
+    return any(
+        _resource_locks_conflict(left_key, right_key)
+        for left_key in left
+        for right_key in right
+    )
 
 
 @dataclass
@@ -94,12 +139,17 @@ class SerialPerKeyQueue(Generic[KeyT, JobT]):
 
 
 class ResourceAwareQueue(Generic[JobT]):
-    """Run jobs concurrently when their exclusive resources do not overlap.
+    """Run jobs concurrently when their resource locks are compatible.
 
     A job may reserve more than one resource, for example a logical kind lane
     and a TDL session lane.  The scheduler scans the pending heap instead of
     blocking behind its first item, so an export can run while a download is
     active while two exports remain serial.
+
+    Resource tokens prefixed with ``shared:`` can overlap other shared tokens.
+    ``exclusive:`` tokens and legacy unprefixed tokens conflict with shared
+    or exclusive tokens for the same resource. Workspace scopes additionally
+    conflict when one selected tree contains the other.
     """
 
     def __init__(
@@ -115,7 +165,7 @@ class ResourceAwareQueue(Generic[JobT]):
         self._condition = threading.Condition(threading.RLock())
         self._pending: list[tuple[int, int, JobT, frozenset[str]]] = []
         self._paused_pending: dict[str, tuple[int, int, JobT, frozenset[str]]] = {}
-        self._active_keys: set[str] = set()
+        self._active_key_counts: dict[str, int] = {}
         self._active_jobs: set[str] = set()
         self._active_resource_keys: dict[str, set[str]] = {}
         self._sequence = itertools.count()
@@ -150,7 +200,7 @@ class ResourceAwareQueue(Generic[JobT]):
         with self._condition:
             sequence = next(self._sequence)
             heapq.heappush(self._pending, (int(priority), sequence, job, keys))
-            position = self._position_for(keys, sequence)
+            position = self._position_for(keys, sequence, int(priority))
             if job_id:
                 self._active_jobs.discard(job_id)
             self._condition.notify_all()
@@ -161,7 +211,10 @@ class ResourceAwareQueue(Generic[JobT]):
             if resources is None:
                 return len(self._pending)
             keys = {resources} if isinstance(resources, str) else set(resources)
-            return sum(1 for _p, _s, _j, item_keys in self._pending if item_keys & keys)
+            return sum(
+                1 for _p, _s, _j, item_keys in self._pending
+                if _resource_sets_conflict(keys, item_keys)
+            )
 
     def active(self) -> int:
         with self._condition:
@@ -234,14 +287,14 @@ class ResourceAwareQueue(Generic[JobT]):
             self._condition.notify_all()
             return True
 
-    def _position_for(self, keys: frozenset[str], sequence: int) -> int:
+    def _position_for(self, keys: frozenset[str], sequence: int, target_priority: int) -> int:
         position = 1
-        for priority, item_sequence, _job, item_keys in self._pending:
-            if item_sequence >= sequence:
+        for item_priority, item_sequence, _job, item_keys in self._pending:
+            if (item_priority, item_sequence) >= (target_priority, sequence):
                 continue
-            if item_keys & keys:
+            if _resource_sets_conflict(keys, item_keys):
                 position += 1
-        if self._active_keys & keys:
+        if _resource_sets_conflict(keys, self._active_key_counts):
             return position
         return 1
 
@@ -259,7 +312,8 @@ class ResourceAwareQueue(Generic[JobT]):
                 heapq.heapify(self._pending)
                 del priority, sequence
                 job_id = str(getattr(job, "get", lambda _key, _default=None: _default)("job_id", ""))
-                self._active_keys.update(keys)
+                for key in keys:
+                    self._active_key_counts[key] = self._active_key_counts.get(key, 0) + 1
                 if job_id:
                     self._active_jobs.add(job_id)
                     self._active_resource_keys[job_id] = set(keys)
@@ -271,14 +325,19 @@ class ResourceAwareQueue(Generic[JobT]):
             ).start()
 
     def _find_ready_index(self) -> int | None:
-        candidates = [
-            (index, item)
-            for index, item in enumerate(self._pending)
-            if not self._active_keys.intersection(item[3])
-        ]
-        if not candidates:
-            return None
-        return min(candidates, key=lambda pair: (pair[1][0], pair[1][1]))[0]
+        ordered = sorted(enumerate(self._pending), key=lambda pair: (pair[1][0], pair[1][1]))
+        for index, item in ordered:
+            priority, sequence, _job, keys = item
+            if _resource_sets_conflict(self._active_key_counts, keys):
+                continue
+            blocked_by_earlier_job = any(
+                (earlier[0], earlier[1]) < (priority, sequence)
+                and _resource_sets_conflict(earlier[3], keys)
+                for _earlier_index, earlier in ordered
+            )
+            if not blocked_by_earlier_job:
+                return index
+        return None
 
     def release_resources(self, job_id: str, resources: set[str] | list[str] | tuple[str, ...]) -> bool:
         """Release a subset of an active job's resources.
@@ -299,9 +358,17 @@ class ResourceAwareQueue(Generic[JobT]):
             if not released:
                 return False
             owned.difference_update(released)
-            self._active_keys.difference_update(released)
+            self._release_active_keys(released)
             self._condition.notify_all()
             return True
+
+    def _release_active_keys(self, resources: Iterable[str]) -> None:
+        for resource in resources:
+            remaining = self._active_key_counts.get(resource, 0) - 1
+            if remaining > 0:
+                self._active_key_counts[resource] = remaining
+            else:
+                self._active_key_counts.pop(resource, None)
 
     def _run(self, job: JobT, keys: frozenset[str], job_id: str) -> None:
         try:
@@ -317,7 +384,7 @@ class ResourceAwareQueue(Generic[JobT]):
         finally:
             with self._condition:
                 owned = self._active_resource_keys.pop(job_id, set(keys))
-                self._active_keys.difference_update(owned)
+                self._release_active_keys(owned)
                 if job_id:
                     self._active_jobs.discard(job_id)
                 self._condition.notify_all()

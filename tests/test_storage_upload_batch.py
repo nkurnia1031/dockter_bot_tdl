@@ -407,10 +407,10 @@ class StorageUploadBatchTests(unittest.TestCase):
         )
         self.assertEqual(
             plan.resource_keys,
-            frozenset({"worker:remote-1:kind:storage_upload", "worker:remote-1:rclone:storage"}),
+            frozenset({"worker:remote-1:rclone:storage"}),
         )
 
-    def test_storage_batches_share_worker_lock_without_reserving_export_or_download(self):
+    def test_telegram_storage_batches_share_tdl_lane_without_reserving_export_or_download(self):
         sender_profiles = ["default", "archive"]
         first = build_execution_plan(
             "storage_upload", "default", "local",
@@ -429,6 +429,57 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertEqual(first.lane, "tdl-storage")
         self.assertEqual(first.priority, 100)
         self.assertEqual(second.priority, 100)
+
+    def test_copy_uploads_to_different_clouds_share_folder_but_move_is_exclusive(self):
+        telegram_copy = build_execution_plan(
+            "storage_upload", "default", "local",
+            {"provider": "telegram", "folder_path": "/workspace/shared", "transfer_mode": "copy"},
+        )
+        rclone_copy = build_execution_plan(
+            "storage_upload", "default", "local",
+            {"provider": "rclone", "folder_path": "/workspace/shared", "transfer_mode": "copy"},
+        )
+        rclone_move = build_execution_plan(
+            "storage_upload", "default", "local",
+            {"provider": "rclone", "folder_path": "/workspace/shared", "transfer_mode": "move"},
+        )
+        workspace = "worker:local:workspace:/workspace/shared"
+
+        self.assertIn("shared:" + workspace, telegram_copy.resource_keys)
+        self.assertIn("shared:" + workspace, rclone_copy.resource_keys)
+        self.assertIn("exclusive:" + workspace, rclone_move.resource_keys)
+        self.assertIn("worker:local:tdl:storage", telegram_copy.resource_keys)
+        self.assertIn("worker:local:rclone:storage", rclone_copy.resource_keys)
+        self.assertNotIn("worker:local:kind:storage_upload", telegram_copy.resource_keys)
+        self.assertNotIn("worker:local:kind:storage_upload", rclone_copy.resource_keys)
+        self.assertEqual(
+            telegram_copy.resource_keys & rclone_copy.resource_keys,
+            frozenset({"shared:" + workspace}),
+        )
+
+    def test_worker_fallback_plan_uses_provider_lane_and_transfer_mode_lock(self):
+        executor = object.__new__(WorkerJobExecutor)
+        executor.config = SimpleNamespace(backup_node_name="local")
+        command = {
+            "kind": "storage_upload", "profile": "default", "worker": "local",
+            "payload": {
+                "provider": "rclone", "folder_path": "/workspace/shared", "transfer_mode": "move",
+            },
+        }
+
+        fallback_keys = executor._resource_keys_for_command(command)
+        planned_keys = build_execution_plan(
+            command["kind"], command["profile"], command["worker"], command["payload"]
+        ).resource_keys
+
+        self.assertEqual(fallback_keys, set(planned_keys))
+        self.assertEqual(
+            fallback_keys,
+            {
+                "worker:local:rclone:storage",
+                "exclusive:worker:local:workspace:/workspace/shared",
+            },
+        )
 
     def test_rclone_management_jobs_share_storage_resource_lock_with_transfers(self):
         manage = build_execution_plan(
@@ -464,7 +515,8 @@ class StorageUploadBatchTests(unittest.TestCase):
             {"provider": "telegram", "folder_path": "/workspace/other"},
         )
 
-        self.assertTrue(download.resource_keys & upload.resource_keys)
+        self.assertIn("worker:local:workspace:/workspace/shared/downloads", download.resource_keys)
+        self.assertIn("shared:worker:local:workspace:/workspace/shared", upload.resource_keys)
         self.assertTrue(download.resource_keys & utility.resource_keys)
         self.assertFalse(download.resource_keys & sibling_upload.resource_keys)
 

@@ -1814,6 +1814,17 @@ class WorkerJobExecutor(
                 keys.add(f"worker:{worker}:workspace:{ancestor}")
         return keys
 
+    @classmethod
+    def _workspace_transfer_resource_keys(
+        cls, worker: str, raw_path: object, *, transfer_mode: str
+    ) -> set[str]:
+        keys = cls._workspace_resource_keys(worker, [raw_path])
+        if not keys:
+            return set()
+        leaf = max(keys, key=lambda key: (key.count("/"), len(key)))
+        lock_mode = "exclusive" if transfer_mode == "move" else "shared"
+        return {f"{lock_mode}:{leaf}"}
+
     def _resource_keys_for_command(self, command: dict[str, Any]) -> set[str]:
         profile = str(command.get("profile") or "default")
         kind = str(command.get("kind") or "unknown")
@@ -1838,19 +1849,44 @@ class WorkerJobExecutor(
                     keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:export")
-        elif kind in {"storage_upload", "storage_reconcile", "storage_sync"}:
-            keys = {f"worker:{worker}:kind:storage_upload"}
+        elif kind == "storage_upload":
+            keys = set()
             payload = command.get("payload") or {}
             workspace_path = payload.get("folder_path") or payload.get("folder")
-            if workspace_path and kind in {"storage_upload", "storage_reconcile"}:
-                keys.update(self._workspace_resource_keys(worker, [workspace_path]))
-            if kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone":
+            if workspace_path:
+                transfer_mode = str(payload.get("transfer_mode") or "copy").strip().lower()
+                keys.update(
+                    self._workspace_transfer_resource_keys(
+                        worker,
+                        workspace_path,
+                        transfer_mode=transfer_mode,
+                    )
+                )
+            if str(payload.get("provider") or "telegram").strip().lower() == "rclone":
                 keys.add(f"worker:{worker}:rclone:storage")
             else:
                 keys.add(f"worker:{worker}:tdl:storage")
                 sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
                 for sender_profile in sender_profiles:
                     keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+        elif kind == "storage_reconcile":
+            keys = {
+                f"worker:{worker}:kind:storage_reconcile",
+                f"worker:{worker}:tdl:storage",
+            }
+            payload = command.get("payload") or {}
+            workspace_path = payload.get("folder_path") or payload.get("folder")
+            if workspace_path:
+                keys.update(self._workspace_resource_keys(worker, [workspace_path]))
+            sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+            for sender_profile in sender_profiles:
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+        elif kind == "storage_sync":
+            keys = {
+                f"worker:{worker}:kind:storage_sync",
+                f"worker:{worker}:tdl:storage",
+                f"profile:{profile}:worker:{worker}:tdl:upload",
+            }
         elif kind == "tts":
             # Lock every verified fallback profile because only explicit
             # pre-send permission denials may move this job to another one.
