@@ -32,8 +32,8 @@
     current_folder:FolderEntry|null; breadcrumbs:{id:number;name:string}[];
     folders:FolderEntry[]; items:Item[]; total_folders:number; total_items:number
   };
-  type RcloneEntry = {name:string; path:string; is_dir:boolean; size:number; updated_at:string; file_count?:number; folder_count?:number; size_bytes?:number; size_complete?:boolean};
-  type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number};
+  type RcloneEntry = {id?:string; ambiguous?:boolean; name:string; path:string; is_dir:boolean; size:number|null; updated_at:string; file_count?:number; folder_count?:number; size_bytes?:number; size_complete?:boolean};
+  type RcloneBrowserResponse = {path:string; breadcrumbs:string[]; items:RcloneEntry[]; total:number; limit:number; offset:number; trash_supported?:boolean; permanent_delete_supported?:boolean};
   type RcloneSummary = {path:string; file_count:number; folder_count:number; size_bytes:number; size_complete:boolean};
   type PublicDownloadLink = {id:string; worker:string; relative_path:string; file_name:string; provider:string; job_id:string; created_at:string; url:string};
   type StorageScanOperation = {operation_id:string; status:string; phase:string; progress?:Record<string, any>; job_id?:string|null; error?:{code?:string;message?:string}|null};
@@ -60,6 +60,7 @@
   let moveOpen = $state(false);
   let editItem = $state<Item|null>(null);
   let editFolder = $state<FolderEntry|null>(null);
+  let editRcloneEntry = $state<RcloneEntry|null>(null);
   let detail = $state<Item|null>(null);
   let detailPanel = $state<HTMLElement | undefined>(undefined);
   let detailCloseButton = $state<HTMLButtonElement | undefined>(undefined);
@@ -79,6 +80,11 @@
   let revokeSubmitting = $state(false);
   let keywords = $state('');
   let rclonePath = $state('');
+  let rcloneView = $state<'active'|'trash'>('active');
+  let rcloneConfirmAction = $state<'copy'|'move'|'trash'|'restore'|'purge'|null>(null);
+  let rcloneManageConfirmed = $state(false);
+  let rclonePurgeConfirmation = $state('');
+  let rcloneManageSubmitting = $state(false);
   let remoteTarget = $state('');
   let remoteTargetSelected = $state(false);
   let remoteQuery = $state('');
@@ -86,6 +92,7 @@
   let remoteOrder = $state('asc');
   let remoteOffset = $state(0);
   let remoteLoading = $state(false);
+  let rcloneMutationSubmitting = $state(false);
   let remoteSummaryLoading = $state(false);
   let remoteSummaryReady = $state(false);
   let remoteSummaryFailed = $state(false);
@@ -357,13 +364,14 @@
   function clearSelection() { selectedItems = []; selectedFolders = []; }
   function clearRcloneSelection() { selectedRclone = []; }
   function toggleRcloneEntry(entry:RcloneEntry) {
+    if (entry.ambiguous) return;
     selectedRclone = selectedRclone.some((item) => item.path === entry.path)
       ? selectedRclone.filter((item) => item.path !== entry.path)
       : [...selectedRclone, entry];
   }
   function selectAllRclone() {
     const selected = new Map(selectedRclone.map((entry) => [entry.path, entry]));
-    for (const entry of remoteData.items) selected.set(entry.path, entry);
+    for (const entry of remoteData.items) if (!entry.ambiguous) selected.set(entry.path, entry);
     selectedRclone = [...selected.values()];
   }
   function toggleItem(id:number) {
@@ -381,6 +389,12 @@
     confirmAction='purge';
   }
   async function createFolder() {
+    if (provider === 'rclone') {
+      if (!worker || !newFolderName.trim()) return;
+      await submitRcloneMutation('create_folder', rclonePath, newFolderName);
+      createOpen=false; newFolderName='';
+      return;
+    }
     await post('/storage/folders', {name:newFolderName,parent_id:folderId});
     createOpen=false; newFolderName=''; await load();
   }
@@ -388,6 +402,76 @@
     if (!editFolder) return;
     await patch(`/storage/folders/${editFolder.id}`, {name:newFolderName});
     editFolder=null; newFolderName=''; await load();
+  }
+  function beginRcloneRename(entry:RcloneEntry) {
+    editRcloneEntry=entry;
+    newFolderName=entry.name;
+  }
+  async function renameRcloneEntry() {
+    if (!editRcloneEntry || !newFolderName.trim()) return;
+    await submitRcloneMutation('rename', editRcloneEntry.path, newFolderName);
+    editRcloneEntry=null; newFolderName='';
+  }
+  async function submitRcloneMutation(action:'create_folder'|'rename', path:string, name:string) {
+    if (!worker || rcloneMutationSubmitting) return;
+    rcloneMutationSubmitting=true;
+    try {
+      const result=await post<{path:string}>('/storage/rclone/actions', {
+        worker, action, path, name:name.trim()
+      });
+      await loadRclone({refreshSummaries:true});
+      message=action==='create_folder'
+        ? 'Folder rclone dibuat: '+result.path
+        : 'Rename rclone berhasil: '+result.path;
+    } catch (cause) {
+      message=cause instanceof Error?cause.message:'Operasi rclone gagal.';
+    } finally {
+      rcloneMutationSubmitting=false;
+    }
+  }
+  function openRcloneTrash() {
+    rcloneView='trash';
+    remoteOffset=0;
+    clearRcloneSelection();
+    void loadRclone();
+  }
+  function openRcloneActive() {
+    rcloneView='active';
+    remoteOffset=0;
+    clearRcloneSelection();
+    void loadRclone({refreshSummaries:true});
+  }
+  function requestRcloneManage(action:'copy'|'move'|'trash'|'restore'|'purge') {
+    if (!selectedRclone.length || !worker) return;
+    rcloneManageConfirmed=false;
+    rclonePurgeConfirmation='';
+    rcloneConfirmAction=action;
+  }
+  async function confirmRcloneManage() {
+    if (!rcloneConfirmAction || !worker || !selectedRclone.length || rcloneManageSubmitting) return;
+    const action=rcloneConfirmAction;
+    if (action==='move'&&!rcloneManageConfirmed) return;
+    if (action==='purge'&&rclonePurgeConfirmation!=='HAPUS') return;
+    rcloneManageSubmitting=true;
+    try {
+      const job=await post<{id:string}>('/storage/rclone/jobs', {
+        worker,
+        action,
+        sources:selectedRclone.map(({path,is_dir,id})=>({path,is_dir,...(id?{id}:{})})),
+        destination_path:['copy','move'].includes(action)?rclonePath:'',
+        trashed:rcloneView==='trash' && ['restore','purge'].includes(action),
+        confirmed:action==='purge'
+      });
+      rcloneConfirmAction=null;
+      clearRcloneSelection();
+      message=`Operasi rclone ${action} masuk Activity sebagai job ${job.id.slice(0,8)}.`;
+      window.dispatchEvent(new CustomEvent('tme3:data-mutated'));
+      await loadRclone({refreshSummaries:rcloneView==='active'});
+    } catch (cause) {
+      message=cause instanceof Error?cause.message:'Operasi rclone tidak dapat dibuat.';
+    } finally {
+      rcloneManageSubmitting=false;
+    }
   }
   async function saveItem() {
     if (!editItem) return;
@@ -504,11 +588,23 @@
     const request=++remoteGeneration;
     const selectedWorker=worker;
     const selectedPath=rclonePath;
+    const selectedView=rcloneView;
     remoteLoading=true;
     try {
+      if (selectedView==='trash') {
+        const params=new URLSearchParams({worker:selectedWorker,limit:'100',offset:String(remoteOffset)});
+        const response=await api<{supported:boolean;permanent_delete_supported?:boolean;items:RcloneEntry[];total:number;limit:number;offset:number}>(`/storage/rclone/trash?${params}`);
+        if (request!==remoteGeneration || provider!=='rclone' || worker!==selectedWorker || rcloneView!==selectedView) return;
+        remoteData={path:'',breadcrumbs:[],items:response.items||[],total:response.total||0,limit:response.limit||100,offset:response.offset||0,trash_supported:response.supported,permanent_delete_supported:response.permanent_delete_supported};
+        remoteSummaries={};
+        message=response.supported?'':response.permanent_delete_supported
+          ?'Trash remote tidak dapat dikelola dari sini; penghapusan permanen tersedia sebagai tindakan terpisah.'
+          :'Trash remote tidak dapat dikelola dari sini dan semantik hapus permanen backend belum dapat dipastikan.';
+        return;
+      }
       const params=new URLSearchParams({worker:selectedWorker,path:selectedPath,q:remoteQuery,sort:remoteSort,order:remoteOrder,limit:'100',offset:String(remoteOffset)});
       const response=await api<RcloneBrowserResponse>(`/storage/rclone/browser?${params}`);
-      if (request!==remoteGeneration || provider!=='rclone' || worker!==selectedWorker || rclonePath!==selectedPath) return;
+      if (request!==remoteGeneration || provider!=='rclone' || worker!==selectedWorker || rclonePath!==selectedPath || rcloneView!==selectedView) return;
       remoteData=response;
       message='';
       if (refreshSummaries) void loadRcloneSummaries(selectedWorker, selectedPath);
@@ -542,7 +638,7 @@
     remoteSummaryFailed=false;
     remoteSummaryReady=false;
     clearSelection(); clearRcloneSelection();
-    if (next==='rclone') { rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false; }
+    if (next==='rclone') { rclonePath=''; rcloneView='active'; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false; }
     else void load();
   }
   function handleWorkerChange() {
@@ -560,12 +656,13 @@
     remoteSummaryLoading=false;
     remoteSummaryFailed=false;
     remoteSummaryReady=false;
-    rclonePath=''; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false;
+    rclonePath=''; rcloneView='active'; remoteOffset=0; remoteTarget=''; remoteTargetSelected=false;
     clearRcloneSelection();
     publicLinks=[];
     remoteData={path:'',breadcrumbs:[],items:[],total:0,limit:100,offset:0};
   }
   function openRemoteFolder(path:string) {
+    rcloneView='active';
     remoteSummaryGeneration++;
     remoteSummaries={};
     remoteSummaryLoading=false;
@@ -750,28 +847,50 @@
     <div><h2 class="text-xl font-black">Remote rclone</h2><p class="muted mt-1 text-sm">Worker {worker || 'belum dipilih'} · status {rcloneReadiness.status}</p></div>
     <div class="flex flex-wrap gap-2">
       {#if selectedRclone.length}<button class="button secondary" disabled={!rcloneWorkerAvailable} onclick={startDownload}><Download size={16}/>Download {selectedRclone.length} dipilih</button>{/if}
-      <button class="button" disabled={!rcloneWorkerAvailable} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
+      {#if selectedRclone.length && rcloneView==='active'}
+        <button class="button secondary" disabled={!rcloneWorkerAvailable || rcloneManageSubmitting} onclick={() => requestRcloneManage('copy')}><Copy size={16}/>Copy ke sini</button>
+        <button class="button secondary" disabled={!rcloneWorkerAvailable || rcloneManageSubmitting} onclick={() => requestRcloneManage('move')}><Move size={16}/>Move ke sini</button>
+        <button class="button danger" disabled={!rcloneWorkerAvailable || rcloneManageSubmitting || (!remoteData.trash_supported&&!remoteData.permanent_delete_supported)} onclick={() => requestRcloneManage(remoteData.trash_supported?'trash':'purge')}><Trash2 size={16}/>{remoteData.trash_supported?'Pindahkan ke Trash':remoteData.permanent_delete_supported?'Hapus permanen':'Hapus tidak didukung'}</button>
+      {:else if selectedRclone.length && rcloneView==='trash'}
+        <button class="button secondary" disabled={!rcloneWorkerAvailable || rcloneManageSubmitting || !remoteData.trash_supported} onclick={() => requestRcloneManage('restore')}><ArchiveRestore size={16}/>Pulihkan</button>
+        <button class="button danger" disabled={!rcloneWorkerAvailable || rcloneManageSubmitting || !remoteData.trash_supported || !remoteData.permanent_delete_supported} onclick={() => requestRcloneManage('purge')}><Trash2 size={16}/>Hapus permanen</button>
+      {/if}
+      {#if rcloneView==='active'}
+        <button class="button secondary" disabled={!rcloneWorkerAvailable || rcloneMutationSubmitting} onclick={() => {newFolderName='';createOpen=true}}><CirclePlus size={16}/>Folder baru</button>
+        <button class="button" disabled={!rcloneWorkerAvailable} onclick={startUpload}><CloudUpload size={16}/>Upload ke folder ini</button>
+      {/if}
     </div>
   </div>
   {#if rcloneReadiness.status !== 'ready'}<p class="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950 dark:text-amber-100">Hasil scan rclone: {rcloneReadiness.reason_code || rcloneReadiness.status}. Daftar remote akan menguji command rclone aktual.</p>{/if}
+  <div class="mt-4 inline-flex rounded-xl border border-[var(--line)] p-1" role="tablist" aria-label="Tampilan rclone">
+    <button role="tab" aria-selected={rcloneView==='active'} class={`rounded-lg px-4 py-2 text-sm font-bold ${rcloneView==='active'?'bg-[var(--brand-soft)] text-[var(--brand)]':''}`} onclick={openRcloneActive}>Remote</button>
+    <button role="tab" aria-selected={rcloneView==='trash'} class={`rounded-lg px-4 py-2 text-sm font-bold ${rcloneView==='trash'?'bg-[var(--brand-soft)] text-[var(--brand)]':''}`} onclick={openRcloneTrash}>Trash</button>
+  </div>
+  {#if rcloneView==='trash' && !remoteData.trash_supported}
+    <p class="mt-3 rounded-xl bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100">{remoteData.permanent_delete_supported?'Trash remote tidak dapat dikelola di sini. Hapus permanen tersedia dengan konfirmasi.':'Trash remote tidak dapat dikelola di sini dan backend belum dapat memastikan penghapusan permanen.'}</p>
+  {/if}
   <div class="mt-4 flex flex-wrap items-center gap-2">
+    {#if rcloneView==='active'}
     <div class="flex min-w-0 flex-1 items-center gap-1"><button class="button ghost" onclick={() => openRemoteFolder('')}>Root</button>{#each rclonePath.split('/').filter(Boolean) as crumb,index}<ChevronRight size={14}/><button class="max-w-40 truncate rounded px-2 py-1 text-sm font-semibold hover:bg-[var(--brand-soft)]" onclick={() => openRemoteFolder(rclonePath.split('/').filter(Boolean).slice(0,index+1).join('/'))}>{crumb}</button>{/each}</div>
     <input class="field min-w-[180px] flex-1" bind:value={remoteQuery} placeholder="Cari di folder ini" onkeydown={(e)=>e.key==='Enter'&&(remoteOffset=0,loadRclone())}/>
     <select class="field !w-auto" bind:value={remoteSort} onchange={()=>{remoteOffset=0;loadRclone()}}><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select>
     <button class="button ghost" onclick={()=>{remoteOrder=remoteOrder==='asc'?'desc':'asc';loadRclone()}} title="Balik urutan"><ArrowUp class={remoteOrder==='desc'?'rotate-180':''} size={17}/></button>
-    <button class="button ghost" disabled={remoteLoading||!rcloneWorkerAvailable} onclick={()=>loadRclone({refreshSummaries:true})} aria-label="Refresh rclone"><RefreshCw class={remoteLoading||remoteSummaryLoading?'animate-spin':''} size={17}/></button>
+    {/if}
+    <button class="button ghost" disabled={remoteLoading||!rcloneWorkerAvailable} onclick={()=>loadRclone({refreshSummaries:rcloneView==='active'})} aria-label="Refresh rclone"><RefreshCw class={remoteLoading||remoteSummaryLoading?'animate-spin':''} size={17}/></button>
   </div>
   <div class="mt-4 divide-y divide-[var(--line)] rounded-xl border border-[var(--line)]">
-    {#each remoteData.items as entry (entry.path)}
+    {#each remoteData.items as entry, index (`${entry.path}:${entry.id || index}`)}
       <div class="flex items-center gap-3 p-3 text-sm">
-        <input type="checkbox" checked={selectedRclone.some((item)=>item.path===entry.path)} onchange={()=>toggleRcloneEntry(entry)} aria-label={`Pilih ${entry.is_dir?'folder':'file'} ${entry.name}`}/>
-        {#if entry.is_dir}<Folder class="shrink-0 text-amber-500" size={19}/><button class="min-w-0 flex-1 truncate text-left font-bold" onclick={()=>openRemoteFolder(entry.path)}><span class="block truncate">{entry.name}</span><small class="muted block truncate font-normal">{#if remoteSummaries[entry.path]}{remoteSummaries[entry.path].file_count} file · {remoteSummaries[entry.path].folder_count} folder · {remoteSummaries[entry.path].size_complete?formatBytes(remoteSummaries[entry.path].size_bytes):'Ukuran tidak lengkap'}{:else if remoteSummaryLoading}Menghitung…{:else if remoteSummaryFailed}Ringkasan gagal dihitung{:else if remoteSummaryReady}0 file · 0 folder · 0 B{:else}Belum dihitung{/if}</small></button><button class="button secondary !py-1" onclick={()=>{remoteTarget=entry.path;remoteTargetSelected=true;message=`Tujuan upload dipilih: ${entry.path}`}}>Pilih tujuan</button>
-        {:else}<File class="shrink-0 text-violet-500" size={19}/><span class="min-w-0 flex-1 truncate">{entry.name}</span><span class="muted">{formatBytes(entry.size)}</span>{/if}
+        <input type="checkbox" checked={selectedRclone.some((item)=>item.path===entry.path)} disabled={entry.ambiguous} onchange={()=>toggleRcloneEntry(entry)} aria-label={`Pilih ${entry.is_dir?'folder':'file'} ${entry.name}`}/>
+        {#if entry.is_dir}<Folder class="shrink-0 text-amber-500" size={19}/>{#if rcloneView==='active'}<button class="min-w-0 flex-1 truncate text-left font-bold" onclick={()=>openRemoteFolder(entry.path)}><span class="block truncate">{entry.name}</span><small class="muted block truncate font-normal">{#if remoteSummaries[entry.path]}{remoteSummaries[entry.path].file_count} file · {remoteSummaries[entry.path].folder_count} folder · {remoteSummaries[entry.path].size_complete?formatBytes(remoteSummaries[entry.path].size_bytes):'Ukuran tidak lengkap'}{:else if remoteSummaryLoading}Menghitung…{:else if remoteSummaryFailed}Ringkasan gagal dihitung{:else if remoteSummaryReady}0 file · 0 folder · 0 B{:else}Belum dihitung{/if}</small></button><button class="button secondary !py-1" onclick={()=>{remoteTarget=entry.path;remoteTargetSelected=true;message=`Tujuan upload dipilih: ${entry.path}`}}>Pilih tujuan</button>{:else}<span class="min-w-0 flex-1 truncate font-bold">{entry.path}</span>{/if}
+        {:else}<File class="shrink-0 text-violet-500" size={19}/><span class="min-w-0 flex-1 truncate">{rcloneView==='trash'?entry.path:entry.name}</span><span class="muted">{entry.size===null?'Ukuran tidak tersedia':formatBytes(entry.size)}</span>{/if}
+        {#if entry.ambiguous}<span class="text-xs font-semibold text-amber-700">Path ganda; aksi item dinonaktifkan</span>{/if}
+        {#if rcloneView==='active'}<button class="button ghost" disabled={rcloneMutationSubmitting} aria-label={'Rename '+entry.name} onclick={()=>beginRcloneRename(entry)}><Pencil size={15}/></button>{/if}
       </div>
     {/each}
     {#if !remoteData.items.length}<p class="muted p-8 text-center">{remoteLoading?'Memuat remote…':'Folder kosong atau tidak ada hasil.'}</p>{/if}
   </div>
-  <div class="mt-3 flex items-center justify-between text-sm"><span class="muted">{remoteData.total} entri · tujuan: {remoteTargetSelected?(remoteTarget||'root'):'belum dipilih'}</span><div class="flex gap-2"><button class="button secondary" disabled={remoteOffset<=0||remoteLoading} onclick={()=>{remoteOffset=Math.max(0,remoteOffset-100);loadRclone()}}>Sebelumnya</button><span class="muted self-center">Halaman {Math.floor(remoteOffset/100)+1}</span><button class="button secondary" disabled={remoteOffset+remoteData.limit>=remoteData.total||remoteLoading} onclick={()=>{remoteOffset+=100;loadRclone()}}>Berikutnya</button></div></div>
+  <div class="mt-3 flex items-center justify-between text-sm"><span class="muted">{remoteData.total} entri{rcloneView==='active'?` · tujuan: ${remoteTargetSelected?(remoteTarget||'root'):'belum dipilih'}`:''}</span><div class="flex gap-2"><button class="button secondary" disabled={remoteOffset<=0||remoteLoading} onclick={()=>{remoteOffset=Math.max(0,remoteOffset-100);loadRclone()}}>Sebelumnya</button><span class="muted self-center">Halaman {Math.floor(remoteOffset/100)+1}</span><button class="button secondary" disabled={remoteOffset+remoteData.limit>=remoteData.total||remoteLoading} onclick={()=>{remoteOffset+=100;loadRclone()}}>Berikutnya</button></div></div>
 </section>
 {:else}
 <section class="card mt-6 overflow-hidden">
@@ -872,6 +991,7 @@
 <JobTable kind="storage_download" title="Unduhan Storage"/>
 <JobTable kind="storage_upload" title="Transfer upload" retryable={true}/>
 {#if provider==='telegram'}<JobTable kind="storage_sync" title="Sinkronisasi katalog Telegram"/>{/if}
+{#if provider==='rclone'}<JobTable kind="storage_rclone_manage" title="Pengelolaan remote rclone"/>{/if}
 
 <Modal open={downloadOpen} onclose={() => downloadOpen=false} title="Download ke worker" size="lg">
   <p class="muted mb-4 text-sm">{activeSelectionCount} pilihan dari {provider==='telegram'?'Telegram Storage':'rclone'} akan diunduh rekursif ke worker {worker}. File yang sudah ada tidak ditimpa.</p>
@@ -912,7 +1032,16 @@
   </div>
 {/if}
 
-<Modal open={createOpen} onclose={() => createOpen=false} title="Folder baru" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" placeholder="Dokumen 2026"/></label><p class="muted mt-2 text-xs">Maksimal 120 karakter. Slash, titik tunggal, dan karakter kontrol tidak diperbolehkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => createOpen=false}>Batal</button><button class="button" disabled={!newFolderName.trim()} onclick={createFolder}>Buat folder</button></div></Modal>
+<Modal open={createOpen} onclose={() => createOpen=false} title="Folder baru" size="sm"><label class="text-sm font-bold">Nama folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" placeholder="Dokumen 2026"/></label><p class="muted mt-2 text-xs">Maksimal 120 karakter. Slash, titik tunggal, dan karakter kontrol tidak diperbolehkan.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => createOpen=false}>Batal</button><button class="button" disabled={!newFolderName.trim() || rcloneMutationSubmitting} onclick={createFolder}>Buat folder</button></div></Modal>
+
+<Modal open={Boolean(editRcloneEntry)} onclose={() => {editRcloneEntry=null;newFolderName=''}} title="Rename file atau folder rclone" size="sm"><label class="text-sm font-bold">Nama file atau folder<input class="field mt-2" bind:value={newFolderName} maxlength="120" aria-label="Nama file atau folder"/></label><p class="muted mt-2 text-xs">Benturan nama gagal tanpa menimpa item yang ada.</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => {editRcloneEntry=null;newFolderName=''}}>Batal</button><button class="button" disabled={!newFolderName.trim() || rcloneMutationSubmitting} onclick={renameRcloneEntry}>Simpan rename</button></div></Modal>
+
+<Modal open={Boolean(rcloneConfirmAction)} onclose={() => !rcloneManageSubmitting&&(rcloneConfirmAction=null)} title={rcloneConfirmAction==='purge'?'Hapus permanen?':rcloneConfirmAction==='move'?'Pindahkan item rclone?':rcloneConfirmAction==='trash'?'Pindahkan ke Trash?':rcloneConfirmAction==='restore'?'Pulihkan item?':'Copy item rclone?'} size="md">
+  <p class="text-sm">{#if rcloneConfirmAction==='copy'}{selectedRclone.length} item akan disalin ke <b>{rclonePath||'root remote'}</b>. Item tujuan yang bentrok gagal tanpa overwrite.{:else if rcloneConfirmAction==='move'}{selectedRclone.length} item akan disalin dan diverifikasi sebelum sumber dihapus dari lokasi asal. Jika sumber berubah, sumber tetap dipertahankan; item tujuan mungkin sudah tersalin.{:else if rcloneConfirmAction==='trash'}{selectedRclone.length} item dipindahkan ke Trash. Item dapat dipulihkan selama backend remote mempertahankannya.{:else if rcloneConfirmAction==='restore'}{selectedRclone.length} item akan dipulihkan ke lokasi asal. Benturan dengan item aktif gagal tanpa overwrite. Google Drive hanya menyediakan restore seluruh item Trash di folder induk secara rekursif; pilih semua item Trash pada folder induk yang sama dalam satu batch. Jika pilihan tidak mencakup seluruh cakupan, job menolak restore agar item lain tidak ikut berubah.{:else if rcloneView==='trash'}{selectedRclone.length} item Trash akan dihapus permanen dan tidak dapat dipulihkan.{:else}Backend remote ini tidak menyediakan Trash melalui adapter. {selectedRclone.length} item akan dihapus permanen.{/if}</p>
+  {#if rcloneConfirmAction==='move'}<label class="mt-4 flex cursor-pointer items-start gap-3 rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"><input class="mt-1" type="checkbox" bind:checked={rcloneManageConfirmed}/><span>Saya memahami sumber akan dihapus setelah salinan remote terkonfirmasi.</span></label>{/if}
+  {#if rcloneConfirmAction==='purge'}<label class="mt-4 block text-sm font-bold">Ketik HAPUS untuk mengonfirmasi<input class="field mt-2" bind:value={rclonePurgeConfirmation} autocomplete="off"/></label>{/if}
+  <div class="mt-5 flex justify-end gap-2"><button class="button secondary" disabled={rcloneManageSubmitting} onclick={() => rcloneConfirmAction=null}>Batal</button><button class={`button ${['trash','purge'].includes(rcloneConfirmAction||'')?'danger':''}`} disabled={rcloneManageSubmitting || (rcloneConfirmAction==='move'&&!rcloneManageConfirmed) || (rcloneConfirmAction==='purge'&&rclonePurgeConfirmation!=='HAPUS')} onclick={confirmRcloneManage}>{rcloneManageSubmitting?'Membuat job…':rcloneConfirmAction==='purge'?'Hapus permanen':rcloneConfirmAction==='move'?'Move':rcloneConfirmAction==='trash'?'Pindahkan ke Trash':rcloneConfirmAction==='restore'?'Pulihkan':'Copy'}</button></div>
+</Modal>
 
 <Modal open={uploadOpen} onclose={() => uploadOpen=false} title="Upload folder workspace" size="lg">
   <p class="muted mb-4 text-sm">{provider==='telegram'?'Upload akan mencoba profil lokal worker ini.':'Upload akan menjalankan command rclone pada worker ini.'} Semua subfolder sumber dipertahankan.</p><TargetPicker purpose="storage" requireProfile={false} requiresVerification={false} readinessRuntime={provider==='telegram'?'storage':'rclone_storage'} bind:worker onWorkerChange={handleWorkerChange}/><div class="mt-4"><WorkspaceExplorer bind:selected={workspaceFolders} single {worker}/></div>

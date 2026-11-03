@@ -490,6 +490,28 @@ class StorageDownloadRequest(BaseModel):
     publish_public_links: bool = False
 
 
+class RcloneStorageActionRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=48)
+    action: Literal["create_folder", "rename"]
+    path: str = Field(default="", max_length=2048)
+    name: str = Field(min_length=1, max_length=120)
+
+
+class RcloneStorageManageSource(BaseModel):
+    path: str = Field(min_length=1, max_length=2048)
+    is_dir: bool = False
+    id: str = Field(default="", max_length=256)
+
+
+class RcloneStorageManageRequest(BaseModel):
+    worker: str = Field(min_length=1, max_length=48)
+    action: Literal["copy", "move", "trash", "restore", "purge"]
+    sources: list[RcloneStorageManageSource] = Field(min_length=1, max_length=200)
+    destination_path: str = Field(default="", max_length=2048)
+    trashed: bool = False
+    confirmed: bool = False
+
+
 class StoragePublicLinkRevokeRequest(BaseModel):
     confirmed: bool
 

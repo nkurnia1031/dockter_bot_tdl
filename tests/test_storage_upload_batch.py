@@ -430,6 +430,23 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertEqual(first.priority, 100)
         self.assertEqual(second.priority, 100)
 
+    def test_rclone_management_jobs_share_storage_resource_lock_with_transfers(self):
+        manage = build_execution_plan(
+            "storage_rclone_manage", "default", "local",
+            {"action": "copy", "sources": [{"path": "archive/a.zip"}]},
+        )
+        upload = build_execution_plan(
+            "storage_upload", "default", "local", {"provider": "rclone"},
+        )
+        download = build_execution_plan(
+            "storage_download", "default", "local", {"provider": "rclone"},
+        )
+
+        self.assertIn("worker:local:rclone:storage", manage.resource_keys)
+        self.assertTrue(manage.resource_keys & upload.resource_keys)
+        self.assertTrue(manage.resource_keys & download.resource_keys)
+        self.assertEqual(manage.lane, "rclone-storage-manage")
+
     def test_storage_download_and_upload_share_workspace_path_locks(self):
         download = build_execution_plan(
             "storage_download", "default", "local",

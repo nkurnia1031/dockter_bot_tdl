@@ -1,14 +1,32 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import shutil
+import subprocess
+import uuid
 from pathlib import Path
 from typing import Callable, Iterable
 
 from tme3bot.command_audit import bounded_output_tail, sanitize_text
 from tme3bot.tdl import CommandCallback, SubprocessRunner, TDLCommandError, TDLStalledError
 from tme3bot.utility import validate_rclone_destination
+
+
+_PERMANENT_DELETE_FLAGS = {
+    "b2": "--b2-hard-delete",
+    "drime": "--drime-hard-delete",
+    "drive": "--drive-use-trash=false",
+    "jottacloud": "--jottacloud-hard-delete",
+    "mega": "--mega-hard-delete",
+    "onedrive": "--onedrive-hard-delete",
+    "pikpak": "--pikpak-use-trash=false",
+    "quatrix": "--quatrix-hard-delete",
+    "sugarsync": "--sugarsync-hard-delete",
+    "yandex": "--yandex-hard-delete",
+}
+_PERMANENT_DELETE_DEFAULT_BACKENDS = frozenset({"ftp", "local", "sftp", "webdav"})
 
 
 class RcloneError(RuntimeError):
@@ -146,7 +164,10 @@ class RcloneRunner:
         root = str(root or "").strip().rstrip("/")
         relative = str(relative_path or "").replace("\\", "/")
         if relative.startswith("/"):
-            raise RcloneError("Path rclone harus berada di bawah root yang dikonfigurasi.")
+            raise RcloneError(
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            )
         relative = relative.strip("/")
         parts = relative.split("/") if relative else []
         if (
@@ -156,7 +177,10 @@ class RcloneRunner:
             or any(ord(char) < 32 for char in relative)
             or any(not part or part in {".", ".."} or ":" in part for part in parts)
         ):
-            raise RcloneError("Path rclone harus berada di bawah root yang dikonfigurasi.")
+            raise RcloneError(
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            )
         return root + ("/" + "/".join(parts) if parts else ""), relative
 
     def list_directory(
@@ -233,8 +257,11 @@ class RcloneRunner:
                 return (not bool(item["is_dir"]), Path(str(item["name"])).suffix.casefold(), str(item["name"]).casefold())
             return (not bool(item["is_dir"]), str(item["name"]).casefold())
         entries.sort(key=key, reverse=order == "desc")
+        backend_type = self._remote_backend_type(destination, config)
         return {"path": normalized, "breadcrumbs": normalized.split("/") if normalized else [],
                 "items": entries[offset:offset + limit], "total": len(entries),
+                "trash_supported": backend_type == "drive",
+                "permanent_delete_supported": self._permanent_delete_flags(backend_type) is not None,
                 "limit": limit, "offset": offset}
 
     def list_directory_summaries(
@@ -411,6 +438,879 @@ class RcloneRunner:
         except (TypeError, ValueError, json.JSONDecodeError):
             return True
         return not (isinstance(value, dict) and isinstance(value.get("stats"), dict))
+
+    @staticmethod
+    def _remote_entry_name(value: str) -> str:
+        name = str(value or "").strip()
+        if (
+            not name
+            or len(name) > 120
+            or name in {".", ".."}
+            or "/" in name
+            or "\\" in name
+            or ":" in name
+            or any(ord(char) < 32 for char in name)
+        ):
+            raise RcloneError(
+                "Nama file atau folder rclone tidak valid.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            )
+        return name
+
+    def _storage_config(self, config_path: Path, config_root: Path) -> Path:
+        config = Path(config_path).resolve()
+        try:
+            config.relative_to(Path(config_root).resolve())
+        except ValueError as exc:
+            raise RcloneError(
+                "Konfigurasi rclone tidak tersedia untuk worker ini.",
+                code="RCLONE_RUNTIME_UNAVAILABLE",
+            ) from exc
+        if not config.is_file() or shutil.which("rclone") is None:
+            raise RcloneError(
+                "Runtime rclone belum tersedia pada worker.",
+                code="RCLONE_RUNTIME_UNAVAILABLE",
+            )
+        return config
+
+    def _run_storage_command(
+        self,
+        command: list[str],
+        *,
+        log_prefix: str,
+        error_code: str = "RCLONE_ACCESS_FAILED",
+    ):
+        try:
+            result = self.runner.run(
+                command,
+                log_prefix=log_prefix,
+                output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
+        except (TDLStalledError, TDLCommandError, OSError) as exc:
+            raise RcloneError(
+                "Worker tidak dapat menjalankan operasi rclone.",
+                code=error_code,
+            ) from exc
+        if result.returncode != 0:
+            raise RcloneError(
+                "Worker tidak dapat menjalankan operasi rclone.",
+                code=error_code,
+            )
+        return result
+
+    def _list_storage_children(
+        self, remote_parent: str, config: Path, *, log_prefix: str
+    ) -> list[dict[str, object]]:
+        result = self._run_storage_command(
+            [
+                "rclone",
+                "lsjson",
+                remote_parent,
+                "--max-depth",
+                "1",
+                "--no-modtime",
+                "--no-mimetype",
+                "--config",
+                str(config),
+                "--log-level",
+                "ERROR",
+            ],
+            log_prefix=log_prefix,
+        )
+        try:
+            entries = json.loads(getattr(result, "stdout", "") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RcloneError("Worker menerima listing rclone yang tidak valid.") from exc
+        if not isinstance(entries, list):
+            raise RcloneError("Worker menerima listing rclone yang tidak valid.")
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    @staticmethod
+    def _remote_backend_type(destination: str, config: Path) -> str:
+        """Read only the configured backend type; never expose config values."""
+        remote_name = str(destination or "").split(":", 1)[0].strip()
+        if not remote_name:
+            return ""
+        parser = configparser.RawConfigParser(interpolation=None)
+        try:
+            try:
+                parser.read(config, encoding="utf-8")
+            except (configparser.Error, UnicodeError):
+                # Encrypted rclone configs are not INI until rclone decrypts
+                # and redacts them below.
+                parser = configparser.RawConfigParser(interpolation=None)
+            for _ in range(8):
+                if parser.has_section(remote_name):
+                    section = parser[remote_name]
+                else:
+                    # rclone supports encrypted configuration files. Ask its
+                    # redaction command for this one section so capability
+                    # detection can still work without exposing config values
+                    # to logs or callers. An unavailable config passphrase
+                    # simply makes destructive capability unknown.
+                    try:
+                        result = subprocess.run(
+                            [
+                                "rclone", "config", "redacted", remote_name,
+                                "--config", str(config),
+                            ],
+                            check=False,
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                            input="",
+                        )
+                    except (OSError, subprocess.SubprocessError):
+                        return ""
+                    if result.returncode != 0 or len(result.stdout or "") > 65536:
+                        return ""
+                    redacted = configparser.RawConfigParser(interpolation=None)
+                    try:
+                        redacted.read_string(result.stdout or "")
+                    except (configparser.Error, UnicodeError):
+                        return ""
+                    if not redacted.has_section(remote_name):
+                        return ""
+                    section = redacted[remote_name]
+                backend = str(section.get("type") or "").strip().lower()
+                if backend != "alias":
+                    return backend
+                alias_target = str(section.get("remote") or "").strip()
+                remote_name = alias_target.split(":", 1)[0].strip()
+                if not remote_name:
+                    return ""
+        except (OSError, configparser.Error, UnicodeError):
+            return ""
+        return ""
+
+    @staticmethod
+    def _permanent_delete_flags(backend_type: str, *, trashed: bool = False) -> list[str] | None:
+        """Return a known permanent-delete strategy or None for unknown semantics."""
+        backend = str(backend_type or "").strip().lower()
+        if trashed:
+            if backend != "drive":
+                return None
+            return ["--drive-use-trash=false", "--drive-trashed-only"]
+        flag = _PERMANENT_DELETE_FLAGS.get(backend)
+        if flag:
+            return [flag]
+        if backend in _PERMANENT_DELETE_DEFAULT_BACKENDS:
+            return []
+        return None
+
+    def _list_recursive_entries(
+        self,
+        remote: str,
+        config: Path,
+        *,
+        log_prefix: str,
+        trashed_only: bool = False,
+    ) -> list[dict[str, object]]:
+        command = [
+            "rclone", "lsjson", remote, "--recursive", "--config", str(config),
+            "--log-level", "ERROR",
+        ]
+        if trashed_only:
+            command.append("--drive-trashed-only")
+        result = self._run_storage_command(
+            command, log_prefix=log_prefix, error_code="RCLONE_LIST_FAILED"
+        )
+        try:
+            entries = json.loads(getattr(result, "stdout", "") or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RcloneError(
+                "Worker menerima listing rclone yang tidak valid.",
+                code="RCLONE_LIST_FAILED",
+            ) from exc
+        if not isinstance(entries, list):
+            raise RcloneError(
+                "Worker menerima listing rclone yang tidak valid.",
+                code="RCLONE_LIST_FAILED",
+            )
+        normalized: list[dict[str, object]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            relative = str(entry.get("Path") or entry.get("Name") or "").replace("\\", "/")
+            parts = relative.split("/")
+            if (
+                not relative
+                or relative.startswith("/")
+                or any(not part or part in {".", ".."} or ":" in part for part in parts)
+                or any(ord(char) < 32 for char in relative)
+            ):
+                raise RcloneError(
+                    "Remote memiliki path yang tidak aman untuk operasi ini.",
+                    code="RCLONE_REMOTE_ENTRY_INVALID",
+                )
+            item = dict(entry)
+            item["_relative_path"] = "/".join(parts)
+            normalized.append(item)
+        return normalized
+
+    def list_trash(
+        self,
+        destination: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, object]:
+        """List trashed Drive items below the configured Storage root."""
+        try:
+            validate_rclone_destination(destination)
+        except ValueError as exc:
+            raise RcloneError("Root rclone tidak valid.", code="RCLONE_BROWSER_PATH_INVALID") from exc
+        config = self._storage_config(config_path, config_root)
+        backend_type = self._remote_backend_type(destination, config)
+        supported = backend_type == "drive"
+        if not supported:
+            return {
+                "supported": False,
+                "permanent_delete_supported": self._permanent_delete_flags(backend_type) is not None,
+                "items": [],
+                "total": 0,
+                "limit": limit,
+                "offset": offset,
+            }
+        remote, _ = self._remote_path(destination, "")
+        entries = self._list_recursive_entries(
+            remote, config, log_prefix="rclone-storage-trash-list", trashed_only=True
+        )
+        items: list[dict[str, object]] = []
+        for entry in entries:
+            relative = str(entry.get("_relative_path") or "")
+            name = relative.rsplit("/", 1)[-1]
+            if not name:
+                continue
+            raw_size = entry.get("Size")
+            try:
+                size = max(0, int(raw_size)) if raw_size is not None else None
+            except (TypeError, ValueError):
+                size = None
+            items.append({
+                "id": str(entry.get("ID") or "")[:256],
+                "name": name,
+                "path": relative,
+                "is_dir": entry.get("IsDir") is True,
+                "size": size,
+                "updated_at": str(entry.get("ModTime") or "")[:64],
+            })
+        counts: dict[str, int] = {}
+        for item in items:
+            item_path = str(item["path"])
+            counts[item_path] = counts.get(item_path, 0) + 1
+        for item in items:
+            item["ambiguous"] = counts[str(item["path"])] > 1
+        items.sort(key=lambda item: (
+            not bool(item["is_dir"]),
+            str(item["path"]).casefold(),
+            str(item["id"]),
+        ))
+        limit = max(1, min(200, int(limit)))
+        offset = max(0, int(offset))
+        return {
+            "supported": True,
+            "permanent_delete_supported": True,
+            "items": items[offset:offset + limit],
+            "total": len(items),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @staticmethod
+    def _entry_metadata(entry: dict[str, object]) -> tuple[object, ...]:
+        return (
+            str(entry.get("_relative_path") or ""),
+            entry.get("IsDir") is True,
+            str(entry.get("ID") or ""),
+            str(entry.get("Size") if entry.get("Size") is not None else ""),
+            str(entry.get("ModTime") or ""),
+        )
+
+    def _source_snapshot(
+        self,
+        destination: str,
+        relative_path: str,
+        remote_path: str,
+        *,
+        is_dir: bool,
+        config: Path,
+    ) -> list[dict[str, object]]:
+        """Capture the selected entry and all descendants for safe Move cleanup."""
+        parent_relative = relative_path.rpartition("/")[0]
+        leaf = relative_path.rsplit("/", 1)[-1]
+        parent_remote, _ = self._remote_path(destination, parent_relative)
+        entries = self._list_storage_children(
+            parent_remote, config, log_prefix="rclone-storage-manage-source"
+        )
+        matches = [
+            entry for entry in entries
+            if str(entry.get("Name") or "") == leaf
+            and (entry.get("IsDir") is True) == is_dir
+        ]
+        if not matches:
+            raise RcloneError(
+                "File atau folder sumber tidak ditemukan.", code="RCLONE_SOURCE_NOT_FOUND"
+            )
+        if len(matches) != 1:
+            raise RcloneError(
+                "Nama sumber tidak unik pada remote; operasi dibatalkan.",
+                code="RCLONE_SOURCE_AMBIGUOUS",
+            )
+        root_entry = dict(matches[0])
+        root_entry["_relative_path"] = relative_path
+        snapshot = [root_entry]
+        if not is_dir:
+            return snapshot
+        children = self._list_recursive_entries(
+            remote_path, config, log_prefix="rclone-storage-manage-source"
+        )
+        for entry in children:
+            child_relative = str(entry.get("_relative_path") or "")
+            if child_relative == relative_path or child_relative.startswith(relative_path + "/"):
+                normalized = child_relative
+            else:
+                normalized = relative_path + "/" + child_relative
+            child = dict(entry)
+            child["_relative_path"] = normalized
+            snapshot.append(child)
+        return snapshot
+
+    def manage_storage_item(
+        self,
+        destination: str,
+        *,
+        action: str,
+        path: str,
+        is_dir: bool,
+        config_path: Path,
+        config_root: Path,
+        destination_path: str = "",
+        trashed: bool = False,
+        item_id: str = "",
+        selected_restore_sources: list[dict[str, object]] | None = None,
+        progress_callback: Callable[[dict[str, object]], None] | None = None,
+    ) -> dict[str, object]:
+        """Safely mutate one item, keeping every command below the configured root."""
+        try:
+            validate_rclone_destination(destination)
+            source_remote, source_relative = self._remote_path(destination, path)
+        except ValueError as exc:
+            raise RcloneError(
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            ) from exc
+        if not source_relative:
+            raise RcloneError(
+                "Root rclone tidak dapat diubah.", code="RCLONE_BROWSER_PATH_INVALID"
+            )
+        config = self._storage_config(config_path, config_root)
+        if action in {"copy", "move"}:
+            destination_remote, normalized_parent = self._remote_path(
+                destination, destination_path
+            )
+            source_name = source_relative.rsplit("/", 1)[-1]
+            target_relative = "/".join(
+                part for part in (normalized_parent, source_name) if part
+            )
+            target_remote, target_relative = self._remote_path(destination, target_relative)
+            if is_dir and (
+                target_relative == source_relative
+                or target_relative.startswith(source_relative + "/")
+            ):
+                raise RcloneError(
+                    "Folder tidak dapat disalin ke dalam dirinya sendiri.",
+                    code="RCLONE_TARGET_INVALID",
+                )
+            parent_entries = self._list_storage_children(
+                destination_remote, config, log_prefix="rclone-storage-manage-target"
+            )
+            if any(str(item.get("Name") or "") == source_name for item in parent_entries):
+                raise RcloneError(
+                    "Nama tujuan rclone sudah ada.", code="RCLONE_TARGET_EXISTS"
+                )
+
+            before_entries = self._source_snapshot(
+                destination, source_relative, source_remote,
+                is_dir=is_dir, config=config,
+            )
+
+            stage_name = f".tme3bot-stage-{uuid.uuid4().hex}"
+            stage_relative = "/".join(
+                part for part in (normalized_parent, stage_name) if part
+            )
+            stage_remote, _ = self._remote_path(destination, stage_relative)
+            transfer_command = [
+                "rclone", "copy" if is_dir else "copyto", source_remote, stage_remote,
+                "--config", str(config), "--log-level", "NOTICE", "--stats", "1s",
+                "--stats-log-level", "NOTICE", "--use-json-log",
+            ]
+            if is_dir:
+                transfer_command.append("--create-empty-src-dirs")
+            transfer_output = self._transfer_log_callback(
+                progress_callback,
+                file_name=source_name,
+                file_size=None,
+                log_callback=self.log_callback,
+            )
+            try:
+                result = self.runner.run(
+                    transfer_command,
+                    log_prefix="rclone-storage-manage-copy",
+                    output_callback=transfer_output,
+                    output_filter=self._keep_non_stats_output_line,
+                    stall_timeout_seconds=self.stall_timeout_seconds,
+                    command_callback=self.command_callback,
+                )
+                if result.returncode != 0:
+                    raise RcloneError(
+                        "rclone gagal menyalin item.", code="RCLONE_OPERATION_FAILED"
+                    )
+                self._run_storage_command(
+                    [
+                        "rclone", "moveto", stage_remote, target_remote,
+                        "--ignore-existing", "--config", str(config), "--log-level", "ERROR",
+                    ],
+                    log_prefix="rclone-storage-manage-commit",
+                    error_code="RCLONE_OPERATION_FAILED",
+                )
+                target_parent, _ = self._remote_path(destination, normalized_parent)
+                committed = self._list_storage_children(
+                    target_parent, config, log_prefix="rclone-storage-manage-verify"
+                )
+                stage_name_still_exists = any(
+                    str(item.get("Name") or "") == stage_name for item in committed
+                )
+                if stage_name_still_exists:
+                    raise RcloneError(
+                        "Nama tujuan dibuat bersamaan; sumber remote tetap dipertahankan.",
+                        code="RCLONE_TARGET_EXISTS",
+                    )
+                if not any(str(item.get("Name") or "") == source_name for item in committed):
+                    raise RcloneError(
+                        "Hasil salinan remote belum dapat dipastikan.",
+                        code="RCLONE_OPERATION_AMBIGUOUS",
+                    )
+            except Exception:
+                # The stage path is unique to this operation; cleanup cannot
+                # target an operator-owned item.
+                try:
+                    self._run_storage_command(
+                        [
+                            "rclone", "purge" if is_dir else "deletefile", stage_remote,
+                            "--config", str(config),
+                            "--log-level", "ERROR",
+                        ],
+                        log_prefix="rclone-storage-manage-stage-cleanup",
+                        error_code="RCLONE_STAGE_CLEANUP_FAILED",
+                    )
+                except Exception:
+                    pass
+                raise
+
+            result: dict[str, object] = {
+                "action": action,
+                "path": source_relative,
+                "target_path": target_relative,
+                "status": "succeeded",
+                "cleanup_status": "not_requested" if action == "copy" else "pending",
+            }
+            if action == "move":
+                try:
+                    after_entries = self._source_snapshot(
+                        destination, source_relative, source_remote,
+                        is_dir=is_dir, config=config,
+                    )
+                except RcloneError as exc:
+                    result.update(
+                        status="partial",
+                        cleanup_status="skipped_source_changed",
+                        error_code=exc.code or "RCLONE_SOURCE_CHANGED",
+                        error="Salinan selesai, tetapi sumber berubah atau tidak dapat diperiksa; sumber tidak dihapus.",
+                    )
+                    return result
+                before = sorted(self._entry_metadata(entry) for entry in before_entries)
+                after = sorted(self._entry_metadata(entry) for entry in after_entries)
+                if before != after:
+                    result.update(status="partial", cleanup_status="skipped_source_changed")
+                    return result
+                cleanup_command = ["rclone", "purge" if is_dir else "deletefile", source_remote]
+                cleanup_command.extend(["--config", str(config), "--log-level", "ERROR"])
+                try:
+                    self._run_storage_command(
+                        cleanup_command,
+                        log_prefix="rclone-storage-manage-move-cleanup",
+                        error_code="RCLONE_SOURCE_CLEANUP_FAILED",
+                    )
+                    result["cleanup_status"] = "deleted"
+                except RcloneError:
+                    result.update(status="partial", cleanup_status="failed")
+            return result
+
+        if action in {"trash", "restore", "purge"}:
+            trash_supported = self._remote_backend_type(destination, config) == "drive"
+            if action == "trash" and not trash_supported:
+                raise RcloneError(
+                    "Remote ini tidak menyediakan Trash melalui adapter rclone.",
+                    code="RCLONE_TRASH_UNSUPPORTED",
+                )
+            if action == "restore":
+                if not trash_supported or not trashed:
+                    raise RcloneError(
+                        "Restore hanya tersedia untuk item Trash Google Drive.",
+                        code="RCLONE_TRASH_UNSUPPORTED",
+                    )
+                trash_entries = self._list_recursive_entries(
+                    self._remote_path(destination, "")[0], config,
+                    log_prefix="rclone-storage-restore-scope", trashed_only=True,
+                )
+                selected_entries = [
+                    entry for entry in trash_entries
+                    if str(entry.get("_relative_path") or "") == source_relative
+                    or (is_dir and str(entry.get("_relative_path") or "").startswith(source_relative + "/"))
+                ]
+                exact_matches = [
+                    entry for entry in selected_entries
+                    if str(entry.get("_relative_path") or "") == source_relative
+                ]
+                if not exact_matches:
+                    parent_relative = source_relative.rpartition("/")[0]
+                    parent_remote, _ = self._remote_path(destination, parent_relative)
+                    active_children = self._list_storage_children(
+                        parent_remote, config, log_prefix="rclone-storage-restore-check"
+                    )
+                    already_restored = [
+                        entry for entry in active_children
+                        if str(entry.get("Name") or "") == source_relative.rsplit("/", 1)[-1]
+                        and (entry.get("IsDir") is True) == is_dir
+                        and item_id
+                        and str(entry.get("ID") or "") == item_id
+                    ]
+                    if len(already_restored) == 1:
+                        return {
+                            "action": action,
+                            "path": source_relative,
+                            "status": "succeeded",
+                            "cleanup_status": "not_requested",
+                        }
+                    raise RcloneError(
+                        "Item Trash tidak ditemukan.", code="RCLONE_SOURCE_NOT_FOUND"
+                    )
+                if len(exact_matches) != 1 or (
+                    item_id and str(exact_matches[0].get("ID") or "") != item_id
+                ):
+                    raise RcloneError(
+                        "Item Trash tidak unik atau sudah berubah; refresh daftar Trash.",
+                        code="RCLONE_SOURCE_AMBIGUOUS",
+                    )
+                if (exact_matches[0].get("IsDir") is True) != is_dir:
+                    raise RcloneError(
+                        "Jenis item Trash berubah; refresh daftar Trash.",
+                        code="RCLONE_SOURCE_CHANGED",
+                    )
+                parent_relative = source_relative.rpartition("/")[0]
+                affected_entries = [
+                    entry for entry in trash_entries
+                    if not parent_relative
+                    or str(entry.get("_relative_path") or "") == parent_relative
+                    or str(entry.get("_relative_path") or "").startswith(parent_relative + "/")
+                ]
+                selected_scopes = selected_restore_sources or [
+                    {"path": source_relative, "is_dir": is_dir, "id": item_id}
+                ]
+                selected_paths: list[tuple[str, bool, str]] = []
+                for selected in selected_scopes:
+                    selected_path = str(selected.get("path") or "").replace("\\", "/").strip("/")
+                    selected_is_dir = selected.get("is_dir") is True
+                    if not selected_path or selected_path.rpartition("/")[0] != parent_relative:
+                        continue
+                    selected_id = str(selected.get("id") or "")
+                    selected_exact = [
+                        entry for entry in trash_entries
+                        if str(entry.get("_relative_path") or "") == selected_path
+                    ]
+                    if len(selected_exact) != 1 or (
+                        selected_id and str(selected_exact[0].get("ID") or "") != selected_id
+                    ) or (selected_exact[0].get("IsDir") is True) != selected_is_dir:
+                        raise RcloneError(
+                            "Pilihan Trash berubah; refresh daftar Trash.",
+                            code="RCLONE_SOURCE_CHANGED",
+                        )
+                    selected_paths.append((selected_path, selected_is_dir, selected_id))
+                selected_entries = [
+                    entry for entry in trash_entries
+                    if any(
+                        str(entry.get("_relative_path") or "") == selected_path
+                        or (selected_is_dir and str(entry.get("_relative_path") or "").startswith(selected_path + "/"))
+                        for selected_path, selected_is_dir, _ in selected_paths
+                    )
+                ]
+                selected_snapshot = sorted(self._entry_metadata(entry) for entry in selected_entries)
+                affected_snapshot = sorted(self._entry_metadata(entry) for entry in affected_entries)
+                if affected_snapshot != selected_snapshot:
+                    raise RcloneError(
+                        "Ada item Trash lain di folder induk yang sama. Pilih semua item Trash pada folder induk itu dalam satu batch agar item lain tidak ikut berubah.",
+                        code="RCLONE_RESTORE_SCOPE_AMBIGUOUS",
+                    )
+                parent_remote, _ = self._remote_path(destination, parent_relative)
+                active_children = self._list_storage_children(
+                    parent_remote, config, log_prefix="rclone-storage-restore-check"
+                )
+                if any(str(item.get("Name") or "") == source_relative.rsplit("/", 1)[-1] for item in active_children):
+                    raise RcloneError(
+                        "Item aktif sudah memakai nama tujuan.", code="RCLONE_TARGET_EXISTS"
+                    )
+                # rclone's Drive untrash command works at directory scope. The
+                # preflight above ensures this parent contains no other trashed
+                # items, so the command cannot restore an unrelated sibling.
+                command = ["rclone", "backend", "untrash", parent_remote]
+            elif action == "trash":
+                parent_relative = source_relative.rpartition("/")[0]
+                parent_remote, _ = self._remote_path(destination, parent_relative)
+                active_children = self._list_storage_children(
+                    parent_remote, config, log_prefix="rclone-storage-trash-check"
+                )
+                matches = [
+                    entry for entry in active_children
+                    if str(entry.get("Name") or "") == source_relative.rsplit("/", 1)[-1]
+                    and (entry.get("IsDir") is True) == is_dir
+                ]
+                if not matches:
+                    raise RcloneError(
+                        "File atau folder sumber tidak ditemukan.", code="RCLONE_SOURCE_NOT_FOUND"
+                    )
+                if len(matches) != 1:
+                    raise RcloneError(
+                        "Nama sumber tidak unik pada remote; operasi dibatalkan.",
+                        code="RCLONE_SOURCE_AMBIGUOUS",
+                    )
+                command = ["rclone", "purge" if is_dir else "deletefile", source_remote]
+                command.append("--drive-use-trash=true")
+            else:
+                if trashed:
+                    if not trash_supported:
+                        raise RcloneError(
+                            "Remote ini tidak menyediakan Trash melalui adapter rclone.",
+                            code="RCLONE_TRASH_UNSUPPORTED",
+                        )
+                    trash_entries = self._list_recursive_entries(
+                        self._remote_path(destination, "")[0], config,
+                        log_prefix="rclone-storage-purge-check", trashed_only=True,
+                    )
+                    matches = [
+                        entry for entry in trash_entries
+                        if str(entry.get("_relative_path") or "") == source_relative
+                    ]
+                    if not matches:
+                        raise RcloneError(
+                            "Item Trash tidak ditemukan.", code="RCLONE_SOURCE_NOT_FOUND"
+                        )
+                    if len(matches) != 1 or (
+                        item_id and str(matches[0].get("ID") or "") != item_id
+                    ):
+                        raise RcloneError(
+                            "Item Trash tidak unik atau sudah berubah; refresh daftar Trash.",
+                            code="RCLONE_SOURCE_AMBIGUOUS",
+                        )
+                    if (matches[0].get("IsDir") is True) != is_dir:
+                        raise RcloneError(
+                            "Jenis item Trash berubah; refresh daftar Trash.",
+                            code="RCLONE_SOURCE_CHANGED",
+                        )
+                else:
+                    parent_relative = source_relative.rpartition("/")[0]
+                    parent_remote, _ = self._remote_path(destination, parent_relative)
+                    active_children = self._list_storage_children(
+                        parent_remote, config, log_prefix="rclone-storage-purge-check"
+                    )
+                    matches = [
+                        entry for entry in active_children
+                        if str(entry.get("Name") or "") == source_relative.rsplit("/", 1)[-1]
+                        and (entry.get("IsDir") is True) == is_dir
+                    ]
+                    if len(matches) != 1:
+                        raise RcloneError(
+                            "File atau folder sumber tidak ditemukan atau tidak unik.",
+                            code="RCLONE_SOURCE_AMBIGUOUS" if matches else "RCLONE_SOURCE_NOT_FOUND",
+                        )
+                backend_type = self._remote_backend_type(destination, config)
+                delete_flags = self._permanent_delete_flags(backend_type, trashed=trashed)
+                if delete_flags is None:
+                    raise RcloneError(
+                        "Semantik hapus permanen backend ini tidak dapat dipastikan; aksi dibatalkan.",
+                        code="RCLONE_PERMANENT_DELETE_UNSUPPORTED",
+                    )
+                command = ["rclone", "purge" if is_dir else "deletefile", source_remote]
+                command.extend(delete_flags)
+            command.extend(["--config", str(config), "--log-level", "ERROR"])
+            self._run_storage_command(
+                command,
+                log_prefix=f"rclone-storage-{action}",
+                error_code="RCLONE_OPERATION_FAILED",
+            )
+            if action == "restore":
+                restored_children = self._list_storage_children(
+                    parent_remote, config, log_prefix="rclone-storage-restore-verify"
+                )
+                restored = [
+                    entry for entry in restored_children
+                    if str(entry.get("Name") or "") == source_relative.rsplit("/", 1)[-1]
+                ]
+                if len(restored) != 1 or (item_id and str(restored[0].get("ID") or "") != item_id):
+                    raise RcloneError(
+                        "Hasil pemulihan belum dapat dipastikan.",
+                        code="RCLONE_OPERATION_AMBIGUOUS",
+                    )
+            return {
+                "action": action,
+                "path": source_relative,
+                "status": "succeeded",
+                "cleanup_status": "not_requested",
+            }
+
+        raise RcloneError("Operasi Storage rclone tidak didukung.", code="RCLONE_ACTION_INVALID")
+
+    def create_directory(
+        self,
+        destination: str,
+        parent_path: str,
+        name: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+    ) -> dict[str, object]:
+        """Create one folder below the configured Storage root."""
+        try:
+            validate_rclone_destination(destination)
+            remote_parent, normalized_parent = self._remote_path(
+                destination, parent_path
+            )
+        except ValueError as exc:
+            raise RcloneError(
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            ) from exc
+        folder_name = self._remote_entry_name(name)
+        normalized_path = "/".join(
+            part for part in (normalized_parent, folder_name) if part
+        )
+        remote_folder, normalized_path = self._remote_path(
+            destination, normalized_path
+        )
+        config = self._storage_config(config_path, config_root)
+        children = self._list_storage_children(
+            remote_parent, config, log_prefix="rclone-storage-mkdir-check"
+        )
+        if any(str(item.get("Name") or "") == folder_name for item in children):
+            raise RcloneError(
+                "Nama folder rclone sudah ada.",
+                code="RCLONE_TARGET_EXISTS",
+            )
+        self._run_storage_command(
+            [
+                "rclone",
+                "mkdir",
+                remote_folder,
+                "--config",
+                str(config),
+                "--log-level",
+                "ERROR",
+            ],
+            log_prefix="rclone-storage-mkdir",
+        )
+        return {"action": "create_folder", "path": normalized_path}
+
+    def rename_path(
+        self,
+        destination: str,
+        source_path: str,
+        new_name: str,
+        config_path: Path,
+        *,
+        config_root: Path,
+    ) -> dict[str, object]:
+        """Rename one file or folder without replacing an existing sibling."""
+        try:
+            validate_rclone_destination(destination)
+            source, normalized_source = self._remote_path(
+                destination, source_path
+            )
+        except ValueError as exc:
+            raise RcloneError(
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            ) from exc
+        source_parts = normalized_source.split("/") if normalized_source else []
+        if not source_parts:
+            raise RcloneError(
+                "Root rclone tidak dapat di-rename.",
+                code="RCLONE_BROWSER_PATH_INVALID",
+            )
+        source_name = source_parts[-1]
+        parent_path = "/".join(source_parts[:-1])
+        new_entry_name = self._remote_entry_name(new_name)
+        if new_entry_name == source_name:
+            return {"action": "rename", "path": normalized_source, "unchanged": True}
+        target_relative = "/".join(
+            part for part in (parent_path, new_entry_name) if part
+        )
+        target, normalized_target = self._remote_path(destination, target_relative)
+        remote_parent, _ = self._remote_path(destination, parent_path)
+        config = self._storage_config(config_path, config_root)
+        children = self._list_storage_children(
+            remote_parent, config, log_prefix="rclone-storage-rename-check"
+        )
+        sources = [item for item in children if str(item.get("Name") or "") == source_name]
+        if not sources:
+            raise RcloneError(
+                "File atau folder yang akan di-rename tidak ditemukan.",
+                code="RCLONE_SOURCE_NOT_FOUND",
+            )
+        if len(sources) != 1:
+            raise RcloneError(
+                "Nama sumber tidak unik pada remote; operasi dibatalkan.",
+                code="RCLONE_SOURCE_AMBIGUOUS",
+            )
+        source_is_dir = sources[0].get("IsDir") is True
+        if any(str(item.get("Name") or "") == new_entry_name for item in children):
+            raise RcloneError(
+                "Nama tujuan rclone sudah ada.",
+                code="RCLONE_TARGET_EXISTS",
+            )
+        self._run_storage_command(
+            [
+                "rclone",
+                "moveto",
+                source,
+                target,
+                "--ignore-existing",
+                "--config",
+                str(config),
+                "--log-level",
+                "ERROR",
+            ],
+            log_prefix="rclone-storage-rename",
+        )
+        remaining = self._list_storage_children(
+            remote_parent, config, log_prefix="rclone-storage-rename-verify"
+        )
+        renamed = [item for item in remaining if str(item.get("Name") or "") == new_entry_name]
+        source_remains = any(str(item.get("Name") or "") == source_name for item in remaining)
+        if source_remains:
+            raise RcloneError(
+                "Hasil rename belum dapat dipastikan; sumber masih tersedia.",
+                code="RCLONE_OPERATION_AMBIGUOUS",
+            )
+        if len(renamed) != 1 or (renamed[0].get("IsDir") is True) != source_is_dir:
+            raise RcloneError(
+                "Hasil rename belum dapat dipastikan pada remote.",
+                code="RCLONE_OPERATION_AMBIGUOUS",
+            )
+        return {"action": "rename", "path": normalized_target}
 
     def ensure_directory(
         self,

@@ -3,13 +3,45 @@ from __future__ import annotations
 import re
 from dataclasses import asdict
 from fastapi import Depends, Query
-from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, StorageBulkActionRequest, StorageDeliveryRequest, StorageDownloadRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StoragePublicLinkRevokeRequest, StorageSettingsResponse, StorageSyncRequest, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
+from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, RcloneStorageActionRequest, RcloneStorageManageRequest, StorageBulkActionRequest, StorageDeliveryRequest, StorageDownloadRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StoragePublicLinkRevokeRequest, StorageSettingsResponse, StorageSyncRequest, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
 import uuid
 
 def register_storage(app, context, *, _active_storage_item, _deliver_storage_telegram, _model_dict, _require_storage_folders_idle, _storage_item, current_actor, job_dict, require_service):
+
+    def _rclone_relative_path(path: str) -> str:
+        normalized = str(path or "").replace("\\", "/").strip("/")
+        parts = normalized.split("/") if normalized else []
+        if (
+            len(normalized) > 2048
+            or any(ord(char) < 32 for char in normalized)
+            or str(path or "").startswith(("/", "\\"))
+            or any(not part or part in {".", ".."} or ":" in part for part in parts)
+        ):
+            raise DomainError(
+                "RCLONE_BROWSER_PATH_INVALID",
+                "Path rclone harus berada di bawah root yang dikonfigurasi.",
+                status_code=422,
+            )
+        return normalized
+
+    def _rclone_entry_name(name: str) -> str:
+        normalized = str(name or "").strip()
+        if (
+            not normalized
+            or len(normalized) > 120
+            or normalized in {".", ".."}
+            or any(char in normalized for char in ("/", "\\", ":"))
+            or any(ord(char) < 32 for char in normalized)
+        ):
+            raise DomainError(
+                "RCLONE_BROWSER_NAME_INVALID",
+                "Nama file atau folder rclone tidak valid.",
+                status_code=422,
+            )
+        return normalized
 
     @app.get("/api/v1/storage/rclone/browser", response_model=ObjectResponse)
     def rclone_storage_browser(
@@ -22,16 +54,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         offset: int = Query(0, ge=0),
         actor=Depends(current_actor),
     ):
-        normalized_path = str(path or "").replace("\\", "/").strip("/")
-        path_parts = normalized_path.split("/") if normalized_path else []
-        if len(normalized_path) > 2048 or any(ord(char) < 32 for char in normalized_path) or str(path or "").startswith(("/", "\\")) or any(
-            not part or part in {".", ".."} or ":" in part for part in path_parts
-        ):
-            raise DomainError(
-                "RCLONE_BROWSER_PATH_INVALID",
-                "Path rclone harus berada di bawah root yang dikonfigurasi.",
-                status_code=422,
-            )
+        normalized_path = _rclone_relative_path(path)
         _, selected_worker = context.control_plane.resolve_target(
             actor, worker=worker, check_readiness=False
         )
@@ -64,16 +87,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
 
     @app.get("/api/v1/storage/rclone/folder-summaries", response_model=ObjectResponse)
     def rclone_storage_folder_summaries(worker: str, path: str = "", actor=Depends(current_actor)):
-        normalized_path = str(path or "").replace("\\", "/").strip("/")
-        path_parts = normalized_path.split("/") if normalized_path else []
-        if len(normalized_path) > 2048 or any(ord(char) < 32 for char in normalized_path) or str(path or "").startswith(("/", "\\")) or any(
-            not part or part in {".", ".."} or ":" in part for part in path_parts
-        ):
-            raise DomainError(
-                "RCLONE_BROWSER_PATH_INVALID",
-                "Path rclone harus berada di bawah root yang dikonfigurasi.",
-                status_code=422,
-            )
+        normalized_path = _rclone_relative_path(path)
         _, selected_worker = context.control_plane.resolve_target(
             actor, worker=worker, check_readiness=False
         )
@@ -100,6 +114,202 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                     )
                 raise DomainError("RCLONE_ACCESS_FAILED", "Worker tidak dapat membaca remote rclone.", status_code=503) from exc
             raise DomainError("RCLONE_FOLDER_SUMMARY_FAILED", "Worker tidak dapat menghitung isi folder rclone.", status_code=503) from exc
+
+    @app.post("/api/v1/storage/rclone/actions", response_model=ObjectResponse)
+    def rclone_storage_action(body: RcloneStorageActionRequest, actor=Depends(current_actor)):
+        path = _rclone_relative_path(body.path)
+        name = _rclone_entry_name(body.name)
+        if body.action == "rename" and not path:
+            raise DomainError(
+                "RCLONE_BROWSER_PATH_INVALID",
+                "Root remote tidak dapat di-rename.",
+                status_code=422,
+            )
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=body.worker, check_readiness=False
+        )
+        settings = context.utility_settings.get()
+        destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
+        mutate = getattr(context.worker_dispatcher, "rclone_storage_mutate", None)
+        if not callable(mutate):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pengelolaan Storage rclone.",
+                status_code=503,
+            )
+        gate = getattr(context.control_plane, "runtime_readiness_gate", None)
+        try:
+            result = mutate(
+                selected_worker, destination, action=body.action, path=path, name=name
+            )
+            if gate is not None:
+                gate.record_command_result(
+                    worker=selected_worker,
+                    profile=None,
+                    runtime="rclone_storage",
+                    succeeded=True,
+                )
+            return result
+        except Exception as exc:
+            payload = getattr(exc, "payload", {})
+            nested = payload.get("error", {}) if isinstance(payload, dict) else {}
+            code = (
+                str(getattr(exc, "code", "") or "")
+                or (str(nested.get("code", "")) if isinstance(nested, dict) else "")
+            )
+            status_by_code = {
+                "RCLONE_BROWSER_PATH_INVALID": 422,
+                "RCLONE_BROWSER_NAME_INVALID": 422,
+                "RCLONE_ACTION_REQUEST_INVALID": 422,
+                "RCLONE_ACTION_INVALID": 422,
+                "RCLONE_PERMANENT_DELETE_UNSUPPORTED": 422,
+                "RCLONE_TARGET_EXISTS": 409,
+                "RCLONE_SOURCE_NOT_FOUND": 404,
+            }
+            status = status_by_code.get(
+                code, int(getattr(exc, "status", 503) or 503)
+            )
+            if code == "RCLONE_ACCESS_FAILED" and gate is not None:
+                gate.record_command_result(
+                    worker=selected_worker,
+                    profile=None,
+                    runtime="rclone_storage",
+                    succeeded=False,
+                    reason_code=code,
+                )
+            message_by_code = {
+                "RCLONE_BROWSER_PATH_INVALID": "Path rclone tidak valid.",
+                "RCLONE_BROWSER_NAME_INVALID": "Nama file atau folder rclone tidak valid.",
+                "RCLONE_TARGET_EXISTS": "Nama tujuan rclone sudah ada.",
+                "RCLONE_SOURCE_NOT_FOUND": "File atau folder rclone tidak ditemukan.",
+                "RCLONE_PERMANENT_DELETE_UNSUPPORTED": "Backend rclone ini belum dapat dipastikan mendukung hapus permanen; tidak ada perubahan yang dilakukan.",
+            }
+            raise DomainError(
+                code or "RCLONE_ACTION_FAILED",
+                message_by_code.get(code, "Worker tidak dapat mengubah remote rclone."),
+                status_code=status,
+            ) from exc
+
+    @app.get("/api/v1/storage/rclone/trash", response_model=ObjectResponse)
+    def rclone_storage_trash(
+        worker: str,
+        limit: int = Query(100, ge=1, le=200),
+        offset: int = Query(0, ge=0),
+        actor=Depends(current_actor),
+    ):
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=worker, check_readiness=False
+        )
+        settings = context.utility_settings.get()
+        destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
+        listing = getattr(context.worker_dispatcher, "rclone_storage_trash", None)
+        if not callable(listing):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung daftar Trash rclone.",
+                status_code=503,
+            )
+        gate = getattr(context.control_plane, "runtime_readiness_gate", None)
+        try:
+            result = listing(
+                selected_worker, destination, limit=limit, offset=offset
+            )
+            if result.get("supported") is True and gate is not None:
+                gate.record_command_result(
+                    worker=selected_worker,
+                    profile=None,
+                    runtime="rclone_storage",
+                    succeeded=True,
+                )
+            return result
+        except Exception as exc:
+            code = str(getattr(exc, "code", "") or "")
+            if code in {"RCLONE_ACCESS_FAILED", "RCLONE_LIST_FAILED", "RCLONE_RUNTIME_UNAVAILABLE"} and gate is not None:
+                gate.record_command_result(
+                    worker=selected_worker,
+                    profile=None,
+                    runtime="rclone_storage",
+                    succeeded=False,
+                    reason_code=code,
+                )
+            raise DomainError(
+                code or "RCLONE_TRASH_LIST_FAILED",
+                "Worker tidak dapat memuat Trash rclone.",
+                status_code=int(getattr(exc, "status", 0) or 503),
+            ) from exc
+
+    @app.post("/api/v1/storage/rclone/jobs", response_model=JobResponse)
+    def submit_rclone_storage_job(
+        body: RcloneStorageManageRequest, actor=Depends(current_actor)
+    ):
+        action = body.action
+        if action == "purge" and body.confirmed is not True:
+            raise DomainError(
+                "RCLONE_PURGE_CONFIRMATION_REQUIRED",
+                "Penghapusan permanen memerlukan konfirmasi eksplisit.",
+                status_code=422,
+            )
+        sources = []
+        for source in body.sources:
+            path = _rclone_relative_path(source.path)
+            if not path:
+                raise DomainError(
+                    "RCLONE_BROWSER_PATH_INVALID",
+                    "Root rclone tidak dapat dipilih sebagai item.",
+                    status_code=422,
+                )
+            selected = {"path": path, "is_dir": source.is_dir}
+            if source.id:
+                selected["id"] = source.id
+            sources.append(selected)
+        destination_path = _rclone_relative_path(body.destination_path)
+        if action in {"copy", "move"}:
+            if body.trashed:
+                raise DomainError(
+                    "RCLONE_ACTION_REQUEST_INVALID",
+                    "Copy dan move hanya berlaku untuk item aktif.",
+                    status_code=422,
+                )
+        elif action == "restore" and not body.trashed:
+            raise DomainError(
+                "RCLONE_ACTION_REQUEST_INVALID",
+                "Restore hanya berlaku untuk item Trash.",
+                status_code=422,
+            )
+        elif action == "trash" and body.trashed:
+            raise DomainError(
+                "RCLONE_ACTION_REQUEST_INVALID",
+                "Item Trash tidak dapat dipindahkan ke Trash lagi.",
+                status_code=422,
+            )
+        if action not in {"copy", "move"} and destination_path:
+            raise DomainError(
+                "RCLONE_ACTION_REQUEST_INVALID",
+                "Tujuan hanya berlaku untuk copy dan move.",
+                status_code=422,
+            )
+        _, selected_worker = context.control_plane.resolve_target(
+            actor, worker=body.worker, check_readiness=False
+        )
+        settings = context.utility_settings.get()
+        payload = {
+            "action": action,
+            "sources": sources,
+            "destination_path": destination_path,
+            "trashed": body.trashed,
+            "rclone_destination": str(
+                settings.get("rclone_destination") or "googledrive:backup"
+            ).strip(),
+        }
+        return job_dict(
+            context.control_plane.submit_job(
+                actor,
+                "storage_rclone_manage",
+                payload,
+                profile=actor.profile,
+                worker=selected_worker,
+            )
+        )
 
     @app.get("/api/v1/storage/items", response_model=StorageItemListResponse)
     def search_storage(

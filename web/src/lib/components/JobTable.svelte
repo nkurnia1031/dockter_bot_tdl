@@ -97,7 +97,8 @@
   function storageStatusLabel(status: string): string {
     return ({
       succeeded: 'Berhasil', failed: 'Gagal', pending: 'Menunggu', sending: 'Mengirim',
-      needs_reconciliation: 'Perlu verifikasi', deleted: 'Dihapus',
+      partial: 'Selesai sebagian', cancelled: 'Dibatalkan', deleted: 'Dihapus',
+      needs_reconciliation: 'Perlu verifikasi',
       retained_conflict: 'Disimpan · target bentrok', retained_ambiguous: 'Disimpan · hasil belum pasti',
       retained_upload_failed: 'Disimpan · upload gagal', retained_unverified: 'Disimpan · belum terverifikasi',
       skipped_source_changed: 'Dilewati · sumber berubah', cleanup_failed: 'Gagal menghapus',
@@ -421,7 +422,7 @@
             {#if job.id}
               <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
             {/if}
-            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind === 'storage_reconcile' ? 'Storage reconcile' : job.kind.replaceAll('_',' ')}</b>
+            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind === 'storage_reconcile' ? 'Storage reconcile' : job.kind === 'storage_rclone_manage' ? `Rclone ${job.payload?.action || 'manage'}` : job.kind.replaceAll('_',' ')}</b>
             {#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}
             {#if stageId}
               <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {String(stageId).slice(0, 8)}</span>
@@ -552,6 +553,28 @@
                   {#if item.relative_path && item.relative_path !== item.name}<p class="muted mt-1 break-all text-xs">{item.relative_path}</p>{/if}
                   {#if item.public_url}<a class="mt-1 block break-all text-sm text-violet-700 underline dark:text-violet-300" href={item.public_url} target="_blank" rel="noopener noreferrer">{item.public_url}</a>{/if}
                   {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                </article>
+              {/each}
+            </div>
+          </section>
+        {/if}
+        {#if selected.kind === 'storage_rclone_manage' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
+          {@const manageResult = selected.result?.value || selected.result || {}}
+          {@const manageItems = manageResult.items || []}
+          <section class="record-card mb-4" aria-label="Hasil operasi rclone">
+            <h3 class="font-bold">Hasil {selected.payload?.action || 'operasi'} rclone</h3>
+            <p class="muted mt-1 text-sm">{manageResult.succeeded || 0} berhasil · {manageResult.failed || 0} gagal · {manageResult.skipped || 0} dilewati</p>
+            <div class="mt-2 space-y-2">
+              {#each manageItems as item, index (`${item.path || 'item'}:${index}`)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{item.path || `Item ${index + 1}`}</b>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'cancelled' ? 'queued' : 'failed'}`}>{storageStatusLabel(item.status || 'unknown')}</span>
+                    {#if item.target_path}<span class="muted break-all text-xs">Tujuan: {item.target_path}</span>{/if}
+                    {#if item.cleanup_status && item.cleanup_status!=='not_requested'}<span class={`text-xs font-semibold ${item.cleanup_status==='deleted'?'text-emerald-700':'text-amber-700'}`}>Sumber: {storageStatusLabel(item.cleanup_status)}</span>{/if}
+                  </div>
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                  {#if item.error_code}<p class="muted mt-1 text-xs">{item.error_code}</p>{/if}
                 </article>
               {/each}
             </div>

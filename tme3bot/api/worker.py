@@ -258,6 +258,93 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 status_code=status,
             ) from exc
 
+    @app.post("/internal/v1/storage/rclone-mutate", dependencies=[Depends(authorize)])
+    def rclone_storage_mutate(body: dict[str, Any]):
+        required = {"rclone_destination", "action", "path", "name"}
+        if (
+            set(body) != required
+            or not all(isinstance(body.get(key), str) for key in required)
+            or body.get("action") not in {"create_folder", "rename"}
+            or len(body.get("path", "")) > 2048
+            or not body.get("name", "").strip()
+            or len(body.get("name", "")) > 120
+            or any(char in body.get("name", "") for char in ("/", "\\", ":"))
+            or body.get("name", "").strip() in {".", ".."}
+            or any(ord(char) < 32 for char in body.get("name", ""))
+        ):
+            raise DomainError(
+                "RCLONE_ACTION_REQUEST_INVALID",
+                "Permintaan pengelolaan rclone tidak valid.",
+                status_code=422,
+            )
+        mutate = getattr(context.executor, "rclone_storage_mutate", None)
+        if not callable(mutate):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pengelolaan Storage rclone.",
+                status_code=404,
+            )
+        try:
+            return mutate(
+                body["rclone_destination"], body["action"], body["path"], body["name"]
+            )
+        except RcloneError as exc:
+            status_by_code = {
+                "RCLONE_BROWSER_PATH_INVALID": 422,
+                "RCLONE_ACTION_INVALID": 422,
+                "RCLONE_TARGET_EXISTS": 409,
+                "RCLONE_SOURCE_NOT_FOUND": 404,
+            }
+            status = status_by_code.get(exc.code, 503)
+            message_by_code = {
+                "RCLONE_BROWSER_PATH_INVALID": "Path atau nama rclone tidak valid.",
+                "RCLONE_ACTION_INVALID": "Operasi Storage rclone tidak didukung.",
+                "RCLONE_TARGET_EXISTS": "Nama tujuan rclone sudah ada.",
+                "RCLONE_SOURCE_NOT_FOUND": "File atau folder rclone tidak ditemukan.",
+            }
+            raise DomainError(
+                exc.code or "RCLONE_ACTION_FAILED",
+                message_by_code.get(exc.code, "Worker tidak dapat mengubah remote rclone."),
+                status_code=status,
+            ) from exc
+
+    @app.post("/internal/v1/storage/rclone-trash", dependencies=[Depends(authorize)])
+    def rclone_storage_trash(body: dict[str, Any]):
+        allowed = {"rclone_destination", "limit", "offset"}
+        if (
+            set(body) - allowed
+            or not isinstance(body.get("rclone_destination"), str)
+            or type(body.get("limit", 100)) is not int
+            or not 1 <= body.get("limit", 100) <= 200
+            or type(body.get("offset", 0)) is not int
+            or not 0 <= body.get("offset", 0) <= 2_000_000
+        ):
+            raise DomainError(
+                "RCLONE_TRASH_REQUEST_INVALID",
+                "Permintaan daftar Trash rclone tidak valid.",
+                status_code=422,
+            )
+        listing = getattr(context.executor, "rclone_storage_trash", None)
+        if not callable(listing):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung daftar Trash rclone.",
+                status_code=404,
+            )
+        try:
+            return listing(
+                body["rclone_destination"],
+                limit=body.get("limit", 100),
+                offset=body.get("offset", 0),
+            )
+        except RcloneError as exc:
+            status = 422 if "PATH" in exc.code else 503
+            raise DomainError(
+                exc.code or "RCLONE_TRASH_LIST_FAILED",
+                "Path rclone tidak valid." if status == 422 else "Worker tidak dapat memuat Trash rclone.",
+                status_code=status,
+            ) from exc
+
     @app.post("/internal/v1/storage/download-links", dependencies=[Depends(authorize)])
     def create_storage_download_link(body: dict[str, Any]):
         allowed = {"file_path", "public_base_url", "job_id", "provider"}

@@ -155,6 +155,12 @@ def build_execution_plan(
         else:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
             lane = "tdl-storage-download"
+    elif kind == "storage_rclone_manage":
+        keys = {
+            f"worker:{worker}:kind:storage_rclone_manage",
+            f"worker:{worker}:rclone:storage",
+        }
+        lane = "rclone-storage-manage"
     elif kind == "tts":
         # Keep one end-to-end TTS job per worker, including Telegram delivery.
         # Different workers remain independent and can each use three routes.

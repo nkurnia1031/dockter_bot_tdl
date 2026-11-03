@@ -23,6 +23,554 @@ class FakeSubprocessRunner:
 
 
 class RcloneRunnerTests(unittest.TestCase):
+    def test_backend_type_is_read_from_rclone_redacted_encrypted_config_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = Path(temp_dir) / "rclone.conf"
+            config.write_text("RCLONE_ENCRYPT_V0:opaque", encoding="utf-8")
+            with patch("tme3bot.rclone.subprocess.run") as run:
+                run.return_value = SimpleNamespace(
+                    returncode=0,
+                    stdout="[remote]\ntype = drive\nclient_secret = XXX\n",
+                )
+                backend = RcloneRunner._remote_backend_type("remote:backup", config)
+
+        self.assertEqual(backend, "drive")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][1:4], ["config", "redacted", "remote"])
+        self.assertNotIn("secret", backend)
+
+    def test_browser_reports_safe_trash_and_permanent_delete_capabilities(self):
+        class EmptyListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            fake = EmptyListingRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                capabilities = []
+                for backend in ("drive", "pikpak", "s3", "sftp"):
+                    config = root / f"{backend}.conf"
+                    config.write_text(f"[remote]\ntype = {backend}\n", encoding="utf-8")
+                    response = RcloneRunner(fake).list_directory(
+                        "remote:bucket", "", config, config_root=root,
+                    )
+                    capabilities.append((
+                        response["trash_supported"],
+                        response["permanent_delete_supported"],
+                    ))
+
+        self.assertEqual(capabilities, [
+            (True, True),
+            (False, True),
+            (False, False),
+            (False, True),
+        ])
+
+    def test_create_folder_and_rename_stay_below_configured_root(self):
+        class ListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson":
+                    listing_count = sum(
+                        1 for recorded, _ in self.commands if recorded[1] == "lsjson"
+                    )
+                    name = "reports-old" if listing_count == 3 else "reports"
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Name": name, "IsDir": False},
+                    ]), stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = ListingRunner()
+            runner = RcloneRunner(fake)
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                created = runner.create_directory(
+                    "remote:backup", "docs", "2026", config, config_root=root,
+                )
+                renamed = runner.rename_path(
+                    "remote:backup", "docs/reports", "reports-old",
+                    config, config_root=root,
+                )
+
+        self.assertEqual(created["path"], "docs/2026")
+        self.assertEqual(renamed["path"], "docs/reports-old")
+        commands = [command for command, _ in fake.commands]
+        self.assertEqual(commands[0][1:3], ["lsjson", "remote:backup/docs"])
+        self.assertEqual(commands[1][1:3], ["mkdir", "remote:backup/docs/2026"])
+        self.assertEqual(commands[2][1:3], ["lsjson", "remote:backup/docs"])
+        self.assertEqual(
+            commands[3][1:4],
+            ["moveto", "remote:backup/docs/reports", "remote:backup/docs/reports-old"],
+        )
+        self.assertIn("--ignore-existing", commands[3])
+        self.assertEqual(commands[4][1:3], ["lsjson", "remote:backup/docs"])
+
+    def test_rclone_folder_creation_rejects_parent_traversal_before_running(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = FakeSubprocessRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).create_directory(
+                        "remote:backup", "../outside", "new",
+                        config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_BROWSER_PATH_INVALID")
+        self.assertEqual(fake.commands, [])
+
+    def test_rclone_rename_rejects_existing_destination_without_moving(self):
+        class ExistingTargetRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Name": "current.txt", "IsDir": False},
+                    {"Name": "taken.txt", "IsDir": False},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\n", encoding="utf-8")
+            fake = ExistingTargetRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).rename_path(
+                        "remote:backup", "current.txt", "taken.txt",
+                        config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_TARGET_EXISTS")
+        self.assertEqual(len(fake.commands), 1)
+
+    def test_rclone_rename_requires_the_new_name_to_be_visible_after_success(self):
+        class MissingTargetRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                listing_count = sum(1 for recorded, _ in self.commands if recorded[1] == "lsjson")
+                entries = [{"Name":"old.txt","IsDir":False}] if listing_count == 1 else []
+                return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = local\n", encoding="utf-8")
+            fake = MissingTargetRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).rename_path(
+                        "remote:backup", "old.txt", "new.txt", config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_OPERATION_AMBIGUOUS")
+        self.assertEqual(fake.commands[-1][0][1], "lsjson")
+
+    def test_trash_listing_is_scoped_to_drive_root_and_reports_capability(self):
+        class TrashRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Path":"Archive/old.zip","Name":"old.zip","ID":"file-1","IsDir":False,"Size":17,"ModTime":"now"},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[drive]\ntype = drive\n", encoding="utf-8")
+            fake = TrashRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).list_trash(
+                    "drive:backup", config, config_root=root, limit=25, offset=0,
+                )
+
+        self.assertTrue(result["supported"])
+        self.assertEqual(result["items"], [{
+            "id":"file-1","name":"old.zip","path":"Archive/old.zip","is_dir":False,
+            "size":17,"updated_at":"now","ambiguous":False,
+        }])
+        command = fake.commands[0][0]
+        self.assertEqual(command[1:3], ["lsjson", "drive:backup"])
+        self.assertIn("--drive-trashed-only", command)
+
+    def test_trash_is_not_assumed_for_unknown_backend(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = s3\n", encoding="utf-8")
+            fake = FakeSubprocessRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).list_trash(
+                    "remote:bucket", config, config_root=root,
+                )
+
+        self.assertFalse(result["supported"])
+        self.assertEqual(fake.commands, [])
+
+    def test_permanent_delete_uses_provider_hard_delete_flag(self):
+        class ActiveListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([{"Name": "old.zip", "IsDir": False}])
+                    if command[1] == "lsjson"
+                    else "",
+                    stderr="",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = pikpak\n", encoding="utf-8")
+            fake = ActiveListingRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).manage_storage_item(
+                    "remote:bucket", action="purge", path="old.zip", is_dir=False,
+                    config_path=config, config_root=root,
+                )
+
+        self.assertEqual(result["status"], "succeeded")
+        purge_command = fake.commands[-1][0]
+        self.assertEqual(purge_command[1:3], ["deletefile", "remote:bucket/old.zip"])
+        self.assertIn("--pikpak-use-trash=false", purge_command)
+        self.assertNotIn("--drive-use-trash=false", purge_command)
+
+    def test_permanent_delete_fails_closed_for_backend_with_unknown_semantics(self):
+        class ActiveListingRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps([{"Name": "old.zip", "IsDir": False}])
+                    if command[1] == "lsjson"
+                    else "",
+                    stderr="",
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = s3\n", encoding="utf-8")
+            fake = ActiveListingRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).manage_storage_item(
+                        "remote:bucket", action="purge", path="old.zip", is_dir=False,
+                        config_path=config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_PERMANENT_DELETE_UNSUPPORTED")
+        self.assertFalse(any(command[0][1] == "deletefile" for command in fake.commands))
+
+    def test_rclone_copy_stages_then_commits_without_overwriting_conflicts(self):
+        class ManageRunner(FakeSubprocessRunner):
+            target_listing_count = 0
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson":
+                    target_listing = command[2] == "remote:backup/archive"
+                    if target_listing:
+                        self.target_listing_count += 1
+                    return SimpleNamespace(
+                        returncode=0,
+                        stdout=json.dumps([
+                            {"Name":"report.zip","IsDir":False,"ID":"source-id","Size":42,"ModTime":"before"},
+                        ] if not target_listing else ([
+                            {"Name":"report.zip","IsDir":False,"ID":"target-id","Size":42,"ModTime":"now"},
+                        ] if self.target_listing_count > 1 else [])),
+                        stderr="",
+                    )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = drive\n", encoding="utf-8")
+            fake = ManageRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).manage_storage_item(
+                    "remote:backup", action="copy", path="docs/report.zip", is_dir=False,
+                    destination_path="archive", config_path=config, config_root=root,
+                )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["target_path"], "archive/report.zip")
+        commands = [command for command, _ in fake.commands]
+        self.assertEqual(commands[0][2], "remote:backup/archive")
+        self.assertEqual(commands[1][2], "remote:backup/docs")
+        self.assertEqual(commands[2][1:3], ["copyto", "remote:backup/docs/report.zip"])
+        self.assertIn(".tme3bot-stage-", commands[2][3])
+        self.assertEqual(commands[3][1], "moveto")
+        self.assertIn("--ignore-existing", commands[3])
+        self.assertEqual(len(commands), 5)
+
+    def test_rclone_copy_refuses_target_conflict_before_writing(self):
+        class ExistingTargetRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Name":"report.zip","IsDir":False},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = drive\n", encoding="utf-8")
+            fake = ExistingTargetRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).manage_storage_item(
+                        "remote:backup", action="copy", path="docs/report.zip", is_dir=False,
+                        destination_path="archive", config_path=config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_TARGET_EXISTS")
+        self.assertEqual(len(fake.commands), 1)
+
+    def test_move_does_not_delete_a_source_that_changed_during_copy(self):
+        class ChangedSourceRunner(FakeSubprocessRunner):
+            target_listing_count = 0
+            source_listing_count = 0
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and command[2] == "remote:backup/archive":
+                    self.target_listing_count += 1
+                    entries = [] if self.target_listing_count == 1 else [
+                        {"Name":"report.zip","ID":"target-id","IsDir":False,"Size":42,"ModTime":"now"},
+                    ]
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                if command[1] == "lsjson" and command[2] == "remote:backup/docs":
+                    self.source_listing_count += 1
+                    modified = "before" if self.source_listing_count == 1 else "changed"
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Name":"report.zip","ID":"source-id","IsDir":False,"Size":42,"ModTime":modified},
+                    ]), stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = drive\n", encoding="utf-8")
+            fake = ChangedSourceRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).manage_storage_item(
+                    "remote:backup", action="move", path="docs/report.zip", is_dir=False,
+                    destination_path="archive", config_path=config, config_root=root,
+                )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["cleanup_status"], "skipped_source_changed")
+        self.assertFalse(any(
+            command[1] == "deletefile" and command[2] == "remote:backup/docs/report.zip"
+            for command, _ in fake.commands
+        ))
+
+    def test_move_reports_partial_when_source_disappears_before_cleanup_check(self):
+        class DisappearingSourceRunner(FakeSubprocessRunner):
+            target_listing_count = 0
+            source_listing_count = 0
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and command[2] == "remote:backup/archive":
+                    self.target_listing_count += 1
+                    entries = [] if self.target_listing_count == 1 else [
+                        {"Name": "report.zip", "ID": "target-id", "IsDir": False, "Size": 42},
+                    ]
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                if command[1] == "lsjson" and command[2] == "remote:backup/docs":
+                    self.source_listing_count += 1
+                    entries = [{
+                        "Name": "report.zip", "ID": "source-id", "IsDir": False,
+                        "Size": 42, "ModTime": "before",
+                    }] if self.source_listing_count == 1 else []
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = drive\n", encoding="utf-8")
+            fake = DisappearingSourceRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).manage_storage_item(
+                    "remote:backup", action="move", path="docs/report.zip", is_dir=False,
+                    destination_path="archive", config_path=config, config_root=root,
+                )
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["cleanup_status"], "skipped_source_changed")
+        self.assertEqual(result["target_path"], "archive/report.zip")
+        self.assertEqual(result["error_code"], "RCLONE_SOURCE_NOT_FOUND")
+        self.assertFalse(any(
+            command[1] == "deletefile" and command[2] == "remote:backup/docs/report.zip"
+            for command, _ in fake.commands
+        ))
+
+    def test_commit_race_keeps_existing_destination_and_cleans_only_unique_stage(self):
+        class RacingTargetRunner(FakeSubprocessRunner):
+            target_listing_count = 0
+            stage_path = ""
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and command[2] == "remote:backup/archive":
+                    self.target_listing_count += 1
+                    entries = []
+                    if self.target_listing_count > 1:
+                        stage_name = self.stage_path.rsplit("/", 1)[-1]
+                        entries = [
+                            {"Name":"report.zip","ID":"other-writer","IsDir":False},
+                            {"Name":stage_name,"ID":"our-stage","IsDir":False},
+                        ]
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                if command[1] == "copyto":
+                    self.stage_path = command[3].removesuffix("/report.zip") if command[3].endswith("/report.zip") else command[3]
+                if command[1] == "lsjson" and command[2] == "remote:backup/docs":
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Name":"report.zip","ID":"source-id","IsDir":False,"Size":42,"ModTime":"before"},
+                    ]), stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[remote]\ntype = drive\n", encoding="utf-8")
+            fake = RacingTargetRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).manage_storage_item(
+                        "remote:backup", action="move", path="docs/report.zip", is_dir=False,
+                        destination_path="archive", config_path=config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_TARGET_EXISTS")
+        self.assertTrue(any(command[1] == "deletefile" and ".tme3bot-stage-" in command[2]
+                            for command, _ in fake.commands))
+        self.assertFalse(any(command[1] == "deletefile" and command[2] == "remote:backup/docs/report.zip"
+                             for command, _ in fake.commands))
+
+    def test_restore_single_file_is_scoped_to_its_trash_parent(self):
+        class RestoreRunner(FakeSubprocessRunner):
+            restored = False
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and "--drive-trashed-only" in command:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps([
+                        {"Path":"Archive/old.zip","Name":"old.zip","ID":"file-1","IsDir":False,"Size":17},
+                    ]), stderr="")
+                if command[1] == "lsjson" and command[2] == "drive:backup/Archive":
+                    entries = [] if not self.restored else [
+                        {"Name":"old.zip","ID":"file-1","IsDir":False,"Size":17},
+                    ]
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                if command[1:3] == ["backend", "untrash"]:
+                    self.restored = True
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[drive]\ntype = drive\n", encoding="utf-8")
+            fake = RestoreRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                result = RcloneRunner(fake).manage_storage_item(
+                    "drive:backup", action="restore", path="Archive/old.zip", is_dir=False,
+                    trashed=True, item_id="file-1", config_path=config, config_root=root,
+                )
+
+        self.assertEqual(result["status"], "succeeded")
+        restore_command = next(command for command, _ in fake.commands if command[1:3] == ["backend", "untrash"])
+        self.assertEqual(restore_command[3], "drive:backup/Archive")
+
+    def test_restore_refuses_unrelated_trash_in_the_same_parent(self):
+        class SiblingTrashRunner(FakeSubprocessRunner):
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                return SimpleNamespace(returncode=0, stdout=json.dumps([
+                    {"Path":"Archive/old.zip","Name":"old.zip","ID":"file-1","IsDir":False},
+                    {"Path":"Archive/other.zip","Name":"other.zip","ID":"file-2","IsDir":False},
+                ]), stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[drive]\ntype = drive\n", encoding="utf-8")
+            fake = SiblingTrashRunner()
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                with self.assertRaises(RcloneError) as raised:
+                    RcloneRunner(fake).manage_storage_item(
+                        "drive:backup", action="restore", path="Archive/old.zip", is_dir=False,
+                        trashed=True, item_id="file-1", config_path=config, config_root=root,
+                    )
+
+        self.assertEqual(raised.exception.code, "RCLONE_RESTORE_SCOPE_AMBIGUOUS")
+        self.assertIn("Pilih semua item Trash pada folder induk itu dalam satu batch", str(raised.exception))
+        self.assertFalse(any(command[1:3] == ["backend", "untrash"] for command, _ in fake.commands))
+
+    def test_restore_batch_untrashes_selected_siblings_once(self):
+        class BatchRestoreRunner(FakeSubprocessRunner):
+            def __init__(self):
+                super().__init__()
+                self.trashed = [
+                    {"Path":"Archive/one.zip","Name":"one.zip","ID":"file-1","IsDir":False,"Size":17},
+                    {"Path":"Archive/two.zip","Name":"two.zip","ID":"file-2","IsDir":False,"Size":23},
+                ]
+                self.untrash_count = 0
+
+            def run(self, command, **kwargs):
+                self.commands.append((command, kwargs))
+                if command[1] == "lsjson" and "--drive-trashed-only" in command:
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(self.trashed), stderr="")
+                if command[1] == "lsjson" and command[2] == "drive:backup/Archive":
+                    entries = []
+                    if self.untrash_count:
+                        entries = [
+                            {"Name":"one.zip","ID":"file-1","IsDir":False,"Size":17},
+                            {"Name":"two.zip","ID":"file-2","IsDir":False,"Size":23},
+                        ]
+                    return SimpleNamespace(returncode=0, stdout=json.dumps(entries), stderr="")
+                if command[1:3] == ["backend", "untrash"]:
+                    self.untrash_count += 1
+                    self.trashed = []
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = root / "rclone.conf"
+            config.write_text("[drive]\ntype = drive\n", encoding="utf-8")
+            fake = BatchRestoreRunner()
+            runner = RcloneRunner(fake)
+            selected = [
+                {"path":"Archive/one.zip","is_dir":False,"id":"file-1"},
+                {"path":"Archive/two.zip","is_dir":False,"id":"file-2"},
+            ]
+            with patch("tme3bot.rclone.shutil.which", return_value="/usr/bin/rclone"):
+                first = runner.manage_storage_item(
+                    "drive:backup", action="restore", path="Archive/one.zip", is_dir=False,
+                    trashed=True, item_id="file-1", selected_restore_sources=selected,
+                    config_path=config, config_root=root,
+                )
+                second = runner.manage_storage_item(
+                    "drive:backup", action="restore", path="Archive/two.zip", is_dir=False,
+                    trashed=True, item_id="file-2", selected_restore_sources=selected,
+                    config_path=config, config_root=root,
+                )
+
+        self.assertEqual(first["status"], "succeeded")
+        self.assertEqual(second["status"], "succeeded")
+        self.assertEqual(fake.untrash_count, 1)
+
     def test_recursive_folder_summary_aggregates_metadata_in_one_listing(self):
         class RecursiveListingRunner(FakeSubprocessRunner):
             def run(self, command, **kwargs):

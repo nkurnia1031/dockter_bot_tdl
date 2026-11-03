@@ -28,6 +28,8 @@ class FakeExecutor:
         self.rclone_storage_probe_destinations = []
         self.rclone_storage_browse_requests = []
         self.rclone_storage_summary_requests = []
+        self.rclone_storage_mutation_requests = []
+        self.rclone_storage_trash_requests = []
         self.storage_move_cleanup_requests = []
         self.safelink_probe_calls = 0
         self.profile_readiness_canary_requests = []
@@ -106,6 +108,14 @@ class FakeExecutor:
     def rclone_storage_folder_summaries(self, destination, path=""):
         self.rclone_storage_summary_requests.append((destination, path))
         return {"path": path, "summaries": []}
+
+    def rclone_storage_mutate(self, destination, action, path, name):
+        self.rclone_storage_mutation_requests.append((destination, action, path, name))
+        return {"action": action, "path": "/".join(part for part in (path, name) if part)}
+
+    def rclone_storage_trash(self, destination, *, limit=100, offset=0):
+        self.rclone_storage_trash_requests.append((destination, limit, offset))
+        return {"supported": True, "items": [], "total": 0, "limit": limit, "offset": offset}
 
     def storage_move_cleanup_reconciled(self, source_job_id, folder_path, relative_path):
         self.storage_move_cleanup_requests.append((source_job_id, folder_path, relative_path))
@@ -369,6 +379,58 @@ class WorkerApiTests(unittest.TestCase):
             json={**body, "unexpected": True},
         )
         self.assertEqual(invalid.status_code, 422)
+
+    def test_rclone_mutation_requires_worker_auth_and_forwards_bounded_request(self):
+        body = {
+            "rclone_destination":"remote:backup",
+            "action":"create_folder",
+            "path":"docs",
+            "name":"2026",
+        }
+        denied = self.client.post("/internal/v1/storage/rclone-mutate", json=body)
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.post(
+            "/internal/v1/storage/rclone-mutate",
+            headers={"Authorization":"Bearer worker-secret"},
+            json=body,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["path"], "docs/2026")
+        self.assertEqual(
+            self.executor.rclone_storage_mutation_requests,
+            [("remote:backup","create_folder","docs","2026")],
+        )
+        invalid = self.client.post(
+            "/internal/v1/storage/rclone-mutate",
+            headers={"Authorization":"Bearer worker-secret"},
+            json={**body, "action":"purge"},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(len(self.executor.rclone_storage_mutation_requests), 1)
+
+    def test_rclone_trash_listing_requires_worker_auth_and_bounds_pagination(self):
+        denied = self.client.post(
+            "/internal/v1/storage/rclone-trash",
+            json={"rclone_destination": "remote:backup", "limit": 25, "offset": 50},
+        )
+        self.assertEqual(denied.status_code, 401)
+        response = self.client.post(
+            "/internal/v1/storage/rclone-trash",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"rclone_destination": "remote:backup", "limit": 25, "offset": 50},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            self.executor.rclone_storage_trash_requests,
+            [("remote:backup", 25, 50)],
+        )
+        invalid = self.client.post(
+            "/internal/v1/storage/rclone-trash",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"rclone_destination": "remote:backup", "limit": 201, "offset": 0},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(len(self.executor.rclone_storage_trash_requests), 1)
 
     def test_move_cleanup_endpoint_uses_worker_private_checkpoint_identity(self):
         response = self.client.post(

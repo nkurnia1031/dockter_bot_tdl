@@ -136,6 +136,8 @@ class FakeDispatcher:
         self.storage_fingerprint_overrides = {}
         self.rclone_browse_calls = []
         self.rclone_summary_calls = []
+        self.rclone_mutation_calls = []
+        self.rclone_trash_calls = []
         self.public_download_link_calls = []
         self.public_download_links_result = {"items": []}
         self.public_download_link_revocations = []
@@ -202,6 +204,15 @@ class FakeDispatcher:
     def rclone_storage_folder_summaries(self, worker, destination, *, path=""):
         self.rclone_summary_calls.append((worker, destination, path))
         return {"path": path, "summaries": []}
+
+    def rclone_storage_mutate(self, worker, destination, *, action, path, name):
+        self.rclone_mutation_calls.append((worker, destination, action, path, name))
+        result_path = "/".join(part for part in (path, name) if part)
+        return {"action": action, "path": result_path}
+
+    def rclone_storage_trash(self, worker, destination, *, limit=100, offset=0):
+        self.rclone_trash_calls.append((worker, destination, limit, offset))
+        return {"supported": True, "items": [], "total": 0, "limit": limit, "offset": offset}
 
     def public_download_links(self, worker):
         self.public_download_link_calls.append(worker)
@@ -4775,6 +4786,109 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(len(self.dispatcher.rclone_summary_calls), 1)
+
+    def test_rclone_create_folder_and_rename_dispatch_inside_configured_root(self):
+        headers = self.login()
+        self.context.utility_settings.set("rclone_destination", "remote:archive")
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(self.runtime_readiness_store)
+        created = self.client.post(
+            "/api/v1/storage/rclone/actions",
+            headers=headers,
+            json={"worker":"local","action":"create_folder","path":"docs","name":"2026"},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        self.assertEqual(created.json()["path"], "docs/2026")
+        renamed = self.client.post(
+            "/api/v1/storage/rclone/actions",
+            headers=headers,
+            json={"worker":"local","action":"rename","path":"docs/report.txt","name":"report-old.txt"},
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual(
+            self.dispatcher.rclone_mutation_calls,
+            [
+                ("local","remote:archive","create_folder","docs","2026"),
+                ("local","remote:archive","rename","docs/report.txt","report-old.txt"),
+            ],
+        )
+        self.assertEqual(self.runtime_readiness_store.cell("local", None, "rclone_storage")["status"], "ready")
+        traversal = self.client.post(
+            "/api/v1/storage/rclone/actions",
+            headers=headers,
+            json={"worker":"local","action":"rename","path":"../outside","name":"renamed"},
+        )
+        self.assertEqual(traversal.status_code, 422)
+        self.assertEqual(len(self.dispatcher.rclone_mutation_calls), 2)
+
+    def test_rclone_manage_jobs_are_worker_scoped_and_root_bounded(self):
+        headers = self.login()
+        self.context.utility_settings.set("rclone_destination", "remote:archive")
+        trash = self.client.get(
+            "/api/v1/storage/rclone/trash?worker=local&limit=25&offset=50",
+            headers=headers,
+        )
+        self.assertEqual(trash.status_code, 200, trash.text)
+        self.assertEqual(self.dispatcher.rclone_trash_calls, [("local", "remote:archive", 25, 50)])
+
+        created = self.client.post(
+            "/api/v1/storage/rclone/jobs",
+            headers=headers,
+            json={
+                "worker": "local", "action": "move",
+                "sources": [{"path": "docs/report.zip", "is_dir": False}],
+                "destination_path": "archive/2026",
+            },
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["kind"], "storage_rclone_manage")
+        self.assertEqual(command["worker"], "local")
+        self.assertEqual(command["payload"]["rclone_destination"], "remote:archive")
+        self.assertEqual(command["payload"]["sources"], [{"path": "docs/report.zip", "is_dir": False}])
+
+        unconfirmed_purge = self.client.post(
+            "/api/v1/storage/rclone/jobs",
+            headers=headers,
+            json={
+                "worker": "local", "action": "purge",
+                "sources": [{"path": "docs/report.zip", "is_dir": False}],
+            },
+        )
+        self.assertEqual(unconfirmed_purge.status_code, 422)
+        self.assertEqual(
+            unconfirmed_purge.json()["error"]["code"],
+            "RCLONE_PURGE_CONFIRMATION_REQUIRED",
+        )
+        self.assertEqual(len(self.dispatcher.commands), 1)
+
+        confirmed_purge = self.client.post(
+            "/api/v1/storage/rclone/jobs",
+            headers=headers,
+            json={
+                "worker": "local", "action": "purge", "confirmed": True,
+                "trashed": True,
+                "sources": [{"path": "docs/report.zip", "is_dir": False, "id": "file-1"}],
+            },
+        )
+        self.assertEqual(confirmed_purge.status_code, 200, confirmed_purge.text)
+        purge_job_id = confirmed_purge.json()["id"]
+        purge_payload = self.jobs.command_payload(purge_job_id)
+        self.assertTrue(purge_payload["trashed"])
+        self.assertEqual(purge_payload["sources"], [
+            {"path": "docs/report.zip", "is_dir": False, "id": "file-1"},
+        ])
+
+        invalid = self.client.post(
+            "/api/v1/storage/rclone/jobs",
+            headers=headers,
+            json={
+                "worker": "local", "action": "copy",
+                "sources": [{"path": "../outside", "is_dir": True}],
+                "destination_path": "archive",
+            },
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(len(self.dispatcher.commands), 1)
 
     def test_storage_reconciliation_endpoint_uses_original_private_destination(self):
         headers = self.login()

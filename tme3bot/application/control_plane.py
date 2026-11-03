@@ -920,7 +920,7 @@ class ControlPlane:
             return
         if job.kind not in {
             "export", "download", "tts", "storage_upload", "storage_download",
-            "storage_sync", "tdl_access_verify", "safelink_resolve",
+            "storage_sync", "storage_rclone_manage", "tdl_access_verify", "safelink_resolve",
         }:
             return
 

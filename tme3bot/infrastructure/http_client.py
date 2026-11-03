@@ -619,6 +619,34 @@ class WorkerHttpDispatcher:
             timeout=180,
         )
 
+    def rclone_storage_mutate(
+        self, worker: str, rclone_destination: str, *, action: str, path: str, name: str,
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/storage/rclone-mutate",
+            {"rclone_destination": str(rclone_destination or ""),
+             "action": str(action or ""), "path": str(path or ""), "name": str(name or "")},
+            timeout=45,
+        )
+
+    def rclone_storage_trash(
+        self, worker: str, rclone_destination: str, *, limit: int = 100, offset: int = 0,
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/storage/rclone-trash",
+            {"rclone_destination": str(rclone_destination or ""),
+             "limit": int(limit), "offset": int(offset)},
+            timeout=180,
+        )
+
     def public_download_links(self, worker: str) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

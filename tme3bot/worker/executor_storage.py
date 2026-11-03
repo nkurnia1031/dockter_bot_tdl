@@ -539,6 +539,203 @@ class StorageExecutorMixin:
             destination, relative_path, config_path, config_root=config_root,
         )
 
+    def rclone_storage_mutate(
+        self, destination: str, action: str, path: str, name: str
+    ) -> dict[str, object]:
+        """Create one remote folder or rename one remote entry."""
+        config_path = Path(
+            getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+        ).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        runner = RcloneRunner(
+            stall_timeout_seconds=30,
+            command_callback=self._command_callback(runtime="rclone_storage"),
+        )
+        with self._rclone_storage_lock:
+            if action == "create_folder":
+                return runner.create_directory(
+                    destination, path, name, config_path, config_root=config_root
+                )
+            if action == "rename":
+                return runner.rename_path(
+                    destination, path, name, config_path, config_root=config_root
+                )
+            raise RcloneError(
+                "Operasi Storage rclone tidak didukung.",
+                code="RCLONE_ACTION_INVALID",
+            )
+
+    def rclone_storage_trash(
+        self, destination: str, *, limit: int = 100, offset: int = 0
+    ) -> dict[str, object]:
+        config_path = Path(
+            getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+        ).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        runner = RcloneRunner(stall_timeout_seconds=120)
+        return runner.list_trash(
+            destination, config_path, config_root=config_root,
+            limit=limit, offset=offset,
+        )
+
+    def _storage_rclone_manage(self, command: dict[str, Any]) -> dict[str, Any]:
+        payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+        job_id = str(command.get("job_id") or "")
+        destination = str(payload.get("rclone_destination") or "").strip()
+        action = str(payload.get("action") or "").strip().lower()
+        raw_sources = payload.get("sources")
+        sources = [item for item in raw_sources if isinstance(item, dict)] if isinstance(raw_sources, list) else []
+        destination_path = str(payload.get("destination_path") or "")
+        trashed = payload.get("trashed") is True
+        if action not in {"copy", "move", "trash", "restore", "purge"}:
+            raise RcloneError("Operasi Storage rclone tidak didukung.", code="RCLONE_ACTION_INVALID")
+        if not destination or not sources or len(sources) > 200:
+            raise RcloneError("Pilihan Storage rclone tidak valid.", code="RCLONE_ACTION_REQUEST_INVALID")
+
+        config_path = Path(
+            getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+        ).resolve()
+        config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        reporter = ProgressReporter(self.publisher, job_id)
+        runner = RcloneRunner(
+            log_callback=self._append_job_log,
+            command_callback=self._command_callback(runtime="rclone_storage"),
+            stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
+            cancel_check=lambda: self._storage_download_cancelled(job_id),
+        )
+        with self._lock:
+            self._rclone_runners[job_id] = runner
+
+        deduplicated: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for source in sources:
+            path = str(source.get("path") or "").replace("\\", "/").strip("/")
+            item_id = str(source.get("id") or "").strip()[:256]
+            parts = path.split("/") if path else []
+            if (
+                not path or len(path) > 2048
+                or any(not part or part in {".", ".."} or ":" in part for part in parts)
+                or any(ord(char) < 32 for char in path)
+            ):
+                raise RcloneError("Path sumber rclone tidak valid.", code="RCLONE_BROWSER_PATH_INVALID")
+            if path in seen:
+                continue
+            seen.add(path)
+            deduplicated.append({
+                "path": path,
+                "is_dir": source.get("is_dir") is True,
+                "id": item_id,
+            })
+        # Parent selections subsume their children, avoiding duplicate writes.
+        ordered = sorted(deduplicated, key=lambda item: (str(item["path"]).count("/"), str(item["path"])))
+        sources = []
+        selected_roots: list[str] = []
+        for item in ordered:
+            path = str(item["path"])
+            if any(path.startswith(parent + "/") for parent in selected_roots):
+                continue
+            selected_roots.append(path)
+            sources.append(item)
+
+        items: list[dict[str, Any]] = []
+        succeeded = failed = skipped = 0
+        total = len(sources)
+        reporter.report(
+            phase="queued",
+            message=f"Menyiapkan {total} operasi rclone",
+            overall={"current": 0, "total": total, "unit": "items"},
+            counters={"succeeded": 0, "failed": 0, "skipped": 0},
+            force=True,
+        )
+        for index, source in enumerate(sources, start=1):
+            path = str(source["path"])
+            is_dir = source["is_dir"] is True
+            if self._storage_download_cancelled(job_id):
+                items.append({"path": path, "status": "cancelled", "error_code": "JOB_TERMINATED"})
+                skipped += 1
+                continue
+            source_name = path.rsplit("/", 1)[-1]
+            transfer_latest: dict[str, Any] = {}
+
+            def report_transfer(transfer: dict[str, object]) -> None:
+                transfer_latest.update(transfer)
+                reporter.report(
+                    phase=action,
+                    message=f"{action.capitalize()} {source_name}",
+                    overall={"current": index - 1, "total": total, "unit": "items"},
+                    item={"name": source_name, "path": path, "index": index, "total": total,
+                          "percent": transfer.get("percent"), "size_bytes": transfer.get("bytes_total")},
+                    transfer=reporter.transfer_metrics(
+                        speed_bps=transfer.get("speed_bps"),
+                        current_bytes=transfer.get("bytes_current"),
+                        total_bytes=transfer.get("bytes_total"),
+                        eta_seconds=transfer.get("eta_seconds"),
+                        percent=transfer.get("percent"),
+                    ),
+                    counters={"succeeded": succeeded, "failed": failed, "skipped": skipped},
+                )
+
+            try:
+                result = runner.manage_storage_item(
+                    destination,
+                    action=action,
+                    path=path,
+                    is_dir=is_dir,
+                    config_path=config_path,
+                    config_root=config_root,
+                    destination_path=destination_path,
+                    trashed=trashed,
+                    item_id=str(source.get("id") or ""),
+                    selected_restore_sources=sources if action == "restore" else None,
+                    progress_callback=report_transfer,
+                )
+                item = {"path": path, "is_dir": is_dir, **result}
+                status = str(item.get("status") or "succeeded")
+                if status == "succeeded":
+                    succeeded += 1
+                elif status == "partial":
+                    failed += 1
+                items.append(item)
+            except RcloneError as exc:
+                failed += 1
+                items.append({
+                    "path": path,
+                    "is_dir": is_dir,
+                    "status": "failed",
+                    "error_code": exc.code or "RCLONE_OPERATION_FAILED",
+                    "error": str(exc),
+                    "transfer": transfer_latest or None,
+                })
+            except Exception as exc:
+                failed += 1
+                items.append({
+                    "path": path,
+                    "is_dir": is_dir,
+                    "status": "failed",
+                    "error_code": "RCLONE_OPERATION_FAILED",
+                    "error": "rclone gagal menjalankan operasi ini.",
+                    "failure_type": type(exc).__name__,
+                    "transfer": transfer_latest or None,
+                })
+            reporter.report(
+                phase=action,
+                message=f"{action.capitalize()} {source_name} selesai",
+                overall={"current": index, "total": total, "unit": "items"},
+                item={"name": source_name, "path": path, "index": index, "total": total, "status": items[-1]["status"]},
+                counters={"succeeded": succeeded, "failed": failed, "skipped": skipped},
+                force=True,
+            )
+        outcome = "succeeded" if failed == 0 and skipped == 0 else "partial_failure" if succeeded else "failed"
+        reporter.report(
+            phase=outcome,
+            message=f"Operasi rclone selesai: {succeeded} berhasil, {failed} gagal, {skipped} dibatalkan",
+            overall={"current": succeeded + failed + skipped, "total": total, "unit": "items"},
+            counters={"succeeded": succeeded, "failed": failed, "skipped": skipped},
+            force=True,
+        )
+        return {"outcome": outcome, "action": action, "total": total,
+                "succeeded": succeeded, "failed": failed, "skipped": skipped, "items": items}
+
     @staticmethod
     def _storage_source_identity(path: Path) -> dict[str, int]:
         info = path.stat(follow_symlinks=False)

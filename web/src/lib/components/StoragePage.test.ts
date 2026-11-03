@@ -123,6 +123,103 @@ describe('Storage file manager', () => {
     await waitFor(()=>expect(summaryCalls).toEqual(['','Archive','Archive']));
   },15000);
 
+  it('creates an rclone folder and renames a listed remote entry through the selected worker', async () => {
+    enableDialogMethods();
+    const mutations: {method:string;body:Record<string,unknown>}[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url=new URL(String(input),'https://ui.test');
+      const method=(init?.method||'GET').toUpperCase();
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{name:'local',url:'http://worker',enabled:true}]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']}],
+        runtime_readiness:{checked_at:'now',workers:[{name:'local',status:'success',checked_at:'now',reason_code:''}],
+          cells:[{worker:'local',profile:null,runtime:'rclone_storage',status:'ready',checked_at:'now',reason_code:''}]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/browser')) return new Response(JSON.stringify({
+        path:'',breadcrumbs:[],items:[{name:'Archive',path:'Archive',is_dir:true,size:0,updated_at:'now'}],total:1,limit:100,offset:0,
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/folder-summaries')) return new Response(JSON.stringify({path:'',summaries:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/actions') && method==='POST') {
+        const body=JSON.parse(String(init?.body||'{}'));
+        mutations.push({method,body});
+        return new Response(JSON.stringify({action:body.action,path:(body.path?body.path+'/':'')+body.name}),{status:200});
+      }
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+    await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
+
+    await fireEvent.click(await screen.findByRole('button',{name:'Folder baru'}));
+    await fireEvent.input(screen.getByLabelText('Nama folder'),{target:{value:'2026'}});
+    await fireEvent.click(screen.getByRole('button',{name:'Buat folder'}));
+    await waitFor(()=>expect(mutations).toHaveLength(1));
+    expect(mutations[0].body).toMatchObject({worker:'local',action:'create_folder',path:'',name:'2026'});
+
+    await waitFor(()=>expect((screen.getByRole('button',{name:'Rename Archive'}) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole('button',{name:'Rename Archive'}));
+    await fireEvent.input(screen.getByLabelText('Nama file atau folder'),{target:{value:'Archive-old'}});
+    await fireEvent.click(screen.getByRole('button',{name:'Simpan rename'}));
+    await waitFor(()=>expect(mutations).toHaveLength(2));
+    expect(mutations[1].body).toMatchObject({worker:'local',action:'rename',path:'Archive',name:'Archive-old'});
+  },15000);
+
+  it('submits a bounded rclone copy job and restores an item from its Trash view', async () => {
+    enableDialogMethods();
+    const jobs: Record<string, unknown>[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input:string, init?:RequestInit) => {
+      const url=new URL(String(input),'https://ui.test');
+      const method=(init?.method||'GET').toUpperCase();
+      if (url.pathname.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated:true,profiles:['default'],actor:{telegram_user_id:1,profile:'default',worker_route:'local'},
+      }),{status:200});
+      if (url.pathname.endsWith('/workers')) return new Response(JSON.stringify({items:[{name:'local',url:'http://worker',enabled:true}]}),{status:200});
+      if (url.pathname.endsWith('/profiles/local')) return new Response(JSON.stringify({
+        profiles:[{name:'default',workers:['local']}],runtime_readiness:{checked_at:'now',
+          workers:[{name:'local',status:'success',checked_at:'now',reason_code:''}],
+          cells:[{worker:'local',profile:null,runtime:'rclone_storage',status:'ready',checked_at:'now',reason_code:''}]},
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/browser')) return new Response(JSON.stringify({current_folder:null,breadcrumbs:[],folders:[],items:[],total_folders:0,total_items:0}),{status:200});
+      if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}),{status:200});
+      if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({path:'/workspace',items:[]}),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/browser')) return new Response(JSON.stringify({
+        path:'',breadcrumbs:[],items:[{name:'report.zip',path:'report.zip',is_dir:false,size:42,updated_at:'now'}],total:1,limit:100,offset:0,trash_supported:true,
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/trash')) return new Response(JSON.stringify({
+        supported:true,items:[{id:'file-1',ambiguous:false,name:'old.zip',path:'Archive/old.zip',is_dir:false,size:15,updated_at:'now'}],total:1,limit:100,offset:0,
+      }),{status:200});
+      if (url.pathname.endsWith('/storage/rclone/jobs') && method==='POST') {
+        const body=JSON.parse(String(init?.body||'{}')) as Record<string,unknown>;
+        jobs.push(body);
+        return new Response(JSON.stringify({id:`rclone-job-${jobs.length}`}),{status:200});
+      }
+      return new Response(JSON.stringify({items:[]}),{status:200});
+    }));
+    await session.restore();
+    render(StoragePage);
+    await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
+    await fireEvent.click(await screen.findByLabelText('Pilih file report.zip'));
+    await fireEvent.click(screen.getByRole('button',{name:'Copy ke sini'}));
+    await fireEvent.click(screen.getByRole('button',{name:'Copy'}));
+    await waitFor(()=>expect(jobs).toHaveLength(1));
+    expect(jobs[0]).toMatchObject({worker:'local',action:'copy',sources:[{path:'report.zip',is_dir:false}],destination_path:'',trashed:false});
+
+    await fireEvent.click(screen.getByRole('tab',{name:'Trash'}));
+    expect(await screen.findByText('Archive/old.zip')).toBeTruthy();
+    await fireEvent.click(screen.getByLabelText('Pilih file old.zip'));
+    await fireEvent.click(screen.getByRole('button',{name:'Pulihkan'}));
+    expect(screen.getByText(/Google Drive hanya menyediakan restore seluruh item Trash di folder induk secara rekursif/)).toBeTruthy();
+    await fireEvent.click(screen.getAllByRole('button',{name:'Pulihkan'}).at(-1)!);
+    await waitFor(()=>expect(jobs).toHaveLength(2));
+    expect(jobs[1]).toMatchObject({worker:'local',action:'restore',sources:[{path:'Archive/old.zip',is_dir:false,id:'file-1'}],destination_path:'',trashed:true,confirmed:false});
+  },15000);
+
   it('uses the saved Storage readiness snapshot and does not start a verification message/job', async () => {
     enableDialogMethods();
     const requests: { url: string; method: string; body?: string }[] = [];
@@ -534,6 +631,7 @@ describe('Storage file manager', () => {
       if (url.pathname.endsWith('/storage/rclone/browser')) {
         const nested=url.searchParams.get('path')==='docs';
         return new Response(JSON.stringify({path:nested?'docs':'',breadcrumbs:nested?['docs']:[],limit:100,offset:0,total:nested?1:1,
+          trash_supported:false,permanent_delete_supported:false,
           items:nested?[{name:'report.txt',path:'docs/report.txt',is_dir:false,size:12,updated_at:''}]:[{name:'docs',path:'docs',is_dir:true,size:0,updated_at:''}]}),{status:200});
       }
       return new Response(JSON.stringify({items:[]}),{status:200});
@@ -543,6 +641,10 @@ describe('Storage file manager', () => {
     render(StoragePage);
     await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
     expect(await screen.findByText('Remote rclone')).toBeTruthy();
+    await screen.findByRole('button',{name:/^docs/});
+    await fireEvent.click(screen.getByRole('checkbox',{name:'Pilih folder docs'}));
+    expect((screen.getByRole('button',{name:'Hapus tidak didukung'}) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.click(screen.getByRole('checkbox',{name:'Pilih folder docs'}));
     await fireEvent.click(await screen.findByRole('button',{name:/^docs/}));
     expect(await screen.findByText('report.txt')).toBeTruthy();
     expect(requests.some(item=>item.path.endsWith('/storage/rclone/browser')&&item.url.searchParams.get('worker')==='local')).toBe(true);

@@ -202,6 +202,7 @@ class WorkerJobExecutor(
         self._quick_delete_active: set[str] = set()
         self._quick_stage_jobs: dict[str, str] = {}
         self._cancel_requested: set[str] = set()
+        self._rclone_storage_lock = threading.RLock()
         self._pause_events: dict[str, threading.Event] = {}
         self._paused_pending_ids: set[str] = set()
         self._known: set[str] = set()
@@ -1245,6 +1246,9 @@ class WorkerJobExecutor(
                     "Storage Telegram download",
                     getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
                 )
+        elif kind == "storage_rclone_manage":
+            if rclone_runner is not None:
+                interrupt("Storage rclone management", rclone_runner.cancel_current)
         elif kind in {"export", "backup_node", "backup_verify"}:
             interrupt(
                 "export",
@@ -1877,6 +1881,11 @@ class WorkerJobExecutor(
                 keys.add(f"worker:{worker}:rclone:storage")
             else:
                 keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
+        elif kind == "storage_rclone_manage":
+            keys = {
+                f"worker:{worker}:kind:storage_rclone_manage",
+                f"worker:{worker}:rclone:storage",
+            }
         elif kind in {"download", "download_clear_failed"}:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
         elif kind == "backup_node":
@@ -2114,7 +2123,7 @@ class WorkerJobExecutor(
                     },
                     **(
                         {"result": {"value": json_value(result)}}
-                        if kind in {"storage_upload", "storage_reconcile", "storage_download"} and isinstance(result, dict)
+                        if kind in {"storage_upload", "storage_reconcile", "storage_download", "storage_rclone_manage"} and isinstance(result, dict)
                         else {}
                     ),
                     error={"code": "JOB_TERMINATED", "message": self._cancel_error(command)},
@@ -2123,7 +2132,7 @@ class WorkerJobExecutor(
             else:
                 storage_outcome = (
                     str(result.get("outcome") or "")
-                    if kind in {"storage_upload", "storage_reconcile", "storage_download"} and isinstance(result, dict)
+                    if kind in {"storage_upload", "storage_reconcile", "storage_download", "storage_rclone_manage"} and isinstance(result, dict)
                     else ""
                 )
                 utility_outcome = (
@@ -2132,7 +2141,21 @@ class WorkerJobExecutor(
                     else ""
                 )
                 if storage_outcome and storage_outcome != "succeeded":
-                    error_code = (
+                    if kind == "storage_rclone_manage":
+                        error_code = (
+                            "RCLONE_MANAGE_PARTIAL"
+                            if storage_outcome == "partial_failure"
+                            else "RCLONE_MANAGE_FAILED"
+                        )
+                        error_message = (
+                            "Sebagian operasi rclone gagal. Periksa hasil tiap item."
+                            if storage_outcome == "partial_failure"
+                            else "Semua operasi rclone gagal. Periksa hasil tiap item."
+                        )
+                        event_type = "storage.rclone_manage_completed"
+                        unit = "items"
+                    else:
+                        error_code = (
                         "STORAGE_DOWNLOAD_PARTIAL"
                         if kind == "storage_download" and storage_outcome == "partial_failure"
                         else "STORAGE_DOWNLOAD_FAILED"
@@ -2142,21 +2165,23 @@ class WorkerJobExecutor(
                         else "STORAGE_UPLOAD_PARTIAL"
                         if storage_outcome == "partial_failure"
                         else "STORAGE_UPLOAD_FAILED"
-                    )
-                    error_message = {
-                        "STORAGE_DOWNLOAD_PARTIAL": "Sebagian file gagal diunduh. Periksa hasil per file sebelum mengulangi.",
-                        "STORAGE_DOWNLOAD_FAILED": "Semua file yang dipilih gagal diunduh.",
-                        "STORAGE_UPLOAD_RECONCILIATION_REQUIRED": "Sebagian hasil upload belum dapat dipastikan dan perlu rekonsiliasi.",
-                        "STORAGE_UPLOAD_PARTIAL": "Sebagian file gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
-                        "STORAGE_UPLOAD_FAILED": "Semua file upload gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
-                    }[error_code]
-                    if kind == "storage_reconcile":
-                        error_code = "STORAGE_RECONCILIATION_INCOMPLETE"
-                        error_message = "Sebagian file tetap ambigu; hasil ekspor tidak membuktikan file aman untuk Retry."
+                        )
+                        error_message = {
+                            "STORAGE_DOWNLOAD_PARTIAL": "Sebagian file gagal diunduh. Periksa hasil per file sebelum mengulangi.",
+                            "STORAGE_DOWNLOAD_FAILED": "Semua file yang dipilih gagal diunduh.",
+                            "STORAGE_UPLOAD_RECONCILIATION_REQUIRED": "Sebagian hasil upload belum dapat dipastikan dan perlu rekonsiliasi.",
+                            "STORAGE_UPLOAD_PARTIAL": "Sebagian file gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
+                            "STORAGE_UPLOAD_FAILED": "Semua file upload gagal. Retry hanya mencakup file yang dipastikan belum terkirim.",
+                        }[error_code]
+                        if kind == "storage_reconcile":
+                            error_code = "STORAGE_RECONCILIATION_INCOMPLETE"
+                            error_message = "Sebagian file tetap ambigu; hasil ekspor tidak membuktikan file aman untuk Retry."
+                        event_type = "storage.download_completed" if kind == "storage_download" else "storage.reconciliation_completed" if kind == "storage_reconcile" else "storage.batch_completed"
+                        unit = "files"
                     self.publisher.emit(
                         job_id,
                         "failed",
-                        "storage.download_completed" if kind == "storage_download" else "storage.reconciliation_completed" if kind == "storage_reconcile" else "storage.batch_completed",
+                        event_type,
                         progress={
                             "phase": storage_outcome,
                             "message": error_message,
@@ -2164,7 +2189,7 @@ class WorkerJobExecutor(
                             "overall": {
                                 "current": int(result.get("succeeded") or 0),
                                 "total": int(result.get("total") or 0),
-                                "unit": "files",
+                                "unit": unit,
                             },
                         },
                         result={"value": json_value(result)},
@@ -2567,7 +2592,24 @@ class WorkerJobExecutor(
             finally:
                 runtime.download_progress.set_event_callback(previous)
 
+    @staticmethod
+    def _uses_rclone_storage(command: dict[str, Any]) -> bool:
+        kind = str(command.get("kind") or "")
+        payload = command.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        if kind == "storage_rclone_manage":
+            return True
+        if kind in {"storage_upload", "storage_download"}:
+            return str(payload.get("provider") or "telegram").strip().lower() == "rclone"
+        return kind == "export" and payload.get("quick_mode") is True
+
     def _execute(self, command: dict[str, Any]) -> Any:
+        if self._uses_rclone_storage(command):
+            with self._rclone_storage_lock:
+                return self._execute_unlocked(command)
+        return self._execute_unlocked(command)
+
+    def _execute_unlocked(self, command: dict[str, Any]) -> Any:
         kind = str(command["kind"])
         handlers = {
             "export": self._export,
@@ -2579,6 +2621,7 @@ class WorkerJobExecutor(
             "utility": self._utility,
             "storage_upload": self._storage_upload,
             "storage_download": self._storage_download,
+            "storage_rclone_manage": self._storage_rclone_manage,
             "storage_reconcile": self._storage_reconcile,
             "storage_sync": self._storage_sync,
             "backup_node": self._backup,

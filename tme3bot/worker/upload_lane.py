@@ -177,6 +177,12 @@ class UploadLanePreparer:
         profile_root: Path | None = None
         candidate_home: Path | None = None
         held_locks: list[Any] = []
+        terminal_result = (
+            "failed",
+            "failed",
+            100,
+            "PROFILE_UPLOAD_PREPARATION_FAILED",
+        )
         try:
             config = self.profile_manager.session_config(profile)
             profile_root = Path(config.profile_root)
@@ -203,7 +209,7 @@ class UploadLanePreparer:
             if marker == fingerprint and self._has_private_modes(upload_home) and self._lane_session_valid(
                 upload_storage, namespace, upload_home
             ):
-                self._finish(profile, "ready", "ready", 100, "OK")
+                terminal_result = ("ready", "ready", 100, "OK")
                 return
 
             self._set_progress(profile, "copying", 35)
@@ -229,19 +235,18 @@ class UploadLanePreparer:
             self._set_progress(profile, "installing", 90)
             self._install_candidate(profile_root, candidate_home, upload_home)
             candidate_home = None
-            self._finish(profile, "ready", "ready", 100, "OK")
+            terminal_result = ("ready", "ready", 100, "OK")
         except _PreparationFailure as exc:
             if candidate_home is not None:
                 self._remove_tree(candidate_home)
                 candidate_home = None
-            self._finish(profile, "failed", "failed", 100, exc.code)
+            terminal_result = ("failed", "failed", 100, exc.code)
         except Exception:
             LOGGER.warning("Upload lane preparation failed for profile %s", profile)
             if candidate_home is not None:
                 self._remove_tree(candidate_home)
                 candidate_home = None
-            self._finish(
-                profile,
+            terminal_result = (
                 "failed",
                 "failed",
                 100,
@@ -255,8 +260,7 @@ class UploadLanePreparer:
                     lock.release()
                 except RuntimeError:
                     pass
-            with self._lock:
-                self._active.discard(profile)
+            self._finish(profile, *terminal_result)
 
     def _acquire_profile_locks(self, profile: str) -> list[Any]:
         source_locks = self.profile_manager.profile_operation_locks(profile)
@@ -502,6 +506,7 @@ class UploadLanePreparer:
                 "code": code,
                 "updated_at": self._now(),
             })
+            self._active.discard(profile)
             self._save_locked()
 
     def _load_records(self) -> dict[str, dict[str, Any]]:
