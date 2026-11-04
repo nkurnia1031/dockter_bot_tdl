@@ -439,20 +439,32 @@ def cleanup_quick_tdl_sessions(
     if staging_root.is_symlink():
         raise QuickModeError("Root database staging Quick Mode tidak aman.")
     if profile:
-        candidates = [
-            paths.tdl_staging(profile, f"quickmode-{mode}", stage_id).parent
-            for mode in ("export", "download")
-        ]
+        profile_names = [profile]
     elif staging_root.is_dir():
-        candidates = [
-            profile_root / f"quickmode-{mode}" / stage_id
-            for profile_root in staging_root.iterdir()
-            if profile_root.is_dir() and not profile_root.is_symlink()
-            for mode in ("export", "download")
-        ]
+        profile_names = []
+        for profile_dir in staging_root.iterdir():
+            if profile_dir.is_symlink():
+                raise QuickModeError("Folder profil database staging tidak aman.")
+            if not profile_dir.is_dir():
+                continue
+            if profile_dir.name != paths.tdl_profile(profile_dir.name).name:
+                raise QuickModeError("Nama profil database staging tidak aman.")
+            profile_names.append(profile_dir.name)
     else:
-        candidates = []
-    for candidate in candidates:
+        profile_names = []
+    candidates = []
+    for profile_name in profile_names:
+        for mode in ("export", "download"):
+            lane = f"quickmode-{mode}"
+            lane_root = paths.tdl_staging_lane(profile_name, lane)
+            candidates.append(
+                (
+                    paths.tdl_staging(profile_name, lane, stage_id).parent,
+                    lane_root,
+                    lane_root.parent,
+                )
+            )
+    for candidate, lane_root, profile_root in candidates:
         if candidate.is_symlink():
             raise QuickModeError("Folder database staging Quick Mode tidak aman.")
         resolved = candidate.resolve(strict=False)
@@ -465,7 +477,7 @@ def cleanup_quick_tdl_sessions(
                 if item.is_symlink():
                     raise QuickModeError("Folder database staging Quick Mode berisi symlink.")
             shutil.rmtree(candidate)
-        for parent in (candidate.parent, candidate.parent.parent):
+        for parent in (lane_root, profile_root):
             try:
                 parent.rmdir()
             except OSError:

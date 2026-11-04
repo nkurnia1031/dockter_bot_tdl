@@ -663,6 +663,25 @@ class TDLClientTests(unittest.TestCase):
 
             self.assertFalse(stage_db.exists())
 
+    def test_quick_mode_tdl_database_cleanup_uses_resolver_for_all_profile_paths(self):
+        from tme3bot.worker.quick_export import cleanup_quick_tdl_sessions
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            session_paths = []
+            for profile in ("default", "irang"):
+                session = (
+                    root / "database" / "tdl-staging" / profile
+                    / "quickmode-download" / "job" / ".tdl" / "data" / profile
+                )
+                session.parent.mkdir(parents=True)
+                session.write_bytes(b"quickmode-copy")
+                session_paths.append(session)
+
+            cleanup_quick_tdl_sessions(root / "database", "job")
+
+            self.assertTrue(all(not session.exists() for session in session_paths))
+
     def test_parses_tdl_progress_line(self) -> None:
         progress = parse_tdl_progress_line("3/12 sample.mp4 45.5% 1.2MiB/s", "stdout")
 
