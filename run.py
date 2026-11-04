@@ -1627,7 +1627,7 @@ def add_profile(env: dict[str, str], profile_name: str | None) -> None:
         host_root = Path(database_root_value(env)).expanduser()
         if database_root == Path("/database/worker-local"):
             host_root = host_root / "worker-local"
-        print(f"Host database folder: {host_root / 'tdl' / profile}")
+        print(f"Host database folder: {DatabasePaths(host_root).tdl_profile(profile)}")
     print(f"Di bot Telegram, pilih dengan: /profile {profile}")
 
 

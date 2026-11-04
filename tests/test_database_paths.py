@@ -43,6 +43,10 @@ class DatabasePathsTests(unittest.TestCase):
             paths.tdl_staging_lane("irang", "upload"),
             Path("/database/worker-local/tdl-staging/irang/upload"),
         )
+        self.assertEqual(
+            paths.tdl_staging_root(),
+            Path("/database/worker-local/tdl-staging"),
+        )
         with self.assertRaises(ValueError):
             paths.profile_provisioning("stages", "../workspace")
 

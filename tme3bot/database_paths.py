@@ -68,6 +68,9 @@ class DatabasePaths:
             raise ValueError("Invalid profile or lane for TDL staging path.")
         return self._safe_join("tdl-staging", normalized, lane_name)
 
+    def tdl_staging_root(self) -> Path:
+        return self._safe_join("tdl-staging")
+
     def tdl(self, profile: str, lane: str) -> Path:
         normalized = normalize_profile_name(str(profile or ""))
         if not normalized:

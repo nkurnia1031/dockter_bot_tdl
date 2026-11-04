@@ -435,7 +435,7 @@ def cleanup_quick_tdl_sessions(
     paths = DatabasePaths(database_root)
     paths.tdl_staging(profile or "default", "quickmode-export", stage_id)
     root = paths.root.resolve(strict=False)
-    staging_root = paths.root / "tdl-staging"
+    staging_root = paths.tdl_staging_root()
     if staging_root.is_symlink():
         raise QuickModeError("Root database staging Quick Mode tidak aman.")
     if profile:
