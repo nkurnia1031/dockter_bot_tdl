@@ -897,7 +897,7 @@ def write_profile_identity(env: dict[str, str], profile_name: str | None) -> Non
     else:
         profile_root = f"{profiles_root}/{normalized}"
     database_root = database_root_container_value(env)
-    storage = str(DatabasePaths(database_root).tdl(normalized, "export") / "data")
+    storage = str(DatabasePaths(database_root).tdl_storage_data(normalized, "export"))
     identity_file = f"{profile_root}/identity.json"
     namespace = env.get("TDL_EXPORT_NAMESPACE", "default").strip() or "default"
     command = [
@@ -1626,7 +1626,7 @@ def add_profile(env: dict[str, str], profile_name: str | None) -> None:
         print(f"Database TDL export: {DatabasePaths(database_root).tdl(profile, 'export')}")
         host_root = Path(database_root_value(env)).expanduser()
         if database_root == Path("/database/worker-local"):
-            host_root = host_root / "worker-local"
+            host_root = DatabasePaths(host_root).worker_local_root()
         print(f"Host database folder: {DatabasePaths(host_root).tdl_profile(profile)}")
     print(f"Di bot Telegram, pilih dengan: /profile {profile}")
 

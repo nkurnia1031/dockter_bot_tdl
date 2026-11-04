@@ -48,6 +48,9 @@ class DatabasePaths:
     def redis_directory(self) -> Path:
         return self._safe_join("redis")
 
+    def worker_local_root(self) -> Path:
+        return self._safe_join("worker-local")
+
     def profile_provisioning(self, *parts: str) -> Path:
         """Resolve private session-provisioning staging and rollback paths."""
 
@@ -79,6 +82,11 @@ class DatabasePaths:
         if not _SAFE_SEGMENT.fullmatch(lane_name):
             raise ValueError("Invalid lane name for TDL database path.")
         return self._safe_join("tdl", normalized, lane_name, ".tdl")
+
+    def tdl_storage_data(self, profile: str, lane: str) -> Path:
+        """Resolve the TDL Bolt database directory within a lane's .tdl store."""
+
+        return self.tdl(profile, lane) / "data"
 
     def tdl_staging(self, profile: str, lane: str, operation_id: str) -> Path:
         normalized = normalize_profile_name(str(profile or ""))

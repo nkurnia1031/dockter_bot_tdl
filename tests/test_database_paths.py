@@ -19,6 +19,14 @@ class DatabasePathsTests(unittest.TestCase):
         paths = DatabasePaths(Path("/database/worker-local"))
 
         self.assertEqual(
+            DatabasePaths(Path("/srv/tme3bot/db/gateway")).worker_local_root(),
+            Path("/srv/tme3bot/db/gateway/worker-local"),
+        )
+        self.assertEqual(
+            paths.tdl_storage_data("irang", "export"),
+            Path("/database/worker-local/tdl/irang/export/.tdl/data"),
+        )
+        self.assertEqual(
             paths.sqlite("worker-command-journal.sqlite3"),
             Path("/database/worker-local/worker-command-journal.sqlite3"),
         )
