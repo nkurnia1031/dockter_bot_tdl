@@ -454,9 +454,9 @@ describe('ProfilesPage', () => {
           checked_at: '2026-10-31T10:00:00Z', reason_code: '',
           last_attempt: {
             target: { worker: 'local', profile: 'default', runtime: 'storage' },
-            checked_at: '2026-10-31T10:00:00Z', phase: 'verify_storage',
+            checked_at: '2026-10-31T10:00:00Z', phase: 'storage_access_canary',
             checks: [{ name: 'upload', status: 'ready', reason_code: '' }, { name: 'storage', status: 'ready', reason_code: '' }],
-            status: 'ready', reason_code: '', dependencies: ['export', 'upload'],
+            status: 'ready', reason_code: '', dependencies: ['upload'],
             cleanup: { status: 'succeeded', reason_code: '' },
             stdout: 'NEVER-SHOW-CANARY-OUTPUT',
           },
@@ -498,8 +498,8 @@ describe('ProfilesPage', () => {
     await fireEvent.click(logButton);
     const dialog = screen.getByRole('dialog', { name: 'Log uji Storage profil default worker local' });
     expect(dialog.textContent).toContain('Profil default');
-    expect(dialog.textContent).toContain('verify_storage');
-    expect(dialog.textContent).toContain('Export, Upload');
+    expect(dialog.textContent).toContain('storage_access_canary');
+    expect(dialog.textContent).toContain('Upload');
     expect(dialog.textContent).toContain('Cleanup');
     expect(dialog.textContent).not.toContain('NEVER-SHOW-CANARY-OUTPUT');
     await fireEvent.click(screen.getByRole('button', { name: 'Tutup log uji' }));

@@ -797,6 +797,11 @@ class TDLClient:
             else float(os.getenv("TDL_UPLOAD_RESOLVE_INTERVAL_SECONDS", "5"))
         )
 
+    def interrupt_current(self) -> bool:
+        """Interrupt this client's currently running TDL subprocess, if any."""
+        interrupt = getattr(self.runner, "interrupt_current", None)
+        return bool(interrupt()) if callable(interrupt) else False
+
     def export_messages(
         self,
         chat_ref: str,

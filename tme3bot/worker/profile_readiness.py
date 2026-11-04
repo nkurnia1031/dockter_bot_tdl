@@ -4,6 +4,7 @@ import copy
 import re
 import tempfile
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -50,16 +51,6 @@ def _failure_code(exc: BaseException, fallback: str) -> str:
     )
 
 
-def _contains_marker(value: Any, marker: str) -> bool:
-    if isinstance(value, str):
-        return marker in value
-    if isinstance(value, dict):
-        return any(_contains_marker(item, marker) for item in value.values())
-    if isinstance(value, list):
-        return any(_contains_marker(item, marker) for item in value)
-    return False
-
-
 def _redact_scan_log_text(value: Any) -> str:
     text = str(value or "")
     for pattern in _LOG_SECRET_PATTERNS:
@@ -71,7 +62,7 @@ def _redact_scan_log_text(value: Any) -> str:
 
 
 class ProfileReadinessCanary:
-    """Exercise one profile's Export, Download, and Upload Telegram lanes."""
+    """Test profile lanes through bounded exports and download progress."""
 
     def __init__(
         self,
@@ -79,11 +70,15 @@ class ProfileReadinessCanary:
         diagnose_profile_tdl: Callable[[str], dict],
         temp_root: Path,
         upload_session_fingerprint: Callable[[str], str] | None = None,
+        download_progress_timeout_seconds: float = 20.0,
     ):
         self.profile_manager = profile_manager
         self.diagnose_profile_tdl = diagnose_profile_tdl
         self.temp_root = Path(temp_root)
         self.upload_session_fingerprint = upload_session_fingerprint
+        self.download_progress_timeout_seconds = max(
+            0.0, float(download_progress_timeout_seconds)
+        )
 
     def run(
         self,
@@ -111,7 +106,9 @@ class ProfileReadinessCanary:
                 "upload_session_fingerprint": "",
             }
         runtime = self.profile_manager.runtime(profile)
-        locks = [runtime.export_operation_lock]
+        locks = []
+        if selected_checks.intersection({"export", "download", "tts"}):
+            locks.append(runtime.export_operation_lock)
         if "download" in selected_checks:
             locks.append(runtime.download_operation_lock)
         if "storage" in selected_checks:
@@ -182,10 +179,12 @@ class ProfileReadinessCanary:
             upload_fingerprint = ""
 
             if not storage_target:
-                for key in selected_checks.intersection({"export", "download", "storage"}):
-                    target_check = "upload" if key == "storage" else key
-                    checks[target_check]["reason_code"] = "TDL_ACCESS_TARGET_UNAVAILABLE"
+                if "export" in selected_checks or "download" in selected_checks:
+                    checks["export"]["reason_code"] = "TDL_ACCESS_TARGET_UNAVAILABLE"
+                if "download" in selected_checks:
+                    checks["download"]["reason_code"] = "TDL_ACCESS_TARGET_UNAVAILABLE"
                 if "storage" in selected_checks:
+                    checks["upload"]["reason_code"] = "TDL_ACCESS_TARGET_UNAVAILABLE"
                     checks["storage"]["reason_code"] = "TDL_ACCESS_TARGET_UNAVAILABLE"
             if not tts_target and "tts" in selected_checks:
                 checks["tts"]["reason_code"] = "TTS_CHAT_UNAVAILABLE"
@@ -196,10 +195,9 @@ class ProfileReadinessCanary:
                 export_json = root / "canary.json"
                 media_dir = root / "download"
                 export_client = runtime.export_tdl_client
-                needs_export = bool(selected_checks.intersection({"export", "download", "storage", "tts"}))
                 export_ready = False
 
-                if needs_export and storage_target:
+                if selected_checks.intersection({"export", "download"}) and storage_target:
                     emit("export_canary")
                     try:
                         exported = run_tdl(
@@ -222,20 +220,39 @@ class ProfileReadinessCanary:
                             exc, "PROFILE_CANARY_EXPORT_FAILED"
                         )
                 if not export_ready:
-                    export_reason = checks["export"]["reason_code"]
-                    if export_reason == "PROFILE_CANARY_NOT_RUN":
-                        export_reason = "TDL_ACCESS_TARGET_UNAVAILABLE"
-                    for dependent in selected_checks.intersection({"download", "storage", "tts"}):
-                        checks[dependent]["reason_code"] = export_reason or "PROFILE_CANARY_EXPORT_FAILED"
-                    if "storage" in selected_checks:
-                        checks["upload"]["reason_code"] = export_reason or "PROFILE_CANARY_EXPORT_FAILED"
+                    if "download" in selected_checks:
+                        export_reason = checks["export"]["reason_code"]
+                        if export_reason == "PROFILE_CANARY_NOT_RUN":
+                            export_reason = "TDL_ACCESS_TARGET_UNAVAILABLE"
+                        checks["download"]["reason_code"] = (
+                            export_reason or "PROFILE_CANARY_EXPORT_FAILED"
+                        )
 
                 if "download" in selected_checks and export_ready and exported.has_media:
                     emit("download_canary")
                     download_client = runtime.download_tdl_client
                     previous_progress = getattr(download_client, "progress_callback", None)
-                    speed_seen = threading.Event()
+                    progress_seen = threading.Event()
+                    timeout_elapsed = threading.Event()
+                    command_finished = threading.Event()
                     cancel_started = threading.Event()
+                    cancel_lock = threading.Lock()
+                    progress_deadline = (
+                        time.monotonic() + self.download_progress_timeout_seconds
+                    )
+
+                    def cancel_download(reason: str) -> None:
+                        with cancel_lock:
+                            if command_finished.is_set() or cancel_started.is_set():
+                                return
+                            cancel_started.set()
+                            if reason == "timeout":
+                                timeout_elapsed.set()
+                        threading.Thread(
+                            target=download_client.interrupt_current,
+                            name="profile-readiness-download-cancel",
+                            daemon=True,
+                        ).start()
 
                     def on_download_progress(progress) -> None:
                         if previous_progress is not None:
@@ -249,19 +266,36 @@ class ProfileReadinessCanary:
                             has_speed = float(speed_bps) > 0
                         except (TypeError, ValueError):
                             has_speed = False
-                        if has_speed and not speed_seen.is_set():
-                            speed_seen.set()
-                            if cancel_started.is_set():
-                                return
-                            cancel_started.set()
-                            threading.Thread(
-                                target=download_client.interrupt_current,
-                                name="profile-readiness-download-cancel",
-                                daemon=True,
-                            ).start()
+                        try:
+                            has_bytes = float(
+                                getattr(progress, "transferred_bytes", None) or 0
+                            ) > 0
+                            has_fraction = float(
+                                getattr(progress, "fraction_current", None) or 0
+                            ) > 0
+                            has_percent = float(
+                                getattr(progress, "percent", None) or 0
+                            ) > 0
+                        except (TypeError, ValueError):
+                            has_bytes = has_fraction = has_percent = False
+                        within_deadline = time.monotonic() <= progress_deadline
+                        if (
+                            (has_speed or has_bytes or has_fraction or has_percent)
+                            and within_deadline
+                            and not timeout_elapsed.is_set()
+                        ):
+                            progress_seen.set()
+                            cancel_download("progress")
 
+                    timeout: threading.Timer | None = None
                     try:
                         download_client.progress_callback = on_download_progress
+                        timeout = threading.Timer(
+                            self.download_progress_timeout_seconds,
+                            lambda: cancel_download("timeout"),
+                        )
+                        timeout.daemon = True
+                        timeout.start()
                         try:
                             run_tdl(
                                 "download",
@@ -269,100 +303,66 @@ class ProfileReadinessCanary:
                                 lambda: download_client.download(export_json, media_dir),
                             )
                         except Exception as exc:
-                            if not speed_seen.is_set():
+                            if not progress_seen.is_set() and not timeout_elapsed.is_set():
                                 raise exc
-                        if speed_seen.is_set():
+                        if progress_seen.is_set():
                             checks["download"] = {"ready": True, "reason_code": ""}
+                        elif timeout_elapsed.is_set():
+                            checks["download"]["reason_code"] = (
+                                "PROFILE_CANARY_DOWNLOAD_PROGRESS_TIMEOUT"
+                            )
                         else:
-                            checks["download"]["reason_code"] = "PROFILE_CANARY_DOWNLOAD_SPEED_MISSING"
+                            checks["download"]["reason_code"] = (
+                                "PROFILE_CANARY_DOWNLOAD_PROGRESS_MISSING"
+                            )
                     except Exception as exc:
                         checks["download"]["reason_code"] = _failure_code(
                             exc, "PROFILE_CANARY_DOWNLOAD_FAILED"
                         )
                     finally:
+                        command_finished.set()
+                        if timeout is not None:
+                            timeout.cancel()
                         download_client.progress_callback = previous_progress
                 elif "download" in selected_checks and export_ready:
                     checks["download"]["reason_code"] = "PROFILE_CANARY_MEDIA_UNAVAILABLE"
 
-                if "storage" in selected_checks and export_ready:
-                    marker = f"[TME3BOT PROFILE SCAN {uuid.uuid4()}]"
-                    emit("upload_storage")
+                if "storage" in selected_checks and storage_target:
+                    emit("storage_access_canary")
                     upload_client = runtime.upload_tdl_client
                     try:
-                        uploaded = run_tdl(
-                            "storage",
+                        run_tdl(
+                            "upload",
                             upload_client,
-                            lambda: upload_client.upload(export_json, storage_target, marker),
+                            lambda: upload_client.export_messages(
+                                storage_target,
+                                1,
+                                root / "verify-storage-access.json",
+                                last_count=1,
+                            ),
                         )
-                        storage_message_id = int(uploaded.message_id)
                         checks["upload"] = {"ready": True, "reason_code": ""}
-                        messages.append({"target": "storage", "message_id": storage_message_id})
-                        emit("verify_storage")
+                        checks["storage"] = {"ready": True, "reason_code": ""}
                     except Exception as exc:
                         checks["upload"]["reason_code"] = _failure_code(
                             exc, "PROFILE_CANARY_UPLOAD_FAILED"
                         )
                         checks["storage"]["reason_code"] = checks["upload"]["reason_code"]
-                    else:
-                        try:
-                            verified = run_tdl(
-                                "storage",
-                                export_client,
-                                lambda: export_client.export_messages(
-                                    storage_target,
-                                    storage_message_id,
-                                    root / "verify-storage.json",
-                                    with_content=True,
-                                    end_id=storage_message_id,
-                                ),
-                            )
-                            found = any(
-                                int(item.get("id") or 0) == storage_message_id
-                                and _contains_marker(item, marker)
-                                for item in verified.messages
-                            )
-                            if found:
-                                checks["storage"] = {"ready": True, "reason_code": ""}
-                            else:
-                                checks["storage"]["reason_code"] = "PROFILE_CANARY_STORAGE_VERIFY_FAILED"
-                        except Exception as exc:
-                            checks["storage"]["reason_code"] = _failure_code(
-                                exc, "PROFILE_CANARY_STORAGE_VERIFY_FAILED"
-                            )
 
-                if "tts" in selected_checks and export_ready and tts_target:
-                    marker = f"[TME3BOT PROFILE SCAN {uuid.uuid4()}]"
-                    emit("upload_tts")
+                if "tts" in selected_checks and tts_target:
+                    emit("tts_access_canary")
                     try:
-                        uploaded = run_tdl(
-                            "tts",
-                            export_client,
-                            lambda: export_client.upload(export_json, tts_target, marker),
-                        )
-                        tts_message_id = int(uploaded.message_id)
-                        messages.append({"target": "tts", "message_id": tts_message_id})
-                        emit("verify_tts")
-                        verified = run_tdl(
+                        run_tdl(
                             "tts",
                             export_client,
                             lambda: export_client.export_messages(
                                 tts_target,
-                                tts_message_id,
-                                root / "verify-tts.json",
-                                with_content=True,
-                                end_id=tts_message_id,
+                                1,
+                                root / "verify-tts-access.json",
+                                last_count=1,
                             ),
                         )
-                        found = any(
-                            int(item.get("id") or 0) == tts_message_id
-                            and _contains_marker(item, marker)
-                            for item in verified.messages
-                        )
-                        checks["tts"] = (
-                            {"ready": True, "reason_code": ""}
-                            if found
-                            else {"ready": False, "reason_code": "PROFILE_CANARY_TTS_VERIFY_FAILED"}
-                        )
+                        checks["tts"] = {"ready": True, "reason_code": ""}
                     except Exception as exc:
                         checks["tts"]["reason_code"] = _failure_code(
                             exc, "PROFILE_CANARY_TTS_FAILED"

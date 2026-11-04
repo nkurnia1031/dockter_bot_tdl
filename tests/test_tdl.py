@@ -100,6 +100,21 @@ class FakeRunner:
 
 
 class TDLClientTests(unittest.TestCase):
+    def test_interrupt_current_delegates_to_the_clients_runner(self):
+        class InterruptRunner:
+            def __init__(self):
+                self.interrupt_calls = 0
+
+            def interrupt_current(self):
+                self.interrupt_calls += 1
+                return True
+
+        runner = InterruptRunner()
+        client = TDLClient(Path("/tmp/session"), "download", runner=runner)
+
+        self.assertTrue(client.interrupt_current())
+        self.assertEqual(runner.interrupt_calls, 1)
+
     def test_storage_history_export_uses_one_unbounded_content_export(self):
         class StorageHistoryRunner:
             def __init__(self, peer_id=123):

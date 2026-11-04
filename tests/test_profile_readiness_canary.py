@@ -21,10 +21,19 @@ class _Message:
 
 
 class _ExportClient:
-    def __init__(self, uploads, counter, *, fail_tts_verification=False):
+    def __init__(
+        self,
+        uploads,
+        counter,
+        *,
+        empty_targets=(),
+        failed_targets=(),
+    ):
         self.uploads = uploads
         self.counter = counter
-        self.fail_tts_verification = fail_tts_verification
+        self.empty_targets = set(empty_targets)
+        self.failed_targets = set(failed_targets)
+        self.export_calls = []
         self.raw_output_callback = None
 
     def _emit_raw(self):
@@ -59,13 +68,23 @@ class _ExportClient:
         self, chat_ref, start_id, path, *, with_content=False,
         last_count=None, end_id=None,
     ):
+        self.export_calls.append({
+            "chat_ref": chat_ref,
+            "start_id": start_id,
+            "last_count": last_count,
+            "with_content": with_content,
+            "end_id": end_id,
+        })
         self._emit_raw()
+        if chat_ref in self.failed_targets:
+            raise RuntimeError(f"export access failed for {chat_ref}")
         path = Path(path)
         if last_count == 1:
-            messages = [{"id": 99, "media": {"name": "backup.7z"}}]
+            messages = (
+                [] if chat_ref in self.empty_targets else
+                [{"id": 99, "media": {"name": "backup.7z"}}]
+            )
         else:
-            if self.fail_tts_verification and chat_ref == "tts-chat":
-                raise RuntimeError("verification failed")
             message_id = int(end_id or start_id)
             marker = next((item["marker"] for item in self.uploads if item["id"] == message_id), "")
             messages = [{"id": message_id, "caption": marker}]
@@ -74,8 +93,8 @@ class _ExportClient:
             export_path=path,
             messages=messages,
             exported_count=len(messages),
-            max_message_id=max(item["id"] for item in messages),
-            has_media=last_count == 1,
+            max_message_id=max((item["id"] for item in messages), default=0),
+            has_media=any(item.get("media") for item in messages),
         )
 
     def upload(self, path, chat_ref, caption):
@@ -86,13 +105,19 @@ class _ExportClient:
 
 
 class _DownloadClient:
-    def __init__(self):
+    def __init__(self, *, emit_progress=True, progress_delay_seconds=0):
         self.progress_callback = None
         self.interrupted = threading.Event()
+        self.started = threading.Event()
+        self.emit_progress = emit_progress
+        self.progress_delay_seconds = progress_delay_seconds
 
     def download(self, _export_path, download_dir):
         Path(download_dir).mkdir(parents=True, exist_ok=True)
-        self.progress_callback(_Message(speed_bps=4096, speed="4KiB/s"))
+        self.started.set()
+        if self.emit_progress:
+            if not self.interrupted.wait(timeout=self.progress_delay_seconds):
+                self.progress_callback(_Message(speed_bps=4096, speed="4KiB/s"))
         self.interrupted.wait(timeout=1)
 
     def interrupt_current(self):
@@ -101,18 +126,36 @@ class _DownloadClient:
 
 
 class ProfileReadinessCanaryTests(unittest.TestCase):
-    def _run(self, *, fail_tts_verification=False, checks=None):
+    def _run(
+        self,
+        *,
+        empty_targets=(),
+        failed_targets=(),
+        checks=None,
+        download_progress_timeout_seconds=0.1,
+        progress_delay_seconds=0,
+    ):
         uploads = []
         counter = [700]
-        export = _ExportClient(uploads, counter, fail_tts_verification=fail_tts_verification)
-        download = _DownloadClient()
+        export = _ExportClient(
+            uploads,
+            counter,
+            empty_targets=empty_targets,
+            failed_targets=failed_targets,
+        )
+        download = _DownloadClient(progress_delay_seconds=progress_delay_seconds)
         runtime = SimpleNamespace(
             export_operation_lock=threading.RLock(),
             download_operation_lock=threading.RLock(),
             upload_operation_lock=threading.RLock(),
             export_tdl_client=export,
             download_tdl_client=download,
-            upload_tdl_client=_ExportClient(uploads, counter),
+            upload_tdl_client=_ExportClient(
+                uploads,
+                counter,
+                empty_targets=empty_targets,
+                failed_targets=failed_targets,
+            ),
         )
         manager = SimpleNamespace(runtime=lambda _profile: runtime)
         phases = []
@@ -127,6 +170,7 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
                 },
                 Path(directory),
                 upload_session_fingerprint=lambda _profile: "b" * 64,
+                download_progress_timeout_seconds=download_progress_timeout_seconds,
             )
             result = canary.run(
                 "default",
@@ -138,7 +182,7 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
         self.diagnose_calls = diagnose_calls
         return result, phases, runtime, download
 
-    def test_runs_export_download_upload_and_independent_channel_verifications(self):
+    def test_checks_each_lane_with_export_and_never_sends_marker_uploads(self):
         result, phases, _runtime, download = self._run()
 
         self.assertTrue(result["checks"]["export"]["ready"])
@@ -149,45 +193,132 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
         self.assertEqual(result["session_fingerprint"], "")
         self.assertEqual(result["upload_session_fingerprint"], "")
         self.assertEqual(self.diagnose_calls, [])
-        self.assertEqual({item["target"] for item in result["messages"]}, {"storage", "tts"})
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(_runtime.export_tdl_client.uploads, [])
+        self.assertEqual(_runtime.upload_tdl_client.uploads, [])
+        self.assertEqual(
+            [call["chat_ref"] for call in _runtime.upload_tdl_client.export_calls],
+            ["storage-chat"],
+        )
+        self.assertEqual(
+            [call["chat_ref"] for call in _runtime.export_tdl_client.export_calls],
+            ["storage-chat", "tts-chat"],
+        )
+        self.assertEqual(
+            [call["last_count"] for call in _runtime.export_tdl_client.export_calls],
+            [1, 1],
+        )
+        self.assertEqual(
+            _runtime.upload_tdl_client.export_calls[0]["last_count"], 1
+        )
         self.assertIn("download_canary", phases)
-        self.assertIn("verify_storage", phases)
-        self.assertIn("verify_tts", phases)
+        self.assertIn("storage_access_canary", phases)
+        self.assertIn("tts_access_canary", phases)
         self.assertTrue(download.interrupted.wait(timeout=0.2))
 
-    def test_tts_verification_failure_does_not_clear_storage_or_upload_readiness(self):
-        result, _phases, _runtime, _download = self._run(fail_tts_verification=True)
+    def test_empty_channel_export_proves_storage_and_tts_access(self):
+        result, _phases, runtime, _download = self._run(
+            empty_targets={"storage-chat", "tts-chat"},
+            checks=["storage", "tts"],
+        )
+
+        self.assertTrue(result["checks"]["upload"]["ready"])
+        self.assertTrue(result["checks"]["storage"]["ready"])
+        self.assertTrue(result["checks"]["tts"]["ready"])
+        self.assertFalse(result["checks"]["export"]["ready"])
+        self.assertEqual(runtime.upload_tdl_client.export_calls[0]["chat_ref"], "storage-chat")
+        self.assertEqual(runtime.export_tdl_client.export_calls[0]["chat_ref"], "tts-chat")
+        self.assertEqual(result["messages"], [])
+
+    def test_tts_access_failure_does_not_clear_storage_readiness(self):
+        result, _phases, _runtime, _download = self._run(
+            failed_targets={"tts-chat"},
+            checks=["storage", "tts"],
+        )
 
         self.assertTrue(result["checks"]["upload"]["ready"])
         self.assertTrue(result["checks"]["storage"]["ready"])
         self.assertFalse(result["checks"]["tts"]["ready"])
-        self.assertEqual(
-            result["checks"]["tts"]["reason_code"],
-            "PROFILE_CANARY_TTS_FAILED",
-        )
+        self.assertEqual(result["checks"]["tts"]["reason_code"], "PROFILE_CANARY_TTS_FAILED")
 
     def test_selected_tts_canary_does_not_run_storage_or_download_canaries(self):
         result, phases, _runtime, download = self._run(checks=["tts"])
 
-        self.assertTrue(result["checks"]["export"]["ready"])
+        self.assertFalse(result["checks"]["export"]["ready"])
         self.assertTrue(result["checks"]["tts"]["ready"])
         self.assertFalse(result["checks"]["upload"]["ready"])
         self.assertFalse(result["checks"]["storage"]["ready"])
-        self.assertEqual([item["target"] for item in result["messages"]], ["tts"])
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(
+            [call["chat_ref"] for call in _runtime.export_tdl_client.export_calls],
+            ["tts-chat"],
+        )
+        self.assertEqual(_runtime.export_tdl_client.export_calls[0]["last_count"], 1)
         self.assertNotIn("download_canary", phases)
-        self.assertNotIn("upload_storage", phases)
+        self.assertNotIn("storage_access_canary", phases)
         self.assertFalse(download.interrupted.is_set())
 
     def test_selected_storage_canary_does_not_run_tts_or_download_canaries(self):
         result, phases, _runtime, download = self._run(checks=["storage"])
 
-        self.assertTrue(result["checks"]["export"]["ready"])
+        self.assertFalse(result["checks"]["export"]["ready"])
         self.assertTrue(result["checks"]["upload"]["ready"])
         self.assertTrue(result["checks"]["storage"]["ready"])
-        self.assertEqual([item["target"] for item in result["messages"]], ["storage"])
+        self.assertEqual(result["messages"], [])
+        self.assertEqual(
+            [call["chat_ref"] for call in _runtime.upload_tdl_client.export_calls],
+            ["storage-chat"],
+        )
+        self.assertEqual(_runtime.upload_tdl_client.export_calls[0]["last_count"], 1)
+        self.assertEqual(_runtime.export_tdl_client.export_calls, [])
         self.assertNotIn("download_canary", phases)
-        self.assertNotIn("upload_tts", phases)
+        self.assertNotIn("tts_access_canary", phases)
         self.assertFalse(download.interrupted.is_set())
+
+    def test_download_lane_times_out_and_cancels_when_no_progress_appears(self):
+        uploads = []
+        counter = [700]
+        runtime = SimpleNamespace(
+            export_operation_lock=threading.RLock(),
+            download_operation_lock=threading.RLock(),
+            upload_operation_lock=threading.RLock(),
+            export_tdl_client=_ExportClient(uploads, counter),
+            download_tdl_client=_DownloadClient(emit_progress=False),
+            upload_tdl_client=_ExportClient(uploads, counter),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            canary = ProfileReadinessCanary(
+                SimpleNamespace(runtime=lambda _profile: runtime),
+                lambda _profile: {"ready": True},
+                Path(directory),
+                download_progress_timeout_seconds=0.05,
+            )
+            started_at = time.monotonic()
+            result = canary.run(
+                "default", "storage-chat", "tts-chat", lambda *_args: None,
+                checks=["download"],
+            )
+
+        self.assertLess(time.monotonic() - started_at, 0.8)
+        self.assertTrue(runtime.download_tdl_client.started.is_set())
+        self.assertTrue(runtime.download_tdl_client.interrupted.wait(timeout=0.2))
+        self.assertFalse(result["checks"]["download"]["ready"])
+        self.assertEqual(
+            result["checks"]["download"]["reason_code"],
+            "PROFILE_CANARY_DOWNLOAD_PROGRESS_TIMEOUT",
+        )
+
+    def test_download_lane_cancels_as_soon_as_progress_appears(self):
+        started_at = time.monotonic()
+        result, _phases, _runtime, download = self._run(
+            checks=["download"],
+            download_progress_timeout_seconds=2.0,
+            progress_delay_seconds=0.02,
+        )
+
+        self.assertLess(time.monotonic() - started_at, 1.5)
+        self.assertTrue(result["checks"]["download"]["ready"])
+        self.assertTrue(download.interrupted.wait(timeout=0.2))
 
     def test_canary_operation_exposes_live_raw_tdl_logs_with_only_secrets_redacted(self):
         uploads = []

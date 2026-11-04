@@ -1150,10 +1150,10 @@ class BackendApiTests(unittest.TestCase):
                     {"worker": "local", "profile": "default", "runtime": runtime},
                 )
         storage_attempt = cells[("local", "default", "storage")]["last_attempt"]
-        self.assertEqual(storage_attempt["dependencies"], ["export", "upload"])
+        self.assertEqual(storage_attempt["dependencies"], ["upload"])
         self.assertEqual(
             {check["name"] for check in storage_attempt["checks"]},
-            {"export", "upload", "storage"},
+            {"upload", "storage"},
         )
         quick_attempt = cells[("local", "default", "quick_mode")]["last_attempt"]
         self.assertEqual(quick_attempt["phase"], "derived_readiness")
@@ -1587,6 +1587,9 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.profile_readiness_canary_scopes[-1], ("storage",))
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "upload")["status"], "ready")
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "storage")["status"], "ready")
+        storage_attempt = self.runtime_readiness_store.cell("local", "default", "storage")["last_attempt"]
+        self.assertEqual(storage_attempt["dependencies"], ["upload"])
+        self.assertEqual({check["name"] for check in storage_attempt["checks"]}, {"upload", "storage"})
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "export")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "download")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["checked_at"], checked_at)
@@ -1703,6 +1706,9 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.tts_health_calls, ["local"])
         self.assertEqual(self.runtime_readiness_store.cell("local", None, "tts_helper")["status"], "ready")
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "tts")["status"], "ready")
+        tts_attempt = self.runtime_readiness_store.cell("local", "default", "tts")["last_attempt"]
+        self.assertEqual(tts_attempt["dependencies"], ["tts_helper"])
+        self.assertEqual({check["name"] for check in tts_attempt["checks"]}, {"tts", "tts_helper"})
         self.assertEqual(self.runtime_readiness_store.cell("local", "archive", "tts")["checked_at"], checked_at)
         self.assertEqual(self.runtime_readiness_store.cell("local", "default", "export")["checked_at"], checked_at)
 

@@ -86,9 +86,9 @@ _Avoid_: benturan dianggap gagal, menimpa tujuan, menghapus sumber yang dilewati
 Memindahkan item di antara folder katalog Telegram tanpa menghapus file sumber yang berada di worker.
 _Avoid_: mode transfer pindah.
 
-**Bukti akses kirim**:
-Hasil pemeriksaan bahwa satu profil pada satu worker dapat mengirim ke tujuan tertentu. Bukti berlaku sampai izin atau sesi gagal, tujuan berubah, atau sesi yang diuji berubah.
-_Avoid_: kesiapan worker, verifikasi setiap job.
+**Bukti akses channel**:
+Hasil pemeriksaan bahwa lane profil-worker dapat menjalankan `tdl chat export` pada channel tujuan. Untuk lane Upload Storage dan TTS, scan memakai akses baca ke channel sebagai bukti tujuan tersedia; channel kosong tetap membuktikan akses bila perintah berhasil. Ini tidak menguji izin mengirim file.
+_Avoid_: bukti izin upload, kesiapan worker, verifikasi setiap job.
 
 **Hasil upload ambigu**:
 Upload sudah mulai dikirim tetapi worker tidak dapat memastikan apakah Telegram menerimanya. File tidak boleh dikirim ulang sebelum rekonsiliasi.

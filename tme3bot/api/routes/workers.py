@@ -980,7 +980,7 @@ def register_workers(app, context, *, current_actor):
                         profile,
                         "upload",
                         selected_checks("upload"),
-                        ["export"],
+                        [],
                         cleanup,
                     )
                 storage_readiness = item.get("_storage_readiness")
@@ -989,8 +989,8 @@ def register_workers(app, context, *, current_actor):
                         name,
                         profile,
                         "storage",
-                        selected_checks("export", "upload", "storage"),
-                        ["export", "upload"],
+                        selected_checks("upload", "storage"),
+                        ["upload"],
                         cleanup,
                     )
                 tts_readiness = next(
@@ -1001,7 +1001,7 @@ def register_workers(app, context, *, current_actor):
                     None,
                 )
                 if tts_readiness is not None:
-                    tts_checks = selected_checks("export", "tts")
+                    tts_checks = selected_checks("tts")
                     helper = readiness_tts_workers.get(name, {})
                     helper_ready = helper.get("ready") is True
                     tts_checks["tts_helper"] = {
@@ -1015,7 +1015,7 @@ def register_workers(app, context, *, current_actor):
                         profile,
                         "tts",
                         tts_checks,
-                        ["export", "tts_helper"],
+                        ["tts_helper"],
                         cleanup,
                     )
                 quickmode_readiness = item.get("_quickmode_readiness")
@@ -1432,14 +1432,14 @@ def register_workers(app, context, *, current_actor):
         dependencies = {
             "export": [],
             "download": ["export"],
-            "storage": ["export", "upload"],
-            "tts": ["export", "tts_helper"],
+            "storage": ["upload"],
+            "tts": ["tts_helper"],
         }[runtime]
         relevant_check_names = {
             "export": ("export",),
             "download": ("export", "download"),
-            "storage": ("export", "upload", "storage"),
-            "tts": ("export", "tts"),
+            "storage": ("upload", "storage"),
+            "tts": ("tts",),
         }[runtime]
         report("session_probe", {}, dependencies=dependencies)
         checks: dict[str, dict] = {}
@@ -1597,7 +1597,7 @@ def register_workers(app, context, *, current_actor):
             upload_attempt = _profile_readiness_attempt(
                 worker, profile, "upload", checked_at, "complete",
                 {"upload": checks.get("upload", {"ready": False, "reason_code": upload_reason})},
-                ["export"], cleanup,
+                [], cleanup,
             )
             readiness_store.upsert_cell(
                 worker=worker,

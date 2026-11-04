@@ -95,9 +95,9 @@ class ProfileScanOperationStoreTests(unittest.TestCase):
             )
             store.report_profile(
                 operation["id"], "remote-1", "irang", "running",
-                phase="verify_storage",
+                phase="storage_access_canary",
                 checks={"upload": {"ready": True}, "storage": {"ready": False, "reason_code": "PROFILE_CANARY_STORAGE_VERIFY_FAILED"}},
-                dependencies=["export", "upload", "private/path"],
+                dependencies=["upload", "private/path"],
             )
 
             restored = ProfileScanOperationStore(path)
@@ -109,7 +109,7 @@ class ProfileScanOperationStoreTests(unittest.TestCase):
             self.assertEqual(progress["error_code"], "PROFILE_SCAN_INTERRUPTED")
             self.assertEqual(progress["checks"]["upload"]["ready"], True)
             self.assertEqual(progress["checks"]["storage"]["reason_code"], "PROFILE_CANARY_STORAGE_VERIFY_FAILED")
-            self.assertEqual(progress["dependencies"], ["export", "upload"])
+            self.assertEqual(progress["dependencies"], ["upload"])
 
     def test_targeted_runtime_operation_persists_safe_target_and_check_progress(self):
         with tempfile.TemporaryDirectory() as raw:
