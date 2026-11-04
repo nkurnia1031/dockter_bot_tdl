@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from tme3bot.names import normalize_profile_name
+from tme3bot.database_paths import DatabasePaths, ensure_private_directory
 from tme3bot.persistence import write_json_atomic_private
 from tme3bot.profile_diagnostics import (
     PROFILE_UPLOAD_LANE_CODES,
@@ -190,14 +191,16 @@ class UploadLanePreparer:
             namespace = str(config.tdl_export_namespace)
             source_home = Path(config.tdl_export_home)
             upload_home = profile_root / "upload"
-            upload_storage = upload_home / ".tdl"
+            database_paths = DatabasePaths(getattr(config, "database_root", "/database"))
+            upload_storage = database_paths.tdl(profile, "upload")
+            ensure_private_directory(upload_storage.parent)
 
             if profile_root.is_symlink() or not profile_root.is_dir():
                 raise _PreparationFailure("PROFILE_UPLOAD_LANE_UNSAFE")
 
             self._set_progress(profile, "waiting_idle", 5)
             held_locks = self._acquire_profile_locks(profile)
-            self._recover_interrupted_install(profile_root, upload_home)
+            self._recover_interrupted_install(profile_root, upload_home, upload_storage)
 
             self._set_progress(profile, "validating_source", 15)
             self._check_session(source_storage, namespace, source_home, "PROFILE_EXPORT_SESSION_INVALID")
@@ -213,9 +216,10 @@ class UploadLanePreparer:
                 return
 
             self._set_progress(profile, "copying", 35)
-            candidate_home = profile_root / f".upload-candidate-{uuid.uuid4().hex}"
-            candidate_storage = candidate_home / ".tdl"
-            candidate_home.mkdir(mode=0o700)
+            operation_id = uuid.uuid4().hex
+            candidate_storage = database_paths.tdl_staging(profile, "upload", operation_id)
+            candidate_home = candidate_storage.parent
+            ensure_private_directory(candidate_home)
             self._copy_session_tree(source_storage, candidate_storage)
             self._set_private_tree(candidate_home)
 
@@ -226,14 +230,14 @@ class UploadLanePreparer:
                 candidate_home,
                 "PROFILE_UPLOAD_SESSION_INVALID",
             )
-            write_json_atomic_private(candidate_home / _MARKER_NAME, {
-                "format": _FORMAT_VERSION,
-                "source_fingerprint": fingerprint,
-            })
-            self._set_private_tree(candidate_home)
-
             self._set_progress(profile, "installing", 90)
-            self._install_candidate(profile_root, candidate_home, upload_home)
+            self._install_candidate(
+                candidate_storage,
+                upload_home,
+                upload_storage,
+                fingerprint,
+            )
+            self._remove_tree(candidate_home)
             candidate_home = None
             terminal_result = ("ready", "ready", 100, "OK")
         except _PreparationFailure as exc:
@@ -427,42 +431,71 @@ class UploadLanePreparer:
         except (OSError, UnicodeError, json.JSONDecodeError):
             return ""
 
-    def _install_candidate(self, profile_root: Path, candidate: Path, upload_home: Path) -> None:
+    def _install_candidate(
+        self,
+        candidate: Path,
+        upload_home: Path,
+        upload_storage: Path,
+        fingerprint: str,
+    ) -> None:
         if upload_home.is_symlink() or (upload_home.exists() and not upload_home.is_dir()):
             raise _PreparationFailure("PROFILE_UPLOAD_LANE_UNSAFE")
-        backup = profile_root / f".upload-backup-{uuid.uuid4().hex}"
-        had_old = upload_home.exists()
+        if upload_storage.is_symlink() or (upload_storage.exists() and not upload_storage.is_dir()):
+            raise _PreparationFailure("PROFILE_UPLOAD_LANE_UNSAFE")
+        upload_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        backup = upload_storage.parent / f".upload-backup-{uuid.uuid4().hex}"
+        had_old = upload_storage.exists()
         try:
             if had_old:
-                os.replace(upload_home, backup)
+                os.replace(upload_storage, backup)
             try:
-                os.replace(candidate, upload_home)
+                os.replace(candidate, upload_storage)
             except OSError:
-                if had_old and backup.exists() and not upload_home.exists():
-                    os.replace(backup, upload_home)
+                if had_old and backup.exists() and not upload_storage.exists():
+                    os.replace(backup, upload_storage)
                 raise
         except _PreparationFailure:
             raise
         except OSError:
             raise _PreparationFailure("PROFILE_UPLOAD_PREPARATION_FAILED") from None
+        try:
+            write_json_atomic_private(upload_home / _MARKER_NAME, {
+                "format": _FORMAT_VERSION,
+                "source_fingerprint": fingerprint,
+            })
+            self._set_private_tree(upload_home)
+        except OSError:
+            if upload_storage.exists():
+                self._remove_tree(upload_storage)
+            if had_old and backup.exists():
+                os.replace(backup, upload_storage)
+            raise _PreparationFailure("PROFILE_UPLOAD_PREPARATION_FAILED") from None
         if had_old:
             self._remove_tree(backup)
 
-    def _recover_interrupted_install(self, profile_root: Path, upload_home: Path) -> None:
-        backups = sorted(profile_root.glob(".upload-backup-*"), key=lambda path: path.name)
+    def _recover_interrupted_install(
+        self, profile_root: Path, upload_home: Path, upload_storage: Path
+    ) -> None:
+        backups = sorted(upload_storage.parent.glob(".upload-backup-*"), key=lambda path: path.name)
+        database_root = upload_storage.parents[3]
+        profile_name = upload_storage.parents[1].name
+        staging_root = database_root / "tdl-staging" / profile_name / "upload"
         candidates = list(profile_root.glob(".upload-candidate-*"))
-        if upload_home.is_symlink():
+        if upload_home.is_symlink() or upload_storage.is_symlink():
             raise _PreparationFailure("PROFILE_UPLOAD_LANE_UNSAFE")
-        if not upload_home.exists():
+        if not upload_storage.exists():
             valid_backups = [path for path in backups if path.is_dir() and not path.is_symlink()]
             if valid_backups:
                 try:
-                    os.replace(valid_backups[-1], upload_home)
+                    os.replace(valid_backups[-1], upload_storage)
                 except OSError:
                     raise _PreparationFailure("PROFILE_UPLOAD_PREPARATION_FAILED") from None
                 backups.remove(valid_backups[-1])
         for path in [*backups, *candidates]:
             self._remove_tree(path)
+        if staging_root.exists():
+            for path in staging_root.iterdir():
+                self._remove_tree(path)
 
     @staticmethod
     def _remove_tree(path: Path) -> None:

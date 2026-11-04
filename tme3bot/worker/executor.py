@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from tme3bot.backup_service import BackupService, sha256_file
 from tme3bot.command_audit import bounded_output_tail, sanitize_command, sanitize_text
 from tme3bot.domain.models import DomainError, utc_now
+from tme3bot.database_paths import DatabasePaths, ensure_private_directory
 from tme3bot.export_catalog import discard_export_without_media, inspect_export_json
 from tme3bot.infrastructure.http_client import JsonHttpError, request_json
 from tme3bot.profile_queue import ResourceAwareQueue
@@ -213,11 +214,13 @@ class WorkerJobExecutor(
         self._quick_log_locks: dict[str, threading.RLock] = {}
         self._quick_log_named_progress: dict[str, bool] = {}
         self._quick_log_state_lock = threading.RLock()
+        database_paths = DatabasePaths(getattr(config, "database_root", "/database"))
+        ensure_private_directory(database_paths.root)
         self.command_store = WorkerCommandStore(
-            config.state_file.parent / "worker-command-journal.sqlite3"
+            database_paths.sqlite("worker-command-journal.sqlite3")
         )
         self.public_download_links = PublicDownloadLinks(
-            config.state_file.parent / "public-download-links.sqlite3",
+            database_paths.sqlite("public-download-links.sqlite3"),
             Path(getattr(config, "utility_workspace_root", "/workspace")),
         )
 

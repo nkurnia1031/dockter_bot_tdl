@@ -10,11 +10,18 @@ services:
     env_file:
       - ${WORKER_ENV_FILE:-.env.worker}
     restart: unless-stopped
+    environment:
+      DATABASE_ROOT: /database
+      TTS_DATA_ROOT: /data/tts
+      STORAGE_DB_FILE: /database/storage.db
+      TDL_EXPORT_STORAGE: ""
+      TDL_DOWNLOAD_STORAGE: ""
     ports:
       # Do not expose the worker API publicly; the reverse proxy owns the domain/TLS.
       - "127.0.0.1:${WORKER_PORT:-8080}:${WORKER_PORT:-8080}"
     volumes:
       - ${PROFILE_ROOT}:/data
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/worker}:/database
       - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}
 
   tts-1:

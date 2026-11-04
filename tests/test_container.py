@@ -131,11 +131,14 @@ class ContainerBuildTests(unittest.TestCase):
             payload = yaml.safe_load((PROJECT_ROOT / filename).read_text(encoding="utf-8"))
             services = payload["services"]
             redis = services["redis"]
+            self.assertEqual(redis["user"], "${REDIS_UID:-999}:${REDIS_GID:-1000}")
             runner = services["backend-queue"]
             self.assertNotIn("ports", redis)
             self.assertNotIn("ports", runner)
             self.assertNotIn("volumes", runner)
-            self.assertEqual(redis["volumes"], ["queue-redis-data:/data"])
+            self.assertEqual(len(redis["volumes"]), 1)
+            self.assertIn("/redis:/data", redis["volumes"][0])
+            self.assertNotIn("queue-redis-data", str(payload.get("volumes", {})))
             self.assertIn("--appendonly", redis["command"])
             self.assertIn("--appendfsync", redis["command"])
             self.assertIn("everysec", redis["command"])
@@ -154,10 +157,26 @@ class ContainerBuildTests(unittest.TestCase):
             self.assertIn("queue-private", backend["networks"])
             self.assertEqual(backend["environment"]["DURABLE_DISPATCH_ENABLED"], "true")
             self.assertEqual(backend["environment"]["REDIS_URL"], "redis://redis:6379/0")
+            self.assertIn("/database", "\n".join(backend["volumes"]))
+            self.assertEqual(backend["environment"]["DATABASE_ROOT"], "/database/gateway")
+            self.assertEqual(backend["environment"]["STORAGE_DB_FILE"], "/database/gateway/storage.db")
+            self.assertEqual(backend["environment"]["TDL_EXPORT_STORAGE"], "")
+            self.assertEqual(backend["environment"]["TDL_DOWNLOAD_STORAGE"], "")
+            local_worker = services["worker-local"]
+            self.assertIn("/database", "\n".join(local_worker["volumes"]))
+            self.assertEqual(local_worker["environment"]["DATABASE_ROOT"], "/database/worker-local")
+            self.assertEqual(local_worker["environment"]["STORAGE_DB_FILE"], "/database/worker-local/storage.db")
+            self.assertEqual(local_worker["environment"]["TDL_EXPORT_STORAGE"], "")
+            self.assertEqual(local_worker["environment"]["TDL_DOWNLOAD_STORAGE"], "")
 
         remote = yaml.safe_load((PROJECT_ROOT / "docker-compose.worker.yml").read_text(encoding="utf-8"))
         self.assertNotIn("redis", remote["services"])
         self.assertNotIn("backend-queue", remote["services"])
+        self.assertIn("/database", "\n".join(remote["services"]["worker"]["volumes"]))
+        self.assertEqual(remote["services"]["worker"]["environment"]["DATABASE_ROOT"], "/database")
+        self.assertEqual(remote["services"]["worker"]["environment"]["STORAGE_DB_FILE"], "/database/storage.db")
+        self.assertEqual(remote["services"]["worker"]["environment"]["TDL_EXPORT_STORAGE"], "")
+        self.assertEqual(remote["services"]["worker"]["environment"]["TDL_DOWNLOAD_STORAGE"], "")
 
     def test_application_image_installs_pinned_queue_dependencies(self) -> None:
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")

@@ -42,6 +42,7 @@ from tme3bot.worker.quick_export import (
     QuickModeError,
     QuickThumbnailBuilder,
     delete_quick_stage,
+    cleanup_quick_tdl_sessions,
     ensure_quick_stage_writable,
     ensure_quick_tdl_client,
     migrate_legacy_quick_stage,
@@ -199,6 +200,12 @@ class QuickModeExecutorMixin:
             log_path = self._quick_log_paths.pop(job_id, None)
         try:
             try:
+                manifest = read_quick_manifest(stage_root)
+                cleanup_quick_tdl_sessions(
+                    Path(getattr(self.config, "database_root", "/database")),
+                    str(Path(stage_root).name),
+                    str(manifest.get("profile") or "") or None,
+                )
                 shutil.rmtree(stage_root)
             except OSError:
                 # Retain the stage and its diagnostics if deletion fails.
@@ -293,6 +300,8 @@ class QuickModeExecutorMixin:
             return getattr(runtime, f"{mode}_tdl_client")
         return ensure_quick_tdl_client(
             stage_root,
+            database_root=Path(getattr(config, "database_root", "/database")),
+            profile=str(getattr(runtime, "name", "default")),
             mode=mode,
             source_storage=Path(source_storage),
             namespace=str(getattr(config, f"tdl_{mode}_namespace", "default")),
@@ -1550,6 +1559,11 @@ class QuickModeExecutorMixin:
             drive_expected = len(archive_files)
             if channel_found == channel_expected and drive_found == drive_expected and not channel_reason and not drive_reason:
                 try:
+                    cleanup_quick_tdl_sessions(
+                        Path(getattr(self.config, "database_root", "/database")),
+                        str(stage_job_id),
+                        str(manifest.get("profile") or "") or None,
+                    )
                     shutil.rmtree(stage_root)
                 except OSError as exc:
                     verification = {
@@ -1638,6 +1652,12 @@ class QuickModeExecutorMixin:
 
         try:
             try:
+                manifest = read_quick_manifest(quick_stage_root(workspace, stage_job_id))
+                cleanup_quick_tdl_sessions(
+                    Path(getattr(self.config, "database_root", "/database")),
+                    stage_job_id,
+                    str(manifest.get("profile") or "") or None,
+                )
                 deleted = delete_quick_stage(workspace, stage_job_id)
             except QuickModeError as exc:
                 raise DomainError(

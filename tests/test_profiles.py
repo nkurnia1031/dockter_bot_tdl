@@ -40,10 +40,11 @@ class ProfileTests(unittest.TestCase):
             export_failed_dir=root / "exports" / "failed",
             state_file=root / "state.json",
             legacy_max_json=root / "max.json",
+            database_root=root / "database",
             tdl_export_home=root / "user1",
             tdl_download_home=root / "root",
-            tdl_export_storage=root / "user1" / ".tdl",
-            tdl_download_storage=root / "root" / ".tdl",
+            tdl_export_storage=root / "database/tdl/default/export/.tdl",
+            tdl_download_storage=root / "database/tdl/default/download/.tdl",
             tdl_export_namespace="default",
             tdl_download_namespace="default",
             tdl_export_stall_timeout_seconds=300,
@@ -91,6 +92,54 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(config.tdl_export_home, Path("/data/user1"))
         self.assertEqual(config.tdl_download_home, Path("/data/root"))
 
+    def test_database_paths_default_under_database_root_and_tts_artifacts_stay_in_data(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_ROLE": "worker"}, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            config = AppConfig.from_env()
+
+        self.assertEqual(config.storage_db_file, Path("/database/gateway/storage.db"))
+        self.assertEqual(config.tts_data_root, Path("/data/tts"))
+        self.assertEqual(config.tdl_export_storage, Path("/database/tdl/default/export/.tdl"))
+
+    def test_tts_artifacts_can_use_data_root_while_databases_use_database_root(self) -> None:
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "APP_ROLE": "worker",
+                    "DATABASE_ROOT": "/database",
+                    "TTS_DATA_ROOT": "/data/tts",
+                },
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            config = AppConfig.from_env()
+
+        self.assertEqual(config.tts_data_root, Path("/data/tts"))
+        self.assertEqual(config.storage_db_file, Path("/database/gateway/storage.db"))
+        self.assertEqual(config.tdl_export_storage, Path("/database/tdl/default/export/.tdl"))
+
+    def test_database_backed_config_paths_reject_data_and_workspace_roots(self) -> None:
+        for key, value in (
+            ("STORAGE_DB_FILE", "/data/storage.db"),
+            ("STORAGE_DB_FILE", "/workspace/storage.db"),
+            ("TDL_EXPORT_STORAGE", "/data/user1/.tdl"),
+        ):
+            with self.subTest(key=key, value=value):
+                with (
+                    patch.dict(
+                        os.environ,
+                        {"APP_ROLE": "worker", "DATABASE_ROOT": "/database", key: value},
+                        clear=True,
+                    ),
+                    patch("tme3bot.config.load_dotenv"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "DATABASE_ROOT"):
+                        AppConfig.from_env()
+
     def test_default_profile_keeps_legacy_single_profile_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -100,7 +149,10 @@ class ProfileTests(unittest.TestCase):
 
             self.assertEqual(profile_config.download_root, root / "download")
             self.assertEqual(profile_config.state_file, root / "state.json")
-            self.assertEqual(profile_config.tdl_export_storage, root / "user1" / ".tdl")
+        self.assertEqual(
+            profile_config.tdl_export_storage,
+            root / "database/tdl/default/export/.tdl",
+        )
 
     def test_named_profile_uses_shared_default_download_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -118,11 +170,11 @@ class ProfileTests(unittest.TestCase):
             )
             self.assertEqual(
                 profile_config.tdl_download_storage,
-                root / "profiles" / "bot-01" / "root" / ".tdl",
+                root / "database" / "tdl" / "bot-01" / "download" / ".tdl",
             )
             self.assertEqual(
                 profile_config.tdl_export_storage,
-                root / "profiles" / "bot-01" / "user1" / ".tdl",
+                root / "database" / "tdl" / "bot-01" / "export" / ".tdl",
             )
 
     def test_named_profile_can_use_isolated_download_root(self) -> None:
@@ -296,11 +348,11 @@ class ProfileTests(unittest.TestCase):
             self.assertNotIn("runuser", download_command)
             self.assertEqual(
                 export_command[export_command.index("--storage") + 1],
-                f"type=bolt,path={root / 'user1' / '.tdl' / 'data'}",
+                f"type=bolt,path={root / 'database/tdl/default/export/.tdl/data'}",
             )
             self.assertEqual(
                 download_command[download_command.index("--storage") + 1],
-                f"type=bolt,path={root / 'root' / '.tdl' / 'data'}",
+                f"type=bolt,path={root / 'database/tdl/default/download/.tdl/data'}",
             )
             self.assertEqual(export_env["HOME"], str(root / "user1"))
             self.assertEqual(download_env["HOME"], str(root / "root"))
@@ -310,20 +362,22 @@ class ProfileTests(unittest.TestCase):
             root = Path(temp_dir)
             config = replace(self.make_config(root), app_role="worker")
             manager = ProfileManager(config)
-            export_db = root / "user1" / ".tdl" / "data" / "default"
+            export_db = root / "database/tdl/default/export/.tdl/data/default"
             export_db.parent.mkdir(parents=True)
             export_db.write_bytes(b"export bolt")
-            ready_db = root / "upload" / ".tdl" / "data" / "default"
+            ready_db = root / "database/tdl/default/upload/.tdl/data/default"
             ready_db.parent.mkdir(parents=True)
             ready_db.write_bytes(b"bolt")
             archive_db = (
-                root / "profiles" / "archive" / "upload" / ".tdl" / "data" / "default"
+                root / "database/tdl/archive/upload/.tdl/data/default"
             )
             archive_db.parent.mkdir(parents=True)
             archive_db.write_bytes(b"archive bolt")
-            empty_db = root / "profiles" / "empty" / "upload" / ".tdl" / "data"
+            (root / "profiles/archive").mkdir(parents=True)
+            empty_db = root / "database/tdl/empty/upload/.tdl/data"
             empty_db.mkdir(parents=True)
             (empty_db / "default").write_bytes(b"")
+            (root / "profiles/empty").mkdir(parents=True)
 
             ready = manager.tdl_session_diagnostic("default", "storage")
             missing = manager.tdl_session_diagnostic("missing", "storage")
@@ -355,7 +409,10 @@ class ProfileTests(unittest.TestCase):
                 upload_operation_lock=upload_lock,
             )
 
-            self.assertEqual(runtime.upload_tdl_client.storage_root, root / "upload" / ".tdl")
+            self.assertEqual(
+                runtime.upload_tdl_client.storage_root,
+                root / "database/tdl/default/upload/.tdl",
+            )
             self.assertEqual(runtime.upload_tdl_client.home, root / "upload")
             self.assertIs(runtime.upload_operation_lock, upload_lock)
             self.assertIsNot(runtime.upload_tdl_client, runtime.export_tdl_client)

@@ -592,20 +592,76 @@ class TDLClientTests(unittest.TestCase):
 
             client = ensure_quick_tdl_client(
                 stage,
+                database_root=root / "database",
+                profile="default",
                 mode="export",
                 source_storage=source_storage,
                 namespace="default",
             )
 
-            self.assertEqual(client.home, stage / ".tdl" / "export-home")
+            expected_storage = (
+                root / "database" / "tdl-staging" / "default"
+                / "quickmode-export" / "job" / ".tdl"
+            )
+            self.assertEqual(client.home, expected_storage.parent / "home")
             self.assertEqual(
                 client.storage_root,
-                stage / ".tdl" / "export-home" / ".tdl",
+                expected_storage,
             )
             self.assertNotEqual(client.storage_root, source_storage)
+            self.assertFalse((stage / ".tdl").exists())
             self.assertEqual(client._base_command()[0], "tdl")
             self.assertEqual(client._command_env()["HOME"], str(client.home))
             self.assertNotIn("run_as_user", vars(client))
+
+    def test_quick_mode_migrates_legacy_stage_tdl_store_to_database_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stage = root / "workspace" / "quickmode" / "job"
+            legacy_home = stage / ".tdl" / "export-home"
+            legacy_database = legacy_home / ".tdl" / "data" / "default"
+            legacy_database.parent.mkdir(parents=True)
+            legacy_database.write_bytes(b"resumable-session")
+            legacy_config = legacy_home / ".config" / "tdl" / "config.toml"
+            legacy_config.parent.mkdir(parents=True)
+            legacy_config.write_text("namespace = 'default'", encoding="utf-8")
+
+            client = ensure_quick_tdl_client(
+                stage,
+                database_root=root / "database",
+                profile="irang",
+                mode="export",
+                source_storage=root / "unused-source",
+                namespace="default",
+            )
+
+            self.assertEqual(
+                (client.storage_root / "data" / "default").read_bytes(),
+                b"resumable-session",
+            )
+            self.assertEqual(
+                (client.home / ".config" / "tdl" / "config.toml").read_text(
+                    encoding="utf-8"
+                ),
+                "namespace = 'default'",
+            )
+            self.assertTrue(legacy_database.is_file())
+
+    def test_quick_mode_tdl_database_cleanup_uses_only_stage_id_under_database_root(self):
+        from tme3bot.worker.quick_export import cleanup_quick_tdl_sessions
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            stage_db = (
+                root / "database" / "tdl-staging" / "default"
+                / "quickmode-export" / "job" / ".tdl" / "data" / "default"
+            )
+            stage_db.parent.mkdir(parents=True)
+            stage_db.write_bytes(b"quickmode-copy")
+
+            cleanup_quick_tdl_sessions(root / "database", "job", "default")
+
+            self.assertFalse(stage_db.exists())
 
     def test_parses_tdl_progress_line(self) -> None:
         progress = parse_tdl_progress_line("3/12 sample.mp4 45.5% 1.2MiB/s", "stdout")

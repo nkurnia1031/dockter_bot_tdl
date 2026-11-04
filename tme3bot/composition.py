@@ -15,6 +15,7 @@ from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
+from tme3bot.database_paths import ensure_private_directory
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
 from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistoryStore
@@ -69,6 +70,8 @@ class ControlPlaneBackupRouter:
 def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupScheduler]:
     from telegram import Bot
 
+    ensure_private_directory(config.database_root)
+    ensure_private_directory(config.storage_db_file.parent)
     runtime_settings = BackendRuntimeSettings(
         config.state_file.parent / "app_runtime_settings.json",
         {

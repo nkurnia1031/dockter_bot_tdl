@@ -27,6 +27,7 @@ from tme3bot.tdl import (
     pause_process_group,
     resume_process_group,
 )
+from tme3bot.database_paths import DatabasePaths, ensure_private_directory
 from tme3bot.url_parser import slugify_label
 
 
@@ -353,14 +354,45 @@ def scan_quick_stages(workspace: Path, *, worker: str | None = None) -> list[dic
 def _clone_tree(source: Path, destination: Path) -> None:
     source = Path(source)
     destination = Path(destination)
+    if source.is_symlink():
+        raise QuickModeError("TDL session source must not be a symlink.")
+    if source.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        return
     destination.mkdir(parents=True, exist_ok=True)
     if source != Path(".") and source.is_dir():
-        shutil.copytree(source, destination, dirs_exist_ok=True)
+        for path in source.rglob("*"):
+            if path.is_symlink():
+                raise QuickModeError("TDL session source contains a symlink.")
+            target = destination / path.relative_to(source)
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif path.is_file():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+
+
+def _copy_legacy_tdl_home(source: Path, destination: Path) -> None:
+    if source.is_symlink():
+        raise QuickModeError("TDL session home must not be a symlink.")
+    destination.mkdir(parents=True, exist_ok=True)
+    if not source.is_dir():
+        return
+    for path in source.iterdir():
+        if path.name == ".tdl":
+            continue
+        if path.is_symlink():
+            raise QuickModeError("TDL session home contains a symlink.")
+        target = destination / path.name
+        _clone_tree(path, target)
 
 
 def ensure_quick_tdl_client(
     stage_root: Path,
     *,
+    database_root: Path,
+    profile: str,
     mode: str,
     source_storage: Path | None,
     namespace: str,
@@ -371,11 +403,20 @@ def ensure_quick_tdl_client(
     """Create/reuse the isolated export or download TDL session for a stage."""
     if mode not in {"export", "download"}:
         raise QuickModeError("Mode TDL Quick Mode tidak valid.")
-    mode_root = Path(stage_root) / ".tdl" / f"{mode}-home"
-    storage_root = mode_root / ".tdl"
+    stage_id = Path(stage_root).name
+    storage_root = DatabasePaths(database_root).tdl_staging(
+        profile, f"quickmode-{mode}", stage_id
+    )
+    mode_root = storage_root.parent / "home"
+    ensure_private_directory(mode_root)
     if not storage_root.exists() or not any(storage_root.iterdir()):
-        _clone_tree(Path(source_storage) if source_storage else Path(), storage_root)
-    mode_root.mkdir(parents=True, exist_ok=True)
+        legacy_home = Path(stage_root) / ".tdl" / f"{mode}-home"
+        legacy_storage = legacy_home / ".tdl"
+        if legacy_storage.is_dir():
+            _clone_tree(legacy_storage, storage_root)
+            _copy_legacy_tdl_home(legacy_home, mode_root)
+        else:
+            _clone_tree(Path(source_storage) if source_storage else Path(), storage_root)
     return TDLClient(
         storage_root=storage_root,
         namespace=namespace,
@@ -385,6 +426,50 @@ def ensure_quick_tdl_client(
         progress_callback=progress_callback,
         output_callback=output_callback,
     )
+
+
+def cleanup_quick_tdl_sessions(
+    database_root: Path, stage_id: str, profile: str | None = None
+) -> None:
+    """Remove isolated TDL Bolt clones for a completed/deleted Quick Mode stage."""
+    paths = DatabasePaths(database_root)
+    paths.tdl_staging(profile or "default", "quickmode-export", stage_id)
+    root = paths.root.resolve(strict=False)
+    staging_root = paths.root / "tdl-staging"
+    if staging_root.is_symlink():
+        raise QuickModeError("Root database staging Quick Mode tidak aman.")
+    if profile:
+        candidates = [
+            paths.tdl_staging(profile, f"quickmode-{mode}", stage_id).parent
+            for mode in ("export", "download")
+        ]
+    elif staging_root.is_dir():
+        candidates = [
+            profile_root / f"quickmode-{mode}" / stage_id
+            for profile_root in staging_root.iterdir()
+            if profile_root.is_dir() and not profile_root.is_symlink()
+            for mode in ("export", "download")
+        ]
+    else:
+        candidates = []
+    for candidate in candidates:
+        if candidate.is_symlink():
+            raise QuickModeError("Folder database staging Quick Mode tidak aman.")
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise QuickModeError("Folder database staging Quick Mode keluar dari root.") from exc
+        if candidate.exists():
+            for item in candidate.rglob("*"):
+                if item.is_symlink():
+                    raise QuickModeError("Folder database staging Quick Mode berisi symlink.")
+            shutil.rmtree(candidate)
+        for parent in (candidate.parent, candidate.parent.parent):
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
 
 
 def ensure_quick_stage_writable(stage_root: Path) -> None:

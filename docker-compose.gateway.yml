@@ -13,13 +13,16 @@ services:
       DURABLE_DISPATCH_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
       SAFELINK_RESOLVER_ENABLED: "false"
-      STORAGE_DB_FILE: /gateway-db/storage.db
+      DATABASE_ROOT: /database/gateway
+      STORAGE_DB_FILE: /database/gateway/storage.db
+      TDL_EXPORT_STORAGE: ""
+      TDL_DOWNLOAD_STORAGE: ""
     restart: unless-stopped
     ports:
       - "${BACKEND_BIND_HOST:-0.0.0.0}:${BACKEND_HOST_PORT:-${BACKEND_PORT:-8080}}:${BACKEND_PORT:-8080}"
     volumes:
       - ${GATEWAY_DATA_ROOT:-/srv/tme3bot/gateway}:/data
-      - ${GATEWAY_DB_ROOT:-/srv/tme3bot/gateway-db}:/gateway-db
+      - ${DATABASE_ROOT:-${GATEWAY_DB_ROOT:-/srv/tme3bot/db/gateway}}:/database
       - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${BACKEND_PORT:-8080}/healthz"]
@@ -32,10 +35,11 @@ services:
 
   redis:
     image: redis:7.4-alpine
+    user: "${REDIS_UID:-999}:${REDIS_GID:-1000}"
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
     volumes:
-      - queue-redis-data:/data
+      - ${DATABASE_ROOT:-${GATEWAY_DB_ROOT:-/srv/tme3bot/db/gateway}}/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -93,7 +97,14 @@ services:
         condition: service_healthy
     volumes:
       - ${LOCAL_WORKER_DATA_ROOT:-/srv/tme3bot/worker-local}:/data
+      - ${DATABASE_ROOT:-${GATEWAY_DB_ROOT:-/srv/tme3bot/db/gateway}}:/database
       - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}
+    environment:
+      DATABASE_ROOT: /database/worker-local
+      TTS_DATA_ROOT: /data/tts
+      STORAGE_DB_FILE: /database/worker-local/storage.db
+      TDL_EXPORT_STORAGE: ""
+      TDL_DOWNLOAD_STORAGE: ""
 
   tts-1:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
@@ -151,9 +162,6 @@ services:
       timeout: 5s
       retries: 12
       start_period: 90s
-
-volumes:
-  queue-redis-data:
 
 networks:
   queue-private:

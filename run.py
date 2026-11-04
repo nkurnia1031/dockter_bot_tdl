@@ -22,6 +22,8 @@ except ModuleNotFoundError:  # First-run bootstrap before Python dependencies ex
     request_json = None  # type: ignore[assignment]
     normalize_profile_name = None  # type: ignore[assignment]
 
+from tme3bot.database_paths import DatabasePaths, filesystem_identity, validate_database_root
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_DIR / ".env"
@@ -85,6 +87,7 @@ def main() -> int:
             return int(preflight.get("exit_code", 0))
         if action in {"up", "start"}:
             ensure_profile_root(env)
+            ensure_database_root(env)
             ensure_base_image_available(env)
             prepare_tdl_build_asset(env)
             run_compose(["up", "-d", "--build"], env)
@@ -110,6 +113,7 @@ def main() -> int:
             return 0
         if action == "update":
             ensure_profile_root(env)
+            ensure_database_root(env)
             ensure_base_image_available(env)
             prepare_tdl_build_asset(env)
             run_compose(["build"], env)
@@ -541,6 +545,7 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
     print_preflight_report(report)
     if int(report.get("exit_code", 0)) != 0:
         raise RuntimeError("Preflight gagal; selesaikan masalah di atas sebelum deploy.")
+    ensure_database_root(target_env, role=target)
     image_status = report.get("images") or {}
     if target == "gateway":
         required_names = [
@@ -773,6 +778,95 @@ def ensure_profile_root(env: dict[str, str]) -> Path:
     return root
 
 
+def database_root_role(env: dict[str, str], role: str | None = None) -> str:
+    if role in {"gateway", "worker"}:
+        return role
+    compose_names = {
+        Path(path.replace("\\", "/")).name.lower()
+        for path in (env.get("COMPOSE_FILE") or "").split(os.pathsep)
+        if path.strip()
+    }
+    if "docker-compose.worker.yml" in compose_names or (
+        env.get("PROFILE_ROOT", "").strip()
+        and not env.get("GATEWAY_DATA_ROOT", "").strip()
+        and not env.get("LOCAL_WORKER_DATA_ROOT", "").strip()
+    ):
+        return "worker"
+    return "gateway"
+
+
+def database_root_value(env: dict[str, str], role: str | None = None) -> str:
+    configured = env.get("DATABASE_ROOT", "").strip()
+    if not configured:
+        # Preserve the existing gateway database location during the first
+        # deploy after this setting is introduced. The explicit migration
+        # ticket moves data only after writers have been drained.
+        configured = env.get("GATEWAY_DB_ROOT", "").strip()
+    if configured:
+        return configured
+    instance = "gateway" if database_root_role(env, role) == "gateway" else "worker"
+    return f"/srv/tme3bot/db/{instance}"
+
+
+def database_root_container_value(env: dict[str, str]) -> str:
+    """Return the path visible to the selected worker container."""
+    return "/database/worker-local" if worker_service(env) == "worker-local" else "/database"
+
+
+def ensure_database_root(env: dict[str, str], *, role: str | None = None) -> Path:
+    """Validate and prepare the host database bind root before Compose starts."""
+
+    configured = database_root_value(env, role)
+    data_paths = [
+        Path(value).expanduser()
+        for key in ("PROFILE_ROOT", "GATEWAY_DATA_ROOT", "LOCAL_WORKER_DATA_ROOT")
+        if (value := env.get(key, "").strip())
+    ]
+    workspace = env.get("UTILITY_WORKSPACE_HOST", "/www/wwwroot/downloads").strip()
+    workspace_paths = [Path(workspace).expanduser()] if workspace else []
+    try:
+        validation = validate_database_root(
+            configured,
+            data_paths=data_paths,
+            workspace_paths=workspace_paths,
+            filesystem_identity=filesystem_identity,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    try:
+        validation.path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            validation.path.chmod(0o700)
+        if database_root_role(env, role) == "gateway":
+            redis_data = validation.path / "redis"
+            redis_data.mkdir(mode=0o700, exist_ok=True)
+            if os.name == "posix":
+                redis_data.chmod(0o700)
+                redis_uid = int(env.get("REDIS_UID", "999"))
+                redis_gid = int(env.get("REDIS_GID", "1000"))
+                os.chown(redis_data, redis_uid, redis_gid)
+    except OSError as exc:
+        raise RuntimeError(f"Tidak dapat menyiapkan DATABASE_ROOT: {exc}") from exc
+
+    # Recheck after creation so a mount or symlink change cannot redirect the
+    # newly-created path between preflight and Compose interpolation.
+    try:
+        validation = validate_database_root(
+            validation.path,
+            data_paths=data_paths,
+            workspace_paths=workspace_paths,
+            filesystem_identity=filesystem_identity,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+    env["DATABASE_ROOT"] = str(validation.path)
+    print(f"Database root: {validation.path}")
+    for warning in validation.warnings:
+        print(f"Database root warning: {warning}")
+    return validation.path
+
+
 def ensure_host_subdirs(profile_root: Path, env: dict[str, str]) -> None:
     for key, default in {
         "DOWNLOAD_ROOT": "/data/download",
@@ -807,7 +901,8 @@ def write_profile_identity(env: dict[str, str], profile_name: str | None) -> Non
         profile_root = "/data"
     else:
         profile_root = f"{profiles_root}/{normalized}"
-    storage = f"{profile_root}/user1/.tdl/data"
+    database_root = database_root_container_value(env)
+    storage = str(DatabasePaths(database_root).tdl(normalized, "export") / "data")
     identity_file = f"{profile_root}/identity.json"
     namespace = env.get("TDL_EXPORT_NAMESPACE", "default").strip() or "default"
     command = [
@@ -857,7 +952,12 @@ def compose_base_command(dotenv: dict[str, str] | None = None) -> list[str]:
     return command
 
 
-def compose_files_for_target(target: str, env: dict[str, str] | None = None) -> str:
+def compose_files_for_target(
+    target: str,
+    env: dict[str, str] | None = None,
+    *,
+    include_overrides: bool = True,
+) -> str:
     files = {
         "gateway": ["docker-compose.gateway.yml"],
         "worker": ["docker-compose.worker.yml"],
@@ -866,6 +966,17 @@ def compose_files_for_target(target: str, env: dict[str, str] | None = None) -> 
         selected = list(files[target])
     except KeyError as exc:
         raise RuntimeError("Target deploy harus gateway atau worker.") from exc
+    if include_overrides and env is not None:
+        primary_names = {"docker-compose.gateway.yml", "docker-compose.worker.yml"}
+        for path in (env.get("COMPOSE_FILE") or "").split(os.pathsep):
+            candidate = path.strip()
+            if not candidate:
+                continue
+            name = Path(candidate.replace("\\", "/")).name.lower()
+            if name in primary_names or name.startswith("docker-compose.resolver"):
+                continue
+            if candidate not in selected:
+                selected.append(candidate)
     return os.pathsep.join(selected)
 
 
@@ -1024,6 +1135,8 @@ def deploy_application(
         deploy_env["COMPOSE_FILE"] = compose_files_for_target(target, deploy_env)
 
     ensure_profile_root(deploy_env)
+    if start_services:
+        ensure_database_root(deploy_env, role=target or None)
     if pull_only:
         print("Deploy target: pull image registry, tanpa docker build.", flush=True)
         run_compose(["pull"], deploy_env)
@@ -1226,7 +1339,9 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
         login_registry(publish_env)
     for item in targets:
         target_env = dict(publish_env)
-        target_env["COMPOSE_FILE"] = compose_files_for_target(item, target_env)
+        target_env["COMPOSE_FILE"] = compose_files_for_target(
+            item, target_env, include_overrides=False
+        )
         deploy_application(target_env, [item], start_services=False)
         run_compose(["push"], target_env)
         print(f"Image {item} berhasil dipublish dengan tag {target_env['IMAGE_TAG']}.")
@@ -1327,7 +1442,9 @@ def migrate_images(env: dict[str, str]) -> Path:
     ):
         build_env = dict(env)
         build_env.update(example_overrides)
-        build_env["COMPOSE_FILE"] = compose_files_for_target(target, build_env)
+        build_env["COMPOSE_FILE"] = compose_files_for_target(
+            target, build_env, include_overrides=False
+        )
         run_compose(["build"], build_env)
         output = capture_compose(["config", "--images"], build_env)
         resolved = [line.strip() for line in output.splitlines() if line.strip()]
@@ -1529,8 +1646,13 @@ def add_profile(env: dict[str, str], profile_name: str | None) -> None:
     print(f"Profile siap: {profile}")
     if profile_root is not None:
         print(f"Host folder: {profile_root}")
-        print(f"Copy .tdl download ke: {profile_root / 'root' / '.tdl'}")
-        print(f"Copy .tdl export ke: {profile_root / 'user1' / '.tdl'}")
+        database_root = Path(database_root_container_value(env))
+        print(f"Database TDL download: {DatabasePaths(database_root).tdl(profile, 'download')}")
+        print(f"Database TDL export: {DatabasePaths(database_root).tdl(profile, 'export')}")
+        host_root = Path(database_root_value(env)).expanduser()
+        if database_root == Path("/database/worker-local"):
+            host_root = host_root / "worker-local"
+        print(f"Host database folder: {host_root / 'tdl' / profile}")
     print(f"Di bot Telegram, pilih dengan: /profile {profile}")
 
 
@@ -1540,15 +1662,13 @@ def ensure_container_profile_dirs(env: dict[str, str], profile: str) -> None:
     )
     if profile == default_profile:
         command = (
-            "mkdir -p /data/.config /data/root/.tdl /data/user1/.tdl /data/download /data/download/berlabel /data/download/biasa "
+            "mkdir -p /data/.config /data/download /data/download/berlabel /data/download/biasa "
             "/data/exports/pending /data/exports/processing /data/exports/done "
             "/data/exports/failed /data/tmp"
         )
     else:
         command = (
-            f"mkdir -p /data/profiles/{profile}/root/.tdl "
-            f"/data/profiles/{profile}/user1/.tdl "
-            f"/data/profiles/{profile}/download "
+            f"mkdir -p /data/profiles/{profile}/download "
             f"/data/profiles/{profile}/download/berlabel "
             f"/data/profiles/{profile}/download/biasa "
             f"/data/profiles/{profile}/exports/pending "

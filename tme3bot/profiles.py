@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from tme3bot.config import AppConfig
+from tme3bot.database_paths import DatabasePaths
 from tme3bot.application.ports import ProfileStateStore, SourceRepository
 from tme3bot.names import normalize_profile_name
 from tme3bot.persistence import write_json_atomic
@@ -340,17 +341,7 @@ class ProfileManager:
     def session_config(self, profile_name: str) -> AppConfig:
         """Resolve the actual TDL session paths without loading state or creating files."""
         normalized = normalize_profile_name(profile_name) or self.default_profile
-        profile_config = build_profile_config(self.base_config, normalized)
-        export_storage = self.export_tdl_storage_path(normalized)
-        if Path(profile_config.tdl_export_storage).resolve() != export_storage.resolve():
-            # Older add-profile output could place a default profile under
-            # PROFILES_ROOT. Point TDL operations at that initialized session.
-            profile_config = replace(
-                profile_config,
-                tdl_export_storage=export_storage,
-                tdl_export_home=export_storage.parent,
-            )
-        return profile_config
+        return build_profile_config(self.base_config, normalized)
 
     def cached_runtime(self, profile_name: str) -> ProfileRuntime | None:
         """Return an already initialized runtime without creating profile files."""
@@ -371,11 +362,11 @@ class ProfileManager:
             export_storage = Path(profile_config.tdl_export_storage)
             runtime.config = profile_config
             runtime.export_tdl_client.storage_root = export_storage
-            runtime.export_tdl_client.home = export_storage.parent
+            runtime.export_tdl_client.home = Path(profile_config.tdl_export_home)
             runtime.download_tdl_client.storage_root = Path(profile_config.tdl_download_storage)
             runtime.download_tdl_client.home = Path(profile_config.tdl_download_home)
             runtime.upload_tdl_client.storage_root = self.upload_tdl_storage_path(normalized)
-            runtime.upload_tdl_client.home = runtime.upload_tdl_client.storage_root.parent
+            runtime.upload_tdl_client.home = Path(profile_config.profile_root) / "upload"
 
     def forget_profile_runtime(self, profile_name: str) -> None:
         """Discard cached worker objects after a complete local profile removal."""
@@ -388,32 +379,14 @@ class ProfileManager:
             self._state_store_modes.pop(normalized, None)
 
     def export_tdl_storage_path(self, profile_name: str) -> Path:
-        """Resolve the session path, including a legacy default-profile location."""
+        """Resolve the Export Bolt store below this worker's database mount."""
         normalized = normalize_profile_name(profile_name) or self.default_profile
-        configured = Path(build_profile_config(self.base_config, normalized).tdl_export_storage)
-        if normalized != self.default_profile:
-            return configured
-
-        legacy = (
-            Path(self.base_config.profiles_root)
-            / normalized
-            / "user1"
-            / ".tdl"
-        )
-        namespace = self.base_config.tdl_export_namespace
-        if (
-            legacy.resolve() != configured.resolve()
-            and _tdl_session_database_ready(legacy, namespace)
-            and not _tdl_session_database_ready(configured, namespace)
-        ):
-            return legacy
-        return configured
+        return Path(build_profile_config(self.base_config, normalized).tdl_export_storage)
 
     def upload_tdl_storage_path(self, profile_name: str) -> Path:
         """Resolve the dedicated Storage upload session path for one profile."""
         normalized = normalize_profile_name(profile_name) or self.default_profile
-        profile_config = self.session_config(normalized)
-        return Path(profile_config.profile_root) / "upload" / ".tdl"
+        return DatabasePaths(self.base_config.database_root).tdl(normalized, "upload")
 
     def tdl_session_available(self, profile_name: str, purpose: str = "export") -> bool:
         """Check an initialized local TDL session without creating runtime files."""
@@ -598,12 +571,13 @@ def build_profile_runtime(
         stall_timeout_seconds=config.tdl_download_stall_timeout_seconds,
         progress_callback=download_progress.update_tdl_progress,
     )
-    upload_storage = Path(config.profile_root) / "upload" / ".tdl"
+    upload_storage = DatabasePaths(config.database_root).tdl(profile_name, "upload")
+    upload_home = Path(config.profile_root) / "upload"
     upload_tdl_client = TDLClient(
         storage_root=upload_storage,
         namespace=config.tdl_export_namespace,
         debug=config.log_level == "DEBUG",
-        home=upload_storage.parent,
+        home=upload_home,
         log_prefix=f"tdl-upload:{profile_name}",
         stall_timeout_seconds=config.tdl_export_stall_timeout_seconds,
     )
@@ -657,9 +631,9 @@ def build_profile_config(base_config: AppConfig, profile_name: str) -> AppConfig
         state_file=root / "state.json",
         legacy_max_json=root / "max.json",
         tdl_download_home=download_home,
-        tdl_download_storage=download_home / ".tdl",
+        tdl_download_storage=DatabasePaths(base_config.database_root).tdl(normalized, "download"),
         tdl_export_home=export_home,
-        tdl_export_storage=export_home / ".tdl",
+        tdl_export_storage=DatabasePaths(base_config.database_root).tdl(normalized, "export"),
         temp_root=root / "tmp",
     )
 

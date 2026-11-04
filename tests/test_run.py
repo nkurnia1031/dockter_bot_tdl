@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import call, patch
 
 import run
+from tme3bot.database_paths import FilesystemIdentity
 
 
 class RunScriptTests(unittest.TestCase):
@@ -48,6 +49,85 @@ class RunScriptTests(unittest.TestCase):
 
     def test_gateway_data_root_is_accepted_by_preflight_helpers(self) -> None:
         self.assertEqual(run.data_root_value({"GATEWAY_DATA_ROOT": "/srv/gateway"}), "/srv/gateway")
+
+    def test_database_root_preflight_requires_os_filesystem_when_data_is_separate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "database"
+            data = root / "data"
+            workspace = root / "workspace"
+            identities = {
+                "/": FilesystemIdentity(1, "/"),
+                str(database): FilesystemIdentity(2, "/workspace"),
+                str(data): FilesystemIdentity(3, "/data"),
+                str(workspace): FilesystemIdentity(2, "/workspace"),
+            }
+            env = {
+                "DATABASE_ROOT": str(database),
+                "GATEWAY_DATA_ROOT": str(data),
+                "LOCAL_WORKER_DATA_ROOT": str(root / "worker-data"),
+                "UTILITY_WORKSPACE_HOST": str(workspace),
+            }
+
+            with patch.object(
+                run,
+                "filesystem_identity",
+                side_effect=lambda path: identities[str(path)],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "filesystem root OS"):
+                    run.ensure_database_root(env, role="gateway")
+
+            self.assertFalse(database.exists())
+
+    def test_database_root_preflight_creates_private_root_and_redis_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "database"
+            data = root / "data"
+            workspace = root / "workspace"
+            for path in (data, workspace):
+                path.mkdir()
+            env = {
+                "DATABASE_ROOT": str(database),
+                "PROFILE_ROOT": str(data),
+                "UTILITY_WORKSPACE_HOST": str(workspace),
+            }
+
+            with (
+                patch.object(
+                    run,
+                    "filesystem_identity",
+                    return_value=FilesystemIdentity(1, "/"),
+                ),
+                patch.object(run.os, "chown") as chown,
+            ):
+                resolved = run.ensure_database_root(env, role="gateway")
+
+            self.assertEqual(resolved, database)
+            self.assertTrue((database / "redis").is_dir())
+            if run.os.name == "posix":
+                self.assertEqual(database.stat().st_mode & 0o777, 0o700)
+                self.assertEqual((database / "redis").stat().st_mode & 0o777, 0o700)
+                chown.assert_called_once_with(database / "redis", 999, 1000)
+
+    def test_worker_database_preflight_does_not_create_gateway_redis_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            database = root / "database"
+            env = {
+                "DATABASE_ROOT": str(database),
+                "PROFILE_ROOT": str(root / "profile-data"),
+                "UTILITY_WORKSPACE_HOST": str(root / "workspace"),
+            }
+            with patch.object(
+                run,
+                "filesystem_identity",
+                return_value=FilesystemIdentity(1, "/"),
+            ):
+                run.ensure_database_root(env, role="worker")
+
+            self.assertTrue(database.is_dir())
+            self.assertFalse((database / "redis").exists())
 
     def test_compose_falls_back_to_legacy_binary(self) -> None:
         with (
@@ -193,6 +273,7 @@ class RunScriptTests(unittest.TestCase):
                 patch.object(run, "validate_local_base_image") as validate_base,
                 patch.object(run, "ensure_base_image_available"),
                 patch.object(run, "ensure_profile_root") as ensure_root,
+                patch.object(run, "ensure_database_root") as ensure_db_root,
                 patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
                 patch.object(run, "run_compose") as run_compose,
             ):
@@ -200,6 +281,7 @@ class RunScriptTests(unittest.TestCase):
 
         validate_base.assert_called_once_with()
         ensure_root.assert_called_once()
+        ensure_db_root.assert_called()
         prepare_tdl.assert_called_once()
         self.assertEqual([call.args[0] for call in run_compose.call_args_list], [
             ["build"],
@@ -241,6 +323,29 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(
             run.compose_files_for_target("worker").split(run.os.pathsep),
             ["docker-compose.worker.yml"],
+        )
+
+    def test_deploy_preserves_custom_compose_override_but_filters_resolver(self) -> None:
+        env = {
+            "COMPOSE_FILE": run.os.pathsep.join(
+                [
+                    "docker-compose.gateway.yml",
+                    "/srv/tme3bot/ssd-upload-test/compose.override.yml",
+                    "docker-compose.resolver-gateway.yml",
+                ]
+            )
+        }
+
+        self.assertEqual(
+            run.compose_files_for_target("gateway", env).split(run.os.pathsep),
+            [
+                "docker-compose.gateway.yml",
+                "/srv/tme3bot/ssd-upload-test/compose.override.yml",
+            ],
+        )
+        self.assertEqual(
+            run.compose_files_for_target("gateway", env, include_overrides=False),
+            "docker-compose.gateway.yml",
         )
 
     def test_migrate_builds_gateway_and_worker_without_resolver_even_when_legacy_flag_enabled(self) -> None:
@@ -347,6 +452,7 @@ class RunScriptTests(unittest.TestCase):
             patch.object(run.sys, "argv", ["run.py", "update"]),
             patch.object(run, "load_env_file", return_value=env),
             patch.object(run, "ensure_profile_root"),
+            patch.object(run, "ensure_database_root"),
             patch.object(run, "ensure_base_image_available"),
             patch.object(run, "prepare_tdl_build_asset") as prepare_tdl,
             patch.object(run, "run_compose") as run_compose,
@@ -391,16 +497,36 @@ class RunScriptTests(unittest.TestCase):
             ["exec", "-T", "worker-local", "/usr/local/bin/tdl-leave"],
         )
         self.assertNotIn("runuser", command)
-        self.assertEqual(command[command.index("--storage") + 1], "/data/user1/.tdl/data")
+        self.assertEqual(
+            command[command.index("--storage") + 1],
+            "/database/worker-local/tdl/default/export/.tdl/data",
+        )
         self.assertEqual(command[command.index("--namespace") + 1], "default")
 
-    def test_profile_setup_preserves_both_lane_directories_without_user_chown(self):
+    def test_write_profile_identity_uses_container_database_path_for_gateway_worker(self):
+        with patch.object(run, "run_compose") as run_compose, patch("builtins.print"):
+            run.write_profile_identity(
+                {
+                    "COMPOSE_FILE": "docker-compose.gateway.yml",
+                    "DATABASE_ROOT": "/srv/tme3bot/db/gateway",
+                },
+                "irang",
+            )
+
+        command = run_compose.call_args.args[0]
+        self.assertEqual(
+            command[command.index("--storage") + 1],
+            "/database/worker-local/tdl/irang/export/.tdl/data",
+        )
+
+    def test_profile_setup_creates_data_paths_without_tdl_database_directories(self):
         with patch.object(run, "run_compose") as run_compose:
             run.ensure_container_profile_dirs({}, "default")
 
         command = run_compose.call_args.args[0]
-        self.assertIn("/data/root/.tdl", command[-1])
-        self.assertIn("/data/user1/.tdl", command[-1])
+        self.assertNotIn("/data/root/.tdl", command[-1])
+        self.assertNotIn("/data/user1/.tdl", command[-1])
+        self.assertIn("/data/download", command[-1])
         self.assertNotIn("chown", command[-1])
         self.assertNotIn("runuser", command[-1])
 

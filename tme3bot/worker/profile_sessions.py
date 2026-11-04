@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - TDL workers run on Linux.
     pty = None  # type: ignore[assignment]
 
 from tme3bot.domain.models import DomainError
+from tme3bot.database_paths import DatabasePaths, ensure_private_directory
 from tme3bot.names import normalize_profile_name
 from tme3bot.profile_provisioning import (
     MAX_PROFILE_BUNDLE_BYTES,
@@ -71,9 +72,9 @@ class ProfileSessionManager:
 
     def __init__(self, config: Any) -> None:
         self.config = config
-        temp_root = getattr(config, "temp_root", None) or tempfile.gettempdir()
-        self.root = Path(temp_root) / "profile-provisioning"
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.database_root = Path(getattr(config, "database_root", "/database"))
+        self.root = self.database_root / "profile-provisioning"
+        ensure_private_directory(self.root)
         if os.name == "posix":
             self._set_private_tree(self.root)
         self.login_root = self.root / "logins"
@@ -323,15 +324,18 @@ class ProfileSessionManager:
         expected_identity = int(telegram_user_id)
         if expected_identity < 1:
             raise ValueError("Identity Telegram tidak valid.")
-        stage_root = profile_root / f".{normalized}.provision-{operation_id}"
+        stage_root = self.root / "stages" / normalized / operation_id
         backup_root = self._backup_directory(normalized, operation_id)
         marker = profile_root / ".profile-provisioning.json"
+        upload_marker_path = profile_root / "upload" / _UPLOAD_LANE_MARKER
         receipt_file = profile_root / _PROFILE_INSTALL_RECEIPTS
         for target in (
             profile_root / "root",
             profile_root / "user1",
             profile_root / "upload",
-            profile_root / ".profile-provisioning-backups",
+            upload_marker_path,
+            self.root,
+            self.root / "stages",
             backup_root.parent.parent,
             stage_root,
             backup_root.parent,
@@ -343,8 +347,7 @@ class ProfileSessionManager:
             if target.is_symlink():
                 raise ValueError("Direktori sesi profil tidak aman.")
         for relative in _PROFILE_INSTALL_LANES:
-            self._assert_safe_tree(profile_root / relative)
-        self._assert_safe_tree(profile_root / ".profile-provisioning-backups")
+            self._assert_safe_tree(self._live_lane_path(profile_config, normalized, relative))
         self._assert_safe_tree(backup_root.parent)
         self._assert_safe_tree(backup_root)
         if marker.exists() and not marker.is_file():
@@ -366,8 +369,7 @@ class ProfileSessionManager:
         bundle_digest = bundle_digest_builder.hexdigest()
         report("bundle_validation", "succeeded")
 
-        # Keep staging and rollback data beside profile files on the same
-        # filesystem. For default, this avoids creating directories under /.
+        # Keep Bolt staging and rollback data on the dedicated database mount.
         receipts = self._read_install_receipts(profile_root)
         receipt = receipts["commits"].get(operation_id)
         if receipt is not None and (
@@ -392,13 +394,20 @@ class ProfileSessionManager:
             # A marker from the previous two-lane installer did not touch
             # Upload. Capture its pre-transaction tree before upgrading it.
             if "upload" not in original:
-                original["upload"] = (profile_root / "upload").exists() or (
+                original["upload"] = self._live_lane_path(profile_config, normalized, "upload").exists() or (
                     backup_root / "upload"
                 ).exists()
+            original.setdefault(
+                "upload_marker",
+                (backup_root / "upload-lane.json").is_file() or upload_marker_path.is_file(),
+            )
             original.setdefault("root/.tdl", False)
             original.setdefault("user1/.tdl", False)
             original.setdefault("identity.json", False)
-            if any(type(original.get(key)) is not bool for key in (*_PROFILE_INSTALL_LANES, "identity.json")):
+            if any(
+                type(original.get(key)) is not bool
+                for key in (*_PROFILE_INSTALL_LANES, "identity.json", "upload_marker")
+            ):
                 raise RuntimeError("Snapshot provisioning profil tidak valid.")
             existing_digest = state.get("bundle_sha256")
             if existing_digest and existing_digest != bundle_digest:
@@ -442,10 +451,11 @@ class ProfileSessionManager:
                 self._set_private_tree(backup_root.parent)
                 self._set_private_tree(backup_root)
             original = {
-                relative: (profile_root / relative).exists()
+                relative: self._live_lane_path(profile_config, normalized, relative).exists()
                 for relative in _PROFILE_INSTALL_LANES
             }
             original["identity.json"] = (profile_root / "identity.json").exists()
+            original["upload_marker"] = upload_marker_path.is_file()
             state = {
                 "operation_id": operation_id,
                 "new_profile": not original["identity.json"],
@@ -481,7 +491,7 @@ class ProfileSessionManager:
                 phase = f"{lane}_staging"
                 report(phase, "running")
                 try:
-                    destination = stage_root / relative
+                    destination = self._staged_lane_path(stage_root, relative)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copytree(candidate_source, destination, symlinks=True)
                     self._normalize_candidate_namespace(destination, namespace)
@@ -512,9 +522,9 @@ class ProfileSessionManager:
             # candidate. Never hard-link it: TDL opens each lane independently.
             report("upload_staging", "running")
             try:
-                export_storage = stage_root / "user1" / ".tdl"
+                export_storage = self._staged_lane_path(stage_root, "user1/.tdl")
                 upload_home = stage_root / "upload"
-                upload_storage = upload_home / ".tdl"
+                upload_storage = self._staged_lane_path(stage_root, "upload")
                 upload_home.mkdir(mode=0o700, parents=True, exist_ok=True)
                 shutil.copytree(export_storage, upload_storage, symlinks=False)
                 fingerprint = self._session_tree_fingerprint(
@@ -541,7 +551,7 @@ class ProfileSessionManager:
             report("upload_staging", "succeeded")
 
             validation_specs = (
-                ("download", stage_root / "root" / ".tdl", str(profile_config.tdl_download_namespace)),
+                ("download", self._staged_lane_path(stage_root, "root/.tdl"), str(profile_config.tdl_download_namespace)),
                 ("export", export_storage, str(profile_config.tdl_export_namespace)),
                 ("upload", upload_storage, str(profile_config.tdl_export_namespace)),
             )
@@ -569,16 +579,14 @@ class ProfileSessionManager:
                     raise _ProfileInstallFailure(code) from None
                 report(phase, "succeeded")
 
-            # Complete any interrupted backup before replacing sessions. Keep
-            # the original Upload home (including its fingerprint marker) with
-            # the two source lanes and identity metadata.
+            # Complete any interrupted backup before replacing sessions.
             backup_root.mkdir(parents=True, exist_ok=True)
             for relative in _PROFILE_INSTALL_LANES:
                 lane = "download" if relative == "root/.tdl" else "export" if relative == "user1/.tdl" else "upload"
                 phase = f"{lane}_install"
                 report(phase, "running")
                 try:
-                    current = profile_root / relative
+                    current = self._live_lane_path(profile_config, normalized, relative)
                     saved = backup_root / relative
                     if original.get(relative) and current.exists() and not saved.exists():
                         self._set_private_tree(current)
@@ -587,11 +595,30 @@ class ProfileSessionManager:
                         os.replace(current, saved)
                     if current.exists():
                         self._remove_path(current)
-                    candidate = stage_root / relative
+                    candidate = self._staged_lane_path(stage_root, relative)
                     current.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(candidate, current)
                     self._set_private_tree(current)
                     self._require_private_tree(current)
+                    if relative == "upload":
+                        saved_marker = backup_root / "upload-lane.json"
+                        if (
+                            original.get("upload_marker")
+                            and upload_marker_path.is_file()
+                            and not saved_marker.exists()
+                        ):
+                            previous_marker = json.loads(
+                                upload_marker_path.read_text(encoding="utf-8")
+                            )
+                            self._write_private_json(saved_marker, previous_marker)
+                        staged_marker = stage_root / "upload" / _UPLOAD_LANE_MARKER
+                        marker_payload = json.loads(
+                            staged_marker.read_text(encoding="utf-8")
+                        )
+                        if not isinstance(marker_payload, dict):
+                            raise ValueError("Upload lane marker is invalid.")
+                        upload_marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        self._write_private_json(upload_marker_path, marker_payload)
                 except Exception:
                     report(phase, "failed", "PROFILE_LANE_INSTALL_FAILED")
                     raise _ProfileInstallFailure("PROFILE_LANE_INSTALL_FAILED") from None
@@ -669,6 +696,7 @@ class ProfileSessionManager:
                 self._assert_safe_tree(backup_root.parent)
                 self._remove_path(backup_root.parent)
                 self._remove_empty_backup_root(profile_root)
+                self._remove_empty_database_backup_root()
             except (OSError, _ProfileInstallFailure):
                 pass
             return True
@@ -709,6 +737,7 @@ class ProfileSessionManager:
         try:
             self._remove_path(backup.parent)
             self._remove_empty_backup_root(profile_root)
+            self._remove_empty_database_backup_root()
         except OSError:
             # The installation is already committed; a later retry can clean
             # this private, operation-scoped recovery directory.
@@ -753,41 +782,63 @@ class ProfileSessionManager:
         if not isinstance(original, dict):
             original = {
                 relative: (backup / relative).exists()
-                for relative in ("root/.tdl", "user1/.tdl")
+                for relative in _PROFILE_INSTALL_LANES
             }
             original["identity.json"] = (backup / "identity.json").exists()
         if any(
             relative in original and type(original[relative]) is not bool
-            for relative in (*_PROFILE_INSTALL_LANES, "identity.json")
+            for relative in (*_PROFILE_INSTALL_LANES, "identity.json", "upload_marker")
         ):
             return False
         for target in (
             profile_root / "root",
             profile_root / "user1",
             profile_root / "upload",
+            profile_root / "upload" / _UPLOAD_LANE_MARKER,
             profile_root / "identity.json",
         ):
             if target.is_symlink():
                 return False
         for relative in _PROFILE_INSTALL_LANES:
             try:
-                self._assert_safe_tree(profile_root / relative)
+                self._assert_safe_tree(self._live_lane_path(
+                    build_profile_config(self.config, normalized), normalized, relative
+                ))
             except _ProfileInstallFailure:
                 return False
+        profile_config = build_profile_config(self.config, normalized)
+        self._remove_path(self.root / "stages" / normalized / operation_id)
         self._remove_path(profile_root / f".{normalized}.provision-{operation_id}")
         for relative in _PROFILE_INSTALL_LANES:
             # A two-lane transaction marker predates managed Upload state.
             # Leave that untouched lane alone if it has no saved snapshot.
             if relative not in original:
                 continue
-            current = profile_root / relative
+            current = self._live_lane_path(profile_config, normalized, relative)
             saved = backup / relative
+            if relative == "upload" and saved.is_dir() and (saved / ".tdl").is_dir():
+                # Recover an upload snapshot created by the previous layout,
+                # where the session and marker shared the profile data folder.
+                saved = saved / ".tdl"
             if saved.exists():
                 self._remove_path(current)
                 current.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(saved, current)
             elif not original.get(relative, state.get("new_profile", False)):
                 self._remove_path(current)
+        upload_marker_path = profile_root / "upload" / _UPLOAD_LANE_MARKER
+        saved_upload_marker = backup / "upload-lane.json"
+        if saved_upload_marker.is_file():
+            try:
+                marker_payload = json.loads(saved_upload_marker.read_text(encoding="utf-8"))
+                if not isinstance(marker_payload, dict):
+                    return False
+                upload_marker_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                self._write_private_json(upload_marker_path, marker_payload)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                return False
+        elif not original.get("upload_marker", state.get("new_profile", False)):
+            upload_marker_path.unlink(missing_ok=True)
         identity = profile_root / "identity.json"
         saved_identity = backup / "identity.json"
         if saved_identity.exists():
@@ -834,6 +885,7 @@ class ProfileSessionManager:
                 status_code=409,
             )
         expected = profiles_root / normalized
+        database_profile_root = DatabasePaths(self.database_root).root / "tdl" / normalized
         configured = Path(build_profile_config(self.config, normalized).profile_root)
         if configured != expected or expected.name != normalized:
             raise DomainError(
@@ -847,34 +899,55 @@ class ProfileSessionManager:
                 "Direktori profil worker tidak aman; tidak ada data yang dihapus.",
                 status_code=409,
             )
-        if not expected.exists():
+        if database_profile_root.is_symlink():
+            raise DomainError(
+                "PROFILE_ROOT_UNSAFE",
+                "Direktori database profil worker tidak aman; tidak ada data yang dihapus.",
+                status_code=409,
+            )
+        if not expected.exists() and not database_profile_root.exists():
             return {"profile": normalized, "deleted": True, "already_absent": True}
-        if not expected.is_dir() or expected.resolve().parent != profiles_root.resolve():
+        if expected.exists() and (
+            not expected.is_dir() or expected.resolve().parent != profiles_root.resolve()
+        ):
             raise DomainError(
                 "PROFILE_ROOT_UNSAFE",
                 "Direktori profil worker tidak aman; tidak ada data yang dihapus.",
                 status_code=409,
             )
 
-        # Do not let a profile tree redirect recursive deletion outside its root.
-        try:
-            for current, directories, files in os.walk(expected, followlinks=False):
-                base = Path(current)
-                if any((base / child).is_symlink() for child in (*directories, *files)):
+        # Validate every target before deleting either side so a link in the
+        # data tree cannot leave profile metadata deleted while Bolt survives.
+        for target in (expected, database_profile_root):
+            if not target.exists():
+                continue
+            try:
+                if not target.is_dir():
                     raise DomainError(
                         "PROFILE_ROOT_UNSAFE",
-                        "Direktori profil berisi link filesystem; tidak ada data yang dihapus.",
+                        "Target profil worker bukan direktori; tidak ada data yang dihapus.",
                         status_code=409,
                     )
-        except OSError as exc:
-            raise DomainError(
-                "PROFILE_DELETE_FAILED",
-                "Direktori profil worker tidak dapat diperiksa dengan aman.",
-                status_code=409,
-            ) from exc
+                for current, directories, files in os.walk(target, followlinks=False):
+                    base = Path(current)
+                    if any((base / child).is_symlink() for child in (*directories, *files)):
+                        raise DomainError(
+                            "PROFILE_ROOT_UNSAFE",
+                            "Direktori profil berisi link filesystem; tidak ada data yang dihapus.",
+                            status_code=409,
+                        )
+            except OSError as exc:
+                raise DomainError(
+                    "PROFILE_DELETE_FAILED",
+                    "Direktori profil worker tidak dapat diperiksa dengan aman.",
+                    status_code=409,
+                ) from exc
 
         try:
-            shutil.rmtree(expected)
+            if expected.exists():
+                shutil.rmtree(expected)
+            if database_profile_root.exists():
+                shutil.rmtree(database_profile_root)
         except OSError as exc:
             raise DomainError(
                 "PROFILE_DELETE_FAILED",
@@ -885,13 +958,44 @@ class ProfileSessionManager:
 
     def _backup_directory(self, profile: str, operation_id: str) -> Path:
         profile_root = Path(build_profile_config(self.config, profile).profile_root)
-        current = profile_root / ".profile-provisioning-backups" / operation_id / profile
-        legacy = self.root / "backups" / operation_id / profile
-        # Let a worker upgraded during provisioning still commit or roll back
-        # backups created by the prior layout.
-        if legacy.exists() and not current.exists():
-            return legacy
+        current = self.root / "backups" / operation_id / profile
+        legacy_paths = (
+            profile_root / ".profile-provisioning-backups" / operation_id / profile,
+            Path(getattr(self.config, "temp_root", "/data/tmp"))
+            / "profile-provisioning" / "backups" / operation_id / profile,
+        )
+        # An operation already in progress on an older image keeps using the
+        # rollback snapshot it wrote before the deployment.
+        if not current.exists():
+            for legacy in legacy_paths:
+                if legacy.exists():
+                    return legacy
         return current
+
+    @staticmethod
+    def _live_lane_path(profile_config: Any, profile: str, relative: str) -> Path:
+        if relative == "root/.tdl":
+            return Path(profile_config.tdl_download_storage)
+        if relative == "user1/.tdl":
+            return Path(profile_config.tdl_export_storage)
+        if relative == "upload":
+            return DatabasePaths(profile_config.database_root).tdl(profile, "upload")
+        raise ValueError("Unknown TDL lane.")
+
+    @staticmethod
+    def _staged_lane_path(stage_root: Path, relative: str) -> Path:
+        if relative == "upload":
+            return stage_root / "upload" / ".tdl"
+        if relative in {"root/.tdl", "user1/.tdl"}:
+            return stage_root / relative
+        raise ValueError("Unknown staged TDL lane.")
+
+    def _remove_empty_database_backup_root(self) -> None:
+        for path in (self.root / "backups", self.root / "stages"):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
 
     @staticmethod
     def _remove_empty_backup_root(profile_root: Path) -> None:
@@ -916,14 +1020,16 @@ class ProfileSessionManager:
             raise ValueError("PROFILE_IDENTITY_MISSING") from exc
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for relative in ("root/.tdl", "user1/.tdl"):
-                source = root / relative
+            for relative, source in (
+                ("root/.tdl", Path(config.tdl_download_storage)),
+                ("user1/.tdl", Path(config.tdl_export_storage)),
+            ):
                 if not source.is_dir():
                     code = "PROFILE_ROOT_SESSION_MISSING" if relative.startswith("root/") else "PROFILE_USER1_SESSION_MISSING"
                     raise ValueError(code)
                 for path in source.rglob("*"):
                     if path.is_file():
-                        archive.write(path, path.relative_to(root).as_posix())
+                        archive.write(path, f"{relative}/{path.relative_to(source).as_posix()}")
             archive.writestr("identity.json", json.dumps({"telegram_user_id": user_id, "tdl_user_id": user_id}))
         data = output.getvalue()
         validate_profile_bundle(data)
@@ -939,7 +1045,8 @@ class ProfileSessionManager:
                 "checks": [{"name": "profile_name", "ready": False, "code": "PROFILE_NAME_INVALID"}],
             }
 
-        root = Path(build_profile_config(self.config, normalized).profile_root)
+        profile_config = build_profile_config(self.config, normalized)
+        root = Path(profile_config.profile_root)
         checks: list[dict[str, Any]] = []
 
         identity_path = root / "identity.json"
@@ -958,12 +1065,14 @@ class ProfileSessionManager:
                 identity_code = "PROFILE_IDENTITY_MISSING"
         checks.append({"name": "identity", "ready": identity_ready, "code": identity_code})
 
-        for key, relative in (("root_session", "root/.tdl"), ("user1_session", "user1/.tdl")):
-            session_root = root / relative
+        for key, relative, session_root in (
+            ("root_session", "root/.tdl", Path(profile_config.tdl_download_storage)),
+            ("user1_session", "user1/.tdl", Path(profile_config.tdl_export_storage)),
+        ):
             data_root = session_root / "data"
             code = "OK"
             ready = False
-            if root.is_symlink() or session_root.is_symlink() or data_root.is_symlink():
+            if session_root.is_symlink() or session_root.parent.is_symlink() or data_root.is_symlink():
                 code = "PROFILE_SESSION_UNSAFE"
             elif not session_root.is_dir() or not data_root.is_dir():
                 code = "PROFILE_ROOT_SESSION_MISSING" if key == "root_session" else "PROFILE_USER1_SESSION_MISSING"
@@ -1147,13 +1256,12 @@ class ProfileSessionManager:
         namespace: str,
         home: Path,
     ) -> tuple[int | None, str]:
-        session_parent = profile_root / name
         session_root = storage_root
         data_root = session_root / "data"
         database_file = data_root / namespace
         if (
             profile_root.is_symlink()
-            or session_parent.is_symlink()
+            or session_root.parent.is_symlink()
             or session_root.is_symlink()
             or data_root.is_symlink()
             or database_file.is_symlink()
@@ -1181,7 +1289,9 @@ class ProfileSessionManager:
         self, storage_root: Path, *, namespace: str, home: Path
     ) -> int:
         helper = str(getattr(self.config, "leave_helper_binary", "/usr/local/bin/tdl-leave"))
-        with tempfile.TemporaryDirectory(prefix="tdl-diagnostic-") as raw_directory:
+        with tempfile.TemporaryDirectory(
+            prefix="tdl-diagnostic-", dir=self.root
+        ) as raw_directory:
             private_directory = Path(raw_directory)
             self._set_private_tree(private_directory)
             # tdl-leave opens Bolt for writes even in --whoami mode. Use a
@@ -1251,16 +1361,14 @@ class ProfileSessionManager:
             return False
         session_files: list[set[tuple[int, int]]] = []
         specifications = (
-            ("root/.tdl", str(profile_config.tdl_download_namespace)),
-            ("user1/.tdl", str(profile_config.tdl_export_namespace)),
-            ("upload/.tdl", str(profile_config.tdl_export_namespace)),
+            (Path(profile_config.tdl_download_storage), str(profile_config.tdl_download_namespace)),
+            (Path(profile_config.tdl_export_storage), str(profile_config.tdl_export_namespace)),
+            (DatabasePaths(profile_config.database_root).tdl(normalized, "upload"), str(profile_config.tdl_export_namespace)),
         )
-        for relative, namespace in specifications:
-            session_root = root / relative
-            session_parent = root / relative.split("/", 1)[0]
+        for session_root, namespace in specifications:
             data_root = session_root / "data"
             if (
-                session_parent.is_symlink()
+                session_root.parent.is_symlink()
                 or not self._tree_is_safe(session_root)
                 or not self._tree_is_private(session_root)
                 or data_root.is_symlink()
@@ -1284,6 +1392,23 @@ class ProfileSessionManager:
             for left in range(len(session_files))
             for right in range(left + 1, len(session_files))
         ):
+            return False
+        upload_marker_path = root / "upload" / _UPLOAD_LANE_MARKER
+        if upload_marker_path.is_symlink() or not upload_marker_path.is_file():
+            return False
+        try:
+            upload_marker = json.loads(upload_marker_path.read_text(encoding="utf-8"))
+            expected_fingerprint = self._session_tree_fingerprint(
+                Path(profile_config.tdl_export_storage),
+                str(profile_config.tdl_export_namespace),
+            )
+            if (
+                not isinstance(upload_marker, dict)
+                or upload_marker.get("format") != 1
+                or upload_marker.get("source_fingerprint") != expected_fingerprint
+            ):
+                return False
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
             return False
         return user_id
 

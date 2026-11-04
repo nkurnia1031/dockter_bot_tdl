@@ -13,6 +13,7 @@ from tme3bot.worker.upload_lane import UploadLanePreparer
 class _ProfileManager:
     def __init__(self, profile_root: Path) -> None:
         self.profile_root = profile_root
+        self.database_root = profile_root.parent / "database"
         self.export_lock = threading.RLock()
         self.download_lock = threading.RLock()
         self.upload_lock = threading.RLock()
@@ -20,7 +21,8 @@ class _ProfileManager:
     def session_config(self, _profile: str):
         return type("Config", (), {
             "profile_root": self.profile_root,
-            "tdl_export_storage": self.profile_root / "user1" / ".tdl",
+            "database_root": self.database_root,
+            "tdl_export_storage": self.database_root / "tdl" / _profile / "export" / ".tdl",
             "tdl_export_namespace": "export-ns",
             "tdl_export_home": self.profile_root / "user1",
         })()
@@ -35,13 +37,17 @@ class _ProfileManager:
 class UploadLanePreparerTests(unittest.TestCase):
     def _profile(self, root: Path) -> tuple[Path, Path, Path]:
         profile_root = root / "profile"
-        (profile_root / "user1" / ".tdl" / "data").mkdir(parents=True)
-        (profile_root / "root" / ".tdl" / "data").mkdir(parents=True)
+        database_root = root / "database"
+        export_storage = database_root / "tdl" / "irang" / "export" / ".tdl"
+        download_storage = database_root / "tdl" / "irang" / "download" / ".tdl"
+        (export_storage / "data").mkdir(parents=True)
+        (download_storage / "data").mkdir(parents=True)
+        profile_root.mkdir(parents=True)
         (profile_root / "identity.json").write_text(
             json.dumps({"telegram_user_id": 424242}), encoding="utf-8"
         )
-        export_db = profile_root / "user1" / ".tdl" / "data" / "export-ns"
-        download_db = profile_root / "root" / ".tdl" / "data" / "download-ns"
+        export_db = export_storage / "data" / "export-ns"
+        download_db = download_storage / "data" / "download-ns"
         export_db.write_bytes(b"export bolt session")
         download_db.write_bytes(b"download bolt session")
         return profile_root, export_db, download_db
@@ -85,7 +91,8 @@ class UploadLanePreparerTests(unittest.TestCase):
             self.assertIn(started["status"], {"running", "ready"})
             result = self._wait_terminal(preparer)
 
-            upload_db = profile_root / "upload" / ".tdl" / "data" / "export-ns"
+            upload_root = root / "database" / "tdl" / "irang" / "upload" / ".tdl"
+            upload_db = upload_root / "data" / "export-ns"
             self.assertEqual(result["status"], "ready")
             self.assertEqual(result["phase"], "ready")
             self.assertEqual(result["progress"], 100)
@@ -96,7 +103,6 @@ class UploadLanePreparerTests(unittest.TestCase):
             self.assertEqual(download_db.read_bytes(), source_download)
             self.assertEqual([payload for _path, payload in checked], [source_export, source_export])
             if os.name == "posix":
-                upload_root = profile_root / "upload"
                 self.assertEqual(stat.S_IMODE(upload_root.stat().st_mode), 0o700)
                 self.assertEqual(stat.S_IMODE(upload_db.stat().st_mode), 0o600)
 
@@ -107,7 +113,7 @@ class UploadLanePreparerTests(unittest.TestCase):
             preparer, _manager, _checked = self._preparer(root, profile_root)
             preparer.ensure("irang")
             self.assertEqual(self._wait_terminal(preparer)["status"], "ready")
-            upload_db = profile_root / "upload" / ".tdl" / "data" / "export-ns"
+            upload_db = root / "database/tdl/irang/upload/.tdl/data/export-ns"
             installed_inode = upload_db.stat().st_ino
 
             preparer.ensure("irang")
@@ -126,7 +132,7 @@ class UploadLanePreparerTests(unittest.TestCase):
             self.assertEqual(self._wait_terminal(preparer)["status"], "ready")
 
             first = preparer.session_fingerprint("irang")
-            upload_db = profile_root / "upload" / ".tdl" / "data" / "export-ns"
+            upload_db = root / "database/tdl/irang/upload/.tdl/data/export-ns"
             upload_db.write_bytes(b"updated by normal Upload lane use")
             self.assertEqual(preparer.session_fingerprint("irang"), first)
 
@@ -142,7 +148,7 @@ class UploadLanePreparerTests(unittest.TestCase):
             preparer, _manager, _checked = self._preparer(root, profile_root)
             preparer.ensure("irang")
             self.assertEqual(self._wait_terminal(preparer)["status"], "ready")
-            upload_db = profile_root / "upload" / ".tdl" / "data" / "export-ns"
+            upload_db = root / "database/tdl/irang/upload/.tdl/data/export-ns"
             old_upload = upload_db.read_bytes()
             upload_home = profile_root / "upload"
             old_modes = None

@@ -41,10 +41,11 @@ def make_config(root: Path) -> AppConfig:
         export_failed_dir=root / "exports" / "failed",
         state_file=root / "state.json",
         legacy_max_json=root / "max.json",
+        database_root=root / "database",
         tdl_export_home=root / "user1",
         tdl_download_home=root / "root",
-        tdl_export_storage=root / "user1" / ".tdl",
-        tdl_download_storage=root / "root" / ".tdl",
+        tdl_export_storage=root / "database/tdl/default/export/.tdl",
+        tdl_download_storage=root / "database/tdl/default/download/.tdl",
         tdl_export_namespace="default",
         tdl_download_namespace="default",
         tdl_export_stall_timeout_seconds=300,
@@ -53,6 +54,21 @@ def make_config(root: Path) -> AppConfig:
         log_level="INFO",
         app_role="worker",
     )
+
+
+def tdl_storage(root: Path, profile: str, legacy_lane: str) -> Path:
+    lane = {
+        "root/.tdl": "download",
+        "user1/.tdl": "export",
+        "upload/.tdl": "upload",
+        "upload": "upload",
+    }[legacy_lane]
+    return root / "database" / "tdl" / profile / lane / ".tdl"
+
+
+def tdl_database(root: Path, profile: str, legacy_lane: str, namespace: str = "default") -> Path:
+    (root / "profiles" / profile).mkdir(parents=True, exist_ok=True)
+    return tdl_storage(root, profile, legacy_lane) / "data" / namespace
 
 
 def profile_bundle_with_sessions(
@@ -242,9 +258,9 @@ class ProfileProvisioningTests(unittest.TestCase):
                 profile_root / "identity.json",
                 profile_root / "state.json",
                 profile_root / "exports" / "done" / "export.json",
-                profile_root / "root" / ".tdl" / "data" / "default",
-                profile_root / "user1" / ".tdl" / "data" / "default",
-                profile_root / "upload" / ".tdl" / "data" / "default",
+                tdl_database(root, "archive", "root/.tdl"),
+                tdl_database(root, "archive", "user1/.tdl"),
+                tdl_database(root, "archive", "upload/.tdl"),
                 profile_root / "other" / "nested.bin",
             ]
             for path in files:
@@ -258,6 +274,7 @@ class ProfileProvisioningTests(unittest.TestCase):
 
             self.assertEqual(result, {"profile": "archive", "deleted": True, "already_absent": False})
             self.assertFalse(profile_root.exists())
+            self.assertFalse((root / "database" / "tdl" / "archive").exists())
             self.assertEqual(vault_bundle.read_bytes(), b"vault-data")
 
             default_file = root / "root" / "default-only"
@@ -338,7 +355,8 @@ class ProfileProvisioningTests(unittest.TestCase):
                 '{"telegram_user_id":123,"tdl_user_id":123}', encoding="utf-8"
             )
             for session in ("root/.tdl/data", "user1/.tdl/data"):
-                session_root = profile_root / Path(session)
+                legacy_lane = "root/.tdl" if session.startswith("root/") else "user1/.tdl"
+                session_root = tdl_storage(root, "storage", legacy_lane) / "data"
                 session_root.mkdir(parents=True)
                 (session_root / "default").write_bytes(b"session")
 
@@ -347,7 +365,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertEqual([item["name"] for item in ready["checks"]], ["identity", "root_session", "user1_session"])
             self.assertNotIn(str(profile_root), str(ready))
 
-            (profile_root / "user1" / ".tdl" / "data" / "default").unlink()
+            tdl_database(root, "storage", "user1/.tdl").unlink()
             incomplete = manager.diagnose_export_bundle("storage")
             self.assertFalse(incomplete["ready"])
             self.assertIn("PROFILE_USER1_SESSION_EMPTY", incomplete["reason_codes"])
@@ -509,9 +527,9 @@ class ProfileProvisioningTests(unittest.TestCase):
             with patch.object(manager, "_run_whoami", return_value=123456):
                 manager.install_bundle("novel", 123456, bundle, "operation-1")
             profile_root = root / "profiles" / "novel"
-            download_db = profile_root / "root" / ".tdl" / "data" / "default"
-            export_db = profile_root / "user1" / ".tdl" / "data" / "default"
-            upload_db = profile_root / "upload" / ".tdl" / "data" / "default"
+            download_db = tdl_database(root, "novel", "root/.tdl")
+            export_db = tdl_database(root, "novel", "user1/.tdl")
+            upload_db = tdl_database(root, "novel", "upload/.tdl")
             self.assertEqual(download_db.read_bytes(), b"bolt-session")
             self.assertEqual(export_db.read_bytes(), b"bolt-session")
             self.assertEqual(upload_db.read_bytes(), b"bolt-session")
@@ -543,9 +561,9 @@ class ProfileProvisioningTests(unittest.TestCase):
                 )
 
             profile_root = root / "profiles" / "novel"
-            download_db = profile_root / "root" / ".tdl" / "data" / "default"
-            export_db = profile_root / "user1" / ".tdl" / "data" / "default"
-            upload_db = profile_root / "upload" / ".tdl" / "data" / "default"
+            download_db = tdl_database(root, "novel", "root/.tdl")
+            export_db = tdl_database(root, "novel", "user1/.tdl")
+            upload_db = tdl_database(root, "novel", "upload/.tdl")
             self.assertEqual(download_db.read_bytes(), b"download-candidate")
             self.assertEqual(export_db.read_bytes(), b"export-candidate")
             self.assertEqual(upload_db.read_bytes(), b"export-candidate")
@@ -553,7 +571,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             marker = json.loads((profile_root / "upload" / "upload-lane.json").read_text())
             self.assertEqual(
                 marker["source_fingerprint"],
-                UploadLanePreparer._fingerprint(profile_root / "user1" / ".tdl", "default"),
+                UploadLanePreparer._fingerprint(tdl_storage(root, "novel", "user1/.tdl"), "default"),
             )
             for phase in (
                 "download_staging", "download_validation", "download_install",
@@ -579,7 +597,7 @@ class ProfileProvisioningTests(unittest.TestCase):
 
             profile_root = root / "profiles" / "novel"
             databases = [
-                profile_root / relative / "data" / "default"
+                tdl_database(root, "novel", relative)
                 for relative in ("root/.tdl", "user1/.tdl", "upload/.tdl")
             ]
             self.assertTrue(result["ready"])
@@ -603,25 +621,27 @@ class ProfileProvisioningTests(unittest.TestCase):
                     "upload/.tdl": b"old-upload",
                 }
                 for relative, payload in old_sessions.items():
-                    database = profile_root / relative / "data" / "default"
+                    database = tdl_database(root, "novel", relative)
                     database.parent.mkdir(parents=True, exist_ok=True)
                     database.write_bytes(payload)
                 upload_marker = profile_root / "upload" / "upload-lane.json"
+                upload_marker.parent.mkdir(parents=True, exist_ok=True)
                 upload_marker.write_text('{"format":1,"source_fingerprint":"old"}')
                 identity_path = profile_root / "identity.json"
                 identity_path.write_text('{"telegram_user_id":77,"tdl_user_id":77}')
                 manager = ProfileSessionManager(config)
                 operation_id = "fail-" + failing_lane.replace("/", "-").replace(".", "-")
-                candidate_root = profile_root / f".novel.provision-{operation_id}"
-                destination = profile_root / failing_lane
+                candidate_root = root / "database/profile-provisioning/stages/novel" / operation_id
+                destination = tdl_storage(root, "novel", failing_lane)
                 real_replace = os.replace
                 injected = False
 
                 def fail_selected_candidate(source, target):
                     nonlocal injected
+                    staged_relative = "upload/.tdl" if failing_lane == "upload" else failing_lane
                     if (
                         not injected
-                        and Path(source) == candidate_root / failing_lane
+                        and Path(source) == candidate_root / staged_relative
                         and Path(target) == destination
                     ):
                         injected = True
@@ -637,7 +657,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 self.assertTrue(injected)
                 for relative, payload in old_sessions.items():
                     self.assertEqual(
-                        (profile_root / relative / "data" / "default").read_bytes(),
+                        tdl_database(root, "novel", relative).read_bytes(),
                         payload,
                     )
                 self.assertEqual(upload_marker.read_text(), '{"format":1,"source_fingerprint":"old"}')
@@ -660,7 +680,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                     "upload/.tdl": b"old-upload",
                 }
                 for relative, payload in old_sessions.items():
-                    database = profile_root / relative / "data" / "default"
+                    database = tdl_database(root, "novel", relative)
                     database.parent.mkdir(parents=True, exist_ok=True)
                     database.write_bytes(payload)
                 identity_path = profile_root / "identity.json"
@@ -671,7 +691,7 @@ class ProfileProvisioningTests(unittest.TestCase):
 
                 def candidate_identity(storage, *, namespace, home):
                     checked.append(storage)
-                    self.assertIn(".novel.provision-identity-check", str(storage))
+                    self.assertIn("/stages/novel/identity-check/", str(storage))
                     return 77 if len(checked) == invalid_call else 88
 
                 with patch.object(manager, "_run_whoami", side_effect=candidate_identity):
@@ -684,7 +704,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 self.assertEqual(len(checked), invalid_call)
                 for relative, payload in old_sessions.items():
                     self.assertEqual(
-                        (profile_root / relative / "data" / "default").read_bytes(),
+                        tdl_database(root, "novel", relative).read_bytes(),
                         payload,
                     )
                 self.assertEqual(identity_path.read_text(), '{"telegram_user_id":77}')
@@ -710,14 +730,14 @@ class ProfileProvisioningTests(unittest.TestCase):
                     "upload/.tdl": b"old-upload",
                 }
                 for relative, payload in old_sessions.items():
-                    database = profile_root / relative / "data" / "default"
+                    database = tdl_database(root, "novel", relative)
                     database.parent.mkdir(parents=True, exist_ok=True)
                     database.write_bytes(payload)
                 identity_path = profile_root / "identity.json"
                 identity_path.write_text('{"telegram_user_id":77}')
                 manager = ProfileSessionManager(make_config(root))
                 operation_id = "stage-failure"
-                candidate_root = profile_root / f".novel.provision-{operation_id}"
+                candidate_root = root / "database/profile-provisioning/stages/novel" / operation_id
                 events = []
 
                 real_copy = profile_sessions_module.shutil.copytree
@@ -752,7 +772,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 self.assertIn((f"{failing_lane}_staging", "failed", "PROFILE_SESSION_STAGING_FAILED"), events)
                 for relative, payload in old_sessions.items():
                     self.assertEqual(
-                        (profile_root / relative / "data" / "default").read_bytes(),
+                        tdl_database(root, "novel", relative).read_bytes(),
                         payload,
                     )
                 self.assertEqual(identity_path.read_text(), '{"telegram_user_id":77}')
@@ -768,7 +788,8 @@ class ProfileProvisioningTests(unittest.TestCase):
             external_file.write_text("untouched")
             profile_root.mkdir(parents=True)
             try:
-                os.symlink(external, profile_root / "root", target_is_directory=True)
+                tdl_storage(root, "novel", "root/.tdl").parent.mkdir(parents=True)
+                os.symlink(external, tdl_storage(root, "novel", "root/.tdl"), target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f"directory symlink unavailable: {exc}")
             manager = ProfileSessionManager(make_config(root))
@@ -789,28 +810,28 @@ class ProfileProvisioningTests(unittest.TestCase):
                 ("user1/.tdl", b"old-export"),
                 ("upload/.tdl", b"old-upload"),
             ):
-                database = profile_root / relative / "data" / "default"
+                database = tdl_database(root, "novel", relative)
                 database.parent.mkdir(parents=True, exist_ok=True)
                 database.write_bytes(payload)
             (profile_root / "identity.json").write_text('{"telegram_user_id":77}')
             manager = ProfileSessionManager(make_config(root))
             bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
-            backup_root = profile_root / ".profile-provisioning-backups" / "retry-1" / "novel"
+            backup_root = root / "database/profile-provisioning/backups/retry-1/novel"
 
             with patch.object(manager, "_run_whoami", return_value=88):
                 manager.install_bundle("novel", 88, bundle, "retry-1")
-                original_snapshot = (backup_root / "upload" / ".tdl" / "data" / "default").read_bytes()
+                original_snapshot = (backup_root / "upload" / "data" / "default").read_bytes()
                 retry = manager.install_bundle("novel", 88, bundle, "retry-1")
 
             self.assertTrue(retry["reused"])
             self.assertEqual(original_snapshot, b"old-upload")
             self.assertEqual(
-                list((profile_root / ".profile-provisioning-backups").glob("retry-1/novel")),
+                list((root / "database/profile-provisioning/backups").glob("retry-1/novel")),
                 [backup_root],
             )
             self.assertTrue(manager.rollback_bundle("novel", "retry-1"))
             self.assertEqual(
-                (profile_root / "upload" / ".tdl" / "data" / "default").read_bytes(),
+                tdl_database(root, "novel", "upload/.tdl").read_bytes(),
                 b"old-upload",
             )
 
@@ -827,17 +848,17 @@ class ProfileProvisioningTests(unittest.TestCase):
 
             self.assertEqual(manager.verify_installed("novel"), 123456)
             self.assertFalse(manager.verify_installed("novel", 123457))
-            upload_db = root / "profiles" / "novel" / "upload" / ".tdl" / "data" / "default"
+            upload_db = tdl_database(root, "novel", "upload/.tdl")
             upload_db.unlink()
             self.assertFalse(manager.verify_installed("novel"))
             upload_db.write_bytes(b"bolt-session")
-            (root / "profiles" / "novel" / "root" / ".tdl" / "data" / "default").unlink()
+            tdl_database(root, "novel", "root/.tdl").unlink()
             self.assertFalse(manager.verify_installed("novel"))
 
     def test_worker_restart_cleans_abandoned_login_data_but_keeps_install_backups(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            provisioning_root = root / "tmp" / "profile-provisioning"
+            provisioning_root = root / "database" / "profile-provisioning"
             stale_login = provisioning_root / "logins" / "old-operation"
             stale_login.mkdir(parents=True)
             (stale_login / "session.db").write_bytes(b"temporary-session")
@@ -855,8 +876,8 @@ class ProfileProvisioningTests(unittest.TestCase):
             root = Path(temporary)
             config = make_config(root)
             profile_root = root / "profiles" / "novel"
-            old_root = profile_root / "root" / ".tdl" / "data" / "default"
-            old_export = profile_root / "user1" / ".tdl" / "data" / "default"
+            old_root = tdl_database(root, "novel", "root/.tdl")
+            old_export = tdl_database(root, "novel", "user1/.tdl")
             old_root.parent.mkdir(parents=True)
             old_export.parent.mkdir(parents=True)
             old_root.write_bytes(b"old-root-session")
@@ -878,8 +899,8 @@ class ProfileProvisioningTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             config = make_config(root)
-            old_root = root / "root" / ".tdl" / "data" / "default"
-            old_export = root / "user1" / ".tdl" / "data" / "default"
+            old_root = tdl_database(root, "default", "root/.tdl")
+            old_export = tdl_database(root, "default", "user1/.tdl")
             old_root.parent.mkdir(parents=True)
             old_export.parent.mkdir(parents=True)
             old_root.write_bytes(b"old-root-session")
@@ -909,7 +930,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertEqual(old_root.read_bytes(), b"new-session")
             self.assertEqual(old_export.read_bytes(), b"new-session")
             self.assertEqual(config.state_file.read_text(), "backend-state")
-            self.assertFalse((root / ".profile-provisioning-backups").exists())
+            self.assertFalse((root / "database/profile-provisioning/backups").exists())
 
     def test_committed_operation_retry_reuses_installed_lanes_without_replacing_them(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -920,7 +941,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             with patch.object(manager, "_run_whoami", return_value=88):
                 manager.install_bundle("novel", 88, bundle, "committed-retry")
             self.assertTrue(manager.commit_bundle("novel", "committed-retry"))
-            upload_db = root / "profiles" / "novel" / "upload" / ".tdl" / "data" / "default"
+            upload_db = tdl_database(root, "novel", "upload/.tdl")
             original_inode = upload_db.stat().st_ino
 
             with patch.object(manager, "_run_whoami", return_value=88):

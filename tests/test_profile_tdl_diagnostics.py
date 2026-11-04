@@ -25,10 +25,11 @@ def make_config(root: Path) -> AppConfig:
         export_failed_dir=root / "data/exports/failed",
         state_file=root / "data/state.json",
         legacy_max_json=root / "data/max.json",
+        database_root=root / "database",
         tdl_export_home=root / "data/user1",
         tdl_download_home=root / "data/root",
-        tdl_export_storage=root / "data/user1/.tdl",
-        tdl_download_storage=root / "data/root/.tdl",
+        tdl_export_storage=root / "database/tdl/default/export/.tdl",
+        tdl_download_storage=root / "database/tdl/default/download/.tdl",
         tdl_export_namespace="export-ns",
         tdl_download_namespace="download-ns",
         tdl_export_stall_timeout_seconds=300,
@@ -50,7 +51,12 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             json.dumps({"telegram_user_id": 424242}), encoding="utf-8"
         )
         for session in ("root/.tdl", "user1/.tdl"):
-            data = root / session / "data"
+            storage = (
+                Path(config.tdl_download_storage)
+                if session.startswith("root/")
+                else Path(config.tdl_export_storage)
+            )
+            data = storage / "data"
             data.mkdir(parents=True, exist_ok=True)
             namespace = "download-ns" if session.startswith("root/") else "export-ns"
             (data / namespace).write_bytes(b"bolt database")
@@ -342,7 +348,7 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             )
             self.assertTrue(all(not path.exists() for path, _data in snapshot_databases))
             self.assertEqual(
-                (profile_root / "root/.tdl/data/download-ns").read_bytes(),
+                (config.tdl_download_storage / "data/download-ns").read_bytes(),
                 b"bolt database",
             )
             self.assertNotIn("424242", json.dumps(result))
@@ -456,7 +462,7 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
 
             with patch("tme3bot.worker.profile_sessions.subprocess.run", side_effect=fake_run):
                 first = manager.diagnose_tdl_sessions("default")
-                (profile_root / "user1/.tdl/data/export-ns").write_bytes(
+                (config.tdl_export_storage / "data/export-ns").write_bytes(
                     b"changed export session"
                 )
                 second = manager.diagnose_tdl_sessions("default")
@@ -477,7 +483,7 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             root = Path(raw)
             config = make_config(root)
             profile_root = self.prepare_profile(config)
-            bolt_file = profile_root / "root/.tdl/data/download-ns"
+            bolt_file = config.tdl_download_storage / "data/download-ns"
             bolt_file.unlink()
             manager = ProfileSessionManager(config)
             with patch("tme3bot.worker.profile_sessions.subprocess.run") as run:

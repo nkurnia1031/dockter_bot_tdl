@@ -4,6 +4,7 @@ import logging
 from dataclasses import replace
 
 from tme3bot.config import AppConfig
+from tme3bot.database_paths import set_private_file_creation_umask
 
 
 def configure_logging(log_level: str) -> None:
@@ -16,6 +17,8 @@ def configure_logging(log_level: str) -> None:
 def main() -> None:
     config = AppConfig.from_env()
     config.validate_runtime()
+    if config.app_role in {"backend", "backend-queue", "worker"}:
+        set_private_file_creation_umask()
     configure_logging(config.log_level)
     if config.app_role == "backend":
         from tme3bot.composition import run_backend

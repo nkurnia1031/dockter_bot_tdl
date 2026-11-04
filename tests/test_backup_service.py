@@ -19,12 +19,14 @@ def make_config(root: Path) -> AppConfig:
         export_pending_dir=root / "exports/pending", export_processing_dir=root / "exports/processing",
         export_done_dir=root / "exports/done", export_failed_dir=root / "exports/failed",
         state_file=root / "state.json", legacy_max_json=root / "max.json",
+        database_root=root / "database",
         tdl_export_home=root / "user1", tdl_download_home=root / "root",
-        tdl_export_storage=root / "user1/.tdl", tdl_download_storage=root / "root/.tdl",
+        tdl_export_storage=root / "database/tdl/default/export/.tdl",
+        tdl_download_storage=root / "database/tdl/default/download/.tdl",
         tdl_export_namespace="default", tdl_download_namespace="default",
         tdl_export_stall_timeout_seconds=300, tdl_download_stall_timeout_seconds=1800,
         temp_root=root / "tmp", log_level="INFO", utility_settings_file=root / "utility_settings.json",
-        storage_db_file=root / "storage.db", backup_volume_size="45m",
+        storage_db_file=root / "database/gateway/storage.db", backup_volume_size="45m",
     )
 
 
@@ -46,7 +48,8 @@ class BackupServiceTests(unittest.TestCase):
             profile_root.mkdir(parents=True)
             (profile_root / "state.json").write_text('{"last_id": 888}', encoding="utf-8")
             (profile_root / "identity.json").write_text('{"telegram_user_id": 43}', encoding="utf-8")
-            journal = root / "worker-command-journal.sqlite3"
+            journal = root / "database/worker-command-journal.sqlite3"
+            journal.parent.mkdir(parents=True, exist_ok=True)
             db = sqlite3.connect(journal)
             try:
                 db.execute("CREATE TABLE journal_marker (value TEXT)")
@@ -54,6 +57,10 @@ class BackupServiceTests(unittest.TestCase):
                 db.commit()
             finally:
                 db.close()
+            public_links = root / "database/public-download-links.sqlite3"
+            with sqlite3.connect(public_links) as db:
+                db.execute("CREATE TABLE links_marker (value TEXT)")
+                db.execute("INSERT INTO links_marker VALUES ('active-link')")
             service = BackupService(config)
             staging = root / "worker-staging"
 
@@ -73,6 +80,13 @@ class BackupServiceTests(unittest.TestCase):
                 )
             finally:
                 db.close()
+            links_snapshot = staging / "data/public-download-links.sqlite3"
+            self.assertTrue(links_snapshot.is_file())
+            with sqlite3.connect(links_snapshot) as db:
+                self.assertEqual(
+                    db.execute("SELECT value FROM links_marker").fetchone()[0],
+                    "active-link",
+                )
 
     def test_runtime_staging_includes_json_and_excludes_workspace_media(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -87,8 +101,8 @@ class BackupServiceTests(unittest.TestCase):
             vault_key.parent.mkdir(parents=True)
             vault_key.write_bytes(b"encrypted-session-vault-test-key")
             (root / "utility_settings.json").write_text(json.dumps({"compress_password": "secret"}), encoding="utf-8")
-            catalog = StorageCatalog(root / "storage.db")
-            source_repository = SqliteSourceRepository(root / "storage.db")
+            catalog = StorageCatalog(config.storage_db_file)
+            source_repository = SqliteSourceRepository(config.storage_db_file)
             source_repository.apply_migration_plan(
                 migration_id="backup-test-migration", plan_sha256="a" * 64,
                 backup_sha256="b" * 64,

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from tme3bot.channel_ref import channel_chat_id, channel_tdl_ref, compact_channel_ref
+from tme3bot.database_paths import DatabasePaths
 
 try:
     from dotenv import load_dotenv
@@ -15,6 +16,26 @@ except (
 
     def load_dotenv(*args, **kwargs):
         return False
+
+
+def _database_path(
+    configured: str,
+    default: Path,
+    database_root: Path,
+    name: str,
+) -> Path:
+    if not str(configured or "").strip():
+        return default
+    path = Path(configured).expanduser()
+    root = database_root.expanduser().resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{name} harus berada di bawah DATABASE_ROOT.") from exc
+    if not path.is_absolute():
+        raise ValueError(f"{name} harus berupa absolute path di bawah DATABASE_ROOT.")
+    return path
 
 
 @dataclass(frozen=True)
@@ -41,6 +62,7 @@ class AppConfig:
     tdl_download_stall_timeout_seconds: int
     temp_root: Path
     log_level: str
+    database_root: Path = Path("/database")
     app_role: str = "backend"
     leave_helper_binary: str = "/usr/local/bin/tdl-leave"
     utility_workspace_root: Path = Path("/workspace")
@@ -53,7 +75,7 @@ class AppConfig:
     storage_channel_id: int = 0
     storage_channel_username: str = ""
     storage_channel: str = ""
-    storage_db_file: Path = Path("/data/storage.db")
+    storage_db_file: Path = Path("/database/gateway/storage.db")
     storage_trash_retention_days: int = 30
     backup_enabled: bool = True
     backup_channel_ref: str = ""
@@ -181,14 +203,22 @@ class AppConfig:
 
         state_file = Path(os.getenv("STATE_FILE", "/data/state.json"))
         legacy_max_json = Path(os.getenv("LEGACY_MAX_JSON", "/data/max.json"))
+        database_root = Path(os.getenv("DATABASE_ROOT", "/database"))
+        database_paths = DatabasePaths(database_root)
 
         tdl_export_home = Path(os.getenv("TDL_EXPORT_HOME", "/data/user1"))
         tdl_download_home = Path(os.getenv("TDL_DOWNLOAD_HOME", "/data/root"))
-        tdl_export_storage = Path(
-            os.getenv("TDL_EXPORT_STORAGE", str(tdl_export_home / ".tdl"))
+        tdl_export_storage = _database_path(
+            os.getenv("TDL_EXPORT_STORAGE", ""),
+            database_paths.tdl(default_profile, "export"),
+            database_root,
+            "TDL_EXPORT_STORAGE",
         )
-        tdl_download_storage = Path(
-            os.getenv("TDL_DOWNLOAD_STORAGE", str(tdl_download_home / ".tdl"))
+        tdl_download_storage = _database_path(
+            os.getenv("TDL_DOWNLOAD_STORAGE", ""),
+            database_paths.tdl(default_profile, "download"),
+            database_root,
+            "TDL_DOWNLOAD_STORAGE",
         )
         tdl_export_namespace = (
             os.getenv("TDL_EXPORT_NAMESPACE", "default").strip() or "default"
@@ -224,7 +254,12 @@ class AppConfig:
             storage_channel_id = channel_chat_id(storage_channel) or (int(raw_storage_channel_id) if raw_storage_channel_id else 0)
         except ValueError as exc:
             raise ValueError("STORAGE_CHANNEL_ID harus berupa angka Telegram chat ID.") from exc
-        storage_db_file = Path(os.getenv("STORAGE_DB_FILE", "/data/storage.db"))
+        storage_db_file = _database_path(
+            os.getenv("STORAGE_DB_FILE", str(database_paths.sqlite("gateway/storage.db"))),
+            database_paths.sqlite("gateway/storage.db"),
+            database_root,
+            "STORAGE_DB_FILE",
+        )
         storage_trash_retention_days = max(
             1, int(os.getenv("STORAGE_TRASH_RETENTION_DAYS", "30"))
         )
@@ -277,6 +312,7 @@ class AppConfig:
             export_failed_dir=export_failed_dir,
             state_file=state_file,
             legacy_max_json=legacy_max_json,
+            database_root=database_root,
             tdl_export_home=tdl_export_home,
             tdl_download_home=tdl_download_home,
             tdl_export_storage=tdl_export_storage,
@@ -362,7 +398,9 @@ class AppConfig:
                 for value in os.getenv("TTS_TOR_CONTROL_PORTS", "9051,9051,9051").split(",")
                 if value.strip()
             ),
-            tts_data_root=Path(os.getenv("TTS_DATA_ROOT", "/data/tts")),
+            # TTS_DATA_ROOT holds generated audio artifacts, not a database.
+            # Keep potentially large job outputs on the worker data volume.
+            tts_data_root=Path(os.getenv("TTS_DATA_ROOT", "/data/tts")).expanduser(),
             tts_part_retries=max(0, int(os.getenv("TTS_PART_RETRIES", "4"))),
             tts_retry_base_seconds=max(0.1, float(os.getenv("TTS_RETRY_BASE_SECONDS", "2"))),
             tts_newnym_after_retries=max(1, int(os.getenv("TTS_NEWNYM_AFTER_RETRIES", "3"))),

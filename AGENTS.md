@@ -120,7 +120,7 @@ nama key dan status configured/missing.
 - `domain/`, `application/`, dan `infrastructure/` menerapkan ports/adapters,
   job state machine, repository, auth bot challenge, dan worker strategy.
 - `profiles.py` menentukan runtime profile dan authorization dari `identity.json`.
-- Seluruh proses TDL worker berjalan sebagai root. Lane Export/leave memakai HOME `/data/user1` dan storage `user1/.tdl`; lane Download memakai HOME `/data/root` dan storage `root/.tdl`. Nama folder adalah label historis, bukan akun Linux. Jangan gabungkan folder `.tdl`.
+- Seluruh proses TDL worker berjalan sebagai root. HOME Export/leave tetap `/data/user1` dan Download `/data/root`; Bolt store masing-masing lane berada di `/database/tdl/<profile>/<export|download|upload>/.tdl`. Nama HOME historis bukan akun Linux, dan sesi antar-lane tetap terpisah.
 - `service.py` mengorkestrasi export/download; `tdl.py` menjalankan subprocess dan menangani output ANSI/PTY.
 - `application/control_plane.py` mengorkestrasi command/query dan lifecycle job.
 - `worker/executor.py` menangani export/download/leave, utility, storage, dan
@@ -139,15 +139,20 @@ nama key dan status configured/missing.
   menyimpan worker asalnya saat dibuat, sehingga perubahan route hanya berlaku
   untuk job baru dan tidak memindahkan job aktif. `state.json` gateway adalah
   sumber kebenaran lintas VPS untuk source, `last_id`, label, dan warmup.
-- Database SQLite gateway dipasang terpisah dari profile/state dan Workspace:
-  `GATEWAY_DB_ROOT` (production: `/srv/tme3bot/gateway-db`) di-mount ke
-  `/gateway-db`, dengan `STORAGE_DB_FILE=/gateway-db/storage.db`. Lokasi ini
-  harus tetap pada filesystem persisten gateway yang berlatensi rendah; jangan
-  memindahkan database ke Workspace atau writable layer container. Data profile
-  dan state tetap mengikuti `GATEWAY_DATA_ROOT`. Salinan lama di
-  `$GATEWAY_DATA_ROOT/storage.db` dipertahankan sebagai snapshot rollback beku;
-  jangan arahkan service kembali ke sana tanpa menyalin database aktif terbaru
-  terlebih dahulu.
+- Semua database persisten memakai host `DATABASE_ROOT` pada filesystem OS,
+  terpisah dari volume data dan Workspace bila host memiliki disk berbeda.
+  `run.py` memvalidasi filesystem, symlink, mount tersarang, permission root,
+  dan kepemilikan Redis sebelum Compose berjalan. Gateway memakai
+  `/database/gateway/storage.db` serta Redis `/database/redis`; worker-local
+  memakai `/database/worker-local`, dan setiap worker remote memakai
+  `/database`. SQLite worker, TDL/Bolt per profile/lane, dan staging clone TDL
+  Quick Mode juga harus berada di bawah `/database`. Gunakan
+  `tme3bot.database_paths.DatabasePaths` untuk membentuk path. `/data` tetap
+  menyimpan metadata/profile serta artifact audio TTS di `/data/tts`;
+  artifact audio bukan database dan bisa berukuran besar. `/workspace` menyimpan
+  file pengguna dan staging besar. Database/cache persisten TTS di masa depan
+  wajib di bawah `/database/tts`. Migrasi host harus menunggu job terminal dan menghentikan writer,
+  membuat snapshot konsisten, lalu mempertahankan salinan lama untuk rollback.
 
 ### Model target fitur saat ini
 
