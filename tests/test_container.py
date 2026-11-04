@@ -149,6 +149,8 @@ class ContainerBuildTests(unittest.TestCase):
             self.assertIn("queue-private", redis["networks"])
             self.assertIn("queue-private", runner["networks"])
             self.assertEqual(runner["environment"]["APP_ROLE"], "backend-queue")
+            self.assertEqual(runner["environment"]["DATABASE_ROOT"], "/database")
+            self.assertEqual(runner["environment"]["STORAGE_DB_FILE"], "/database/gateway/storage.db")
             self.assertEqual(runner["environment"]["REDIS_URL"], "redis://redis:6379/0")
             self.assertEqual(runner["environment"]["BOT_TOKEN"], "")
             self.assertNotIn("BACKEND_INTERNAL_TOKEN", runner["environment"])
