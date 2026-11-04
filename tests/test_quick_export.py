@@ -42,6 +42,8 @@ class WorkerExecutorTestCase(unittest.TestCase):
     def make_executor(self, config, profile_manager, publisher):
         if not getattr(config, "state_file", None):
             config.state_file = Path(self.worker_settings_tmp.name) / "state.json"
+        if not getattr(config, "database_root", None):
+            config.database_root = Path(self.worker_settings_tmp.name) / "database"
         return WorkerJobExecutor(config, profile_manager, publisher)
 
     def make_media(self, root: Path, names: list[str]) -> None:
