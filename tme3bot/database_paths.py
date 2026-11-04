@@ -18,7 +18,7 @@ _SAFE_SEGMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 
 
 class DatabasePaths:
-    """Resolve SQLite and TDL paths beneath one mounted database root."""
+    """Resolve persistent database and provisioning paths under one root."""
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
@@ -45,6 +45,29 @@ class DatabasePaths:
             raise ValueError("Database path contains an unsafe segment.")
         return self._safe_join(*relative.parts)
 
+    def redis_directory(self) -> Path:
+        return self._safe_join("redis")
+
+    def profile_provisioning(self, *parts: str) -> Path:
+        """Resolve private session-provisioning staging and rollback paths."""
+
+        if any(not _SAFE_SEGMENT.fullmatch(str(part or "")) for part in parts):
+            raise ValueError("Invalid profile-provisioning path segment.")
+        return self._safe_join("profile-provisioning", *parts)
+
+    def tdl_profile(self, profile: str) -> Path:
+        normalized = normalize_profile_name(str(profile or ""))
+        if not normalized:
+            raise ValueError("Invalid profile name for TDL database path.")
+        return self._safe_join("tdl", normalized)
+
+    def tdl_staging_lane(self, profile: str, lane: str) -> Path:
+        normalized = normalize_profile_name(str(profile or ""))
+        lane_name = str(lane or "").strip().lower()
+        if not normalized or not _SAFE_SEGMENT.fullmatch(lane_name):
+            raise ValueError("Invalid profile or lane for TDL staging path.")
+        return self._safe_join("tdl-staging", normalized, lane_name)
+
     def tdl(self, profile: str, lane: str) -> Path:
         normalized = normalize_profile_name(str(profile or ""))
         if not normalized:
@@ -62,7 +85,9 @@ class DatabasePaths:
             raise ValueError("Invalid profile or lane for TDL staging path.")
         if not _SAFE_SEGMENT.fullmatch(operation):
             raise ValueError("Invalid operation ID for TDL staging path.")
-        return self._safe_join("tdl-staging", normalized, lane_name, operation, ".tdl")
+        return self._safe_join(
+            "tdl-staging", normalized, lane_name, operation, ".tdl"
+        )
 
 
 def set_private_file_creation_umask() -> int | None:
@@ -118,8 +143,42 @@ def filesystem_identity(path: Path | str) -> FilesystemIdentity:
         if value:
             mount_point = os.path.realpath(value)
     except (OSError, subprocess.CalledProcessError):
-        pass
+        mount_point = None
+    if mount_point is None:
+        mount_point = _mount_point_from_mountinfo(candidate)
+    if mount_point is None:
+        raise ValueError(f"Tidak dapat memverifikasi mount filesystem untuk {candidate}.")
     return FilesystemIdentity(device, mount_point)
+
+
+def _mount_point_from_mountinfo(
+    candidate: Path, mountinfo: str | None = None
+) -> str | None:
+    """Find the longest containing mountpoint in Linux mountinfo."""
+
+    if mountinfo is None:
+        try:
+            mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+        except OSError:
+            return None
+    lines = mountinfo.splitlines()
+    resolved = Path(os.path.realpath(candidate))
+    matches: list[Path] = []
+    for line in lines:
+        fields = line.split(" - ", 1)[0].split()
+        if len(fields) < 5:
+            continue
+        raw_target = re.sub(
+            r"\\([0-7]{3})",
+            lambda match: chr(int(match.group(1), 8)),
+            fields[4],
+        )
+        target = Path(raw_target)
+        if target == resolved or target in resolved.parents:
+            matches.append(target)
+    if not matches:
+        return None
+    return str(max(matches, key=lambda item: len(item.parts)))
 
 
 def _same_filesystem(left: FilesystemIdentity, right: FilesystemIdentity) -> bool:

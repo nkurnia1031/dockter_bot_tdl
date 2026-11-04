@@ -36,10 +36,10 @@ services:
   redis:
     image: redis:7.4-alpine
     user: "${REDIS_UID:-999}:${REDIS_GID:-1000}"
-    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
+    command: ["redis-server", "--dir", "/database", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory-policy", "noeviction"]
     restart: unless-stopped
     volumes:
-      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/redis:/data
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/redis:/database
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

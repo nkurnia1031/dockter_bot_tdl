@@ -571,7 +571,7 @@ def deploy_all(env: dict[str, str], arguments: list[str]) -> None:
     else:
         ensure_profile_root(target_env)
         compose_env_values = dict(target_env)
-        compose_env_values["COMPOSE_FILE"] = compose_files_for_target(target, target_env)
+        compose_env_values["COMPOSE_FILE"] = compose_files_for_target(target)
         run_compose(["up", "-d", "--remove-orphans"], compose_env_values)
         run_compose(["ps"], compose_env_values)
 
@@ -797,11 +797,6 @@ def database_root_role(env: dict[str, str], role: str | None = None) -> str:
 
 def database_root_value(env: dict[str, str], role: str | None = None) -> str:
     configured = env.get("DATABASE_ROOT", "").strip()
-    if not configured:
-        # Preserve the existing gateway database location during the first
-        # deploy after this setting is introduced. The explicit migration
-        # ticket moves data only after writers have been drained.
-        configured = env.get("GATEWAY_DB_ROOT", "").strip()
     if configured:
         return configured
     instance = "gateway" if database_root_role(env, role) == "gateway" else "worker"
@@ -839,7 +834,7 @@ def ensure_database_root(env: dict[str, str], *, role: str | None = None) -> Pat
         if os.name == "posix":
             validation.path.chmod(0o700)
         if database_root_role(env, role) == "gateway":
-            redis_data = validation.path / "redis"
+            redis_data = DatabasePaths(validation.path).redis_directory()
             redis_data.mkdir(mode=0o700, exist_ok=True)
             if os.name == "posix":
                 redis_data.chmod(0o700)
@@ -952,12 +947,7 @@ def compose_base_command(dotenv: dict[str, str] | None = None) -> list[str]:
     return command
 
 
-def compose_files_for_target(
-    target: str,
-    env: dict[str, str] | None = None,
-    *,
-    include_overrides: bool = True,
-) -> str:
+def compose_files_for_target(target: str) -> str:
     files = {
         "gateway": ["docker-compose.gateway.yml"],
         "worker": ["docker-compose.worker.yml"],
@@ -966,17 +956,6 @@ def compose_files_for_target(
         selected = list(files[target])
     except KeyError as exc:
         raise RuntimeError("Target deploy harus gateway atau worker.") from exc
-    if include_overrides and env is not None:
-        primary_names = {"docker-compose.gateway.yml", "docker-compose.worker.yml"}
-        for path in (env.get("COMPOSE_FILE") or "").split(os.pathsep):
-            candidate = path.strip()
-            if not candidate:
-                continue
-            name = Path(candidate.replace("\\", "/")).name.lower()
-            if name in primary_names or name.startswith("docker-compose.resolver"):
-                continue
-            if candidate not in selected:
-                selected.append(candidate)
     return os.pathsep.join(selected)
 
 
@@ -1126,13 +1105,13 @@ def deploy_application(
     # `python3 run.py deploy web` and never participates in Docker builds.
     deploy_env["IMAGE_TAG"] = release_image_tag(deploy_env)
     if target == "gateway":
-        deploy_env["COMPOSE_FILE"] = compose_files_for_target(target, deploy_env)
+        deploy_env["COMPOSE_FILE"] = compose_files_for_target(target)
     elif target == "worker":
         # Compose interpolation happens before env_file is loaded. Import
         # PROFILE_ROOT (and other useful defaults) so ${PROFILE_ROOT} in the
         # worker volume is valid for both build and pull deployments.
         merge_env_file(deploy_env, deploy_env.get("WORKER_ENV_FILE", ".env.worker"))
-        deploy_env["COMPOSE_FILE"] = compose_files_for_target(target, deploy_env)
+        deploy_env["COMPOSE_FILE"] = compose_files_for_target(target)
 
     ensure_profile_root(deploy_env)
     if start_services:
@@ -1339,9 +1318,7 @@ def publish_application(env: dict[str, str], arguments: list[str]) -> None:
         login_registry(publish_env)
     for item in targets:
         target_env = dict(publish_env)
-        target_env["COMPOSE_FILE"] = compose_files_for_target(
-            item, target_env, include_overrides=False
-        )
+        target_env["COMPOSE_FILE"] = compose_files_for_target(item)
         deploy_application(target_env, [item], start_services=False)
         run_compose(["push"], target_env)
         print(f"Image {item} berhasil dipublish dengan tag {target_env['IMAGE_TAG']}.")
@@ -1442,9 +1419,7 @@ def migrate_images(env: dict[str, str]) -> Path:
     ):
         build_env = dict(env)
         build_env.update(example_overrides)
-        build_env["COMPOSE_FILE"] = compose_files_for_target(
-            target, build_env, include_overrides=False
-        )
+        build_env["COMPOSE_FILE"] = compose_files_for_target(target)
         run_compose(["build"], build_env)
         output = capture_compose(["config", "--images"], build_env)
         resolved = [line.strip() for line in output.splitlines() if line.strip()]

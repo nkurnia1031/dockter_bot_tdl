@@ -72,12 +72,14 @@ class ProfileSessionManager:
 
     def __init__(self, config: Any) -> None:
         self.config = config
-        self.database_root = Path(getattr(config, "database_root", "/database"))
-        self.root = self.database_root / "profile-provisioning"
+        self.database_paths = DatabasePaths(
+            getattr(config, "database_root", "/database")
+        )
+        self.root = self.database_paths.profile_provisioning()
         ensure_private_directory(self.root)
         if os.name == "posix":
             self._set_private_tree(self.root)
-        self.login_root = self.root / "logins"
+        self.login_root = self.database_paths.profile_provisioning("logins")
         self.login_root.mkdir(parents=True, exist_ok=True)
         if os.name == "posix":
             self._set_private_tree(self.login_root)
@@ -324,7 +326,9 @@ class ProfileSessionManager:
         expected_identity = int(telegram_user_id)
         if expected_identity < 1:
             raise ValueError("Identity Telegram tidak valid.")
-        stage_root = self.root / "stages" / normalized / operation_id
+        stage_root = self.database_paths.profile_provisioning(
+            "stages", normalized, operation_id
+        )
         backup_root = self._backup_directory(normalized, operation_id)
         marker = profile_root / ".profile-provisioning.json"
         upload_marker_path = profile_root / "upload" / _UPLOAD_LANE_MARKER
@@ -335,7 +339,7 @@ class ProfileSessionManager:
             profile_root / "upload",
             upload_marker_path,
             self.root,
-            self.root / "stages",
+            self.database_paths.profile_provisioning("stages"),
             backup_root.parent.parent,
             stage_root,
             backup_root.parent,
@@ -807,7 +811,9 @@ class ProfileSessionManager:
             except _ProfileInstallFailure:
                 return False
         profile_config = build_profile_config(self.config, normalized)
-        self._remove_path(self.root / "stages" / normalized / operation_id)
+        self._remove_path(
+            self.database_paths.profile_provisioning("stages", normalized, operation_id)
+        )
         self._remove_path(profile_root / f".{normalized}.provision-{operation_id}")
         for relative in _PROFILE_INSTALL_LANES:
             # A two-lane transaction marker predates managed Upload state.
@@ -885,7 +891,7 @@ class ProfileSessionManager:
                 status_code=409,
             )
         expected = profiles_root / normalized
-        database_profile_root = DatabasePaths(self.database_root).root / "tdl" / normalized
+        database_profile_root = self.database_paths.tdl_profile(normalized)
         configured = Path(build_profile_config(self.config, normalized).profile_root)
         if configured != expected or expected.name != normalized:
             raise DomainError(
@@ -958,7 +964,9 @@ class ProfileSessionManager:
 
     def _backup_directory(self, profile: str, operation_id: str) -> Path:
         profile_root = Path(build_profile_config(self.config, profile).profile_root)
-        current = self.root / "backups" / operation_id / profile
+        current = self.database_paths.profile_provisioning(
+            "backups", operation_id, profile
+        )
         legacy_paths = (
             profile_root / ".profile-provisioning-backups" / operation_id / profile,
             Path(getattr(self.config, "temp_root", "/data/tmp"))
@@ -991,7 +999,10 @@ class ProfileSessionManager:
         raise ValueError("Unknown staged TDL lane.")
 
     def _remove_empty_database_backup_root(self) -> None:
-        for path in (self.root / "backups", self.root / "stages"):
+        for path in (
+            self.database_paths.profile_provisioning("backups"),
+            self.database_paths.profile_provisioning("stages"),
+        ):
             try:
                 path.rmdir()
             except OSError:

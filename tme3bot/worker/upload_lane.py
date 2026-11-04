@@ -200,7 +200,13 @@ class UploadLanePreparer:
 
             self._set_progress(profile, "waiting_idle", 5)
             held_locks = self._acquire_profile_locks(profile)
-            self._recover_interrupted_install(profile_root, upload_home, upload_storage)
+            self._recover_interrupted_install(
+                profile,
+                profile_root,
+                upload_home,
+                upload_storage,
+                database_paths,
+            )
 
             self._set_progress(profile, "validating_source", 15)
             self._check_session(source_storage, namespace, source_home, "PROFILE_EXPORT_SESSION_INVALID")
@@ -474,12 +480,15 @@ class UploadLanePreparer:
             self._remove_tree(backup)
 
     def _recover_interrupted_install(
-        self, profile_root: Path, upload_home: Path, upload_storage: Path
+        self,
+        profile: str,
+        profile_root: Path,
+        upload_home: Path,
+        upload_storage: Path,
+        database_paths: DatabasePaths,
     ) -> None:
         backups = sorted(upload_storage.parent.glob(".upload-backup-*"), key=lambda path: path.name)
-        database_root = upload_storage.parents[3]
-        profile_name = upload_storage.parents[1].name
-        staging_root = database_root / "tdl-staging" / profile_name / "upload"
+        staging_root = database_paths.tdl_staging_lane(profile, "upload")
         candidates = list(profile_root.glob(".upload-candidate-*"))
         if upload_home.is_symlink() or upload_storage.is_symlink():
             raise _PreparationFailure("PROFILE_UPLOAD_LANE_UNSAFE")

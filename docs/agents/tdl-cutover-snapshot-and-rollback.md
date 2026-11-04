@@ -1,5 +1,12 @@
 # Snapshot, canary, dan rollback storage TDL
 
+> **Runbook historis.** Prosedur ini hanya berlaku untuk migrasi sebelum
+> Bolt/TDL dipindahkan ke `DATABASE_ROOT`. Deployment saat ini menyimpan lane di
+> `/database/tdl/<profile>/<lane>/.tdl`; jangan jalankan snapshot atau restore
+> `/data/{root,user1}/.tdl` dari langkah lama untuk deployment saat ini. Untuk
+> lokasi persisten gunakan kontrak pada issue #91 dan prosedur cutover #96.
+> Diagnosis sesi read-only pada dokumen ini tetap dapat dipakai.
+
 Runbook ini mengamankan dua storage TDL pada satu worker sebelum cutover image yang menjalankan semua proses TDL sebagai root. Jalankan terpisah untuk setiap worker. Dokumen ini tidak mengubah vault dan tidak menjalankan deployment production.
 
 Cakupan snapshot:

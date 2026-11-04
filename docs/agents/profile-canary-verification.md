@@ -5,9 +5,11 @@ profil-worker untuk canary vault. Perintah di sini hanya membaca sesi dan
 arsip; tidak mengadopsi, memasang, atau memulihkan sesi. Jangan mengirim hasil
 diagnosis yang belum lolos ke issue sebagai bukti kesiapan.
 
-Sebelum cutover proses TDL, ikuti [runbook snapshot, canary, dan rollback
-storage TDL](tdl-cutover-snapshot-and-rollback.md). Dokumen ini melengkapi
-runbook itu dengan diagnosis sesi dan verifikasi arsip backup.
+Diagnosis sesi dan verifikasi arsip backup di dokumen ini tetap berlaku.
+Runbook snapshot/rollback yang ditautkan di bawah bersifat historis dan hanya
+untuk migrasi TDL lama dari `/data`; deployment sekarang memakai
+`/database/tdl/<profile>/<lane>/.tdl`. Untuk pemindahan database host gunakan
+prosedur operasional issue #96.
 
 ## Diagnosis sesi pada worker
 

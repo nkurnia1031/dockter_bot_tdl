@@ -61,6 +61,14 @@ class BackupServiceTests(unittest.TestCase):
             with sqlite3.connect(public_links) as db:
                 db.execute("CREATE TABLE links_marker (value TEXT)")
                 db.execute("INSERT INTO links_marker VALUES ('active-link')")
+            for profile_name in ("default", "novel"):
+                for lane in ("download", "export", "upload"):
+                    session = (
+                        root / "database" / "tdl" / profile_name / lane
+                        / ".tdl" / "data" / "default"
+                    )
+                    session.parent.mkdir(parents=True, exist_ok=True)
+                    session.write_text(f"{profile_name}-{lane}", encoding="utf-8")
             service = BackupService(config)
             staging = root / "worker-staging"
 
@@ -70,7 +78,7 @@ class BackupServiceTests(unittest.TestCase):
             self.assertFalse((staging / "data/max.json").exists())
             self.assertFalse((staging / "data/profiles/novel/state.json").exists())
             self.assertTrue((staging / "data/identity.json").exists())
-            snapshot = staging / "data/worker-command-journal.sqlite3"
+            snapshot = staging / "database/worker-command-journal.sqlite3"
             self.assertTrue(snapshot.is_file())
             db = sqlite3.connect(snapshot)
             try:
@@ -80,13 +88,22 @@ class BackupServiceTests(unittest.TestCase):
                 )
             finally:
                 db.close()
-            links_snapshot = staging / "data/public-download-links.sqlite3"
+            links_snapshot = staging / "database/public-download-links.sqlite3"
             self.assertTrue(links_snapshot.is_file())
             with sqlite3.connect(links_snapshot) as db:
                 self.assertEqual(
                     db.execute("SELECT value FROM links_marker").fetchone()[0],
                     "active-link",
                 )
+            for profile_name in ("default", "novel"):
+                for lane in ("download", "export", "upload"):
+                    self.assertTrue(
+                        (
+                            staging / "database" / "tdl" / profile_name / lane
+                            / ".tdl" / "data" / "default"
+                        ).is_file()
+                    )
+            self.assertFalse((staging / "data/root/.tdl").exists())
 
     def test_runtime_staging_includes_json_and_excludes_workspace_media(self):
         with tempfile.TemporaryDirectory() as temp_dir:

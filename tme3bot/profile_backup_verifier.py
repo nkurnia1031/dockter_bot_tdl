@@ -135,7 +135,9 @@ def verify_profile_backup(
                         raise _VerificationFailure("BACKUP_MANIFEST_MISSING")
                     if not bool(archive.needs_password()):
                         raise _VerificationFailure("BACKUP_ARCHIVE_NOT_ENCRYPTED")
-                    expected_root, expected_user1 = _expected_session_prefixes(normalized)
+                    expected_root, expected_user1 = _expected_session_prefixes(
+                        normalized, archive_names
+                    )
                     identity_entry = _expected_identity_entry(normalized)
                     targets = _selected_extract_targets(
                         names,
@@ -419,7 +421,18 @@ def _verify_manifest_selection(manifest: Any, run_id: str, node_name: str) -> No
         raise _VerificationFailure("BACKUP_MANIFEST_INVALID") from None
 
 
-def _expected_session_prefixes(profile: str) -> tuple[str, str]:
+def _expected_session_prefixes(profile: str, archive_names: list[str]) -> tuple[str, str]:
+    """Prefer canonical database paths while accepting existing legacy backups."""
+
+    canonical = (
+        f"database/tdl/{profile}/download/.tdl/data/",
+        f"database/tdl/{profile}/export/.tdl/data/",
+    )
+    if any(
+        name.startswith(canonical[0]) or name.startswith(canonical[1])
+        for name in archive_names
+    ):
+        return canonical
     if profile == "default":
         return "data/root/.tdl/data/", "data/user1/.tdl/data/"
     base = f"data/profiles/{profile}/"

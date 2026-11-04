@@ -8,6 +8,7 @@ from pathlib import Path
 from tme3bot.database_paths import (
     DatabasePaths,
     FilesystemIdentity,
+    _mount_point_from_mountinfo,
     set_private_file_creation_umask,
     validate_database_root,
 )
@@ -26,6 +27,24 @@ class DatabasePathsTests(unittest.TestCase):
             Path("/database/worker-local/tdl/bot-01/upload/.tdl"),
         )
         self.assertNotEqual(paths.tdl("default", "export"), paths.tdl("default", "download"))
+
+    def test_provisioning_and_tdl_staging_paths_use_validated_database_root(self) -> None:
+        paths = DatabasePaths(Path("/database/worker-local"))
+
+        self.assertEqual(
+            paths.profile_provisioning("stages", "irang", "operation-1"),
+            Path("/database/worker-local/profile-provisioning/stages/irang/operation-1"),
+        )
+        self.assertEqual(
+            paths.tdl_profile("irang"),
+            Path("/database/worker-local/tdl/irang"),
+        )
+        self.assertEqual(
+            paths.tdl_staging_lane("irang", "upload"),
+            Path("/database/worker-local/tdl-staging/irang/upload"),
+        )
+        with self.assertRaises(ValueError):
+            paths.profile_provisioning("stages", "../workspace")
 
     def test_database_paths_reject_traversal_and_invalid_lane(self) -> None:
         paths = DatabasePaths(Path("/database"))
@@ -108,6 +127,17 @@ class DatabasePathsTests(unittest.TestCase):
                 workspace_paths=[Path("/workspace")],
                 filesystem_identity=lambda path: identities[str(path)],
             )
+
+    def test_mountinfo_fallback_selects_nested_mountpoint_and_unescapes_spaces(self) -> None:
+        mountinfo = (
+            "1 0 8:1 / / rw - ext4 /dev/root rw\n"
+            "2 1 8:1 /nested /srv/database\\040ssd rw - ext4 /dev/root rw\n"
+        )
+
+        self.assertEqual(
+            _mount_point_from_mountinfo(Path("/srv/database ssd/db"), mountinfo),
+            "/srv/database ssd",
+        )
 
     def test_single_filesystem_is_allowed_with_warning(self) -> None:
         same = FilesystemIdentity(1, "/")

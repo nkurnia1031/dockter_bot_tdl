@@ -184,7 +184,7 @@ Detail konfigurasi dan rollout ada di [runbook TTS Novel](TTS_NOVEL_RUNBOOK.md).
 | Job, event, antrean, autentikasi, katalog export dan storage | SQLite backend, `/database/gateway/storage.db` | Menyimpan lifecycle job dan progress yang dibaca UI. Host memasang `DATABASE_ROOT` dari filesystem OS. |
 | Identity, profile, source, route worker, label, dan pengaturan | File JSON di `/data` | Credential dan token tidak boleh ditulis ke log atau dikirim ke Web. |
 | Sesi TDL | `/database/tdl/<profile>/<lane>/.tdl` pada masing-masing worker | Semua proses TDL berjalan sebagai root. Lane Export memakai lane `export`; Download `download`; Upload `upload`. Host memasang `DATABASE_ROOT` dari filesystem OS. |
-| SQLite worker | `/database/worker-command-journal.sqlite3` dan `/database/public-download-links.sqlite3` | Backup worker mengambil snapshot konsisten dari kedua file. |
+| SQLite worker | `/database/worker-command-journal.sqlite3` dan `/database/public-download-links.sqlite3` | Backup worker mengambil snapshot konsisten ke prefix arsip `database/`; verifier menerima format kanonis dan arsip lama. |
 | Artifact audio TTS | `/data/tts` pada worker | MP3 hasil job adalah data operasional, bukan database; cache atau database persisten TTS harus memakai `/database/tts`. |
 | File kerja dan staging | Workspace worker, `/workspace` | Operasi berjalan pada filesystem worker yang dipilih. |
 

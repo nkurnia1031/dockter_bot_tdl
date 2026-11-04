@@ -151,7 +151,7 @@ class RunScriptTests(unittest.TestCase):
             "SAFELINK_RESOLVER_ENABLED": "true",
         }
         self.assertEqual(
-            run.compose_files_for_target("worker", env).split(run.os.pathsep),
+            run.compose_files_for_target("worker").split(run.os.pathsep),
             ["docker-compose.worker.yml"],
         )
         command = run.compose_base_command(env)
@@ -325,7 +325,7 @@ class RunScriptTests(unittest.TestCase):
             ["docker-compose.worker.yml"],
         )
 
-    def test_deploy_preserves_custom_compose_override_but_filters_resolver(self) -> None:
+    def test_target_deploy_uses_only_primary_compose_file(self) -> None:
         env = {
             "COMPOSE_FILE": run.os.pathsep.join(
                 [
@@ -337,14 +337,7 @@ class RunScriptTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            run.compose_files_for_target("gateway", env).split(run.os.pathsep),
-            [
-                "docker-compose.gateway.yml",
-                "/srv/tme3bot/ssd-upload-test/compose.override.yml",
-            ],
-        )
-        self.assertEqual(
-            run.compose_files_for_target("gateway", env, include_overrides=False),
+            run.compose_files_for_target("gateway"),
             "docker-compose.gateway.yml",
         )
 
@@ -380,7 +373,7 @@ class RunScriptTests(unittest.TestCase):
             worker_build_env["PROFILE_ROOT"], "/tmp/tme3bot-worker-build"
         )
         self.assertEqual(
-            worker_build_env["COMPOSE_FILE"], run.compose_files_for_target("worker", env)
+            worker_build_env["COMPOSE_FILE"], run.compose_files_for_target("worker")
         )
         for build_env in [call.args[1] for call in run_compose.call_args_list]:
             self.assertNotIn("docker-compose.resolver.yml", build_env["COMPOSE_FILE"])

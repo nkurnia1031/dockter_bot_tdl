@@ -171,8 +171,10 @@ class BackupService:
     def _build_worker_staging(self, staging: Path) -> None:
         data_root = Path(self.config.profile_root)
         data_target = staging / "data"
+        database_target = staging / "database"
         database_paths = DatabasePaths(getattr(self.config, "database_root", "/database"))
         data_target.mkdir(parents=True, exist_ok=True)
+        database_target.mkdir(parents=True, exist_ok=True)
         for name in ("identity.json", "profile.json"):
             self._copy_file(data_root / name, data_target / name)
         self._copy_profile_metadata(
@@ -180,34 +182,32 @@ class BackupService:
         )
         self._backup_sqlite_snapshot(
             database_paths.sqlite("worker-command-journal.sqlite3"),
-            data_target / "worker-command-journal.sqlite3",
+            database_target / "worker-command-journal.sqlite3",
         )
         self._backup_sqlite_snapshot(
             database_paths.sqlite("public-download-links.sqlite3"),
-            data_target / "public-download-links.sqlite3",
+            database_target / "public-download-links.sqlite3",
         )
         default_profile = str(getattr(self.config, "default_profile", "default"))
-        for source, name in (
-            (self.config.tdl_download_storage, "root/.tdl"),
-            (self.config.tdl_export_storage, "user1/.tdl"),
-            (database_paths.tdl(default_profile, "upload"), "upload/.tdl"),
-        ):
-            self._copy_tree(Path(source), data_target / name)
+        profile_names = [default_profile]
         profiles_root = Path(self.config.profiles_root)
         if profiles_root.exists():
-            from tme3bot.profiles import build_profile_config
-
             for profile in profiles_root.iterdir():
                 if not profile.is_dir() or profile.is_symlink():
                     continue
-                profile_config = build_profile_config(self.config, profile.name)
-                profile_target = data_target / "profiles" / profile.name
-                self._copy_tree(Path(profile_config.tdl_download_storage), profile_target / "root/.tdl")
-                self._copy_tree(Path(profile_config.tdl_export_storage), profile_target / "user1/.tdl")
+                if profile.name != default_profile:
+                    profile_names.append(profile.name)
+        for profile_name in profile_names:
+            for lane in ("download", "export", "upload"):
                 self._copy_tree(
-                    database_paths.tdl(profile.name, "upload"),
-                    profile_target / "upload/.tdl",
+                    database_paths.tdl(profile_name, lane),
+                    database_target / "tdl" / profile_name / lane / ".tdl",
                 )
+        if profiles_root.exists():
+            for profile in profiles_root.iterdir():
+                if not profile.is_dir() or profile.is_symlink():
+                    continue
+                profile_target = data_target / "profiles" / profile.name
                 self._copy_json_tree(profile / "exports" / "pending", profile_target / "exports/pending")
                 self._copy_json_tree(profile / "exports" / "processing", profile_target / "exports/processing")
                 self._copy_json_tree(profile / "exports" / "done", profile_target / "exports/done")

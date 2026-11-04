@@ -19,8 +19,8 @@ class FakeArchive:
         self.names = names or [
             "backup-manifest.json",
             "data/identity.json",
-            "data/root/.tdl/data/default",
-            "data/user1/.tdl/data/default",
+            "database/tdl/default/download/.tdl/data/default",
+            "database/tdl/default/export/.tdl/data/default",
         ]
         self.fail = fail
         self.test_calls = 0
@@ -112,8 +112,8 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             "created_at": "2026-10-11T01:00:00+00:00",
             "included": [
                 "data/identity.json",
-                "data/root/.tdl/data/default",
-                "data/user1/.tdl/data/default",
+                "database/tdl/default/download/.tdl/data/default",
+                "database/tdl/default/export/.tdl/data/default",
             ],
         }
 
@@ -159,7 +159,7 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.assertTrue(all(item["included"] for item in report["sessions"]))
         self.assertTrue(all(item["tdl_test"] == "passed" for item in report["sessions"]))
         self.assertTrue(all(archive.test_calls == 0 for archive in self.archive_instances))
-        self.assertTrue(all("data/root/.tdl/data/default" in archive.extract_targets for archive in self.archive_instances))
+        self.assertTrue(all("database/tdl/default/download/.tdl/data/default" in archive.extract_targets for archive in self.archive_instances))
         self.assertNotIn(self.password, json.dumps(report))
         self.assertNotIn(str(self.parts_dir), json.dumps(report))
         self.assertNotIn(self.part_name, json.dumps(report))
@@ -255,7 +255,13 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         self.assertTrue(all(not item["identity_match"] for item in report["sessions"]))
 
     def test_missing_profile_session_entry_fails_verification(self):
-        manifest = {**self.manifest, "included": ["data/identity.json", "data/root/.tdl/data/default"]}
+        manifest = {
+            **self.manifest,
+            "included": [
+                "data/identity.json",
+                "database/tdl/default/download/.tdl/data/default",
+            ],
+        }
         report, _ = self.verify(manifest=manifest)
         self.assertEqual(report["reason_codes"], ["BACKUP_PROFILE_SESSIONS_INCOMPLETE"])
         self.assertFalse(report["sessions"][1]["included"])
@@ -265,15 +271,35 @@ class ProfileBackupVerifierTests(unittest.TestCase):
             names=[
                 "backup-manifest.json",
                 "data/identity.json",
-                "data/root/.tdl/data/default",
+                "database/tdl/default/download/.tdl/data/default",
             ]
         )
         self.assertEqual(report["reason_codes"], ["BACKUP_PROFILE_SESSIONS_INCOMPLETE"])
         self.assertFalse(report["sessions"][1]["included"])
 
     def test_unsafe_archive_path_is_rejected(self):
-        report, _ = self.verify(names=["backup-manifest.json", "../outside", "data/root/.tdl/data/default"])
+        report, _ = self.verify(
+            names=[
+                "backup-manifest.json",
+                "../outside",
+                "database/tdl/default/download/.tdl/data/default",
+            ]
+        )
         self.assertEqual(report["reason_codes"], ["BACKUP_ARCHIVE_UNSAFE_ENTRY"])
+
+    def test_legacy_backup_session_paths_remain_verifiable(self):
+        legacy_names = [
+            "backup-manifest.json",
+            "data/identity.json",
+            "data/root/.tdl/data/default",
+            "data/user1/.tdl/data/default",
+        ]
+        legacy_manifest = {
+            **self.manifest,
+            "included": legacy_names[1:],
+        }
+        report, _ = self.verify(manifest=legacy_manifest, names=legacy_names)
+        self.assertEqual(report["status"], "verified")
 
     def test_combined_report_requires_matching_redacted_tdl_diagnostics(self):
         diagnostics = {
@@ -342,8 +368,8 @@ class ProfileBackupVerifierTests(unittest.TestCase):
         ) as archive:
             archive.write(manifest_file, "backup-manifest.json")
             archive.write(identity_file, "data/identity.json")
-            archive.write(root_session, "data/root/.tdl/data/default")
-            archive.write(user1_session, "data/user1/.tdl/data/default")
+            archive.write(root_session, "database/tdl/default/download/.tdl/data/default")
+            archive.write(user1_session, "database/tdl/default/export/.tdl/data/default")
         archive_bytes = archive_file.read_bytes()
         split = len(archive_bytes) // 2
         first, second = archive_bytes[:split], archive_bytes[split:]
