@@ -108,18 +108,27 @@ def _read_storage_state(store: TrustedDeviceStore, path: Path) -> dict:
     cookies = state["cookies"]
     if {item.get("name") for item in cookies if isinstance(item, dict)} != COOKIE_NAMES or len(cookies) != len(COOKIE_NAMES):
         raise TrustedDeviceError("Storage state bukan sesi Web trusted device yang diharapkan.")
+    now = time.time()
     for cookie in cookies:
         if not isinstance(cookie, dict):
             raise TrustedDeviceError("Cookie dalam storage state tidak valid.")
         domain = str(cookie.get("domain") or "").lstrip(".").lower()
         name = cookie.get("name")
+        try:
+            expires_at = float(cookie.get("expires") or 0)
+        except (TypeError, ValueError):
+            expires_at = 0
         if (
             domain != str(host).lower()
             or cookie.get("path") != "/"
             or cookie.get("secure") is not True
             or not isinstance(cookie.get("value"), str)
             or not cookie.get("value")
-            or float(cookie.get("expires") or 0) <= time.time()
+            # Access tokens are intentionally short-lived. The Web app refreshes
+            # them through tme3_refresh when its initial session request returns
+            # 401, so an expired access cookie must not invalidate an otherwise
+            # live trusted-device session snapshot.
+            or (name != "tme3_access" and expires_at <= now)
             or (name in {"tme3_access", "tme3_refresh"} and cookie.get("httpOnly") is not True)
             or (name == "tme3_csrf" and cookie.get("httpOnly") is not False)
         ):
