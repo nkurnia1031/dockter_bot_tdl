@@ -1504,8 +1504,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(second.status.value, "dispatched")
         self.assertEqual(len(self.dispatcher.commands), 2)
 
-    def test_utility_does_not_wait_for_unrelated_profile_sync(self):
-        self.control.profile_readiness = lambda _profile, _worker: False
+    def test_utility_job_does_not_depend_on_vault_distribution_status(self):
         self.control.runtime_readiness_gate = RuntimeReadinessGate(
             RuntimeReadinessStore(Path(self.temp.name) / "utility-unscanned.json")
         )

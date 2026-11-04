@@ -42,17 +42,9 @@ class FakeExecutor:
         self.previous_worker_api_token = ""
         self.profile_inputs = []
         self.profile_installs = []
-        self.profile_sync_contexts = []
-        self.profile_sync_commits = []
-        self.profile_sync_requests = []
-        self.profile_sync_cancellations = []
+        self.profile_install_contexts = []
+        self.profile_install_commits = []
         self.local_profile_deletes = []
-        self.profile_sync_snapshot = {
-            "status": "ready",
-            "backend_available": True,
-            "startup_checked": True,
-            "profiles": {},
-        }
         self.profile_tdl_diagnostics = {
             "ready": True,
             "identity_match": True,
@@ -81,7 +73,6 @@ class FakeExecutor:
             "profiles": ["default"],
             "tts": self.tts_ready,
             "safelink_resolver": True,
-            "profile_sync": {"status": "ready"},
         }
 
     def utility_runtime_readiness(self):
@@ -139,17 +130,6 @@ class FakeExecutor:
         if operation_id != self.profile_readiness_canary_status["id"]:
             return None
         return dict(self.profile_readiness_canary_status)
-
-    def profile_sync_status(self):
-        return dict(self.profile_sync_snapshot)
-
-    def request_profile_sync(self, profile=None, mode="check"):
-        self.profile_sync_requests.append((profile, mode))
-        return {"accepted": True, "status": "sync_pending", "profile": profile}
-
-    def cancel_profile_sync(self, profile, mode="check"):
-        self.profile_sync_cancellations.append((profile, mode))
-        return {"accepted": True, "status": "cancelling", "profile": profile}
 
     def delete_local_profile(self, profile):
         self.local_profile_deletes.append(profile)
@@ -295,16 +275,16 @@ class FakeExecutor:
     def cancel_profile_login(self, operation_id):
         return True
 
-    def install_profile_bundle(self, profile, telegram_user_id, bundle, operation_id, **sync_context):
+    def install_profile_bundle(self, profile, telegram_user_id, bundle, operation_id, **install_context):
         self.profile_installs.append((profile, telegram_user_id, bundle, operation_id))
-        self.profile_sync_contexts.append(dict(sync_context))
+        self.profile_install_contexts.append(dict(install_context))
         return {"profile": profile, "ready": True}
 
     def export_profile_bundle(self, profile):
         return 123, b"profile-bundle"
 
-    def commit_profile_bundle(self, profile, operation_id, **sync_context):
-        self.profile_sync_commits.append(dict(sync_context))
+    def commit_profile_bundle(self, profile, operation_id, **install_context):
+        self.profile_install_commits.append(dict(install_context))
         return True
 
     def rollback_profile_bundle(self, profile, operation_id):
@@ -533,73 +513,11 @@ class WorkerApiTests(unittest.TestCase):
         )
         self.assertEqual(invalid.status_code, 422)
 
-    def test_healthz_distinguishes_running_process_from_pending_profile_sync(self):
-        ready = self.client.get("/healthz")
-        self.assertEqual(ready.json()["ok"], True)
-        self.assertTrue(ready.json()["profiles_ready"])
-
-        self.executor.profile_sync_snapshot["status"] = "sync_pending"
-        pending = self.client.get("/healthz")
-        self.assertEqual(pending.json()["ok"], True)
-        self.assertFalse(pending.json()["profiles_ready"])
-        self.assertEqual(pending.json()["profile_sync_status"], "sync_pending")
-
-    def test_profile_sync_status_and_manual_request_require_worker_auth(self):
-        denied_status = self.client.get("/internal/v1/profile-sync")
-        self.assertEqual(denied_status.status_code, 401)
-        headers = {"Authorization": "Bearer worker-secret"}
-        status = self.client.get("/internal/v1/profile-sync", headers=headers)
-        self.assertEqual(status.status_code, 200)
-        self.assertEqual(status.json()["status"], "ready")
-        self.assertTrue(status.json()["startup_checked"])
-
-        denied_request = self.client.post(
-            "/internal/v1/profile-sync", json={"profile": "irang"}
-        )
-        self.assertEqual(denied_request.status_code, 401)
-        accepted = self.client.post(
-            "/internal/v1/profile-sync",
-            headers=headers,
-            json={"profile": "irang", "mode": "repair"},
-        )
-        self.assertEqual(accepted.status_code, 200)
-        self.assertEqual(self.executor.profile_sync_requests, [("irang", "repair")])
-
-        invalid_mode = self.client.post(
-            "/internal/v1/profile-sync",
-            headers=headers,
-            json={"mode": "force-shell"},
-        )
-        self.assertEqual(invalid_mode.status_code, 422)
-
-        extra = self.client.post(
-            "/internal/v1/profile-sync",
-            headers=headers,
-            json={"profile": "irang", "url": "http://attacker.invalid"},
-        )
-        self.assertEqual(extra.status_code, 422)
-        self.assertEqual(len(self.executor.profile_sync_requests), 1)
-
-        denied_cancel = self.client.request(
-            "DELETE", "/internal/v1/profile-sync", json={"profile": "irang"}
-        )
-        self.assertEqual(denied_cancel.status_code, 401)
-        cancelled = self.client.request(
-            "DELETE",
-            "/internal/v1/profile-sync",
-            headers=headers,
-            json={"profile": "irang", "mode": "check"},
-        )
-        self.assertEqual(cancelled.status_code, 200)
-        self.assertEqual(cancelled.json()["status"], "cancelling")
-        self.assertEqual(self.executor.profile_sync_cancellations, [("irang", "check")])
-        invalid_cancel = self.client.request(
-            "DELETE",
-            "/internal/v1/profile-sync",
-            headers=headers,
-            json={"profile": "irang", "url": "http://attacker.invalid"},
-        )
-        self.assertEqual(invalid_cancel.status_code, 422)
+    def test_worker_health_has_no_vault_state_and_pull_sync_endpoints_are_gone(self):
+        health = self.client.get("/healthz")
+        self.assertEqual(health.json(), {"ok": True, "role": "worker"})
+        self.assertEqual(self.client.get("/internal/v1/profile-sync").status_code, 404)
+        self.assertEqual(self.client.post("/internal/v1/profile-sync", json={}).status_code, 404)
 
     def test_vault_distribution_worker_api_accepts_only_correlation_metadata(self):
         captured = []
@@ -1031,21 +949,21 @@ class WorkerApiTests(unittest.TestCase):
                 **headers,
                 "X-Telegram-User-ID": "123",
                 "X-Provisioning-ID": "op-1",
-                "X-Profile-Sync-Run-ID": "a" * 32,
-                "X-Profile-Sync-Revision": "7",
+                "X-Profile-Install-Run-ID": "a" * 32,
+                "X-Profile-Install-Revision": "7",
             },
             content=b"profile-bundle",
         )
         self.assertEqual(installed.status_code, 200)
         self.assertEqual(self.executor.profile_installs[-1][0:2], ("novel", 123))
-        self.assertEqual(self.executor.profile_sync_contexts[-1], {"sync_run_id": "a" * 32, "sync_revision": 7})
+        self.assertEqual(self.executor.profile_install_contexts[-1], {"install_run_id": "a" * 32, "install_revision": 7})
         committed = self.client.post(
             "/internal/v1/profiles/novel/session/commit",
             headers=headers,
-            json={"operation_id": "op-1", "sync_run_id": "a" * 32, "revision": 7},
+            json={"operation_id": "op-1", "install_run_id": "a" * 32, "revision": 7},
         )
         self.assertEqual(committed.status_code, 200)
-        self.assertEqual(self.executor.profile_sync_commits[-1], {"sync_run_id": "a" * 32, "sync_revision": 7})
+        self.assertEqual(self.executor.profile_install_commits[-1], {"install_run_id": "a" * 32, "install_revision": 7})
 
     def test_profile_export_diagnostics_requires_worker_token_and_never_returns_paths(self):
         denied = self.client.get("/internal/v1/profiles/default/session/diagnostics")

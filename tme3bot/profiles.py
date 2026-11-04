@@ -417,7 +417,7 @@ class ProfileManager:
         }
 
     def profiles_with_tdl_session(self, purpose: str = "export") -> list[str]:
-        """Return locally initialized sessions; vault ACK state is diagnostic only."""
+        """Return locally initialized sessions for the requested TDL lane."""
         return [
             profile
             for profile in self.list_profiles()

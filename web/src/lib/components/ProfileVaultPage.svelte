@@ -10,21 +10,10 @@
     error?: string;
     desired_revision?: number | null;
     installed_revision?: number | null;
-    vault_ack_status?: string;
-    vault_ack_installed_revision?: number | null;
-    runtime_status?: string;
-    runtime_error_code?: string;
-    runtime_desired_revision?: number | null;
-    runtime_installed_revision?: number | null;
+    updated_at?: string;
   };
   type Profile = { name: string; status: string; vault: boolean; desired_revision?: number; error?: string; workers: WorkerState[] };
   type Management = { items: Profile[]; workers: Worker[] };
-  type SyncEvent = {
-    id: number; run_id: string; sequence: number | null; revision: number | null;
-    phase: string; status: string; code: string; created_at: string;
-    details?: Record<string, number>;
-  };
-  type SyncHistory = { items: SyncEvent[]; active: boolean; next_after_id: number };
   type DistributionWorker = {
     worker: string; status: string; phase: string; reason_code: string;
     archive_message_id?: number | null; updated_at: string;
@@ -45,47 +34,28 @@
   let notice = $state('');
   let checkedAt = $state('');
   let deletingProfile = $state('');
-  let syncHistories = $state<Record<string, SyncHistory>>({});
   let distributionBusy = $state('');
   let distributionOperations = $state<Record<string, DistributionOperation[]>>({});
   let distributionEvents = $state<Record<string, DistributionEvents>>({});
 
-  const workerByName = $derived(new Map(workers.map((worker) => [worker.name, worker])));
   const statusLabel = (status: string) => ({
-    ready: 'Siap', stored: 'Tersimpan di Vault', queued: 'Dalam antrean', running: 'Berjalan', waiting: 'Menunggu', waiting_worker: 'Menunggu worker', sync_pending: 'Belum tersinkron',
+    ready: 'Tersimpan pada worker', stored: 'Tersimpan di Vault', queued: 'Dalam antrean', running: 'Berjalan', waiting: 'Menunggu worker', waiting_worker: 'Menunggu worker',
+    active: 'Aktif di Vault',
     succeeded: 'Selesai', cancelled: 'Dibatalkan',
     not_assigned: 'Belum ditugaskan', worker_unavailable: 'Worker tidak terjangkau', worker_update_required: 'Perlu diperbarui',
     failed: 'Gagal', unavailable: 'Tidak tersedia'
   } as Record<string, string>)[status] || status || 'Belum diperiksa';
   const phaseLabel = (phase: string) => ({
-    queued: 'Antrean', manifest_fetch: 'Baca daftar profil', revision_compare: 'Bandingkan revision',
-    bundle_download: 'Unduh bundle', archive_upload: 'Unggah arsip terenkripsi', archive_download: 'Unduh arsip dari channel', bundle_validation: 'Validasi bundle',
+    queued: 'Antrean', archive_upload: 'Unggah arsip terenkripsi', archive_download: 'Unduh arsip dari channel', bundle_validation: 'Validasi bundle',
     session_validation: 'Validasi sesi', session_install: 'Pasang sesi', session_commit: 'Simpan sesi',
     download_staging: 'Siapkan lane Download', download_validation: 'Validasi lane Download', download_install: 'Pasang lane Download',
     export_staging: 'Siapkan lane Export', export_validation: 'Validasi lane Export', export_install: 'Pasang lane Export',
     upload_staging: 'Salin lane Upload', upload_validation: 'Validasi lane Upload', upload_install: 'Pasang lane Upload',
     identity_install: 'Pasang metadata identitas', transaction_rollback: 'Pulihkan seluruh lane',
     installation_reused: 'Pemasangan sudah tercatat',
-    acknowledgement: 'Konfirmasi ke Vault', worker_unreachable: 'Worker tidak terjangkau',
+    worker_unreachable: 'Worker tidak terjangkau',
     worker_dispatch: 'Kirim perintah ke worker', completed: 'Selesai', cancelled: 'Dibatalkan', failed: 'Gagal'
   } as Record<string, string>)[phase] || phase;
-  const historyKey = (profile: string, worker: string) => `${profile}:${worker}`;
-
-  async function loadSyncHistories() {
-    const targets = profiles
-      .filter((profile) => profile.vault)
-      .flatMap((profile) => profile.workers.map((worker) => ({ profile: profile.name, worker: worker.worker })));
-    await Promise.all(targets.map(async ({ profile, worker }) => {
-      const key = historyKey(profile, worker);
-      try {
-        const result = await api<SyncHistory>(`/profiles/${encodeURIComponent(profile)}/workers/${encodeURIComponent(worker)}/sync-logs?limit=50`);
-        syncHistories = { ...syncHistories, [key]: result };
-      } catch {
-        syncHistories = { ...syncHistories, [key]: { items: [], active: false, next_after_id: 0 } };
-      }
-    }));
-  }
-
   async function loadDistributionOperations() {
     const vaulted = profiles.filter((profile) => profile.vault);
     await Promise.all(vaulted.map(async (profile) => {
@@ -150,35 +120,6 @@
     }
   }
 
-  function runtimeMessage(item: WorkerState, worker?: Worker) {
-    if (item.runtime_status === 'ready' && item.runtime_installed_revision === item.desired_revision) {
-      return `Sesi runtime sudah siap pada revision ${item.runtime_installed_revision}.`;
-    }
-    if (worker && !worker.online) return 'Worker sedang offline. Status lokal belum bisa diperiksa.';
-    if (item.runtime_error_code) {
-      const httpStatus = item.runtime_error_code.match(/^PROFILE_BACKEND_HTTP_(\d{3})$/)?.[1];
-      if (httpStatus) return `Worker menerima penolakan manifest dari backend (HTTP ${httpStatus}; ${item.runtime_error_code}).`;
-      if (item.runtime_error_code === 'WORKER_IDENTITY_AMBIGUOUS') return 'Token worker dipakai bersama. Setiap worker harus memiliki token internal yang unik.';
-      if (item.runtime_error_code === 'WORKER_UNAUTHORIZED') return 'WORKER_API_TOKEN pada worker tidak cocok dengan token worker di registry backend. Pulihkan token yang terdaftar, lalu rotasi dari halaman Workers.';
-      if (item.runtime_error_code === 'INTERNAL_UNAUTHORIZED') return 'BACKEND_INTERNAL_TOKEN pada worker tidak cocok dengan token internal backend.';
-      if (item.runtime_error_code === 'PROFILE_BACKEND_UNAUTHORIZED') return 'Backend tidak menerima token internal worker.';
-      if (item.runtime_error_code === 'PROFILE_BACKEND_FORBIDDEN') return 'Backend menolak identitas worker.';
-      if (item.runtime_error_code === 'PROFILE_TRANSFER_REQUIRES_HTTPS') return 'Worker perlu memakai URL backend HTTPS.';
-      if (item.runtime_error_code === 'BACKEND_UNAVAILABLE') return 'Worker belum dapat menjangkau backend.';
-      return `Pemeriksaan runtime gagal (${item.runtime_error_code}).`;
-    }
-    if (item.runtime_status === 'waiting_worker') return 'Worker belum berhasil membaca manifest vault dari backend.';
-    if (item.runtime_status === 'sync_pending') return 'Worker belum mengonfirmasi revision vault yang diinginkan.';
-    if (item.runtime_status === 'worker_update_required') return 'Perbarui worker untuk membaca status sinkronisasi profil.';
-    return item.error || 'Kesiapan sesi runtime belum dikonfirmasi.';
-  }
-
-  function runtimeReady(item: WorkerState) {
-    return item.runtime_status === 'ready'
-      && item.runtime_desired_revision === item.desired_revision
-      && item.runtime_installed_revision === item.desired_revision;
-  }
-
   async function load() {
     loading = true;
     failure = '';
@@ -187,7 +128,7 @@
       profiles = Array.isArray(result.items) ? result.items : [];
       workers = Array.isArray(result.workers) ? result.workers : [];
       checkedAt = new Date().toLocaleString();
-      await Promise.all([loadSyncHistories(), loadDistributionOperations()]);
+      await loadDistributionOperations();
     } catch (cause) {
       failure = cause instanceof Error ? cause.message : 'Status Vault gagal dimuat.';
     } finally {
@@ -217,7 +158,6 @@
   onMount(() => {
     void load();
     const timer = window.setInterval(() => {
-      if (Object.values(syncHistories).some((history) => history.active)) void loadSyncHistories();
       if (Object.values(distributionOperations).flat().some((operation) => ['queued', 'running', 'waiting'].includes(operation.status))) {
         void loadDistributionOperations();
       }
@@ -232,7 +172,7 @@
   <div>
     <p class="eyebrow">PROFIL BERSAMA</p>
     <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Vault profil</h1>
-    <p class="muted mt-2">Bandingkan ACK Vault dengan kesiapan sesi TDL yang benar-benar dilaporkan tiap worker.</p>
+    <p class="muted mt-2">Simpan profil aktif di satu tempat dan distribusikan salinannya ke worker.</p>
   </div>
   <div class="flex items-center gap-2">
     <a class="button secondary" href="/profiles/">Profil lokal</a>
@@ -254,8 +194,8 @@
 <section class="card mt-6 p-5 sm:p-6" aria-label="Status Vault">
   <div class="flex flex-wrap items-center justify-between gap-3">
     <div>
-      <h2 class="font-extrabold">Profil dan kesiapan worker</h2>
-      <p class="muted mt-1 text-sm">ACK Vault, revision runtime, dan hasil pemeriksaan worker ditampilkan terpisah.</p>
+      <h2 class="font-extrabold">Profil dan distribusi worker</h2>
+      <p class="muted mt-1 text-sm">Profil aktif setelah disimpan. Status pemasangan di worker hanya informasi dan tidak menahan job.</p>
     </div>
     {#if checkedAt}<p class="muted text-xs">Diperiksa {checkedAt}</p>{/if}
   </div>
@@ -320,43 +260,13 @@
             {:else}
               <div class="mt-3 grid gap-2 lg:grid-cols-2">
                 {#each profile.workers as item (`${profile.name}:${item.worker}`)}
-                  {@const worker = workerByName.get(item.worker)}
-                  {@const history = syncHistories[historyKey(profile.name, item.worker)]}
                   <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3">
                     <div class="flex flex-wrap items-center justify-between gap-2">
                       <b>{item.worker}</b>
-                      <span class={runtimeReady(item) ? 'text-sm font-bold text-emerald-600' : 'text-sm font-bold text-amber-600'}>
-                        {runtimeReady(item) ? 'Sesi runtime siap' : statusLabel(item.runtime_status || item.status)}
-                      </span>
+                      <span class="text-sm font-bold">{statusLabel(item.status)}</span>
                     </div>
-                    <p class="muted mt-2 text-xs">Vault ACK: {statusLabel(item.vault_ack_status || item.status)} · revision {item.vault_ack_installed_revision ?? item.installed_revision ?? '-'} · Runtime worker: {statusLabel(item.runtime_status || item.status)} · revision {item.runtime_installed_revision ?? '-'}</p>
-                    <p class="mt-2 text-sm">{runtimeMessage(item, worker)}</p>
-                    {#if item.desired_revision}<p class="muted mt-1 text-xs">Revision tujuan: {item.desired_revision}</p>{/if}
-                    <div class="mt-3 border-t border-[var(--line)] pt-3" aria-label={`Riwayat progress ${profile.name} ${item.worker}`}>
-                      <div class="flex items-center justify-between gap-2">
-                        <h4 class="text-xs font-bold">Riwayat progress</h4>
-                        {#if history?.active}<span class="text-xs font-bold text-amber-600">Berjalan</span>{/if}
-                      </div>
-                      {#if !history}
-                        <p class="muted mt-2 text-xs">Memuat event...</p>
-                      {:else if history.items.length === 0}
-                        <p class="muted mt-2 text-xs">Belum ada event sinkronisasi.</p>
-                      {:else}
-                        <ol class="mt-2 space-y-2">
-                          {#each history.items.slice(-12).reverse() as event (event.id)}
-                            <li class="flex items-start justify-between gap-3 text-xs">
-                              <span>
-                                <b>{phaseLabel(event.phase)}</b>
-                                <span class="muted"> · {statusLabel(event.status)}</span>
-                                {#if event.code}<span class="muted block">{event.code}</span>{/if}
-                              </span>
-                              <time class="muted shrink-0" datetime={event.created_at}>{new Date(event.created_at).toLocaleString()}</time>
-                            </li>
-                          {/each}
-                        </ol>
-                      {/if}
-                    </div>
-                    <a class="muted mt-2 inline-block text-xs underline" href={`/api/v1/profiles/${encodeURIComponent(profile.name)}/workers/${encodeURIComponent(item.worker)}/sync-logs?limit=500`} target="_blank" rel="noreferrer">Buka log JSON</a>
+                    <p class="muted mt-2 text-xs">Revision terpasang {item.installed_revision ?? '-'} dari {item.desired_revision ?? profile.desired_revision ?? '-'}{#if item.updated_at} · {new Date(item.updated_at).toLocaleString()}{/if}</p>
+                    {#if item.error}<p class="mt-2 text-sm text-rose-600">{item.error}</p>{/if}
                   </div>
                 {/each}
               </div>
@@ -367,5 +277,5 @@
     {/if}
   {/if}
 
-  <p class="muted mt-5 flex items-start gap-2 text-xs"><ShieldCheck size={15} class="mt-0.5 shrink-0 text-emerald-600"/>Menghapus bundle hanya mengosongkan Vault; sesi pada worker lokal tetap ada. Adopsi dimulai dari card Profil lokal, sedangkan distribusi adalah operasi terpisah.</p>
+  <p class="muted mt-5 flex items-start gap-2 text-xs"><ShieldCheck size={15} class="mt-0.5 shrink-0 text-emerald-600"/>Menghapus bundle hanya mengosongkan Vault; sesi pada worker lokal tetap ada. Status distribusi tidak menjadi gate job; worker menguji sesi melalui perintah yang dijalankan.</p>
 </section>

@@ -56,7 +56,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
     ):
         normalized_path = _rclone_relative_path(path)
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=worker, check_readiness=False
+            actor, worker=worker
         )
         settings = context.utility_settings.get()
         destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
@@ -89,7 +89,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
     def rclone_storage_folder_summaries(worker: str, path: str = "", actor=Depends(current_actor)):
         normalized_path = _rclone_relative_path(path)
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=worker, check_readiness=False
+            actor, worker=worker
         )
         settings = context.utility_settings.get()
         destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
@@ -126,7 +126,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 status_code=422,
             )
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=body.worker, check_readiness=False
+            actor, worker=body.worker
         )
         settings = context.utility_settings.get()
         destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
@@ -198,7 +198,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         actor=Depends(current_actor),
     ):
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=worker, check_readiness=False
+            actor, worker=worker
         )
         settings = context.utility_settings.get()
         destination = str(settings.get("rclone_destination") or "googledrive:backup").strip()
@@ -289,7 +289,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 status_code=422,
             )
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=body.worker, check_readiness=False
+            actor, worker=body.worker
         )
         settings = context.utility_settings.get()
         payload = {
@@ -530,7 +530,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
             if body.rclone_sources:
                 raise DomainError("STORAGE_SELECTION_INVALID", "Pilihan rclone hanya berlaku untuk provider rclone.", status_code=422)
             profile, selected_worker = context.control_plane.resolve_target(
-                actor, profile=body.profile, worker=body.worker, check_readiness=False
+                actor, profile=body.profile, worker=body.worker
             )
             selected_profile = profile
         else:
@@ -539,7 +539,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
             if body.item_ids or body.folder_ids or body.profile is not None:
                 raise DomainError("STORAGE_SELECTION_INVALID", "Profil dan pilihan katalog Telegram tidak berlaku untuk provider rclone.", status_code=422)
             _, selected_worker = context.control_plane.resolve_target(
-                actor, worker=body.worker, check_readiness=False
+                actor, worker=body.worker
             )
         try:
             return job_dict(
@@ -557,7 +557,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
     @app.get("/api/v1/storage/download-links", response_model=ObjectResponse)
     def list_storage_download_links(worker: str, actor=Depends(current_actor)):
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=worker, check_readiness=False, allow_disabled_worker=True
+            actor, worker=worker, allow_disabled_worker=True
         )
         listing = getattr(context.worker_dispatcher, "public_download_links", None)
         if not callable(listing):
@@ -605,7 +605,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         if body.confirmed is not True:
             raise DomainError("PUBLIC_DOWNLOAD_CONFIRMATION_REQUIRED", "Pencabutan link dan penghapusan file perlu dikonfirmasi.", status_code=422)
         _, selected_worker = context.control_plane.resolve_target(
-            actor, worker=worker, check_readiness=False, allow_disabled_worker=True
+            actor, worker=worker, allow_disabled_worker=True
         )
         revoke = getattr(context.worker_dispatcher, "revoke_public_download_link", None)
         if not callable(revoke):

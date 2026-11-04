@@ -14,7 +14,7 @@ from tme3bot.profile_provisioning import build_profile_bundle
 from tme3bot.worker.executor import WorkerJobExecutor
 
 
-class _ProfileSync:
+class _ProfileDistributionEvents:
     def __init__(self) -> None:
         self.sequence = 0
         self.events: list[dict[str, object]] = []
@@ -65,7 +65,7 @@ class WorkerProfileDistributionTests(unittest.TestCase):
             executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
             executor.config = config
             executor.profile_manager = SimpleNamespace(runtime=lambda _profile: runtime)
-            executor.profile_sync = _ProfileSync()
+            executor.profile_distribution_events = _ProfileDistributionEvents()
             executor.runtime_settings = SimpleNamespace(worker_api_token=lambda: worker_token)
             executor.validate_profile_session = lambda _data: self.fail(
                 "Vault profile bundles must not use the single-session upload validator"
@@ -99,7 +99,7 @@ class WorkerProfileDistributionTests(unittest.TestCase):
 
         self.assertEqual(result, {"ready": True, "profile": profile, "revision": revision})
         self.assertEqual(
-            [event["phase"] for event in executor.profile_sync.events],
+            [event["phase"] for event in executor.profile_distribution_events.events],
             ["archive_download", "archive_download", "bundle_validation", "bundle_validation", "completed"],
         )
 

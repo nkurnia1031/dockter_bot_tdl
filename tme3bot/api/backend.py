@@ -820,88 +820,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                 "secure": secure,
             })
         profile_items = provisioner.profiles(actor.telegram_user_id)
-        sync_reader = getattr(context.worker_dispatcher, "profile_sync_status", None)
-        sync_targets = sorted({
-            str(distribution.get("worker") or "")
-            for profile in profile_items
-            for distribution in profile.get("workers", [])
-            if not str(profile.get("source") or "").startswith("local_")
-            and isinstance(distribution, dict)
-            and str(distribution.get("worker") or "")
-        })
-
-        def live_sync(name: str) -> tuple[str, dict[str, Any], str]:
-            if not callable(sync_reader):
-                return name, {}, "WORKER_UPDATE_REQUIRED"
-            try:
-                value = sync_reader(name)
-                if isinstance(value, dict):
-                    return name, value, ""
-                return name, {}, "WORKER_STATUS_INVALID"
-            except Exception as exc:
-                code = "WORKER_UPDATE_REQUIRED" if getattr(exc, "status", None) == 404 else "WORKER_UNAVAILABLE"
-                return name, {}, code
-
-        live_by_worker: dict[str, tuple[dict[str, Any], str]] = {}
-        if sync_targets:
-            with ThreadPoolExecutor(max_workers=min(8, len(sync_targets))) as executor:
-                for name, snapshot, error_code in executor.map(live_sync, sync_targets):
-                    live_by_worker[name] = (snapshot, error_code)
-
-        allowed_runtime_statuses = {"ready", "sync_pending", "waiting_worker", "not_assigned"}
-        for profile in profile_items:
-            if str(profile.get("source") or "").startswith("local_"):
-                continue
-            profile_name = str(profile.get("name") or "")
-            for distribution in profile.get("workers", []):
-                if not isinstance(distribution, dict):
-                    continue
-                worker_name = str(distribution.get("worker") or "")
-                ack_status = str(distribution.get("status") or "waiting")
-                ack_revision = distribution.get("desired_revision")
-                distribution["vault_ack_status"] = ack_status
-                distribution["vault_ack_installed_revision"] = distribution.get("installed_revision")
-
-                snapshot, transport_error = live_by_worker.get(worker_name, ({}, "WORKER_UNAVAILABLE"))
-                runtime_error = transport_error
-                runtime_profile = (snapshot.get("profiles") or {}).get(profile_name) if isinstance(snapshot.get("profiles"), dict) else None
-                if runtime_error:
-                    runtime_status = "worker_update_required" if runtime_error == "WORKER_UPDATE_REQUIRED" else "worker_unavailable"
-                elif snapshot.get("startup_checked") is None:
-                    runtime_status = "worker_update_required"
-                    runtime_error = "WORKER_UPDATE_REQUIRED"
-                elif snapshot.get("backend_available") is not True:
-                    runtime_status = "waiting_worker"
-                    runtime_error = str(snapshot.get("backend_error_code") or "PROFILE_BACKEND_UNAVAILABLE")
-                elif snapshot.get("startup_checked") is not True:
-                    runtime_status = "sync_pending"
-                    runtime_error = "PROFILE_STARTUP_CHECK_PENDING"
-                elif not isinstance(runtime_profile, dict):
-                    runtime_status = "waiting_worker"
-                    runtime_error = str(snapshot.get("backend_error_code") or "PROFILE_RUNTIME_PROFILE_MISSING")
-                else:
-                    runtime_status = str(runtime_profile.get("status") or "sync_pending")
-                    if runtime_status not in allowed_runtime_statuses:
-                        runtime_status = "sync_pending"
-                    runtime_error = str(runtime_profile.get("error_code") or "")
-                    runtime_desired = runtime_profile.get("desired_revision")
-                    runtime_installed = runtime_profile.get("installed_revision")
-                    distribution["runtime_desired_revision"] = runtime_desired
-                    distribution["runtime_installed_revision"] = runtime_installed
-                    if runtime_status == "ready" and (
-                        runtime_desired != ack_revision or runtime_installed != ack_revision
-                    ):
-                        runtime_status = "sync_pending"
-                        runtime_error = "PROFILE_REVISION_MISMATCH"
-
-                if not re.fullmatch(r"[A-Z0-9_-]{1,64}", runtime_error):
-                    runtime_error = ""
-                distribution["runtime_status"] = runtime_status
-                distribution["runtime_error_code"] = runtime_error
-                if ack_status == "ready":
-                    distribution["status"] = runtime_status
-                else:
-                    distribution["status"] = ack_status
         return {
             "items": profile_items,
             "workers": workers,
@@ -937,7 +855,11 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError("PROFILE_SESSION_INVALID", str(exc), status_code=422) from exc
         except Exception as exc:
             raise DomainError("PROFILE_PROVISIONING_FAILED", "Worker tidak dapat memvalidasi sesi profil.", status_code=503) from exc
-        return {"id": operation_id, "status": "distributing"}
+        operation = provisioner.operation(operation_id, actor.telegram_user_id)
+        return {
+            "id": operation_id,
+            "status": str(operation.get("status") or "distributing"),
+        }
 
     @app.post("/api/v1/profiles/provisionings/login")
     def start_profile_login(request: Request, body: dict[str, Any], actor=Depends(current_actor)):
@@ -1253,12 +1175,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         and context.queue_publisher is not None
         and context.queue_command_service is not None
     ):
-        from tme3bot.api.routes.profile_sync import (
-            advance_profile_sync_cancel,
-            advance_profile_sync_command,
-            prepare_profile_sync_operation,
-        )
-
         def prepare_background_job(actor, target, input_data):
             job_kind = str(input_data.get("job_kind") or "").strip().lower()
             if job_kind == "safelink_resolve":
@@ -1293,33 +1209,21 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             return result
 
         def advance_accepted_operation(command):
-            if command.get("kind") == "profile.sync":
-                return advance_profile_sync_command(command, context)
             if command.get("kind") == "profile.local_delete":
                 return advance_profile_local_delete_command(command, context)
             return advance_background_job(command)
 
         def advance_retry_operation(command):
-            if command.get("kind") == "profile.sync":
-                return advance_profile_sync_command(command, context)
             if command.get("kind") == "profile.local_delete":
                 return advance_profile_local_delete_command(command, context)
             return advance_background_job(command)
 
         def advance_cancel_operation(command):
-            if command.get("kind") == "profile.sync":
-                return advance_profile_sync_cancel(command, context)
             if command.get("kind") == "profile.local_delete":
                 return advance_profile_local_delete_cancel(command, context)
             return context.control_plane.advance_durable_cancel(command)
 
         operations.register_handler("job.submit", prepare_background_job)
-        operations.register_handler(
-            "profile.sync",
-            lambda actor, target, input_data: prepare_profile_sync_operation(
-                context, actor, target, input_data
-            ),
-        )
         operations.register_handler(
             "profile.local_delete",
             lambda actor, target, input_data: prepare_profile_local_delete(
@@ -1339,11 +1243,6 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         app,
         operations,
         current_actor=current_actor,
-        profile_sync_store=(
-            context.profile_provisioner.store
-            if context.profile_provisioner is not None
-            else None
-        ),
         retry_guard=guard_operation_retry,
     )
     from tme3bot.api.routes.activity import register_activity
@@ -1461,14 +1360,8 @@ def _profile_artifact(context: BackendContext, actor, artifact_id: str):
 def _add_internal_state_routes(
     app: FastAPI, context: BackendContext, require_internal, *, current_actor
 ):
-    from tme3bot.api.routes.profile_sync import register_profile_sync
-
-    register_profile_sync(
-        app,
-        context,
-        require_internal=require_internal,
-        current_actor=current_actor,
-    )
+    from tme3bot.api.routes.profile_install_events import register_profile_install_events
+    register_profile_install_events(app, context, require_internal=require_internal)
     from tme3bot.api.routes.profile_distribution import register_profile_distribution
     register_profile_distribution(
         app,
@@ -1754,44 +1647,6 @@ def _add_internal_state_routes(
         return completed
 
     prefix = "/internal/v1/profiles/{profile}/state"
-
-    @app.post(
-        "/internal/v1/profiles/sync",
-        include_in_schema=False,
-        dependencies=[Depends(require_internal)],
-    )
-    async def sync_profiles(request: Request):
-        body = await request.json()
-        profiles = body.get("profiles", []) if isinstance(body, dict) else []
-        registry = getattr(context.profile_manager, "profile_registry", None)
-        if registry is None:
-            raise DomainError("PROFILE_REGISTRY_UNAVAILABLE", "Registry profile backend tidak tersedia.", status_code=503)
-        synced: list[str] = []
-        candidates: list[str] = []
-        protected: list[str] = []
-        for item in profiles:
-            if not isinstance(item, dict):
-                continue
-            try:
-                name = str(item.get("name", ""))
-                raw_user_id = item.get("telegram_user_id")
-                user_id = int(raw_user_id) if raw_user_id is not None else None
-                vault = getattr(context.profile_provisioner, "store", None)
-                if vault is not None and vault.is_vaulted(name):
-                    protected.append(name)
-                    continue
-                if vault is not None and user_id is not None:
-                    vault.record_legacy_discovery(name, user_id)
-                    candidates.append(name)
-                if registry.register_discovered(name, user_id):
-                    synced.append(name)
-            except (TypeError, ValueError) as exc:
-                raise DomainError("PROFILE_SYNC_INVALID", str(exc), status_code=422) from exc
-        return {
-            "profiles": sorted(set(synced)),
-            "adoption_candidates": sorted(set(candidates)),
-            "vault_protected": sorted(set(protected)),
-        }
 
     @app.get(
         prefix + "/sources",

@@ -27,16 +27,16 @@ Sesi TDL yang berada pada worker dan digunakan job pada worker tersebut. Setiap 
 _Avoid_: bundle distribusi, sumber distribusi.
 
 **Bundle vault**:
-Arsip profil terenkripsi yang disimpan backend sebagai sumber untuk distribusi yang dimulai operator. Job tetap memakai profil lokal worker; menghapus bundle vault tidak menghapus profil lokal.
+Salinan arsip profil aktif yang dienkripsi dan disimpan backend. Vault menjadi tempat penyimpanan bersama untuk distribusi ke worker; job memakai salinan sesi lokal di worker. Menghapus bundle Vault tidak menghapus salinan lokal.
 _Avoid_: sesi aktif worker, sumber sesi job.
 
 **Adopsi profil**:
-Operasi eksplisit yang menyalin profil lokal dari worker terpilih ke bundle terenkripsi di vault. Adopsi tidak memasang profil ke worker lain.
-_Avoid_: sinkronisasi otomatis, distribusi.
+Operasi yang menyimpan profil aktif dari worker terpilih ke bundle terenkripsi Vault. Distribusi bundle ke worker dicatat sebagai proses tersendiri.
+_Avoid_: pull saat startup, pemeriksaan kesiapan untuk setiap job.
 
 **Distribusi profil**:
-Operasi eksplisit yang memasang bundle vault ke profil lokal pada seluruh worker terdaftar dalam satu job. Kemajuan dicatat per worker; worker offline menunggu sampai dapat dijangkau.
-_Avoid_: sinkronisasi startup, adopsi.
+Pemasangan bundle aktif Vault ke salinan profil lokal pada worker yang dituju. Kemajuan dicatat per worker; status distribusi tidak menjadi gate job dan worker menjalankan perintah dengan sesi lokal yang tersedia.
+_Avoid_: pull saat startup, syarat readiness Vault.
 
 **Hapus bundle vault**:
 Menghapus arsip distribusi dari backend tanpa mengubah profil lokal yang sudah terpasang pada worker.

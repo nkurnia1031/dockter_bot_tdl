@@ -72,7 +72,7 @@ from tme3bot.worker.profile_readiness import (
     ProfileReadinessCanary,
     ProfileReadinessCanaryOperations,
 )
-from tme3bot.worker.profile_sync import ProfileSyncClient, ProfileSyncError
+from tme3bot.worker.profile_distribution_events import ProfileDistributionEventReporter
 from tme3bot.worker.upload_lane import UploadLanePreparer
 from tme3bot.worker.command_runner import WorkerCommandRunner
 from tme3bot.worker.command_store import WorkerCommandStore
@@ -225,18 +225,9 @@ class WorkerJobExecutor(
         )
 
         self.command_runner = WorkerCommandRunner(self.command_store, self)
-        self.profile_sync = ProfileSyncClient(
+        self.profile_distribution_events = ProfileDistributionEventReporter(
             config,
-            profile_manager,
-            self._profile_sessions,
-            install_bundle=self.install_profile_bundle,
-            commit_bundle=self.commit_profile_bundle,
-            rollback_bundle=self.rollback_profile_bundle,
-            diagnose_installed_tdl=self.diagnose_profile_tdl,
             worker_token_provider=self.runtime_settings.worker_api_token,
-        )
-        self.command_runner.register_operation_handler(
-            "profile.sync", self._run_profile_sync_operation
         )
         self._durable_admission_lock = threading.RLock()
         # Inventory statistics are derived from the JSON file.  Keep a small
@@ -510,13 +501,6 @@ class WorkerJobExecutor(
         except OSError:
             pass
 
-    def sync_profiles(self) -> None:
-        """Pull backend-owned revisions; never publish local identity as authority."""
-        self.profile_sync.start()
-
-    def profile_sync_status(self) -> dict[str, Any]:
-        return self.profile_sync.snapshot()
-
     def prepare_upload_lanes(self) -> None:
         """Queue idempotent Upload lane checks for all profiles on this worker."""
         list_local = getattr(self.profile_manager, "local_profiles", None)
@@ -629,24 +613,6 @@ class WorkerJobExecutor(
             "updated_at": "",
         }
 
-    def request_profile_sync(self, profile: str | None = None, mode: str = "check") -> dict[str, Any]:
-        return self.profile_sync.request_sync(profile=profile, mode=mode)
-
-    def cancel_profile_sync(self, profile: str, mode: str = "check") -> dict[str, Any]:
-        return self.profile_sync.cancel_sync(profile=profile, mode=mode)
-
-    def _run_profile_sync_operation(self, envelope: dict[str, Any]) -> None:
-        operation = envelope.get("operation")
-        operation = operation if isinstance(operation, dict) else {}
-        profile = operation.get("profile") or envelope.get("profile")
-        mode = str(operation.get("mode") or "check")
-        result = self.profile_sync.sync_now(profile=str(profile) if profile else None, mode=mode)
-        if result.get("status") != "ready":
-            code = "PROFILE_SYNC_PENDING"
-            if result.get("status") == "not_assigned":
-                code = "PROFILE_NOT_ASSIGNED"
-            raise ProfileSyncError(code)
-
     def validate_profile_session(self, archive_data: bytes) -> dict[str, int]:
         return {"telegram_user_id": self._profile_sessions.validate_upload(archive_data)}
 
@@ -705,28 +671,28 @@ class WorkerJobExecutor(
         bundle: bytes,
         operation_id: str,
         *,
-        sync_run_id: str = "",
-        sync_revision: int = 0,
+        install_run_id: str = "",
+        install_revision: int = 0,
         distribution_operation_id: str = "",
     ) -> dict[str, Any]:
         sequence = 0
 
         def report(phase: str, status: str, code: str = "") -> None:
             nonlocal sequence
-            if not sync_run_id or sync_revision < 1:
+            if not install_run_id or install_revision < 1:
                 return
             try:
-                allocator = getattr(self.profile_sync, "next_external_event_sequence", None)
+                allocator = getattr(self.profile_distribution_events, "next_external_event_sequence", None)
                 if callable(allocator):
-                    event_sequence = allocator(sync_run_id)
+                    event_sequence = allocator(install_run_id)
                 else:
                     sequence += 1
                     event_sequence = sequence
-                self.profile_sync.report_external_event(
-                    run_id=sync_run_id,
+                self.profile_distribution_events.report_external_event(
+                    run_id=install_run_id,
                     sequence=event_sequence,
                     profile=profile,
-                    revision=sync_revision,
+                    revision=install_revision,
                     phase=phase,
                     status=status,
                     code=code,
@@ -741,7 +707,7 @@ class WorkerJobExecutor(
         try:
             with self._profile_session_locks(profile):
                 stage_callback = None
-                if sync_run_id:
+                if install_run_id:
                     stage_callback = lambda phase, status, code="": report(
                         phase, status, code
                     )
@@ -767,23 +733,23 @@ class WorkerJobExecutor(
         profile: str,
         operation_id: str,
         *,
-        sync_run_id: str = "",
-        sync_revision: int = 0,
+        install_run_id: str = "",
+        install_revision: int = 0,
         distribution_operation_id: str = "",
     ) -> bool:
         def report(status: str, code: str = "") -> None:
-            if not sync_run_id or sync_revision < 1:
+            if not install_run_id or install_revision < 1:
                 return
             try:
-                allocator = getattr(self.profile_sync, "next_external_event_sequence", None)
-                sequence = allocator(sync_run_id) if callable(allocator) else 0
+                allocator = getattr(self.profile_distribution_events, "next_external_event_sequence", None)
+                sequence = allocator(install_run_id) if callable(allocator) else 0
                 if sequence < 1:
                     return
-                self.profile_sync.report_external_event(
-                    run_id=sync_run_id,
+                self.profile_distribution_events.report_external_event(
+                    run_id=install_run_id,
                     sequence=sequence,
                     profile=profile,
-                    revision=sync_revision,
+                    revision=install_revision,
                     phase="session_commit",
                     status=status,
                     code=code,
@@ -847,8 +813,8 @@ class WorkerJobExecutor(
         def report(phase: str, status: str, code: str = "") -> None:
             nonlocal sequence
             try:
-                sequence = self.profile_sync.next_external_event_sequence(operation_id)
-                self.profile_sync.report_external_event(
+                sequence = self.profile_distribution_events.next_external_event_sequence(operation_id)
+                self.profile_distribution_events.report_external_event(
                     run_id=operation_id,
                     sequence=sequence,
                     profile=profile,
@@ -871,7 +837,7 @@ class WorkerJobExecutor(
             report("failed", "failed", "PROFILE_DISTRIBUTION_CONFIG_INVALID")
             raise RuntimeError("PROFILE_DISTRIBUTION_CONFIG_INVALID")
 
-        self.profile_sync.seed_external_event_sequence(operation_id, event_sequence_start)
+        self.profile_distribution_events.seed_external_event_sequence(operation_id, event_sequence_start)
 
         temp_root = Path(getattr(self.config, "temp_root", "/tmp"))
         temp_root.mkdir(parents=True, exist_ok=True)
@@ -916,8 +882,8 @@ class WorkerJobExecutor(
                 user_id,
                 bundle,
                 operation_id,
-                sync_run_id=operation_id,
-                sync_revision=revision,
+                install_run_id=operation_id,
+                install_revision=revision,
                 distribution_operation_id=operation_id,
             )
             if not isinstance(installed, dict) or installed.get("ready") is not True:
@@ -925,8 +891,8 @@ class WorkerJobExecutor(
             committed = self.commit_profile_bundle(
                 profile,
                 operation_id,
-                sync_run_id=operation_id,
-                sync_revision=revision,
+                install_run_id=operation_id,
+                install_revision=revision,
                 distribution_operation_id=operation_id,
             )
             if not committed:
@@ -1496,13 +1462,6 @@ class WorkerJobExecutor(
         download_profiles = self.available_download_profiles()
         profiles = export_profiles
         storage_profiles_available = self.available_storage_profiles()
-        profile_sync_manager = getattr(self, "profile_sync", None)
-        snapshot = getattr(profile_sync_manager, "snapshot", None)
-        profile_sync = snapshot() if callable(snapshot) else {
-            "enabled": False,
-            "status": "disabled",
-            "profiles": {},
-        }
         storage_profile = self.storage_profile()
         storage_available = storage_profile in storage_profiles_available
         storage_session_fingerprints = self.available_storage_session_fingerprints(
@@ -1535,7 +1494,6 @@ class WorkerJobExecutor(
             "profiles": profiles,
             "export_profiles": export_profiles,
             "download_profiles": download_profiles,
-            "profile_sync": profile_sync,
             "storage_profile": storage_profile,
             "storage_profile_available": storage_available,
             "available_storage_profiles": storage_profiles_available,
@@ -1989,20 +1947,6 @@ class WorkerJobExecutor(
             return f"Job dihentikan oleh user (Ctrl+C). Staging dipertahankan di {staging}."
         return "Job dihentikan oleh user (Ctrl+C)."
 
-    def _wait_for_profile_sync(
-        self,
-        kind: str,
-        profile: str,
-        expected_revision: int,
-        *,
-        cancelled: Callable[[], bool],
-        on_wait: Callable[[str], None],
-    ) -> bool:
-        # Desired vault revision is diagnostic. A job's real session
-        # prerequisite is checked locally immediately before execution.
-        del kind, profile, expected_revision, cancelled, on_wait
-        return True
-
     def _require_local_job_session(self, command: dict[str, Any]) -> None:
         kind = str(command.get("kind") or "")
         if kind in {
@@ -2093,54 +2037,7 @@ class WorkerJobExecutor(
             with self._lock:
                 cancelled_before_execute = job_id in self._cancel_requested
             if not cancelled_before_execute:
-                expected_revision = int(command.get("profile_revision") or 0)
-
-                def report_profile_wait(reason: str) -> None:
-                    sync_error_code = ""
-                    message = "Menunggu sesi profil siap pada worker."
-                    try:
-                        sync_snapshot = self.profile_sync.snapshot()
-                        profile_state = (sync_snapshot.get("profiles") or {}).get(profile, {})
-                        sync_error_code = str(profile_state.get("error_code") or "")
-                    except Exception:
-                        profile_state = {}
-                    if sync_error_code:
-                        message = {
-                            "BACKEND_UNAVAILABLE": "Worker tidak dapat menghubungi backend vault untuk mengambil profil.",
-                            "PROFILE_BACKEND_REJECTED": "Backend menolak permintaan sinkronisasi profil worker.",
-                            "WORKER_IDENTITY_NOT_CONFIGURED": "Identitas worker untuk sinkronisasi profil belum lengkap.",
-                            "PROFILE_NOT_ASSIGNED": "Profil ini belum ditugaskan ke worker.",
-                            "PROFILE_ACK_PENDING": "Sesi terpasang, tetapi backend belum mengonfirmasi hasil sinkronisasi.",
-                        }.get(sync_error_code, f"Sinkronisasi profil gagal: {sync_error_code}.")
-                    elif reason == "waiting_worker":
-                        message = "Worker belum dapat mengakses backend sinkronisasi profil."
-                    elif reason == "legacy_profile_unavailable":
-                        message = "Sesi profil tidak tersedia pada worker dan belum ditemukan di vault."
-                    elif reason == "not_assigned":
-                        message = "Profil belum ditugaskan ke worker ini."
-                    self.publisher.emit(
-                        job_id,
-                        "running",
-                        "profile_sync",
-                        progress={
-                            "phase": "waiting_profile_sync",
-                            "reason": reason,
-                            **({"profile_sync_error_code": sync_error_code} if sync_error_code else {}),
-                            "message": message,
-                            "indeterminate": True,
-                        },
-                    )
-
-                ready = self._wait_for_profile_sync(
-                    kind,
-                    profile,
-                    expected_revision,
-                    cancelled=lambda: self._job_cancelled(job_id),
-                    on_wait=report_profile_wait,
-                )
-                cancelled_before_execute = not ready
-                if not cancelled_before_execute:
-                    self._require_local_job_session(command)
+                self._require_local_job_session(command)
             if not cancelled_before_execute:
                 self.publisher.emit(
                     job_id,

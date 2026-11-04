@@ -371,9 +371,7 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertFalse(self.jobs.command_payload(operation.job_id)["dispatch_started"])
         self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
 
-    def test_unready_profile_sync_does_not_block_job_dispatch(self):
-        self.control.profile_readiness = lambda profile, worker: False
-
+    def test_job_dispatch_does_not_depend_on_vault_distribution_status(self):
         operation = self.submit()
         result = self.control.advance_durable_job(self.queue_command(operation))
 

@@ -108,15 +108,7 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
 
     @app.get("/healthz")
     def healthz():
-        snapshot = getattr(context.executor, "profile_sync_status", None)
-        profile_sync = snapshot() if callable(snapshot) else {"status": "disabled"}
-        status = str(profile_sync.get("status") or "disabled")
-        return {
-            "ok": True,
-            "role": "worker",
-            "profiles_ready": status in {"ready", "disabled"},
-            "profile_sync_status": status,
-        }
+        return {"ok": True, "role": "worker"}
 
     @app.get("/public/download/{token}", include_in_schema=False)
     def public_storage_download(token: str = ApiPath(..., min_length=40, max_length=80)):
@@ -407,13 +399,6 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             )
         return probe()
 
-    @app.get("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
-    def profile_sync_status():
-        snapshot = getattr(context.executor, "profile_sync_status", None)
-        if not callable(snapshot):
-            return {"status": "disabled", "backend_available": None, "profiles": {}}
-        return snapshot()
-
     @app.get("/internal/v1/profiles/local", dependencies=[Depends(authorize)])
     def local_profile_inventory():
         inventory = getattr(context.executor, "local_profile_inventory", None)
@@ -548,84 +533,6 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             "Worker gagal menghapus profil lokal.",
         )
 
-    @app.post("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
-    def request_profile_sync(body: dict[str, Any]):
-        if set(body) - {"profile", "mode"}:
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID",
-                "Payload sinkronisasi profil tidak valid.",
-                status_code=422,
-            )
-        profile = body.get("profile")
-        if profile is not None and (not isinstance(profile, str) or len(profile) > 48):
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID",
-                "Nama profil sinkronisasi tidak valid.",
-                status_code=422,
-            )
-        mode = str(body.get("mode") or "check").strip().lower()
-        if mode not in {"check", "repair"}:
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID",
-                "Mode sinkronisasi harus check atau repair.",
-                status_code=422,
-            )
-        request_sync = getattr(context.executor, "request_profile_sync", None)
-        if not callable(request_sync):
-            raise DomainError(
-                "PROFILE_SYNC_UNAVAILABLE",
-                "Worker belum mendukung sinkronisasi profil.",
-                status_code=503,
-            )
-        try:
-            return request_sync(profile=profile, mode=mode)
-        except ValueError as exc:
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID", str(exc), status_code=422
-            ) from exc
-        except RuntimeError as exc:
-            raise DomainError(
-                "PROFILE_SYNC_UNAVAILABLE",
-                "Sinkronisasi profil backend belum dikonfigurasi pada worker.",
-                status_code=503,
-            ) from exc
-
-    @app.delete("/internal/v1/profile-sync", dependencies=[Depends(authorize)])
-    def cancel_profile_sync(body: dict[str, Any]):
-        if set(body) - {"profile", "mode"} or not isinstance(body.get("profile"), str):
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID",
-                "Target pembatalan sinkronisasi profil tidak valid.",
-                status_code=422,
-            )
-        profile = body["profile"]
-        if len(profile) > 48:
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID",
-                "Nama profil sinkronisasi tidak valid.",
-                status_code=422,
-            )
-        mode = str(body.get("mode") or "check").strip().lower()
-        if mode not in {"check", "repair"}:
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID",
-                "Mode sinkronisasi harus check atau repair.",
-                status_code=422,
-            )
-        cancel_sync = getattr(context.executor, "cancel_profile_sync", None)
-        if not callable(cancel_sync):
-            raise DomainError(
-                "PROFILE_SYNC_UNAVAILABLE",
-                "Worker belum mendukung pembatalan sinkronisasi profil.",
-                status_code=503,
-            )
-        try:
-            return cancel_sync(profile=profile, mode=mode)
-        except ValueError as exc:
-            raise DomainError(
-                "PROFILE_SYNC_REQUEST_INVALID", str(exc), status_code=422
-            ) from exc
-
     @app.get("/internal/v1/tts/health", dependencies=[Depends(authorize)])
     def tts_health():
         return context.executor.tts_health()
@@ -740,22 +647,22 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         request: Request,
         telegram_user_id: int = Header(alias="X-Telegram-User-ID"),
         provisioning_id: str = Header(default="", alias="X-Provisioning-ID"),
-        sync_run_id: str = Header(default="", alias="X-Profile-Sync-Run-ID"),
-        sync_revision: int = Header(default=0, alias="X-Profile-Sync-Revision"),
+        install_run_id: str = Header(default="", alias="X-Profile-Install-Run-ID"),
+        install_revision: int = Header(default=0, alias="X-Profile-Install-Revision"),
     ):
         data = await request.body()
         if len(data) > MAX_PROFILE_BUNDLE_BYTES:
             raise DomainError("PROFILE_ARCHIVE_TOO_LARGE", "Bundle profil melebihi batas.", status_code=413)
-        sync_kwargs = {}
-        if sync_run_id and sync_revision > 0:
-            sync_kwargs = {"sync_run_id": sync_run_id, "sync_revision": sync_revision}
+        install_kwargs = {}
+        if install_run_id and install_revision > 0:
+            install_kwargs = {"install_run_id": install_run_id, "install_revision": install_revision}
         return profile_operation(
             lambda: context.executor.install_profile_bundle(
                 profile,
                 telegram_user_id,
                 data,
                 provisioning_id,
-                **sync_kwargs,
+                **install_kwargs,
             ),
             "PROFILE_INSTALL_FAILED",
             "Worker tidak dapat memasang sesi profil.",
@@ -948,17 +855,17 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
 
     @app.post("/internal/v1/profiles/{profile}/session/commit", dependencies=[Depends(authorize)])
     def commit_profile_bundle(profile: str, body: dict[str, Any]):
-        sync_kwargs = {}
-        if body.get("sync_run_id") and type(body.get("revision")) is int and body.get("revision", 0) > 0:
-            sync_kwargs = {
-                "sync_run_id": str(body["sync_run_id"]),
-                "sync_revision": int(body["revision"]),
+        install_kwargs = {}
+        if body.get("install_run_id") and type(body.get("revision")) is int and body.get("revision", 0) > 0:
+            install_kwargs = {
+                "install_run_id": str(body["install_run_id"]),
+                "install_revision": int(body["revision"]),
             }
         return {
             "committed": context.executor.commit_profile_bundle(
                 profile,
                 str(body.get("operation_id") or ""),
-                **sync_kwargs,
+                **install_kwargs,
             )
         }
 

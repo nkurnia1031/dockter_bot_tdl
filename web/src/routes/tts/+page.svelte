@@ -14,7 +14,6 @@
     reason_code: string;
     profiles?: TtsProfile[];
     verified_profiles?: string[];
-    profile_sync_ready?: boolean;
     profile_session_ready?: boolean;
   };
 

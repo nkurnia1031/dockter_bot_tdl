@@ -81,7 +81,7 @@ def _job_uses_profile(context, job, profile: str, worker: str) -> bool:
     )
 
 
-def _active_sync_exists(context, profile: str, worker: str) -> bool:
+def _active_distribution_exists(context, profile: str, worker: str) -> bool:
     provisioner = getattr(context, "profile_provisioner", None)
     store = getattr(provisioner, "store", None)
     active_install = getattr(store, "distribution_install_active", None)
@@ -91,13 +91,7 @@ def _active_sync_exists(context, profile: str, worker: str) -> bool:
                 return True
         except (KeyError, TypeError, ValueError):
             return True
-    list_requests = getattr(store, "sync_requests", None)
-    if not callable(list_requests):
-        return False
-    try:
-        return bool(list_requests(profile, worker))
-    except (KeyError, TypeError, ValueError):
-        return True
+    return False
 
 
 def _assert_no_active_profile_work(context, profile: str, worker: str) -> None:
@@ -113,10 +107,10 @@ def _assert_no_active_profile_work(context, profile: str, worker: str) -> None:
                     status_code=409,
                     details={"profile": profile, "worker": worker, "job_id": job.id},
                 )
-    if _active_sync_exists(context, profile, worker):
+    if _active_distribution_exists(context, profile, worker):
         raise DomainError(
-            "PROFILE_SYNC_ACTIVE",
-            f"Profil {profile} sedang disinkronkan ke worker {worker}; tidak ada data yang dihapus.",
+            "PROFILE_DISTRIBUTION_ACTIVE",
+            f"Profil {profile} sedang dipasang ke worker {worker}; tidak ada data yang dihapus.",
             status_code=409,
             details={"profile": profile, "worker": worker},
         )

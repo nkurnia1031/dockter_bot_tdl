@@ -9,92 +9,39 @@ describe('ProfileVaultPage', () => {
     vi.unstubAllGlobals();
   });
 
-  it('separates the Vault acknowledgement from worker runtime and shows the safe failure reason', async () => {
-    const requests: string[] = [];
-    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
-      const url = String(input);
-      requests.push(url);
-      if (url === '/api/v1/profiles/management') {
-        return new Response(JSON.stringify({
-          workers: [{ name: 'remote-1', enabled: true, online: true, secure: true }],
-          items: [{
-            name: 'default', active: true, status: 'waiting_worker', vault: true,
-            workers: [{
-              worker: 'remote-1', status: 'waiting_worker', desired_revision: 1, installed_revision: 1,
-              vault_ack_status: 'ready', vault_ack_installed_revision: 1,
-              runtime_status: 'waiting_worker', runtime_error_code: 'WORKER_IDENTITY_AMBIGUOUS'
-            }]
-          }, {
-            name: 'irang', active: true, status: 'waiting_worker', vault: true,
-            workers: [{ worker: 'remote-1', status: 'waiting_worker', runtime_status: 'waiting_worker', runtime_error_code: 'WORKER_UNAUTHORIZED' }]
-          }, {
-            name: 'storage', active: true, status: 'waiting_worker', vault: true,
-            workers: [{ worker: 'remote-1', status: 'waiting_worker', runtime_status: 'waiting_worker', runtime_error_code: 'INTERNAL_UNAUTHORIZED' }]
-          }]
-        }), { status: 200 });
-      }
-      return new Response(JSON.stringify({ items: [] }), { status: 200 });
-    }));
-
-    render(ProfileVaultPage);
-
-    expect(await screen.findByText(/Token worker dipakai bersama/)).toBeTruthy();
-    expect(screen.getByText(/WORKER_API_TOKEN pada worker tidak cocok/)).toBeTruthy();
-    expect(screen.getByText(/BACKEND_INTERNAL_TOKEN pada worker tidak cocok/)).toBeTruthy();
-    expect(screen.getByText(/Vault ACK: Siap/)).toBeTruthy();
-    expect(screen.getAllByText(/Runtime worker: Menunggu/)).toHaveLength(3);
-    expect(screen.getAllByRole('link', { name: 'Buka log JSON' })[0].getAttribute('href'))
-      .toBe('/api/v1/profiles/default/workers/remote-1/sync-logs?limit=500');
-    expect(screen.queryByRole('button', { name: /Adopsi|Sebarkan|login TDL/i })).toBeNull();
-    expect(requests.filter((url) => url === '/api/v1/profiles/management')).toHaveLength(1);
-    expect(requests).toContain('/api/v1/profiles/default/workers/remote-1/sync-logs?limit=50');
-
-    await waitFor(() => expect(
-      screen.getByRole('button', { name: 'Muat ulang status Vault' }).hasAttribute('disabled')
-    ).toBe(false));
-    await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang status Vault' }));
-    expect(requests.filter((url) => url === '/api/v1/profiles/management')).toHaveLength(2);
-  });
-
-  it('shows persisted sync progress history and refreshes it without restarting the operation', async () => {
+  it('shows active Vault storage independently from worker distribution and never polls sync', async () => {
     const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
       const url = String(input);
       requests.push(url);
       if (url === '/api/v1/profiles/management') return new Response(JSON.stringify({
-        workers: [{ name: 'remote-1', enabled: true, online: true, secure: true }],
+        workers: [{ name: 'remote-1', enabled: true, online: false, secure: true }],
         items: [{
-          name: 'default', active: true, status: 'sync_pending', vault: true,
-          workers: [{ worker: 'remote-1', status: 'sync_pending', desired_revision: 3, runtime_status: 'sync_pending' }]
+          name: 'default', active: true, status: 'active', vault: true, desired_revision: 3,
+          workers: [{
+            worker: 'remote-1', status: 'waiting', desired_revision: 3,
+            installed_revision: null, error: 'Worker belum menerima sesi.'
+          }]
         }]
-      }), { status: 200 });
-      if (url.endsWith('/sync-logs?limit=50')) return new Response(JSON.stringify({
-        active: true,
-        next_after_id: 3,
-        items: [
-          { id: 1, run_id: 'operation-123', sequence: null, revision: 3, phase: 'queued', status: 'queued', code: 'PROFILE_SYNC_QUEUED', created_at: '2026-10-01T10:00:00Z' },
-          { id: 2, run_id: 'worker-run-123', sequence: 1, revision: 3, phase: 'bundle_download', status: 'running', code: '', created_at: '2026-10-01T10:00:03Z' },
-          { id: 3, run_id: 'worker-run-123', sequence: 2, revision: 3, phase: 'upload_validation', status: 'succeeded', code: '', created_at: '2026-10-01T10:00:04Z' }
-        ]
       }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
     render(ProfileVaultPage);
 
-    expect(await screen.findByText('Unduh bundle')).toBeTruthy();
-    expect(screen.getByText('Validasi lane Upload')).toBeTruthy();
-    expect(screen.getByText('Antrean')).toBeTruthy();
-    expect(screen.getAllByText('Berjalan').length).toBeGreaterThan(0);
-    expect(requests).toContain('/api/v1/profiles/default/workers/remote-1/sync-logs?limit=50');
-    expect(requests.some((url) => url.includes('/api/v1/operations'))).toBe(false);
+    expect(await screen.findByText('Aktif di Vault')).toBeTruthy();
+    expect(screen.getByText('Menunggu worker')).toBeTruthy();
+    expect(screen.getByText('Worker belum menerima sesi.')).toBeTruthy();
+    expect(requests).toContain('/api/v1/profiles/default/distributions');
+    expect(requests.some((url) => /profile-sync|sync-logs/.test(url))).toBe(false);
+    expect(screen.queryByText(/kesiapan runtime|Vault ACK|sync_pending/i)).toBeNull();
+
     await waitFor(() => expect(
       screen.getByRole('button', { name: 'Muat ulang status Vault' }).hasAttribute('disabled')
     ).toBe(false));
     await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang status Vault' }));
-    await waitFor(() => expect(requests.filter((url) => url.endsWith('/sync-logs?limit=50'))).toHaveLength(2));
+    await waitFor(() => expect(requests.filter((url) => url === '/api/v1/profiles/management')).toHaveLength(2));
   });
-
   it('deletes only the Vault bundle after explicit confirmation', async () => {
     const requests: { url: string; method: string }[] = [];
     const confirmation = vi.spyOn(window, 'confirm').mockReturnValue(true);
@@ -158,7 +105,6 @@ describe('ProfileVaultPage', () => {
         return new Response(JSON.stringify(operation), { status: 202 });
       }
       if (url.endsWith('/workers/remote-1/retry') && method === 'POST') return new Response(JSON.stringify(operation), { status: 202 });
-      if (url.endsWith('/sync-logs?limit=50')) return new Response(JSON.stringify({ items: [], active: false, next_after_id: 0 }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 

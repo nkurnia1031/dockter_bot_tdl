@@ -19,7 +19,6 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from tme3bot.domain.operations import OperationStatus
 from tme3bot.names import normalize_profile_name
 
 
@@ -288,22 +287,8 @@ class ProfileProvisioningStore:
                     installed_revision INTEGER,
                     installed_sha256 TEXT,
                     installed_telegram_user_id INTEGER,
-                    sync_requested INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(profile, worker)
                 );
-                CREATE TABLE IF NOT EXISTS profile_sync_requests (
-                    operation_id TEXT PRIMARY KEY,
-                    actor_user_id INTEGER NOT NULL,
-                    profile TEXT NOT NULL,
-                    worker TEXT NOT NULL,
-                    desired_revision INTEGER NOT NULL,
-                    mode TEXT NOT NULL DEFAULT 'check',
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_profile_sync_requests_target
-                    ON profile_sync_requests(profile, worker, desired_revision, status);
                 CREATE TABLE IF NOT EXISTS profile_legacy_candidates (
                     profile TEXT NOT NULL,
                     telegram_user_id INTEGER NOT NULL,
@@ -327,7 +312,7 @@ class ProfileProvisioningStore:
                     ON profile_diagnostic_logs(actor_user_id,category,id DESC);
                 CREATE INDEX IF NOT EXISTS idx_profile_diagnostic_logs_operation
                     ON profile_diagnostic_logs(operation_id,id);
-                CREATE TABLE IF NOT EXISTS profile_sync_logs (
+                CREATE TABLE IF NOT EXISTS profile_install_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     profile TEXT NOT NULL,
                     worker TEXT NOT NULL,
@@ -340,35 +325,13 @@ class ProfileProvisioningStore:
                     details_json TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
-                CREATE INDEX IF NOT EXISTS idx_profile_sync_logs_target
-                    ON profile_sync_logs(profile,worker,id DESC);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_logs_event
-                    ON profile_sync_logs(worker,run_id,sequence)
+                CREATE INDEX IF NOT EXISTS idx_profile_install_events_target
+                    ON profile_install_events(profile,worker,id DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_install_events_event
+                    ON profile_install_events(worker,run_id,sequence)
                     WHERE sequence IS NOT NULL;
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_logs_server_event
-                    ON profile_sync_logs(worker,run_id,phase,status,code)
-                    WHERE sequence IS NULL;
-                CREATE TABLE IF NOT EXISTS profile_sync_operation_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    operation_id TEXT NOT NULL,
-                    profile TEXT NOT NULL,
-                    worker TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    sequence INTEGER,
-                    revision INTEGER,
-                    phase TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    code TEXT NOT NULL,
-                    details_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_profile_sync_operation_events_operation
-                    ON profile_sync_operation_events(operation_id,id);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_operation_events_worker_event
-                    ON profile_sync_operation_events(operation_id,worker,run_id,sequence)
-                    WHERE sequence IS NOT NULL;
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_sync_operation_events_server_event
-                    ON profile_sync_operation_events(operation_id,worker,run_id,phase,status,code)
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_profile_install_events_server_event
+                    ON profile_install_events(worker,run_id,phase,status,code)
                     WHERE sequence IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_profile_provisionings_status
                     ON profile_provisionings(status, updated_at);
@@ -398,14 +361,35 @@ class ProfileProvisioningStore:
                     "installed_revision": "INTEGER",
                     "installed_sha256": "TEXT",
                     "installed_telegram_user_id": "INTEGER",
-                    "sync_requested": "INTEGER NOT NULL DEFAULT 0",
                 },
             )
-            self._ensure_columns(
-                db,
-                "profile_sync_requests",
-                {"mode": "TEXT NOT NULL DEFAULT 'check'"},
-            )
+            # Remove the retired worker-pull state on upgrade. Saved bundles
+            # are installed through provisioning/distribution operations.
+            db.execute("DROP TABLE IF EXISTS profile_sync_requests")
+            db.execute("DROP TABLE IF EXISTS profile_sync_operation_events")
+            legacy_columns = {
+                str(row[1]) for row in db.execute("PRAGMA table_info(profile_distributions)")
+            }
+            if "sync_requested" in legacy_columns:
+                try:
+                    db.execute("ALTER TABLE profile_distributions DROP COLUMN sync_requested")
+                except sqlite3.OperationalError:
+                    # Older SQLite keeps the now-unused compatibility column;
+                    # no query or gate reads it.
+                    pass
+            legacy_log_table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='profile_sync_logs'"
+            ).fetchone()
+            if legacy_log_table:
+                db.execute(
+                    "INSERT OR IGNORE INTO profile_install_events "
+                    "(id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at) "
+                    "SELECT id,profile,worker,run_id,sequence,revision,phase,status,"
+                    "CASE code WHEN 'PROFILE_SYNC_QUEUED' THEN 'PROFILE_INSTALL_QUEUED' "
+                    "WHEN 'PROFILE_SYNC_INSTALLED' THEN 'PROFILE_INSTALLED' ELSE code END,"
+                    "details_json,created_at FROM profile_sync_logs"
+                )
+                db.execute("DROP TABLE profile_sync_logs")
             # Additive migration: make each pre-versioned vault row revision 1.
             legacy_rows = db.execute(
                 "SELECT profile,telegram_user_id,encrypted_bundle,source,updated_at,desired_revision "
@@ -461,10 +445,10 @@ class ProfileProvisioningStore:
         if category == "tts":
             allowed = {
                 "ready", "reason_code", "helpers_ready", "capability_ready",
-                "profile_session_ready", "profile_sync_ready", "helpers", "queued_jobs",
+                "profile_session_ready", "helpers", "queued_jobs",
             }
             result = {key: details[key] for key in allowed if key in details}
-            for key in ("ready", "helpers_ready", "capability_ready", "profile_session_ready", "profile_sync_ready"):
+            for key in ("ready", "helpers_ready", "capability_ready", "profile_session_ready"):
                 if key in result:
                     result[key] = bool(result[key])
             if "queued_jobs" in result:
@@ -552,7 +536,7 @@ class ProfileProvisioningStore:
             ).fetchall()
         return [self._diagnostic_log_row(row) for row in rows]
 
-    def append_profile_sync_log(
+    def append_profile_install_event(
         self,
         *,
         profile: str,
@@ -565,11 +549,11 @@ class ProfileProvisioningStore:
         sequence: int | None = None,
         details: dict[str, Any] | None = None,
     ) -> int | None:
-        safe_details = self._safe_profile_sync_details(details)
+        safe_details = self._safe_profile_install_details(details)
         now = _now()
         with self._lock, self._db() as db:
             cursor = db.execute(
-                "INSERT OR IGNORE INTO profile_sync_logs "
+                "INSERT OR IGNORE INTO profile_install_events "
                 "(profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
@@ -583,117 +567,31 @@ class ProfileProvisioningStore:
                 ),
             )
             db.execute(
-                "DELETE FROM profile_sync_logs WHERE id NOT IN "
-                "(SELECT id FROM profile_sync_logs ORDER BY id DESC LIMIT 50000)"
+                "DELETE FROM profile_install_events WHERE id NOT IN "
+                "(SELECT id FROM profile_install_events ORDER BY id DESC LIMIT 50000)"
             )
             return int(cursor.lastrowid) if cursor.rowcount else None
 
-    def append_profile_sync_operation_event(
-        self,
-        *,
-        operation_id: str,
-        profile: str,
-        worker: str,
-        run_id: str,
-        phase: str,
-        status: str,
-        code: str = "",
-        revision: int | None = None,
-        sequence: int | None = None,
-        details: dict[str, Any] | None = None,
-    ) -> int | None:
-        safe_details = self._safe_profile_sync_details(details)
-        now = _now()
-        with self._lock, self._db() as db:
-            cursor = db.execute(
-                "INSERT OR IGNORE INTO profile_sync_operation_events "
-                "(operation_id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    str(operation_id)[:64], str(profile)[:48], str(worker)[:48], str(run_id)[:64],
-                    int(sequence) if sequence is not None else None,
-                    int(revision) if revision is not None else None,
-                    re.sub(r"[^a-z0-9_-]", "", str(phase).lower())[:64] or "event",
-                    str(status)[:24],
-                    re.sub(r"[^A-Z0-9_-]", "", str(code).upper())[:64],
-                    json.dumps(safe_details, separators=(",", ":")), now,
-                ),
-            )
-            db.execute(
-                "DELETE FROM profile_sync_operation_events WHERE id NOT IN "
-                "(SELECT id FROM profile_sync_operation_events ORDER BY id DESC LIMIT 50000)"
-            )
-            return int(cursor.lastrowid) if cursor.rowcount else None
-
-    def profile_sync_operation_events(
-        self, operation_id: str, *, after_id: int = 0, limit: int = 100
-    ) -> dict[str, Any]:
-        safe_limit = min(500, max(1, int(limit)))
-        with self._db() as db:
-            latest = db.execute(
-                "SELECT status FROM profile_sync_operation_events WHERE operation_id=? ORDER BY id DESC LIMIT 1",
-                (str(operation_id),),
-            ).fetchone()
-            if int(after_id) <= 0:
-                rows = db.execute(
-                    "SELECT id,operation_id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
-                    "FROM profile_sync_operation_events WHERE operation_id=? ORDER BY id LIMIT ?",
-                    (str(operation_id), safe_limit),
-                ).fetchall()
-            else:
-                rows = db.execute(
-                    "SELECT id,operation_id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
-                    "FROM profile_sync_operation_events WHERE operation_id=? AND id>? ORDER BY id LIMIT ?",
-                    (str(operation_id), int(after_id), safe_limit),
-                ).fetchall()
-        items = []
-        for row in rows:
-            try:
-                details = json.loads(str(row["details_json"]))
-            except (TypeError, ValueError, json.JSONDecodeError):
-                details = {}
-            items.append({
-                "id": int(row["id"]),
-                "operation_id": str(row["operation_id"]),
-                "profile": str(row["profile"]),
-                "worker": str(row["worker"]),
-                "run_id": str(row["run_id"]),
-                "sequence": int(row["sequence"]) if row["sequence"] is not None else None,
-                "revision": int(row["revision"]) if row["revision"] is not None else None,
-                "phase": str(row["phase"]),
-                "status": str(row["status"]),
-                "code": str(row["code"]),
-                "details": details if isinstance(details, dict) else {},
-                "created_at": str(row["created_at"]),
-            })
-        last_id = items[-1]["id"] if items else max(0, int(after_id))
-        latest_status = str(latest["status"]) if latest else ""
-        return {
-            "items": items,
-            "next_after_id": last_id,
-            "active": latest_status in {"queued", "running", "waiting"},
-        }
-
-    def profile_sync_logs(
+    def profile_install_events(
         self, profile: str, worker: str, *, after_id: int = 0, limit: int = 100
     ) -> dict[str, Any]:
         safe_limit = min(500, max(1, int(limit)))
         with self._db() as db:
             latest = db.execute(
-                "SELECT run_id,status FROM profile_sync_logs "
+                "SELECT run_id,status FROM profile_install_events "
                 "WHERE profile=? AND worker=? ORDER BY id DESC LIMIT 1",
                 (str(profile), str(worker)),
             ).fetchone()
             if int(after_id) <= 0:
                 rows = db.execute(
                     "SELECT id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
-                    "FROM profile_sync_logs WHERE profile=? AND worker=? ORDER BY id DESC LIMIT ?",
+                    "FROM profile_install_events WHERE profile=? AND worker=? ORDER BY id DESC LIMIT ?",
                     (str(profile), str(worker), safe_limit),
                 ).fetchall()[::-1]
             else:
                 rows = db.execute(
                     "SELECT id,profile,worker,run_id,sequence,revision,phase,status,code,details_json,created_at "
-                    "FROM profile_sync_logs WHERE profile=? AND worker=? AND id>? ORDER BY id LIMIT ?",
+                    "FROM profile_install_events WHERE profile=? AND worker=? AND id>? ORDER BY id LIMIT ?",
                     (str(profile), str(worker), int(after_id), safe_limit),
                 ).fetchall()
         items = []
@@ -726,7 +624,7 @@ class ProfileProvisioningStore:
         }
 
     @staticmethod
-    def _safe_profile_sync_details(details: dict[str, Any] | None) -> dict[str, Any]:
+    def _safe_profile_install_details(details: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(details, dict):
             return {}
         allowed = {"desired_revision", "installed_revision", "bundle_bytes", "entry_count", "attempt"}
@@ -872,17 +770,12 @@ class ProfileProvisioningStore:
             is_adoption = str(row["source"]) == "adoption"
             if not is_adoption:
                 db.execute(
-                    "UPDATE profile_distributions SET status='waiting',error=NULL,desired_revision=?,installed_revision=NULL,installed_sha256=NULL,installed_telegram_user_id=NULL,sync_requested=0,updated_at=? WHERE profile=?",
+                    "UPDATE profile_distributions SET status='waiting',error=NULL,desired_revision=?,installed_revision=NULL,installed_sha256=NULL,installed_telegram_user_id=NULL,updated_at=? WHERE profile=?",
                     (revision, now, profile),
                 )
             db.execute(
                 "DELETE FROM profile_legacy_candidates WHERE profile=?", (profile,)
             )
-            if not is_adoption:
-                db.execute(
-                    "UPDATE profile_sync_requests SET desired_revision=?,status='pending',updated_at=? WHERE profile=? AND status='pending'",
-                    (revision, now, profile),
-                )
             db.execute(
                 "UPDATE profile_provisionings SET telegram_user_id=?,status=?,error=NULL,updated_at=? WHERE id=?",
                 (int(user_id), "stored" if is_adoption else "distributing", now, operation_id),
@@ -905,11 +798,7 @@ class ProfileProvisioningStore:
                 "SELECT 1 FROM profile_distributions WHERE profile=? AND status='installing' LIMIT 1",
                 (str(profile),),
             ).fetchone()
-            pending_sync = db.execute(
-                "SELECT 1 FROM profile_sync_requests WHERE profile=? AND status='pending' LIMIT 1",
-                (str(profile),),
-            ).fetchone()
-            if active or installing or pending_sync:
+            if active or installing:
                 raise ValueError("Operasi Vault profil masih berjalan.")
             db.execute("DELETE FROM profile_distributions WHERE profile=?", (str(profile),))
             db.execute("DELETE FROM profile_session_revisions WHERE profile=?", (str(profile),))
@@ -1055,120 +944,6 @@ class ProfileProvisioningStore:
             for row in rows
         ]
 
-    def profile_manifest(self, worker: str) -> list[dict[str, Any]]:
-        with self._db() as db:
-            rows = db.execute(
-                "SELECT p.profile,p.desired_revision,p.format_version,p.bundle_sha256,p.active, "
-                "d.status,d.installed_revision,d.installed_sha256,d.sync_requested "
-                "FROM profile_sessions p JOIN profile_distributions d ON d.profile=p.profile "
-                "WHERE d.worker=? ORDER BY p.profile",
-                (str(worker),),
-            ).fetchall()
-        return [
-            {
-                "profile": str(row["profile"]),
-                "revision": int(row["desired_revision"]),
-                "format_version": int(row["format_version"]),
-                "bundle_sha256": str(row["bundle_sha256"]),
-                "admission_status": (
-                    "ready" if bool(row["active"])
-                    and str(row["status"]) == "ready"
-                    and row["installed_revision"] is not None
-                    and int(row["installed_revision"]) == int(row["desired_revision"])
-                    and str(row["installed_sha256"] or "") == str(row["bundle_sha256"])
-                    else "pending"
-                ),
-                "sync_requested": bool(row["sync_requested"]),
-            }
-            for row in rows
-        ]
-
-    def bundle_for_worker(self, profile: str, revision: int, worker: str) -> dict[str, Any] | None:
-        with self._db() as db:
-            assigned = db.execute(
-                "SELECT desired_revision FROM profile_distributions WHERE profile=? AND worker=?",
-                (str(profile), str(worker)),
-            ).fetchone()
-            if assigned is None or assigned["desired_revision"] is None or int(assigned["desired_revision"]) != int(revision):
-                return None
-            row = db.execute(
-                "SELECT revision,format_version,bundle_sha256,telegram_user_id,encrypted_bundle "
-                "FROM profile_session_revisions WHERE profile=? AND revision=?",
-                (str(profile), int(revision)),
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "profile": str(profile),
-            "revision": int(row["revision"]),
-            "format_version": int(row["format_version"]),
-            "bundle_sha256": str(row["bundle_sha256"]),
-            "telegram_user_id": int(row["telegram_user_id"]),
-            "bundle": self._decrypt(str(profile), bytes(row["encrypted_bundle"])),
-        }
-
-    def acknowledge_bundle(
-        self, profile: str, worker: str, revision: int, bundle_sha256: str,
-        telegram_user_id: int, *, error_code: str | None = None,
-    ) -> dict[str, Any]:
-        now = _now()
-        with self._lock, self._db() as db:
-            assignment = db.execute(
-                "SELECT desired_revision FROM profile_distributions WHERE profile=? AND worker=?",
-                (str(profile), str(worker)),
-            ).fetchone()
-            expected = db.execute(
-                "SELECT bundle_sha256,telegram_user_id FROM profile_session_revisions WHERE profile=? AND revision=?",
-                (str(profile), int(revision)),
-            ).fetchone()
-            if assignment is None or expected is None:
-                return {"accepted": False, "reason": "not_assigned"}
-            desired = int(assignment["desired_revision"] or 0)
-            current_revision = db.execute(
-                "SELECT desired_revision FROM profile_sessions WHERE profile=?",
-                (str(profile),),
-            ).fetchone()
-            latest_desired = int(current_revision[0]) if current_revision else desired
-            stale = desired != int(revision) or latest_desired != int(revision)
-            metadata_matches = (
-                str(expected["bundle_sha256"]) == str(bundle_sha256)
-                and int(expected["telegram_user_id"]) == int(telegram_user_id)
-            )
-            if not metadata_matches:
-                db.execute(
-                    "UPDATE profile_distributions SET status='failed',error='ACK_METADATA_MISMATCH',updated_at=? WHERE profile=? AND worker=?",
-                    (now, str(profile), str(worker)),
-                )
-                return {"accepted": False, "reason": "metadata_mismatch", "desired_revision": desired}
-            if stale:
-                db.execute(
-                    "UPDATE profile_distributions SET status='waiting',error='STALE_REVISION_ACK', "
-                    "installed_revision=CASE WHEN ? IS NULL THEN installed_revision ELSE ? END, "
-                    "installed_sha256=CASE WHEN ? IS NULL THEN installed_sha256 ELSE ? END, "
-                    "installed_telegram_user_id=CASE WHEN ? IS NULL THEN installed_telegram_user_id ELSE ? END, "
-                    "sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
-                    (
-                        error_code, int(revision), error_code, str(bundle_sha256),
-                        error_code, int(telegram_user_id), now, str(profile), str(worker),
-                    ),
-                )
-            elif error_code:
-                safe_code = re.sub(r"[^A-Z0-9_-]", "", str(error_code).upper())[:64] or "INSTALL_FAILED"
-                db.execute(
-                    "UPDATE profile_distributions SET status='failed',error=?,sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
-                    (safe_code, now, str(profile), str(worker)),
-                )
-            else:
-                db.execute(
-                    "UPDATE profile_distributions SET status='ready',error=NULL,installed_revision=?,installed_sha256=?,installed_telegram_user_id=?,sync_requested=0,updated_at=? WHERE profile=? AND worker=?",
-                    (int(revision), str(bundle_sha256), int(telegram_user_id), now, str(profile), str(worker)),
-                )
-            return {
-                "accepted": not stale and not bool(error_code),
-                "reason": "stale_revision" if stale else ("install_failed" if error_code else "installed"),
-                "desired_revision": latest_desired,
-            }
-
     def distribution_provisioning_id(self, profile: str, worker: str) -> str | None:
         with self._db() as db:
             row = db.execute(
@@ -1177,100 +952,32 @@ class ProfileProvisioningStore:
             ).fetchone()
         return str(row[0]) if row and row[0] else None
 
-    def request_sync(
-        self, operation_id: str, actor_user_id: int, profile: str, worker: str,
-        revision: int, mode: str = "check",
-    ) -> None:
-        now = _now()
-        with self._lock, self._db() as db:
-            current = db.execute(
-                "SELECT desired_revision FROM profile_sessions WHERE profile=?", (str(profile),)
-            ).fetchone()
-            if current is None or int(current["desired_revision"]) != int(revision):
-                raise ValueError("Revision profil berubah sebelum permintaan sinkronisasi disimpan.")
-            assigned = db.execute(
-                "SELECT 1 FROM profile_distributions WHERE profile=? AND worker=?",
-                (str(profile), str(worker)),
-            ).fetchone()
-            if assigned is None:
-                raise KeyError(worker)
-            db.execute(
-                "INSERT INTO profile_sync_requests(operation_id,actor_user_id,profile,worker,desired_revision,mode,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,'pending',?,?) ON CONFLICT(operation_id) DO UPDATE SET desired_revision=excluded.desired_revision,mode=excluded.mode,status='pending',updated_at=excluded.updated_at",
-                (str(operation_id), int(actor_user_id), str(profile), str(worker), int(revision), str(mode), now, now),
-            )
-            db.execute(
-                "UPDATE profile_distributions SET desired_revision=?, "
-                "status=CASE WHEN status='removed_locally' THEN 'waiting' WHEN installed_revision=desired_revision AND installed_sha256=(SELECT bundle_sha256 FROM profile_sessions WHERE profile=?) THEN status ELSE 'waiting' END, "
-                "error=NULL,sync_requested=1,updated_at=? WHERE profile=? AND worker=?",
-                (int(revision), str(profile), now, str(profile), str(worker)),
-            )
-
-    def cancel_sync_request(self, operation_id: str) -> dict[str, Any] | None:
-        with self._lock, self._db() as db:
-            request = db.execute(
-                "SELECT profile,worker,desired_revision,mode,status FROM profile_sync_requests WHERE operation_id=?",
-                (str(operation_id),),
-            ).fetchone()
-            if request is None or str(request["status"]) != "pending":
-                return None
-            db.execute(
-                "UPDATE profile_sync_requests SET status='cancelled',updated_at=? WHERE operation_id=?",
-                (_now(), str(operation_id)),
-            )
-            still_pending = db.execute(
-                "SELECT 1 FROM profile_sync_requests WHERE profile=? AND worker=? AND status='pending' LIMIT 1",
-                (str(request["profile"]), str(request["worker"])),
-            ).fetchone()
-            if not still_pending:
-                db.execute(
-                    "UPDATE profile_distributions SET sync_requested=0 WHERE profile=? AND worker=?",
-                    (str(request["profile"]), str(request["worker"])),
-                )
-            return {
-                "profile": str(request["profile"]),
-                "worker": str(request["worker"]),
-                "desired_revision": int(request["desired_revision"]),
-                "mode": str(request["mode"]),
-            }
-
-    def finish_sync_requests(self, profile: str, worker: str, revision: int, status: str) -> list[dict[str, Any]]:
-        if status not in {"succeeded", "failed"}:
-            raise ValueError("Status operasi sinkronisasi tidak valid.")
-        now = _now()
-        with self._lock, self._db() as db:
-            rows = db.execute(
-                "SELECT operation_id,actor_user_id FROM profile_sync_requests WHERE profile=? AND worker=? AND desired_revision=? AND status='pending' ORDER BY created_at",
-                (str(profile), str(worker), int(revision)),
-            ).fetchall()
-            db.execute(
-                "UPDATE profile_sync_requests SET status=?,updated_at=? WHERE profile=? AND worker=? AND desired_revision=? AND status='pending'",
-                (status, now, str(profile), str(worker), int(revision)),
-            )
-            return [
-                {"operation_id": str(row["operation_id"]), "actor_user_id": int(row["actor_user_id"])}
-                for row in rows
-            ]
-
-    def sync_requests(self, profile: str, worker: str, revision: int | None = None) -> list[dict[str, Any]]:
-        query = "SELECT operation_id,actor_user_id,desired_revision,mode FROM profile_sync_requests WHERE profile=? AND worker=? AND status='pending'"
-        values: list[Any] = [str(profile), str(worker)]
-        if revision is not None:
-            query += " AND desired_revision=?"
-            values.append(int(revision))
-        with self._db() as db:
-            rows = db.execute(query + " ORDER BY created_at", values).fetchall()
-        return [
-            {"operation_id": str(row["operation_id"]), "actor_user_id": int(row["actor_user_id"]), "desired_revision": int(row["desired_revision"]), "mode": str(row["mode"])}
-            for row in rows
-        ]
-
     def active_profiles(self) -> list[str]:
         with self._db() as db:
             rows = db.execute(
                 "SELECT profile FROM profile_sessions WHERE active=1 ORDER BY profile"
             ).fetchall()
         return [str(row["profile"]) for row in rows]
+
+    def activate_profile(self, profile: str) -> int:
+        """Activate the stored Vault profile independently of worker installs."""
+        with self._lock, self._db() as db:
+            cursor = db.execute(
+                "UPDATE profile_sessions SET active=1,updated_at=? WHERE profile=?",
+                (_now(), str(profile)),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(profile)
+            row = db.execute(
+                "SELECT telegram_user_id FROM profile_sessions WHERE profile=?",
+                (str(profile),),
+            ).fetchone()
+            db.execute(
+                "UPDATE profile_provisionings SET status='active',updated_at=?,error=NULL "
+                "WHERE profile=? AND status IN ('stored','distributing')",
+                (_now(), str(profile)),
+            )
+        return int(row["telegram_user_id"])
 
     def mark_active(self, operation_id: str) -> tuple[str, int]:
         now = _now()
@@ -1312,7 +1019,7 @@ class ProfileProvisioningStore:
             if revision is not None:
                 if status == "ready":
                     db.execute(
-                        "UPDATE profile_distributions SET desired_revision=?,installed_revision=?,installed_sha256=?,installed_telegram_user_id=?,sync_requested=0 WHERE profile=? AND worker=?",
+                        "UPDATE profile_distributions SET desired_revision=?,installed_revision=?,installed_sha256=?,installed_telegram_user_id=? WHERE profile=? AND worker=?",
                         (
                             int(revision["desired_revision"]),
                             int(revision["desired_revision"]),
@@ -1327,33 +1034,6 @@ class ProfileProvisioningStore:
                         "UPDATE profile_distributions SET desired_revision=? WHERE profile=? AND worker=?",
                         (int(revision["desired_revision"]), str(profile), str(worker)),
                     )
-
-    def distribution_ready(self, profile: str, worker: str) -> bool:
-        with self._db() as db:
-            row = db.execute(
-                "SELECT 1 FROM profile_sessions WHERE profile=?", (profile,)
-            ).fetchone()
-            item = db.execute(
-                "SELECT d.status,d.desired_revision,d.installed_revision,d.installed_sha256,p.bundle_sha256 "
-                "FROM profile_distributions d JOIN profile_sessions p ON p.profile=d.profile "
-                "WHERE d.profile=? AND d.worker=?",
-                (profile, worker),
-            ).fetchone()
-        # Legacy profiles without a vault retain their pre-existing behavior.
-        if row is None:
-            return True
-        # A worker can use its installed session as soon as it acknowledges
-        # its own distribution. Global activation remains gated on every
-        # worker in the provisioning snapshot, but an offline worker must not
-        # block targets that are already ready.
-        return bool(
-            item is not None
-            and str(item["status"]) == "ready"
-            and item["desired_revision"] is not None
-            and item["installed_revision"] is not None
-            and int(item["installed_revision"]) == int(item["desired_revision"])
-            and str(item["installed_sha256"] or "") == str(item["bundle_sha256"] or "")
-        )
 
     def provisioning(self, operation_id: str) -> dict[str, Any] | None:
         with self._db() as db:
@@ -1398,7 +1078,7 @@ class ProfileProvisioningStore:
             results = []
             for profile in profiles:
                 workers = db.execute(
-                    "SELECT worker,status,error,updated_at,desired_revision,installed_revision,installed_sha256,installed_telegram_user_id,sync_requested "
+                    "SELECT worker,status,error,updated_at,desired_revision,installed_revision,installed_sha256,installed_telegram_user_id "
                     "FROM profile_distributions WHERE profile=? ORDER BY worker",
                     (profile["profile"],),
                 ).fetchall()
@@ -1421,7 +1101,6 @@ class ProfileProvisioningStore:
                                 "desired_revision": int(item["desired_revision"]) if item["desired_revision"] is not None else None,
                                 "installed_revision": int(item["installed_revision"]) if item["installed_revision"] is not None else None,
                                 "installed_sha256": str(item["installed_sha256"] or ""),
-                                "sync_requested": bool(item["sync_requested"]),
                             }
                             for item in workers
                         ],
@@ -1496,13 +1175,8 @@ class ProfileProvisioningStore:
         now = _now()
         with self._lock, self._db() as db:
             db.execute(
-                "UPDATE profile_distributions SET status='removed_locally',error=NULL,sync_requested=0,updated_at=? "
+                "UPDATE profile_distributions SET status='removed_locally',error=NULL,updated_at=? "
                 "WHERE profile=? AND worker=?",
-                (now, str(profile), str(worker)),
-            )
-            db.execute(
-                "UPDATE profile_sync_requests SET status='cancelled',updated_at=? "
-                "WHERE profile=? AND worker=? AND status='pending'",
                 (now, str(profile), str(worker)),
             )
 
@@ -1514,19 +1188,6 @@ class ProfileProvisioningStore:
                 (_now(),),
             )
             return int(cursor.rowcount)
-
-    def add_worker_for_active_profiles(self, worker: str) -> None:
-        now = _now()
-        with self._db() as db:
-            rows = db.execute(
-                "SELECT profile,desired_revision FROM profile_sessions "
-                "WHERE (active=1 OR source!='adoption') AND source NOT IN ('local_upload','local_login')"
-            ).fetchall()
-            for row in rows:
-                db.execute(
-                    "INSERT OR IGNORE INTO profile_distributions(profile,worker,status,updated_at,desired_revision) VALUES(?,?,?,?,?)",
-                    (str(row["profile"]), worker, "waiting", now, int(row["desired_revision"])),
-                )
 
     def cancel(self, operation_id: str) -> dict[str, Any]:
         info = self.provisioning(operation_id)
@@ -1569,14 +1230,12 @@ class ProfileProvisioningStore:
 class ProfileProvisioningService:
     def __init__(
         self, store: ProfileProvisioningStore, profile_manager, worker_registry,
-        dispatcher, operation_service=None, runtime_readiness_gate=None,
+        dispatcher,
     ) -> None:
         self.store = store
         self.profile_manager = profile_manager
         self.worker_registry = worker_registry
         self.dispatcher = dispatcher
-        self.operation_service = operation_service
-        self.runtime_readiness_gate = runtime_readiness_gate
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -1650,6 +1309,11 @@ class ProfileProvisioningService:
             self.profile_manager.profile_registry.register(profile, user_id)
             set_worker_route(profile, worker)
 
+    def _activate_vault_profile(self, profile: str, user_id: int) -> None:
+        """Expose a validated Vault session before asynchronous worker installs finish."""
+        self.profile_manager.profile_registry.register_vaulted(profile, user_id)
+        self.store.activate_profile(profile)
+
     def _complete_login(self, operation_id: str) -> None:
         info = self.store.provisioning(operation_id)
         if info is None or info["status"] != "validating":
@@ -1662,6 +1326,8 @@ class ProfileProvisioningService:
             if self.profile_manager.profile_registry.profile_for_user(user_id) is not None:
                 raise FileExistsError("Akun Telegram tersebut sudah terdaftar pada profil lain.")
             self.store.store_bundle(operation_id, user_id, build_profile_bundle(session, user_id))
+            if str(info.get("source") or "") not in LOCAL_ONLY_PROVISIONING_SOURCES:
+                self._activate_vault_profile(str(info["profile"]), user_id)
         except FileExistsError:
             self.store.fail(operation_id, "Akun Telegram tersebut sudah terdaftar pada profil lain.")
             try:
@@ -1687,7 +1353,7 @@ class ProfileProvisioningService:
             # Network and worker timeouts are retried by the background loop.
             self.store.set_error(
                 operation_id,
-                "Worker belum dapat memvalidasi sesi; sinkronisasi akan dicoba ulang.",
+                "Worker belum dapat memvalidasi sesi; pemeriksaan akan dicoba ulang.",
             )
             return
         try:
@@ -1779,10 +1445,7 @@ class ProfileProvisioningService:
             if registered_id is not None and registered_id != profile:
                 raise FileExistsError("DUPLICATE_TELEGRAM_IDENTITY")
             self.store.store_bundle(operation_id, int(user_id), bundle)
-            registry = getattr(self.profile_manager, "profile_registry", None)
-            register_vaulted = getattr(registry, "register_vaulted", None)
-            if callable(register_vaulted):
-                register_vaulted(profile, int(user_id))
+            self._activate_vault_profile(profile, int(user_id))
             self._operation_log(
                 operation_id,
                 "bundle_stored_without_distribution",
@@ -1854,13 +1517,13 @@ class ProfileProvisioningService:
                 )
                 continue
             revision = int(desired["revision"])
-            sync_run_id = uuid.uuid4().hex
+            install_run_id = uuid.uuid4().hex
             worker_record = self.worker_registry.get(worker)
             if worker_record is not None and not profile_transfer_is_secure(
                 str(worker_record.get("url") or "")
             ):
-                self.store.append_profile_sync_log(
-                    profile=profile, worker=worker, run_id=sync_run_id,
+                self.store.append_profile_install_event(
+                    profile=profile, worker=worker, run_id=install_run_id,
                     revision=revision, phase="worker_unreachable", status="failed",
                     code="PROFILE_TRANSFER_REQUIRES_HTTPS",
                 )
@@ -1873,10 +1536,10 @@ class ProfileProvisioningService:
                 )
                 continue
             try:
-                self.store.append_profile_sync_log(
-                    profile=profile, worker=worker, run_id=sync_run_id,
+                self.store.append_profile_install_event(
+                    profile=profile, worker=worker, run_id=install_run_id,
                     revision=revision, phase="queued", status="queued",
-                    code="PROFILE_SYNC_QUEUED",
+                    code="PROFILE_INSTALL_QUEUED",
                     details={"desired_revision": revision},
                 )
                 installed = self.dispatcher.install_profile_bundle(
@@ -1884,24 +1547,12 @@ class ProfileProvisioningService:
                     profile,
                     user_id,
                     bundle,
-                    operation_id or f"sync-{sync_run_id}",
-                    sync_run_id=sync_run_id,
+                    operation_id or f"install-{install_run_id}",
+                    install_run_id=install_run_id,
                     revision=revision,
                 )
                 if not isinstance(installed, dict) or not installed.get("ready"):
                     raise RuntimeError("Worker tidak mengonfirmasi sesi siap.")
-                invalidate_readiness = getattr(
-                    self.runtime_readiness_gate, "invalidate_profile_mutation", None
-                )
-                if callable(invalidate_readiness):
-                    try:
-                        invalidate_readiness(
-                            worker=worker,
-                            profile=profile,
-                            reason_code="PROFILE_SESSION_CHANGED",
-                        )
-                    except Exception:
-                        LOGGER.warning("Could not invalidate profile runtime readiness after install.")
                 self.store.update_distribution(profile, worker, "ready", provisioning_id=operation_id)
                 if operation_id:
                     self._operation_log(
@@ -1910,20 +1561,15 @@ class ProfileProvisioningService:
                         "TARGET_INSTALL_READY",
                         worker=worker,
                     )
-                desired = self.store.desired_revision(profile)
-                if desired is not None:
-                    self._complete_sync_operations(
-                        profile, worker, int(desired["revision"]), succeeded=True
-                    )
                 if not operation_id:
                     self.dispatcher.commit_profile_bundle(
-                        worker, profile, f"sync-{sync_run_id}",
-                        sync_run_id=sync_run_id, revision=revision,
+                        worker, profile, f"install-{install_run_id}",
+                        install_run_id=install_run_id, revision=revision,
                     )
-                    self.store.append_profile_sync_log(
-                        profile=profile, worker=worker, run_id=sync_run_id,
+                    self.store.append_profile_install_event(
+                        profile=profile, worker=worker, run_id=install_run_id,
                         revision=revision, phase="completed", status="succeeded",
-                        code="PROFILE_SYNC_INSTALLED",
+                        code="PROFILE_INSTALLED",
                     )
                 else:
                     current_operation = self.store.provisioning(operation_id)
@@ -1933,12 +1579,12 @@ class ProfileProvisioningService:
                         # immediately so the previous session backup is removed.
                         self.dispatcher.commit_profile_bundle(
                             worker, profile, operation_id,
-                            sync_run_id=sync_run_id, revision=revision,
+                            install_run_id=install_run_id, revision=revision,
                         )
-                        self.store.append_profile_sync_log(
-                            profile=profile, worker=worker, run_id=sync_run_id,
+                        self.store.append_profile_install_event(
+                            profile=profile, worker=worker, run_id=install_run_id,
                             revision=revision, phase="completed", status="succeeded",
-                            code="PROFILE_SYNC_INSTALLED",
+                            code="PROFILE_INSTALLED",
                         )
             except Exception as exc:
                 raw_code = getattr(exc, "code", "WORKER_UNAVAILABLE")
@@ -1947,11 +1593,11 @@ class ProfileProvisioningService:
                     raw_code = payload["error"].get("code") or raw_code
                 if str(exc).startswith("PROFILE_"):
                     raw_code = str(exc)
-                sync_code = re.sub(r"[^A-Z0-9_-]", "", str(raw_code).upper())[:64] or "WORKER_UNAVAILABLE"
-                self.store.append_profile_sync_log(
-                    profile=profile, worker=worker, run_id=sync_run_id,
+                install_code = re.sub(r"[^A-Z0-9_-]", "", str(raw_code).upper())[:64] or "WORKER_UNAVAILABLE"
+                self.store.append_profile_install_event(
+                    profile=profile, worker=worker, run_id=install_run_id,
                     revision=revision, phase="worker_unreachable", status="waiting",
-                    code=sync_code,
+                    code=install_code,
                 )
                 current = self.store.provisioning(operation_id) if operation_id else None
                 previous = next(
@@ -1962,7 +1608,7 @@ class ProfileProvisioningService:
                     profile,
                     worker,
                     "waiting",
-                    "Worker belum menerima sesi; sinkronisasi akan dicoba ulang.",
+                    "Worker belum menerima sesi; distribusi akan dicoba ulang.",
                     operation_id,
                 )
                 if operation_id and (not previous or previous["status"] != "waiting" or not previous["error"]):
@@ -1996,7 +1642,7 @@ class ProfileProvisioningService:
                         commit_run_id = uuid.uuid4().hex
                         current_revision = self.store.desired_revision(profile_name)
                         revision_value = int(current_revision["revision"]) if current_revision else 0
-                        self.store.append_profile_sync_log(
+                        self.store.append_profile_install_event(
                             profile=profile_name,
                             worker=str(item["worker"]),
                             run_id=commit_run_id,
@@ -2011,22 +1657,22 @@ class ProfileProvisioningService:
                                 profile_name,
                                 operation_id,
                                 **(
-                                    {"sync_run_id": commit_run_id, "revision": revision_value}
+                            {"install_run_id": commit_run_id, "revision": revision_value}
                                     if revision_value > 0
                                     else {}
                                 ),
                             )
-                            self.store.append_profile_sync_log(
+                            self.store.append_profile_install_event(
                                 profile=profile_name,
                                 worker=str(item["worker"]),
                                 run_id=commit_run_id,
                                 revision=revision_value or None,
                                 phase="completed",
                                 status="succeeded",
-                                code="PROFILE_SYNC_INSTALLED",
+                                code="PROFILE_INSTALLED",
                             )
                         except Exception:
-                            self.store.append_profile_sync_log(
+                            self.store.append_profile_install_event(
                                 profile=profile_name,
                                 worker=str(item["worker"]),
                                 run_id=commit_run_id,
@@ -2036,13 +1682,10 @@ class ProfileProvisioningService:
                                 code="PROFILE_INSTALL_COMMIT_FAILED",
                             )
                             # Installation was already confirmed. A later
-                            # idempotent sync can clean up a stale backup.
+                            # installation retry can clean up a stale backup.
                             pass
                     if local_only:
                         self.store.discard_local_provisioning_bundle(profile_name, operation_id)
-
-    def ready(self, profile: str, worker: str) -> bool:
-        return self.store.distribution_ready(profile, worker)
 
     def profiles(self, actor_user_id: int | None = None) -> list[dict[str, Any]]:
         managed = {
@@ -2192,6 +1835,8 @@ class ProfileProvisioningService:
             operation_id = self.store.begin(profile=profile, actor_user_id=actor_user_id, bootstrap_worker=worker, source=source, target_workers=targets)
             try:
                 self.store.store_bundle(operation_id, user_id, build_profile_bundle(session, user_id))
+                if not local_only:
+                    self._activate_vault_profile(profile, user_id)
             except Exception:
                 self.store.cancel(operation_id)
                 raise
@@ -2434,39 +2079,3 @@ class ProfileProvisioningService:
                 worker=str(source_worker or info["bootstrap_worker"]),
             )
         self._wake.set()
-
-    def worker_ready(self, profile: str, worker: str) -> bool:
-        return self.ready(profile, worker)
-
-    def _complete_sync_operations(
-        self, profile: str, worker: str, revision: int, *, succeeded: bool
-    ) -> None:
-        requests = self.store.finish_sync_requests(
-            profile, worker, revision, "succeeded" if succeeded else "failed"
-        )
-        if self.operation_service is None:
-            return
-        operation_store = self.operation_service.store
-        for request in requests:
-            operation = operation_store.get_for_actor(
-                request["operation_id"], request["actor_user_id"]
-            )
-            if operation is None or operation.status.terminal:
-                continue
-            if operation.status == OperationStatus.WAITING_WORKER:
-                operation = operation_store.transition_from_job(
-                    operation.id,
-                    expected_revision=operation.revision,
-                    status=OperationStatus.RUNNING,
-                    phase="install_confirmed",
-                    safe_progress={"worker": worker},
-                )
-                if operation is None:
-                    continue
-            operation_store.transition_from_job(
-                operation.id,
-                expected_revision=operation.revision,
-                status=(OperationStatus.SUCCEEDED if succeeded else OperationStatus.FAILED),
-                phase="installed" if succeeded else "install_failed",
-                safe_progress={"worker": worker, "installed_revision": int(revision)},
-            )

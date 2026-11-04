@@ -252,10 +252,6 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
             def start(self):
                 calls.append("start_commands")
 
-        class VaultSync:
-            def start(self):
-                raise AssertionError("vault distribution must be explicit")
-
         executor = object.__new__(WorkerJobExecutor)
         executor.prepare_upload_lanes = lambda: calls.append("prepare_upload")
         executor._recover_legacy_quick_stages = lambda: calls.append("recover_quick")
@@ -263,8 +259,6 @@ class ProfileTdlDiagnosticsTests(unittest.TestCase):
         executor.command_store = object()
         executor._jobs = Jobs()
         executor.command_runner = Runner()
-        executor.profile_sync = VaultSync()
-
         executor.start()
 
         self.assertEqual(calls, [

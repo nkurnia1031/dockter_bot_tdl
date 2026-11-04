@@ -204,13 +204,6 @@ class WorkerHttpDispatcher:
     def cancel_profile_login(self, worker: str, operation_id: str) -> None:
         self._profile_json(worker, "DELETE", f"/internal/v1/profiles/login/{quote(operation_id, safe='')}")
 
-    def profile_sync_status(self, worker: str, *, timeout: float = 4) -> dict[str, Any]:
-        # This snapshot is read by the profiles page; an offline worker must
-        # not hold the page request for the generic 90-second provisioning timeout.
-        return self._profile_json(
-            worker, "GET", "/internal/v1/profile-sync", timeout=timeout
-        )
-
     def profile_local_inventory(self, worker: str) -> dict[str, Any]:
         return self._profile_json(worker, "GET", "/internal/v1/profiles/local", timeout=20)
 
@@ -226,24 +219,6 @@ class WorkerHttpDispatcher:
             "DELETE",
             f"/internal/v1/profiles/{quote(normalized, safe='')}/local",
             timeout=45,
-        )
-
-    def request_profile_sync(
-        self, worker: str, *, profile: str | None = None, mode: str = "check"
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {"mode": mode}
-        if profile:
-            payload["profile"] = profile
-        return self._profile_json(worker, "POST", "/internal/v1/profile-sync", payload)
-
-    def cancel_profile_sync(
-        self, worker: str, profile: str, *, mode: str = "check"
-    ) -> dict[str, Any]:
-        return self._profile_json(
-            worker,
-            "DELETE",
-            "/internal/v1/profile-sync",
-            {"profile": profile, "mode": mode},
         )
 
     def check_worker_fast(self, worker: str, *, timeout: float = 2.5) -> dict[str, Any]:
@@ -272,17 +247,17 @@ class WorkerHttpDispatcher:
         bundle: bytes,
         operation_id: str,
         *,
-        sync_run_id: str = "",
+        install_run_id: str = "",
         revision: int = 0,
     ) -> dict[str, Any]:
         extra_headers = {
             "X-Telegram-User-ID": str(int(telegram_user_id)),
             "X-Provisioning-ID": operation_id,
         }
-        if sync_run_id:
-            extra_headers["X-Profile-Sync-Run-ID"] = str(sync_run_id)
+        if install_run_id:
+            extra_headers["X-Profile-Install-Run-ID"] = str(install_run_id)
         if revision > 0:
-            extra_headers["X-Profile-Sync-Revision"] = str(int(revision))
+            extra_headers["X-Profile-Install-Revision"] = str(int(revision))
         data, _ = self._profile_request(
             worker,
             "PUT",
@@ -308,11 +283,11 @@ class WorkerHttpDispatcher:
         return result
 
     def commit_profile_bundle(
-        self, worker: str, profile: str, operation_id: str, *, sync_run_id: str = "", revision: int = 0
+        self, worker: str, profile: str, operation_id: str, *, install_run_id: str = "", revision: int = 0
     ) -> None:
         payload: dict[str, Any] = {"operation_id": operation_id}
-        if sync_run_id:
-            payload["sync_run_id"] = str(sync_run_id)
+        if install_run_id:
+            payload["install_run_id"] = str(install_run_id)
         if revision > 0:
             payload["revision"] = int(revision)
         result = self._profile_json(

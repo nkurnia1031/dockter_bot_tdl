@@ -70,15 +70,15 @@ class WorkerCommandStoreTests(unittest.TestCase):
     def test_jobless_operation_command_is_supported(self):
         envelope = {
             "command_id": "operation-command",
-            "operation_id": "profile-sync-1",
+            "operation_id": "profile-distribution-1",
             "attempt": 1,
             "dispatch_token": "operation-token",
-            "operation": {"kind": "profile.sync", "profile": "default", "worker": "local"},
+            "operation": {"kind": "profile.distribute", "profile": "default", "worker": "local"},
         }
         snapshot, replayed = self.store.accept(envelope)
         self.assertFalse(replayed)
         self.assertIsNone(snapshot["job_id"])
-        self.assertEqual(snapshot["operation_id"], "profile-sync-1")
+        self.assertEqual(snapshot["operation_id"], "profile-distribution-1")
 
     def test_startup_requeues_pre_spawn_work_and_marks_running_work_uncertain(self):
         self.store.accept(job_envelope("claimed-command", "job-claimed"))

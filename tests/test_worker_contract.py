@@ -56,15 +56,6 @@ class CapturingPublisher:
 
 
 class WorkerContractTests(unittest.TestCase):
-    def test_profile_sync_status_uses_short_timeout_for_profiles_page(self):
-        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
-        with patch.object(dispatcher, "_profile_json", return_value={}) as profile_json:
-            dispatcher.profile_sync_status("remote")
-
-        profile_json.assert_called_once_with(
-            "remote", "GET", "/internal/v1/profile-sync", timeout=4
-        )
-
     @patch("tme3bot.infrastructure.http_client.request_json")
     def test_resolver_readiness_uses_authenticated_internal_probe(self, request):
         request.return_value = {"ready": True, "fingerprint": "a" * 64}

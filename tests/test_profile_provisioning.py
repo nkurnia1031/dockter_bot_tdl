@@ -129,7 +129,7 @@ class FakeProfileDispatcher:
         self.online = {"local"}
         self.installed = {}
         self.committed = []
-        self.profile_sync_contexts = []
+        self.profile_install_contexts = []
         self.login_state_value = {"status": "waiting_input", "step": "qr", "qr_text": "qr-test"}
         self.login_bundle_downloads = []
         self.profile_diagnostic_result = {
@@ -164,14 +164,14 @@ class FakeProfileDispatcher:
     def profile_export_diagnostics(self, worker, profile):
         return dict(self.profile_diagnostic_result)
 
-    def install_profile_bundle(self, worker, profile, user_id, bundle, operation_id, **sync_context):
-        self.profile_sync_contexts.append((worker, profile, dict(sync_context)))
+    def install_profile_bundle(self, worker, profile, user_id, bundle, operation_id, **install_context):
+        self.profile_install_contexts.append((worker, profile, dict(install_context)))
         if worker not in self.online:
             raise RuntimeError("worker offline")
         self.installed[(profile, worker)] = (user_id, bundle, operation_id)
         return {"ready": True}
 
-    def commit_profile_bundle(self, worker, profile, operation_id, **sync_context):
+    def commit_profile_bundle(self, worker, profile, operation_id, **install_context):
         self.committed.append((worker, profile, operation_id))
 
     def cancel_profile_login(self, worker, operation_id):
@@ -401,7 +401,7 @@ class ProfileProvisioningTests(unittest.TestCase):
 
         self.assertEqual(executor.export_profile_bundle("default"), (123, (True, True)))
         self.assertEqual(
-            executor.install_profile_bundle("default", 123, b"bundle", "sync-1"),
+            executor.install_profile_bundle("default", 123, b"bundle", "install-1"),
             {"locked": (True, True)},
         )
 
@@ -427,7 +427,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             def commit_bundle(self, *_args):
                 return True
 
-        class FakeProfileSync:
+        class FakeProfileInstallEvents:
             def __init__(self):
                 self.sequence = 0
                 self.events = []
@@ -442,22 +442,22 @@ class ProfileProvisioningTests(unittest.TestCase):
         executor = object.__new__(WorkerJobExecutor)
         executor.profile_manager = FakeProfileManager()
         executor._profile_sessions = FakeProfileSessions()
-        executor.profile_sync = FakeProfileSync()
+        executor.profile_distribution_events = FakeProfileInstallEvents()
 
         executor.install_profile_bundle(
-            "default", 123, b"bundle", "sync-1",
-            sync_run_id="a" * 32, sync_revision=7,
+            "default", 123, b"bundle", "install-1",
+            install_run_id="a" * 32, install_revision=7,
         )
         self.assertTrue(executor.commit_profile_bundle(
-            "default", "sync-1", sync_run_id="a" * 32, sync_revision=7
+            "default", "install-1", install_run_id="a" * 32, install_revision=7
         ))
 
         self.assertEqual(
-            [event["sequence"] for event in executor.profile_sync.events],
+            [event["sequence"] for event in executor.profile_distribution_events.events],
             [1, 2, 3, 4, 5],
         )
         self.assertEqual(
-            [event["phase"] for event in executor.profile_sync.events],
+            [event["phase"] for event in executor.profile_distribution_events.events],
             ["session_install", "download_validation", "session_install", "session_commit", "session_commit"],
         )
 
@@ -515,7 +515,8 @@ class ProfileProvisioningTests(unittest.TestCase):
             service.process_once()
 
             self.assertEqual(dispatcher.login_bundle_downloads, [("local", operation)])
-            self.assertEqual(store.provisioning(operation)["status"], "distributing")
+            self.assertEqual(store.provisioning(operation)["status"], "active")
+            self.assertTrue(store.list_profiles()[0]["active"])
 
     def test_single_session_zip_is_duplicated_into_independent_profile_sessions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -964,7 +965,7 @@ class ProfileProvisioningTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             extract_single_session(output.getvalue())
 
-    def test_vault_encrypts_session_and_gates_each_worker_independently(self):
+    def test_vault_profile_is_active_independently_from_worker_distribution(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             store = ProfileProvisioningStore(root / "storage.db", root / "vault")
@@ -987,52 +988,87 @@ class ProfileProvisioningTests(unittest.TestCase):
                 db.close()
             self.assertNotIn(b"secret-session", encrypted)
             self.assertEqual(store.bundle("novel"), (123, bundle))
-            self.assertFalse(store.distribution_ready("novel", "local"))
-            self.assertTrue(store.distribution_ready("legacy", "remote"))
+            self.assertEqual(store.provisioning(operation)["status"], "distributing")
+            store.activate_profile("novel")
+            self.assertTrue(store.list_profiles()[0]["active"])
 
             store.update_distribution("novel", "local", "ready", provisioning_id=operation)
-            self.assertTrue(store.distribution_ready("novel", "local"))
-            self.assertFalse(store.distribution_ready("novel", "remote"))
-            # One unavailable worker keeps the provisioning operation pending,
-            # but does not prevent using a worker that has installed the bundle.
-            store.mark_active(operation)
-            self.assertTrue(store.distribution_ready("novel", "local"))
-            self.assertFalse(store.list_profiles()[0]["active"])
-            self.assertEqual(store.provisioning(operation)["status"], "distributing")
+            profile = store.list_profiles()[0]
+            self.assertTrue(profile["active"])
+            self.assertEqual(
+                {item["worker"]: item["status"] for item in profile["workers"]},
+                {"local": "ready", "remote": "waiting"},
+            )
+            self.assertEqual(store.provisioning(operation)["status"], "active")
 
             store.update_distribution("novel", "remote", "ready", provisioning_id=operation)
-            store.mark_active(operation)
-            self.assertTrue(store.distribution_ready("novel", "local"))
-            self.assertFalse(store.distribution_ready("novel", "new-worker"))
+            self.assertTrue(store.list_profiles()[0]["active"])
+            self.assertEqual(store.provisioning(operation)["status"], "active")
 
-    def test_worker_added_after_snapshot_gets_desired_revision_without_blocking_activation(self):
+    def test_upgrade_removes_retired_vault_sync_state_and_keeps_install_history(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
-            operation = store.begin(
-                profile="novel", actor_user_id=7, bootstrap_worker="local",
-                source="upload", target_workers=["local", "offline-disabled"],
-            )
-            bundle = build_profile_bundle({"data/default": b"revision-one"}, 123)
-            store.store_bundle(operation, 123, bundle)
-            desired = store.desired_revision("novel")
-            self.assertEqual(desired["revision"], 1)
+            database = root / "storage.db"
+            with sqlite3.connect(database) as db:
+                db.executescript(
+                    """
+                    CREATE TABLE profile_distributions (
+                        profile TEXT NOT NULL,
+                        worker TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        provisioning_id TEXT,
+                        error TEXT,
+                        updated_at TEXT NOT NULL,
+                        sync_requested INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY(profile,worker)
+                    );
+                    CREATE TABLE profile_sync_requests (
+                        id TEXT PRIMARY KEY, profile TEXT NOT NULL, worker TEXT NOT NULL
+                    );
+                    CREATE TABLE profile_sync_operation_events (
+                        id INTEGER PRIMARY KEY, operation_id TEXT NOT NULL
+                    );
+                    CREATE TABLE profile_sync_logs (
+                        id INTEGER PRIMARY KEY,
+                        profile TEXT NOT NULL,
+                        worker TEXT NOT NULL,
+                        run_id TEXT NOT NULL,
+                        sequence INTEGER,
+                        revision INTEGER,
+                        phase TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        code TEXT NOT NULL,
+                        details_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    INSERT INTO profile_sync_logs VALUES(
+                        1,'archive','remote-1','run-1',1,2,'queued','queued',
+                        'PROFILE_SYNC_QUEUED','{}','2026-11-04T00:00:00Z'
+                    );
+                    """
+                )
 
-            store.update_distribution("novel", "local", "ready", provisioning_id=operation)
-            store.add_worker_for_active_profiles("worker-added-later")
+            store = ProfileProvisioningStore(database, root / "vault")
+
+            with sqlite3.connect(database) as db:
+                tables = {
+                    str(row[0])
+                    for row in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                distribution_columns = {
+                    str(row[1]) for row in db.execute("PRAGMA table_info(profile_distributions)")
+                }
+            self.assertNotIn("profile_sync_requests", tables)
+            self.assertNotIn("profile_sync_operation_events", tables)
+            self.assertNotIn("profile_sync_logs", tables)
+            self.assertNotIn("sync_requested", distribution_columns)
+            events = store.profile_install_events("archive", "remote-1")
             self.assertEqual(
-                store.profile_manifest("worker-added-later")[0]["revision"], 1
+                [event["code"] for event in events["items"]],
+                ["PROFILE_INSTALL_QUEUED"],
             )
-            self.assertFalse(store.distribution_ready("novel", "worker-added-later"))
-
-            store.mark_active(operation)
-            self.assertFalse(store.list_profiles()[0]["active"])
-            store.update_distribution(
-                "novel", "offline-disabled", "ready", provisioning_id=operation
-            )
-            store.mark_active(operation)
-            self.assertTrue(store.list_profiles()[0]["active"])
-            self.assertFalse(store.distribution_ready("novel", "worker-added-later"))
 
     def test_new_bundle_creates_revision_without_mutating_previous_revision(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1114,10 +1150,10 @@ class ProfileProvisioningTests(unittest.TestCase):
                 self.assertEqual(archive.read("root/.tdl/data/default"), b"vault-session")
                 self.assertEqual(archive.read("user1/.tdl/data/default"), b"vault-session")
             info = store.provisioning(operation)
-            self.assertEqual(info["status"], "stored")
+            self.assertEqual(info["status"], "active")
             self.assertEqual(info["workers"], [])
             self.assertEqual(dispatcher.installed, {})
-            self.assertEqual(service.profiles(actor_user_id=42)[0]["status"], "stored")
+            self.assertEqual(service.profiles(actor_user_id=42)[0]["status"], "active")
 
             busy_operation = store.begin(
                 profile="default", actor_user_id=42, bootstrap_worker="local",
@@ -1188,7 +1224,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             self.assertEqual(store.provisioning(operation_id)["bootstrap_worker"], "local")
             self.assertEqual(store.provisioning(operation_id)["status"], "validating")
             service.process_once()
-            self.assertEqual(store.provisioning(operation_id)["status"], "stored")
+            self.assertEqual(store.provisioning(operation_id)["status"], "active")
             self.assertIsNotNone(store.bundle("default"))
             self.assertEqual(store.provisioning(operation_id)["workers"], [])
 
@@ -1252,7 +1288,7 @@ class ProfileProvisioningTests(unittest.TestCase):
             service = ProfileProvisioningService(store, manager, workers, FakeProfileDispatcher())
 
             service.upload("first", "local", single_session_zip(), 42)
-            with self.assertRaisesRegex(FileExistsError, "Akun Telegram"):
+            with self.assertRaisesRegex(ValueError, "Akun Telegram"):
                 service.upload("second", "local", single_session_zip(), 42)
 
             self.assertIsNone(store.bundle("second"))
@@ -1260,7 +1296,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 row = db.execute(
                     "SELECT status FROM profile_provisionings WHERE profile='second'"
                 ).fetchone()
-            self.assertEqual(row["status"], "cancelled")
+            self.assertIsNone(row)
 
     def test_profile_management_hides_operation_id_from_other_actor(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1277,9 +1313,9 @@ class ProfileProvisioningTests(unittest.TestCase):
             profile_for_owner = next(item for item in service.profiles(42) if item["name"] == "novel")
             profile_for_other = next(item for item in service.profiles(99) if item["name"] == "novel")
             self.assertEqual(profile_for_owner["operation_id"], operation)
-            self.assertIsNone(profile_for_other["operation_id"])
+            self.assertNotIn("operation_id", profile_for_other)
 
-    def test_profile_waits_for_disabled_offline_worker_and_keeps_original_worker_snapshot(self):
+    def test_vault_profile_activates_immediately_while_worker_distribution_continues(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manager = FakeProfileManager(root)
@@ -1289,96 +1325,42 @@ class ProfileProvisioningTests(unittest.TestCase):
             service = ProfileProvisioningService(store, manager, workers, dispatcher)
 
             operation = service.upload("novel", "local", single_session_zip(), 42)
+            self.assertIn("novel", manager.list_profiles())
+            self.assertEqual(manager.profile_registry.profile_for_user(987654), "novel")
+            self.assertEqual(store.provisioning(operation)["status"], "active")
             service.process_once()
             state = store.provisioning(operation)
-            self.assertEqual(state["status"], "distributing")
+            self.assertEqual(state["status"], "active")
             self.assertEqual(
                 {item["worker"]: item["status"] for item in state["workers"]},
                 {"local": "ready", "remote-offline": "waiting"},
             )
-            self.assertNotIn("novel", manager.list_profiles())
-            self.assertTrue(service.worker_ready("novel", "local"))
-            self.assertFalse(service.worker_ready("novel", "remote-offline"))
-            offline_logs = store.profile_sync_logs("novel", "remote-offline")
+            self.assertIn("novel", manager.list_profiles())
+            offline_logs = store.profile_install_events("novel", "remote-offline")
             self.assertEqual(offline_logs["latest_status"], "waiting")
             self.assertEqual(offline_logs["items"][-1]["phase"], "worker_unreachable")
             self.assertEqual(offline_logs["items"][-1]["code"], "WORKER_UNAVAILABLE")
-            local_context = next(item[2] for item in dispatcher.profile_sync_contexts if item[0] == "local")
+            local_context = next(item[2] for item in dispatcher.profile_install_contexts if item[0] == "local")
             self.assertEqual(local_context["revision"], 1)
-            self.assertRegex(local_context["sync_run_id"], r"^[a-f0-9]{32}$")
+            self.assertRegex(local_context["install_run_id"], r"^[a-f0-9]{32}$")
 
             dispatcher.online.add("remote-offline")
             service.process_once()
             self.assertIn("novel", manager.list_profiles())
-            self.assertTrue(service.worker_ready("novel", "local"))
-            self.assertTrue(service.worker_ready("novel", "remote-offline"))
-            remote_logs = store.profile_sync_logs("novel", "remote-offline")
+            remote_logs = store.profile_install_events("novel", "remote-offline")
             self.assertEqual(remote_logs["latest_status"], "succeeded")
-            self.assertEqual(remote_logs["items"][-1]["code"], "PROFILE_SYNC_INSTALLED")
+            self.assertEqual(remote_logs["items"][-1]["code"], "PROFILE_INSTALLED")
 
             workers.add("future-worker")
             dispatcher.online.add("future-worker")
             service.process_once()
             self.assertNotIn(("novel", "future-worker"), dispatcher.installed)
-            self.assertFalse(service.worker_ready("novel", "future-worker"))
-
             committed_before_retry = len(dispatcher.committed)
             store.update_distribution("novel", "remote-offline", "failed", provisioning_id=operation)
             service.retry(operation, 42)
             service.process_once()
             self.assertGreater(len(dispatcher.committed), committed_before_retry)
             self.assertIn(("remote-offline", "novel", operation), dispatcher.committed)
-
-    def test_profile_sync_operation_events_are_idempotent_paginated_and_redacted(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
-            first = store.append_profile_sync_operation_event(
-                operation_id="operation-123",
-                profile="novel",
-                worker="remote-1",
-                run_id="worker-run-123",
-                sequence=1,
-                revision=3,
-                phase="bundle_download",
-                status="running",
-                code="",
-                details={"bundle_bytes": 128, "password": "must-not-persist"},
-            )
-            duplicate = store.append_profile_sync_operation_event(
-                operation_id="operation-123",
-                profile="novel",
-                worker="remote-1",
-                run_id="worker-run-123",
-                sequence=1,
-                revision=3,
-                phase="bundle_download",
-                status="running",
-            )
-            store.append_profile_sync_operation_event(
-                operation_id="operation-123",
-                profile="novel",
-                worker="remote-1",
-                run_id="worker-run-123",
-                sequence=2,
-                revision=3,
-                phase="completed",
-                status="succeeded",
-                code="PROFILE_SYNC_INSTALLED",
-            )
-
-            page = store.profile_sync_operation_events("operation-123", limit=1)
-            next_page = store.profile_sync_operation_events(
-                "operation-123", after_id=page["next_after_id"], limit=1
-            )
-
-            self.assertIsNotNone(first)
-            self.assertIsNone(duplicate)
-            self.assertEqual(page["items"][0]["sequence"], 1)
-            self.assertEqual(page["items"][0]["details"], {"bundle_bytes": 128})
-            self.assertEqual(next_page["items"][0]["status"], "succeeded")
-            self.assertFalse(next_page["active"])
-
 
 if __name__ == "__main__":
     unittest.main()

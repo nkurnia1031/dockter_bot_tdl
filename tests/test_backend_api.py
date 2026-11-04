@@ -141,23 +141,6 @@ class FakeDispatcher:
         self.public_download_link_calls = []
         self.public_download_links_result = {"items": []}
         self.public_download_link_revocations = []
-        self.profile_sync_requests = []
-        self.profile_sync_snapshot = {
-            "status": "waiting_worker",
-            "backend_available": False,
-            "backend_error_code": "PROFILE_TRANSFER_REQUIRES_HTTPS",
-            "last_checked_at": "2026-10-10T00:00:00Z",
-            "profiles": {
-                "default": {
-                    "status": "waiting_worker",
-                    "error_code": "BACKEND_UNAVAILABLE",
-                    "desired_revision": 4,
-                    "installed_revision": 3,
-                    "bundle_sha256": "private-hash",
-                }
-            },
-            "queued_requests": [{"profile": "default", "mode": "check"}],
-        }
         self.profile_tdl_diagnostic_calls = []
         self.profile_readiness_canary_calls = []
         self.profile_readiness_canary_scopes = []
@@ -277,10 +260,6 @@ class FakeDispatcher:
         self.tts_recoveries.append((worker, slot))
         return {"accepted": True, "status": "restarting"}
 
-    def profile_sync_status(self, worker):
-        del worker
-        return self.profile_sync_snapshot
-
     def profile_tdl_diagnostics(self, worker, profile):
         self.profile_tdl_diagnostic_calls.append((worker, profile))
         return {
@@ -315,10 +294,6 @@ class FakeDispatcher:
     def profile_readiness_canary(self, _worker, operation_id):
         operation = self.profile_readiness_canaries.get(operation_id)
         return dict(operation) if operation else None
-
-    def request_profile_sync(self, worker, *, profile=None, mode="check"):
-        self.profile_sync_requests.append((worker, profile, mode))
-        return {"accepted": True, "status": "sync_pending", "profile": profile}
 
     def worker_settings(self, worker):
         return dict(self.runtime_settings)
@@ -461,6 +436,13 @@ class FakeProfileProvisioner:
         return "operation-login"
 
     def operation(self, operation_id, actor_user_id):
+        if operation_id == "operation-upload" and self.uploaded and actor_user_id == self.uploaded[3]:
+            return {
+                "id": operation_id,
+                "profile": self.uploaded[0],
+                "status": "distributing" if self.uploaded[4] else "active",
+                "workers": [],
+            }
         if operation_id != "operation-login" or actor_user_id != 42:
             raise KeyError(operation_id)
         return {"id": operation_id, "profile": "novel", "status": "authenticating", "login": {"step": "qr", "qr_text": "qr-payload"}, "workers": []}
@@ -979,301 +961,49 @@ class BackendApiTests(unittest.TestCase):
         capabilities = self.client.get("/api/v1/capabilities").json()
         self.assertNotIn("job.submit", capabilities["operations"]["supported_kinds"])
 
-    def test_profile_sync_is_a_durable_operation_completed_by_worker_ack(self):
-        from tme3bot.api.routes.profile_sync import advance_profile_sync_command
-
-        vault = ProfileProvisioningStore(
-            Path(self.temp.name) / "app.db", Path(self.temp.name) / "vault"
-        )
-        provisioning_id = vault.begin(
-            profile="default", actor_user_id=42, bootstrap_worker="local",
-            source="adoption", target_workers=["local"],
-        )
-        bundle = build_profile_bundle({"data/default": b"vault-session"}, 42)
-        vault.store_bundle(provisioning_id, 42, bundle)
-        vault.update_distribution("default", "local", "ready", provisioning_id=provisioning_id)
-        vault.mark_active(provisioning_id)
-        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
+    def test_retired_profile_sync_api_is_absent_and_vault_status_is_store_only(self):
         self.context.queue_publisher = object()
         self.context.queue_command_service = object()
         client = TestClient(create_backend_app(self.context))
-
-        response = client.post(
-            "/api/v1/operations",
-            headers={**self.login(42), "Idempotency-Key": "profile-sync-default-local"},
-            json={"kind": "profile.sync", "target": {"profile": "default", "worker": "local"}, "input": {}},
-        )
-
-        self.assertEqual(response.status_code, 202)
-        self.assertIn("profile.sync", client.get("/api/v1/capabilities").json()["operations"]["supported_kinds"])
-        operation_id = response.json()["operation_id"]
-        progress = client.get(
-            f"/api/v1/operations/{operation_id}/events", headers=self.login(42)
-        )
-        self.assertEqual(progress.status_code, 200, progress.text)
-        self.assertEqual(progress.json()["items"][0]["phase"], "queued")
-        self.assertEqual(progress.json()["items"][0]["code"], "PROFILE_SYNC_QUEUED")
+        capabilities = client.get("/api/v1/capabilities").json()
+        self.assertNotIn("profile.sync", capabilities["operations"]["supported_kinds"])
         self.assertEqual(
-            client.get(f"/api/v1/operations/{operation_id}/events").status_code,
-            401,
+            client.post(
+                "/internal/v1/profiles/sync",
+                headers={"Authorization": "Bearer internal"},
+                json={"profiles": []},
+            ).status_code,
+            404,
         )
-        repeated = client.post(
-            "/api/v1/operations",
-            headers={**self.login(42), "Idempotency-Key": "profile-sync-default-local"},
-            json={"kind": "profile.sync", "target": {"profile": "default", "worker": "local"}, "input": {}},
-        )
-        self.assertEqual(repeated.status_code, 202)
-        self.assertEqual(repeated.json()["operation_id"], operation_id)
-        private = self.operation_service.store.get_private_payload(operation_id)
-        self.assertNotIn("bundle", private)
-        command = {
-            "operation_id": operation_id,
-            "kind": "profile.sync",
-            "private_payload": private,
-        }
-        self.assertEqual(advance_profile_sync_command(command, self.context)["status"], "accepted")
-        self.assertEqual(self.dispatcher.profile_sync_requests, [("local", "default", "check")])
         self.assertEqual(
-            self.operation_service.get(self.control.actor(42), operation_id).status.value,
-            "waiting_worker",
+            client.get("/internal/v1/profile-sync").status_code,
+            404,
         )
 
-        revision = vault.desired_revision("default")
-        self.control.runtime_readiness_gate = RuntimeReadinessGate(
-            self.runtime_readiness_store
+        provisioner = FakeProfileProvisioner()
+        provisioner.profiles = lambda actor_user_id=None: [{
+            "name": "default",
+            "active": True,
+            "status": "active",
+            "vault": True,
+            "workers": [{
+                "worker": "local",
+                "status": "waiting",
+                "desired_revision": 4,
+                "installed_revision": None,
+            }],
+        }]
+        self.context.profile_provisioner = provisioner
+        self.dispatcher.profile_sync_status = lambda _worker: self.fail(
+            "Vault management must not poll worker sync state"
         )
-        self.runtime_readiness_store.apply_export_scan(
-            checked_at="2026-10-23T10:00:00Z",
-            workers=[{"worker": "local", "status": "success"}],
-            profiles={"local": [{"profile": "default", "ready": True, "fingerprint": "a" * 64}]},
-        )
-        worker_headers = {
-            "Authorization": "Bearer internal",
-            "X-Worker-Name": "local",
-            "X-Worker-Token": "secret",
-        }
-        worker_event = {
-            "profile": "default",
-            "run_id": "worker-run-123",
-            "sequence": 1,
-            "revision": revision["revision"],
-            "phase": "session_install",
-            "status": "running",
-            "details": {"entry_count": 2, "password": "must-not-be-stored"},
-        }
-        event_response = client.post(
-            "/internal/v1/profile-sync/events",
-            headers=worker_headers,
-            json=worker_event,
-        )
-        self.assertEqual(event_response.status_code, 200, event_response.text)
-        changed_cell = self.runtime_readiness_store.cell("local", "default", "export")
-        self.assertIsNone(changed_cell)
-        duplicate_response = client.post(
-            "/internal/v1/profile-sync/events",
-            headers=worker_headers,
-            json=worker_event,
-        )
-        self.assertTrue(duplicate_response.json()["duplicate"])
-        events = client.get(
-            f"/api/v1/operations/{operation_id}/events", headers=self.login(42)
-        ).json()["items"]
-        install_events = [item for item in events if item["phase"] == "session_install"]
-        self.assertEqual(len(install_events), 1)
-        self.assertNotIn("password", repr(install_events))
-
-        acknowledged = client.post(
-            "/internal/v1/profiles/default/ack",
-            headers=worker_headers,
-            json={
-                "revision": revision["revision"],
-                "bundle_sha256": revision["bundle_sha256"],
-                "telegram_user_id": 42,
-            },
-        )
-        self.assertEqual(acknowledged.status_code, 200, acknowledged.text)
-        self.assertEqual(
-            self.operation_service.get(self.control.actor(42), operation_id).status.value,
-            "succeeded",
-        )
-        progress = client.get(
-            f"/api/v1/operations/{operation_id}/events", headers=self.login(42)
-        )
-        self.assertTrue(any(
-            item["phase"] == "completed" and item["status"] == "succeeded"
-            for item in progress.json()["items"]
-        ))
-
-        failed_response = client.post(
-            "/api/v1/operations",
-            headers={**self.login(42), "Idempotency-Key": "profile-sync-default-local-failed"},
-            json={
-                "kind": "profile.sync",
-                "target": {"profile": "default", "worker": "local"},
-                "input": {"mode": "repair"},
-            },
-        )
-        self.assertEqual(failed_response.status_code, 202, failed_response.text)
-        failed_id = failed_response.json()["operation_id"]
-        failed_command = {
-            "operation_id": failed_id,
-            "kind": "profile.sync",
-            "private_payload": self.operation_service.store.get_private_payload(failed_id),
-        }
-        self.assertEqual(advance_profile_sync_command(failed_command, self.context)["status"], "accepted")
-        failed_event = client.post(
-            "/internal/v1/profile-sync/events",
-            headers=worker_headers,
-            json={
-                "profile": "default",
-                "run_id": "worker-fail-123",
-                "sequence": 1,
-                "revision": revision["revision"],
-                "phase": "completed",
-                "status": "failed",
-                "code": "PROFILE_SESSION_TDL_INVALID",
-            },
-        )
-        self.assertEqual(failed_event.status_code, 200, failed_event.text)
-        self.assertEqual(
-            self.operation_service.get(self.control.actor(42), failed_id).status.value,
-            "failed",
-        )
-        failed_progress = client.get(
-            f"/api/v1/operations/{failed_id}/events", headers=self.login(42)
-        ).json()["items"]
-        self.assertTrue(any(
-            item["phase"] == "completed" and item["status"] == "failed"
-            for item in failed_progress
-        ))
+        response = client.get("/api/v1/profiles/management", headers=self.login())
+        self.assertEqual(response.status_code, 200, response.text)
+        worker_state = response.json()["items"][0]["workers"][0]
+        self.assertEqual(worker_state["status"], "waiting")
+        self.assertNotIn("runtime_status", worker_state)
+        self.assertNotIn("vault_ack_status", worker_state)
         client.close()
-
-    def test_worker_profile_sync_status_is_authenticated_and_redacted(self):
-        denied = self.client.get("/api/v1/workers/local/profile-sync")
-        self.assertEqual(denied.status_code, 401)
-        response = self.client.get(
-            "/api/v1/workers/local/profile-sync", headers=self.login()
-        )
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["status"], "waiting_worker")
-        self.assertEqual(response.json()["profiles"]["default"]["error_code"], "BACKEND_UNAVAILABLE")
-        self.assertEqual(
-            response.json()["backend_error_code"], "PROFILE_TRANSFER_REQUIRES_HTTPS"
-        )
-        self.assertNotIn("bundle_sha256", response.text)
-        self.assertNotIn("private-hash", response.text)
-        self.assertNotIn("queued_requests", response.json())
-
-    def test_profile_management_does_not_call_vault_ack_ready_runtime_ready(self):
-        headers = self.login()
-        provisioner = FakeProfileProvisioner()
-        provisioner.profiles = lambda actor_user_id=None: [{
-            "name": "default",
-            "active": True,
-            "status": "active",
-            "vault": True,
-            "workers": [{
-                "worker": "local",
-                "status": "ready",
-                "desired_revision": 4,
-                "installed_revision": 4,
-            }],
-        }]
-        self.context.profile_provisioner = provisioner
-        self.dispatcher.profile_sync_snapshot = {
-            "status": "waiting_worker",
-            "backend_available": False,
-            "startup_checked": True,
-            "backend_error_code": "PROFILE_TRANSFER_REQUIRES_HTTPS",
-            "profiles": {},
-        }
-
-        response = self.client.get("/api/v1/profiles/management", headers=headers)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        worker_status = response.json()["items"][0]["workers"][0]
-        self.assertEqual(worker_status["vault_ack_status"], "ready")
-        self.assertEqual(worker_status["runtime_status"], "waiting_worker")
-        self.assertEqual(worker_status["runtime_error_code"], "PROFILE_TRANSFER_REQUIRES_HTTPS")
-        self.assertEqual(worker_status["status"], "waiting_worker")
-
-    def test_profile_management_hides_cached_ready_until_this_startup_sync_check_finishes(self):
-        headers = self.login()
-        provisioner = FakeProfileProvisioner()
-        provisioner.profiles = lambda actor_user_id=None: [{
-            "name": "default",
-            "active": True,
-            "status": "active",
-            "vault": True,
-            "workers": [{
-                "worker": "local",
-                "status": "ready",
-                "desired_revision": 4,
-                "installed_revision": 4,
-            }],
-        }]
-        self.context.profile_provisioner = provisioner
-        self.dispatcher.profile_sync_snapshot = {
-            "status": "sync_pending",
-            "backend_available": True,
-            "startup_checked": False,
-            "profiles": {
-                "default": {
-                    "status": "ready",
-                    "desired_revision": 4,
-                    "installed_revision": 4,
-                }
-            },
-        }
-
-        response = self.client.get("/api/v1/profiles/management", headers=headers)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        worker_status = response.json()["items"][0]["workers"][0]
-        self.assertEqual(worker_status["vault_ack_status"], "ready")
-        self.assertEqual(worker_status["runtime_status"], "sync_pending")
-        self.assertEqual(worker_status["runtime_error_code"], "PROFILE_STARTUP_CHECK_PENDING")
-        self.assertEqual(worker_status["status"], "sync_pending")
-
-    def test_profile_management_does_not_trust_cached_ready_without_live_backend_confirmation(self):
-        headers = self.login()
-        provisioner = FakeProfileProvisioner()
-        provisioner.profiles = lambda actor_user_id=None: [{
-            "name": "default",
-            "active": True,
-            "status": "active",
-            "vault": True,
-            "workers": [{
-                "worker": "local",
-                "status": "ready",
-                "desired_revision": 4,
-                "installed_revision": 4,
-            }],
-        }]
-        self.context.profile_provisioner = provisioner
-        self.dispatcher.profile_sync_snapshot = {
-            "status": "ready",
-            "startup_checked": True,
-            # A cached profile row is not proof that the backend manifest was
-            # reached during this worker's latest live sync check.
-            "profiles": {
-                "default": {
-                    "status": "ready",
-                    "desired_revision": 4,
-                    "installed_revision": 4,
-                }
-            },
-        }
-
-        response = self.client.get("/api/v1/profiles/management", headers=headers)
-
-        self.assertEqual(response.status_code, 200, response.text)
-        worker_status = response.json()["items"][0]["workers"][0]
-        self.assertEqual(worker_status["vault_ack_status"], "ready")
-        self.assertEqual(worker_status["runtime_status"], "waiting_worker")
-        self.assertEqual(worker_status["runtime_error_code"], "PROFILE_BACKEND_UNAVAILABLE")
-        self.assertEqual(worker_status["status"], "waiting_worker")
-
     def test_local_profile_scan_requires_actor_and_returns_selected_worker_snapshot(self):
         calls = []
         self.dispatcher.scan_local_profiles = lambda worker: calls.append(worker) or {
@@ -2943,57 +2673,15 @@ class BackendApiTests(unittest.TestCase):
         )
         self.assertEqual(renamed.status_code, 404)
 
-    def test_worker_profile_sync_persists_gateway_registry(self):
-        vault = ProfileProvisioningStore(
-            Path(self.temp.name) / "app.db", Path(self.temp.name) / "vault"
-        )
-        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
+    def test_worker_profile_discovery_sync_route_is_removed(self):
         response = self.client.post(
             "/internal/v1/profiles/sync",
             headers={"Authorization": "Bearer internal"},
             json={"profiles": [{"name": "remote-1", "telegram_user_id": 42}]},
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["profiles"], ["remote-1"])
-        self.assertEqual(response.json()["adoption_candidates"], ["remote-1"])
-        self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
-
-        changed = self.client.post(
-            "/internal/v1/profiles/sync",
-            headers={"Authorization": "Bearer internal"},
-            json={"profiles": [{"name": "remote-1", "telegram_user_id": 43}]},
-        )
-        self.assertEqual(changed.status_code, 200)
-        self.assertEqual(self.profiles.profile_registry.profile_for_user(42), "remote-1")
-        self.assertIsNone(self.profiles.profile_registry.profile_for_user(43))
-
-    def test_worker_profile_sync_cannot_rewrite_vaulted_identity(self):
-        vault = ProfileProvisioningStore(
-            Path(self.temp.name) / "app.db", Path(self.temp.name) / "vault"
-        )
-        operation_id = vault.begin(
-            profile="vaulted", actor_user_id=42, bootstrap_worker="local",
-            source="adoption", target_workers=["local"],
-        )
-        vault.store_bundle(
-            operation_id, 4242, build_profile_bundle({"data/default": b"session"}, 4242)
-        )
-        self.profiles.profile_registry.register_vaulted("vaulted", 4242)
-        self.context.profile_provisioner = type("Provisioner", (), {"store": vault})()
-
-        response = self.client.post(
-            "/internal/v1/profiles/sync",
-            headers={"Authorization": "Bearer internal"},
-            json={"profiles": [{"name": "vaulted", "telegram_user_id": 9999}]},
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["vault_protected"], ["vaulted"])
-        self.assertEqual(self.profiles.profile_registry.profile_for_user(4242), "vaulted")
-        self.assertIsNone(self.profiles.profile_registry.profile_for_user(9999))
-        self.assertEqual(vault.legacy_candidates("vaulted"), [])
-
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(self.profiles.profile_registry.profile_for_user(42))
     def test_web_profile_upload_and_stepwise_login_keep_private_input_out_of_response(self):
         headers = self.login()
         provisioner = FakeProfileProvisioner()
@@ -3015,6 +2703,15 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(uploaded.json(), {"id": "operation-upload", "status": "distributing"})
         self.assertEqual(provisioner.uploaded[:3], ("novel", "local", b"session-zip"))
         self.assertTrue(provisioner.uploaded[4])
+
+        vault_uploaded = self.client.post(
+            "/api/v1/profiles/provisionings/upload?name=shared&worker=local",
+            content=b"session-zip",
+            headers={**headers, "content-type": "application/zip"},
+        )
+        self.assertEqual(vault_uploaded.status_code, 200)
+        self.assertEqual(vault_uploaded.json(), {"id": "operation-upload", "status": "active"})
+        self.assertFalse(provisioner.uploaded[4])
 
         secret_phone = "+62 812 0000 9999"
         started = self.client.post(
@@ -3575,7 +3272,6 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn(secret, response.text)
         self.assertEqual(self.workers.get("local")["token"], secret)
         self.assertTrue(self.dispatcher.runtime_settings["worker_api_token_configured"])
-        self.assertIn(("local", None, "check"), self.dispatcher.profile_sync_requests)
 
     def test_worker_api_token_rotation_rejects_token_used_by_another_worker(self):
         headers = self.login()

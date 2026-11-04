@@ -1,5 +1,10 @@
 # Perombakan Profil Lokal dan Vault
 
+> **Dokumen ini telah superseded pada 2026-11-04.** Rancangan sumber sesi,
+> pull-sync, pemilihan sumber aktif worker, dan readiness gate di bawah bukan
+> kontrak aplikasi saat ini. Vault sekarang hanya menyimpan profil aktif dan
+> mendistribusikan salinannya; lihat [ADR 0002](../docs/adr/0002-vault-storage-and-profile-distribution.md).
+
 **Status:** rencana kerja; belum mengubah aplikasi.
 
 **Issue terkait:** [#1 — diagnosis verifikasi akses TDL Storage/TTS](https://github.com/nkurnia1031/dockter_bot_tdl/issues/1) · [#2 — profil Remote-1 tampak siap tetapi sesi tidak terbaca](https://github.com/nkurnia1031/dockter_bot_tdl/issues/2)

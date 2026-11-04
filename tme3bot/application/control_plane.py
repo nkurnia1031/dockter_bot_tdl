@@ -63,7 +63,6 @@ class ControlPlane:
         runtime_settings_store=None,
         backup_coordinator=None,
         storage_delivery=None,
-        profile_readiness=None,
         local_profile_catalog=None,
         runtime_readiness_gate=None,
         label_store=None,
@@ -84,7 +83,6 @@ class ControlPlane:
         self.runtime_settings_store = runtime_settings_store
         self.backup_coordinator = backup_coordinator
         self.storage_delivery = storage_delivery
-        self.profile_readiness = profile_readiness
         self.local_profile_catalog = local_profile_catalog
         self.runtime_readiness_gate = runtime_readiness_gate
         self.label_store = label_store
@@ -168,41 +166,13 @@ class ControlPlane:
             and str(item.get("name") or "").strip()
         })
 
-    def assert_profile_worker_verified(self, profile: str, worker: str) -> None:
-        owners = self.verified_profile_workers(profile)
-        if owners is None:
-            return
-        normalized_profile = str(profile or "").strip().lower()
-        normalized_worker = str(worker or "").strip().lower()
-        if not owners:
-            raise DomainError(
-                "PROFILE_NOT_VERIFIED",
-                f"Profil {normalized_profile} belum ada pada katalog profil terverifikasi. Jalankan Scan di halaman Profil.",
-                status_code=409,
-                details={"profile": normalized_profile},
-            )
-        if normalized_worker not in owners:
-            raise DomainError(
-                "PROFILE_WORKER_MISMATCH",
-                f"Profil {normalized_profile} tidak tersedia pada worker {normalized_worker} menurut katalog terverifikasi.",
-                status_code=409,
-                details={
-                    "profile": normalized_profile,
-                    "worker": normalized_worker,
-                    "available_workers": sorted(owners),
-                },
-            )
-
     def resolve_target(
         self, actor: Actor, *, profile: str | None = None, worker: str | None = None,
-        check_readiness: bool = False, validate_catalog: bool = False,
         allow_disabled_worker: bool = False,
     ) -> tuple[str, str]:
         selected_profile = self.require_profile(actor, profile)
-        # The last Profile scan may help choose a default worker, but never
-        # admits or rejects a job. TDL/runtime is the source of truth when the
-        # command actually runs.
-        del validate_catalog
+        # Profile catalogs and stored scan evidence may help choose a target;
+        # the selected worker's actual command is the source of truth.
         owners = self.verified_profile_workers(selected_profile) if profile is not None else None
         routed = str(self.profile_manager.worker_route(selected_profile) or "").strip().lower()
         if worker:
@@ -229,14 +199,6 @@ class ControlPlane:
                     "Worker sedang dinonaktifkan dan tidak menerima job baru.",
                     status_code=409,
                 )
-        if check_readiness and callable(self.profile_readiness) and not self.profile_readiness(
-            selected_profile, selected_worker
-        ):
-            raise DomainError(
-                "PROFILE_WORKER_PENDING",
-                f"Profil {selected_profile} belum selesai disinkronkan ke worker {selected_worker}.",
-                status_code=409,
-            )
         return selected_profile, selected_worker
 
     def _assert_profile_admission(
@@ -406,7 +368,6 @@ class ControlPlane:
                 actor,
                 profile=owner_profile,
                 worker=worker,
-                check_readiness=False,
             )
             internal_payload = self._prepare_durable_payload(
                 actor, kind, internal_payload, owner_profile, selected_worker
@@ -427,7 +388,6 @@ class ControlPlane:
                 actor,
                 profile=selected_profile,
                 worker=worker,
-                check_readiness=False,
             )
             try:
                 channel_id = int(internal_payload.get("channel_id"))
@@ -734,7 +694,7 @@ class ControlPlane:
             if not str(target.get("worker") or "").strip():
                 raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk verifikasi akses TDL.", status_code=422)
             owner_profile, selected_worker = self.resolve_target(
-                actor, worker=str(target.get("worker")), check_readiness=False
+                actor, worker=str(target.get("worker"))
             )
         else:
             if not str(target.get("worker") or "").strip():
@@ -746,7 +706,6 @@ class ControlPlane:
                     "artifact_inventory", "artifact_delete", "backup_verify",
                 } else None,
                 worker=str(target.get("worker")),
-                check_readiness=False,
             )
         payload = self._prepare_durable_payload(
             actor, kind, payload, owner_profile, selected_worker
@@ -2182,7 +2141,6 @@ class ControlPlane:
                 "profiles": sorted(profile_rows, key=lambda item: item["profile"]),
                 "helpers": [],
                 "profile_session_ready": bool(ready_profiles),
-                "profile_sync_ready": None,
             })
         return sorted(result, key=lambda option: option["name"].lower())
 
@@ -2210,7 +2168,6 @@ class ControlPlane:
                 "capability_ready": False,
                 "helpers_ready": False,
                 "profile_session_ready": False,
-                "profile_sync_ready": False,
                 "reason_code": "worker_disabled" if not enabled else "capability_unavailable",
                 "helpers": [],
                 "queued_jobs": 0,
@@ -2268,25 +2225,6 @@ class ControlPlane:
             # verified local profile; actor profile is only ownership.
             verified_profiles = [value for value in verified_profiles if value in advertised_set]
             advertised_profile = bool(verified_profiles)
-            try:
-                sync_snapshot = response.get("profile_sync") if isinstance(response, dict) else None
-                sync_rows = sync_snapshot.get("profiles", {}) if isinstance(sync_snapshot, dict) else {}
-                if not isinstance(sync_rows, dict) or not sync_rows:
-                    backend_profile_ready = bool(
-                        isinstance(sync_snapshot, dict)
-                        and sync_snapshot.get("status") in {"disabled", "ready"}
-                    )
-                else:
-                    relevant = [sync_rows.get(item) for item in verified_profiles if item in sync_rows]
-                    backend_profile_ready = all(
-                        isinstance(row, dict)
-                        and row.get("status") == "ready"
-                        and int(row.get("installed_revision") or 0) >= int(row.get("desired_revision") or 0)
-                        for row in relevant
-                    ) if relevant else False
-            except Exception:
-                backend_profile_ready = False
-            item["profile_sync_ready"] = backend_profile_ready
             item["profile_session_ready"] = advertised_profile
             item["verified_profiles"] = verified_profiles
             if not item["helpers_ready"]:

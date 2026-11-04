@@ -655,7 +655,7 @@ def register_workers(app, context, *, current_actor):
                             check["reason_code"] = canary_error
                     # The canary result is the readiness evidence. Session
                     # generation hashes are intentionally ignored so a
-                    # redeploy or profile sync cannot make a working lane
+                    # redeploy or profile installation cannot make a working lane
                     # appear unavailable.
                     fingerprint = ""
                     canary_succeeded = canary_state.get("status") == "succeeded"
@@ -2232,17 +2232,6 @@ def register_workers(app, context, *, current_actor):
             )
         except ValueError as exc:
             raise DomainError("WORKER_CONFIGURATION_INVALID", str(exc), status_code=422) from exc
-        if rotated_token:
-            # The worker's vault client must recheck its manifest using the
-            # newly rotated runtime token after the registry commit.
-            request_profile_sync = getattr(context.worker_dispatcher, "request_profile_sync", None)
-            if callable(request_profile_sync):
-                try:
-                    request_profile_sync(updated_name, mode="check")
-                except Exception:
-                    # Token rotation is already committed. The worker's own
-                    # retry loop will refresh the vault status if this nudge fails.
-                    pass
         return {"name": updated_name}
 
     @app.patch("/api/v1/workers/{name}", response_model=ObjectResponse)
@@ -2256,73 +2245,6 @@ def register_workers(app, context, *, current_actor):
             )
         context.worker_registry.set_enabled(name, body.enabled)
         return {"name": name, "enabled": bool(body.enabled)}
-
-    @app.get("/api/v1/workers/{name}/profile-sync", response_model=ObjectResponse)
-    def worker_profile_sync_status(name: str, actor=Depends(current_actor)):
-        del actor
-        if context.worker_registry.get(name) is None:
-            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
-        read_status = getattr(context.worker_dispatcher, "profile_sync_status", None)
-        if not callable(read_status):
-            raise DomainError(
-                "WORKER_UPDATE_REQUIRED",
-                "Backend belum dapat membaca diagnosis sinkronisasi profil worker.",
-                status_code=409,
-            )
-        try:
-            snapshot = read_status(name)
-        except JsonHttpError as exc:
-            if exc.status == 404:
-                raise DomainError(
-                    "WORKER_UPDATE_REQUIRED",
-                    f"Worker {name} perlu diperbarui untuk menampilkan diagnosis sinkronisasi profil.",
-                    status_code=409,
-                ) from exc
-            raise DomainError(
-                "WORKER_UNAVAILABLE",
-                f"Worker {name} tidak dapat dihubungi untuk membaca status sinkronisasi profil.",
-                status_code=503,
-            ) from exc
-        except Exception:
-            raise DomainError(
-                "WORKER_UNAVAILABLE",
-                f"Worker {name} tidak dapat dihubungi untuk membaca status sinkronisasi profil.",
-                status_code=503,
-            ) from None
-
-        allowed_statuses = {"disabled", "ready", "sync_pending", "waiting_worker"}
-        status = str(snapshot.get("status") or "waiting_worker")
-        if status not in allowed_statuses:
-            status = "waiting_worker"
-        profiles = {}
-        raw_profiles = snapshot.get("profiles")
-        backend_error_code = str(snapshot.get("backend_error_code") or "")
-        if not re.fullmatch(r"[A-Z0-9_-]{1,64}", backend_error_code):
-            backend_error_code = ""
-        for profile, raw in raw_profiles.items() if isinstance(raw_profiles, dict) else []:
-            profile_name = str(profile).strip().lower()
-            if not re.fullmatch(r"[a-z0-9_-]{1,48}", profile_name) or not isinstance(raw, dict):
-                continue
-            item_status = str(raw.get("status") or "sync_pending")
-            if item_status not in {"ready", "sync_pending", "waiting_worker", "not_assigned"}:
-                item_status = "sync_pending"
-            error_code = str(raw.get("error_code") or "")
-            profiles[profile_name] = {
-                "status": item_status,
-                "error_code": error_code if re.fullmatch(r"[A-Z0-9_-]{1,64}", error_code) else "",
-                "desired_revision": raw.get("desired_revision") if type(raw.get("desired_revision")) is int else None,
-                "installed_revision": raw.get("installed_revision") if type(raw.get("installed_revision")) is int else None,
-                "updated_at": str(raw.get("updated_at") or "")[:64],
-            }
-        return {
-            "worker": name,
-            "status": status,
-            "backend_available": snapshot.get("backend_available") if isinstance(snapshot.get("backend_available"), bool) else None,
-            "backend_error_code": backend_error_code,
-            "startup_checked": snapshot.get("startup_checked") if isinstance(snapshot.get("startup_checked"), bool) else None,
-            "last_checked_at": str(snapshot.get("last_checked_at") or "")[:64],
-            "profiles": profiles,
-        }
 
     def tts_worker_error(name: str, exc: Exception) -> DomainError:
         if isinstance(exc, JsonHttpError):
@@ -2397,7 +2319,6 @@ def register_workers(app, context, *, current_actor):
             "helpers_ready": bool(item.get("helpers_ready")),
             "capability_ready": bool(item.get("capability_ready")),
             "profile_session_ready": bool(item.get("profile_session_ready")),
-            "profile_sync_ready": bool(item.get("profile_sync_ready")),
             "reason_code": str(item.get("reason_code") or "worker_unavailable"),
             "helpers": safe_helpers,
         }

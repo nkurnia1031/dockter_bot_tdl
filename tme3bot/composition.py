@@ -200,8 +200,6 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         profiles,
         registry,
         dispatcher,
-        operation_service,
-        runtime_readiness_gate=runtime_readiness_gate,
     )
     folders = UtilityFolderStore(
         config.utility_folders_file, config.utility_workspace_root
@@ -232,7 +230,6 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         worker_registry=registry,
         local_profile_catalog=local_profile_catalog,
         runtime_readiness_gate=runtime_readiness_gate,
-        profile_readiness=profile_provisioner.worker_ready,
         utility_folders=folders,
         utility_settings=settings,
         runtime_settings_store=runtime_settings_store,

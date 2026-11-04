@@ -1,5 +1,10 @@
 # 07 — Vault profil berversi dan kontrak tarik/ACK
 
+> **Arsip historis, bukan kontrak saat ini.** Pull-sync, manifest/ACK readiness,
+> dan gate job yang dibangun pada task ini dicabut pada 2026-11-04. Vault kini
+> hanya menyimpan profil aktif dan mendistribusikan salinannya; status install
+> tidak menghalangi job. Lihat [ADR 0002](../docs/adr/0002-vault-storage-and-profile-distribution.md).
+
 ## Tujuan
 
 Tambahkan revision immutable, format_version, hash bundle, identity dan source worker pada vault. Bundle baru akibat upload/login/adopsi menghasilkan revision baru, bukan overwrite revision yang sedang diunduh.
