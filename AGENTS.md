@@ -467,6 +467,10 @@ Rules:
 
 ## Agent skills
 
+### Required first step
+
+Before acting on any actionable user request in this repository, run `/ask-matt` by reading `.agents/skills/ask-matt/SKILL.md` and routing the request to the appropriate skill or flow. Do this for every scope—including code, bugs, documentation, tests, GitHub, production, and deployment—even when the task looks small. Read the selected skill's `SKILL.md` before applying its workflow. Finish routing before inspecting or changing task files or making external requests, then carry out the authorized work without asking the user to repeat details already provided. Ask Matt selects a workflow; it does not authorize external side effects.
+
 ### Issue tracker
 
 Project issues live in GitHub Issues. See `docs/agents/issue-tracker.md`.
