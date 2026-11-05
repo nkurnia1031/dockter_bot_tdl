@@ -889,12 +889,16 @@ class ProfileProvisioningTests(unittest.TestCase):
             manager = ProfileSessionManager(config)
             bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
             saved_identity = manager._backup_directory("novel", "operation-2") / "identity.json"
+            identity_stage = manager.database_paths.profile_provisioning(
+                "stages", "novel", "operation-2"
+            ) / "identity.json"
             replace = os.replace
 
             def reject_cross_mount_identity_rename(source, destination):
                 if (Path(source), Path(destination)) in {
                     (identity_path, saved_identity),
                     (saved_identity, identity_path),
+                    (identity_stage, identity_path),
                 }:
                     raise OSError(errno.EXDEV, "cross-device link")
                 return replace(source, destination)

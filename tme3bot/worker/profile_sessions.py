@@ -639,7 +639,11 @@ class ProfileSessionManager:
                         pass
                     self._require_private_file(identity)
                     self._copy_private_file(identity, saved_identity)
-                os.replace(identity_stage, identity)
+                # Identity staging lives under DATABASE_ROOT while the active
+                # profile metadata stays with the profile data. They can be
+                # different filesystems, so install through a private atomic
+                # copy on the destination mount instead of cross-mount rename.
+                self._copy_private_file(identity_stage, identity)
                 self._require_private_file(identity)
             except Exception:
                 report("identity_install", "failed", "PROFILE_IDENTITY_INSTALL_FAILED")
