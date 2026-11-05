@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import os
@@ -883,14 +884,26 @@ class ProfileProvisioningTests(unittest.TestCase):
             old_export.parent.mkdir(parents=True)
             old_root.write_bytes(b"old-root-session")
             old_export.write_bytes(b"old-export-session")
-            (profile_root / "identity.json").write_text('{"telegram_user_id":77}')
+            identity_path = profile_root / "identity.json"
+            identity_path.write_text('{"telegram_user_id":77}')
             manager = ProfileSessionManager(config)
             bundle = build_profile_bundle({"data/default": b"new-session"}, 88)
+            saved_identity = manager._backup_directory("novel", "operation-2") / "identity.json"
+            replace = os.replace
 
-            with patch.object(manager, "_run_whoami", return_value=88):
-                manager.install_bundle("novel", 88, bundle, "operation-2")
-            self.assertEqual(old_root.read_bytes(), b"new-session")
-            self.assertTrue(manager.rollback_bundle("novel", "operation-2"))
+            def reject_cross_mount_identity_rename(source, destination):
+                if (Path(source), Path(destination)) in {
+                    (identity_path, saved_identity),
+                    (saved_identity, identity_path),
+                }:
+                    raise OSError(errno.EXDEV, "cross-device link")
+                return replace(source, destination)
+
+            with patch("tme3bot.worker.profile_sessions.os.replace", side_effect=reject_cross_mount_identity_rename):
+                with patch.object(manager, "_run_whoami", return_value=88):
+                    manager.install_bundle("novel", 88, bundle, "operation-2")
+                self.assertEqual(old_root.read_bytes(), b"new-session")
+                self.assertTrue(manager.rollback_bundle("novel", "operation-2"))
             self.assertEqual(old_root.read_bytes(), b"old-root-session")
             self.assertEqual(old_export.read_bytes(), b"old-export-session")
             identity = (profile_root / "identity.json").read_text()
@@ -1101,6 +1114,31 @@ class ProfileProvisioningTests(unittest.TestCase):
                 ).fetchall()
             self.assertEqual([int(row["revision"]) for row in revisions], [1, 2])
             self.assertEqual(str(revisions[0]["bundle_sha256"]), first["bundle_sha256"])
+
+    def test_stale_local_only_cleanup_preserves_a_later_vault_adoption(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            local_operation = store.begin(
+                profile="novel", actor_user_id=7, bootstrap_worker="local",
+                source="local_upload", target_workers=["local"],
+            )
+            local_bundle = build_profile_bundle({"data/default": b"local-session"}, 123)
+            store.store_bundle(local_operation, 123, local_bundle)
+            store.update_distribution("novel", "local", "ready", provisioning_id=local_operation)
+            store.mark_active(local_operation)
+
+            adoption_operation = store.begin(
+                profile="novel", actor_user_id=7, bootstrap_worker="local",
+                source="adoption", target_workers=[], status="validating",
+            )
+            adopted_bundle = build_profile_bundle({"data/default": b"vault-session"}, 123)
+            store.store_bundle(adoption_operation, 123, adopted_bundle)
+            store.activate_profile("novel")
+
+            self.assertEqual(store.completed_local_provisioning_staging(), [])
+            self.assertFalse(store.discard_local_provisioning_bundle("novel", local_operation))
+            self.assertEqual(store.bundle("novel"), (123, adopted_bundle))
 
     def test_store_bundle_rejects_identity_that_does_not_match_session_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:

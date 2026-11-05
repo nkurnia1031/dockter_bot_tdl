@@ -12,6 +12,12 @@ from tme3bot.profile_distribution_crypto import encrypt_distribution_bundle
 
 LOGGER = logging.getLogger(__name__)
 _TELEGRAM_PART_BYTES = 40 * 1024 * 1024
+_PERMANENT_ARTIFACT_ERRORS = {
+    "PROFILE_DISTRIBUTION_SOURCE_UNAVAILABLE",
+    "PROFILE_DISTRIBUTION_REVISION_MISMATCH",
+    "PROFILE_DISTRIBUTION_ARTIFACT_CONFLICT",
+    "PROFILE_REVISION_CHECKSUM_INVALID",
+}
 
 
 class ProfileDistributionService:
@@ -138,8 +144,12 @@ class ProfileDistributionService:
                 )
         except Exception as exc:
             code = _safe_error_code(exc, "BACKUP_CHANNEL_UNAVAILABLE")
-            self.store.update_target(operation_id, worker, "waiting", "archive_upload", code)
-            LOGGER.info("Profile distribution artifact deferred for %s (%s).", worker, code)
+            if code in _PERMANENT_ARTIFACT_ERRORS:
+                self.store.update_target(operation_id, worker, "failed", "failed", code)
+                LOGGER.info("Profile distribution artifact failed for %s (%s).", worker, code)
+            else:
+                self.store.update_target(operation_id, worker, "waiting", "archive_upload", code)
+                LOGGER.info("Profile distribution artifact deferred for %s (%s).", worker, code)
             return
 
         record = self.worker_registry.get(worker)

@@ -809,12 +809,27 @@ class ProfileProvisioningStore:
         """Discard temporary encrypted staging after a local-only install succeeds."""
         with self._lock, self._db() as db:
             operation = db.execute(
-                "SELECT source,status FROM profile_provisionings WHERE id=? AND profile=?",
+                "SELECT source,status,bootstrap_worker,updated_at FROM profile_provisionings WHERE id=? AND profile=?",
                 (str(operation_id), str(profile)),
             ).fetchone()
             if operation is None or str(operation["source"]) not in LOCAL_ONLY_PROVISIONING_SOURCES:
                 return False
             if str(operation["status"]) != "active":
+                return False
+            current_bundle = db.execute(
+                "SELECT source,source_worker,updated_at FROM profile_sessions WHERE profile=?",
+                (str(profile),),
+            ).fetchone()
+            # A completed local-only operation can remain in the operation log
+            # indefinitely. Only discard the bundle that operation itself
+            # staged; a later Vault adoption/upload for the same profile must
+            # survive recovery of the older operation.
+            if (
+                current_bundle is None
+                or str(current_bundle["source"] or "") != str(operation["source"])
+                or str(current_bundle["source_worker"] or "") != str(operation["bootstrap_worker"] or "")
+                or str(current_bundle["updated_at"] or "") != str(operation["updated_at"] or "")
+            ):
                 return False
             pending = db.execute(
                 "SELECT 1 FROM profile_distributions WHERE profile=? AND provisioning_id=? AND status!='ready' LIMIT 1",
@@ -831,6 +846,8 @@ class ProfileProvisioningStore:
             rows = db.execute(
                 "SELECT p.id,p.profile,s.telegram_user_id FROM profile_provisionings p "
                 "JOIN profile_sessions s ON s.profile=p.profile "
+                "AND s.source=p.source AND COALESCE(s.source_worker,'')=p.bootstrap_worker "
+                "AND s.updated_at=p.updated_at "
                 "WHERE p.source IN ('local_upload','local_login') AND p.status='active' "
                 "ORDER BY p.updated_at"
             ).fetchall()

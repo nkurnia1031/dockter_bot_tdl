@@ -219,6 +219,22 @@ class ProfileDistributionTests(unittest.TestCase):
         self.assertEqual(len(bot.uploads), 1)
         self.assertEqual([call[1] for call in dispatcher.calls], [operation["id"], operation["id"]])
 
+    def test_missing_vault_revision_fails_target_without_repeated_retries(self):
+        operation, _ = self.create_operation(workers=["remote-1"])
+        self.vault.bundle_for_revision = lambda _profile, _revision: None
+        service = self.service(FakeDispatcher())
+
+        service.process_pending()
+
+        current = self.store.operation(operation["id"])
+        self.assertEqual(current["status"], "failed")
+        self.assertEqual(current["workers"][0]["status"], "failed")
+        self.assertEqual(
+            current["workers"][0]["reason_code"],
+            "PROFILE_DISTRIBUTION_SOURCE_UNAVAILABLE",
+        )
+        self.assertEqual(self.store.pending_targets(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -630,15 +630,15 @@ class ProfileSessionManager:
 
             identity = profile_root / "identity.json"
             saved_identity = backup_root / "identity.json"
-            if original.get("identity.json") and identity.exists() and not saved_identity.exists():
-                try:
-                    identity.chmod(0o600)
-                except OSError:
-                    pass
-                self._require_private_file(identity)
-                os.replace(identity, saved_identity)
             report("identity_install", "running")
             try:
+                if original.get("identity.json") and identity.exists() and not saved_identity.exists():
+                    try:
+                        identity.chmod(0o600)
+                    except OSError:
+                        pass
+                    self._require_private_file(identity)
+                    self._copy_private_file(identity, saved_identity)
                 os.replace(identity_stage, identity)
                 self._require_private_file(identity)
             except Exception:
@@ -848,8 +848,10 @@ class ProfileSessionManager:
         identity = profile_root / "identity.json"
         saved_identity = backup / "identity.json"
         if saved_identity.exists():
-            identity.unlink(missing_ok=True)
-            os.replace(saved_identity, identity)
+            try:
+                self._copy_private_file(saved_identity, identity)
+            except (OSError, _ProfileInstallFailure):
+                return False
         elif not original.get("identity.json", state.get("new_profile", False)):
             identity.unlink(missing_ok=True)
         try:
@@ -1531,6 +1533,35 @@ class ProfileSessionManager:
     @staticmethod
     def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
         write_json_atomic_private(path, payload)
+
+    @staticmethod
+    def _copy_private_file(source: Path, destination: Path) -> None:
+        """Copy a private file atomically even when the paths are on different mounts."""
+        if source.is_symlink() or not source.is_file() or destination.is_symlink():
+            raise _ProfileInstallFailure("PROFILE_SESSION_UNSAFE")
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "wb") as target, source.open("rb") as original:
+                shutil.copyfileobj(original, target)
+                target.flush()
+                os.fsync(target.fileno())
+            os.chmod(temporary, 0o600)
+            ProfileSessionManager._require_private_file(temporary)
+            if source.stat().st_size != temporary.stat().st_size:
+                raise _ProfileInstallFailure("PROFILE_SESSION_STAGING_FAILED")
+            os.replace(temporary, destination)
+            os.chmod(destination, 0o600)
+            ProfileSessionManager._require_private_file(destination)
+        except Exception:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _read_install_receipts(self, profile_root: Path) -> dict[str, Any]:
         path = profile_root / _PROFILE_INSTALL_RECEIPTS
