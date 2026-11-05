@@ -381,11 +381,69 @@ class TrustedDeviceStore:
         self._prepare_private_dir(self.states)
         return self.states / f"browser-{uuid.uuid4()}.json"
 
+    def new_persistent_browser_state_path(self, *, expires_at: int) -> Path:
+        self._prepare_private_dir(self.root)
+        self._prepare_private_dir(self.states)
+        if int(expires_at) <= 0:
+            raise TrustedDeviceError("Masa berlaku sesi browser tidak valid.")
+        return self.states / f"browser-session-{int(expires_at)}-{uuid.uuid4()}.json"
+
     def write_browser_state(self, path: Path, document: dict) -> None:
         states_root = self.states.resolve()
         if path.parent.resolve() != states_root or not path.name.startswith("browser-") or path.suffix != ".json":
             raise TrustedDeviceError("Lokasi browser state di luar direktori aplikasi.")
         self._write_exclusive(path, json.dumps(document, separators=(",", ":")).encode("utf-8"))
+
+    def update_browser_state(self, path: Path, document: dict) -> None:
+        """Atomically persist rotated browser cookies without exposing a partial state."""
+        self._prepare_private_dir(self.root)
+        self._prepare_private_dir(self.states)
+        states_root = self.states.resolve()
+        if (
+            path.parent.resolve() != states_root
+            or not path.name.startswith("browser-")
+            or path.suffix != ".json"
+            or path.is_symlink()
+        ):
+            raise TrustedDeviceError("Lokasi browser state di luar direktori aplikasi.")
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise TrustedDeviceError("Browser state tersimpan tidak dapat diperbarui.") from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise TrustedDeviceError("Browser state tersimpan tidak aman untuk diperbarui.")
+
+        temporary = self.states / f".browser-state-{uuid.uuid4().hex}.tmp"
+        payload = json.dumps(document, separators=(",", ":")).encode("utf-8")
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.acl_applier(temporary)
+            # Recheck the destination immediately before replacement. The parent
+            # directory is private to this OS user, and os.replace never follows
+            # a destination symlink.
+            current = path.lstat()
+            if path.is_symlink() or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                raise TrustedDeviceError("Browser state berubah saat diperbarui.")
+            os.replace(temporary, path)
+            if os.name != "nt":
+                directory_fd = os.open(states_root, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except TrustedDeviceError:
+            raise
+        except OSError as exc:
+            raise TrustedDeviceError("Browser state terbaru tidak dapat disimpan dengan aman.") from exc
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def clean_stale_states(self, *, now: float | None = None) -> None:
         if self.root.is_symlink():
@@ -401,6 +459,8 @@ class TrustedDeviceStore:
         root = self.states.resolve()
         for path in self.states.glob("browser-*.json"):
             try:
+                if path.name.startswith("browser-session-"):
+                    continue
                 info = path.lstat()
                 if stat.S_ISREG(info.st_mode) and path.resolve().parent == root and current - info.st_mtime > 300:
                     path.unlink()

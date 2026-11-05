@@ -113,15 +113,15 @@ Gunakan wrapper DPAPI terbatas di trusted_device_store.py dengan API Windows sta
 
 Berkas enrollment berisi versi, device_id, origin, name, public_key dan fingerprint saja. Web menghitung ulang fingerprint sebelum persetujuan. Tidak ada rahasia dalam berkas itu.
 
-State browser mengikuti format Playwright storage_state (cookies dan origins), membawa cookie access/refresh/CSRF dengan domain/path/secure/httpOnly/sameSite/expiry yang diterbitkan server. Jangan menurunkan atribut cookie atau mengembalikan token melalui stdout. File state sementara harus diberi ACL sebelum bytes credential ditulis, path selalu di root lokal aplikasi, dan tidak ditaruh dalam repo atau temp bersama.
+State browser mengikuti format Playwright storage_state (cookies dan origins), membawa cookie access/refresh/CSRF dengan domain/path/secure/httpOnly/sameSite/expiry yang diterbitkan server. Jangan menurunkan atribut cookie atau mengembalikan token melalui stdout. File state harus diberi ACL sebelum bytes credential ditulis, path selalu di root lokal aplikasi, dan tidak ditaruh dalam repo atau temp bersama. Sesi trusted-device berakhir sesuai masa berlaku server (default 30 hari); state yang tersimpan dipakai ulang dan cookie hasil rotasi disimpan atomik.
 
-Runner `tools/trusted_device_browser.py` mengimpor state langsung ke Playwright context, membatasi request pada origin terdaftar, lalu menghapus file setelah import. `open_trusted_context()` dapat dipakai agent Python untuk interaksi Playwright selanjutnya. Jika browser gagal dibuka, runner juga menghapus file state. Helper membersihkan state miliknya yang tertinggal lebih dari 5 menit pada invocation berikutnya. Tidak ada janji cleanup otomatis saat seluruh mesin mati; ACL dan expiry sesi tetap berlaku.
+Runner `tools/trusted_device_browser.py` memvalidasi state dan membatasi request pada origin terdaftar. Tanpa path eksplisit, runner memilih state privat terbaru, mengunci penggunaan agar refresh tidak berlomba, lalu menyimpan rotasi cookie secara atomik ketika context ditutup. Masa sesi mengikuti server (default 30 hari); file disimpan di direktori privat sampai dihapus operator. State lama yang belum memakai nama persisten dimigrasikan dengan membuat file baru, sementara file sumber dipertahankan. Path legacy eksplisit tetap mendukung impor sekali pakai. `open_trusted_context()` dapat dipakai agent Python tanpa memberikan path agar sesi tersimpan dipakai otomatis.
 
 ### Web dan workflow agent
 
 Tambahkan komponen Perangkat tepercaya pada Settings. Sediakan upload enrollment, pemeriksaan fingerprint/origin, konfirmasi pengguna, daftar, rename dan revoke. Metadata di-refresh saat mount/aksi atau melalui tombol Refresh; tidak ada polling baru.
 
-Pada AGENTS.md, tulis urutan untuk pekerjaan production yang sudah diotorisasi: periksa helper status, prepare-browser, import state dengan tool yang mendukung, bersihkan file state, lalu periksa sesi. Jangan membaca file state melalui tool yang mencetak isinya, screenshot token, atau menyalin credential ke percakapan.
+Pada AGENTS.md, tulis urutan untuk pekerjaan production yang sudah diotorisasi: periksa helper status bila perlu, gunakan state tersimpan tanpa path untuk tes berulang, jalankan `prepare-browser` hanya saat belum ada sesi atau sesi 30 hari telah berakhir, lalu periksa sesi. Jangan membaca file state melalui tool yang mencetak isinya, screenshot token, atau menyalin credential ke percakapan.
 
 Jika browser automation tidak mendukung import state, berhenti pada laporan keterbatasan integrasi. Jangan memasang token di URL, menonaktifkan auth, atau otomatis memulai login Telegram. Browser biasa yang bersih tetap membutuhkan helper atau login normal; website tidak dapat mengambil key laptop dengan sendirinya.
 
@@ -173,7 +173,7 @@ Baca plan/00-OVERVIEW.md dan seluruh plan/00-PRIORITY-trusted-device-access.md.
 - Web tidak melakukan polling perangkat; halaman bersih tanpa helper tidak mengklaim mengenali laptop.
 - API daftar, log, stdout, repository dan URL tidak memuat private key, signature penuh, cookie, refresh token atau access token.
 - Backend Linux dapat import/start tanpa Windows API. Helper unsupported/DPAPI gagal tidak menyimpan plaintext.
-- File state dibuat privat sebelum diisi, dihapus setelah import/gagal, dan stale cleanup tidak keluar dari root aplikasi.
+- File state dibuat privat sebelum diisi, state persisten menyimpan rotasi cookie secara atomik, file persisten tidak ikut stale cleanup, impor sekali pakai dihapus, dan stale cleanup tidak keluar dari root aplikasi.
 - Semua verifikasi dan keterbatasan dicatat di PROGRESS; produksi tidak diubah.
 
 ## Cara verifikasi

@@ -241,17 +241,20 @@ memiliki field `enabled` dianggap aktif. Error admission yang diharapkan adalah
 
   Helper menghasilkan Playwright storage state di direktori privat OS.
   Jangan membuka atau mencetak isi file, menyalin cookie ke log/chat, atau
-  memasukkannya ke URL. Impor hanya bila tool browser yang tersedia secara
-  eksplisit menerima Playwright `storage_state`; setelah tool memuat state,
-  hapus file sementara. Bila import tidak didukung, laporkan keterbatasan dan
-  jangan melemahkan login atau mencoba melewati autentikasi.
+  memasukkannya ke URL. State dipertahankan untuk masa sesi yang diterbitkan
+  server (default 30 hari). Bila
+  `prepare-browser` diperlukan, agent membaca path dari output secara lokal;
+  pengguna tidak perlu menyalin path pada setiap tes.
 
   Repository menyediakan `tools.trusted_device_browser.open_trusted_context()`
   untuk agent berbasis Playwright serta `python -m tools.trusted_device_browser`
-  untuk memeriksa sesi browser. Runner memvalidasi origin, memblokir request ke
-  origin lain, dan menghapus state setelah diimpor. Agent yang memakai API
-  Python tetap harus membatasi navigasi ke origin tersebut dan menutup context
-  setelah selesai.
+  untuk memeriksa sesi browser. Tanpa `--state-file`, runner otomatis memakai
+  state tersimpan terbaru, membatasi request ke origin tersebut, lalu
+  menyimpan rotasi cookie secara atomik saat context ditutup. Jalankan browser
+  secara serial agar refresh token tidak berlomba. State eksplisit yang dipakai
+  sebagai impor sekali pakai tetap dihapus setelah import. Setelah masa sesi
+  habis, buat satu state baru dengan `prepare-browser`; device yang sudah
+  dipercaya tidak perlu dienroll ulang.
 - Setelah autentikasi, verifikasi sesi melalui UI/API yang diizinkan sebelum
   melakukan tindakan. Cabut perangkat dari Pengaturan bila laptop tidak lagi
   dipercaya; `forget-local` hanya menghapus credential pada laptop dan tidak

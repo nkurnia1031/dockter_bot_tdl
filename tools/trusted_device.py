@@ -105,7 +105,12 @@ def _open_json(origin: str, path: str, body: dict) -> tuple[dict, list[str], int
     return result, cookies, server_time
 
 
-def browser_state(origin: str, set_cookie_headers: list[str]) -> dict:
+def browser_state(
+    origin: str,
+    set_cookie_headers: list[str],
+    *,
+    reference_time: int | None = None,
+) -> dict:
     host = urlsplit(canonical_origin(origin)).hostname
     cookies = []
     parsed_names = set()
@@ -139,7 +144,7 @@ def browser_state(origin: str, set_cookie_headers: list[str]) -> dict:
                 "value": morsel.value,
                 "domain": morsel["domain"] or host,
                 "path": morsel["path"] or "/",
-                "expires": int(time.time()) + max_age,
+                "expires": int(time.time() if reference_time is None else reference_time) + max_age,
                 "httpOnly": bool(morsel["httponly"]),
                 "secure": bool(morsel["secure"]),
                 "sameSite": same_site if same_site in {"Strict", "Lax", "None"} else "Lax",
@@ -176,7 +181,6 @@ def command_init(args) -> dict:
 def command_prepare(args) -> dict:
     origin = canonical_origin(args.origin)
     store = TrustedDeviceStore(origin)
-    store.clean_stale_states()
     document, private_bytes = store.credentials()
     challenge, _, server_time = _open_json(
         origin, "/auth/device/challenge", {"device_id": document["device_id"]}
@@ -191,7 +195,7 @@ def command_prepare(args) -> dict:
     )
     private_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
     signature = _b64(private_key.sign(signed))
-    session_data, set_cookie, _ = _open_json(
+    session_data, set_cookie, session_server_time = _open_json(
         origin,
         "/auth/device/exchange",
         {
@@ -202,8 +206,9 @@ def command_prepare(args) -> dict:
     )
     if session_data.get("authenticated") is not True:
         raise TrustedDeviceError("Backend tidak mengonfirmasi sesi perangkat.")
-    state = browser_state(origin, set_cookie)
-    state_path = store.new_browser_state_path()
+    state = browser_state(origin, set_cookie, reference_time=session_server_time)
+    refresh_cookie = next(cookie for cookie in state["cookies"] if cookie["name"] == "tme3_refresh")
+    state_path = store.new_persistent_browser_state_path(expires_at=int(refresh_cookie["expires"]))
     store.write_browser_state(state_path, state)
     return {
         "browser_state_file": str(state_path),

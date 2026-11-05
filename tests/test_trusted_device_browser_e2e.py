@@ -209,7 +209,7 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
             self.assertEqual(first_result["status"], 200)
             self.assertTrue(first_result["authenticated"])
             self.assertEqual(first_result["actor_id"], 42)
-            self.assertFalse(first_state.exists(), "Runner must remove the imported state file")
+            self.assertTrue(first_state.exists(), "Trusted-device state must remain reusable for its session lifetime")
 
             revoked = browser_client.delete(
                 f"/api/v1/auth/devices/{device_id}",
@@ -226,7 +226,7 @@ class TrustedDevicePlaywrightHttpsE2ETests(unittest.TestCase):
             )
             self.assertEqual(second.returncode, 1, "A revoked device session must not authenticate")
             self.assertEqual(json.loads(second.stdout)["status"], 401)
-            self.assertFalse(second_state.exists(), "Runner must remove state after rejected import too")
+            self.assertTrue(second_state.exists(), "Rejected session state remains available for diagnosis until expiry")
         finally:
             if server is not None:
                 server.should_exit = True
@@ -335,7 +335,7 @@ class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
                     payload = response.json()
                     self.assertTrue(payload["authenticated"])
                     self.assertEqual(payload["actor"]["telegram_user_id"], 42)
-                self.assertFalse(first_state.exists(), "Imported browser state must be consumed")
+                self.assertTrue(first_state.exists(), "Trusted-device state must remain reusable for its session lifetime")
 
                 second_state = prepare_state()
                 revoked = browser_client.delete(
@@ -356,7 +356,7 @@ class TrustedDeviceLinuxPlaywrightHttpsE2ETests(unittest.TestCase):
                         timeout=30_000,
                     )
                     self.assertEqual(response.status if response else None, 401)
-                self.assertFalse(second_state.exists(), "Rejected browser state must also be consumed")
+                self.assertTrue(second_state.exists(), "Rejected session state remains available for diagnosis until expiry")
         finally:
             if server is not None:
                 server.should_exit = True
