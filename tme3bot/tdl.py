@@ -276,6 +276,7 @@ class SubprocessRunner:
         output_callback: OutputCallback | None = None,
         raw_output_callback: RawOutputCallback | None = None,
         command_callback: CommandCallback | None = None,
+        process_started_callback: Callable[[], None] | None = None,
         quiet_output: bool = False,
         output_filter: OutputFilter | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -337,14 +338,18 @@ class SubprocessRunner:
                 )
             raise TDLCommandError(command, -1, "", str(exc)) from exc
 
-        command_id = notify_command_started(command_callback, command, log_prefix)
-
         with self._lock:
             self._current_process = process
             self._current_command = command
             self._current_owner = command_owner
             self._last_output_at = started_at
             self._last_progress_signature = None
+        if process_started_callback is not None:
+            try:
+                process_started_callback()
+            except Exception:
+                LOGGER.warning("Process-start callback failed for %s", log_prefix, exc_info=True)
+        command_id = notify_command_started(command_callback, command, log_prefix)
 
         stdout_thread = threading.Thread(
             target=self._read_stream,
@@ -1236,7 +1241,11 @@ class TDLClient:
         return requested.isdigit() and peer_id == f"-100{requested}"
 
     def download(
-        self, export_path: Path, download_dir: Path
+        self,
+        export_path: Path,
+        download_dir: Path,
+        *,
+        process_started_callback: Callable[[], None] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         download_dir.mkdir(parents=True, exist_ok=True)
         command = self._base_command() + [
@@ -1259,6 +1268,7 @@ class TDLClient:
             output_callback=self.output_callback,
             **({"raw_output_callback": self.raw_output_callback} if self.raw_output_callback is not None else {}),
             **({"command_callback": self.command_callback} if self.command_callback is not None else {}),
+            **({"process_started_callback": process_started_callback} if process_started_callback is not None else {}),
         )
         self._ensure_success(command, result)
         return result

@@ -237,9 +237,8 @@ class ProfileReadinessCanary:
                     command_finished = threading.Event()
                     cancel_started = threading.Event()
                     cancel_lock = threading.Lock()
-                    progress_deadline = (
-                        time.monotonic() + self.download_progress_timeout_seconds
-                    )
+                    progress_deadline: list[float | None] = [None]
+                    timeout: threading.Timer | None = None
 
                     def cancel_download(reason: str) -> None:
                         with cancel_lock:
@@ -278,7 +277,10 @@ class ProfileReadinessCanary:
                             ) > 0
                         except (TypeError, ValueError):
                             has_bytes = has_fraction = has_percent = False
-                        within_deadline = time.monotonic() <= progress_deadline
+                        deadline = progress_deadline[0]
+                        within_deadline = (
+                            deadline is not None and time.monotonic() <= deadline
+                        )
                         if (
                             (has_speed or has_bytes or has_fraction or has_percent)
                             and within_deadline
@@ -287,20 +289,29 @@ class ProfileReadinessCanary:
                             progress_seen.set()
                             cancel_download("progress")
 
-                    timeout: threading.Timer | None = None
-                    try:
-                        download_client.progress_callback = on_download_progress
+                    def on_download_command_started() -> None:
+                        nonlocal timeout
+                        progress_deadline[0] = (
+                            time.monotonic() + self.download_progress_timeout_seconds
+                        )
                         timeout = threading.Timer(
                             self.download_progress_timeout_seconds,
                             lambda: cancel_download("timeout"),
                         )
                         timeout.daemon = True
                         timeout.start()
+
+                    try:
+                        download_client.progress_callback = on_download_progress
                         try:
                             run_tdl(
                                 "download",
                                 download_client,
-                                lambda: download_client.download(export_json, media_dir),
+                                lambda: download_client.download(
+                                    export_json,
+                                    media_dir,
+                                    process_started_callback=on_download_command_started,
+                                ),
                             )
                         except Exception as exc:
                             if not progress_seen.is_set() and not timeout_elapsed.is_set():

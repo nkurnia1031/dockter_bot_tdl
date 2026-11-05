@@ -105,15 +105,27 @@ class _ExportClient:
 
 
 class _DownloadClient:
-    def __init__(self, *, emit_progress=True, progress_delay_seconds=0):
+    def __init__(
+        self,
+        *,
+        emit_progress=True,
+        progress_delay_seconds=0,
+        before_command_start_delay_seconds=0,
+    ):
         self.progress_callback = None
         self.interrupted = threading.Event()
         self.started = threading.Event()
+        self.command_started_at = None
+        self.interrupted_at = None
         self.emit_progress = emit_progress
         self.progress_delay_seconds = progress_delay_seconds
+        self.before_command_start_delay_seconds = before_command_start_delay_seconds
 
-    def download(self, _export_path, download_dir):
+    def download(self, _export_path, download_dir, *, process_started_callback=None):
         Path(download_dir).mkdir(parents=True, exist_ok=True)
+        time.sleep(self.before_command_start_delay_seconds)
+        self.command_started_at = time.monotonic()
+        process_started_callback()
         self.started.set()
         if self.emit_progress:
             if not self.interrupted.wait(timeout=self.progress_delay_seconds):
@@ -121,6 +133,7 @@ class _DownloadClient:
         self.interrupted.wait(timeout=1)
 
     def interrupt_current(self):
+        self.interrupted_at = time.monotonic()
         self.interrupted.set()
         return True
 
@@ -283,7 +296,10 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
             download_operation_lock=threading.RLock(),
             upload_operation_lock=threading.RLock(),
             export_tdl_client=_ExportClient(uploads, counter),
-            download_tdl_client=_DownloadClient(emit_progress=False),
+            download_tdl_client=_DownloadClient(
+                emit_progress=False,
+                before_command_start_delay_seconds=0.12,
+            ),
             upload_tdl_client=_ExportClient(uploads, counter),
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -291,7 +307,7 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
                 SimpleNamespace(runtime=lambda _profile: runtime),
                 lambda _profile: {"ready": True},
                 Path(directory),
-                download_progress_timeout_seconds=0.05,
+                download_progress_timeout_seconds=0.08,
             )
             started_at = time.monotonic()
             result = canary.run(
@@ -302,6 +318,11 @@ class ProfileReadinessCanaryTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started_at, 0.8)
         self.assertTrue(runtime.download_tdl_client.started.is_set())
         self.assertTrue(runtime.download_tdl_client.interrupted.wait(timeout=0.2))
+        self.assertGreaterEqual(
+            runtime.download_tdl_client.interrupted_at
+            - runtime.download_tdl_client.command_started_at,
+            0.06,
+        )
         self.assertFalse(result["checks"]["download"]["ready"])
         self.assertEqual(
             result["checks"]["download"]["reason_code"],

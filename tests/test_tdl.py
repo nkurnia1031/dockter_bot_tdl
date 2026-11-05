@@ -115,6 +115,26 @@ class TDLClientTests(unittest.TestCase):
         self.assertTrue(client.interrupt_current())
         self.assertEqual(runner.interrupt_calls, 1)
 
+    def test_download_forwards_process_started_callback_to_runner(self):
+        class StartedRunner:
+            def __init__(self):
+                self.callback = None
+
+            def run(self, command, **kwargs):
+                self.callback = kwargs.get("process_started_callback")
+                self.callback()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+        runner = StartedRunner()
+        callback_called = threading.Event()
+        TDLClient(Path("/tmp/session"), "download", runner=runner).download(
+            Path("/tmp/export.json"),
+            Path("/tmp/media"),
+            process_started_callback=callback_called.set,
+        )
+
+        self.assertTrue(callback_called.is_set())
+
     def test_storage_history_export_uses_one_unbounded_content_export(self):
         class StorageHistoryRunner:
             def __init__(self, peer_id=123):
@@ -441,14 +461,17 @@ class TDLClientTests(unittest.TestCase):
         env = dict(os.environ)
         env["TDL_FORCE_PTY"] = "0"
         captured: list[str] = []
+        command_started = threading.Event()
         result = SubprocessRunner().run(
             [sys.executable, "-c", "print('raw worker output')"],
             env=env,
             log_prefix="tdl-test",
             output_callback=captured.append,
+            process_started_callback=command_started.set,
         )
 
         self.assertEqual(result.returncode, 0)
+        self.assertTrue(command_started.is_set())
         self.assertTrue(any("raw worker output" in line for line in captured))
         self.assertTrue(any("process exited with code 0" in line for line in captured))
 
