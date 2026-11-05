@@ -166,6 +166,65 @@ class WorkerContractTests(unittest.TestCase):
                     self.assertEqual(raised.exception.kind, expected_kind)
                     self.assertNotIn("private detail", str(raised.exception))
 
+            opener.open.side_effect = urllib.error.HTTPError(
+                "https://worker.test/internal/v1/profiles/local",
+                409,
+                "Conflict",
+                {},
+                io.BytesIO(
+                    b'{"error":{"code":"BACKUP_CHANNEL_EXPORT_FAILED",'
+                    b'"message":"private path and session detail"}}'
+                ),
+            )
+            with self.assertRaises(JsonHttpError) as raised:
+                dispatcher.profile_local_inventory("remote")
+            self.assertEqual(
+                raised.exception.payload,
+                {"error": {"code": "BACKUP_CHANNEL_EXPORT_FAILED"}},
+            )
+            self.assertNotIn("private path", repr(raised.exception.payload))
+
+    def test_encrypted_vault_artifact_dispatch_uses_binary_worker_route(self):
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+        payload = {
+            "profile": "archive",
+            "revision": 7,
+            "telegram_user_id": 123,
+            "archive_sha256": "a" * 64,
+            "bundle_sha256": "b" * 64,
+            "event_sequence_start": 3,
+        }
+        with patch(
+            "tme3bot.infrastructure.http_client.profile_transfer_is_secure",
+            return_value=True,
+        ), patch.object(
+            dispatcher, "_profile_request", return_value=(b'{"ready":true}', {})
+        ) as request:
+            result = dispatcher.distribute_profile_bundle_artifact(
+                "remote", "a36b11cb-2135-4fce-89c2-772b0eb25792", payload, b"ciphertext"
+            )
+        self.assertEqual(result, {"ready": True})
+        args = request.call_args.args
+        self.assertEqual(args[:3], (
+            "remote",
+            "PUT",
+            "/internal/v1/profiles/distributions/a36b11cb-2135-4fce-89c2-772b0eb25792/artifact",
+        ))
+        self.assertEqual(args[3], b"ciphertext")
+        self.assertEqual(request.call_args.kwargs["content_type"], "application/octet-stream")
+        self.assertEqual(
+            request.call_args.kwargs["extra_headers"],
+            {
+                "X-Profile-Name": "archive",
+                "X-Profile-Worker": "remote",
+                "X-Profile-Revision": "7",
+                "X-Telegram-User-ID": "123",
+                "X-Archive-SHA256": "a" * 64,
+                "X-Bundle-SHA256": "b" * 64,
+                "X-Event-Sequence-Start": "3",
+            },
+        )
+
     def test_profile_scan_dispatch_starts_upload_lane_preparation(self):
         dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
         with patch.object(dispatcher, "_profile_json", return_value={"items": []}) as profile_json:

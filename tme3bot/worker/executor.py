@@ -769,13 +769,20 @@ class WorkerJobExecutor(
         report("succeeded" if committed else "failed", "" if committed else "PROFILE_INSTALL_COMMIT_FAILED")
         return committed
 
-    def distribute_profile_bundle(self, operation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Fetch an encrypted operation artifact from the private channel and install it."""
+    def distribute_profile_bundle(
+        self,
+        operation_id: str,
+        payload: dict[str, Any],
+        *,
+        encrypted_artifact: bytes | None = None,
+    ) -> dict[str, Any]:
+        """Fetch or receive worker-bound ciphertext, then validate and install it."""
         import hashlib
         import tempfile
         from pathlib import Path
 
         from tme3bot.profile_distribution_crypto import decrypt_distribution_bundle
+        from tme3bot.profile_provisioning import MAX_PROFILE_BUNDLE_BYTES
         from tme3bot.worker.backup_channel_download import (
             BackupChannelDownloadError,
             download_profile_distribution_artifact,
@@ -795,16 +802,21 @@ class WorkerJobExecutor(
         if (
             not profile or type(revision) is not int or revision < 1
             or type(user_id) is not int or user_id < 1
-            or not isinstance(message_ids, list) or not message_ids or len(message_ids) > 100
+            or not isinstance(message_ids, list) or len(message_ids) > 100
+            or (encrypted_artifact is None and not message_ids)
             or any(type(value) is not int or value < 1 for value in message_ids)
             or len(set(message_ids)) != len(message_ids)
             or not re.fullmatch(r"[a-f0-9]{64}", archive_sha256)
             or not re.fullmatch(r"[a-f0-9]{64}", bundle_sha256)
             or not worker or requested_worker != worker
             or type(event_sequence_start) is not int or event_sequence_start < 0
-            or not channel_ref or len(channel_ref) > 200
+            or (encrypted_artifact is None and (not channel_ref or len(channel_ref) > 200))
             or any(ord(char) < 33 or ord(char) > 126 for char in channel_ref)
-            or (configured_channel_ref and channel_ref != configured_channel_ref)
+            or (encrypted_artifact is None and configured_channel_ref and channel_ref != configured_channel_ref)
+            or (
+                encrypted_artifact is not None
+                and len(encrypted_artifact) > MAX_PROFILE_BUNDLE_BYTES + 28
+            )
         ):
             raise RuntimeError("PROFILE_DISTRIBUTION_METADATA_INVALID")
 
@@ -833,7 +845,7 @@ class WorkerJobExecutor(
         )
         worker_token_provider = getattr(getattr(self, "runtime_settings", None), "worker_api_token", None)
         worker_token = str(worker_token_provider() or "") if callable(worker_token_provider) else str(getattr(self.config, "worker_api_token", "") or "")
-        if not channel_ref or len(worker_token) < 16:
+        if (encrypted_artifact is None and not channel_ref) or len(worker_token) < 16:
             report("failed", "failed", "PROFILE_DISTRIBUTION_CONFIG_INVALID")
             raise RuntimeError("PROFILE_DISTRIBUTION_CONFIG_INVALID")
 
@@ -844,17 +856,23 @@ class WorkerJobExecutor(
         try:
             with tempfile.TemporaryDirectory(prefix="profile-distribution-", dir=str(temp_root)) as raw_temp:
                 with runtime.export_operation_lock, runtime.download_operation_lock:
-                    artifact_path = download_profile_distribution_artifact(
-                        runtime.export_tdl_client,
-                        channel_ref=channel_ref,
-                        node_name=worker,
-                        operation_id=operation_id,
-                        profile=profile,
-                        revision=revision,
-                        destination=Path(raw_temp),
-                        message_ids=message_ids,
-                        archive_sha256=archive_sha256,
-                    )
+                    if encrypted_artifact is None:
+                        artifact_path = download_profile_distribution_artifact(
+                            runtime.export_tdl_client,
+                            channel_ref=channel_ref,
+                            node_name=worker,
+                            operation_id=operation_id,
+                            profile=profile,
+                            revision=revision,
+                            destination=Path(raw_temp),
+                            message_ids=message_ids,
+                            archive_sha256=archive_sha256,
+                        )
+                    else:
+                        artifact_path = Path(raw_temp) / f"{operation_id}.enc"
+                        with artifact_path.open("xb") as output:
+                            output.write(encrypted_artifact)
+                        artifact_path.chmod(0o600)
                 encrypted = artifact_path.read_bytes()
                 if not hashlib.sha256(encrypted).hexdigest() == archive_sha256:
                     raise RuntimeError("PROFILE_DISTRIBUTION_ARCHIVE_CHECKSUM_INVALID")

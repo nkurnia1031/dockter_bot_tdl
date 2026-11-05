@@ -51,6 +51,7 @@ class FakeDispatcher:
         self.failed = set(failed)
         self.offline = set(offline)
         self.calls = []
+        self.artifact_calls = []
 
     def distribute_profile_bundle(self, worker, operation_id, payload):
         self.calls.append((worker, operation_id, dict(payload)))
@@ -60,6 +61,10 @@ class FakeDispatcher:
             raise error
         if worker in self.failed:
             raise ValueError("PROFILE_INSTALL_FAILED")
+        return {"ready": True}
+
+    def distribute_profile_bundle_artifact(self, worker, operation_id, payload, encrypted):
+        self.artifact_calls.append((worker, operation_id, dict(payload), encrypted))
         return {"ready": True}
 
 
@@ -176,6 +181,50 @@ class ProfileDistributionTests(unittest.TestCase):
                 worker="remote-1",
             ),
             self.bundle,
+        )
+
+    def test_backup_channel_export_failure_falls_back_to_worker_bound_ciphertext(self):
+        operation, _ = self.create_operation(workers=["remote-2"])
+        dispatcher = FakeDispatcher()
+
+        def fail_channel_export(worker, operation_id, payload):
+            dispatcher.calls.append((worker, operation_id, dict(payload)))
+            error = RuntimeError("opaque worker rejection")
+            error.status = 409
+            error.payload = {
+                "error": {
+                    "code": "BACKUP_CHANNEL_EXPORT_FAILED",
+                    "message": "private worker detail must remain hidden",
+                }
+            }
+            raise error
+
+        dispatcher.distribute_profile_bundle = fail_channel_export
+        service = self.service(dispatcher)
+
+        self.assertEqual(service.process_pending(), 1)
+        current = self.store.operation(operation["id"])
+        self.assertEqual(current["status"], "succeeded")
+        self.assertEqual(current["workers"][0]["status"], "ready")
+        self.assertEqual(len(dispatcher.artifact_calls), 1)
+        worker, operation_id, payload, encrypted = dispatcher.artifact_calls[0]
+        self.assertEqual(worker, "remote-2")
+        self.assertEqual(operation_id, operation["id"])
+        self.assertNotIn(self.bundle, encrypted)
+        self.assertEqual(
+            decrypt_distribution_bundle(
+                encrypted,
+                worker_token="worker-token-remote-2-long-enough",
+                operation_id=operation["id"],
+                profile="archive",
+                revision=7,
+                worker="remote-2",
+            ),
+            self.bundle,
+        )
+        events = self.store.events(operation["id"])["items"]
+        self.assertTrue(
+            any(event["code"] == "BACKUP_CHANNEL_DIRECT_FALLBACK" for event in events)
         )
 
     def test_offline_worker_waits_on_same_operation_and_retry_skips_ready_worker(self):

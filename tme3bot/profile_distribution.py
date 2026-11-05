@@ -178,7 +178,49 @@ class ProfileDistributionService:
                 self.store.update_target(operation_id, worker, "waiting", "waiting_worker", code)
             else:
                 code = _safe_error_code(exc, "PROFILE_DISTRIBUTION_FAILED")
-                self.store.update_target(operation_id, worker, "failed", "failed", code)
+                direct_transfer = getattr(
+                    self.dispatcher, "distribute_profile_bundle_artifact", None
+                )
+                if code == "BACKUP_CHANNEL_EXPORT_FAILED" and callable(direct_transfer):
+                    self.store.update_target(
+                        operation_id,
+                        worker,
+                        "running",
+                        "worker_dispatch",
+                        "BACKUP_CHANNEL_DIRECT_FALLBACK",
+                    )
+                    try:
+                        fallback_result = direct_transfer(
+                            worker, operation_id, payload, encrypted
+                        )
+                        if (
+                            not isinstance(fallback_result, dict)
+                            or fallback_result.get("ready") is not True
+                        ):
+                            raise RuntimeError("PROFILE_DISTRIBUTION_NOT_CONFIRMED")
+                        self.store.update_target(
+                            operation_id, worker, "ready", "completed"
+                        )
+                        LOGGER.info(
+                            "Profile distribution used encrypted HTTPS fallback for %s.",
+                            worker,
+                        )
+                        return
+                    except Exception as fallback_exc:
+                        if _is_transient_worker_error(fallback_exc):
+                            code = "WORKER_UNAVAILABLE"
+                            self.store.update_target(
+                                operation_id, worker, "waiting", "waiting_worker", code
+                            )
+                        else:
+                            code = _safe_error_code(
+                                fallback_exc, "PROFILE_DISTRIBUTION_FAILED"
+                            )
+                            self.store.update_target(
+                                operation_id, worker, "failed", "failed", code
+                            )
+                else:
+                    self.store.update_target(operation_id, worker, "failed", "failed", code)
             LOGGER.info("Profile distribution deferred for %s (%s).", worker, code)
 
 

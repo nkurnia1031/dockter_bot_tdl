@@ -718,7 +718,114 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             result = distribute(operation_id, body)
         except Exception as exc:
             raw = str(getattr(exc, "code", "") or str(exc))
-            code = raw if re.fullmatch(r"PROFILE_[A-Z0-9_-]{1,56}", raw) else "PROFILE_DISTRIBUTION_FAILED"
+            code = (
+                raw
+                if re.fullmatch(r"(?:PROFILE|BACKUP_CHANNEL)_[A-Z0-9_-]{1,56}", raw)
+                else "PROFILE_DISTRIBUTION_FAILED"
+            )
+            raise DomainError(
+                code,
+                "Worker gagal memasang revision Vault secara aman.",
+                status_code=409,
+            ) from None
+        if not isinstance(result, dict) or result.get("ready") is not True:
+            raise DomainError(
+                "PROFILE_DISTRIBUTION_NOT_CONFIRMED",
+                "Worker tidak mengonfirmasi pemasangan revision Vault.",
+                status_code=409,
+            )
+        return result
+
+    @app.put(
+        "/internal/v1/profiles/distributions/{operation_id}/artifact",
+        dependencies=[Depends(authorize)],
+    )
+    async def distribute_vault_profile_artifact(
+        operation_id: str,
+        request: Request,
+        profile: str = Header(alias="X-Profile-Name"),
+        worker: str = Header(alias="X-Profile-Worker"),
+        revision: int = Header(alias="X-Profile-Revision"),
+        telegram_user_id: int = Header(alias="X-Telegram-User-ID"),
+        archive_sha256: str = Header(alias="X-Archive-SHA256"),
+        bundle_sha256: str = Header(alias="X-Bundle-SHA256"),
+        event_sequence_start: int = Header(default=0, alias="X-Event-Sequence-Start"),
+    ):
+        if (
+            not re.fullmatch(r"[0-9a-fA-F-]{36}", operation_id)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", profile)
+            or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", worker)
+            or revision < 1
+            or telegram_user_id < 1
+            or event_sequence_start < 0
+            or not re.fullmatch(r"[a-f0-9]{64}", archive_sha256)
+            or not re.fullmatch(r"[a-f0-9]{64}", bundle_sha256)
+        ):
+            raise DomainError(
+                "PROFILE_DISTRIBUTION_METADATA_INVALID",
+                "Metadata distribusi profil tidak valid.",
+                status_code=422,
+            )
+        expected_worker = str(
+            getattr(context.config, "backup_node_name", "") or ""
+        ).strip().lower()
+        if worker != expected_worker:
+            raise DomainError(
+                "PROFILE_DISTRIBUTION_WORKER_MISMATCH",
+                "Operasi ini ditujukan ke worker lain.",
+                status_code=403,
+            )
+        content_length = request.headers.get("content-length", "")
+        if content_length:
+            try:
+                if int(content_length) > MAX_PROFILE_BUNDLE_BYTES + 28:
+                    raise DomainError(
+                        "PROFILE_ARCHIVE_TOO_LARGE",
+                        "Bundle profil melebihi batas.",
+                        status_code=413,
+                    )
+            except ValueError:
+                raise DomainError(
+                    "PROFILE_DISTRIBUTION_METADATA_INVALID",
+                    "Metadata distribusi profil tidak valid.",
+                    status_code=422,
+                ) from None
+        encrypted_artifact = await request.body()
+        if not encrypted_artifact or len(encrypted_artifact) > MAX_PROFILE_BUNDLE_BYTES + 28:
+            raise DomainError(
+                "PROFILE_ARCHIVE_TOO_LARGE",
+                "Bundle profil melebihi batas.",
+                status_code=413,
+            )
+        distribute = getattr(context.executor, "distribute_profile_bundle", None)
+        if not callable(distribute):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung distribusi Vault.",
+                status_code=409,
+            )
+        payload = {
+            "worker": worker,
+            "profile": profile,
+            "revision": revision,
+            "telegram_user_id": telegram_user_id,
+            "message_ids": [],
+            "archive_sha256": archive_sha256,
+            "bundle_sha256": bundle_sha256,
+            "channel_ref": "",
+            "event_sequence_start": event_sequence_start,
+        }
+        try:
+            result = distribute(
+                operation_id, payload, encrypted_artifact=encrypted_artifact
+            )
+        except Exception as exc:
+            raw = str(getattr(exc, "code", "") or str(exc))
+            code = (
+                raw
+                if re.fullmatch(r"PROFILE_[A-Z0-9_-]{1,56}", raw)
+                else "PROFILE_DISTRIBUTION_FAILED"
+            )
             raise DomainError(
                 code,
                 "Worker gagal memasang revision Vault secara aman.",

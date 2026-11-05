@@ -103,6 +103,72 @@ class WorkerProfileDistributionTests(unittest.TestCase):
             ["archive_download", "archive_download", "bundle_validation", "bundle_validation", "completed"],
         )
 
+    def test_distribution_accepts_encrypted_artifact_without_tdl_export(self) -> None:
+        operation_id = str(uuid4())
+        profile = "archive"
+        revision = 4
+        user_id = 9876
+        worker = "remote-2"
+        worker_token = "worker-token-for-direct-artifact-test"
+        bundle = build_profile_bundle({"data/default": b"tdl-session-fixture"}, user_id)
+        encrypted = encrypt_distribution_bundle(
+            bundle,
+            worker_token=worker_token,
+            operation_id=operation_id,
+            profile=profile,
+            revision=revision,
+            worker=worker,
+        )
+        archive_sha256 = hashlib.sha256(encrypted).hexdigest()
+        events = _ProfileDistributionEvents()
+        installed_bundles = []
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config = SimpleNamespace(
+                backup_node_name=worker,
+                backup_channel_ref="",
+                default_profile="default",
+                temp_root=Path(temporary),
+            )
+            runtime = SimpleNamespace(
+                export_operation_lock=threading.RLock(),
+                download_operation_lock=threading.RLock(),
+                export_tdl_client=SimpleNamespace(
+                    export_messages=lambda *_args, **_kwargs: self.fail(
+                        "Direct encrypted artifact delivery must not run TDL export"
+                    )
+                ),
+            )
+            executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
+            executor.config = config
+            executor.profile_manager = SimpleNamespace(runtime=lambda _profile: runtime)
+            executor.profile_distribution_events = events
+            executor.runtime_settings = SimpleNamespace(worker_api_token=lambda: worker_token)
+            executor.install_profile_bundle = lambda _profile, _user, data, *_args, **_kwargs: (
+                installed_bundles.append(data) or {"ready": True}
+            )
+            executor.commit_profile_bundle = lambda *_args, **_kwargs: True
+            executor.rollback_profile_bundle = lambda *_args, **_kwargs: True
+            payload = {
+                "profile": profile,
+                "revision": revision,
+                "telegram_user_id": user_id,
+                "message_ids": [],
+                "archive_sha256": archive_sha256,
+                "bundle_sha256": hashlib.sha256(bundle).hexdigest(),
+                "worker": worker,
+                "event_sequence_start": 0,
+                "channel_ref": "",
+            }
+
+            result = executor.distribute_profile_bundle(
+                operation_id, payload, encrypted_artifact=encrypted
+            )
+
+        self.assertEqual(result, {"ready": True, "profile": profile, "revision": revision})
+        self.assertEqual(installed_bundles, [bundle])
+        self.assertEqual(events.events[-1]["phase"], "completed")
+
 
 if __name__ == "__main__":
     unittest.main()

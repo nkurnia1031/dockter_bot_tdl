@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import urllib.error
 import urllib.request
@@ -129,11 +130,23 @@ class WorkerHttpDispatcher:
             with opener.open(request, timeout=timeout) as response:
                 return response.read(), response.headers
         except urllib.error.HTTPError as exc:
-            # Do not return worker response bodies; they may contain TDL or
-            # filesystem details that must remain private.
+            # Preserve only a stable reason code. Worker messages can contain
+            # TDL output or filesystem details and must remain private.
+            payload: dict[str, Any] = {}
+            try:
+                error_body = json.loads(exc.read().decode("utf-8"))
+                error = error_body.get("error") if isinstance(error_body, dict) else None
+                code = error.get("code") if isinstance(error, dict) else None
+                if isinstance(code, str) and re.fullmatch(
+                    r"(?:PROFILE|BACKUP_CHANNEL)_[A-Z0-9_-]{1,56}", code
+                ):
+                    payload = {"error": {"code": code}}
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                pass
             raise JsonHttpError(
                 exc.code,
                 "Worker menolak operasi provisioning profil.",
+                payload,
                 kind="response",
             ) from exc
         except (TimeoutError, socket.timeout) as exc:
@@ -281,6 +294,34 @@ class WorkerHttpDispatcher:
             timeout=600,
         )
         return result
+
+    def distribute_profile_bundle_artifact(
+        self,
+        worker: str,
+        operation_id: str,
+        payload: dict[str, Any],
+        encrypted_archive: bytes,
+    ) -> dict[str, Any]:
+        """Send worker-bound ciphertext over the authenticated worker API."""
+        headers = {
+            "X-Profile-Name": str(payload["profile"]),
+            "X-Profile-Worker": str(worker),
+            "X-Profile-Revision": str(int(payload["revision"])),
+            "X-Telegram-User-ID": str(int(payload["telegram_user_id"])),
+            "X-Archive-SHA256": str(payload["archive_sha256"]),
+            "X-Bundle-SHA256": str(payload["bundle_sha256"]),
+            "X-Event-Sequence-Start": str(int(payload.get("event_sequence_start", 0))),
+        }
+        raw, _ = self._profile_request(
+            worker,
+            "PUT",
+            f"/internal/v1/profiles/distributions/{quote(operation_id, safe='')}/artifact",
+            encrypted_archive,
+            content_type="application/octet-stream",
+            timeout=600,
+            extra_headers=headers,
+        )
+        return json.loads(raw.decode("utf-8")) if raw else {"ready": True}
 
     def commit_profile_bundle(
         self, worker: str, profile: str, operation_id: str, *, install_run_id: str = "", revision: int = 0

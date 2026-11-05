@@ -560,6 +560,57 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(rejected.status_code, 403)
         self.assertEqual(rejected.json()["error"]["code"], "PROFILE_DISTRIBUTION_WORKER_MISMATCH")
 
+        class ChannelExportFailure(RuntimeError):
+            code = "BACKUP_CHANNEL_EXPORT_FAILED"
+
+        payload["worker"] = "local"
+        self.executor.distribute_profile_bundle = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ChannelExportFailure("private TDL details")
+        )
+        failed = self.client.post(
+            f"/internal/v1/profiles/distributions/{operation_id}",
+            headers={"Authorization": "Bearer worker-secret"},
+            json=payload,
+        )
+        self.assertEqual(failed.status_code, 409)
+        self.assertEqual(failed.json()["error"]["code"], "BACKUP_CHANNEL_EXPORT_FAILED")
+        self.assertNotIn("private TDL details", failed.text)
+
+    def test_vault_distribution_artifact_endpoint_accepts_only_authenticated_worker_ciphertext(self):
+        captured = []
+        self.executor.distribute_profile_bundle = lambda operation_id, payload, **kwargs: (
+            captured.append((operation_id, dict(payload), kwargs)) or {"ready": True}
+        )
+        operation_id = "a36b11cb-2135-4fce-89c2-772b0eb25792"
+        headers = {
+            "Authorization": "Bearer worker-secret",
+            "X-Profile-Name": "archive",
+            "X-Profile-Worker": "local",
+            "X-Profile-Revision": "7",
+            "X-Telegram-User-ID": "123",
+            "X-Archive-SHA256": "a" * 64,
+            "X-Bundle-SHA256": "b" * 64,
+            "X-Event-Sequence-Start": "0",
+        }
+        path = f"/internal/v1/profiles/distributions/{operation_id}/artifact"
+        denied = self.client.put(path, headers={k:v for k,v in headers.items() if k != "Authorization"}, content=b"ciphertext")
+        self.assertEqual(denied.status_code, 401)
+        accepted = self.client.put(path, headers=headers, content=b"ciphertext")
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json(), {"ready": True})
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], operation_id)
+        self.assertEqual(captured[0][2], {"encrypted_artifact": b"ciphertext"})
+        self.assertEqual(captured[0][1]["message_ids"], [])
+
+        wrong_worker = self.client.put(
+            path,
+            headers={**headers, "X-Profile-Worker": "remote-2"},
+            content=b"ciphertext",
+        )
+        self.assertEqual(wrong_worker.status_code, 403)
+        self.assertEqual(wrong_worker.json()["error"]["code"], "PROFILE_DISTRIBUTION_WORKER_MISMATCH")
+
     def test_local_profile_inventory_requires_worker_token_and_returns_safe_summary(self):
         expected = {
             "items": [
