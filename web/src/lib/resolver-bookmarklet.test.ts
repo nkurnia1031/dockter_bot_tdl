@@ -38,20 +38,22 @@ function runBookmarklet({
   url,
   page,
   stepText,
+  bodyText,
   response,
 }: {
   url: string;
-  page?: Record<string, unknown>;
+  page?: Record<string, unknown> | null;
   stepText?: string;
+  bodyText?: string;
   response?: Record<string, unknown>;
 }) {
   if (!bookmarklet) throw new Error('Copyable bookmarklet is missing from its documentation.');
   const parsedUrl = new URL(url);
   const outputs: FakeElement[] = [];
-  const currentPage = page || {
+  const currentPage = page === undefined ? {
     fingerprint: { id: 'component-1', name: 'pages.show' },
     serverMemo: { data: { phase: 0, captcha: false, hasCaptcha: false }, checksum: 'test-checksum' }
-  };
+  } : page;
   const fetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => ({
     ok: true,
     status: 200,
@@ -68,13 +70,13 @@ function runBookmarklet({
   const document = {
     documentElement: { innerHTML: "<script>window.livewire_token='csrf-test'</script>" },
     body: {
-      innerText: stepText || 'Step 1/5',
-      textContent: stepText || 'Step 1/5',
+      innerText: bodyText || stepText || 'Step 1/5',
+      textContent: bodyText || stepText || 'Step 1/5',
       appendChild: (child: FakeElement) => outputs.push(child)
     },
     querySelector(selector: string) {
       if (selector === '[wire\\:initial-data]') {
-        return { getAttribute: () => JSON.stringify(currentPage) };
+        return currentPage ? { getAttribute: () => JSON.stringify(currentPage) } : null;
       }
       return null;
     },
@@ -109,6 +111,7 @@ describe('copyable Safelink bookmarklet', () => {
 
     expect(result.fetch).toHaveBeenCalledTimes(1);
     expect(result.fetch.mock.calls[0]?.[0]).toBe('https://invest.datapendidikan.com/livewire/message/pages.show');
+    expect(result.fetch.mock.calls[0]?.[1]?.redirect).toBe('error');
     expect(result.location.assign).toHaveBeenCalledWith('https://invest.datapendidikan.com/step/2');
     expect(result.outputs).toHaveLength(0);
   });
@@ -141,5 +144,19 @@ describe('copyable Safelink bookmarklet', () => {
     expect(result.navigator.clipboard.writeText).toHaveBeenCalledWith(destination);
     expect(result.copied).toEqual([destination]);
     expect(result.fetch.mock.calls.every(([target]) => String(target).startsWith('https://invest.datapendidikan.com/'))).toBe(true);
+  });
+
+  it('asks the user to handle a CAPTCHA even when the interstitial has no Livewire state', async () => {
+    const result = runBookmarklet({
+      url: 'https://invest.datapendidikan.com/captcha',
+      page: null,
+      bodyText: 'Complete this CAPTCHA to continue'
+    });
+
+    await result.pending;
+
+    expect(result.fetch).not.toHaveBeenCalled();
+    expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
+      .toContain('Selesaikan CAPTCHA secara manual');
   });
 });

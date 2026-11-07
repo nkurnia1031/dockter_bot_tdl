@@ -111,6 +111,10 @@ javascript:(async () => {
     }
     if (!isGate(current.hostname)) throw Error("Halaman ini bukan domain Safelink yang didukung.");
 
+    const visible = document.body.innerText || document.body.textContent || "";
+    const visibleCaptcha = /(captcha|recaptcha|hcaptcha|turnstile|verify\s+you\s+are\s+human|verifikasi\s+(?:bahwa\s+)?anda manusia|i\s+am\s+not\s+a\s+robot)/i.test(visible);
+    if (visibleCaptcha) throw Error("Selesaikan CAPTCHA secara manual, lalu jalankan bookmarklet kembali.");
+
     const node = document.querySelector("[wire\\:initial-data]");
     if (!node) throw Error("State langkah gate tidak ditemukan. Pastikan redirect awal selesai lalu jalankan bookmarklet lagi.");
     const initial = JSON.parse(node.getAttribute("wire:initial-data") || "{}");
@@ -121,10 +125,9 @@ javascript:(async () => {
       throw Error("State langkah gate tidak lengkap.");
     }
 
-    const visible = document.body.innerText || document.body.textContent || "";
-    const hasCaptcha = /(captcha|recaptcha|hcaptcha|turnstile|verify\s+you\s+are\s+human|verifikasi\s+(?:bahwa\s+)?anda manusia|i\s+am\s+not\s+a\s+robot)/i.test(visible)
-      || (data.hasCaptcha === true && data.captcha !== true);
-    if (hasCaptcha) throw Error("Selesaikan CAPTCHA secara manual, lalu jalankan bookmarklet kembali.");
+    if (data.hasCaptcha === true && data.captcha !== true) {
+      throw Error("Selesaikan CAPTCHA secara manual, lalu jalankan bookmarklet kembali.");
+    }
 
     const step = visible.match(/\bStep\s*(\d+)\s*\/\s*\d+/i);
     if (!step) throw Error("Nomor langkah gate tidak ditemukan.");
@@ -140,6 +143,7 @@ javascript:(async () => {
     const response = await fetch(endpoint.href, {
       method: "POST",
       credentials: "same-origin",
+      redirect: "error",
       headers: {
         "X-Livewire": "true",
         "X-CSRF-TOKEN": tokenMatch[1],
