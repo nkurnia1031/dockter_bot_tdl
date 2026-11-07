@@ -168,6 +168,12 @@ _Avoid_: hitungan isi langsung, total ukuran parsial tanpa penanda.
 Pengaturan file dan folder pada root `rclone_destination` di worker terpilih: membuat folder, rename, copy, move, Trash, restore, dan hapus permanen. Operasi batch atau folder rekursif melaporkan hasil per item; benturan tidak menimpa data.
 _Avoid_: akses ke remote atau path di luar root yang dikonfigurasi.
 
+## Resolver
+
+**Bookmarklet Resolver**:
+JavaScript bookmark yang disalin operator dan dijalankan pada halaman Safelink yang sedang dibuka. Setiap klik memajukan paling banyak satu tahap; operator mengulanginya setelah halaman berpindah sampai URL akhir ditampilkan dan dapat disalin.
+_Avoid_: resolver otomatis seluruh tahap di worker.
+
 ## Utility
 
 **Kumpulan kandidat password arsip**:
