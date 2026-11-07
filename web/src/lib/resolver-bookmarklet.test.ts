@@ -159,4 +159,20 @@ describe('copyable Safelink bookmarklet', () => {
     expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
       .toContain('Selesaikan CAPTCHA secara manual');
   });
+
+  it('waits for the Cloudflare browser challenge before processing the Safelink page', async () => {
+    const result = runBookmarklet({
+      url: 'https://crm.urlwebsite.com/v/example',
+      page: null,
+      bodyText: 'Just a moment... Enable JavaScript and cookies to continue'
+    });
+
+    await result.pending;
+
+    expect(result.fetch).not.toHaveBeenCalled();
+    expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
+      .toContain('Cloudflare');
+    expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
+      .toContain('jalankan bookmarklet lagi');
+  });
 });

@@ -8,7 +8,7 @@ Bookmarklet ini dijalankan langsung pada tab Safelink di desktop Chrome atau Edg
 2. Salin seluruh isi blok bookmarklet di bawah ke kolom URL/alamat bookmark, termasuk awalan `javascript:`.
 3. Buka URL Safelink. Setelah halaman gate tampil, klik bookmarklet. Ulangi setelah setiap perpindahan halaman.
 
-Bookmarklet menggunakan sesi browser halaman aktif dan hanya mengirim satu request Livewire ke origin halaman itu. Bookmarklet tidak memanggil API TME3Bot, tidak membuat job worker, tidak mengirim URL/sesi ke backend aplikasi, dan tidak mengambil isi URL tujuan. Selesaikan CAPTCHA secara manual sebelum menjalankannya kembali.
+Bookmarklet menggunakan sesi browser halaman aktif dan hanya mengirim satu request Livewire ke origin halaman itu. Bookmarklet tidak memanggil API TME3Bot, tidak membuat job worker, tidak mengirim URL/sesi ke backend aplikasi, dan tidak mengambil isi URL tujuan. Subdomain seperti `crm.urlwebsite.com` termasuk domain gate yang didukung. Jika Cloudflare menampilkan halaman pemeriksaan, selesaikan atau tunggu pemeriksaan itu di browser; setelah halaman gate terbuka, jalankan bookmarklet lagi. Bookmarklet tidak melewati challenge Cloudflare atau CAPTCHA.
 
 ## Bookmarklet siap salin
 
@@ -112,6 +112,10 @@ javascript:(async () => {
     if (!isGate(current.hostname)) throw Error("Halaman ini bukan domain Safelink yang didukung.");
 
     const visible = document.body.innerText || document.body.textContent || "";
+    const visibleMarkup = document.documentElement.innerHTML || "";
+    const visibleCloudflare = /(just a moment\.\.\.|enable javascript and cookies to continue|checking your browser|performing security verification)/i.test(visible)
+      || /\/cdn-cgi\/challenge-platform\//i.test(visibleMarkup);
+    if (visibleCloudflare) throw Error("Halaman ini sedang menjalankan pemeriksaan Cloudflare. Selesaikan atau tunggu pemeriksaan itu di browser; setelah halaman gate terbuka, jalankan bookmarklet lagi.");
     const visibleCaptcha = /(captcha|recaptcha|hcaptcha|turnstile|verify\s+you\s+are\s+human|verifikasi\s+(?:bahwa\s+)?anda manusia|i\s+am\s+not\s+a\s+robot)/i.test(visible);
     if (visibleCaptcha) throw Error("Selesaikan CAPTCHA secara manual, lalu jalankan bookmarklet kembali.");
 
