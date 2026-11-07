@@ -202,4 +202,28 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('Durasi per fase')).toBeTruthy();
     expect(screen.getByText('Mendownload media · 12 dtk')).toBeTruthy();
   });
+
+  it('distinguishes an accepted stop request from a stopped process', () => {
+    render(JobProgressCard, {
+      job: {
+        id: 'cancel-pending',
+        kind: 'storage_upload',
+        status: 'running',
+        profile: 'default',
+        worker: 'local',
+        created_at: new Date().toISOString(),
+        progress: {
+          phase: 'uploading',
+          cancel_request: { status: 'accepted' },
+        },
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn(),
+    });
+
+    expect(screen.getByRole('status').textContent).toContain(
+      'menunggu konfirmasi worker',
+    );
+  });
 });

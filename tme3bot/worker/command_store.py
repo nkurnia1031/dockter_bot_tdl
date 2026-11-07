@@ -161,6 +161,12 @@ class WorkerCommandStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_worker_event_outbox_ready
                     ON worker_event_outbox(status, available_at, id);
+                CREATE TABLE IF NOT EXISTS worker_event_dispatch_cursor (
+                    singleton_id INTEGER PRIMARY KEY CHECK(singleton_id=1),
+                    last_job_id TEXT NOT NULL DEFAULT '',
+                    last_event_id INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT OR IGNORE INTO worker_event_dispatch_cursor(singleton_id) VALUES (1);
                 """
             )
             event_columns = {
@@ -317,6 +323,31 @@ class WorkerCommandStore:
         with self._db() as db:
             row = db.execute("SELECT * FROM worker_commands WHERE command_id=?", (str(command_id),)).fetchone()
         return self._public(row) if row is not None else None
+
+    def event_binding(self, command_id: str) -> dict[str, Any] | None:
+        """Return worker-internal event fencing metadata for one command."""
+        with self._db() as db:
+            row = db.execute(
+                "SELECT command_id,job_id,attempt,dispatch_token,payload FROM worker_commands WHERE command_id=?",
+                (str(command_id),),
+            ).fetchone()
+        if row is None or not row["job_id"]:
+            return None
+        try:
+            envelope = json.loads(row["payload"])
+            job = envelope.get("job") if isinstance(envelope, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            job = None
+        return {
+            "command_id": str(row["command_id"]),
+            "job_id": str(row["job_id"]),
+            "attempt": int(row["attempt"]),
+            "dispatch_token": str(row["dispatch_token"]),
+            "worker": str(job.get("worker") or "") if isinstance(job, dict) else "",
+            "event_sequence_start": envelope.get("event_sequence_start")
+            if isinstance(envelope, dict)
+            else None,
+        }
 
     def claim_next(self) -> tuple[str, dict[str, Any]] | None:
         with self._lock, self._db() as db:
@@ -549,8 +580,14 @@ class WorkerCommandStore:
             try:
                 envelope = json.loads(row["payload"])
                 job = envelope.get("job") if isinstance(envelope, dict) else None
+                event_sequence_start = (
+                    envelope.get("event_sequence_start")
+                    if isinstance(envelope, dict)
+                    else None
+                )
             except (TypeError, ValueError, json.JSONDecodeError):
                 job = None
+                event_sequence_start = None
             if isinstance(job, dict) and str(job.get("kind") or "") == "storage_upload":
                 payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
                 result.append(
@@ -560,6 +597,7 @@ class WorkerCommandStore:
                         "attempt": int(row["attempt"]),
                         "dispatch_token": str(row["dispatch_token"]),
                         "worker": str(job.get("worker") or ""),
+                        "event_sequence_start": event_sequence_start,
                         "provider": str(payload.get("provider") or "telegram"),
                         "transfer_mode": str(payload.get("transfer_mode") or "copy"),
                         "folder_path": str(payload.get("folder_path") or ""),
@@ -567,6 +605,113 @@ class WorkerCommandStore:
                     }
                 )
         return result
+
+    def list_recovery_commands(self) -> list[dict[str, Any]]:
+        """Return interrupted non-Storage jobs that need one gateway outcome."""
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT command_id,job_id,attempt,dispatch_token,payload,phase,checkpoint FROM worker_commands "
+                "WHERE status='needs_reconciliation' AND phase='needs_reconciliation' "
+                "AND job_id IS NOT NULL ORDER BY updated_at,command_id"
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                envelope = json.loads(row["payload"])
+                job = envelope.get("job") if isinstance(envelope, dict) else None
+                event_sequence_start = (
+                    envelope.get("event_sequence_start")
+                    if isinstance(envelope, dict)
+                    else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                job = None
+                event_sequence_start = None
+            if not isinstance(job, dict) or str(job.get("kind") or "") == "storage_upload":
+                continue
+            recovery = {
+                "command_id": str(row["command_id"]),
+                "job_id": str(row["job_id"]),
+                "attempt": int(row["attempt"]),
+                "dispatch_token": str(row["dispatch_token"]),
+                "kind": str(job.get("kind") or "unknown"),
+                "worker": str(job.get("worker") or ""),
+                "event_sequence_start": event_sequence_start,
+                "phase": str(row["phase"] or ""),
+                "checkpoint": json.loads(row["checkpoint"]) if row["checkpoint"] else {},
+            }
+            if str(job.get("kind") or "") == "artifact_delete":
+                job_payload = job.get("payload") if isinstance(job.get("payload"), dict) else {}
+                keys = job_payload.get("artifact_keys") or []
+                if not isinstance(keys, list):
+                    keys = [keys]
+                if not keys and job_payload.get("artifact_key"):
+                    keys = [job_payload["artifact_key"]]
+                recovery["profile"] = str(job.get("profile") or "")
+                recovery["artifact_keys"] = [str(key) for key in keys if isinstance(key, str)]
+                recovery["started_artifact_keys"] = self._started_artifact_delete_keys(
+                    job_id=str(row["job_id"]),
+                    command_id=str(row["command_id"]),
+                    attempt=int(row["attempt"]),
+                    dispatch_token=str(row["dispatch_token"]),
+                )
+            result.append(recovery)
+        return result
+
+    def _started_artifact_delete_keys(
+        self,
+        *,
+        job_id: str,
+        command_id: str,
+        attempt: int,
+        dispatch_token: str,
+    ) -> list[str]:
+        """Find deletes whose started event has no durable outcome event."""
+        states: dict[str, str] = {}
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT event_json FROM worker_event_outbox WHERE job_id=? ORDER BY sequence",
+                (job_id,),
+            ).fetchall()
+        for row in rows:
+            try:
+                event = json.loads(row["event_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                not isinstance(event, dict)
+                or str(event.get("command_id") or "") != command_id
+                or int(event.get("attempt") or 0) != attempt
+                or str(event.get("dispatch_token") or "") != dispatch_token
+            ):
+                continue
+            event_type = str(event.get("event_type") or "")
+            if event_type not in {
+                "artifact.delete.started",
+                "artifact.delete.completed",
+                "artifact.delete.missing",
+                "artifact.delete.failed",
+            }:
+                continue
+            result = event.get("result") if isinstance(event.get("result"), dict) else {}
+            artifact_key = str(result.get("artifact_key") or "").strip()
+            if artifact_key:
+                states[artifact_key] = event_type
+        return [
+            key
+            for key, state in states.items()
+            if state == "artifact.delete.started"
+        ]
+
+    def mark_recovery_reported(self, command_id: str) -> bool:
+        """Fence duplicate local recovery reports once an event is durably queued."""
+        with self._db() as db:
+            changed = db.execute(
+                "UPDATE worker_commands SET phase='recovery_reported',updated_at=? "
+                "WHERE command_id=? AND status='needs_reconciliation' AND phase='needs_reconciliation'",
+                (_now(), str(command_id)),
+            ).rowcount
+        return bool(changed)
 
     def mark_storage_reconciliation_reported(self, command_id: str) -> bool:
         with self._db() as db:
@@ -577,16 +722,100 @@ class WorkerCommandStore:
             ).rowcount
         return bool(changed)
 
-    def request_cancel_by_job(self, job_id: str) -> dict[str, Any] | None:
-        with self._lock, self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
+    def append_recovery_events_once(
+        self,
+        command_id: str,
+        job_id: str,
+        payloads: list[dict[str, Any]],
+        *,
+        reported_phase: str,
+    ) -> list[int] | None:
+        """Atomically enqueue recovery events and fence future startup reports."""
+        if not payloads:
+            return None
+        now = _now()
+        with self._write_transaction() as db:
+            command = db.execute(
+                "SELECT status,phase,job_id,attempt,dispatch_token FROM worker_commands WHERE command_id=?",
+                (str(command_id),),
+            ).fetchone()
+            if (
+                command is None
+                or command["status"] != "needs_reconciliation"
+                or command["phase"] != "needs_reconciliation"
+                or str(command["job_id"] or "") != str(job_id)
+            ):
+                return None
             row = db.execute(
-                "SELECT * FROM worker_commands WHERE job_id=? AND status IN ('accepted','claimed','queued','running','cancelling') ORDER BY attempt DESC LIMIT 1",
+                "SELECT last_sequence FROM worker_event_sequences WHERE job_id=?",
                 (str(job_id),),
             ).fetchone()
+            sequence = int(row["last_sequence"]) if row else 1
+            sequences = []
+            for payload in payloads:
+                sequence += 1
+                bound_payload = {
+                    **payload,
+                    "command_id": str(command_id),
+                    "attempt": int(command["attempt"]),
+                    "dispatch_token": str(command["dispatch_token"]),
+                    "sequence": sequence,
+                }
+                db.execute(
+                    "INSERT INTO worker_event_outbox "
+                    "(job_id,sequence,event_json,transient,status,available_at,created_at) "
+                    "VALUES (?,?,?,0,'pending',?,?)",
+                    (str(job_id), sequence, _dump(bound_payload), now, now),
+                )
+                sequences.append(sequence)
+            if sequences:
+                db.execute(
+                    "INSERT INTO worker_event_sequences(job_id,last_sequence) VALUES (?,?) "
+                    "ON CONFLICT(job_id) DO UPDATE SET last_sequence=excluded.last_sequence",
+                    (str(job_id), sequences[-1]),
+                )
+            db.execute(
+                "UPDATE worker_commands SET phase=?,updated_at=? "
+                "WHERE command_id=? AND status='needs_reconciliation' AND phase='needs_reconciliation'",
+                (str(reported_phase), now, str(command_id)),
+            )
+        return sequences
+
+    def request_cancel_by_job(
+        self,
+        job_id: str,
+        *,
+        attempt: int | None = None,
+        cancellable_kinds: set[str] | frozenset[str] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            query = (
+                "SELECT * FROM worker_commands WHERE job_id=? "
+                "AND status IN ('accepted','claimed','queued','running','cancelling')"
+            )
+            values: list[Any] = [str(job_id)]
+            if attempt is not None:
+                query += " AND attempt=?"
+                values.append(max(1, int(attempt)))
+            query += " ORDER BY attempt DESC LIMIT 1"
+            row = db.execute(query, values).fetchone()
             if row is None:
                 db.commit()
                 return None
+            try:
+                envelope = json.loads(row["payload"])
+                job = envelope.get("job") if isinstance(envelope, dict) else None
+            except (TypeError, ValueError, json.JSONDecodeError):
+                job = None
+            kind = str(job.get("kind") or "") if isinstance(job, dict) else ""
+            if (
+                row["status"] in {"running", "cancelling"}
+                and cancellable_kinds is not None
+                and kind not in cancellable_kinds
+            ):
+                db.commit()
+                return {**self._public(row), "kind": kind, "cancel_rejected": True}
             status = "cancelled" if row["status"] in {"accepted", "claimed"} else "cancelling"
             db.execute(
                 "UPDATE worker_commands SET status=?,phase=?,updated_at=? WHERE command_id=?",
@@ -594,7 +823,7 @@ class WorkerCommandStore:
             )
             updated = db.execute("SELECT * FROM worker_commands WHERE command_id=?", (row["command_id"],)).fetchone()
             db.commit()
-        return self._public(updated)
+        return {**self._public(updated), "kind": kind, "cancel_rejected": False}
 
     def recover_startup(self) -> dict[str, int]:
         with self._write_transaction() as db:
@@ -745,14 +974,37 @@ class WorkerCommandStore:
         ).isoformat()
         lease_token = secrets.token_urlsafe(24)
         with self._write_transaction() as db:
-            row = db.execute(
-                """SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e
-                WHERE ((e.status='pending' AND e.available_at<=?)
-                    OR (e.status='sending' AND (e.lease_until IS NULL OR e.lease_until<=?)))
-                  AND NOT EXISTS (SELECT 1 FROM worker_event_outbox p WHERE p.job_id=e.job_id AND p.sequence<e.sequence AND p.status IN ('pending','sending'))
-                ORDER BY e.id LIMIT 1""",
-                (now, now),
+            cursor = db.execute(
+                "SELECT last_job_id,last_event_id FROM worker_event_dispatch_cursor WHERE singleton_id=1"
             ).fetchone()
+            last_job_id = str(cursor["last_job_id"] or "") if cursor else ""
+            last_event_id = int(cursor["last_event_id"] or 0) if cursor else 0
+            eligible = """((e.status='pending' AND e.available_at<=?)
+                OR (e.status='sending' AND (e.lease_until IS NULL OR e.lease_until<=?)))
+                AND NOT EXISTS (
+                    SELECT 1 FROM worker_event_outbox p
+                    WHERE p.job_id=e.job_id AND p.sequence<e.sequence
+                      AND p.status IN ('pending','sending')
+                )"""
+            # Deliver at most one event for a job while another job has a
+            # ready head. Per-job sequence ordering and leases remain intact.
+            row = db.execute(
+                f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "
+                f"WHERE {eligible} AND e.job_id<>? AND e.id>? ORDER BY e.id LIMIT 1",
+                (now, now, last_job_id, last_event_id),
+            ).fetchone()
+            if row is None:
+                row = db.execute(
+                    f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "
+                    f"WHERE {eligible} AND e.job_id<>? ORDER BY e.id LIMIT 1",
+                    (now, now, last_job_id),
+                ).fetchone()
+            if row is None:
+                row = db.execute(
+                    f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "
+                    f"WHERE {eligible} ORDER BY e.id LIMIT 1",
+                    (now, now),
+                ).fetchone()
             if row is None:
                 return None
             changed = db.execute(
@@ -764,6 +1016,10 @@ class WorkerCommandStore:
             ).rowcount
             if not changed:
                 return None
+            db.execute(
+                "UPDATE worker_event_dispatch_cursor SET last_job_id=?,last_event_id=? WHERE singleton_id=1",
+                (str(row["job_id"]), int(row["id"])),
+            )
         return (
             int(row["id"]),
             str(row["job_id"]),

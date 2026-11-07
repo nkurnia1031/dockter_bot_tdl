@@ -14,8 +14,7 @@ class SafelinkExecutorMixin:
         reporter = ProgressReporter(self.publisher, job_id)
 
         def cancelled() -> bool:
-            with self._lock:
-                return job_id in self._cancel_requested
+            return self._job_cancelled(job_id)
 
         def progress(item: dict[str, Any]) -> None:
             reporter.report(

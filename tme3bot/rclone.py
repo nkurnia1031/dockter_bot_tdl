@@ -59,8 +59,10 @@ class RcloneRunner:
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
         self.command_callback = command_callback
 
-    def cancel_current(self) -> bool:
-        return self.runner.interrupt_current()
+    def cancel_current(self, owner_job_id: str | None = None) -> bool:
+        if owner_job_id is None:
+            return self.runner.interrupt_current()
+        return self.runner.interrupt_current(owner_job_id)
 
     def pause_current(self, owner_job_id: str | None = None) -> bool:
         return self.runner.pause_current(owner_job_id)

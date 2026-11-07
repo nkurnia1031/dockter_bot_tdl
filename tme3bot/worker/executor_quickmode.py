@@ -896,9 +896,8 @@ class QuickModeExecutorMixin:
         rclone_result = dict(rclone_result) if isinstance(rclone_result, dict) else None
 
         def ensure_not_cancelled() -> None:
-            with self._lock:
-                if job_id in self._cancel_requested:
-                    raise QuickModeError("Quick Mode dibatalkan oleh user.")
+            if self._job_cancelled(job_id):
+                raise QuickModeError("Quick Mode dibatalkan oleh user.")
 
         def save_manifest(**updates: Any) -> None:
             error_value = updates.get("last_error")

@@ -45,6 +45,9 @@ class FakeExecutor:
         self.profile_install_contexts = []
         self.profile_install_commits = []
         self.local_profile_deletes = []
+        self.cancel_requests = []
+        self.cancel_attempts = []
+        self.cancel_accepted = True
         self.profile_tdl_diagnostics = {
             "ready": True,
             "identity_match": True,
@@ -74,6 +77,11 @@ class FakeExecutor:
             "tts": self.tts_ready,
             "safelink_resolver": True,
         }
+
+    def cancel(self, job_id, *, attempt=None):
+        self.cancel_requests.append(str(job_id))
+        self.cancel_attempts.append(attempt)
+        return self.cancel_accepted
 
     def utility_runtime_readiness(self):
         self.utility_probe_calls += 1
@@ -220,9 +228,6 @@ class FakeExecutor:
         self.commands.append(command)
         return 1
 
-    def cancel(self, job_id):
-        return job_id == "known"
-
     def pause(self, job_id):
         return job_id == "known"
 
@@ -325,6 +330,28 @@ class WorkerApiTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200)
         self.assertEqual(accepted.json()["position"], 1)
         self.assertEqual(self.executor.commands, [payload])
+
+    def test_cancel_endpoint_reports_request_acceptance_not_process_completion(self):
+        response = self.client.post(
+            "/internal/v1/jobs/job-cancel/cancel",
+            headers={"Authorization": "Bearer worker-secret"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"accepted": True})
+        self.assertEqual(self.executor.cancel_requests, ["job-cancel"])
+
+    def test_cancel_endpoint_forwards_specific_durable_attempt(self):
+        response = self.client.post(
+            "/internal/v1/jobs/job-cancel-attempt/cancel",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={"attempt": 3},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"accepted": True})
+        self.assertEqual(self.executor.cancel_requests, ["job-cancel-attempt"])
+        self.assertEqual(self.executor.cancel_attempts, [3])
 
     def test_worker_has_no_openapi_surface(self):
         response = self.client.get("/openapi.json")

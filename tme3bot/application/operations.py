@@ -284,10 +284,14 @@ class OperationsService:
             JobStatus.CANCELLED: OperationStatus.CANCELLED,
         }
         status = mapping[event.status]
+        phase = "job_" + event.status.value
+        if operation.status == status and operation.phase == phase:
+            self.flush_activity_events()
+            return
         try:
             self.store.transition_from_job(
                 operation.id, expected_revision=operation.revision,
-                status=status, phase="job_" + event.status.value,
+                status=status, phase=phase,
                 safe_progress={"job_status": event.status.value},
             )
         except DomainError:

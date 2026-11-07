@@ -542,6 +542,26 @@ class SqliteOperationStore:
             "UPDATE job_execution_plans SET queued_at=?, admitted_at=NULL, released_at=NULL, blocked_reason=NULL WHERE job_id=?",
             (now, job_id),
         )
+        # The old attempt's dispatch marker must not make the retry wait
+        # forever in advance_durable_attempt(). The retry outbox handler will
+        # install the new command identity and attempt atomically before its
+        # dispatch claim. A stale old handler is rejected by the operation
+        # attempt check at begin_queued_worker_dispatch().
+        command_row = db.execute(
+            "SELECT payload FROM job_commands WHERE job_id=?", (job_id,)
+        ).fetchone()
+        command_payload = _load(command_row["payload"], None) if command_row else None
+        if isinstance(command_payload, dict) and command_payload.get("dispatch_mode") == "durable":
+            command_payload["dispatch_started"] = False
+            command_payload["cancel_before_dispatch"] = False
+            command_payload["cancel_after_dispatch"] = False
+            command_payload["cancel_after_dispatch_accepted"] = False
+            command_payload.pop("cancel_before_dispatch_attempt", None)
+            command_payload.pop("cancel_after_dispatch_attempt", None)
+            db.execute(
+                "UPDATE job_commands SET payload=? WHERE job_id=?",
+                (_dump(command_payload), job_id),
+            )
         db.execute(
             "UPDATE job_telegram_notifications SET status='pending', terminal_notified_at=NULL, last_status_hash=NULL, error=NULL WHERE job_id=?",
             (job_id,),

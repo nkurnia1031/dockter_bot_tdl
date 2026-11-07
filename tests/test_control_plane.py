@@ -1,4 +1,5 @@
 import hashlib
+import threading
 import tempfile
 import unittest
 from datetime import timedelta
@@ -12,6 +13,8 @@ from tme3bot.infrastructure.job_store import SqliteJobRepository
 from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.infrastructure.runtime_readiness_store import RuntimeReadinessStore
 from tme3bot.infrastructure.tdl_access_store import SqliteTdlAccessStore
+from tme3bot.storage_catalog import StorageCatalog, build_storage_caption
+from tme3bot.resource_locks import resource_sets_conflict
 from tme3bot.domain.worker_contract import CAP_SHARED_EXPORT_CURSOR
 from tme3bot.worker_registry import WorkerRegistry
 
@@ -45,6 +48,7 @@ class FakeDispatcher:
     def __init__(self):
         self.commands = []
         self.durable_commands = []
+        self.cancelled_jobs = []
         self.cancel_result = True
         self.resume_result = False
 
@@ -68,6 +72,7 @@ class FakeDispatcher:
         return {"accepted": True}
 
     def cancel(self, worker, job_id):
+        self.cancelled_jobs.append((worker, job_id))
         return self.cancel_result
 
     def resume(self, worker, job_id, event_sequence_start):
@@ -155,6 +160,50 @@ class ControlPlaneTests(unittest.TestCase):
         self.dispatcher = FakeDispatcher()
         self.control = ControlPlane(self.jobs, self.dispatcher, self.profiles)
         self.actor = Actor(42, "default")
+
+    def _create_queued_command_job(
+        self, job_id, *, storage=False, dispatch_started=False, resource_keys=()
+    ):
+        payload = {"folder_path": "/workspace/biasa"} if storage else {"url": "https://t.me/c/1/2"}
+        job = Job(
+            id=job_id,
+            kind="storage_upload" if storage else "export",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload=payload,
+        )
+        dispatch = {
+            "command_id": f"command-{job_id}",
+            "dispatch_token": f"token-{job_id}",
+            "dispatch_started": dispatch_started,
+        }
+        command_payload = (
+            {"_storage_durable_dispatch": dispatch, **payload}
+            if storage
+            else {
+                "dispatch_mode": "durable",
+                "command_id": dispatch["command_id"],
+                "dispatch_token": dispatch["dispatch_token"],
+                "dispatch_started": dispatch_started,
+                "attempt": 1,
+                "profile": "default",
+                "payload": payload,
+            }
+        )
+        self.jobs.create_with_private_values(
+            job,
+            {},
+            execution_plan={
+                "resource_keys": list(resource_keys),
+                "queue_group": "export",
+                "priority": 100,
+                "lane": "export",
+            },
+            command_payload=command_payload,
+        )
+        return job
 
     def tearDown(self):
         self.temp.cleanup()
@@ -625,6 +674,62 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(runtime_store.cell("local", sender_profile, "storage")["status"], "ready")
         for profile in {"default", "archive", "other"} - {sender_profile}:
             self.assertEqual(runtime_store.cell("local", profile, "storage")["status"], "ready")
+
+    def test_storage_recovery_batch_applies_catalog_before_terminal_and_is_idempotent(self):
+        catalog = StorageCatalog(Path(self.temp.name) / "storage-recovery.db")
+        self.control.storage_catalog = catalog
+        job = Job(
+            id="storage-recovery-job",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=self.actor.telegram_user_id,
+            worker="local",
+            status=JobStatus.DISPATCHED,
+            payload={},
+        )
+        self.jobs.create(job)
+        recovered_item = {
+            "upload_id": "recovered-upload-1",
+            "owner_user_id": self.actor.telegram_user_id,
+            "owner_profile": "default",
+            "channel_id": -1001,
+            "channel_message_id": 901,
+            "original_name": "recovered.txt",
+            "display_name": "recovered.txt",
+            "folder_id": None,
+            "relative_folder": "restored",
+            "folder": "restored",
+            "keywords": "",
+            "caption": build_storage_caption("restored", "recovered.txt", ""),
+            "file_size": 17,
+            "mime_type": "text/plain",
+            "sha256": "",
+        }
+        recovery_event = JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.RUNNING,
+            event_type="storage.recovery_batch",
+            result={"items": [recovered_item]},
+        )
+
+        self.control.append_worker_event(recovery_event)
+        self.control.append_worker_event(recovery_event)
+        terminal = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.FAILED,
+                event_type="storage.batch_interrupted",
+                result={"value": {"outcome": "needs_reconciliation", "items": []}},
+            )
+        )
+
+        matches = catalog.search("recovered")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].upload_id, "recovered-upload-1")
+        self.assertEqual(matches[0].folder, "restored")
+        self.assertEqual(terminal.status, JobStatus.FAILED)
 
     def test_storage_dispatch_failure_marks_worker_offline_without_clearing_profile_cells(self):
         self.authorize_quick_mode_storage()
@@ -1908,6 +2013,51 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn("worker:local:quick-stage:stage-1", retry_plan.resource_keys)
         self.assertNotIn("profile:default:worker:local:tdl:export", retry_plan.resource_keys)
 
+    def test_artifact_delete_and_download_share_per_file_execution_fence(self):
+        key = "export-20261107.json"
+        delete_plan = build_execution_plan(
+            "artifact_delete", "default", "local", {"artifact_keys": [key]}
+        )
+        download_plan = build_execution_plan(
+            "download", "default", "local", {"artifact_keys": [key]}
+        )
+
+        shared = delete_plan.resource_keys & download_plan.resource_keys
+        self.assertEqual(
+            shared,
+            {
+                f"worker:local:artifact:{key}",
+                "shared:worker:local:artifact-files",
+            },
+        )
+
+    def test_bulk_artifact_inventory_and_cleanup_fence_per_file_operations(self):
+        inventory = build_execution_plan(
+            "artifact_inventory", "default", "local", {"inventory_id": "scan-1"}
+        )
+        clear_failed = build_execution_plan(
+            "download_clear_failed", "default", "local", {}
+        )
+        first_download = build_execution_plan(
+            "download",
+            "default",
+            "local",
+            {"artifact_keys": ["one.json"]},
+        )
+        other_download = build_execution_plan(
+            "download",
+            "archive",
+            "local",
+            {"artifact_keys": ["two.json"]},
+        )
+
+        self.assertIn("exclusive:worker:local:artifact-files", inventory.resource_keys)
+        self.assertIn("exclusive:worker:local:artifact-files", clear_failed.resource_keys)
+        self.assertIn("shared:worker:local:artifact-files", first_download.resource_keys)
+        self.assertTrue(resource_sets_conflict(inventory.resource_keys, first_download.resource_keys))
+        self.assertTrue(resource_sets_conflict(clear_failed.resource_keys, other_download.resource_keys))
+        self.assertFalse(resource_sets_conflict(first_download.resource_keys, other_download.resource_keys))
+
     def test_quickmode_json_ready_keeps_lane_until_shared_cursor_commit(self):
         cursor = FakeExportCursorGate()
         dispatcher = FakeDispatcher()
@@ -2122,12 +2272,15 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
 
         # If the worker goes silent again, the normal watchdog path still
-        # cancels it after the configured grace period.
+        # waits for the grace period even when cancellation is not confirmed.
+        self.dispatcher.cancel_result = False
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=30))
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=36))
-        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.FAILED)
         self.assertEqual(self.jobs.get(job.id).error["code"], "JOB_STALLED")
+        self.assertTrue(self.jobs.get(job.id).progress["outcome_uncertain"])
+        self.assertFalse(self.jobs.has_active("default"))
 
         late = control.append_worker_event(
             JobEvent(
@@ -2137,7 +2290,444 @@ class ControlPlaneTests(unittest.TestCase):
                 event_type="late_running",
             )
         )
-        self.assertEqual(late.status, JobStatus.CANCELLED)
+        self.assertEqual(late.status, JobStatus.FAILED)
+
+        # A terminal worker event finally confirms the process is gone and
+        # releases the resource fence, but does not erase the uncertain failure.
+        control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=5,
+                status=JobStatus.CANCELLED,
+                event_type="cancelled",
+            )
+        )
+        self.assertFalse(self.jobs.has_active("default"))
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.FAILED)
+        self.assertEqual(
+            self.jobs.get(job.id).result["late_worker_terminal"]["status"],
+            "cancelled",
+        )
+
+    def test_stale_watchdog_revalidates_fresh_progress_before_failing(self):
+        control = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            job_stall_timeout_seconds=10,
+            job_cancel_grace_seconds=5,
+        )
+        job = control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        now = utc_now()
+        stale_at = now - timedelta(seconds=30)
+        self.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="running",
+                created_at=stale_at,
+            )
+        )
+        cancel_request = {
+            "id": "watchdog-request-1",
+            "at": now - timedelta(seconds=6),
+            "signal_status": "not_confirmed",
+        }
+        control._stale_cancel_requested[job.id] = cancel_request
+
+        control.update_worker_progress(
+            JobEvent(
+                job_id=job.id,
+                sequence=3,
+                status=JobStatus.RUNNING,
+                event_type="progress.snapshot",
+                progress={"heartbeat": True},
+                created_at=now - timedelta(seconds=1),
+            )
+        )
+
+        failed = control._fail_stale_job(
+            job,
+            requested_at=cancel_request,
+            now=now,
+        )
+
+        self.assertFalse(failed)
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertNotIn(job.id, control._stale_cancel_requested)
+
+    def test_queued_cancel_uses_transient_progress_sequence_cursor(self):
+        job = Job(
+            id="queued-cancel-cursor",
+            kind="export",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload={"url": "https://t.me/c/1/2"},
+        )
+        self.jobs.create(job)
+        self.jobs.update_progress_snapshot(
+            JobEvent(
+                job_id=job.id,
+                sequence=10,
+                status=JobStatus.QUEUED,
+                event_type="progress.snapshot",
+                progress={"phase": "queued"},
+            )
+        )
+
+        cancelled = self.control.cancel_job(self.actor, job.id)
+
+        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
+        self.assertEqual(self.jobs.get(job.id).progress_sequence, 11)
+        self.assertFalse(self.dispatcher.commands)
+
+    def test_queued_preflight_failure_uses_transient_progress_sequence_cursor(self):
+        job = Job(
+            id="queued-preflight-cursor",
+            kind="export",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload={"url": "https://t.me/c/1/2"},
+        )
+        self.jobs.create(job)
+        self.jobs.update_progress_snapshot(
+            JobEvent(
+                job_id=job.id,
+                sequence=10,
+                status=JobStatus.QUEUED,
+                event_type="progress.snapshot",
+                progress={"phase": "queued"},
+            )
+        )
+
+        self.control._fail_queued_job(job, "WORKER_INCOMPATIBLE", "old worker")
+
+        failed = self.jobs.get(job.id)
+        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertEqual(failed.progress_sequence, 11)
+
+    def test_durable_queued_cancel_uses_transient_progress_sequence_cursor(self):
+        job = Job(
+            id="durable-queued-cancel-cursor",
+            kind="export",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.QUEUED,
+            payload={"url": "https://t.me/c/1/2"},
+        )
+        self.jobs.create(job)
+        self.jobs.update_progress_snapshot(
+            JobEvent(
+                job_id=job.id,
+                sequence=10,
+                status=JobStatus.QUEUED,
+                event_type="progress.snapshot",
+                progress={"phase": "queued"},
+            )
+        )
+
+        result = self.control.advance_durable_cancel(
+            {"private_payload": {"job_id": job.id}}
+        )
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
+        self.assertEqual(self.jobs.get(job.id).progress_sequence, 11)
+
+    def test_dispatch_and_durable_queued_cancel_reserve_one_side_of_boundary(self):
+        cancel_first = self._create_queued_command_job("durable-cancel-first")
+        self.assertEqual(
+            self.jobs.request_queued_cancellation(cancel_first.id),
+            "cancel_requested",
+        )
+        self.assertEqual(
+            self.jobs.begin_queued_worker_dispatch(cancel_first.id),
+            "cancel_requested",
+        )
+
+        dispatch_first = self._create_queued_command_job("durable-dispatch-first")
+        self.assertEqual(
+            self.jobs.begin_queued_worker_dispatch(dispatch_first.id), "started"
+        )
+        self.assertEqual(
+            self.jobs.request_queued_cancellation(dispatch_first.id),
+            "dispatch_started",
+        )
+
+    def test_storage_upload_dispatch_and_cancel_share_the_same_atomic_boundary(self):
+        job = self._create_queued_command_job(
+            "storage-dispatch-boundary", storage=True
+        )
+
+        self.assertEqual(
+            self.jobs.begin_queued_worker_dispatch(job.id), "started"
+        )
+        self.assertEqual(
+            self.jobs.request_queued_cancellation(job.id), "dispatch_started"
+        )
+
+    def test_dispatch_and_queued_cancel_race_has_one_atomic_winner(self):
+        job = self._create_queued_command_job("durable-dispatch-cancel-race")
+        barrier = threading.Barrier(3)
+        outcomes = {}
+
+        def begin_dispatch():
+            barrier.wait()
+            outcomes["dispatch"] = self.jobs.begin_queued_worker_dispatch(job.id)
+
+        def request_cancel():
+            barrier.wait()
+            outcomes["cancel"] = self.jobs.request_queued_cancellation(job.id)
+
+        threads = [
+            threading.Thread(target=begin_dispatch),
+            threading.Thread(target=request_cancel),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertIn(
+            (outcomes["dispatch"], outcomes["cancel"]),
+            {
+                ("started", "dispatch_started"),
+                ("cancel_requested", "cancel_requested"),
+            },
+        )
+
+    def test_durable_advance_terminalizes_cancel_intent_without_dispatch(self):
+        job = self._create_queued_command_job("durable-advance-cancel-intent")
+        self.assertEqual(
+            self.jobs.request_queued_cancellation(job.id), "cancel_requested"
+        )
+
+        result = self.control.advance_durable_job(
+            {"private_payload": {"job_id": job.id}, "attempt": 1}
+        )
+
+        self.assertEqual(result["status"], "terminal")
+        self.assertEqual(result["reason"], "cancelled_before_dispatch")
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
+        self.assertFalse(self.dispatcher.durable_commands)
+
+    def test_retry_after_pre_dispatch_cancel_clears_old_marker_and_dispatches(self):
+        job = self._create_queued_command_job("durable-retry-after-cancel")
+        self.control.cancel_job(self.actor, job.id)
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
+        self.assertTrue(self.jobs.command_payload(job.id)["cancel_before_dispatch"])
+
+        self.dispatcher.capabilities = lambda _worker: {
+            "contract_version": 1,
+            "capabilities": [
+                "jobs.dispatch.v1", "jobs.events.v1", "jobs.control.v1",
+                "jobs.cancel_attempt.v1", "durable_commands_v1"
+            ],
+        }
+        result = self.control.advance_durable_job(
+            {"private_payload": {"job_id": job.id}, "attempt": 2}
+        )
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.DISPATCHED)
+        payload = self.jobs.command_payload(job.id)
+        self.assertEqual(payload["attempt"], 2)
+        self.assertFalse(payload["cancel_before_dispatch"])
+        self.assertTrue(payload["dispatch_started"])
+        self.assertEqual(self.dispatcher.durable_commands[-1]["attempt"], 2)
+
+    def test_duplicate_durable_advance_does_not_release_dispatched_job_lease(self):
+        job = self._create_queued_command_job(
+            "durable-duplicate-advance", resource_keys=["worker:local:export"]
+        )
+        self.dispatcher.capabilities = lambda _worker: {
+            "contract_version": 1,
+            "capabilities": [
+                "jobs.dispatch.v1", "jobs.events.v1", "jobs.control.v1",
+                "jobs.cancel_attempt.v1", "durable_commands_v1"
+            ],
+        }
+        self.assertTrue(self.jobs.try_acquire_execution(job.id)["admitted"])
+
+        def another_advance_won(job_id, **_expected_attempt):
+            self.control.append_worker_event(
+                JobEvent(
+                    job_id=job_id,
+                    sequence=1,
+                    status=JobStatus.DISPATCHED,
+                    event_type="durable_dispatch_accepted",
+                ),
+                dispatch_pending=False,
+            )
+            return "not_queued"
+
+        self.jobs.begin_queued_worker_dispatch = another_advance_won
+        result = self.control.advance_durable_job(
+            {"private_payload": {"job_id": job.id}, "attempt": 1}
+        )
+
+        self.assertEqual(result, {"status": "accepted", "reason": "already_dispatched"})
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.DISPATCHED)
+        with self.jobs._db() as db:
+            leases = db.execute(
+                "SELECT COUNT(*) FROM job_resource_leases WHERE job_id=?", (job.id,)
+            ).fetchone()[0]
+        self.assertEqual(leases, 1)
+
+    def test_dispatch_cancel_race_persists_attempt_intent_until_worker_accepts(self):
+        job = self._create_queued_command_job("durable-dispatch-cancel-in-flight")
+        self.dispatcher.capabilities = lambda _worker: {
+            "contract_version": 1,
+            "capabilities": [
+                "jobs.dispatch.v1", "jobs.events.v1", "jobs.control.v1",
+                "jobs.cancel_attempt.v1", "durable_commands_v1"
+            ],
+        }
+        dispatch_entered = threading.Event()
+        release_dispatch = threading.Event()
+        original_dispatch = self.dispatcher.dispatch_command
+        original_cancel = self.dispatcher.cancel
+        cancel_available = {"value": False}
+
+        def blocked_dispatch(worker, envelope):
+            dispatch_entered.set()
+            if not release_dispatch.wait(timeout=3):
+                raise TimeoutError("test dispatch was not released")
+            return original_dispatch(worker, envelope)
+
+        def delayed_cancel(worker, job_id):
+            self.dispatcher.cancelled_jobs.append((worker, job_id))
+            return cancel_available["value"]
+
+        self.dispatcher.dispatch_command = blocked_dispatch
+        self.dispatcher.cancel = delayed_cancel
+        result = {}
+        thread = threading.Thread(
+            target=lambda: result.update(
+                self.control.advance_durable_job(
+                    {"private_payload": {"job_id": job.id}, "attempt": 1}
+                )
+            )
+        )
+        thread.start()
+        self.assertTrue(dispatch_entered.wait(timeout=3))
+
+        cancelled = self.control.cancel_job(self.actor, job.id)
+        self.assertEqual(cancelled.status, JobStatus.QUEUED)
+        payload = self.jobs.command_payload(job.id)
+        self.assertTrue(payload["cancel_after_dispatch"])
+        self.assertFalse(payload["cancel_after_dispatch_accepted"])
+
+        release_dispatch.set()
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result.get("status"), "wait")
+        self.assertEqual(result.get("reason"), "cancel_pending")
+
+        cancel_available["value"] = True
+        self.control._retry_dispatch_cancel_requests()
+        payload = self.jobs.command_payload(job.id)
+        self.assertTrue(payload["cancel_after_dispatch_accepted"])
+        self.assertEqual(self.dispatcher.cancelled_jobs[-1], ("local", job.id))
+        self.dispatcher.cancel = original_cancel
+
+    def test_cancel_queued_durable_job_uses_worker_after_dispatch_boundary(self):
+        job = self._create_queued_command_job(
+            "durable-cancel-after-start", dispatch_started=True
+        )
+
+        current = self.control.cancel_job(self.actor, job.id)
+
+        self.assertEqual(current.status, JobStatus.QUEUED)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [("local", job.id)])
+
+    def test_cancel_queued_durable_job_before_dispatch_is_terminalized_locally(self):
+        job = self._create_queued_command_job("durable-cancel-before-start")
+
+        current = self.control.cancel_job(self.actor, job.id)
+
+        self.assertEqual(current.status, JobStatus.CANCELLED)
+        self.assertFalse(self.dispatcher.cancelled_jobs)
+        self.assertTrue(
+            self.jobs.command_payload(job.id)["cancel_before_dispatch"]
+        )
+
+    def test_cancel_dispatch_attempt_is_retried_after_command_acceptance(self):
+        job = self._create_queued_command_job(
+            "durable-cancel-attempt-retry", dispatch_started=True
+        )
+        self.dispatcher.cancel_result = False
+
+        current = self.control.cancel_job(self.actor, job.id)
+        self.assertEqual(current.status, JobStatus.QUEUED)
+        self.assertTrue(self.control._has_pending_dispatch_cancellation(job.id))
+        requests = self.jobs.dispatch_cancel_requests()
+        self.assertEqual([(item.id, attempt) for item, attempt in requests], [(job.id, 1)])
+
+        self.dispatcher.cancel_result = True
+        self.control._retry_dispatch_cancel_requests()
+        payload = self.jobs.command_payload(job.id)
+        self.assertTrue(payload["cancel_after_dispatch_accepted"])
+        self.assertEqual(self.jobs.dispatch_cancel_requests(), [])
+
+    def test_late_command_result_notifies_runtime_readiness_observer(self):
+        store = RuntimeReadinessStore(Path(self.temp.name) / "late-readiness.json")
+        store.record_command_result(
+            worker="local",
+            profile="default",
+            runtime="download",
+            succeeded=False,
+            reason_code="COMMAND_FAILED",
+            checked_at="2026-11-06T00:00:00+00:00",
+        )
+        control = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            runtime_readiness_gate=RuntimeReadinessGate(store),
+        )
+        job = Job(
+            id="stalled-command-readiness",
+            kind="download",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={},
+            error={"code": "JOB_STALLED", "message": "worker timeout"},
+            progress_sequence=4,
+        )
+        self.jobs.create(job)
+
+        control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=5,
+                status=JobStatus.RUNNING,
+                event_type="command.completed",
+                result={
+                    "runtime": "download",
+                    "profile": "default",
+                    "returncode": 0,
+                    "output_tail": [],
+                },
+            )
+        )
+
+        self.assertEqual(
+            store.cell("local", "default", "download")["status"],
+            "ready",
+        )
 
     def test_dispatch_failure_is_terminal_after_dispatched_event(self):
         control = ControlPlane(self.jobs, FailingDispatcher(), self.profiles)
@@ -2161,16 +2751,21 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(job.status, JobStatus.FAILED)
         self.assertEqual(self.jobs.events(job.id)[-1].error["code"], "WORKER_INCOMPATIBLE")
 
-    def test_terminate_all_force_cancels_stale_jobs(self):
+    def test_terminate_all_does_not_claim_unconfirmed_workers_stopped(self):
         first = self.control.submit_job(self.actor, "export", {"url": "https://t.me/c/1/2"})
         second = self.control.submit_job(self.actor, "utility", {"utility": "pindah", "folders": ["/workspace/folder"]})
         self.dispatcher.cancel_result = False
 
         result = self.control.terminate_active_jobs(self.actor)
 
-        self.assertEqual(result, {"total": 2, "interrupted": 0, "force_cancelled": 2})
-        self.assertEqual(self.jobs.get(first.id).status.value, "cancelled")
-        self.assertEqual(self.jobs.get(second.id).status.value, "cancelled")
+        self.assertEqual(result, {
+            "total": 2,
+            "cancel_requested": 0,
+            "cancelled_queued": 0,
+            "not_confirmed": 2,
+        })
+        self.assertEqual(self.jobs.get(first.id).status.value, "dispatched")
+        self.assertEqual(self.jobs.get(second.id).status.value, "dispatched")
 
     def test_terminate_quick_mode_filter_does_not_touch_normal_export(self):
         self.authorize_quick_mode_storage()
@@ -2189,6 +2784,8 @@ class ControlPlaneTests(unittest.TestCase):
         )
 
         self.assertEqual(result["total"], 1)
+        # The normal export owns the lane, so Quick Mode is still queued and
+        # can be cancelled locally without asking the worker to stop anything.
         self.assertEqual(self.jobs.get(quick.id).status.value, "cancelled")
         self.assertEqual(self.jobs.get(normal.id).status.value, "dispatched")
 

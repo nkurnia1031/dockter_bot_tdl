@@ -3374,6 +3374,267 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(response.json()["worker"], "remote-1")
         self.assertEqual(response.json()["profile"], "default")
 
+    def test_artifact_delete_keeps_catalog_until_worker_confirms_file_outcome(self):
+        headers = self.login()
+        artifact = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="pending-delete.json",
+            artifact_key="pending-delete.json",
+            status="pending",
+        )
+
+        response = self.client.post(
+            f"/api/v1/downloads/artifacts/{artifact['id']}/delete-file",
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.export_catalog.get(artifact["id"])["status"], "pending")
+        delete_job = self.jobs.get(response.json()["id"])
+        self.control._apply_event_side_effects(
+            delete_job,
+            JobEvent(
+                job_id=delete_job.id,
+                sequence=1,
+                status=JobStatus.RUNNING,
+                event_type="artifact.delete.failed",
+                result={"artifact_key": "pending-delete.json"},
+            ),
+        )
+        self.assertEqual(self.export_catalog.get(artifact["id"])["status"], "pending")
+
+        self.control._apply_event_side_effects(
+            delete_job,
+            JobEvent(
+                job_id=delete_job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="artifact.delete.completed",
+                result={"artifact_key": "pending-delete.json"},
+            ),
+        )
+        deleted = self.export_catalog.get(artifact["id"])
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertFalse(deleted["available"])
+
+    def test_duplicate_persisted_worker_event_replays_catalog_side_effect(self):
+        headers = self.login()
+        artifact = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="replay-delete.json",
+            artifact_key="replay-delete.json",
+            status="pending",
+        )
+        response = self.client.post(
+            f"/api/v1/downloads/artifacts/{artifact['id']}/delete-file",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        job = self.jobs.get(response.json()["id"])
+        self.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=job.progress_sequence + 1,
+                status=JobStatus.RUNNING,
+                event_type="running",
+            )
+        )
+        job = self.jobs.get(job.id)
+        event = JobEvent(
+            job_id=job.id,
+            sequence=job.progress_sequence + 1,
+            status=JobStatus.RUNNING,
+            event_type="artifact.delete.completed",
+            result={"artifact_key": "replay-delete.json"},
+        )
+
+        # Simulate the API process stopping after its event transaction commits
+        # but before catalog effects are applied.
+        self.jobs.append_event(event)
+        self.assertEqual(self.export_catalog.get(artifact["id"])["status"], "pending")
+
+        self.control.append_worker_event(event)
+
+        deleted = self.export_catalog.get(artifact["id"])
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertFalse(deleted["available"])
+
+    def test_duplicate_persisted_terminal_event_replays_catalog_side_effect(self):
+        headers = self.login()
+        artifact = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="terminal-replay-delete.json",
+            artifact_key="terminal-replay-delete.json",
+            status="pending",
+        )
+        response = self.client.post(
+            f"/api/v1/downloads/artifacts/{artifact['id']}/delete-file",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        job = self.jobs.get(response.json()["id"])
+        self.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=job.progress_sequence + 1,
+                status=JobStatus.RUNNING,
+                event_type="running",
+            )
+        )
+        job = self.jobs.get(job.id)
+        event = JobEvent(
+            job_id=job.id,
+            sequence=job.progress_sequence + 1,
+            status=JobStatus.SUCCEEDED,
+            event_type="completed",
+            result={"value": {"deleted": ["terminal-replay-delete.json"]}},
+        )
+
+        # Simulate a crash after the terminal event commits but before its
+        # outcome reaches the catalog.
+        self.jobs.append_event(event)
+        self.assertEqual(self.export_catalog.get(artifact["id"])["status"], "pending")
+
+        replayed = self.control.append_worker_event(event)
+
+        self.assertEqual(replayed.status, JobStatus.SUCCEEDED)
+        deleted = self.export_catalog.get(artifact["id"])
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertFalse(deleted["available"])
+
+    def test_late_worker_outcomes_after_stall_update_catalog_and_are_retained(self):
+        headers = self.login()
+        artifact = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="late-delete.json",
+            artifact_key="late-delete.json",
+            status="pending",
+        )
+        summary_only_artifact = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="late-summary-delete.json",
+            artifact_key="late-summary-delete.json",
+            status="pending",
+        )
+        response = self.client.post(
+            f"/api/v1/downloads/artifacts/{artifact['id']}/delete-file",
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        job = self.jobs.get(response.json()["id"])
+        self.jobs.append_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=job.progress_sequence + 1,
+                status=JobStatus.FAILED,
+                event_type="backend_stall_unconfirmed",
+                progress={"outcome_uncertain": True, "reconciliation_required": True},
+                error={"code": "JOB_STALLED", "message": "Worker tidak merespons."},
+            )
+        )
+        late_outcome = JobEvent(
+            job_id=job.id,
+            sequence=job.progress_sequence + 10,
+            status=JobStatus.RUNNING,
+            event_type="artifact.delete.completed",
+            result={"artifact_key": "late-delete.json", "password": "secret"},
+        )
+
+        late = self.control.append_worker_event(late_outcome)
+        deleted = self.export_catalog.get(artifact["id"])
+        self.assertEqual(late.status, JobStatus.FAILED)
+        self.assertEqual(deleted["status"], "deleted")
+        self.assertFalse(deleted["available"])
+        self.assertEqual(len(late.result["late_worker_events"]), 1)
+        self.assertEqual(
+            late.result["late_worker_events"][0]["result"]["password"], "***"
+        )
+
+        # An outbox retry replays the idempotent catalog effect without
+        # duplicating the saved reconciliation evidence.
+        retried = self.control.append_worker_event(late_outcome)
+        self.assertEqual(len(retried.result["late_worker_events"]), 1)
+
+        terminal = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=job.progress_sequence + 11,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+                result={
+                    "value": {
+                        "deleted": ["late-delete.json", "late-summary-delete.json"]
+                    }
+                },
+            )
+        )
+        self.assertEqual(terminal.status, JobStatus.FAILED)
+        self.assertEqual(
+            self.export_catalog.get(summary_only_artifact["id"])["status"],
+            "deleted",
+        )
+        self.assertEqual(
+            terminal.result["late_worker_terminal"]["result"]["value"]["deleted"],
+            ["late-delete.json", "late-summary-delete.json"],
+        )
+
+    def test_clear_failed_artifact_events_update_catalog(self):
+        deleted = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="failed-deleted.json",
+            artifact_key="failed-deleted.json",
+            status="failed",
+        )
+        missing = self.export_catalog.upsert(
+            profile="default",
+            worker="local",
+            filename="failed-missing.json",
+            artifact_key="failed-missing.json",
+            status="failed",
+        )
+        job = Job(
+            id="clear-failed-catalog-job",
+            kind="download_clear_failed",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.RUNNING,
+            payload={},
+        )
+        self.jobs.create(job)
+
+        self.control._apply_event_side_effects(
+            job,
+            JobEvent(
+                job_id=job.id,
+                sequence=1,
+                status=JobStatus.RUNNING,
+                event_type="artifact.clear_failed.deleted",
+                result={"artifact_key": "failed-deleted.json"},
+            ),
+        )
+        self.control._apply_event_side_effects(
+            job,
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="artifact.clear_failed.missing",
+                result={"artifact_key": "failed-missing.json"},
+            ),
+        )
+
+        self.assertEqual(self.export_catalog.get(deleted["id"])["status"], "deleted")
+        self.assertFalse(self.export_catalog.get(deleted["id"])["available"])
+        self.assertEqual(self.export_catalog.get(missing["id"])["status"], "deleted")
+        self.assertFalse(self.export_catalog.get(missing["id"])["available"])
+
     def test_download_artifact_list_can_filter_worker_and_availability(self):
         headers = self.login()
         self.export_catalog.upsert(
@@ -4711,7 +4972,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(command["payload"]["tdl_access_target"], "-1009876543210")
         self.assertEqual(command["payload"]["start_timestamp"], int(created_at.timestamp()))
 
-    def test_terminate_all_active_jobs_endpoint_handles_stale_jobs(self):
+    def test_terminate_all_active_jobs_endpoint_reports_unconfirmed_worker(self):
         headers = self.login()
         created = self.client.post(
             "/api/v1/exports",
@@ -4726,10 +4987,11 @@ class BackendApiTests(unittest.TestCase):
         )
 
         self.assertEqual(terminated.status_code, 200)
-        self.assertEqual(terminated.json()["force_cancelled"], 1)
+        self.assertEqual(terminated.json()["not_confirmed"], 1)
+        self.assertEqual(terminated.json()["cancel_requested"], 0)
         self.assertEqual(
             self.client.get(f"/api/v1/jobs/{created.json()['id']}", headers=headers).json()["status"],
-            "cancelled",
+            "dispatched",
         )
 
     def test_quick_manager_filters_terminate_and_retries_without_exposing_password(self):
@@ -5229,6 +5491,61 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn(secret_text, public_job.text + public_events.text)
         self.assertNotIn(artifact_ref, public_job.text + public_events.text)
         self.assertNotIn("chat_id", (public_job.text + public_events.text).lower())
+
+    def test_tts_retry_refuses_unconfirmed_delivery_to_prevent_duplicate_audio(self):
+        self.dispatcher.tts_ready = True
+        self.jobs.set_tts_telegram_ready(True)
+        headers = self.login()
+        self.seed_tdl_access(worker="local", purpose="tts")
+        created = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=headers,
+            json={"title": "Bab", "text": "Isi audio"},
+        )
+        self.assertEqual(created.status_code, 200, created.text)
+        job_id = created.json()["id"]
+        self.jobs.create_tts_deliveries(
+            job_id,
+            "local",
+            "Bab",
+            [{"artifact_ref": "c" * 48, "part_index": 1, "total_parts": 1, "byte_size": 512}],
+        )
+        claimed = self.jobs.claim_tts_deliveries(
+            limit=1, worker="local", job_id=job_id, include_artifact_ref=True
+        )
+        self.assertEqual(len(claimed), 1)
+        current = self.jobs.get(job_id)
+        sequence = max(
+            current.progress_sequence,
+            max((event.sequence for event in self.jobs.events(job_id)), default=0),
+        ) + 1
+        self.jobs.append_event(JobEvent(
+            job_id=job_id,
+            sequence=sequence,
+            status=JobStatus.FAILED,
+            event_type="backend_stall_unconfirmed",
+            progress={
+                "phase": "telegram_delivery",
+                "outcome_uncertain": True,
+                "reconciliation_required": True,
+            },
+            error={"code": "JOB_STALLED", "message": "Worker tidak merespons."},
+        ))
+        dispatch_count = len(self.dispatcher.commands)
+
+        response = self.client.post(
+            f"/api/v1/tts/jobs/{job_id}/retry", headers=headers
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            response.json()["error"]["code"],
+            "TTS_DELIVERY_RECONCILIATION_REQUIRED",
+        )
+        self.assertEqual(len(self.dispatcher.commands), dispatch_count)
+        self.assertEqual(
+            self.jobs.get_tts_delivery(claimed[0]["id"])["status"], "claimed"
+        )
 
     def test_tts_requires_chat_but_does_not_gate_on_scan_readiness(self):
         headers = self.login()

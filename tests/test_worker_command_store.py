@@ -67,6 +67,22 @@ class WorkerCommandStoreTests(unittest.TestCase):
             self.store.accept(same_attempt)
         self.assertEqual(conflict.exception.code, "COMMAND_ATTEMPT_CONFLICT")
 
+    def test_cancel_request_is_scoped_to_the_requested_attempt(self):
+        first = job_envelope("command-attempt-1", "retrying-job", attempt=1)
+        self.store.accept(first)
+        self.store.finish("command-attempt-1", "cancelled")
+        second = job_envelope("command-attempt-2", "retrying-job", attempt=2)
+        self.store.accept(second)
+
+        self.assertIsNone(
+            self.store.request_cancel_by_job("retrying-job", attempt=1)
+        )
+        self.assertEqual(self.store.get("command-attempt-2")["status"], "accepted")
+
+        cancelled = self.store.request_cancel_by_job("retrying-job", attempt=2)
+        self.assertEqual(cancelled["attempt"], 2)
+        self.assertEqual(cancelled["status"], "cancelled")
+
     def test_jobless_operation_command_is_supported(self):
         envelope = {
             "command_id": "operation-command",
@@ -95,6 +111,76 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertEqual(recovered.get("claimed-command")["status"], "accepted")
         self.assertEqual(recovered.get("running-command")["status"], "needs_reconciliation")
         self.assertFalse(recovered.get("running-command")["accepted"])
+
+    def test_restart_recovery_lists_one_safe_job_record_and_is_idempotent(self):
+        envelope = job_envelope("utility-command", "utility-job")
+        envelope["job"]["kind"] = "utility"
+        envelope["job"]["payload"] = {"utility": "compress", "password": "must-not-leak"}
+        self.store.accept(envelope)
+        self.store.set_status("utility-command", "running", only_from=("accepted",))
+        self.store.append_event(
+            "utility-job",
+            {
+                "status": "running",
+                "event_type": "progress.snapshot",
+                "progress": {"phase": "compressing"},
+                "command_id": "utility-command",
+                "attempt": 1,
+                "dispatch_token": "dispatch-secret",
+            },
+            transient=False,
+        )
+
+        self.store.recover_startup()
+        commands = self.store.list_recovery_commands()
+
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(commands[0]["kind"], "utility")
+        self.assertEqual(commands[0]["job_id"], "utility-job")
+        self.assertEqual(commands[0]["event_sequence_start"], 3)
+        self.assertNotIn("payload", commands[0])
+        self.assertTrue(self.store.mark_recovery_reported("utility-command"))
+        self.assertEqual(self.store.list_recovery_commands(), [])
+
+    def test_recovery_event_batch_and_report_fence_commit_atomically_once(self):
+        envelope = job_envelope("recovery-command", "recovery-job")
+        envelope["job"]["kind"] = "storage_upload"
+        self.store.accept(envelope)
+        self.store.set_status("recovery-command", "running", only_from=("accepted",))
+        self.store.recover_startup()
+        self.store.seed_sequence("recovery-job", 10)
+
+        payloads = [
+            {"status": "running", "event_type": "storage.recovery_batch", "transient": False},
+            {"status": "failed", "event_type": "storage.batch_interrupted", "transient": False},
+        ]
+        sequences = self.store.append_recovery_events_once(
+            "recovery-command",
+            "recovery-job",
+            payloads,
+            reported_phase="reconciliation_reported",
+        )
+        replay = self.store.append_recovery_events_once(
+            "recovery-command",
+            "recovery-job",
+            payloads,
+            reported_phase="reconciliation_reported",
+        )
+
+        self.assertEqual(sequences, [11, 12])
+        self.assertIsNone(replay)
+        self.assertEqual(self.store.list_storage_reconciliation_commands(), [])
+        with self.store._db() as db:
+            events = db.execute(
+                "SELECT sequence,event_json FROM worker_event_outbox WHERE job_id=? ORDER BY sequence",
+                ("recovery-job",),
+            ).fetchall()
+            command = db.execute(
+                "SELECT phase FROM worker_commands WHERE command_id=?",
+                ("recovery-command",),
+            ).fetchone()
+        self.assertEqual([row["sequence"] for row in events], [11, 12])
+        self.assertEqual(command["phase"], "reconciliation_reported")
 
     def test_startup_resumes_tts_synthesis_checkpoint_but_not_delivery(self):
         synthesis = job_envelope("tts-synthesis", "job-tts-synthesis")
@@ -380,6 +466,33 @@ class WorkerCommandStoreTests(unittest.TestCase):
 
         self.assertCountEqual(delivered, job_kinds)
         self.assertEqual(self.store.pending_event_count(), 0)
+
+    def test_outbox_yields_to_other_jobs_while_one_job_has_a_large_backlog(self):
+        for index in range(20):
+            self.store.append_event(
+                "large-recovery-job",
+                {"event_type": f"recovery-{index}", "index": index},
+                transient=False,
+            )
+        self.store.append_event(
+            "interactive-job",
+            {"event_type": "completed", "status": "succeeded"},
+            transient=False,
+        )
+
+        first = self.store.claim_event()
+        self.assertEqual(first[1], "large-recovery-job")
+        self.assertTrue(
+            self.store.acknowledge_event(first[0], first[4], accepted=True)
+        )
+        second = self.store.claim_event()
+
+        self.assertEqual(second[1], "interactive-job")
+        self.assertTrue(
+            self.store.acknowledge_event(second[0], second[4], accepted=True)
+        )
+        remaining = self.store.claim_event()
+        self.assertEqual(remaining[1], "large-recovery-job")
 
     def test_event_outbox_schema_migrates_legacy_sending_rows(self):
         legacy_path = Path(self.temp.name) / "legacy-worker-journal.sqlite3"

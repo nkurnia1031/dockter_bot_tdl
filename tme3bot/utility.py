@@ -21,6 +21,7 @@ from tme3bot.tdl import (
     ProcessStalledError,
     notify_command_completed,
     notify_command_started,
+    preflight_command,
     pause_process_group,
     resume_process_group,
 )
@@ -449,6 +450,7 @@ class UtilityRunner:
         self._pause_requested = False
         self._paused = False
         self._current_process: subprocess.Popen[str] | None = None
+        self._current_owner: str | None = None
         self._folder_index: int | None = None
         self._folder_total: int | None = None
 
@@ -479,9 +481,12 @@ class UtilityRunner:
             while self._pause_requested:
                 self._pause_condition.wait(timeout=1.0)
 
-    def cancel_current(self) -> bool:
+    def cancel_current(self, owner_job_id: str | None = None) -> bool:
         with self._process_lock:
             process = self._current_process
+            current_owner = self._current_owner
+        if owner_job_id is not None and current_owner != str(owner_job_id):
+            return False
         if process is None or process.poll() is not None:
             return False
         if os.name != "nt":
@@ -924,15 +929,23 @@ class UtilityRunner:
             env["UTILITY_COMPRESS_SIZE"] = settings.get("compress_size", "4g")
             env["UTILITY_COMPRESS_PASSWORD"] = settings.get("compress_password", "")
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(cwd),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=env,
-                start_new_session=os.name != "nt",
-            )
+            # cancel_current reads the process under this lock. Serialize its
+            # final preflight with Popen and owner registration so a cancel
+            # cannot be accepted while the subprocess is invisible to it.
+            with self._process_lock:
+                preflight_command(self.command_callback)
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(cwd),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env,
+                    start_new_session=os.name != "nt",
+                )
+                owner_job_id = str(getattr(self.command_callback, "job_id", "") or "") or None
+                self._current_process = process
+                self._current_owner = owner_job_id
         except OSError as exc:
             if self.command_callback is not None:
                 notify_command_completed(
@@ -948,8 +961,6 @@ class UtilityRunner:
                 "Worker tidak dapat memulai proses Utility.",
             ) from exc
         command_id = notify_command_started(self.command_callback, command, prefix)
-        with self._process_lock:
-            self._current_process = process
         assert process.stdout is not None
         lines: list[str] = []
         marker: dict[str, object] = {}
@@ -1066,6 +1077,7 @@ class UtilityRunner:
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
+                    self._current_owner = None
                     self._paused = False
                     self._pause_requested = False
                     self._pause_condition.notify_all()

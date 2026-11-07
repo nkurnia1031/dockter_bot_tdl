@@ -217,16 +217,24 @@
   }
   async function terminate() {
     try {
+      let response: Record<string, any> | null = null;
       if (confirmTarget === 'all') {
         const params = new URLSearchParams();
         if (scope === 'global') params.set('scope', 'global');
         if (kind) params.set('kind', kind);
         if (quickMode) { params.set('kind', 'export'); params.set('quick_mode', 'true'); }
         const query = params.toString();
-        await post(`/jobs/terminate-active${query ? `?${query}` : ''}`);
+        response = await post(`/jobs/terminate-active${query ? `?${query}` : ''}`);
       }
-      else if (selected) await post(`/jobs/${selected.id}/cancel`);
-      toastMessage = confirmTarget === 'all' ? 'Terminate dikirim ke semua job aktif.' : 'Terminate dikirim ke job.';
+      else if (selected) response = await post(`/jobs/${selected.id}/cancel`);
+      if (confirmTarget === 'all') {
+        const accepted = Number(response?.cancel_requested || 0);
+        const queued = Number(response?.cancelled_queued || 0);
+        const unknown = Number(response?.not_confirmed || 0);
+        toastMessage = `${accepted} permintaan diterima, ${queued} job antrean dibatalkan${unknown ? `, ${unknown} belum dikonfirmasi worker` : ''}.`;
+      } else {
+        toastMessage = 'Permintaan berhenti diterima; menunggu konfirmasi worker.';
+      }
       toastOpen = true; confirmOpen = false; await load();
     } catch (cause) { error = cause instanceof Error ? cause.message : 'Job gagal dihentikan.'; }
   }

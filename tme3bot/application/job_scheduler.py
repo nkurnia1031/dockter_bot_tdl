@@ -204,6 +204,17 @@ def build_execution_plan(
         lane = "safelink-resolver"
     elif kind in {"download", "download_clear_failed"}:
         keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
+        artifact_lock = f"worker:{worker}:artifact-files"
+        if kind == "download_clear_failed":
+            # This command scans/removes every failed JSON, including files
+            # absent from the catalog, so fence the complete local tree.
+            keys.add(f"exclusive:{artifact_lock}")
+        else:
+            keys.add(f"shared:{artifact_lock}")
+        artifact_keys = payload.get("artifact_keys") or payload.get("artifact_key") or []
+        if not isinstance(artifact_keys, (list, tuple, set)):
+            artifact_keys = [artifact_keys]
+        keys.update(f"worker:{worker}:artifact:{item}" for item in artifact_keys)
         lane = "tdl-download"
     elif kind == "backup_node":
         # Backup currently snapshots all profiles and uploads through the
@@ -243,7 +254,20 @@ def build_execution_plan(
             keys.add(f"worker:{worker}:workspace")
     elif kind.startswith("artifact_"):
         lane = "artifact"
-        artifact_ids = payload.get("artifact_ids") or payload.get("artifact_id") or []
+        artifact_lock = f"worker:{worker}:artifact-files"
+        if kind == "artifact_inventory":
+            # Inventory may delete media-less JSON and mark unseen rows
+            # unavailable, so it must fence every per-file operation.
+            keys.add(f"exclusive:{artifact_lock}")
+        else:
+            keys.add(f"shared:{artifact_lock}")
+        artifact_ids = (
+            payload.get("artifact_keys")
+            or payload.get("artifact_key")
+            or payload.get("artifact_ids")
+            or payload.get("artifact_id")
+            or []
+        )
         if not isinstance(artifact_ids, (list, tuple, set)):
             artifact_ids = [artifact_ids]
         keys.update(f"worker:{worker}:artifact:{item}" for item in artifact_ids)

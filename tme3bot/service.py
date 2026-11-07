@@ -362,11 +362,22 @@ class BatchDownloadService:
         )
         return batch.results[0]
 
-    def clear_failed_exports(self) -> int:
+    def clear_failed_exports(self, on_item=None) -> int:
         failed_files = sorted(self.config.export_failed_dir.glob("*.json"))
+        deleted = 0
         for path in failed_files:
-            path.unlink()
-        return len(failed_files)
+            if on_item is not None:
+                on_item("started", path.name)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                if on_item is not None:
+                    on_item("missing", path.name)
+                continue
+            deleted += 1
+            if on_item is not None:
+                on_item("deleted", path.name)
+        return deleted
 
     def _download_files(
         self,

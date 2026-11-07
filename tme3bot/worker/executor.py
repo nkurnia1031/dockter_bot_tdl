@@ -136,6 +136,28 @@ from .executor_safelink import SafelinkExecutorMixin
 from .executor_tts import TtsExecutorMixin
 from .executor_utility import UtilityExecutorMixin
 from .executor_workspace import WorkspaceExecutorMixin
+from .job_lifecycle import WORKER_JOB_LIFECYCLE, lifecycle_policy
+
+
+WORKER_JOB_HANDLER_METHODS = {
+    "export": "_export",
+    "leave": "_leave",
+    "download": "_download",
+    "download_clear_failed": "_download_clear_failed",
+    "artifact_inventory": "_artifact_inventory",
+    "artifact_delete": "_artifact_delete",
+    "utility": "_utility",
+    "storage_upload": "_storage_upload",
+    "storage_download": "_storage_download",
+    "storage_rclone_manage": "_storage_rclone_manage",
+    "storage_reconcile": "_storage_reconcile",
+    "storage_sync": "_storage_sync",
+    "backup_node": "_backup",
+    "backup_verify": "_backup_verify",
+    "tts": "_tts",
+    "tdl_access_verify": "_tdl_access_verify",
+    "safelink_resolve": "_safelink_resolve",
+}
 
 class WorkerJobExecutor(
     QuickModeExecutorMixin,
@@ -195,6 +217,7 @@ class WorkerJobExecutor(
         self._active_commands: dict[str, dict[str, Any]] = {}
         self._utility_runners: dict[str, UtilityRunner] = {}
         self._rclone_runners: dict[str, RcloneRunner] = {}
+        self._backup_services: dict[str, BackupService] = {}
         self._quick_thumbnail_builders: dict[str, QuickThumbnailBuilder] = {}
         self._quick_export_clients: dict[str, Any] = {}
         self._quick_download_clients: dict[str, Any] = {}
@@ -203,6 +226,9 @@ class WorkerJobExecutor(
         self._quick_delete_active: set[str] = set()
         self._quick_stage_jobs: dict[str, str] = {}
         self._cancel_requested: set[str] = set()
+        self._cancel_observed: set[str] = set()
+        self._cancel_confirmed: set[str] = set()
+        self._finalizing: set[str] = set()
         self._rclone_storage_lock = threading.RLock()
         self._pause_events: dict[str, threading.Event] = {}
         self._paused_pending_ids: set[str] = set()
@@ -273,6 +299,175 @@ class WorkerJobExecutor(
         self.publisher.start_sender()
         self.command_runner.start()
         self._publish_storage_upload_recoveries()
+        self._publish_command_recoveries()
+
+    def _publish_command_recoveries(self) -> None:
+        """Report interrupted durable commands without replaying external effects."""
+        store = getattr(self, "command_store", None)
+        publisher = getattr(self, "publisher", None)
+        list_commands = getattr(store, "list_recovery_commands", None)
+        if not callable(list_commands) or publisher is None:
+            return
+        for command in list_commands():
+            command_id = str(command.get("command_id") or "")
+            job_id = str(command.get("job_id") or "")
+            kind = str(command.get("kind") or "unknown")
+            if not command_id or not job_id:
+                continue
+            try:
+                policy = lifecycle_policy(kind)
+                publisher.begin(job_id, command.get("event_sequence_start"))
+                publisher.bind_command(
+                    job_id,
+                    command_id,
+                    int(command.get("attempt") or 1),
+                    str(command.get("dispatch_token") or ""),
+                )
+                worker = str(command.get("worker") or "")
+                if worker:
+                    publisher.bind_job_worker(job_id, worker)
+                reconcile = policy.restart_policy == "report_reconciliation"
+                checkpoint = command.get("checkpoint")
+                checkpoint = checkpoint if isinstance(checkpoint, dict) else {}
+                checkpoint_progress = checkpoint.get("progress")
+                checkpoint_progress = (
+                    checkpoint_progress if isinstance(checkpoint_progress, dict) else {}
+                )
+                previous_phase = str(
+                    checkpoint_progress.get("phase")
+                    or command.get("phase")
+                    or "unknown"
+                )
+                recovery_events: list[dict[str, Any]] = []
+                restart_result = {
+                    "value": {
+                        "outcome": "needs_reconciliation" if reconcile else "failed",
+                        "interrupted_by_worker_restart": True,
+                        "kind": kind,
+                    }
+                }
+                if kind == "artifact_delete":
+                    delete_items = self._reconcile_interrupted_artifact_deletes(command)
+                    restart_result["value"]["artifact_delete_recovery"] = {
+                        "items": delete_items,
+                    }
+                    recovery_events.extend(
+                        {
+                            "status": "running",
+                            "event_type": "artifact.delete.missing",
+                            "result": {"artifact_key": item["artifact_key"]},
+                        }
+                        for item in delete_items
+                        if item["status"] == "missing"
+                    )
+                recovery_event = {
+                    "status": "failed",
+                    "event_type": "worker.restart_interrupted",
+                    "progress": {
+                        "phase": "restart_interrupted",
+                        "finished_at": utc_now().isoformat(),
+                        "previous_phase": previous_phase,
+                        "restart_recovery": {
+                            "status": "needs_reconciliation" if reconcile else "failed",
+                            "policy": policy.restart_policy,
+                            "worker_confirmed_stopped": False,
+                            "external_outcome_may_be_ambiguous": reconcile,
+                        },
+                    },
+                    "result": restart_result,
+                    "error": {
+                        "code": (
+                            "WORKER_RESTART_RECONCILIATION_REQUIRED"
+                            if reconcile
+                            else "WORKER_RESTART_INTERRUPTED"
+                        ),
+                        "message": (
+                            "Worker dimulai ulang saat job berjalan. Efek eksternal mungkin sudah terjadi; "
+                            "job tidak dijalankan ulang otomatis dan perlu diperiksa."
+                            if reconcile
+                            else "Worker dimulai ulang saat job berjalan. Job ditandai gagal dan tidak dijalankan ulang otomatis."
+                        ),
+                    },
+                }
+                recovery_events.append(recovery_event)
+                append_recovery_events = getattr(
+                    store, "append_recovery_events_once", None
+                )
+                emit_recovery_events = getattr(
+                    publisher, "emit_recovery_events_once", None
+                )
+                if callable(append_recovery_events) and callable(emit_recovery_events):
+                    if not emit_recovery_events(
+                        job_id,
+                        command_id,
+                        reported_phase="recovery_reported",
+                        events=recovery_events,
+                    ):
+                        continue
+                else:
+                    for event in recovery_events:
+                        publisher.emit(
+                            job_id,
+                            event["status"],
+                            event["event_type"],
+                            progress=event.get("progress"),
+                            result=event.get("result"),
+                            error=event.get("error"),
+                        )
+                    store.mark_recovery_reported(command_id)
+            except Exception:
+                LOGGER.exception(
+                    "Could not report interrupted worker command %s", command_id
+                )
+
+    def _reconcile_interrupted_artifact_deletes(
+        self, command: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        """Check only deletes that were durably started before worker restart."""
+        profile = str(command.get("profile") or "").strip()
+        keys = command.get("started_artifact_keys")
+        if not profile or not isinstance(keys, list):
+            return []
+        try:
+            runtime = self.profile_manager.runtime(profile)
+            roots = (
+                Path(runtime.config.export_pending_dir),
+                Path(runtime.config.export_failed_dir),
+            )
+        except Exception:
+            return [
+                {"artifact_key": str(key), "status": "unverified"}
+                for key in keys
+                if isinstance(key, str) and key
+            ]
+
+        outcomes: list[dict[str, str]] = []
+        for raw_key in keys:
+            key = str(raw_key or "")
+            if not key or Path(key).name != key or not key.lower().endswith(".json"):
+                outcomes.append({"artifact_key": key, "status": "unverified"})
+                continue
+            present = False
+            unverified = False
+            for root in roots:
+                try:
+                    resolved_root = root.resolve()
+                    candidate = (resolved_root / key).resolve(strict=True)
+                    candidate.relative_to(resolved_root)
+                    candidate.stat()
+                    present = True
+                    break
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError):
+                    unverified = True
+            outcomes.append(
+                {
+                    "artifact_key": key,
+                    "status": "present" if present else "unverified" if unverified else "missing",
+                }
+            )
+        return outcomes
 
     def _publish_storage_upload_recoveries(self) -> None:
         """Report durable per-file states for Storage commands interrupted by a restart."""
@@ -288,6 +483,7 @@ class WorkerJobExecutor(
                 continue
             try:
                 worker = str(command.get("worker") or "")
+                publisher.begin(job_id, command.get("event_sequence_start"))
                 publisher.bind_command(
                     job_id,
                     command_id,
@@ -348,22 +544,22 @@ class WorkerJobExecutor(
                     }
                     for item in raw_items
                 ]
-                for item in raw_items:
-                    uploaded_item = item.get("uploaded_item")
-                    if item.get("status") == "succeeded" and isinstance(uploaded_item, dict):
-                        publisher.emit(
-                            job_id,
-                            "running",
-                            "storage.item_uploaded",
-                            result={"item": uploaded_item},
-                        )
-                    elif item.get("status") == "skipped" and isinstance(uploaded_item, dict):
-                        publisher.emit(
-                            job_id,
-                            "running",
-                            "storage.item_skipped",
-                            result={"item": uploaded_item},
-                        )
+                uploaded_items = [
+                    item["uploaded_item"]
+                    for item in raw_items
+                    if item.get("status") == "succeeded"
+                    and isinstance(item.get("uploaded_item"), dict)
+                ]
+                # Bounded recovery batches carry catalog side effects; they
+                # are inserted atomically with the terminal event/report fence.
+                recovery_events = [
+                    {
+                        "status": "running",
+                        "event_type": "storage.recovery_batch",
+                        "result": {"items": uploaded_items[offset : offset + 100]},
+                    }
+                    for offset in range(0, len(uploaded_items), 100)
+                ]
                 succeeded = sum(item.get("status") == "succeeded" for item in items)
                 skipped = sum(item.get("status") == "skipped" for item in items)
                 incomplete = any(
@@ -413,11 +609,10 @@ class WorkerJobExecutor(
                     "retryable": retryable,
                     "interrupted": True,
                 }
-                publisher.emit(
-                    job_id,
-                    event_status,
-                    "storage.batch_interrupted",
-                    progress={
+                recovery_events.append({
+                    "status": event_status,
+                    "event_type": "storage.batch_interrupted",
+                    "progress": {
                         "phase": outcome,
                         "message": message,
                         "overall": {"current": succeeded + skipped, "total": len(items), "unit": "files"},
@@ -431,10 +626,34 @@ class WorkerJobExecutor(
                         },
                         "indeterminate": False,
                     },
-                    result={"value": result},
-                    error=error,
+                    "result": {"value": result},
+                    "error": error,
+                })
+                append_recovery_events = getattr(
+                    store, "append_recovery_events_once", None
                 )
-                store.mark_storage_reconciliation_reported(command_id)
+                emit_recovery_events = getattr(
+                    publisher, "emit_recovery_events_once", None
+                )
+                if callable(append_recovery_events) and callable(emit_recovery_events):
+                    if not emit_recovery_events(
+                        job_id,
+                        command_id,
+                        reported_phase="reconciliation_reported",
+                        events=recovery_events,
+                    ):
+                        continue
+                else:
+                    for event in recovery_events:
+                        publisher.emit(
+                            job_id,
+                            event["status"],
+                            event["event_type"],
+                            progress=event.get("progress"),
+                            result=event.get("result"),
+                            error=event.get("error"),
+                        )
+                    store.mark_storage_reconciliation_reported(command_id)
             except Exception:
                 LOGGER.exception(
                     "Could not report recovered Storage upload command %s", command_id
@@ -1121,19 +1340,71 @@ class WorkerJobExecutor(
             LOGGER.exception("Could not publish queue position for %s", job_id)
         return position
 
-    def cancel(self, job_id: str) -> bool:
+    def cancel(self, job_id: str, *, attempt: int | None = None) -> bool:
         command_store = getattr(self, "command_store", None)
         with getattr(self, "_durable_admission_lock", threading.RLock()):
-            durable_cancel = (
-                command_store.request_cancel_by_job(job_id)
-                if command_store is not None
-                else None
-            )
+            # Serialize cancellation against the finalization boundary. Keep
+            # lock order durable-admission -> executor lock, matching command
+            # admission, so a late cancel cannot mutate durable state after the
+            # handler has completed its external effects.
+            with self._lock:
+                if job_id in getattr(self, "_finalizing", set()):
+                    return False
+                current_active = self._active.get(job_id)
+                if (
+                    current_active is not None
+                    and not lifecycle_policy(current_active[1]).cancel_supported
+                ):
+                    return False
+                if current_active is not None and attempt is not None:
+                    active_command = self._active_commands.get(job_id, {})
+                    try:
+                        active_attempt = max(1, int(active_command.get("attempt") or 1))
+                    except (TypeError, ValueError):
+                        active_attempt = 1
+                    if active_attempt != max(1, int(attempt)):
+                        # Job IDs are stable across retries. A delayed cancel
+                        # for an older attempt must never interrupt the newer
+                        # command currently occupying the executor slot.
+                        return False
+                cancel_kwargs = {
+                    "cancellable_kinds": frozenset(
+                        kind
+                        for kind, policy in WORKER_JOB_LIFECYCLE.items()
+                        if policy.cancel_supported
+                    )
+                }
+                if attempt is not None:
+                    cancel_kwargs["attempt"] = max(1, int(attempt))
+                durable_cancel = (
+                    command_store.request_cancel_by_job(job_id, **cancel_kwargs)
+                    if command_store is not None
+                    else None
+                )
+                if attempt is not None and durable_cancel is None:
+                    # A missing row means this exact durable attempt has not
+                    # reached the worker (or is already terminal). Do not use
+                    # the stable job ID to cancel a newer retry in the local
+                    # queue or clear its paused state.
+                    return False
+                cancel_rejected = bool(
+                    isinstance(durable_cancel, dict)
+                    and durable_cancel.get("cancel_rejected")
+                )
+                if not cancel_rejected and (
+                    current_active is not None
+                    or (
+                        isinstance(durable_cancel, dict)
+                        and durable_cancel.get("status") == "cancelling"
+                    )
+                ):
+                    self._cancel_requested.add(job_id)
         with self._lock:
-            was_paused = job_id in self._pause_events and self._pause_events[job_id].is_set()
+            pause_events = getattr(self, "_pause_events", {})
+            was_paused = job_id in pause_events and pause_events[job_id].is_set()
             if was_paused:
-                self._pause_events[job_id].clear()
-            paused_pending = job_id in self._paused_pending_ids
+                pause_events[job_id].clear()
+            paused_pending = job_id in getattr(self, "_paused_pending_ids", set())
             if paused_pending:
                 self._paused_pending_ids.discard(job_id)
         if paused_pending and self._jobs.cancel_pending(job_id):
@@ -1183,9 +1454,48 @@ class WorkerJobExecutor(
             rclone_runner = self._rclone_runners.get(job_id)
             quick_export_client = self._quick_export_clients.get(job_id)
             quick_download_client = self._quick_download_clients.get(job_id)
+            backup_service = getattr(self, "_backup_services", {}).get(job_id)
         if active is None:
-            return False
+            if durable_cancel is None:
+                return False
+            if durable_cancel.get("cancel_rejected"):
+                return False
+            if str(durable_cancel.get("status") or "") == "cancelled":
+                binding_method = getattr(command_store, "event_binding", None)
+                binding = binding_method(str(durable_cancel["command_id"])) if callable(binding_method) else None
+                if isinstance(binding, dict):
+                    self.publisher.begin(job_id, binding.get("event_sequence_start"))
+                    self.publisher.bind_command(
+                        job_id,
+                        str(binding["command_id"]),
+                        int(binding["attempt"]),
+                        str(binding["dispatch_token"]),
+                    )
+                    if binding.get("worker"):
+                        self.publisher.bind_job_worker(job_id, str(binding["worker"]))
+                self.publisher.emit(
+                    job_id,
+                    "cancelled",
+                    "cancelled_before_start",
+                    progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
+                    error={
+                        "code": "JOB_TERMINATED",
+                        "message": "Job dibatalkan sebelum mulai dijalankan worker.",
+                    },
+                )
+                command_store.finish(str(durable_cancel["command_id"]), "cancelled")
+                self.publisher.forget(job_id)
+                return True
+            # The command runner and executor share the durable admission lock.
+            # This branch covers the brief handoff after the queue starts but
+            # before the executor registers the active command.
+            with self._lock:
+                self._cancel_requested.add(job_id)
+            return True
         profile, kind = active
+        policy = lifecycle_policy(kind)
+        if not policy.cancel_supported:
+            return False
         with self._lock:
             quick_active = job_id in self._quick_active
             thumbnail_builder = self._quick_thumbnail_builders.get(job_id)
@@ -1200,7 +1510,7 @@ class WorkerJobExecutor(
 
         cancelled = False
 
-        def interrupt(label: str, callback) -> None:
+        def interrupt(label: str, callback, *, owner_aware: bool = False) -> None:
             nonlocal cancelled
             if callback is None:
                 self._write_quick_log_line(
@@ -1208,7 +1518,7 @@ class WorkerJobExecutor(
                 )
                 return
             try:
-                result = bool(callback())
+                result = bool(callback(job_id) if owner_aware else callback())
                 cancelled = result or cancelled
                 self._write_quick_log_line(
                     job_id, f"[cancel] interrupt={label} result={result}"
@@ -1238,37 +1548,67 @@ class WorkerJobExecutor(
             interrupt(
                 "download",
                 getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
+                owner_aware=True,
             )
         elif kind == "storage_download":
             active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
             if isinstance(active_payload, dict) and active_payload.get("provider") == "rclone":
                 if rclone_runner is not None:
-                    interrupt("Storage rclone download", rclone_runner.cancel_current)
+                    interrupt("Storage rclone download", rclone_runner.cancel_current, owner_aware=True)
             else:
                 interrupt(
                     "Storage Telegram download",
                     getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
+                    owner_aware=True,
                 )
         elif kind == "storage_rclone_manage":
             if rclone_runner is not None:
-                interrupt("Storage rclone management", rclone_runner.cancel_current)
-        elif kind in {"export", "backup_node", "backup_verify"}:
+                interrupt("Storage rclone management", rclone_runner.cancel_current, owner_aware=True)
+        elif kind == "backup_node":
+            # Backup upload selects the first runtime from the worker inventory,
+            # not necessarily the profile attached to the gateway job.
+            try:
+                profiles = sorted(self.profile_manager.list_profiles())
+                uploader_profile = profiles[0] if profiles else profile
+                uploader_runtime = self.profile_manager.runtime(uploader_profile)
+            except Exception:
+                uploader_runtime = runtime
+                LOGGER.warning(
+                    "Could not resolve backup uploader runtime for job %s",
+                    job_id,
+                    exc_info=True,
+                )
+            interrupt(
+                "backup archive",
+                getattr(backup_service, "cancel_current", None),
+                owner_aware=True,
+            )
+            interrupt(
+                "backup upload",
+                getattr(getattr(uploader_runtime, "export_tdl_client", None), "interrupt_current", None),
+                owner_aware=True,
+            )
+        elif kind in {"export", "backup_verify"}:
             interrupt(
                 "export",
                 getattr(getattr(runtime, "export_tdl_client", None), "interrupt_current", None),
+                owner_aware=True,
             )
             if quick_active:
                 interrupt(
                     "quick isolated export",
                     getattr(quick_export_client, "interrupt_current", None),
+                    owner_aware=True,
                 )
                 interrupt(
                     "quick isolated download",
                     getattr(quick_download_client, "interrupt_current", None),
+                    owner_aware=True,
                 )
                 interrupt(
                     "quick download",
                     getattr(getattr(runtime, "download_tdl_client", None), "interrupt_current", None),
+                    owner_aware=True,
                 )
                 try:
                     storage_runtime = self.profile_manager.runtime(
@@ -1284,25 +1624,72 @@ class WorkerJobExecutor(
                 interrupt(
                     "quick storage",
                     getattr(getattr(storage_runtime, "export_tdl_client", None), "interrupt_current", None),
+                    owner_aware=True,
                 )
                 if thumbnail_builder is not None:
                     interrupt("quick thumbnail", thumbnail_builder.cancel_current)
                 if utility_runner is not None:
-                    interrupt("quick utility", utility_runner.cancel_current)
+                    interrupt("quick utility", utility_runner.cancel_current, owner_aware=True)
                 if rclone_runner is not None:
-                    interrupt("quick rclone", rclone_runner.cancel_current)
+                    interrupt("quick rclone", rclone_runner.cancel_current, owner_aware=True)
+        elif kind == "tts":
+            active_payload = (
+                active_command.get("payload", {})
+                if isinstance(active_command, dict)
+                else {}
+            )
+            requested_senders = (
+                active_payload.get("_tdl_sender_profiles")
+                if isinstance(active_payload, dict)
+                else None
+            )
+            sender_profiles = (
+                [str(item).strip().lower() for item in requested_senders if str(item).strip()]
+                if isinstance(requested_senders, list)
+                else []
+            )
+            sender_profiles = list(dict.fromkeys([profile, *sender_profiles]))
+            for sender_profile in sender_profiles:
+                try:
+                    sender_runtime = self.profile_manager.runtime(sender_profile)
+                except Exception:
+                    sender_runtime = None
+                interrupt(
+                    f"TTS sender {sender_profile}",
+                    getattr(
+                        getattr(sender_runtime, "export_tdl_client", None),
+                        "interrupt_current",
+                        None,
+                    ),
+                    owner_aware=True,
+                )
         elif kind in {"storage_upload", "storage_reconcile", "storage_sync"}:
             if kind == "storage_upload":
-                try:
-                    storage_runtime = self.profile_manager.runtime(self.storage_profile())
-                except Exception:
-                    storage_runtime = None
-                interrupt(
-                    "storage upload",
-                    getattr(getattr(storage_runtime, "export_tdl_client", None), "interrupt_current", None),
+                active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
+                requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
+                sender_profiles = [
+                    str(item).strip().lower()
+                    for item in requested_senders
+                    if str(item).strip()
+                ] if isinstance(requested_senders, list) else []
+                selected_profile = (
+                    str(active_command.get("profile") or profile).strip().lower()
+                    if isinstance(active_command, dict)
+                    else profile
                 )
+                sender_profiles = list(dict.fromkeys([*sender_profiles, selected_profile]))
+                for sender_profile in sender_profiles:
+                    try:
+                        sender_runtime = self.profile_manager.runtime(sender_profile)
+                    except Exception:
+                        sender_runtime = None
+                    interrupt(
+                        f"Storage upload sender {sender_profile}",
+                        getattr(getattr(sender_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                        owner_aware=True,
+                    )
                 if rclone_runner is not None:
-                    interrupt("storage rclone", rclone_runner.cancel_current)
+                    interrupt("storage rclone", rclone_runner.cancel_current, owner_aware=True)
             elif kind == "storage_sync":
                 try:
                     storage_runtime = self.profile_manager.runtime(profile)
@@ -1311,9 +1698,17 @@ class WorkerJobExecutor(
                 interrupt(
                     "Storage sync",
                     getattr(getattr(storage_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                    owner_aware=True,
                 )
             else:
-                for sender_profile in self.available_storage_profiles():
+                active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
+                requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
+                sender_profiles = (
+                    requested_senders
+                    if isinstance(requested_senders, list) and requested_senders
+                    else self.available_storage_profiles()
+                )
+                for sender_profile in sender_profiles:
                     try:
                         sender_runtime = self.profile_manager.runtime(str(sender_profile))
                     except Exception:
@@ -1321,7 +1716,28 @@ class WorkerJobExecutor(
                     interrupt(
                         f"Storage reconcile {sender_profile}",
                         getattr(getattr(sender_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                        owner_aware=True,
                     )
+        elif kind == "tdl_access_verify":
+            active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
+            purpose = str(active_payload.get("purpose") or "") if isinstance(active_payload, dict) else ""
+            client_name = "upload_tdl_client" if purpose == "storage" else "export_tdl_client"
+            list_profiles = getattr(self.profile_manager, "list_profiles", None)
+            candidate_profiles = list_profiles() if callable(list_profiles) else [profile]
+            for selected_profile in candidate_profiles:
+                try:
+                    selected_runtime = self.profile_manager.runtime(str(selected_profile))
+                except Exception:
+                    selected_runtime = None
+                interrupt(
+                    f"TDL access verify {selected_profile}",
+                    getattr(
+                        getattr(selected_runtime, client_name, None),
+                        "interrupt_current",
+                        None,
+                    ),
+                    owner_aware=True,
+                )
         elif kind == "leave":
             interrupt(
                 "leave",
@@ -1330,15 +1746,40 @@ class WorkerJobExecutor(
                     "interrupt_current",
                     None,
                 ),
+                owner_aware=True,
             )
         elif kind == "utility" and utility_runner is not None:
-            interrupt("utility", utility_runner.cancel_current)
+            interrupt("utility", utility_runner.cancel_current, owner_aware=True)
+        if cancelled:
+            with self._lock:
+                confirmed = getattr(self, "_cancel_confirmed", None)
+                if confirmed is None:
+                    confirmed = set()
+                    self._cancel_confirmed = confirmed
+                confirmed.add(job_id)
         # An active Quick Mode job is cancellable even when its current phase
         # has no subprocess (for example while resolving a Telegram result).
+        try:
+            self.publisher.emit(
+                job_id,
+                "running",
+                "cancel.requested",
+                progress={
+                    "cancel_request": {
+                        "status": "accepted",
+                        "requested_at": utc_now().isoformat(),
+                        "message": "Permintaan diterima; menunggu proses worker berhenti.",
+                    }
+                },
+            )
+        except Exception:
+            LOGGER.warning(
+                "Could not publish accepted cancellation for job %s", job_id, exc_info=True
+            )
         return bool(
             cancelled
             or quick_active
-            or kind in {"export", "backup_node", "backup_verify", "tts", "safelink_resolve", "storage_reconcile"}
+            or policy.cancel_supported
         )
 
     def pause(self, job_id: str) -> bool:
@@ -1366,6 +1807,8 @@ class WorkerJobExecutor(
                         break
                 time.sleep(0.01)
         with self._lock:
+            if target in getattr(self, "_finalizing", set()):
+                return False
             active = self._active.get(target)
             command = self._active_commands.get(target)
             if active is None or command is None:
@@ -1919,6 +2362,11 @@ class WorkerJobExecutor(
             }
         elif kind in {"download", "download_clear_failed"}:
             keys.add(f"profile:{profile}:worker:{worker}:tdl:download")
+            payload = command.get("payload") or {}
+            artifact_keys = payload.get("artifact_keys") or payload.get("artifact_key") or []
+            if not isinstance(artifact_keys, (list, tuple, set)):
+                artifact_keys = [artifact_keys]
+            keys.update(f"worker:{worker}:artifact:{item}" for item in artifact_keys)
         elif kind == "backup_node":
             # Current backup snapshots all profiles and uploads through the
             # export client. Keep this conservative until a dedicated lane is
@@ -1949,7 +2397,13 @@ class WorkerJobExecutor(
                 )
         elif kind.startswith("artifact_"):
             payload = command.get("payload") or {}
-            artifact_ids = payload.get("artifact_ids") or payload.get("artifact_id") or []
+            artifact_ids = (
+                payload.get("artifact_keys")
+                or payload.get("artifact_key")
+                or payload.get("artifact_ids")
+                or payload.get("artifact_id")
+                or []
+            )
             if not isinstance(artifact_ids, (list, tuple, set)):
                 artifact_ids = [artifact_ids]
             keys.update(
@@ -1996,6 +2450,7 @@ class WorkerJobExecutor(
             if durable_status and durable_status["status"] in {"cancelled", "cancelling"}:
                 with self._lock:
                     self._cancel_requested.add(job_id)
+                    self._cancel_observed.add(job_id)
         profile = str(command["profile"])
         kind = str(command["kind"])
         started_at = utc_now().isoformat()
@@ -2015,7 +2470,7 @@ class WorkerJobExecutor(
             self.publisher,
             job_id,
             [value for value in secrets if value],
-            before_command=lambda: self._wait_if_paused(job_id),
+            before_command=lambda: self._before_job_command(job_id),
         )
         self._job_log.job_id = job_id
         self._job_log.secrets = [value for value in secrets if value]
@@ -2054,6 +2509,8 @@ class WorkerJobExecutor(
             heartbeat_thread.start()
             with self._lock:
                 cancelled_before_execute = job_id in self._cancel_requested
+                if cancelled_before_execute:
+                    self._cancel_observed.add(job_id)
             if not cancelled_before_execute:
                 self._require_local_job_session(command)
             if not cancelled_before_execute:
@@ -2073,9 +2530,11 @@ class WorkerJobExecutor(
                     },
                 )
             result = None if cancelled_before_execute else self._execute(command)
-            self._wait_if_paused(job_id)
             with self._lock:
-                cancelled = job_id in self._cancel_requested
+                self._finalizing.add(job_id)
+                cancelled = self._cancellation_was_effective(
+                    job_id, cancelled_before_execute=cancelled_before_execute
+                )
             self._append_job_log("[job terminated]" if cancelled else "[job completed]")
             self._publish_log_snapshot(job_id, snapshot)
             if cancelled:
@@ -2093,13 +2552,21 @@ class WorkerJobExecutor(
                     },
                     **(
                         {"result": {"value": json_value(result)}}
-                        if kind in {"storage_upload", "storage_reconcile", "storage_download", "storage_rclone_manage"} and isinstance(result, dict)
+                        if kind in {
+                            "storage_upload", "storage_reconcile", "storage_download",
+                            "storage_rclone_manage", "artifact_inventory", "artifact_delete",
+                        } and isinstance(result, dict)
                         else {}
                     ),
                     error={"code": "JOB_TERMINATED", "message": self._cancel_error(command)},
                 )
                 command_terminal_status = "cancelled"
             else:
+                artifact_delete_failures = (
+                    result.get("failed", [])
+                    if kind == "artifact_delete" and isinstance(result, dict)
+                    else []
+                )
                 storage_outcome = (
                     str(result.get("outcome") or "")
                     if kind in {"storage_upload", "storage_reconcile", "storage_download", "storage_rclone_manage"} and isinstance(result, dict)
@@ -2110,7 +2577,50 @@ class WorkerJobExecutor(
                     if kind == "utility" and isinstance(result, dict)
                     else ""
                 )
-                if storage_outcome and storage_outcome != "succeeded":
+                if isinstance(artifact_delete_failures, list) and artifact_delete_failures:
+                    deleted = result.get("deleted", []) if isinstance(result, dict) else []
+                    missing = result.get("missing", []) if isinstance(result, dict) else []
+                    completed_count = (
+                        len(deleted) + len(missing)
+                        if isinstance(deleted, list) and isinstance(missing, list)
+                        else 0
+                    )
+                    outcome = "partial_failure" if completed_count else "failed"
+                    message = (
+                        "Sebagian file artifact gagal dihapus; hasil per file tersedia."
+                        if completed_count
+                        else "File artifact gagal dihapus; hasil per file tersedia."
+                    )
+                    total = (
+                        completed_count + len(artifact_delete_failures)
+                        if isinstance(deleted, list) and isinstance(missing, list)
+                        else len(artifact_delete_failures)
+                    )
+                    self.publisher.emit(
+                        job_id,
+                        "failed",
+                        "artifact.delete.batch_completed",
+                        progress={
+                            "phase": outcome,
+                            "message": message,
+                            "finished_at": utc_now().isoformat(),
+                            "overall": {
+                                "current": completed_count,
+                                "total": total,
+                                "unit": "files",
+                            },
+                            "indeterminate": False,
+                        },
+                        result={"value": json_value(result)},
+                        error={
+                            "code": "ARTIFACT_DELETE_PARTIAL"
+                            if outcome == "partial_failure"
+                            else "ARTIFACT_DELETE_FAILED",
+                            "message": message,
+                        },
+                    )
+                    command_terminal_status = "failed"
+                elif storage_outcome and storage_outcome != "succeeded":
                     if kind == "storage_rclone_manage":
                         error_code = (
                             "RCLONE_MANAGE_PARTIAL"
@@ -2211,17 +2721,15 @@ class WorkerJobExecutor(
                     )
                     command_terminal_status = "succeeded"
         except Exception as exc:
+            with self._lock:
+                self._finalizing.add(job_id)
+                cancelled = self._cancellation_was_effective(job_id)
             LOGGER.exception("Job %s (%s) failed", job_id, kind)
             self._append_job_log(f"[job failed: {exc}]")
             self._publish_log_snapshot(job_id, snapshot)
             payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
             quick_mode_job = kind == "export" and bool(payload.get("quick_mode"))
             stalled = isinstance(exc, (ProcessStalledError, TDLStalledError))
-            with self._lock:
-                already_cancelled = job_id in self._cancel_requested
-                if stalled and not (quick_mode_job and not already_cancelled):
-                    self._cancel_requested.add(job_id)
-                cancelled = job_id in self._cancel_requested
             if cancelled:
                 phase = self._quick_terminal_phase(command, "cancelled")
                 staging_path = self._quick_staging_path(command)
@@ -2262,6 +2770,8 @@ class WorkerJobExecutor(
                     )
                     if error_code and not str(getattr(exc, "code", "") or "").strip():
                         failure = QuickModeError(str(exc), code=error_code)
+                elif stalled and not str(getattr(exc, "code", "") or "").strip():
+                    failure = QuickModeError(str(exc), code="JOB_STALLED")
                 self._failed(
                     command,
                     failure,
@@ -2303,6 +2813,9 @@ class WorkerJobExecutor(
                 self._quick_active.discard(job_id)
                 self._quick_stage_jobs.pop(job_id, None)
                 self._cancel_requested.discard(job_id)
+                self._cancel_observed.discard(job_id)
+                self._cancel_confirmed.discard(job_id)
+                self._finalizing.discard(job_id)
             if command_id:
                 self.command_store.finish(command_id, command_terminal_status)
             self.publisher.forget(job_id)
@@ -2387,7 +2900,29 @@ class WorkerJobExecutor(
 
     def _job_cancelled(self, job_id: str) -> bool:
         with self._lock:
-            return job_id in self._cancel_requested
+            requested = job_id in self._cancel_requested
+            if requested and job_id not in getattr(self, "_finalizing", set()):
+                observed = getattr(self, "_cancel_observed", None)
+                if observed is None:
+                    observed = set()
+                    self._cancel_observed = observed
+                observed.add(job_id)
+            return requested
+
+    def _cancellation_was_effective(
+        self, job_id: str, *, cancelled_before_execute: bool = False
+    ) -> bool:
+        """Only report cancellation observed by work or confirmed by an interrupt.
+
+        A request that races with a handler's normal return must not turn an
+        already completed external effect into a false ``cancelled`` result.
+        """
+        with self._lock:
+            return bool(
+                cancelled_before_execute
+                or job_id in getattr(self, "_cancel_observed", set())
+                or job_id in getattr(self, "_cancel_confirmed", set())
+            )
 
 
     def _append_job_log(self, line: str) -> None:
@@ -2474,6 +3009,14 @@ class WorkerJobExecutor(
                 return
             self._set_job_process_paused(job_id, True)
             time.sleep(0.25)
+
+    def _before_job_command(self, job_id: str) -> None:
+        """Pause at command boundaries and do not start effects after cancel."""
+        self._wait_if_paused(job_id)
+        if self._job_cancelled(job_id):
+            raise RuntimeError(
+                "JOB_TERMINATED: operasi dihentikan sebelum command berikutnya."
+            )
 
     def _command_callback(self, *, profile: str | None = None, runtime: str | None = None):
         recorder = getattr(getattr(self, "_job_log", None), "audit", None)
@@ -2581,29 +3124,11 @@ class WorkerJobExecutor(
 
     def _execute_unlocked(self, command: dict[str, Any]) -> Any:
         kind = str(command["kind"])
-        handlers = {
-            "export": self._export,
-            "leave": self._leave,
-            "download": self._download,
-            "download_clear_failed": self._download_clear_failed,
-            "artifact_inventory": self._artifact_inventory,
-            "artifact_delete": self._artifact_delete,
-            "utility": self._utility,
-            "storage_upload": self._storage_upload,
-            "storage_download": self._storage_download,
-            "storage_rclone_manage": self._storage_rclone_manage,
-            "storage_reconcile": self._storage_reconcile,
-            "storage_sync": self._storage_sync,
-            "backup_node": self._backup,
-            "backup_verify": self._backup_verify,
-            "tts": self._tts,
-            "tdl_access_verify": self._tdl_access_verify,
-            "safelink_resolve": self._safelink_resolve,
-        }
-        handler = handlers.get(kind)
-        if handler is None:
+        method_name = WORKER_JOB_HANDLER_METHODS.get(kind)
+        if method_name is None:
             raise ValueError(f"Jenis job tidak dikenal: {kind}.")
-        return handler(command)
+        lifecycle_policy(kind)
+        return getattr(self, method_name)(command)
 
     def _cursor_commit_checkpoint(self, command: dict[str, Any]) -> dict[str, Any] | None:
         command_id = str(command.get("command_id") or "")

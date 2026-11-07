@@ -64,6 +64,9 @@ class _StorageUploader(StorageExecutorMixin):
     def available_storage_profiles(self):
         return list(self.runtimes)
 
+    def _job_cancelled(self, job_id):
+        return job_id in self._cancel_requested
+
     def available_storage_session_fingerprints(self, profiles=None):
         selected = profiles if profiles is not None else self.available_storage_profiles()
         return {

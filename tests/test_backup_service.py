@@ -159,7 +159,11 @@ class BackupServiceTests(unittest.TestCase):
             process = type(
                 "Process",
                 (),
-                {"stdout": io.StringIO(" 50%\r 100%\r"), "wait": lambda self: 0},
+                {
+                    "stdout": io.StringIO(" 50%\r 100%\r"),
+                    "wait": lambda self: 0,
+                    "poll": lambda self: 0,
+                },
             )()
             service = BackupService(make_config(root))
             with patch("tme3bot.backup_service.subprocess.Popen", return_value=process) as popen:
@@ -168,6 +172,92 @@ class BackupServiceTests(unittest.TestCase):
             self.assertIn("-mhe=on", command)
             self.assertIn("-psecret", command)
             self.assertEqual(popen.call_args.kwargs["stderr"], __import__("subprocess").STDOUT)
+
+    def test_backup_archive_process_is_cancelled_only_by_its_owner(self):
+        from tme3bot.backup_service import BackupService
+
+        service = BackupService(make_config(Path("/var/tmp")))
+
+        class Process:
+            def poll(self):
+                return None
+
+        process = Process()
+        service._current_process = process
+        service._current_owner = "backup-job"
+        with patch("tme3bot.backup_service.SubprocessRunner._interrupt_process") as interrupt:
+            self.assertFalse(service.cancel_current("another-job"))
+            interrupt.assert_not_called()
+            self.assertTrue(service.cancel_current("backup-job"))
+            interrupt.assert_called_once_with(process)
+
+    def test_backup_staging_copy_checks_cancel_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "source.bin"
+            source.write_bytes(b"x" * (4 * 1024 * 1024))
+            destination = root / "staging" / "source.bin"
+
+            class CancelDuringCopy:
+                def __init__(self):
+                    self.calls = 0
+
+                def preflight(self):
+                    self.calls += 1
+                    if self.calls == 4:
+                        raise RuntimeError("cancel requested")
+
+            callback = CancelDuringCopy()
+            service = BackupService(make_config(root), command_callback=callback)
+
+            with self.assertRaisesRegex(RuntimeError, "cancel requested"):
+                service._copy_file(source, destination)
+
+            self.assertEqual(callback.calls, 4)
+            self.assertFalse(destination.exists())
+
+    def test_backup_cancel_during_staging_never_starts_compression(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = make_config(root)
+            (root / "identity.json").write_text("{}", encoding="utf-8")
+
+            class CancelDuringStaging:
+                def __init__(self):
+                    self.calls = 0
+
+                def preflight(self):
+                    self.calls += 1
+                    if self.calls == 4:
+                        raise RuntimeError("cancel requested")
+
+            callback = CancelDuringStaging()
+            service = BackupService(config, command_callback=callback)
+            with patch.object(service, "_make_7z") as make_archive:
+                with self.assertRaisesRegex(RuntimeError, "cancel requested"):
+                    service.create_archive("run-1", "worker", password="secret")
+
+            make_archive.assert_not_called()
+
+    def test_failed_compression_removes_only_outputs_created_for_run(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            service = BackupService(make_config(root))
+            created = []
+
+            def fail_after_partial_output(_staging, archive_path, *_args):
+                archive_path.write_bytes(b"partial")
+                part = archive_path.with_name(archive_path.name + ".001")
+                part.write_bytes(b"partial-volume")
+                created.extend([archive_path, part])
+                raise RuntimeError("7z cancelled")
+
+            with patch.object(service, "_make_7z", side_effect=fail_after_partial_output):
+                with self.assertRaisesRegex(RuntimeError, "7z cancelled"):
+                    service.create_archive("run-cleanup", "worker", password="secret")
+
+            self.assertTrue(created)
+            self.assertTrue(all(not path.exists() for path in created))
 
 
 if __name__ == "__main__":

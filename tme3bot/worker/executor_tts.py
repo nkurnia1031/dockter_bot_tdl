@@ -197,7 +197,7 @@ class TtsExecutorMixin:
                 root,
                 on_progress=emit,
                 pause_event=pause_event,
-                is_cancelled=lambda: job_id in self._cancel_requested,
+                is_cancelled=lambda: self._job_cancelled(job_id),
                 on_paused=publish_paused,
             )
             self._append_job_log(
@@ -248,7 +248,7 @@ class TtsExecutorMixin:
                 f"[TTS] mengirim lewat TDL profile={runtime.name} parts={len(result['artifacts'])}"
             )
             while True:
-                if job_id in self._cancel_requested:
+                if self._job_cancelled(job_id):
                     request_json(
                         self.config.backend_api_url,
                         self.config.backend_internal_token,
@@ -287,7 +287,7 @@ class TtsExecutorMixin:
                                 timeout=10,
                             )
                         raise TtsError("Artifact TTS tidak tersedia untuk pengiriman")
-                    if job_id in self._cancel_requested:
+                    if self._job_cancelled(job_id):
                         request_json(
                             self.config.backend_api_url,
                             self.config.backend_internal_token,

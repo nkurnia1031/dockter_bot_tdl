@@ -257,8 +257,6 @@ class CommandMilestoneRecorder:
         context: dict[str, str] | None = None,
     ) -> str:
         """Create the pending milestone before a subprocess begins work."""
-        if self.before_command is not None:
-            self.before_command()
         with self._lock:
             self._counter += 1
             command_id = f"{self.job_id}:command:{self._counter}"
@@ -282,6 +280,10 @@ class CommandMilestoneRecorder:
                 exc_info=True,
             )
         return command_id
+
+    def preflight(self) -> None:
+        if self.before_command is not None:
+            self.before_command()
 
     def command_completed(
         self,
@@ -345,6 +347,7 @@ class ScopedCommandMilestoneRecorder:
 
     def __init__(self, recorder: CommandMilestoneRecorder, **context: str):
         self.recorder = recorder
+        self.job_id = recorder.job_id
         self.context = {
             str(key): str(value)
             for key, value in context.items()
@@ -353,6 +356,11 @@ class ScopedCommandMilestoneRecorder:
 
     def command_started(self, command: list[str], log_prefix: str) -> str:
         return self.recorder.command_started(command, log_prefix, self.context)
+
+    def preflight(self) -> None:
+        callback = getattr(self.recorder, "preflight", None)
+        if callable(callback):
+            callback()
 
     def command_completed(
         self,
@@ -382,6 +390,31 @@ class ScopedCommandMilestoneRecorder:
         log_prefix: str,
     ) -> None:
         self.command_completed(command, returncode, output, duration_seconds, log_prefix)
+
+
+class JobOwnerCommandCallback:
+    """No-op command observer that still binds subprocess ownership to a job."""
+
+    def __init__(self, job_id: str) -> None:
+        self.job_id = str(job_id)
+
+    def command_started(self, command: list[str], log_prefix: str) -> None:
+        del command, log_prefix
+        return None
+
+    def preflight(self) -> None:
+        return None
+
+    def command_completed(
+        self,
+        command: list[str],
+        returncode: int,
+        output: str,
+        duration_seconds: float,
+        log_prefix: str,
+        command_id: object | None = None,
+    ) -> None:
+        del command, returncode, output, duration_seconds, log_prefix, command_id
 
 
 def json_value(value: Any) -> Any:
@@ -745,6 +778,52 @@ class WorkerEventPublisher:
                     time.sleep(0.5 * (attempt + 1))
         assert last_error is not None
         raise last_error
+
+    def emit_recovery_events_once(
+        self,
+        job_id: str,
+        command_id: str,
+        *,
+        reported_phase: str,
+        events: list[dict[str, Any]],
+    ) -> bool:
+        """Atomically enqueue restart outcomes with their command report fence."""
+        append_once = getattr(self._outbox, "append_recovery_events_once", None)
+        if not callable(append_once) or not events:
+            return False
+        selected_job = str(job_id)
+        with self._lock:
+            worker = self._workers.get(selected_job)
+            binding = dict(self._command_bindings.get(selected_job) or {})
+        payloads = []
+        for event in events:
+            payload = {
+                "status": str(event["status"]),
+                "event_type": str(event["event_type"]),
+                "sent_at": utc_now().isoformat(),
+                "transient": False,
+                "progress": json_value(event.get("progress") or {}),
+                "result": json_value(event.get("result")) if event.get("result") is not None else None,
+                "error": json_value(event.get("error")) if event.get("error") is not None else None,
+                **binding,
+            }
+            if worker:
+                payload["worker"] = worker
+            payloads.append(payload)
+        sequences = append_once(
+            str(command_id),
+            selected_job,
+            payloads,
+            reported_phase=str(reported_phase),
+        )
+        if sequences is None:
+            return False
+        for sequence, event in zip(sequences, events):
+            self._audit(
+                selected_job,
+                f"[telemetry] queued sequence={sequence} event={event['event_type']} transient=False",
+            )
+        return True
 
     def begin(self, job_id: str, sequence_start: int | None) -> None:
         """Seed event numbering for a reused job ID."""

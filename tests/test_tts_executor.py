@@ -63,8 +63,12 @@ class _Executor(WorkerJobExecutor):
             backend_internal_token="internal",
         )
         self.runtime_settings = SimpleNamespace(tts_settings=lambda: {})
+        self._lock = threading.RLock()
         self._pause_events = {}
         self._cancel_requested = set()
+        self._cancel_observed = set()
+        self._cancel_confirmed = set()
+        self._finalizing = set()
         self._job_log = threading.local()
         self._job_log.secrets = []
         self.logs = []

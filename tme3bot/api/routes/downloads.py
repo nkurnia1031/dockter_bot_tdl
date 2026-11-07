@@ -188,7 +188,6 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
                 "Artifact aktif atau sudah selesai tidak dapat dihapus.",
                 status_code=409,
             )
-        context.export_catalog.update_status(artifact_id, "deleted")
         return job_dict(
             context.control_plane.submit_job(
                 actor,
@@ -210,17 +209,16 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
             if artifact["status"] not in {"pending", "failed"}:
                 raise DomainError("ARTIFACT_ACTIVE", "Artifact aktif atau selesai tidak dapat dihapus sebagai file pending.", status_code=409)
             groups.setdefault((str(artifact["profile"]), str(artifact["worker"])), []).append(artifact)
-        jobs, deleted = [], []
+        jobs, requested = [], []
         for (profile, worker), items in groups.items():
             for item in items:
-                context.export_catalog.update_status(str(item["id"]), "deleted")
-                deleted.append(str(item["id"]))
+                requested.append(str(item["id"]))
             jobs.append(job_dict(context.control_plane.submit_job(
                 actor, "artifact_delete",
                 {"artifact_keys": [str(item["artifact_key"]) for item in items]},
                 profile=profile, worker=worker,
             )))
-        return {"deleted": deleted, "jobs": jobs}
+        return {"requested": requested, "jobs": jobs}
 
     @app.post("/api/v1/downloads/artifacts/{artifact_id}/archive", response_model=ObjectResponse)
     def archive_artifact(artifact_id: str, actor=Depends(current_actor)):

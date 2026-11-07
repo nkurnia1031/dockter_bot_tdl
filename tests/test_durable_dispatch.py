@@ -1,5 +1,6 @@
 import hashlib
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from tme3bot.application.runtime_readiness import RuntimeReadinessGate
 from tme3bot.domain.models import Actor, DomainError, JobEvent, JobStatus
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
+    CAP_JOB_CANCEL_ATTEMPT,
     CAP_PUBLIC_DOWNLOAD_LINKS,
     CAP_STORAGE_DOWNLOAD,
     CAP_TTS,
@@ -371,6 +373,22 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertFalse(self.jobs.command_payload(operation.job_id)["dispatch_started"])
         self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
 
+    def test_durable_job_waits_for_worker_with_attempt_scoped_cancellation(self):
+        operation = self.submit()
+        advertised = set(self.dispatcher.capabilities("local")["capabilities"])
+        advertised.discard(CAP_JOB_CANCEL_ATTEMPT)
+        self.dispatcher.capabilities = lambda _worker: {
+            "contract_version": WORKER_API_CONTRACT_VERSION,
+            "capabilities": sorted(advertised),
+        }
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result, {"status": "wait", "reason": "not_ready"})
+        self.assertEqual(self.dispatcher.commands, [])
+        self.assertFalse(self.jobs.command_payload(operation.job_id)["dispatch_started"])
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+
     def test_job_dispatch_does_not_depend_on_vault_distribution_status(self):
         operation = self.submit()
         result = self.control.advance_durable_job(self.queue_command(operation))
@@ -534,6 +552,114 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertNotEqual(first_envelope["command_id"], second_envelope["command_id"])
         self.assertNotEqual(first_envelope["dispatch_token"], second_envelope["dispatch_token"])
         self.assertTrue(any(event.event_type == "retry_started" for event in self.jobs.events(operation.job_id)))
+
+    def test_stale_operation_handler_cannot_claim_dispatch_after_retry(self):
+        operation = self.submit()
+        stale_command = self.queue_command(operation)
+        self.assertEqual(
+            self.control.advance_durable_job(stale_command)["status"], "accepted"
+        )
+        sequence = max(event.sequence for event in self.jobs.events(operation.job_id)) + 1
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=operation.job_id,
+                sequence=sequence,
+                status=JobStatus.FAILED,
+                event_type="failed",
+                error={"code": "FAILED", "message": "failed"},
+            )
+        )
+
+        retried, _ = self.operations.retry(self.actor, operation.id, "retry-stale-handler")
+        retry_command = self.jobs.command_payload(operation.job_id)
+        self.assertFalse(retry_command["dispatch_started"])
+
+        stale_result = self.control.advance_durable_job(stale_command)
+
+        self.assertEqual(
+            stale_result, {"status": "terminal", "reason": "stale_attempt"}
+        )
+        self.assertEqual(len(self.dispatcher.commands), 1)
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+
+        retry_result = self.control.advance_durable_job(self.queue_command(retried))
+
+        self.assertEqual(retry_result["status"], "accepted")
+        self.assertEqual(len(self.dispatcher.commands), 2)
+        self.assertEqual(self.dispatcher.commands[-1][1]["attempt"], 2)
+
+    def test_stale_handler_keeps_new_attempt_lease_during_dispatch_rpc(self):
+        operation = self.submit()
+        stale_command = self.queue_command(operation)
+        self.control.advance_durable_job(stale_command)
+        sequence = max(event.sequence for event in self.jobs.events(operation.job_id)) + 1
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=operation.job_id,
+                sequence=sequence,
+                status=JobStatus.FAILED,
+                event_type="failed",
+                error={"code": "FAILED", "message": "failed"},
+            )
+        )
+        retried, _ = self.operations.retry(self.actor, operation.id, "retry-lease-race")
+
+        entered_rpc = threading.Event()
+        release_rpc = threading.Event()
+        original_dispatch = self.dispatcher.dispatch_command
+
+        def blocked_retry_rpc(worker, envelope):
+            if int(envelope.get("attempt") or 0) == 2:
+                entered_rpc.set()
+                if not release_rpc.wait(timeout=3):
+                    raise TimeoutError("retry dispatch RPC was not released")
+            return original_dispatch(worker, envelope)
+
+        self.dispatcher.dispatch_command = blocked_retry_rpc
+        retry_result = {}
+        retry_thread = threading.Thread(
+            target=lambda: retry_result.update(
+                self.control.advance_durable_job(self.queue_command(retried))
+            )
+        )
+        retry_thread.start()
+        self.assertTrue(entered_rpc.wait(timeout=2))
+
+        with self.jobs._db() as db:
+            lease_count_before_stale = db.execute(
+                "SELECT COUNT(*) FROM job_resource_leases WHERE job_id=?",
+                (operation.job_id,),
+            ).fetchone()[0]
+        self.assertGreater(lease_count_before_stale, 0)
+        self.operations.cancel(self.actor, operation.id, "cancel-during-retry-rpc")
+        active_cancel_result = self.control.advance_durable_job(
+            self.queue_command(retried)
+        )
+        self.assertEqual(
+            active_cancel_result,
+            {"status": "terminal", "reason": "operation_cancelling_dispatched"},
+        )
+
+        stale_result = self.control.advance_durable_job(stale_command)
+
+        self.assertEqual(
+            stale_result, {"status": "terminal", "reason": "stale_attempt"}
+        )
+        conflicting = self.submit()
+        conflicting_admission = self.jobs.try_acquire_execution(conflicting.job_id)
+        self.assertFalse(conflicting_admission["admitted"])
+        with self.jobs._db() as db:
+            lease_count = db.execute(
+                "SELECT COUNT(*) FROM job_resource_leases WHERE job_id=?",
+                (operation.job_id,),
+            ).fetchone()[0]
+        self.assertEqual(lease_count, lease_count_before_stale)
+
+        release_rpc.set()
+        retry_thread.join(timeout=3)
+        self.assertFalse(retry_thread.is_alive())
+        self.assertEqual(retry_result.get("status"), "accepted")
+        self.assertEqual(self.dispatcher.commands[-1][1]["attempt"], 2)
 
     def test_tts_lane_is_one_job_per_worker_but_workers_are_independent(self):
         first = self.submit("tts", {"title": "One", "text": "audio"}, worker="local")

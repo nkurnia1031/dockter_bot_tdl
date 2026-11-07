@@ -35,6 +35,7 @@ from typing import (
 
 from .executor_support import (
     LOGGER,
+    JobOwnerCommandCallback,
     _has_transfer_telemetry,
     storage_logical_folder,
     storage_relative_folders,
@@ -53,6 +54,15 @@ def _storage_upload_target_path(root: Path, path: Path, preserve_structure: bool
 
 
 class StorageExecutorMixin:
+
+    def _job_cancelled(self, job_id: str) -> bool:
+        """Fallback for focused mixin harnesses; the full executor adds fencing."""
+        requested = getattr(self, "_cancel_requested", set())
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            return str(job_id) in requested
+        with lock:
+            return str(job_id) in requested
 
     @staticmethod
     def _storage_reconcile_has_content(message: dict[str, Any]) -> bool:
@@ -205,9 +215,8 @@ class StorageExecutorMixin:
         messages = None
         error_code = "STORAGE_RECONCILIATION_SESSION_UNAVAILABLE"
         for profile in candidate_profiles:
-            with self._lock:
-                if str(command.get("job_id") or "") in self._cancel_requested:
-                    break
+            if self._job_cancelled(str(command.get("job_id") or "")):
+                break
             try:
                 runtime = self.profile_manager.runtime(profile)
                 client = runtime.upload_tdl_client
@@ -219,7 +228,9 @@ class StorageExecutorMixin:
                             # The job result contains a safe summary only;
                             # suppress command snapshots that include the temp path.
                             if hasattr(client, "command_callback"):
-                                client.command_callback = None
+                                client.command_callback = JobOwnerCommandCallback(
+                                    str(command.get("job_id") or "")
+                                )
                             exported = client.export_messages_by_time(
                                 target_chat,
                                 start_timestamp,
@@ -469,8 +480,7 @@ class StorageExecutorMixin:
                 )
 
         def cancelled() -> bool:
-            with self._lock:
-                return job_id in self._cancel_requested
+            return self._job_cancelled(job_id)
 
         runner = RcloneRunner(
             log_callback=self._append_job_log,
@@ -1016,8 +1026,7 @@ class StorageExecutorMixin:
         active_file_index = 1
 
         def cancelled() -> bool:
-            with self._lock:
-                return job_id in self._cancel_requested
+            return self._job_cancelled(job_id)
 
         def progress(index: int, total: int, name: str) -> None:
             del index, total
@@ -1346,7 +1355,7 @@ class StorageExecutorMixin:
                 export_path = Path(temp_dir) / "storage-history.json"
                 try:
                     if hasattr(client, "command_callback"):
-                        client.command_callback = None
+                        client.command_callback = JobOwnerCommandCallback(job_id)
                     exported = exporter(
                         target,
                         export_path,
@@ -1600,9 +1609,8 @@ class StorageExecutorMixin:
                 runtime = sender_runtimes[storage_profile]
             with self._capture_storage_upload_output(sender_runtimes):
                 for index, path in enumerate(files, start=1):
-                    with self._lock:
-                        if str(command["job_id"]) in self._cancel_requested:
-                            raise QuickModeError("Upload dibatalkan oleh user.")
+                    if self._job_cancelled(str(command["job_id"])):
+                        raise QuickModeError("Upload dibatalkan oleh user.")
                     size = file_sizes[path]
                     target_path = _storage_upload_target_path(
                         root, path, preserve_structure
@@ -1922,9 +1930,8 @@ class StorageExecutorMixin:
                             result={"item": item},
                         )
                     except Exception as exc:
-                        with self._lock:
-                            if str(command["job_id"]) in self._cancel_requested:
-                                raise
+                        if self._job_cancelled(str(command["job_id"])):
+                            raise
                         if physical_upload_succeeded:
                             if not counted_success:
                                 succeeded += 1
@@ -2191,7 +2198,7 @@ class StorageExecutorMixin:
                     getattr(client, "command_callback", None),
                 )
                 client.output_callback = None
-                client.command_callback = None
+                client.command_callback = JobOwnerCommandCallback(job_id)
             try:
                 for index, item in enumerate(files, start=1):
                     if self._storage_download_cancelled(job_id):
@@ -2576,8 +2583,7 @@ class StorageExecutorMixin:
         }
 
     def _storage_download_cancelled(self, job_id: str) -> bool:
-        with self._lock:
-            return job_id in self._cancel_requested
+        return self._job_cancelled(job_id)
 
     def _storage_upload_round_robin(
         self,
@@ -2987,9 +2993,8 @@ class StorageExecutorMixin:
                 relative = task["relative"]
                 attempt = int(task["attempt"])
                 try:
-                    with self._lock:
-                        if job_id in self._cancel_requested:
-                            return
+                    if self._job_cancelled(job_id):
+                        return
                     with lane_condition:
                         if profile not in active_lanes:
                             tasks.appendleft(task)

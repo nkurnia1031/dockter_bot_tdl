@@ -1072,8 +1072,22 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     @app.post(
         "/internal/v1/jobs/{job_id}/cancel", dependencies=[Depends(authorize)]
     )
-    def cancel_job(job_id: str):
-        return {"cancelled": context.executor.cancel(job_id)}
+    def cancel_job(job_id: str, body: dict[str, Any] | None = None):
+        raw_attempt = body.get("attempt") if isinstance(body, dict) else None
+        try:
+            attempt = max(1, int(raw_attempt)) if raw_attempt is not None else None
+        except (TypeError, ValueError):
+            raise DomainError(
+                "JOB_ATTEMPT_INVALID",
+                "Attempt job untuk pembatalan tidak valid.",
+                status_code=422,
+            ) from None
+        accepted = bool(
+            context.executor.cancel(job_id, attempt=attempt)
+            if attempt is not None
+            else context.executor.cancel(job_id)
+        )
+        return {"accepted": accepted}
 
     @app.post(
         "/internal/v1/jobs/{job_id}/pause", dependencies=[Depends(authorize)]

@@ -143,7 +143,7 @@
   async function deleteSelected() {
     if (!selected.length) return;
     pending = true;
-    try { await post('/downloads/artifacts/actions/delete', {artifact_ids:selected}); message = `${selected.length} artifact dipindahkan dari antrean.`; selected=[]; await load(); }
+    try { await post('/downloads/artifacts/actions/delete', {artifact_ids:selected}); message = `Permintaan hapus dikirim untuk ${selected.length} artifact.`; selected=[]; await load(); }
     catch (cause) { message = cause instanceof Error ? cause.message : 'Artifact gagal dihapus.'; }
     finally { pending=false; }
   }

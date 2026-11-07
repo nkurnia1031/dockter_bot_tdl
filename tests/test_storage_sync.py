@@ -194,6 +194,225 @@ class StorageSyncWorkerTests(unittest.TestCase):
 
 
 class StorageSyncControlPlaneTests(unittest.TestCase):
+    def test_pre_stall_batch_retry_is_not_reconciled_twice(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = StorageCatalog(root / "storage.db")
+            jobs = SqliteJobRepository(root / "jobs.db")
+            jobs.create(Job(
+                id="storage-sync-pre-stall-replay", kind="storage_sync",
+                profile="default", actor_user_id=42, worker="local",
+                status=JobStatus.QUEUED, payload={"channel_id": 123},
+            ))
+            control = ControlPlane(jobs, object(), object(), storage_catalog=catalog)
+            batch = JobEvent(
+                job_id="storage-sync-pre-stall-replay", sequence=1,
+                status=JobStatus.RUNNING, event_type="storage.sync_batch",
+                result={"channel_id": 123, "message_ids": [9], "items": []},
+            )
+            control.append_worker_event(batch)
+            jobs.append_event(JobEvent(
+                job_id="storage-sync-pre-stall-replay", sequence=2,
+                status=JobStatus.FAILED, event_type="backend_stall_unconfirmed",
+                progress={"outcome_uncertain": True, "reconciliation_required": True},
+                error={"code": "JOB_STALLED", "message": "Worker tidak merespons."},
+            ))
+
+            replayed = control.append_worker_event(batch)
+            terminal = control.append_worker_event(JobEvent(
+                job_id="storage-sync-pre-stall-replay", sequence=3,
+                status=JobStatus.SUCCEEDED, event_type="completed",
+                result={"value": {
+                    "channel_id": 123,
+                    "messages_scanned": 1,
+                    "batch_count": 1,
+                    "history_complete": True,
+                    "history_coverage": complete_coverage(9),
+                }},
+            ))
+
+            self.assertEqual(replayed.status, JobStatus.FAILED)
+            self.assertEqual(
+                len([event for event in jobs.events("storage-sync-pre-stall-replay")
+                     if event.event_type == "storage.sync_batch"]),
+                1,
+            )
+            self.assertEqual(
+                jobs.late_worker_events(
+                    "storage-sync-pre-stall-replay", event_type="storage.sync_batch"
+                ),
+                [],
+            )
+            self.assertEqual(
+                terminal.result["late_worker_reconciliation"]["status"],
+                JobStatus.SUCCEEDED.value,
+            )
+
+    def test_late_storage_sync_batch_is_used_when_stalled_job_completes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = StorageCatalog(root / "storage.db")
+            jobs = SqliteJobRepository(root / "jobs.db")
+            jobs.create(Job(
+                id="storage-sync-late", kind="storage_sync", profile="default",
+                actor_user_id=42, worker="local", status=JobStatus.QUEUED,
+                payload={"channel_id": 123},
+            ))
+            control = ControlPlane(jobs, object(), object(), storage_catalog=catalog)
+            jobs.append_event(JobEvent(
+                job_id="storage-sync-late", sequence=1, status=JobStatus.FAILED,
+                event_type="backend_stall_unconfirmed",
+                error={"code": "JOB_STALLED", "message": "Worker tidak merespons."},
+            ))
+
+            control.append_worker_event(JobEvent(
+                job_id="storage-sync-late", sequence=2, status=JobStatus.RUNNING,
+                event_type="storage.sync_batch", result={
+                    "channel_id": 123,
+                    "message_ids": [9],
+                    "items": [{
+                        "channel_message_id": 9,
+                        "original_name": "late.txt",
+                        "display_name": "late.txt",
+                        "folder": "Recovered",
+                        "keywords": "",
+                        "caption": build_storage_caption("Recovered", "late.txt"),
+                        "file_size": 10,
+                        "mime_type": "text/plain",
+                        "uploaded_at": "",
+                    }],
+                },
+            ))
+            terminal = control.append_worker_event(JobEvent(
+                job_id="storage-sync-late", sequence=3, status=JobStatus.SUCCEEDED,
+                event_type="completed", result={"value": {
+                    "channel_id": 123,
+                    "messages_scanned": 1,
+                    "batch_count": 1,
+                    "history_complete": True,
+                    "history_coverage": complete_coverage(9),
+                }},
+            ))
+
+            recovered = catalog.get_by_channel_message(123, 9)
+            self.assertIsNotNone(recovered)
+            self.assertEqual(terminal.status, JobStatus.FAILED)
+            self.assertEqual(
+                terminal.result["late_worker_reconciliation"]["status"],
+                JobStatus.SUCCEEDED.value,
+            )
+            self.assertTrue(
+                terminal.result["late_worker_reconciliation"]["result"]["value"]["history_complete"]
+            )
+
+    def test_stalled_storage_sync_retains_batches_beyond_job_result_cap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = StorageCatalog(root / "storage.db")
+            jobs = SqliteJobRepository(root / "jobs.db")
+            jobs.create(Job(
+                id="storage-sync-late-many", kind="storage_sync", profile="default",
+                actor_user_id=42, worker="local", status=JobStatus.QUEUED,
+                payload={"channel_id": 123},
+            ))
+            control = ControlPlane(jobs, object(), object(), storage_catalog=catalog)
+            jobs.append_event(JobEvent(
+                job_id="storage-sync-late-many", sequence=1, status=JobStatus.FAILED,
+                event_type="backend_stall_unconfirmed",
+                error={"code": "JOB_STALLED", "message": "Worker tidak merespons."},
+            ))
+
+            batch_total = 257
+            for index in range(batch_total):
+                message_id = index + 1
+                control.append_worker_event(JobEvent(
+                    job_id="storage-sync-late-many",
+                    sequence=index + 2,
+                    status=JobStatus.RUNNING,
+                    event_type="storage.sync_batch",
+                    result={
+                        "channel_id": 123,
+                        "message_ids": [message_id],
+                        "items": [],
+                    },
+                ))
+
+            terminal = control.append_worker_event(JobEvent(
+                job_id="storage-sync-late-many",
+                sequence=batch_total + 2,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+                result={"value": {
+                    "channel_id": 123,
+                    "messages_scanned": batch_total,
+                    "batch_count": batch_total,
+                    "history_complete": True,
+                    "history_coverage": complete_coverage(batch_total),
+                }},
+            ))
+
+            self.assertEqual(len(terminal.result["late_worker_events"]), 256)
+            self.assertEqual(
+                len(jobs.late_worker_events(
+                    "storage-sync-late-many", event_type="storage.sync_batch"
+                )),
+                batch_total,
+            )
+            self.assertTrue(
+                terminal.result["late_worker_reconciliation"]["result"]["value"]["history_complete"]
+            )
+
+    def test_storage_sync_terminal_retry_matches_sanitized_applied_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            catalog = StorageCatalog(root / "storage.db")
+            absent = catalog.insert_item(
+                upload_id="sync-retry-old", owner_user_id=5, owner_profile="default",
+                channel_id=123, channel_message_id=8, original_name="old.txt",
+                display_name="old.txt", folder="", keywords="", caption="",
+                file_size=1, mime_type="text/plain", sha256="",
+            )
+            jobs = SqliteJobRepository(root / "jobs.db")
+            jobs.create_with_private_values(
+                Job(
+                    id="storage-sync-terminal-retry", kind="storage_sync",
+                    profile="default", actor_user_id=42, worker="local",
+                    status=JobStatus.QUEUED, payload={"channel_id": 123},
+                ),
+                {},
+                execution_plan={},
+                command_payload={"_storage_sync_candidate_message_ids": [8]},
+            )
+            control = ControlPlane(jobs, object(), object(), storage_catalog=catalog)
+            control.append_worker_event(JobEvent(
+                job_id="storage-sync-terminal-retry", sequence=1,
+                status=JobStatus.RUNNING, event_type="storage.sync_batch",
+                result={"channel_id": 123, "message_ids": [9], "items": []},
+            ))
+            terminal_event = JobEvent(
+                job_id="storage-sync-terminal-retry", sequence=2,
+                status=JobStatus.SUCCEEDED, event_type="completed",
+                result={"value": {
+                    "channel_id": 123,
+                    "messages_scanned": 1,
+                    "batch_count": 1,
+                    "history_complete": True,
+                    "confirmed_missing_message_ids": [8],
+                    "verification_failed_message_ids": [],
+                    "history_coverage": complete_coverage(9),
+                }},
+            )
+            observed = []
+            control.add_event_observer(observed.append)
+
+            first = control.append_worker_event(terminal_event)
+            replayed = control.append_worker_event(terminal_event)
+
+            self.assertEqual(first.status, JobStatus.SUCCEEDED)
+            self.assertEqual(replayed.status, JobStatus.SUCCEEDED)
+            self.assertIsNone(catalog.get_by_channel_message(123, absent.channel_message_id))
+            self.assertEqual(len(observed), 2)
+
     def test_terminal_sync_applies_findings_but_unproven_history_cannot_delete(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

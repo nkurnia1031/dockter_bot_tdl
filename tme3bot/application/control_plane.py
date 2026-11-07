@@ -95,6 +95,7 @@ class ControlPlane:
         self._scheduler_stop = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._stale_cancel_requested: dict[str, Any] = {}
+        self._stale_job_lock = threading.RLock()
         self._tts_route_lock = threading.Lock()
         self._tts_round_robin = 0
         self._tts_sender_round_robin: dict[str, int] = {}
@@ -264,6 +265,8 @@ class ControlPlane:
             internal_payload[_STORAGE_DURABLE_DISPATCH_KEY] = {
                 "command_id": str(uuid.uuid4()),
                 "dispatch_token": secrets.token_urlsafe(32),
+                "attempt": 1,
+                "dispatch_started": False,
             }
         private_values = dict(private_job_values or {})
         if kind == "tts":
@@ -641,7 +644,7 @@ class ControlPlane:
                 event_type="dispatch_failed",
                 error={"code": failure.code, "message": failure.message},
             )
-            self.jobs.append_event(failed)
+            self.append_worker_event(failed)
             raise failure from exc
 
     @staticmethod
@@ -1790,33 +1793,111 @@ class ControlPlane:
         if not isinstance(stored, dict) or stored.get("dispatch_mode") != "durable":
             return {"status": "terminal", "reason": "dispatch_mode_changed"}
         attempt = max(1, int(command.get("attempt") or 1))
-        if job.status.terminal:
-            if attempt <= 1:
-                return {"status": "terminal", "reason": "job_terminal"}
-            job = self.jobs.reset_for_retry(job.id, self._redacted_payload(job.kind, stored.get("payload") or {}))
-            job = self.jobs.get(job.id) or job
         stored_attempt = max(1, int(stored.get("attempt") or 1))
+        if job.status.terminal:
+            if attempt <= stored_attempt:
+                return {"status": "terminal", "reason": "job_terminal"}
+            # Reset the public job, durable command identity, and retry event in
+            # one SQLite transaction. This also drops cancellation intent from
+            # the previous attempt before inspecting the new attempt below.
+            retry_payload = {
+                **stored,
+                "attempt": attempt,
+                "command_id": str(uuid.uuid4()),
+                "dispatch_token": secrets.token_urlsafe(32),
+                "dispatch_started": False,
+                "cancel_before_dispatch": False,
+                "cancel_after_dispatch": False,
+                "cancel_after_dispatch_accepted": False,
+            }
+            retry_payload.pop("cancel_before_dispatch_attempt", None)
+            retry_payload.pop("cancel_after_dispatch_attempt", None)
+            retry_event = JobEvent(
+                job_id=job.id,
+                sequence=self._next_job_event_sequence(job.id, fallback=job),
+                status=JobStatus.QUEUED,
+                event_type="retry_started",
+                progress={"phase": "queued", "retry_attempt": attempt},
+            )
+            execution = self.jobs.execution_plan(job.id) or stored.get("execution") or {}
+            job = self.jobs.reset_for_retry(
+                job.id,
+                self._redacted_payload(job.kind, stored.get("payload") or {}),
+                execution_plan=execution,
+                command_payload=retry_payload,
+                retry_event=retry_event,
+            )
+            # reset_for_retry persisted the event atomically; replay its
+            # idempotent observers after commit.
+            self.append_worker_event(retry_event)
+            job = self.jobs.get(job.id) or job
+            stored = self.jobs.command_payload(job.id) or retry_payload
+            stored_attempt = max(1, int(stored.get("attempt") or attempt))
         if attempt > stored_attempt:
-            # A retry keeps the public job ID but gets a new idempotency token.
-            # Persisting the attempt in job_commands makes this safe if the
-            # queue command is replayed after the row was reset to queued.
-            stored = {
+            # Some older retry rows can already be queued while their internal
+            # durable command still points at the previous attempt. Atomically
+            # advance the command and preserve a cancellation requested for
+            # this queued attempt.
+            updated = {
                 **stored,
                 "attempt": attempt,
                 "command_id": str(uuid.uuid4()),
                 "dispatch_token": secrets.token_urlsafe(32),
                 "dispatch_started": False,
             }
-            self.jobs.update_command_payload(job.id, stored)
-            sequence = job.progress_sequence + 1
-            self.jobs.append_event(JobEvent(
-                job_id=job.id,
-                sequence=sequence,
-                status=JobStatus.QUEUED,
-                event_type="retry_started",
-                progress={"phase": "queued", "retry_attempt": attempt},
-            ))
+            advancer = getattr(self.jobs, "advance_durable_attempt", None)
+            if callable(advancer):
+                advance_state = advancer(job.id, attempt, updated)
+                if advance_state == "dispatch_started":
+                    return {"status": "wait", "reason": "dispatch_in_progress"}
+                if advance_state in {"job_missing", "not_queued", "not_durable"}:
+                    return {"status": "wait", "reason": "retry_race"}
+                stored = self.jobs.command_payload(job.id) or updated
+                if advance_state == "advanced":
+                    retry_event = next(
+                        (
+                            event for event in reversed(self.jobs.events(job.id))
+                            if event.event_type == "retry_started"
+                            and int(event.progress.get("retry_attempt") or 0) == attempt
+                        ),
+                        None,
+                    )
+                    if retry_event is not None:
+                        self.append_worker_event(retry_event)
+            else:
+                self.jobs.update_command_payload(job.id, updated)
+                stored = updated
             job = self.jobs.get(job.id) or job
+            stored_attempt = max(1, int(stored.get("attempt") or attempt))
+
+        cancel_before_attempt = int(
+            stored.get("cancel_before_dispatch_attempt") or stored_attempt
+        )
+        if stored.get("cancel_before_dispatch") and cancel_before_attempt == attempt:
+            outcome, _current = self._cancel_queued_before_dispatch(
+                job.id,
+                event_type="cancelled_queued",
+                message="Job queued dibatalkan sebelum dikirim ke worker.",
+            )
+            if outcome in {"cancelled", "terminal"}:
+                return {"status": "terminal", "reason": "cancelled_before_dispatch"}
+            return {"status": "wait", "reason": "cancel_race"}
+
+        cancel_after_attempt = int(
+            stored.get("cancel_after_dispatch_attempt") or stored_attempt
+        )
+        if (
+            stored.get("cancel_after_dispatch")
+            and not stored.get("cancel_after_dispatch_accepted")
+            and cancel_after_attempt == attempt
+            and job.status in {
+                JobStatus.DISPATCHED, JobStatus.RUNNING, JobStatus.PAUSED
+            }
+        ):
+            if self._cancel_worker_attempt(job, attempt=attempt):
+                self.jobs.acknowledge_dispatch_cancellation(job.id, attempt)
+                return {"status": "accepted", "reason": "cancel_requested"}
+            return {"status": "wait", "reason": "cancel_pending"}
         if job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING, JobStatus.PAUSED}:
             return {"status": "accepted", "reason": "already_dispatched"}
         if job.status != JobStatus.QUEUED:
@@ -1894,8 +1975,55 @@ class ControlPlane:
         # Atomically persist this before the network call and only if the
         # operation has not begun cancellation. After this point an ACK may be
         # ambiguous, so cancellation must go through the worker.
-        begin_dispatch = getattr(self.jobs, "begin_durable_dispatch", None)
-        if not callable(begin_dispatch) or not begin_dispatch(job.id):
+        begin_queued_dispatch = getattr(
+            self.jobs, "begin_queued_worker_dispatch", None
+        )
+        if callable(begin_queued_dispatch):
+            dispatch_state = begin_queued_dispatch(
+                job.id,
+                attempt=attempt,
+                command_id=str(stored["command_id"]),
+                operation_id=str(command.get("operation_id") or "") or None,
+            )
+            dispatch_started = dispatch_state == "started"
+        else:
+            begin_dispatch = getattr(self.jobs, "begin_durable_dispatch", None)
+            dispatch_started = bool(
+                callable(begin_dispatch)
+                and begin_dispatch(
+                    job.id,
+                    attempt=attempt,
+                    command_id=str(stored["command_id"]),
+                    operation_id=str(command.get("operation_id") or "") or None,
+                )
+            )
+            dispatch_state = "started" if dispatch_started else "not_started"
+        if not dispatch_started:
+            if dispatch_state == "cancel_requested":
+                outcome, _current = self._cancel_queued_before_dispatch(
+                    job.id,
+                    event_type="cancelled_queued",
+                    message="Job queued dibatalkan sebelum dikirim ke worker.",
+                )
+                if outcome in {"cancelled", "terminal"}:
+                    return {"status": "terminal", "reason": "cancelled_before_dispatch"}
+            current = self.jobs.get(job.id)
+            if current is not None and current.status in {
+                JobStatus.DISPATCHED, JobStatus.RUNNING, JobStatus.PAUSED
+            }:
+                # A duplicate advance lost the claim because another advance
+                # already crossed the dispatch boundary. Its lease belongs to
+                # the active worker and must remain held.
+                return {"status": "accepted", "reason": "already_dispatched"}
+            if current is not None and current.status.terminal:
+                return {"status": "terminal", "reason": "job_terminal"}
+            if dispatch_state in {
+                "stale_attempt", "stale_command", "operation_cancelling_dispatched"
+            }:
+                # The same job ID can already hold the resource lease for the
+                # newer attempt whose RPC is in flight. A stale handler must
+                # not release that lease; the current attempt owns its release.
+                return {"status": "terminal", "reason": dispatch_state}
             self.jobs.release_execution(job.id)
             return {"status": "terminal", "reason": "dispatch_aborted"}
         try:
@@ -1906,6 +2034,17 @@ class ControlPlane:
             return {"status": "wait", "reason": "not_ready"}
         if not isinstance(receipt, dict) or receipt.get("accepted") is not True:
             return {"status": "wait", "reason": "not_ready"}
+        latest_payload = self.jobs.command_payload(job.id)
+        latest_payload = latest_payload if isinstance(latest_payload, dict) else {}
+        if (
+            latest_payload.get("cancel_after_dispatch")
+            and int(latest_payload.get("cancel_after_dispatch_attempt") or attempt) == attempt
+            and not latest_payload.get("cancel_after_dispatch_accepted")
+        ):
+            if self._cancel_worker_attempt(job, attempt=attempt):
+                self.jobs.acknowledge_dispatch_cancellation(job.id, attempt)
+                return {"status": "accepted", "reason": "cancel_requested"}
+            return {"status": "wait", "reason": "cancel_pending"}
         self.append_worker_event(JobEvent(
             job_id=job.id,
             sequence=latest + 1,
@@ -1916,7 +2055,7 @@ class ControlPlane:
         return {"status": "accepted"}
 
     def _fail_queued_job(self, job: Job, code: str, message: str) -> None:
-        sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
+        sequence = self._next_job_event_sequence(job.id, fallback=job)
         self.append_worker_event(JobEvent(
             job_id=job.id,
             sequence=sequence,
@@ -1925,29 +2064,153 @@ class ControlPlane:
             error={"code": code, "message": message},
         ))
 
+    def _cancel_queued_before_dispatch(
+        self, job_id: str, *, event_type: str, message: str
+    ) -> tuple[str, Job | None]:
+        """Cancel a queued job only if the worker dispatch boundary has not won."""
+        with self._stale_job_lock:
+            job = self.jobs.get(str(job_id))
+            if job is None:
+                return "terminal", None
+            if job.status.terminal:
+                return "terminal", job
+
+            requester = getattr(self.jobs, "request_queued_cancellation", None)
+            if callable(requester):
+                boundary = requester(job.id)
+            else:
+                stored = self.jobs.command_payload(job.id)
+                dispatch_record = stored if isinstance(stored, dict) else {}
+                storage_record = (
+                    dispatch_record.get("_storage_durable_dispatch")
+                    if isinstance(dispatch_record.get("_storage_durable_dispatch"), dict)
+                    else {}
+                )
+                durable = dispatch_record.get("dispatch_mode") == "durable" or bool(storage_record)
+                boundary = (
+                    "dispatch_started"
+                    if durable
+                    else "safe"
+                )
+
+            if boundary not in {"safe", "cancel_requested"}:
+                return boundary, self.jobs.get(job.id) or job
+            current = self.jobs.get(job.id) or job
+            if current.status.terminal:
+                return "terminal", current
+            if not (
+                current.status == JobStatus.QUEUED
+                or (
+                    current.status == JobStatus.PAUSED
+                    and current.progress.get("pause_kind") == "queued"
+                )
+            ):
+                return "not_queued", current
+            sequence = self._next_job_event_sequence(current.id, fallback=current)
+            terminal = self.append_worker_event(
+                JobEvent(
+                    job_id=current.id,
+                    sequence=sequence,
+                    status=JobStatus.CANCELLED,
+                    event_type=event_type,
+                    progress={
+                        "phase": "cancelled",
+                        "finished_at": utc_now().isoformat(),
+                    },
+                    error={"code": "JOB_TERMINATED", "message": message},
+                ),
+                dispatch_pending=False,
+            )
+            return (
+                "cancelled" if terminal.status == JobStatus.CANCELLED else "terminal",
+                terminal,
+            )
+
+    def _durable_dispatch_attempt(self, job_id: str) -> int | None:
+        payload = self.jobs.command_payload(job_id)
+        if not isinstance(payload, dict):
+            return None
+        record = payload if payload.get("dispatch_mode") == "durable" else payload.get(
+            _STORAGE_DURABLE_DISPATCH_KEY
+        )
+        if not isinstance(record, dict) or not record.get("dispatch_started"):
+            return None
+        try:
+            return max(1, int(record.get("attempt") or 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _cancel_worker_attempt(self, job: Job, *, attempt: int | None = None) -> bool:
+        selected_attempt = (
+            max(1, int(attempt)) if attempt is not None
+            else self._durable_dispatch_attempt(job.id)
+        )
+        cancel_attempt = getattr(self.dispatcher, "cancel_attempt", None)
+        if selected_attempt is not None and callable(cancel_attempt):
+            return bool(cancel_attempt(job.worker, job.id, selected_attempt))
+        return bool(self.dispatcher.cancel(job.worker, job.id))
+
+    def _has_pending_dispatch_cancellation(self, job_id: str) -> bool:
+        payload = self.jobs.command_payload(job_id)
+        if not isinstance(payload, dict):
+            return False
+        record = payload if payload.get("dispatch_mode") == "durable" else payload.get(
+            _STORAGE_DURABLE_DISPATCH_KEY
+        )
+        return bool(
+            isinstance(record, dict)
+            and record.get("cancel_after_dispatch")
+            and not record.get("cancel_after_dispatch_accepted")
+        )
+
+    def _retry_dispatch_cancel_requests(self) -> None:
+        """Deliver persisted cancellation intents after worker command acceptance."""
+        list_requests = getattr(self.jobs, "dispatch_cancel_requests", None)
+        acknowledge = getattr(self.jobs, "acknowledge_dispatch_cancellation", None)
+        if not callable(list_requests) or not callable(acknowledge):
+            return
+        try:
+            requests = list_requests(limit=500)
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not load pending worker cancellation requests"
+            )
+            return
+        for job, attempt in requests:
+            try:
+                if self._cancel_worker_attempt(job, attempt=attempt):
+                    acknowledge(job.id, attempt)
+            except Exception:
+                logging.getLogger(__name__).warning(
+                    "Worker cancellation delivery is pending for job %s",
+                    job.id,
+                    exc_info=True,
+                )
+
     def advance_durable_cancel(self, command: dict[str, Any]) -> dict[str, str]:
         private = command.get("private_payload") if isinstance(command.get("private_payload"), dict) else {}
         job = self.jobs.get(str(private.get("job_id") or ""))
         if job is None or job.status.terminal:
             return {"status": "accepted", "reason": "job_terminal"}
-        if job.status == JobStatus.QUEUED:
-            stored = self.jobs.command_payload(job.id)
-            if not isinstance(stored, dict) or not stored.get("dispatch_started"):
-                sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-                self.append_worker_event(JobEvent(
-                    job_id=job.id,
-                    sequence=sequence,
-                    status=JobStatus.CANCELLED,
-                    event_type="operation_cancelled_queued",
-                    progress={"phase": "cancelled"},
-                ))
+        if job.status in {JobStatus.QUEUED, JobStatus.PAUSED}:
+            outcome, current = self._cancel_queued_before_dispatch(
+                job.id,
+                event_type="operation_cancelled_queued",
+                message="Job queued dibatalkan sebelum dikirim ke worker.",
+            )
+            if outcome in {"cancelled", "terminal"}:
                 self._dispatch_pending_jobs()
                 return {"status": "accepted"}
+            job = current or job
         try:
             # A true return only means the worker accepted the cancel request.
             # Keep the durable operation command retryable until a terminal
             # worker event confirms the actual job outcome.
-            self.dispatcher.cancel(job.worker, job.id)
+            signalled = self._cancel_worker_attempt(job)
+            if signalled:
+                attempt = self._durable_dispatch_attempt(job.id)
+                if attempt is not None:
+                    self.jobs.acknowledge_dispatch_cancellation(job.id, attempt)
             return {"status": "wait", "reason": "not_ready"}
         except Exception:
             return {"status": "wait", "reason": "not_ready"}
@@ -2370,7 +2633,12 @@ class ControlPlane:
             event_type="dispatched",
             progress={"worker": job.worker, "position": 1},
         )
-        self.jobs.append_event(dispatched)
+        admitted = self.append_worker_event(dispatched)
+        if admitted.status != JobStatus.DISPATCHED:
+            # A queued cancellation can win immediately before this status
+            # transition. Do not send a command after the job became terminal.
+            self.jobs.release_execution(job.id)
+            return
         self.dispatcher.dispatch(job.worker, command)
 
     def _dispatch_storage_upload_command(
@@ -2400,6 +2668,8 @@ class ControlPlane:
             dispatch_data = {
                 "command_id": str(uuid.uuid4()),
                 "dispatch_token": secrets.token_urlsafe(32),
+                "attempt": max(1, int(command.get("attempt") or 1)),
+                "dispatch_started": False,
             }
             stored_payload = {
                 **stored_payload,
@@ -2415,6 +2685,38 @@ class ControlPlane:
             update_payload(job.id, stored_payload)
             command_id = dispatch_data["command_id"]
             dispatch_token = dispatch_data["dispatch_token"]
+
+        begin_dispatch = getattr(
+            self.jobs, "begin_queued_worker_dispatch", None
+        )
+        if callable(begin_dispatch):
+            dispatch_state = begin_dispatch(
+                job.id,
+                attempt=max(1, int(command.get("attempt") or 1)),
+                command_id=command_id,
+            )
+            if dispatch_state == "cancel_requested":
+                self._cancel_queued_before_dispatch(
+                    job.id,
+                    event_type="cancelled_queued",
+                    message="Job queued dibatalkan sebelum dikirim ke worker.",
+                )
+                self.jobs.release_execution(job.id)
+                return
+            if dispatch_state != "started":
+                current = self.jobs.get(job.id)
+                if current is not None and current.status in {
+                    JobStatus.DISPATCHED, JobStatus.RUNNING, JobStatus.PAUSED
+                }:
+                    return
+                if current is not None and current.status.terminal:
+                    return
+                if dispatch_state in {
+                    "stale_attempt", "stale_command", "operation_cancelling_dispatched"
+                }:
+                    return
+                self.jobs.release_execution(job.id)
+                return
 
         internal_payload = {
             key: value
@@ -2450,6 +2752,17 @@ class ControlPlane:
         receipt = dispatch_command(job.worker, envelope)
         if not isinstance(receipt, dict) or receipt.get("accepted") is not True:
             raise RuntimeError("Worker belum mengonfirmasi command upload Storage.")
+        latest_payload = self.jobs.command_payload(job.id)
+        latest_payload = latest_payload if isinstance(latest_payload, dict) else {}
+        latest_dispatch = latest_payload.get(_STORAGE_DURABLE_DISPATCH_KEY)
+        latest_dispatch = latest_dispatch if isinstance(latest_dispatch, dict) else {}
+        cancel_attempt = int(latest_dispatch.get("cancel_after_dispatch_attempt") or 1)
+        if (
+            latest_dispatch.get("cancel_after_dispatch")
+            and not latest_dispatch.get("cancel_after_dispatch_accepted")
+        ):
+            if self._cancel_worker_attempt(job, attempt=cancel_attempt):
+                self.jobs.acknowledge_dispatch_cancellation(job.id, cancel_attempt)
         self.append_worker_event(JobEvent(
             job_id=job.id,
             sequence=sequence,
@@ -2523,6 +2836,7 @@ class ControlPlane:
         while not self._scheduler_stop.wait(2.0):
             try:
                 self._recover_stale_jobs()
+                self._retry_dispatch_cancel_requests()
                 self._dispatch_pending_jobs()
             except Exception:
                 # A later tick retries; one unavailable worker must not stop
@@ -2532,11 +2846,12 @@ class ControlPlane:
                 logging.getLogger(__name__).exception("Pending job dispatch failed")
 
     def _recover_stale_jobs(self, *, now=None) -> None:
-        """Cancel jobs whose worker has stopped reporting progress.
+        """Request cancellation for stale work and fail only after a grace period.
 
-        Worker cancellation is deliberately best-effort.  The backend still
-        needs a terminal state when a worker, network connection, or a child
-        process is wedged, otherwise the lane remains occupied forever.
+        A backend timeout is not proof that the worker or its external process
+        stopped. The terminal record therefore stays failed/uncertain and its
+        execution lease remains held until a worker terminal event confirms it
+        has stopped.
         """
         if self.job_stall_timeout_seconds <= 0:
             return
@@ -2552,71 +2867,148 @@ class ControlPlane:
                 limit=1000,
             ):
                 active_ids.add(job.id)
-                updated_at = job.updated_at or job.created_at
-                age = (current_time - updated_at).total_seconds()
-                if age <= self.job_stall_timeout_seconds:
-                    self._stale_cancel_requested.pop(job.id, None)
-                    continue
+                should_signal = False
+                should_fail = False
+                requested_at = None
+                with self._stale_job_lock:
+                    latest = self.jobs.get(job.id)
+                    if latest is None or latest.status.terminal:
+                        self._stale_cancel_requested.pop(job.id, None)
+                        continue
+                    updated_at = latest.updated_at or latest.created_at
+                    age = (current_time - updated_at).total_seconds()
+                    if age <= self.job_stall_timeout_seconds:
+                        self._stale_cancel_requested.pop(job.id, None)
+                        continue
 
-                requested_at = self._stale_cancel_requested.get(job.id)
-                if requested_at is None:
+                    requested_at = self._stale_cancel_requested.get(job.id)
+                    if requested_at is None:
+                        requested_at = {
+                            "id": uuid.uuid4().hex,
+                            "at": current_time,
+                            "signal_status": "pending",
+                        }
+                        self._stale_cancel_requested[job.id] = requested_at
+                        should_signal = True
+                    else:
+                        requested_time = (
+                            requested_at.get("at")
+                            if isinstance(requested_at, dict)
+                            else requested_at
+                        )
+                        grace_age = (current_time - requested_time).total_seconds()
+                        should_fail = grace_age >= self.job_cancel_grace_seconds
+
+                if should_signal:
+                    signal_status = "accepted"
                     try:
-                        signalled = bool(self.dispatcher.cancel(job.worker, job.id))
+                        signalled = self._cancel_worker_attempt(job)
                     except Exception:
                         logging.getLogger(__name__).exception(
                             "Stale job cancellation failed for %s", job.id
                         )
                         signalled = False
-                    if signalled:
-                        self._stale_cancel_requested[job.id] = current_time
-                    else:
-                        self._force_cancel_stale_job(job, age)
-                        forced = True
+                        signal_status = "unavailable"
+                    if not signalled:
+                        signal_status = "not_confirmed"
+                    with self._stale_job_lock:
+                        if self._stale_cancel_requested.get(job.id) is requested_at:
+                            requested_at["signal_status"] = signal_status
                     continue
 
-                grace_age = (current_time - requested_at).total_seconds()
-                if grace_age >= self.job_cancel_grace_seconds:
-                    self._force_cancel_stale_job(job, age)
+                if should_fail and self._fail_stale_job(
+                    job, requested_at=requested_at, now=current_time
+                ):
                     forced = True
 
-        for job_id in tuple(self._stale_cancel_requested):
-            if job_id not in active_ids:
-                self._stale_cancel_requested.pop(job_id, None)
+        with self._stale_job_lock:
+            for job_id in tuple(self._stale_cancel_requested):
+                if job_id not in active_ids:
+                    self._stale_cancel_requested.pop(job_id, None)
         if forced:
             self._dispatch_pending_jobs()
 
-    def _force_cancel_stale_job(self, job: Job, age_seconds: float) -> None:
-        current = self.jobs.get(job.id)
-        if current is None or current.status.terminal:
-            self._stale_cancel_requested.pop(job.id, None)
-            return
-        sequence = max(
-            (item.sequence for item in self.jobs.events(job.id)), default=0
-        ) + 1
-        phase = str(job.progress.get("phase") or "cancelled")
-        self.jobs.append_event(
-            JobEvent(
-                job_id=job.id,
-                sequence=sequence,
-                status=JobStatus.CANCELLED,
-                event_type="backend_stall_cancelled",
-                progress={
-                    "phase": phase,
-                    "terminal_phase": "cancelled",
-                    "finished_at": utc_now().isoformat(),
-                    "stale_seconds": round(age_seconds, 1),
-                },
-                error={
-                    "code": "JOB_STALLED",
-                    "message": (
-                        "Job dibatalkan backend karena tidak ada progress "
-                        f"selama {round(age_seconds)} detik."
-                    ),
-                },
+    def _fail_stale_job(
+        self,
+        job: Job,
+        age_seconds: float | None = None,
+        request_state: Any = None,
+        *,
+        requested_at: Any = None,
+        now=None,
+    ) -> bool:
+        current_time = now or utc_now()
+        expected_request = requested_at if requested_at is not None else request_state
+        with self._stale_job_lock:
+            current = self.jobs.get(job.id)
+            if current is None or current.status.terminal:
+                if self._stale_cancel_requested.get(job.id) is expected_request:
+                    self._stale_cancel_requested.pop(job.id, None)
+                return False
+            active_request = self._stale_cancel_requested.get(job.id)
+            if expected_request is not None and active_request is not expected_request:
+                return False
+
+            updated_at = current.updated_at or current.created_at
+            current_age = (current_time - updated_at).total_seconds()
+            if current_age <= self.job_stall_timeout_seconds:
+                self._stale_cancel_requested.pop(job.id, None)
+                return False
+            requested_time = (
+                active_request.get("at")
+                if isinstance(active_request, dict)
+                else active_request
             )
-        )
-        self.jobs.release_execution(job.id)
-        self._stale_cancel_requested.pop(job.id, None)
+            if requested_time is None:
+                return False
+            grace_age = (current_time - requested_time).total_seconds()
+            if grace_age < self.job_cancel_grace_seconds:
+                return False
+
+            final_age = current_age if age_seconds is None else max(current_age, age_seconds)
+            sequence = max(
+                current.progress_sequence,
+                max((item.sequence for item in self.jobs.events(job.id)), default=0),
+            ) + 1
+            phase = str(current.progress.get("phase") or "unknown")
+            signal_status = (
+                str(active_request.get("signal_status") or "not_confirmed")
+                if isinstance(active_request, dict)
+                else "not_confirmed"
+            )
+            failed = self.append_worker_event(
+                JobEvent(
+                    job_id=job.id,
+                    sequence=sequence,
+                    status=JobStatus.FAILED,
+                    event_type="backend_stall_unconfirmed",
+                    progress={
+                        "phase": phase,
+                        "terminal_phase": "failed",
+                        "finished_at": current_time.isoformat(),
+                        "stale_seconds": round(final_age, 1),
+                        "worker_confirmation": "not_received",
+                        "worker_cancel_signal": signal_status,
+                        "outcome_uncertain": True,
+                        "reconciliation_required": True,
+                    },
+                    error={
+                        "code": "JOB_STALLED",
+                        "message": (
+                            "Worker tidak memberi konfirmasi berhenti setelah "
+                            f"{round(final_age)} detik tanpa progress. Status ditandai gagal, "
+                            "tetapi efek eksternal belum dapat dipastikan; periksa sebelum retry."
+                        ),
+                    },
+                ),
+                dispatch_pending=False,
+            )
+            # The event lifecycle updates linked operations and releases backend
+            # admission. The caller dispatches queued work after the stale-job pass.
+            return bool(
+                failed.status == JobStatus.FAILED
+                and failed.error.get("code") == "JOB_STALLED"
+            )
 
     def _dispatch_pending_jobs(self, profile: str | None = None) -> None:
         # Always inspect the global FIFO. Releasing a slot or lease for one
@@ -2668,9 +3060,8 @@ class ControlPlane:
                 if not admission.get("admitted"):
                     continue
                 if not isinstance(command_payload, dict):
-                    self.jobs.release_execution(queued.id)
                     sequence = sequence_cursor + 1
-                    self.jobs.append_event(
+                    self.append_worker_event(
                         JobEvent(
                             job_id=queued.id,
                             sequence=sequence,
@@ -2680,7 +3071,8 @@ class ControlPlane:
                                 "code": "LEGACY_COMMAND_UNAVAILABLE",
                                 "message": "Payload internal job lama tidak tersedia setelah migrasi scheduler.",
                             },
-                        )
+                        ),
+                        dispatch_pending=False,
                     )
                     continue
                 command = {
@@ -2705,14 +3097,15 @@ class ControlPlane:
                         resume = getattr(self.dispatcher, "resume", None)
                         if callable(resume):
                             sequence = sequence_cursor + 1
-                            resuming_job, _ = self.jobs.append_event(
+                            resuming_job = self.append_worker_event(
                                 JobEvent(
                                     job_id=queued.id,
                                     sequence=sequence,
                                     status=JobStatus.DISPATCHED,
                                     event_type="resuming",
                                     progress={"worker": queued.worker, "position": 1},
-                                )
+                                ),
+                                dispatch_pending=False,
                             )
                             resume_sequence = resuming_job.progress_sequence + 1
                             command["event_sequence_start"] = resume_sequence
@@ -2739,28 +3132,118 @@ class ControlPlane:
                         else:
                             self._dispatch_admitted_job(current or queued, command)
                 except Exception as exc:
-                    self.jobs.release_execution(queued.id)
                     failure = self._worker_dispatch_error(queued.worker, exc)
                     current = self.jobs.get(queued.id)
                     sequence = (
                         current.progress_sequence if current is not None
                         else sequence_cursor
                     ) + 1
-                    self.jobs.append_event(
+                    self.append_worker_event(
                         JobEvent(
                             job_id=queued.id,
                             sequence=sequence,
                             status=JobStatus.FAILED,
                             event_type="dispatch_failed",
                             error={"code": failure.code, "message": failure.message},
-                        )
+                        ),
+                        dispatch_pending=False,
                     )
 
-    def append_worker_event(self, event: JobEvent) -> Job:
+    def append_worker_event(
+        self, event: JobEvent, *, dispatch_pending: bool = True
+    ) -> Job:
         current = self.jobs.get(event.job_id)
         if current is None:
             raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
         if current.status.terminal:
+            if (
+                current.error
+                and current.error.get("code") == "JOB_STALLED"
+            ):
+                # Keep the uncertain backend failure, but retain late physical
+                # outcomes and replay their idempotent catalog effects. This
+                # handles worker outbox retries after an API outage/crash.
+                worker_event = event
+                late_record = {
+                    "sequence": int(worker_event.sequence),
+                    "status": worker_event.status.value,
+                    "event_type": str(worker_event.event_type),
+                    "result": _redact_secrets(worker_event.result),
+                    "error": _redact_secrets(worker_event.error),
+                }
+                recorder = getattr(self.jobs, "record_late_worker_event", None)
+                accepted = False
+                late_job = current
+                if callable(recorder):
+                    late_job, accepted = recorder(worker_event.job_id, late_record)
+                else:
+                    existing_result = current.result if isinstance(current.result, dict) else {}
+                    late_events = list(existing_result.get("late_worker_events") or [])
+                    match = next(
+                        (
+                            item for item in late_events
+                            if isinstance(item, dict)
+                            and item.get("sequence") == worker_event.sequence
+                            and item.get("event_type") == worker_event.event_type
+                        ),
+                        None,
+                    )
+                    accepted = match is None or all(
+                        match.get(key) == late_record.get(key)
+                        for key in ("sequence", "status", "event_type", "result", "error")
+                    )
+                    if match is None:
+                        received_at = utc_now().isoformat()
+                        late_events.append({**late_record, "received_at": received_at})
+                        next_result = {
+                            **existing_result,
+                            "late_worker_events": late_events[-256:],
+                        }
+                        if worker_event.status.terminal:
+                            next_result["late_worker_terminal"] = late_events[-1]
+                        self.jobs.update_result(worker_event.job_id, next_result)
+                        late_job = self.jobs.get(worker_event.job_id) or current
+                if accepted:
+                    applied_event = worker_event
+                    if (
+                        late_job.kind == "storage_sync"
+                        and worker_event.status == JobStatus.SUCCEEDED
+                        and worker_event.event_type == "completed"
+                    ):
+                        applied_event = self._apply_storage_sync_completion(
+                            late_job, worker_event
+                        )
+                    self._apply_event_side_effects(late_job, applied_event)
+                    # Late physical outcomes remain useful for readiness and
+                    # operation observers, even though JOB_STALLED remains the
+                    # public terminal state. Observers are required to be
+                    # idempotent because outbox retries can replay this event.
+                    for observer in tuple(self._event_observers):
+                        observer(applied_event)
+                    if applied_event is not worker_event:
+                        latest = self.jobs.get(worker_event.job_id) or late_job
+                        latest_result = (
+                            dict(latest.result)
+                            if isinstance(latest.result, dict)
+                            else {}
+                        )
+                        latest_result["late_worker_reconciliation"] = {
+                            "sequence": int(worker_event.sequence),
+                            "event_type": str(worker_event.event_type),
+                            "status": applied_event.status.value,
+                            "result": _redact_secrets(applied_event.result),
+                            "error": _redact_secrets(applied_event.error),
+                        }
+                        self.jobs.update_result(worker_event.job_id, latest_result)
+                if worker_event.status.terminal:
+                    # A late terminal confirms the physical process stopped;
+                    # the backend's uncertain failure remains authoritative.
+                    self.jobs.release_execution(event.job_id)
+                return self.jobs.get(event.job_id) or current
+            persisted = self._persisted_worker_event(current, event)
+            if persisted is not None:
+                self._replay_persisted_worker_event(current, persisted)
+                return self.jobs.get(event.job_id) or current
             # A worker can finish an interrupt race after the backend already
             # forced a terminal state.  Do not turn that harmless late event
             # into an INTERNAL_ERROR or resurrect the lane.
@@ -2770,20 +3253,42 @@ class ControlPlane:
                 event.job_id,
             )
             return current
-        # The cursor also covers progress snapshots that are not retained in
-        # job_events, so late events from an older worker attempt remain stale.
-        latest_sequence = current.progress_sequence
-        if event.sequence <= latest_sequence:
-            return current
-        if (
-            current.kind == "storage_sync"
-            and event.status == JobStatus.SUCCEEDED
-            and event.event_type == "completed"
-        ):
-            event = self._apply_storage_sync_completion(current, event)
-        event = self._with_observability(current, event)
-        job, inserted = self.jobs.append_event(event)
-        self._stale_cancel_requested.pop(event.job_id, None)
+        # Serialize persisted worker events with transient heartbeats and the
+        # watchdog's final revalidation. This prevents a fresh event from
+        # landing between the stale-age check and its terminal JOB_STALLED row.
+        terminal_race = False
+        stale_current: Job | None = None
+        stale_persisted: JobEvent | None = None
+        with self._stale_job_lock:
+            current = self.jobs.get(event.job_id)
+            if current is None:
+                raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+            if current.status.terminal:
+                terminal_race = True
+            elif event.sequence <= current.progress_sequence:
+                # The cursor also covers progress snapshots that are not
+                # retained in job_events, so old worker attempts stay stale.
+                stale_current = current
+                stale_persisted = self._persisted_worker_event(current, event)
+            else:
+                if (
+                    current.kind == "storage_sync"
+                    and event.status == JobStatus.SUCCEEDED
+                    and event.event_type == "completed"
+                ):
+                    event = self._apply_storage_sync_completion(current, event)
+                event = self._with_observability(current, event)
+                job, inserted = self.jobs.append_event(event)
+                self._stale_cancel_requested.pop(event.job_id, None)
+        if terminal_race:
+            # Re-enter the terminal path to preserve late-event reconciliation.
+            return self.append_worker_event(event, dispatch_pending=dispatch_pending)
+        if stale_current is not None:
+            if stale_persisted is not None:
+                # The event row may have committed before the prior API call
+                # crashed while applying its catalog/readiness side effect.
+                self._replay_persisted_worker_event(stale_current, stale_persisted)
+            return stale_current
         # Side effects are idempotent and intentionally replayed when a worker
         # retries an already persisted event after a transient API failure.
         self._apply_event_side_effects(job, event)
@@ -2831,11 +3336,85 @@ class ControlPlane:
                 self.jobs.release_execution(job.id)
             for observer in tuple(self._event_observers):
                 observer(event)
-            if event.status.terminal:
+            if dispatch_pending and event.status.terminal:
                 self._dispatch_pending_jobs()
-            elif event.status == JobStatus.PAUSED:
+            elif dispatch_pending and event.status == JobStatus.PAUSED:
                 self._dispatch_pending_jobs()
         return job
+
+    def _persisted_worker_event(
+        self, job: Job, event: JobEvent
+    ) -> JobEvent | None:
+        for stored in self.jobs.events(job.id, after_sequence=event.sequence - 1):
+            if stored.sequence != event.sequence:
+                continue
+            result_matches = _stored_worker_result_matches(
+                stored.result, event.result
+            )
+            if (
+                not result_matches
+                and job.kind == "storage_sync"
+                and event.event_type == "completed"
+            ):
+                result_matches = _storage_sync_terminal_result_matches(
+                    stored.result, event.result
+                )
+            if (
+                stored.status == event.status
+                and stored.event_type == event.event_type
+                and result_matches
+                and stored.error == event.error
+            ):
+                return stored
+            return None
+        return None
+
+    def _replay_persisted_worker_event(self, job: Job, event: JobEvent) -> None:
+        """Repair idempotent post-commit effects for an exact worker retry."""
+        self._apply_event_side_effects(job, event)
+        if event.status.terminal and self.export_cursor_service is not None:
+            lease = self.export_cursor_service.lease_for_job(job.id)
+            if lease is not None:
+                worker_confirmed = not (
+                    event.event_type.startswith("backend_")
+                    or event.event_type.startswith("force_cancelled")
+                    or event.event_type in {
+                        "dispatch_failed",
+                        "cancelled_queued",
+                        "cancelled_paused_queue",
+                        "operation_cancelled_queued",
+                    }
+                )
+                self.export_cursor_service.finish_job(
+                    job.id,
+                    attempt=int(lease["lease_attempt"]),
+                    worker_confirmed=worker_confirmed,
+                    require_applied_completion=event.status == JobStatus.SUCCEEDED,
+                )
+        if (
+            event.event_type == "export.json_ready"
+            and event.status in {JobStatus.RUNNING, JobStatus.DISPATCHED}
+            and job.kind == "export"
+            and bool(job.payload.get("quick_mode"))
+        ):
+            lease_held = bool(
+                self.export_cursor_service is not None
+                and self.export_cursor_service.job_has_active_lease(job.id)
+            )
+            cursor_required = self._shared_export_cursor_enabled() or lease_held
+            cursor_committed = bool(
+                self.export_cursor_service is not None
+                and self.export_cursor_service.completion_applied(job.id)
+            )
+            if not cursor_required or cursor_committed:
+                self._release_quick_export_resources(job.id)
+        for observer in tuple(self._event_observers):
+            observer(event)
+        if event.status.terminal:
+            self.jobs.release_execution(job.id)
+            self._dispatch_pending_jobs()
+        elif event.status == JobStatus.PAUSED:
+            self._dispatch_pending_jobs()
 
     def _apply_storage_sync_completion(self, job: Job, event: JobEvent) -> JobEvent:
         """Apply channel facts and only delete rows confirmed missing by ID lookup."""
@@ -2859,12 +3438,35 @@ class ControlPlane:
             items: list[dict[str, Any]] = []
             seen: set[int] = set()
             batches = [
-                stored
+                (stored.sequence, stored.result)
                 for stored in self.jobs.events(job.id)
                 if stored.event_type == "storage.sync_batch"
             ]
-            for batch in batches:
-                batch_result = batch.result if isinstance(batch.result, dict) else {}
+            late_event_reader = getattr(self.jobs, "late_worker_events", None)
+            if callable(late_event_reader):
+                late_events = late_event_reader(
+                    job.id, event_type="storage.sync_batch"
+                )
+            else:
+                late_events = (
+                    job.result.get("late_worker_events", [])
+                    if isinstance(job.result, dict)
+                    else []
+                )
+            if isinstance(late_events, list):
+                batches.extend(
+                    (
+                        int(item.get("sequence") or 0),
+                        item.get("result"),
+                    )
+                    for item in late_events
+                    if isinstance(item, dict)
+                    and item.get("event_type") == "storage.sync_batch"
+                )
+            for _sequence, raw_batch_result in sorted(batches, key=lambda item: item[0]):
+                batch_result = (
+                    raw_batch_result if isinstance(raw_batch_result, dict) else {}
+                )
                 batch_channel = int(batch_result.get("channel_id") or 0)
                 raw_ids = batch_result.get("message_ids")
                 raw_items = batch_result.get("items")
@@ -3075,18 +3677,28 @@ class ControlPlane:
 
     def update_worker_progress_result(self, event: JobEvent) -> tuple[Job, bool]:
         """Return whether a transient worker snapshot advanced the job."""
-        current = self.jobs.get(event.job_id)
-        if current is None:
-            raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
-        if not current.status.terminal:
-            event = self._with_observability(current, event)
-        job, updated = self.jobs.update_progress_snapshot(event)
-        if updated:
-            # A valid worker heartbeat proves that the worker is alive.  Clear
-            # a previous watchdog cancellation request so a delayed scheduler
-            # tick cannot force-cancel a job that has resumed reporting.
-            self._stale_cancel_requested.pop(event.job_id, None)
-        return job, updated
+        with self._stale_job_lock:
+            current = self.jobs.get(event.job_id)
+            if current is None:
+                raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+            if not current.status.terminal:
+                event = self._with_observability(current, event)
+            job, updated = self.jobs.update_progress_snapshot(event)
+            if updated:
+                # Serialize heartbeat advancement and watchdog finalization so
+                # a fresh snapshot cannot land between the watchdog's final
+                # age check and its terminal event.
+                self._stale_cancel_requested.pop(event.job_id, None)
+            return job, updated
+
+    def _next_job_event_sequence(self, job_id: str, *, fallback: Job | None = None) -> int:
+        current = self.jobs.get(job_id) or fallback
+        cursor = current.progress_sequence if current is not None else 0
+        persisted = max(
+            (item.sequence for item in self.jobs.events(job_id)),
+            default=0,
+        )
+        return max(cursor, persisted) + 1
 
     @staticmethod
     def _with_observability(job: Job, event: JobEvent) -> JobEvent:
@@ -3199,41 +3811,50 @@ class ControlPlane:
                     limit=200,
                 )
             )
-        interrupted = forced = 0
+        accepted = not_confirmed = cancelled_queued = 0
+        cancelled_queued_jobs: list[Job] = []
         for job in active:
-            try:
-                signalled = (
-                    False
-                    if job.status == JobStatus.QUEUED
-                    else bool(self.dispatcher.cancel(job.worker, job.id))
+            if job.status == JobStatus.QUEUED or (
+                job.status == JobStatus.PAUSED
+                and job.progress.get("pause_kind") == "queued"
+            ):
+                outcome, current = self._cancel_queued_before_dispatch(
+                    job.id,
+                    event_type="cancelled_queued",
+                    message="Job antrean dibatalkan.",
                 )
+                if outcome in {"cancelled", "terminal"}:
+                    if outcome == "cancelled":
+                        cancelled_queued += 1
+                        cancelled_queued_jobs.append(job)
+                    continue
+                job = current or job
+            try:
+                signalled = self._cancel_worker_attempt(job)
             except Exception:
                 signalled = False
             if signalled:
-                interrupted += 1
+                accepted += 1
+                attempt = self._durable_dispatch_attempt(job.id)
+                if attempt is not None:
+                    self.jobs.acknowledge_dispatch_cancellation(job.id, attempt)
+                if job.kind == "tts":
+                    self._cancel_tts_deliveries(job.id)
                 continue
-            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-            self.jobs.append_event(
-                JobEvent(
-                    job_id=job.id,
-                    sequence=sequence,
-                    status=JobStatus.CANCELLED,
-                    event_type="force_cancelled",
-                    progress={
-                        "phase": "cancelled",
-                        "finished_at": utc_now().isoformat(),
-                    },
-                    error={
-                        "code": "JOB_TERMINATED_STALE",
-                        "message": "Job dihentikan karena worker tidak lagi memiliki proses aktif.",
-                    },
-                )
-            )
-            self.jobs.release_execution(job.id)
-            forced += 1
-        if forced:
+            if self._has_pending_dispatch_cancellation(job.id):
+                # The worker has not accepted this command yet. The persisted
+                # attempt-scoped intent will be retried by the scheduler.
+                accepted += 1
+                continue
+            not_confirmed += 1
+        if cancelled_queued:
             self._dispatch_pending_jobs(selected_profile)
-        return {"total": len(active), "interrupted": interrupted, "force_cancelled": forced}
+        return {
+            "total": len(active),
+            "cancel_requested": accepted,
+            "cancelled_queued": cancelled_queued,
+            "not_confirmed": not_confirmed,
+        }
 
     def retry_job(
         self,
@@ -3405,6 +4026,17 @@ class ControlPlane:
         self.require_profile(actor, original.profile)
         if not original.status.terminal:
             raise DomainError("JOB_NOT_TERMINAL", "Job TTS masih aktif.", status_code=409)
+        delivery_summary = getattr(self.jobs, "tts_delivery_summary", None)
+        if callable(delivery_summary):
+            summary = delivery_summary(job_id)
+            total_parts = int(summary.get("total_parts") or 0)
+            delivered_parts = int(summary.get("delivered_parts") or 0)
+            if total_parts and delivered_parts < total_parts:
+                raise DomainError(
+                    "TTS_DELIVERY_RECONCILIATION_REQUIRED",
+                    "Sebagian hasil TTS belum terkonfirmasi terkirim. Retry otomatis dihentikan agar audio tidak terkirim ganda; periksa chat tujuan sebelum membuat job baru.",
+                    status_code=409,
+                )
         command_payload = self.jobs.command_payload(job_id)
         if not isinstance(command_payload, dict) or not str(command_payload.get("text") or ""):
             raise DomainError("RETRY_PAYLOAD_UNAVAILABLE", "Teks internal job TTS tidak tersedia untuk retry.", status_code=409)
@@ -3534,48 +4166,37 @@ class ControlPlane:
         if job.status.terminal:
             return job
         if job.status == JobStatus.PAUSED and job.progress.get("pause_kind") == "queued":
-            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-            self.jobs.append_event(
-                JobEvent(
-                    job_id=job.id,
-                    sequence=sequence,
-                    status=JobStatus.CANCELLED,
-                    event_type="cancelled_paused_queue",
-                    progress={"phase": "cancelled", "finished_at": utc_now().isoformat()},
-                    error={"code": "JOB_TERMINATED", "message": "Job antrean Quick Mode dibatalkan."},
-                )
+            outcome, current = self._cancel_queued_before_dispatch(
+                job.id,
+                event_type="cancelled_paused_queue",
+                message="Job antrean Quick Mode dibatalkan.",
             )
-            self.jobs.release_execution(job.id)
-            if job.kind == "tts":
-                self._cancel_tts_deliveries(job.id)
-            self._dispatch_pending_jobs()
-            return self.jobs.get(job.id) or job
+            if outcome in {"cancelled", "terminal"}:
+                if job.kind == "tts":
+                    self._cancel_tts_deliveries(job.id)
+                self._dispatch_pending_jobs()
+                return current or self.jobs.get(job.id) or job
+            job = current or job
         if job.status == JobStatus.QUEUED:
-            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-            self.jobs.append_event(
-                JobEvent(
-                    job_id=job.id,
-                    sequence=sequence,
-                    status=JobStatus.CANCELLED,
-                    event_type="cancelled_queued",
-                    progress={
-                        "phase": "cancelled",
-                        "finished_at": utc_now().isoformat(),
-                    },
-                    error={"code": "JOB_TERMINATED", "message": "Job queued dibatalkan."},
-                )
+            outcome, current = self._cancel_queued_before_dispatch(
+                job.id,
+                event_type="cancelled_queued",
+                message="Job queued dibatalkan.",
             )
-            self.jobs.release_execution(job.id)
-            if job.kind == "tts":
-                self._cancel_tts_deliveries(job.id)
-            self._dispatch_pending_jobs(job.profile)
-            return self.jobs.get(job.id) or job
+            if outcome in {"cancelled", "terminal"}:
+                if job.kind == "tts":
+                    self._cancel_tts_deliveries(job.id)
+                self._dispatch_pending_jobs(job.profile)
+                return current or self.jobs.get(job.id) or job
+            job = current or job
         try:
-            cancelled = self.dispatcher.cancel(job.worker, job.id)
+            cancelled = self._cancel_worker_attempt(job)
         except Exception as exc:
             current = self.jobs.get(job.id)
             if current is not None and current.status.terminal:
                 return current
+            if self._has_pending_dispatch_cancellation(job.id):
+                return current or job
             raise DomainError(
                 "WORKER_CANCEL_UNAVAILABLE",
                 f"Worker {job.worker} tidak dapat menerima permintaan terminate: {exc}",
@@ -3585,13 +4206,18 @@ class ControlPlane:
             current = self.jobs.get(job.id)
             if current is not None and current.status.terminal:
                 return current
+            if self._has_pending_dispatch_cancellation(job.id):
+                return current or job
             raise DomainError(
                 "JOB_NOT_CANCELLABLE",
-                "Worker tidak memiliki proses aktif yang dapat dihentikan.",
+                "Worker belum menerima permintaan pembatalan. Status job tidak diubah.",
                 status_code=409,
             )
         if job.kind == "tts":
             self._cancel_tts_deliveries(job.id)
+        attempt = self._durable_dispatch_attempt(job.id)
+        if attempt is not None:
+            self.jobs.acknowledge_dispatch_cancellation(job.id, attempt)
         # The worker emits the terminal ``cancelled`` event only after the
         # interrupted process has actually stopped. Marking it terminal here
         # would reject late log/final events and make the UI lie about a still
@@ -3724,15 +4350,16 @@ class ControlPlane:
         if job.status.terminal:
             raise DomainError("JOB_NOT_PAUSABLE", "Job sudah selesai.", status_code=409)
         if job.status == JobStatus.QUEUED:
-            sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-            self.jobs.append_event(
+            sequence = self._next_job_event_sequence(job.id, fallback=job)
+            self.append_worker_event(
                 JobEvent(
                     job_id=job.id,
                     sequence=sequence,
                     status=JobStatus.PAUSED,
                     event_type="paused",
                     progress={"phase": job.progress.get("phase", "queued"), "pause_kind": "queued"},
-                )
+                ),
+                dispatch_pending=False,
             )
             return self.jobs.get(job.id) or job
         pause = getattr(self.dispatcher, "pause", None)
@@ -3760,8 +4387,8 @@ class ControlPlane:
         self.require_profile(actor, job.profile)
         if job.status != JobStatus.PAUSED:
             raise DomainError("JOB_NOT_PAUSED", "Job tidak sedang dijeda.", status_code=409)
-        sequence = max((item.sequence for item in self.jobs.events(job.id)), default=0) + 1
-        self.jobs.append_event(
+        sequence = self._next_job_event_sequence(job.id, fallback=job)
+        self.append_worker_event(
             JobEvent(
                 job_id=job.id,
                 sequence=sequence,
@@ -3772,7 +4399,8 @@ class ControlPlane:
                     "pause_kind": job.progress.get("pause_kind", "queued"),
                     "message": "Job masuk kembali ke antrean Quick Mode",
                 },
-            )
+            ),
+            dispatch_pending=False,
         )
         self._dispatch_pending_jobs()
         return self.jobs.get(job.id) or job
@@ -3992,20 +4620,30 @@ class ControlPlane:
                         else None
                     ),
                 )
-        if event.event_type == "storage.item_uploaded" and self.storage_catalog is not None:
-            item = result.get("item")
-            if isinstance(item, dict):
-                values = dict(item)
-                relative = str(values.pop("relative_folder", "") or "")
-                parent = values.get("folder_id")
-                if relative:
-                    folder = self.storage_catalog.ensure_path(
-                        relative,
-                        int(values["owner_user_id"]),
-                        parent_id=int(parent) if parent is not None else None,
-                    )
-                    values["folder_id"] = folder.id if folder else parent
-                self.storage_catalog.insert_item(**values)
+        if (
+            event.event_type in {"storage.item_uploaded", "storage.recovery_batch"}
+            and self.storage_catalog is not None
+        ):
+            raw_items = (
+                [result.get("item")]
+                if event.event_type == "storage.item_uploaded"
+                else result.get("items", [])
+            )
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        continue
+                    values = dict(item)
+                    relative = str(values.pop("relative_folder", "") or "")
+                    parent = values.get("folder_id")
+                    if relative:
+                        folder = self.storage_catalog.ensure_path(
+                            relative,
+                            int(values["owner_user_id"]),
+                            parent_id=int(parent) if parent is not None else None,
+                        )
+                        values["folder_id"] = folder.id if folder else parent
+                    self.storage_catalog.insert_item(**values)
         if event.event_type == "artifact.discovered" and self.export_catalog is not None:
             artifact = result.get("artifact")
             if isinstance(artifact, dict):
@@ -4044,6 +4682,60 @@ class ControlPlane:
                     str(artifact["worker"]),
                     str(artifact["artifact_key"]),
                 )
+        if (
+            event.event_type in {
+                "artifact.delete.completed",
+                "artifact.delete.missing",
+                "artifact.clear_failed.deleted",
+                "artifact.clear_failed.missing",
+            }
+            and self.export_catalog is not None
+        ):
+            artifact_key = str(result.get("artifact_key") or "").strip()
+            if artifact_key:
+                artifact = self.export_catalog.get_by_key(
+                    job.profile, job.worker, artifact_key
+                )
+                if artifact is not None:
+                    if event.event_type in {
+                        "artifact.delete.missing",
+                        "artifact.clear_failed.missing",
+                    }:
+                        self.export_catalog.mark_missing(
+                            job.profile, job.worker, artifact_key
+                        )
+                    else:
+                        self.export_catalog.update_status(
+                            str(artifact["id"]),
+                            "deleted",
+                            available=False,
+                            error=None,
+                            missing_at=None,
+                        )
+        if (
+            job.kind == "artifact_delete"
+            and event.status.terminal
+            and self.export_catalog is not None
+            and isinstance(result, dict)
+        ):
+            # Terminal summaries are a second source of per-file evidence if
+            # the API was unavailable while individual delete events were in
+            # flight. These catalog updates are safe to replay.
+            for artifact_key in result.get("deleted", []) or []:
+                key = str(artifact_key or "").strip()
+                artifact = self.export_catalog.get_by_key(job.profile, job.worker, key) if key else None
+                if artifact is not None:
+                    self.export_catalog.update_status(
+                        str(artifact["id"]),
+                        "deleted",
+                        available=False,
+                        error=None,
+                        missing_at=None,
+                    )
+            for artifact_key in result.get("missing", []) or []:
+                key = str(artifact_key or "").strip()
+                if key:
+                    self.export_catalog.mark_missing(job.profile, job.worker, key)
         if event.event_type in {"artifact.downloaded", "artifact.failed"} and self.export_catalog is not None:
             artifact = result.get("artifact")
             if isinstance(artifact, dict):
@@ -4223,3 +4915,39 @@ def _redact_secrets(value: Any, key: str = "") -> Any:
     if isinstance(value, list):
         return [_redact_secrets(item) for item in value]
     return value
+
+
+def _stored_worker_result_matches(stored: Any, incoming: Any) -> bool:
+    """Accept the worker's original payload when backend metadata was added."""
+    if isinstance(stored, dict) and isinstance(incoming, dict):
+        return all(
+            key in stored and _stored_worker_result_matches(stored[key], item)
+            for key, item in incoming.items()
+        )
+    if isinstance(stored, list) and isinstance(incoming, list):
+        return stored == incoming
+    return stored == incoming
+
+
+def _storage_sync_terminal_result_matches(stored: Any, incoming: Any) -> bool:
+    """Match raw Storage Sync output to its sanitized applied completion."""
+    if not isinstance(stored, dict) or not isinstance(incoming, dict):
+        return False
+    stored_value = stored.get("value")
+    incoming_value = incoming.get("value")
+    if not isinstance(stored_value, dict) or not isinstance(incoming_value, dict):
+        return False
+    normalized = dict(incoming_value)
+    confirmed_missing = normalized.pop("confirmed_missing_message_ids", [])
+    verification_failed = normalized.pop("verification_failed_message_ids", [])
+    # Catalog application replaces the worker's history flag and proof ID
+    # lists with the resulting flag and counts. Match the remaining original
+    # fields and verify that both proof-list lengths were preserved.
+    normalized.pop("history_complete", None)
+    if not isinstance(confirmed_missing, list) or not isinstance(verification_failed, list):
+        return False
+    if len(confirmed_missing) != stored_value.get("confirmed_missing_count"):
+        return False
+    if len(verification_failed) != stored_value.get("verification_failed_count"):
+        return False
+    return _stored_worker_result_matches(stored_value, normalized)

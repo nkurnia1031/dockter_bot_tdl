@@ -268,7 +268,18 @@ class DownloadExecutorMixin:
 
     def _download_clear_failed(self, command: dict[str, Any]) -> dict[str, int]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
-        return {"deleted": runtime.download_service.clear_failed_exports()}
+        job_id = str(command["job_id"])
+
+        def report_item(status: str, artifact_key: str) -> None:
+            self.publisher.emit(
+                job_id,
+                "running",
+                f"artifact.clear_failed.{status}",
+                result={"artifact_key": artifact_key},
+            )
+
+        deleted = runtime.download_service.clear_failed_exports(on_item=report_item)
+        return {"deleted": deleted}
 
     def _artifact_inventory(self, command: dict[str, Any]) -> dict[str, Any]:
         runtime = self.profile_manager.runtime(str(command["profile"]))
@@ -299,6 +310,8 @@ class DownloadExecutorMixin:
 
         for status, root in locations:
             for path in sorted(root.glob("*.json")):
+                if self._job_cancelled(str(command.get("job_id") or "")):
+                    return {"discovered": discovered, "interrupted": True}
                 cache_key = (profile_name, str(path))
                 try:
                     file_stat = path.stat()
@@ -389,7 +402,15 @@ class DownloadExecutorMixin:
             keys = [keys]
         deleted: list[str] = []
         missing: list[str] = []
+        failed: list[dict[str, str]] = []
         for raw_key in keys:
+            if self._job_cancelled(str(command.get("job_id") or "")):
+                return {
+                    "deleted": deleted,
+                    "missing": missing,
+                    "failed": failed,
+                    "interrupted": True,
+                }
             key = str(raw_key)
             if Path(key).name != key or not key.lower().endswith(".json"):
                 raise ValueError("Artifact key tidak valid.")
@@ -401,10 +422,55 @@ class DownloadExecutorMixin:
                 except ValueError:
                     continue
                 if candidate.is_file():
-                    candidate.unlink()
-                    deleted.append(key)
+                    self.publisher.emit(
+                        str(command["job_id"]),
+                        "running",
+                        "artifact.delete.started",
+                        result={"artifact_key": key},
+                    )
+                    try:
+                        candidate.unlink()
+                    except FileNotFoundError:
+                        missing.append(key)
+                        self.publisher.emit(
+                            str(command["job_id"]),
+                            "running",
+                            "artifact.delete.missing",
+                            result={"artifact_key": key},
+                        )
+                    except OSError:
+                        failed.append(
+                            {"artifact_key": key, "reason_code": "UNLINK_FAILED"}
+                        )
+                        self.publisher.emit(
+                            str(command["job_id"]),
+                            "running",
+                            "artifact.delete.failed",
+                            result={
+                                "artifact_key": key,
+                                "reason_code": "UNLINK_FAILED",
+                            },
+                            error={
+                                "code": "ARTIFACT_DELETE_FAILED",
+                                "message": "Worker gagal menghapus file artifact.",
+                            },
+                        )
+                    else:
+                        deleted.append(key)
+                        self.publisher.emit(
+                            str(command["job_id"]),
+                            "running",
+                            "artifact.delete.completed",
+                            result={"artifact_key": key},
+                        )
                     found = True
                     break
             if not found:
                 missing.append(key)
-        return {"deleted": deleted, "missing": missing}
+                self.publisher.emit(
+                    str(command["job_id"]),
+                    "running",
+                    "artifact.delete.missing",
+                    result={"artifact_key": key},
+                )
+        return {"deleted": deleted, "missing": missing, "failed": failed}

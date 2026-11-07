@@ -820,6 +820,7 @@ class StorageUploadBatchTests(unittest.TestCase):
             "job_id": "storage-job-recover",
             "attempt": 1,
             "dispatch_token": "dispatch-token",
+            "event_sequence_start": 81,
             "execution_plan": {"resource_keys": ["worker:local:kind:storage_upload"]},
             "job": {
                 "kind": "storage_upload",
@@ -873,6 +874,7 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.store.recover_startup()
         emitted = []
         publisher = SimpleNamespace(
+            begin=lambda *args: emitted.append(("begin", args)),
             bind_command=lambda *args: emitted.append(("bind_command", args)),
             bind_job_worker=lambda *args: emitted.append(("bind_job_worker", args)),
             emit=lambda *args, **kwargs: emitted.append(("emit", args, kwargs)),
@@ -884,12 +886,14 @@ class StorageUploadBatchTests(unittest.TestCase):
         executor._publish_storage_upload_recoveries()
         executor._publish_storage_upload_recoveries()
 
-        item_events = [
+        self.assertIn(("begin", ("storage-job-recover", 81)), emitted)
+
+        recovery_events = [
             (event[1], event[2])
             for event in emitted
             if event[0] == "emit"
             and len(event[1]) > 2
-            and event[1][2] in {"storage.item_uploaded", "storage.item_skipped"}
+            and event[1][2] == "storage.recovery_batch"
         ]
         terminal_events = [
             (event[1], event[2])
@@ -898,8 +902,12 @@ class StorageUploadBatchTests(unittest.TestCase):
             and len(event[1]) > 2
             and event[1][2] == "storage.batch_interrupted"
         ]
-        self.assertEqual(len(item_events), 2)
-        self.assertEqual({event[0][2] for event in item_events}, {"storage.item_uploaded", "storage.item_skipped"})
+        self.assertEqual(len(recovery_events), 1)
+        self.assertEqual(len(recovery_events[0][1]["result"]["items"]), 1)
+        self.assertEqual(
+            recovery_events[0][1]["result"]["items"][0]["upload_id"],
+            "done-upload",
+        )
         self.assertEqual(len(terminal_events), 1)
         result_items = terminal_events[0][1]["result"]["value"]["items"]
         item_status = {item["name"]: item for item in result_items}
@@ -912,6 +920,63 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertFalse(item_status["uncertain.txt"]["retryable"])
         self.assertEqual(terminal_events[0][1]["result"]["value"]["skipped"], 1)
         self.assertEqual(self.store.list_storage_reconciliation_commands(), [])
+
+    def test_storage_restart_catalog_recovery_is_chunked_before_terminal_result(self):
+        command_id = "recover-many-storage"
+        self.store.accept({
+            "command_id": command_id,
+            "operation_id": "storage-operation-many",
+            "job_id": "storage-job-many",
+            "attempt": 1,
+            "dispatch_token": "dispatch-token",
+            "event_sequence_start": 101,
+            "execution_plan": {"resource_keys": ["worker:local:kind:storage_upload"]},
+            "job": {
+                "kind": "storage_upload",
+                "profile": "default",
+                "actor_user_id": 42,
+                "worker": "local",
+                "payload": {},
+            },
+        })
+        self.store.set_status(command_id, "running", only_from=("accepted",))
+        for index in range(101):
+            name = f"file-{index:03}.txt"
+            self.store.record_storage_upload_item(
+                command_id,
+                name,
+                file_name=name,
+                status="succeeded",
+                attempt=1,
+                profile="default",
+                message_id=index + 1,
+                result_item={"upload_id": f"upload-{index}", "channel_message_id": index + 1},
+            )
+        self.store.recover_startup()
+
+        emitted = []
+        publisher = SimpleNamespace(
+            begin=lambda *args: emitted.append(("begin", args)),
+            bind_command=lambda *args: emitted.append(("bind_command", args)),
+            bind_job_worker=lambda *args: emitted.append(("bind_job_worker", args)),
+            emit=lambda *args, **kwargs: emitted.append(("emit", args, kwargs)),
+        )
+        executor = object.__new__(WorkerJobExecutor)
+        executor.command_store = self.store
+        executor.publisher = publisher
+        executor._publish_storage_upload_recoveries()
+
+        batches = [
+            call for call in emitted
+            if call[0] == "emit" and call[1][2] == "storage.recovery_batch"
+        ]
+        terminal = [
+            call for call in emitted
+            if call[0] == "emit" and call[1][2] == "storage.batch_interrupted"
+        ]
+        self.assertEqual([len(call[2]["result"]["items"]) for call in batches], [100, 1])
+        self.assertEqual(len(terminal), 1)
+        self.assertLess(emitted.index(batches[0]), emitted.index(terminal[0]))
 
     def _prepare_reconcile(self, names, messages, *, caption_override=False, export_failure=False):
         self.reconcile_scenario += 1

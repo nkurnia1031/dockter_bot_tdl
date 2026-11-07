@@ -652,6 +652,85 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
 
             self.assertEqual(raised.exception.code, "QUICK_MODE_RUNTIME_UNAVAILABLE")
 
+    def test_cancel_waiting_during_thumbnail_preflight_interrupts_registered_process(self) -> None:
+        builder = QuickThumbnailBuilder()
+        preflight_entered = threading.Event()
+        allow_preflight = threading.Event()
+        cancel_started = threading.Event()
+        cancel_finished = threading.Event()
+        process_killed = threading.Event()
+        cancel_results: list[bool] = []
+        run_errors: list[Exception] = []
+        processes = []
+
+        class FakeProcess:
+            pid = 12345
+
+            def __init__(self):
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self):
+                self.assert_killed = process_killed.wait(2)
+                return "", ""
+
+            def wait(self, timeout=None):
+                if not process_killed.wait(timeout):
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                return self.returncode
+
+        def blocking_preflight(_callback):
+            preflight_entered.set()
+            if not allow_preflight.wait(2):
+                raise AssertionError("test did not release thumbnail preflight")
+
+        def fake_popen(*_args, **_kwargs):
+            process = FakeProcess()
+            processes.append(process)
+            return process
+
+        def fake_killpg(_pgid, _signal):
+            processes[0].returncode = -2
+            process_killed.set()
+
+        def run():
+            try:
+                builder._run(["ffmpeg", "-version"])
+            except Exception as exc:
+                run_errors.append(exc)
+
+        def cancel():
+            cancel_started.set()
+            cancel_results.append(builder.cancel_current())
+            cancel_finished.set()
+
+        with patch("tme3bot.worker.quick_export.preflight_command", side_effect=blocking_preflight), patch(
+            "tme3bot.worker.quick_export.subprocess.Popen", side_effect=fake_popen
+        ), patch("tme3bot.worker.quick_export.os.getpgid", return_value=12345), patch(
+            "tme3bot.worker.quick_export.os.killpg", side_effect=fake_killpg
+        ):
+            run_thread = threading.Thread(target=run)
+            run_thread.start()
+            self.assertTrue(preflight_entered.wait(2))
+            cancel_thread = threading.Thread(target=cancel)
+            cancel_thread.start()
+            self.assertTrue(cancel_started.wait(2))
+            # The cancel waits for preflight's lock; once Popen is registered
+            # it must interrupt that process rather than miss the spawn race.
+            self.assertFalse(cancel_finished.wait(0.05))
+            allow_preflight.set()
+            run_thread.join(3)
+            cancel_thread.join(3)
+
+        self.assertFalse(run_thread.is_alive())
+        self.assertFalse(cancel_thread.is_alive())
+        self.assertEqual(len(processes), 1)
+        self.assertEqual(cancel_results, [True])
+        self.assertTrue(process_killed.is_set())
+        self.assertEqual(len(run_errors), 1)
+
     def test_quick_folder_and_caption_are_deterministic(self) -> None:
         self.assertEqual(quick_folder_name(Path("/tmp/My Folder!.json")), "my-folder")
         self.assertEqual(
@@ -1068,14 +1147,16 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                 self.result = result
                 self.error = error
 
-            def interrupt_current(self):
+            def interrupt_current(self, owner_job_id=None):
+                del owner_job_id
                 calls.append(self.name)
                 if self.error:
                     raise RuntimeError(f"{self.name} already stopped")
                 return self.result
 
         class Runner:
-            def cancel_current(self):
+            def cancel_current(self, owner_job_id=None):
+                del owner_job_id
                 calls.append("utility")
                 raise RuntimeError("utility already stopped")
 

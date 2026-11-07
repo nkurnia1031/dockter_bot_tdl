@@ -31,6 +31,7 @@ class ProcessStalledError(RuntimeError):
     """Raised when a worker subprocess stops making meaningful progress."""
 
     def __init__(self, message: str, timeout_seconds: int) -> None:
+        self.code = "JOB_STALLED"
         self.timeout_seconds = timeout_seconds
         super().__init__(message)
 
@@ -142,6 +143,7 @@ class TDLStalledError(TDLCommandError):
         stderr: str,
         timeout_seconds: int,
     ) -> None:
+        self.code = "JOB_STALLED"
         self.timeout_seconds = timeout_seconds
         super().__init__(command, returncode, stdout, stderr)
         self.args = (
@@ -210,6 +212,14 @@ def notify_command_started(
             LOGGER.warning("Command start callback failed for %s", log_prefix, exc_info=True)
             return None
     return None
+
+
+def preflight_command(callback: CommandCallback | None) -> None:
+    """Run an optional cancellation/pause checkpoint before spawning a process."""
+    preflight = getattr(callback, "preflight", None)
+    declared = getattr(type(callback), "preflight", None) if callback is not None else None
+    if callable(preflight) and callable(declared):
+        preflight()
 
 
 def notify_command_completed(
@@ -308,15 +318,26 @@ class SubprocessRunner:
         stalled = False
 
         try:
-            process = subprocess.Popen(
-                process_command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,
-                bufsize=0,
-                env=env,
-                start_new_session=os.name != "nt",
-            )
+            # Cancellation uses the same lock to inspect/interrupt the active
+            # process. Keep the final cooperative check, spawn, and owner
+            # registration atomic with respect to that interrupt so a cancel
+            # cannot slip into the Popen-to-registration gap.
+            with self._lock:
+                preflight_command(command_callback)
+                process = subprocess.Popen(
+                    process_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                    bufsize=0,
+                    env=env,
+                    start_new_session=os.name != "nt",
+                )
+                self._current_process = process
+                self._current_command = command
+                self._current_owner = command_owner
+                self._last_output_at = started_at
+                self._last_progress_signature = None
         except OSError as exc:
             self._emit_raw_output(
                 raw_output_callback,
@@ -338,12 +359,6 @@ class SubprocessRunner:
                 )
             raise TDLCommandError(command, -1, "", str(exc)) from exc
 
-        with self._lock:
-            self._current_process = process
-            self._current_command = command
-            self._current_owner = command_owner
-            self._last_output_at = started_at
-            self._last_progress_signature = None
         if process_started_callback is not None:
             try:
                 process_started_callback()
@@ -504,10 +519,13 @@ class SubprocessRunner:
             self._pause_condition.notify_all()
             return resumed
 
-    def interrupt_current(self) -> bool:
+    def interrupt_current(self, owner_job_id: str | None = None) -> bool:
         with self._lock:
             process = self._current_process
             command = self._current_command
+            current_owner = self._current_owner
+        if owner_job_id is not None and current_owner != str(owner_job_id):
+            return False
         if process is None or process.poll() is not None:
             return False
 
@@ -802,10 +820,12 @@ class TDLClient:
             else float(os.getenv("TDL_UPLOAD_RESOLVE_INTERVAL_SECONDS", "5"))
         )
 
-    def interrupt_current(self) -> bool:
+    def interrupt_current(self, owner_job_id: str | None = None) -> bool:
         """Interrupt this client's currently running TDL subprocess, if any."""
         interrupt = getattr(self.runner, "interrupt_current", None)
-        return bool(interrupt()) if callable(interrupt) else False
+        if not callable(interrupt):
+            return False
+        return bool(interrupt(owner_job_id) if owner_job_id is not None else interrupt())
 
     def export_messages(
         self,

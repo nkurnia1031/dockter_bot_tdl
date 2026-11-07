@@ -151,6 +151,17 @@ class SqliteJobRepository:
                     PRIMARY KEY(job_id, sequence),
                     FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS late_worker_events (
+                    job_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_json TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    PRIMARY KEY(job_id, sequence, event_type),
+                    FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS late_worker_events_type
+                    ON late_worker_events(job_id, event_type, sequence);
                 CREATE TABLE IF NOT EXISTS job_execution_plans (
                     job_id TEXT PRIMARY KEY,
                     concurrency_keys TEXT NOT NULL,
@@ -642,43 +653,392 @@ class SqliteJobRepository:
                 (_dump(payload), job_id),
             )
 
-    def begin_durable_dispatch(self, job_id: str) -> bool:
-        """Atomically reserve the one-way boundary before a v2 worker request.
-
-        A cancellation can safely cancel a queued job before this boundary.
-        Once it is crossed, cancellation must be confirmed by the worker since
-        the command may already have been accepted.
-        """
+    def advance_durable_attempt(
+        self, job_id: str, attempt: int, payload: dict[str, Any]
+    ) -> str:
+        """Persist a retried command identity without dropping a fresh cancel."""
+        target_attempt = max(1, int(attempt))
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                """SELECT j.status, c.payload AS command_payload, o.status AS operation_status
+                """SELECT j.status, j.progress, j.progress_sequence,
+                          c.payload AS command_payload
+                   FROM jobs AS j JOIN job_commands AS c ON c.job_id=j.id
+                   WHERE j.id=?""",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                db.commit()
+                return "job_missing"
+            if str(row["status"]) != JobStatus.QUEUED.value:
+                db.commit()
+                return "not_queued"
+            current_payload = _load(row["command_payload"], None)
+            current, nested_key = self._dispatch_record(current_payload)
+            if current is None or not isinstance(current_payload, dict):
+                db.commit()
+                return "not_durable"
+            current_attempt = max(1, int(current.get("attempt") or 1))
+            if current_attempt >= target_attempt:
+                db.commit()
+                return "already_advanced"
+            if current.get("dispatch_started"):
+                db.commit()
+                return "dispatch_started"
+
+            queued_attempt = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM job_events WHERE job_id=? AND event_type='retry_started'",
+                    (str(job_id),),
+                ).fetchone()[0]
+            ) + 1
+            replacement, replacement_key = self._dispatch_record(payload)
+            if replacement is None:
+                db.commit()
+                return "not_durable"
+            replacement = dict(replacement)
+            # Cancellation intent belongs to a logical queued attempt. Discard
+            # an old marker, but preserve a cancel requested for this retry.
+            cancel_attempt = int(
+                current.get("cancel_before_dispatch_attempt") or current_attempt
+            )
+            if current.get("cancel_before_dispatch") and cancel_attempt >= queued_attempt:
+                replacement["cancel_before_dispatch"] = True
+                replacement["cancel_before_dispatch_attempt"] = cancel_attempt
+            else:
+                replacement["cancel_before_dispatch"] = False
+                replacement.pop("cancel_before_dispatch_attempt", None)
+
+            after_attempt = int(current.get("cancel_after_dispatch_attempt") or 0)
+            if current.get("cancel_after_dispatch") and after_attempt >= target_attempt:
+                replacement["cancel_after_dispatch"] = True
+                replacement["cancel_after_dispatch_attempt"] = after_attempt
+                replacement["cancel_after_dispatch_accepted"] = bool(
+                    current.get("cancel_after_dispatch_accepted")
+                )
+            else:
+                replacement["cancel_after_dispatch"] = False
+                replacement.pop("cancel_after_dispatch_attempt", None)
+                replacement["cancel_after_dispatch_accepted"] = False
+
+            replacement["attempt"] = target_attempt
+            replacement["dispatch_started"] = False
+            stored_payload = dict(payload)
+            if replacement_key:
+                stored_payload[replacement_key] = replacement
+            else:
+                stored_payload = replacement
+            db.execute(
+                "UPDATE job_commands SET payload=? WHERE job_id=?",
+                (_dump(stored_payload), str(job_id)),
+            )
+            retry_count = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM job_events WHERE job_id=? AND event_type='retry_started'",
+                    (str(job_id),),
+                ).fetchone()[0]
+            )
+            if retry_count < target_attempt - 1:
+                max_sequence = max(
+                    int(row["progress_sequence"] or 0),
+                    int(
+                        db.execute(
+                            "SELECT COALESCE(MAX(sequence),0) FROM job_events WHERE job_id=?",
+                            (str(job_id),),
+                        ).fetchone()[0]
+                    ),
+                )
+                retry_event = JobEvent(
+                    job_id=str(job_id),
+                    sequence=max_sequence + 1,
+                    status=JobStatus.QUEUED,
+                    event_type="retry_started",
+                    progress={"phase": "queued", "retry_attempt": target_attempt},
+                )
+                db.execute(
+                    """INSERT INTO job_events(
+                           job_id, sequence, status, event_type, progress, result,
+                           error, created_at
+                       ) VALUES(?, ?, ?, ?, ?, NULL, NULL, ?)""",
+                    (
+                        retry_event.job_id,
+                        retry_event.sequence,
+                        retry_event.status.value,
+                        retry_event.event_type,
+                        _dump(retry_event.progress),
+                        retry_event.created_at.isoformat(),
+                    ),
+                )
+                db.execute(
+                    "UPDATE jobs SET progress=?,progress_sequence=?,updated_at=? WHERE id=?",
+                    (
+                        _dump({
+                            "phase": "queued",
+                            "retry_sequence": retry_event.sequence,
+                            **retry_event.progress,
+                        }),
+                        retry_event.sequence,
+                        datetime.now(timezone.utc).isoformat(),
+                        str(job_id),
+                    ),
+                )
+            db.commit()
+            return "advanced"
+
+    def dispatch_cancel_requests(self, limit: int = 500) -> list[tuple[Job, int]]:
+        """Return active jobs with an unacknowledged post-dispatch cancel intent."""
+        bounded_limit = max(1, min(int(limit), 5000))
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT j.*, c.payload AS command_payload
+                   FROM jobs AS j JOIN job_commands AS c ON c.job_id=j.id
+                   WHERE j.status IN ('queued','dispatched','running','paused')
+                     AND c.payload LIKE '%\"cancel_after_dispatch\":true%'
+                     AND c.payload NOT LIKE '%\"cancel_after_dispatch_accepted\":true%'
+                   ORDER BY j.updated_at, j.id LIMIT ?""",
+                (bounded_limit,),
+            ).fetchall()
+        result: list[tuple[Job, int]] = []
+        for row in rows:
+            payload = _load(row["command_payload"], None)
+            record, _nested_key = self._dispatch_record(payload)
+            if not isinstance(record, dict):
+                continue
+            if not record.get("cancel_after_dispatch"):
+                continue
+            if record.get("cancel_after_dispatch_accepted"):
+                continue
+            attempt = max(1, int(record.get("cancel_after_dispatch_attempt") or record.get("attempt") or 1))
+            job = self._job(row)
+            if job is not None:
+                result.append((job, attempt))
+        return result
+
+    def acknowledge_dispatch_cancellation(self, job_id: str, attempt: int) -> bool:
+        """Stop scheduler retries once the worker has durably accepted cancel."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT payload FROM job_commands WHERE job_id=?", (str(job_id),)
+            ).fetchone()
+            if row is None:
+                db.commit()
+                return False
+            payload = _load(row["payload"], None)
+            record, nested_key = self._dispatch_record(payload)
+            if record is None or not isinstance(payload, dict):
+                db.commit()
+                return False
+            if int(record.get("cancel_after_dispatch_attempt") or 0) != int(attempt):
+                db.commit()
+                return False
+            record["cancel_after_dispatch_accepted"] = True
+            if nested_key:
+                payload[nested_key] = record
+            db.execute(
+                "UPDATE job_commands SET payload=? WHERE job_id=?",
+                (_dump(payload), str(job_id)),
+            )
+            db.commit()
+            return True
+
+    @staticmethod
+    def _dispatch_record(payload: Any) -> tuple[dict[str, Any] | None, str | None]:
+        if not isinstance(payload, dict):
+            return None, None
+        if payload.get("dispatch_mode") == "durable":
+            return payload, None
+        storage = payload.get("_storage_durable_dispatch")
+        if isinstance(storage, dict) and storage.get("command_id") and storage.get("dispatch_token"):
+            return storage, "_storage_durable_dispatch"
+        return None, None
+
+    def begin_queued_worker_dispatch(
+        self,
+        job_id: str,
+        *,
+        attempt: int | None = None,
+        command_id: str | None = None,
+        operation_id: str | None = None,
+    ) -> str:
+        """Atomically claim dispatch only for the current command attempt."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT j.status, c.payload AS command_payload
                    FROM jobs AS j
                    JOIN job_commands AS c ON c.job_id=j.id
-                   LEFT JOIN operations AS o ON o.job_id=j.id
                    WHERE j.id=?""",
                 (str(job_id),),
             ).fetchone()
             if row is None or str(row["status"]) != JobStatus.QUEUED.value:
                 db.commit()
-                return False
-            if str(row["operation_status"] or "") in {
+                return "not_queued"
+            payload = _load(row["command_payload"], None)
+            record, nested_key = self._dispatch_record(payload)
+            if record is None or not isinstance(payload, dict):
+                db.commit()
+                return "not_durable"
+            if attempt is not None and int(record.get("attempt") or 1) != int(attempt):
+                db.commit()
+                return "stale_attempt"
+            if command_id is not None and str(record.get("command_id") or "") != str(command_id):
+                db.commit()
+                return "stale_command"
+            operation_status = ""
+            operations_table = db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='operations'"
+            ).fetchone()
+            if operation_id is not None:
+                if operations_table is None:
+                    db.commit()
+                    return "stale_attempt"
+                operation_row = db.execute(
+                    "SELECT id, attempt, status FROM operations WHERE job_id=? AND id=?",
+                    (str(job_id), str(operation_id)),
+                ).fetchone()
+                if (
+                    operation_row is None
+                    or int(operation_row["attempt"] or 1) != int(attempt or 1)
+                ):
+                    db.commit()
+                    return "stale_attempt"
+                operation_status = str(operation_row["status"] or "")
+            elif operations_table is not None:
+                operation_row = db.execute(
+                    "SELECT status FROM operations WHERE job_id=?",
+                    (str(job_id),),
+                ).fetchone()
+                operation_status = str(operation_row["status"] or "") if operation_row else ""
+            if operation_status in {
                 "cancelling", "cancelled", "succeeded", "failed", "needs_reconciliation"
             }:
                 db.commit()
-                return False
-            payload = _load(row["command_payload"], None)
-            if not isinstance(payload, dict) or payload.get("dispatch_mode") != "durable":
+                return (
+                    "operation_cancelling_dispatched"
+                    if record.get("dispatch_started")
+                    else "operation_cancelling"
+                )
+            queued_attempt = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM job_events WHERE job_id=? AND event_type='retry_started'",
+                    (str(job_id),),
+                ).fetchone()[0]
+            ) + 1
+            cancel_attempt = int(record.get("cancel_before_dispatch_attempt") or 1)
+            if record.get("cancel_before_dispatch") and cancel_attempt == queued_attempt:
                 db.commit()
-                return False
-            if not payload.get("dispatch_started"):
-                payload["dispatch_started"] = True
+                return "cancel_requested"
+            if record.get("cancel_before_dispatch"):
+                # A queued retry supersedes cancellation intent from the prior
+                # attempt. Keep this reset inside the same transaction as the
+                # dispatch claim so a fresh cancel cannot be lost.
+                record["cancel_before_dispatch"] = False
+                record.pop("cancel_before_dispatch_attempt", None)
+            if not record.get("dispatch_started"):
+                record["dispatch_started"] = True
+                if nested_key:
+                    payload[nested_key] = record
                 db.execute(
                     "UPDATE job_commands SET payload=? WHERE job_id=?",
                     (_dump(payload), str(job_id)),
                 )
+            elif record.get("cancel_after_dispatch"):
+                # Leave the delivery intent in place; the scheduler retries
+                # until the worker confirms it has recorded the cancellation.
+                if nested_key:
+                    payload[nested_key] = record
+                    db.execute(
+                        "UPDATE job_commands SET payload=? WHERE job_id=?",
+                        (_dump(payload), str(job_id)),
+                    )
             db.commit()
-            return True
+            return "started"
+
+    def begin_durable_dispatch(
+        self,
+        job_id: str,
+        *,
+        attempt: int | None = None,
+        command_id: str | None = None,
+        operation_id: str | None = None,
+    ) -> bool:
+        """Compatibility wrapper for durable operation command dispatch."""
+        return self.begin_queued_worker_dispatch(
+            job_id,
+            attempt=attempt,
+            command_id=command_id,
+            operation_id=operation_id,
+        ) == "started"
+
+    def request_queued_cancellation(self, job_id: str) -> str:
+        """Reserve queued cancellation atomically against worker dispatch.
+
+        A returned ``dispatch_started`` means the command may have reached a
+        worker and must be cancelled there. ``safe`` is reserved for legacy
+        commands that have no one-way durable dispatch boundary.
+        """
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                """SELECT j.status, j.progress, c.payload AS command_payload
+                   FROM jobs AS j
+                   LEFT JOIN job_commands AS c ON c.job_id=j.id
+                   WHERE j.id=?""",
+                (str(job_id),),
+            ).fetchone()
+            if row is None or JobStatus(str(row["status"])).terminal:
+                db.commit()
+                return "terminal"
+            status = str(row["status"])
+            progress = _load(row["progress"], {})
+            queued = status == JobStatus.QUEUED.value or (
+                status == JobStatus.PAUSED.value
+                and isinstance(progress, dict)
+                and progress.get("pause_kind") == "queued"
+            )
+            if not queued:
+                db.commit()
+                return "not_queued"
+            payload = _load(row["command_payload"], None)
+            record, nested_key = self._dispatch_record(payload)
+            if record is None or not isinstance(payload, dict):
+                db.commit()
+                return "safe"
+            queued_attempt = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM job_events WHERE job_id=? AND event_type='retry_started'",
+                    (str(job_id),),
+                ).fetchone()[0]
+            ) + 1
+            if record.get("dispatch_started"):
+                same_intent = (
+                    record.get("cancel_after_dispatch")
+                    and int(record.get("cancel_after_dispatch_attempt") or 0)
+                    == queued_attempt
+                )
+                record["cancel_after_dispatch"] = True
+                record["cancel_after_dispatch_attempt"] = queued_attempt
+                if not same_intent:
+                    record["cancel_after_dispatch_accepted"] = False
+                if nested_key:
+                    payload[nested_key] = record
+                db.execute(
+                    "UPDATE job_commands SET payload=? WHERE job_id=?",
+                    (_dump(payload), str(job_id)),
+                )
+                db.commit()
+                return "dispatch_started"
+            record["cancel_before_dispatch"] = True
+            record["cancel_before_dispatch_attempt"] = queued_attempt
+            if nested_key:
+                payload[nested_key] = record
+            db.execute(
+                "UPDATE job_commands SET payload=? WHERE job_id=?",
+                (_dump(payload), str(job_id)),
+            )
+            db.commit()
+            return "cancel_requested"
 
     def quickmode_limits(self, workers: list[str] | tuple[str, ...]) -> list[dict[str, Any]]:
         names = sorted({str(item).strip().lower() for item in workers if str(item).strip()})
@@ -1758,6 +2118,144 @@ class SqliteJobRepository:
         if job is None:
             raise KeyError(f"Unknown job: {job_id}")
         return job
+
+    def record_late_worker_event(
+        self, job_id: str, event: dict[str, Any]
+    ) -> tuple[Job, bool]:
+        """Persist worker evidence received after backend stall failure.
+
+        Store a bounded job summary without reopening it. Storage Sync batches
+        also have durable rows because a long scan can exceed the summary cap.
+        """
+        job_key = str(job_id)
+        event_record = dict(event)
+        try:
+            sequence = int(event_record.get("sequence"))
+        except (TypeError, ValueError):
+            raise ValueError("Late worker event requires a valid sequence.")
+        event_type = str(event_record.get("event_type") or "").strip()
+        if sequence < 1 or not event_type:
+            raise ValueError("Late worker event requires sequence and event type.")
+
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_key,)).fetchone()
+            job = self._job(row)
+            if job is None:
+                raise KeyError(f"Unknown job: {job_key}")
+            result = dict(job.result) if isinstance(job.result, dict) else {}
+            existing_job_event = db.execute(
+                "SELECT status, event_type, result, error FROM job_events "
+                "WHERE job_id = ? AND sequence = ?",
+                (job_key, sequence),
+            ).fetchone()
+            if existing_job_event is not None:
+                stored_event_type = str(existing_job_event["event_type"])
+                if stored_event_type == event_type:
+                    matches = (
+                        str(existing_job_event["status"]) == str(event_record.get("status"))
+                        and _load(existing_job_event["result"], None) == event_record.get("result")
+                        and _load(existing_job_event["error"], None) == event_record.get("error")
+                    )
+                    return job, matches
+            durable_sync_batch = event_type == "storage.sync_batch"
+            existing_row = (
+                db.execute(
+                    "SELECT event_json FROM late_worker_events "
+                    "WHERE job_id = ? AND sequence = ? AND event_type = ?",
+                    (job_key, sequence, event_type),
+                ).fetchone()
+                if durable_sync_batch
+                else None
+            )
+            if existing_row is not None:
+                existing = _load(existing_row["event_json"], {})
+                existing = existing if isinstance(existing, dict) else {}
+                comparable_keys = ("sequence", "event_type", "status", "result", "error")
+                matches = all(
+                    existing.get(key) == event_record.get(key)
+                    for key in comparable_keys
+                )
+                return job, matches
+
+            records = result.get("late_worker_events")
+            records = list(records) if isinstance(records, list) else []
+            if not durable_sync_batch:
+                existing = next(
+                    (
+                        item
+                        for item in records
+                        if isinstance(item, dict)
+                        and item.get("sequence") == sequence
+                        and item.get("event_type") == event_type
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    comparable_keys = (
+                        "sequence", "event_type", "status", "result", "error"
+                    )
+                    return job, all(
+                        existing.get(key) == event_record.get(key)
+                        for key in comparable_keys
+                    )
+
+            event_record.setdefault(
+                "received_at", datetime.now(timezone.utc).isoformat()
+            )
+            if durable_sync_batch:
+                db.execute(
+                    "INSERT INTO late_worker_events(job_id, sequence, event_type, event_json, received_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        job_key,
+                        sequence,
+                        event_type,
+                        _dump(event_record),
+                        str(event_record["received_at"]),
+                    ),
+                )
+            records.append(event_record)
+            result["late_worker_events"] = records[-256:]
+            if str(event_record.get("status") or "") in {
+                JobStatus.SUCCEEDED.value,
+                JobStatus.FAILED.value,
+                JobStatus.CANCELLED.value,
+            }:
+                result["late_worker_terminal"] = event_record
+            db.execute(
+                "UPDATE jobs SET result = ?, updated_at = ? WHERE id = ?",
+                (_dump(result), str(event_record["received_at"]), job_key),
+            )
+            updated_row = db.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_key,)
+            ).fetchone()
+            updated = self._job(updated_row)
+            if updated is None:
+                raise KeyError(f"Unknown job: {job_key}")
+            return updated, True
+
+    def late_worker_events(
+        self, job_id: str, *, event_type: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Read durable late Storage Sync batches for reconciliation."""
+        clauses = ["job_id = ?"]
+        values: list[object] = [str(job_id)]
+        if event_type:
+            clauses.append("event_type = ?")
+            values.append(str(event_type))
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT event_json FROM late_worker_events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY sequence, event_type",
+                values,
+            ).fetchall()
+        return [
+            value
+            for row in rows
+            if isinstance((value := _load(row["event_json"], {})), dict)
+        ]
 
     def events(self, job_id: str, *, after_sequence: int = 0) -> list[JobEvent]:
         with self._db() as db:

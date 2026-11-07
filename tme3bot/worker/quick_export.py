@@ -24,6 +24,7 @@ from tme3bot.tdl import (
     TDLClient,
     notify_command_completed,
     notify_command_started,
+    preflight_command,
     pause_process_group,
     resume_process_group,
 )
@@ -537,6 +538,7 @@ class QuickThumbnailBuilder:
         self._pause_requested = False
         self._paused = False
         self._current_process: subprocess.Popen[str] | None = None
+        self._cancel_requested = False
 
     def pause_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
@@ -562,9 +564,13 @@ class QuickThumbnailBuilder:
 
     def cancel_current(self) -> bool:
         with self._process_lock:
+            self._cancel_requested = True
             process = self._current_process
-        if process is None or process.poll() is not None:
-            return False
+            if process is None or process.poll() is not None:
+                # Remember cancellation even if ffmpeg has not spawned yet.
+                # _run uses this same lock around preflight + spawn + owner
+                # registration, so a later process cannot escape this request.
+                return True
         try:
             if os.name != "nt":
                 os.killpg(os.getpgid(process.pid), signal.SIGINT)
@@ -809,14 +815,26 @@ class QuickThumbnailBuilder:
             subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         )
         try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                start_new_session=os.name != "nt",
-                creationflags=creationflags,
-            )
+            # Cancellation and process ownership are one atomic handoff. A
+            # cancel arriving during preflight waits here, then sees the
+            # registered process and interrupts it; a cancel arriving first
+            # prevents the spawn entirely.
+            with self._process_lock:
+                if self._cancel_requested:
+                    raise QuickModeError(
+                        "Quick Mode dibatalkan sebelum thumbnail dijalankan.",
+                        code="JOB_TERMINATED",
+                    )
+                preflight_command(self.command_callback)
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    start_new_session=os.name != "nt",
+                    creationflags=creationflags,
+                )
+                self._current_process = process
         except OSError as exc:
             if self.command_callback is not None:
                 notify_command_completed(
@@ -834,8 +852,6 @@ class QuickThumbnailBuilder:
         command_id = notify_command_started(
             self.command_callback, command, "quick-thumbnail"
         )
-        with self._process_lock:
-            self._current_process = process
         stalled = threading.Event()
         watchdog_stop = threading.Event()
         started_at = time.monotonic()

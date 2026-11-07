@@ -151,25 +151,31 @@ class BackupVerificationExecutorMixin:
             parts_dir.mkdir(mode=0o700)
             try:
                 with runtime.export_operation_lock, runtime.download_operation_lock:
-                    with self._capture_tdl_progress(
+                    with self._capture_tdl_output(
                         runtime.export_tdl_client,
-                        lambda value: self._report_backup_download_bytes(
-                            reporter,
-                            value,
-                            current_part,
-                            completed_bytes,
-                            expected_total_bytes,
+                        command_callback=self._command_callback(
+                            profile=profile, runtime="backup_verify"
                         ),
                     ):
-                        download_backup_parts(
+                        with self._capture_tdl_progress(
                             runtime.export_tdl_client,
-                            channel_ref=channel_ref,
-                            node_name=worker,
-                            run_id=run_id,
-                            parts=parts,
-                            destination=parts_dir,
-                            progress=report_download,
-                        )
+                            lambda value: self._report_backup_download_bytes(
+                                reporter,
+                                value,
+                                current_part,
+                                completed_bytes,
+                                expected_total_bytes,
+                            ),
+                        ):
+                            download_backup_parts(
+                                runtime.export_tdl_client,
+                                channel_ref=channel_ref,
+                                node_name=worker,
+                                run_id=run_id,
+                                parts=parts,
+                                destination=parts_dir,
+                                progress=report_download,
+                            )
             except BackupChannelDownloadError as exc:
                 download_error = exc.code
 

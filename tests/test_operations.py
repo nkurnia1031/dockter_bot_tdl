@@ -5,9 +5,11 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
+from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService, PreparedOperation
-from tme3bot.domain.models import Actor, DomainError, Job, JobStatus
+from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.domain.operations import OperationStatus, ensure_operation_transition
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
 from tme3bot.infrastructure.job_store import SqliteJobRepository
@@ -24,6 +26,47 @@ class OperationTests(unittest.TestCase):
         self.activity_journal = ActivityJournalStore(self.path)
         self.service = OperationsService(self.store, activity_journal=self.activity_journal)
         self.actor = Actor(42, "default")
+
+    def _linked_job_control(self, job_id):
+        action = f"test.lifecycle.{job_id}"
+
+        def prepare(actor, _target, _input_data):
+            return PreparedOperation(
+                profile=actor.profile,
+                target={"worker": "local"},
+                private_payload={},
+                job=Job(
+                    id=job_id,
+                    kind="export",
+                    profile=actor.profile,
+                    actor_user_id=actor.telegram_user_id,
+                    worker="local",
+                    status=JobStatus.QUEUED,
+                    payload={"url": "https://t.me/c/1/2"},
+                ),
+                execution_plan={
+                    "resource_keys": ["export:default"],
+                    "queue_group": "export",
+                    "lane": "export",
+                },
+                command_payload={"url": "https://t.me/c/1/2"},
+            )
+
+        self.service.register_handler(action, prepare)
+        operation, _created = self.service.submit(
+            self.actor,
+            kind=action,
+            target={},
+            input_data={},
+            idempotency_key=f"key-{job_id}",
+        )
+        control = ControlPlane(
+            self.jobs,
+            SimpleNamespace(),
+            SimpleNamespace(list_profiles=lambda: ["default"]),
+        )
+        control.add_event_observer(self.service.on_job_event)
+        return control, operation
 
     def register_simple(self):
         self.service.register_handler(
@@ -93,6 +136,80 @@ class OperationTests(unittest.TestCase):
         outbox = self.store.claim_outbox()
         self.assertEqual(outbox[0]["payload"], {"attempt": 1, "operation_id": operation.id})
         self.assertNotIn("chat_ref", outbox[0]["payload"])
+
+    def test_replayed_job_event_does_not_advance_operation_revision(self):
+        def prepare(actor, _target, _input_data):
+            return PreparedOperation(
+                profile=actor.profile,
+                target={"worker": "local"},
+                private_payload={},
+                job=Job(
+                    id="job-observer-replay",
+                    kind="export",
+                    profile=actor.profile,
+                    actor_user_id=actor.telegram_user_id,
+                    worker="local",
+                    status=JobStatus.QUEUED,
+                    payload={},
+                ),
+                execution_plan={"resource_keys": [], "queue_group": "", "lane": "export"},
+                command_payload={},
+            )
+
+        self.service.register_handler("test.observer_replay", prepare)
+        operation, _ = self.service.submit(
+            self.actor,
+            kind="test.observer_replay",
+            target={},
+            input_data={},
+            idempotency_key="key-observer-replay-0001",
+        )
+        event = JobEvent(
+            job_id="job-observer-replay",
+            sequence=1,
+            status=JobStatus.RUNNING,
+            event_type="running",
+        )
+
+        self.service.on_job_event(event)
+        revision = self.store.get_for_actor(operation.id, 42).revision
+        self.service.on_job_event(event)
+
+        self.assertEqual(self.store.get_for_actor(operation.id, 42).revision, revision)
+
+    def test_backend_stall_event_transitions_linked_operation_to_failed(self):
+        control, operation = self._linked_job_control("job-linked-stall")
+        control.append_worker_event(JobEvent(
+            job_id=operation.job_id,
+            sequence=1,
+            status=JobStatus.RUNNING,
+            event_type="started",
+        ))
+
+        control.append_worker_event(JobEvent(
+            job_id=operation.job_id,
+            sequence=2,
+            status=JobStatus.FAILED,
+            event_type="backend_stall_unconfirmed",
+            error={"code": "JOB_STALLED", "message": "worker timeout"},
+        ))
+
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.FAILED)
+        self.assertEqual(
+            self.store.get_for_actor(operation.id, 42).status,
+            OperationStatus.FAILED,
+        )
+
+    def test_queued_cancel_event_transitions_linked_operation_to_cancelled(self):
+        control, operation = self._linked_job_control("job-linked-queued-cancel")
+
+        control.cancel_job(self.actor, operation.job_id)
+
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.CANCELLED)
+        self.assertEqual(
+            self.store.get_for_actor(operation.id, 42).status,
+            OperationStatus.CANCELLED,
+        )
 
     def test_failure_mid_bundle_rolls_back_operation_idempotency_payload_and_outbox(self):
         self.jobs.create(Job(

@@ -51,14 +51,28 @@ class BackupExecutorMixin:
             for runtime in runtimes:
                 locks.enter_context(runtime.export_operation_lock)
                 locks.enter_context(runtime.download_operation_lock)
-            archive = BackupService(
-                self.config, progress_callback=backup_progress
-            ).create_archive(
-                str(payload["backup_run_id"]),
-                str(payload["node_name"]),
-                password=str(payload["password"]),
-                volume_size=str(payload.get("volume_size") or self.config.backup_volume_size),
+            backup_service = BackupService(
+                self.config,
+                progress_callback=backup_progress,
+                command_callback=self._command_callback(
+                    profile=profiles[0] if profiles else None,
+                    runtime="backup_compress",
+                ),
             )
+            job_id = str(command["job_id"])
+            with self._lock:
+                self._backup_services[job_id] = backup_service
+            try:
+                archive = backup_service.create_archive(
+                    str(payload["backup_run_id"]),
+                    str(payload["node_name"]),
+                    password=str(payload["password"]),
+                    volume_size=str(payload.get("volume_size") or self.config.backup_volume_size),
+                )
+            finally:
+                with self._lock:
+                    if self._backup_services.get(job_id) is backup_service:
+                        self._backup_services.pop(job_id, None)
         if not runtimes:
             raise RuntimeError("Tidak ada profile runtime untuk upload backup.")
         uploader = runtimes[0].export_tdl_client

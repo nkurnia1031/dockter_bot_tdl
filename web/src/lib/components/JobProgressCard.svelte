@@ -40,6 +40,7 @@
       ? storageDownloadResult.items
       : []
   );
+  const cancelRequest = $derived(job.progress?.cancel_request || null);
 </script>
 
 <article class="idm-row">
@@ -52,6 +53,11 @@
             <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
           {/if}
           <span class={`badge ${job.status === 'paused' ? 'paused' : 'running'} shrink-0`}>{job.status === 'paused' ? 'Dijeda' : phaseLabel(progress.phase)}</span>
+          {#if cancelRequest?.status === 'accepted' && ['dispatched','running','paused'].includes(job.status)}
+            <span class="rounded bg-amber-100 px-2 py-1 text-xs font-semibold text-amber-900 dark:bg-amber-950 dark:text-amber-200" role="status">
+              Permintaan berhenti diterima; menunggu konfirmasi worker
+            </span>
+          {/if}
           {#if stageId}
             <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {stageId.slice(0, 8)}</span>
           {/if}

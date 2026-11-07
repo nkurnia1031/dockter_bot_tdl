@@ -13,6 +13,7 @@ from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
     CAP_PROFILE_READINESS_CANARY,
     CAP_JOB_CONTROL,
+    CAP_JOB_CANCEL_ATTEMPT,
     CAP_JOB_LOG_SNAPSHOT,
     CAP_QUICKMODE_SCAN,
     CAP_QUICKMODE_STAGING,
@@ -471,7 +472,29 @@ class WorkerHttpDispatcher:
             "POST",
             f"/internal/v1/jobs/{job_id}/cancel",
         )
-        return bool(result.get("cancelled"))
+        # ``accepted`` means the worker recorded the request. It does not
+        # claim the child process has stopped; older workers only returned
+        # ``cancelled`` so retain that response as a rolling-upgrade fallback.
+        return bool(result.get("accepted", result.get("cancelled", False)))
+
+    def cancel_attempt(self, worker: str, job_id: str, attempt: int) -> bool:
+        """Cancel one durable attempt without affecting a later retry."""
+        record = self.worker_registry.get(worker)
+        if not record:
+            return False
+        self._require_capabilities(
+            worker,
+            {CAP_JOB_CONTROL, CAP_JOB_CANCEL_ATTEMPT},
+            record=record,
+        )
+        result = request_json(
+            str(record["url"]),
+            str(record["token"]),
+            "POST",
+            f"/internal/v1/jobs/{job_id}/cancel",
+            {"attempt": max(1, int(attempt))},
+        )
+        return bool(result.get("accepted", result.get("cancelled", False)))
 
     def pause(self, worker: str, job_id: str) -> bool:
         record = self.worker_registry.get(worker)
