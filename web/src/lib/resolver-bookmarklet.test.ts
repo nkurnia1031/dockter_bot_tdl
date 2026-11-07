@@ -104,6 +104,12 @@ function runBookmarklet({
 }
 
 describe('copyable Safelink bookmarklet', () => {
+  it('is a compact single-line JavaScript URL ready to paste into a bookmark', () => {
+    expect(bookmarklet).toBeDefined();
+    expect(bookmarklet).not.toMatch(/[\r\n]/);
+    expect(bookmarklet?.length).toBeLessThan(7000);
+  });
+
   it('advances one gate phase and navigates to the next gate page', async () => {
     const result = runBookmarklet({ url: 'https://invest.datapendidikan.com/step/1' });
 
