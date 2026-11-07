@@ -656,6 +656,15 @@ class StorageUploadBatchTests(unittest.TestCase):
         active_items = [snapshot.get("active_items") or [] for snapshot in progress_snapshots]
         self.assertTrue(active_items)
         self.assertLessEqual(max(map(len, active_items)), 1)
+        active_pairs = {
+            (item.get("profile"), item.get("name"))
+            for items in active_items
+            for item in items
+        }
+        self.assertEqual(
+            active_pairs,
+            set(uploader.metrics.upload_order),
+        )
         items = self.store.storage_upload_items("storage-command")
         self.assertEqual([item["name"] for item in items], ["one.txt", "three.txt", "two.txt"])
         self.assertTrue(all(item["status"] == "succeeded" for item in items))

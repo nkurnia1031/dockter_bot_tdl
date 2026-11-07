@@ -3468,6 +3468,14 @@ class BackendApiTests(unittest.TestCase):
             artifact_key="missing.json", status="deleted", available=False,
         )
         self.export_catalog.upsert(
+            profile="default", worker="remote-1", filename="remote-one.json",
+            artifact_key="remote-one.json", status="pending", available=True,
+        )
+        self.export_catalog.upsert(
+            profile="archive", worker="remote-2", filename="remote-two.json",
+            artifact_key="remote-two.json", status="pending", available=True,
+        )
+        self.export_catalog.upsert(
             profile="archive", worker="remote-2", filename="archived.json",
             artifact_key="archived.json", status="archived",
             archived_at="2026-11-01T00:00:00+00:00",
@@ -3481,7 +3489,12 @@ class BackendApiTests(unittest.TestCase):
         global_jobs = global_result.json()["jobs"]
         self.assertEqual(
             {(job["profile"], job["worker"]) for job in global_jobs},
-            {("default", "local"), ("archive", "remote-1")},
+            {
+                ("default", "local"),
+                ("archive", "remote-1"),
+                ("default", "remote-1"),
+                ("archive", "remote-2"),
+            },
         )
 
         filtered_result = self.client.post(
@@ -3493,6 +3506,26 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(
             {(job["profile"], job["worker"]) for job in filtered_result.json()["jobs"]},
             {("archive", "remote-1")},
+        )
+
+        profile_filtered_result = self.client.post(
+            "/api/v1/downloads/artifacts/reconcile?scope=global&profile=archive",
+            headers=headers,
+        )
+        self.assertEqual(profile_filtered_result.status_code, 200, profile_filtered_result.text)
+        self.assertEqual(
+            {(job["profile"], job["worker"]) for job in profile_filtered_result.json()["jobs"]},
+            {("archive", "remote-1"), ("archive", "remote-2")},
+        )
+
+        worker_filtered_result = self.client.post(
+            "/api/v1/downloads/artifacts/reconcile?scope=global&worker=remote-1",
+            headers=headers,
+        )
+        self.assertEqual(worker_filtered_result.status_code, 200, worker_filtered_result.text)
+        self.assertEqual(
+            {(job["profile"], job["worker"]) for job in worker_filtered_result.json()["jobs"]},
+            {("default", "remote-1"), ("archive", "remote-1")},
         )
 
     def test_context_checker_returns_verified_target(self):
