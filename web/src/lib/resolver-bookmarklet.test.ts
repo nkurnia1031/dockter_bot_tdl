@@ -110,22 +110,25 @@ describe('copyable Safelink bookmarklet', () => {
     expect(bookmarklet?.length).toBeLessThan(7000);
   });
 
-  it('advances one gate phase and navigates to the next gate page', async () => {
-    const result = runBookmarklet({ url: 'https://invest.datapendidikan.com/step/1' });
+  it('advances one phase across previously unlisted gate domains', async () => {
+    const result = runBookmarklet({
+      url: 'https://new-shortlink.example.test/step/1',
+      response: { effects: { emits: [{ event: 'setLink', params: ['https://new-gate.example.test/step/2'] }] } }
+    });
 
     await result.pending;
 
     expect(result.fetch).toHaveBeenCalledTimes(1);
-    expect(result.fetch.mock.calls[0]?.[0]).toBe('https://invest.datapendidikan.com/livewire/message/pages.show');
+    expect(result.fetch.mock.calls[0]?.[0]).toBe('https://new-shortlink.example.test/livewire/message/pages.show');
     expect(result.fetch.mock.calls[0]?.[1]?.redirect).toBe('error');
-    expect(result.location.assign).toHaveBeenCalledWith('https://invest.datapendidikan.com/step/2');
+    expect(result.location.assign).toHaveBeenCalledWith('https://new-gate.example.test/step/2');
     expect(result.outputs).toHaveLength(0);
   });
 
   it('shows and copies the final URL without opening it or calling the app backend', async () => {
     const destination = 'https://files.example.test/archive.zip';
     const result = runBookmarklet({
-      url: 'https://invest.datapendidikan.com/step/5',
+      url: 'https://new-shortlink.example.test/step/5',
       stepText: 'Step 5/5',
       page: {
         fingerprint: { id: 'component-5', name: 'pages.show' },
@@ -137,7 +140,7 @@ describe('copyable Safelink bookmarklet', () => {
     await result.pending;
 
     expect(result.fetch).toHaveBeenCalledTimes(1);
-    expect(result.fetch.mock.calls[0]?.[0]).toBe('https://invest.datapendidikan.com/livewire/message/pages.show');
+    expect(result.fetch.mock.calls[0]?.[0]).toBe('https://new-shortlink.example.test/livewire/message/pages.show');
     const requestBody = JSON.parse(String(result.fetch.mock.calls[0]?.[1]?.body || '{}'));
     expect(requestBody.updates[0].payload.event).toBe('getData');
     expect(result.location.assign).not.toHaveBeenCalled();
@@ -149,7 +152,7 @@ describe('copyable Safelink bookmarklet', () => {
     await copy?.listeners.click?.();
     expect(result.navigator.clipboard.writeText).toHaveBeenCalledWith(destination);
     expect(result.copied).toEqual([destination]);
-    expect(result.fetch.mock.calls.every(([target]) => String(target).startsWith('https://invest.datapendidikan.com/'))).toBe(true);
+    expect(result.fetch.mock.calls.every(([target]) => String(target).startsWith('https://new-shortlink.example.test/'))).toBe(true);
   });
 
   it('asks the user to handle a CAPTCHA even when the interstitial has no Livewire state', async () => {
