@@ -78,6 +78,10 @@ _Avoid_: metadata pengunggah asli, item upload baru.
 Pilihan salin atau pindah file dari worker ke Tujuan Storage. Salin mempertahankan file sumber; pindah menghapus file sumber hanya setelah upload dipastikan berhasil, sedangkan file gagal atau ambigu tetap disimpan.
 _Avoid_: pindah folder katalog.
 
+**Rotasi profil upload Telegram Storage**:
+Penugasan file upload bergiliran kepada profil lokal dalam satu batch, dengan satu file aktif pada satu waktu. Batch baru memulai urutan dari sender pertamanya.
+_Avoid_: upload paralel lintas profil, rotasi lintas batch.
+
 **Konflik upload Storage rclone**:
 Jika nama/path file sudah ada pada folder tujuan rclone yang sama, item dilewati tanpa overwrite dan file sumber tetap disimpan pada mode Pindah. Item lain dalam batch tetap diproses.
 _Avoid_: benturan dianggap gagal, menimpa tujuan, menghapus sumber yang dilewati.
