@@ -95,6 +95,59 @@ describe('DownloadsPage profile filter', () => {
     expect(request?.body).toBeUndefined();
   });
 
+  it('applies the pending status before the global 200-item limit', async () => {
+    const target = {
+      id: 'remote2-pending',
+      filename: 'restore-me.json',
+      profile: 'irang',
+      worker: 'remote-2',
+      status: 'pending',
+      available: true,
+      created_at: '2026-11-06T17:49:31Z'
+    };
+    const recentDownloaded = Array.from({ length: 200 }, (_, index) => ({
+      id: `downloaded-${index}`,
+      filename: `recent-${index}.json`,
+      profile: 'default',
+      worker: 'local',
+      status: 'downloaded',
+      available: true,
+      created_at: `2026-11-07T${String(23 - Math.floor(index / 60)).padStart(2, '0')}:${String(59 - index % 60).padStart(2, '0')}:00Z`
+    }));
+    const catalog = [...recentDownloaded, target];
+    const requests: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default', 'irang']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', enabled: true }, { name: 'remote-2', enabled: true }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({ profiles: [] }), { status: 200 });
+      if (url.includes('/downloads/artifacts?')) {
+        const params = new URL(url, 'http://localhost').searchParams;
+        const archived = params.get('archived') === 'true';
+        const status = params.get('status');
+        const matching = archived ? [] : catalog.filter(item => !status || item.status === status);
+        const offset = Number(params.get('offset') || 0);
+        const limit = Number(params.get('limit') || 50);
+        return new Response(JSON.stringify({ items: matching.slice(offset, offset + limit), total: matching.length }), { status: 200 });
+      }
+      if (url.includes('/jobs')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    await session.restore();
+    render(DownloadsPage);
+
+    expect(await screen.findByText('restore-me.json')).toBeTruthy();
+    expect(requests.some(url => new URL(url, 'http://localhost').searchParams.get('status') === 'pending')).toBe(true);
+  });
+
   it('offers only verified catalog profiles and reloads with the selected catalog value', async () => {
     const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
