@@ -3455,6 +3455,46 @@ class BackendApiTests(unittest.TestCase):
             {("default", "local"), ("archive", "remote-1")},
         )
 
+    def test_global_artifact_reconcile_uses_all_unarchived_origins_and_filters(self):
+        headers = self.login()
+        self.workers.values["remote-1"] = {"url": "http://remote-1", "token": "secret"}
+        self.workers.values["remote-2"] = {"url": "http://remote-2", "token": "secret"}
+        self.export_catalog.upsert(
+            profile="default", worker="local", filename="available.json",
+            artifact_key="available.json", status="pending", available=True,
+        )
+        self.export_catalog.upsert(
+            profile="archive", worker="remote-1", filename="missing.json",
+            artifact_key="missing.json", status="deleted", available=False,
+        )
+        self.export_catalog.upsert(
+            profile="archive", worker="remote-2", filename="archived.json",
+            artifact_key="archived.json", status="archived",
+            archived_at="2026-11-01T00:00:00+00:00",
+        )
+
+        global_result = self.client.post(
+            "/api/v1/downloads/artifacts/reconcile?scope=global", headers=headers
+        )
+
+        self.assertEqual(global_result.status_code, 200, global_result.text)
+        global_jobs = global_result.json()["jobs"]
+        self.assertEqual(
+            {(job["profile"], job["worker"]) for job in global_jobs},
+            {("default", "local"), ("archive", "remote-1")},
+        )
+
+        filtered_result = self.client.post(
+            "/api/v1/downloads/artifacts/reconcile?scope=global&profile=archive&worker=remote-1",
+            headers=headers,
+        )
+
+        self.assertEqual(filtered_result.status_code, 200, filtered_result.text)
+        self.assertEqual(
+            {(job["profile"], job["worker"]) for job in filtered_result.json()["jobs"]},
+            {("archive", "remote-1")},
+        )
+
     def test_context_checker_returns_verified_target(self):
         headers = self.login()
         response = self.client.post(

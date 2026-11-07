@@ -134,7 +134,10 @@
     const request = ++generation;
     syncing=true; pending=true; selected=[]; message='Menyinkronkan inventory seluruh profile-worker...';
     try {
-      const result = await post<{jobs?:Array<{id:string}>; id?:string}>('/downloads/artifacts/reconcile', {scope:'global', profile:profileFilter || null, worker:workerFilter || null});
+      const params = new URLSearchParams({scope:'global'});
+      if (profileFilter) params.set('profile', profileFilter);
+      if (workerFilter) params.set('worker', workerFilter);
+      const result = await post<{jobs?:Array<{id:string}>; id?:string}>(`/downloads/artifacts/reconcile?${params}`);
       const jobs = result.jobs || (result.id ? [{id:result.id}] : []);
       while (jobs.length && request === generation) {
         const states = await Promise.all(jobs.map(item => api<{status:string;error?:{message?:string}}>(`/jobs/${item.id}`)));

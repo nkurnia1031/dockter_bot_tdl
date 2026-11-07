@@ -50,6 +50,51 @@ describe('DownloadsPage profile filter', () => {
     expect(requests.filter((url) => url.includes('/downloads/artifacts?'))).toHaveLength(artifactsInitial + 2);
   });
 
+  it('sends global reconcile scope and filters as query parameters', async () => {
+    const requests: Array<{ url: string; method: string; body?: BodyInit | null }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      requests.push({ url, method, body: init?.body });
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', enabled: true }, { name: 'remote-1', enabled: true }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return new Response(JSON.stringify({ profiles: [
+        { name: 'archive', workers: ['remote-1'], exclusive_worker: 'remote-1' }
+      ] }), { status: 200 });
+      if (url.includes('/downloads/artifacts?')) return new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 });
+      if (url.includes('/downloads/artifacts/reconcile')) return new Response(JSON.stringify({ jobs: [] }), { status: 200 });
+      if (url.includes('/jobs')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    await session.restore();
+    render(DownloadsPage);
+    const profilePicker = await screen.findByLabelText('Profile') as HTMLSelectElement;
+    await fireEvent.change(profilePicker, { target: { value: 'archive' } });
+    const workerPicker = screen.getByLabelText('Worker / VPS') as HTMLSelectElement;
+    await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
+    await fireEvent.click(await screen.findByRole('button', { name: /Reconcile global/ }));
+
+    await waitFor(() => expect(requests.some(({ url, method }) =>
+      method === 'POST' && url.includes('/downloads/artifacts/reconcile')
+    )).toBe(true));
+    const request = requests.find(({ url, method }) =>
+      method === 'POST' && url.includes('/downloads/artifacts/reconcile')
+    );
+    if (!request) throw new Error('Global reconcile request was not sent.');
+    const params = new URL(request.url, 'http://localhost').searchParams;
+    expect(params.get('scope')).toBe('global');
+    expect(params.get('profile')).toBe('archive');
+    expect(params.get('worker')).toBe('remote-1');
+    expect(request?.body).toBeUndefined();
+  });
+
   it('offers only verified catalog profiles and reloads with the selected catalog value', async () => {
     const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

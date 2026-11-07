@@ -4,9 +4,9 @@ import mimetypes
 import os
 import shutil
 import tempfile
-import queue
 import threading
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import (
@@ -1578,7 +1578,7 @@ class StorageExecutorMixin:
             ),
         )
         if durable_batch:
-            return self._storage_upload_parallel(
+            return self._storage_upload_round_robin(
                 command,
                 payload=payload,
                 files=files,
@@ -2579,7 +2579,7 @@ class StorageExecutorMixin:
         with self._lock:
             return job_id in self._cancel_requested
 
-    def _storage_upload_parallel(
+    def _storage_upload_round_robin(
         self,
         command: dict[str, Any],
         *,
@@ -2597,7 +2597,7 @@ class StorageExecutorMixin:
         reporter: ProgressReporter,
         upload_item_callback=None,
     ) -> dict[str, Any]:
-        """Run one file at a time per Upload lane and keep durable item outcomes."""
+        """Run one durable file at a time and rotate through Upload profiles."""
         job_id = str(command["job_id"])
         command_id = str(command["command_id"])
         command_store = getattr(self, "command_store", None)
@@ -2640,7 +2640,22 @@ class StorageExecutorMixin:
         skipped_count = 0
         in_flight = 0
         active_items: dict[str, dict[str, Any]] = {}
+        next_sender: str | None = sender_profiles[0] if sender_profiles else None
+        priority_task: dict[str, Any] | None = None
         lane_condition = threading.Condition(lanes_lock)
+
+        def next_active_sender(profile: str) -> str | None:
+            if not active_lanes:
+                return None
+            try:
+                start = sender_profiles.index(profile)
+            except ValueError:
+                start = -1
+            for offset in range(1, len(sender_profiles) + 1):
+                candidate = sender_profiles[(start + offset) % len(sender_profiles)]
+                if candidate in active_lanes:
+                    return candidate
+            return None
 
         def persist(
             path: str,
@@ -2673,7 +2688,7 @@ class StorageExecutorMixin:
 
         # Capture only filesystem metadata before sending. TDL streams file
         # contents; pre-hashing the whole batch delays every upload.
-        tasks: queue.Queue[dict[str, Any]] = queue.Queue()
+        tasks: deque[dict[str, Any]] = deque()
         skipped_tasks: list[dict[str, Any]] = []
         occupied_targets = {
             str(item).replace("\\", "/").strip("/")
@@ -2710,7 +2725,7 @@ class StorageExecutorMixin:
                     skipped_tasks.append(task)
                 else:
                     occupied_targets.add(target_path)
-                    tasks.put(task)
+                    tasks.append(task)
             except Exception:
                 persist(
                     relative,
@@ -2949,22 +2964,25 @@ class StorageExecutorMixin:
             )
 
         def worker_for_lane(profile: str) -> None:
+            nonlocal in_flight, next_sender, priority_task
             runtime = sender_runtimes[profile]
             client = runtime.upload_tdl_client
             while True:
-                nonlocal in_flight
                 with lane_condition:
                     while True:
                         if profile not in active_lanes:
                             return
-                        try:
-                            task = tasks.get_nowait()
+                        if in_flight == 0 and priority_task is None and not tasks:
+                            return
+                        if in_flight == 0 and profile == next_sender:
+                            if priority_task is not None:
+                                task = priority_task
+                                priority_task = None
+                            else:
+                                task = tasks.popleft()
                             in_flight += 1
                             break
-                        except queue.Empty:
-                            if in_flight == 0 and tasks.empty():
-                                return
-                            lane_condition.wait(timeout=0.05)
+                        lane_condition.wait()
                 path = task["path"]
                 relative = task["relative"]
                 attempt = int(task["attempt"])
@@ -2972,11 +2990,10 @@ class StorageExecutorMixin:
                     with self._lock:
                         if job_id in self._cancel_requested:
                             return
-                    with lanes_lock:
+                    with lane_condition:
                         if profile not in active_lanes:
-                            with lane_condition:
-                                tasks.put(task)
-                                lane_condition.notify_all()
+                            tasks.appendleft(task)
+                            lane_condition.notify_all()
                             return
                     size = metadata[relative]
                     base_folder = str(
@@ -3145,9 +3162,15 @@ class StorageExecutorMixin:
                                 error_code=access_denial,
                                 error_message=denied_message,
                             )
-                            with lanes_lock:
+                            with lane_condition:
                                 active_lanes.discard(profile)
                                 has_alternative = bool(active_lanes)
+                                if has_alternative:
+                                    priority_task = {**task, "attempt": attempt + 1}
+                                    next_sender = next_active_sender(profile)
+                                else:
+                                    next_sender = None
+                                lane_condition.notify_all()
                             if has_alternative:
                                 persist(
                                     relative,
@@ -3161,9 +3184,6 @@ class StorageExecutorMixin:
                                 with results_lock:
                                     active_items.pop(relative, None)
                                     active_bytes.pop(relative, None)
-                                with lane_condition:
-                                    tasks.put({**task, "attempt": attempt + 1})
-                                    lane_condition.notify_all()
                                 report_progress(
                                     phase="uploading",
                                     message=f"Memindahkan {path.name} ke lane Upload lain",
@@ -3261,8 +3281,7 @@ class StorageExecutorMixin:
                     )
                     if callable(upload_item_callback):
                         # Quick Mode uses this hook to persist physical Telegram
-                        # evidence to its staging manifest after each accepted
-                        # file, even though the upload is running in parallel.
+                        # evidence after each accepted file before the next item.
                         with checkpoint_lock:
                             with results_lock:
                                 checkpoint_items = [
@@ -3304,8 +3323,8 @@ class StorageExecutorMixin:
                 finally:
                     with lane_condition:
                         in_flight -= 1
+                        next_sender = next_active_sender(profile)
                         lane_condition.notify_all()
-                    tasks.task_done()
 
         with ThreadPoolExecutor(
             max_workers=max(1, len(sender_profiles)),
@@ -3317,11 +3336,9 @@ class StorageExecutorMixin:
 
         # If every verified lane was rejected or rotated, the files still in
         # the FIFO are known not to have been attempted and can be retried.
-        while True:
-            try:
-                task = tasks.get_nowait()
-            except queue.Empty:
-                break
+        while priority_task is not None or tasks:
+            task = priority_task if priority_task is not None else tasks.popleft()
+            priority_task = None
             path = task["path"]
             relative = task["relative"]
             attempt = int(task["attempt"])

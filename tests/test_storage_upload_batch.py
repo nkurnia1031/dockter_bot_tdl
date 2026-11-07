@@ -23,6 +23,9 @@ class _UploadMetrics:
         self.total_active = 0
         self.maximum_total = 0
         self.next_message_id = 100
+        self.upload_order = []
+        self.workspace = None
+        self.workspace_files_at_upload = []
 
 
 class _UploadClient:
@@ -39,12 +42,23 @@ class _UploadClient:
         path = Path(path)
         self.uploads.append(path.name)
         self.captions[path.name] = _caption
-        action = self.behavior.get(path.name)
+        action = self.behavior.get((self.profile, path.name), self.behavior.get(path.name))
         if action == "pre_send_failure":
             raise RuntimeError("failure before tdl starts upload")
+        if action == "denied":
+            raise RuntimeError("CHAT_WRITE_FORBIDDEN")
         if status_callback:
             status_callback("uploading")
         with self.metrics.lock:
+            if self.metrics.workspace is not None:
+                current_files = {
+                    item.relative_to(self.metrics.workspace).as_posix()
+                    for item in self.metrics.workspace.rglob("*")
+                    if item.is_file()
+                }
+                self.metrics.workspace_files_at_upload.append(
+                    (self.profile, path.name, current_files)
+                )
             self.metrics.active[self.profile] = self.metrics.active.get(self.profile, 0) + 1
             self.metrics.maximum[self.profile] = max(
                 self.metrics.maximum.get(self.profile, 0),
@@ -54,6 +68,7 @@ class _UploadClient:
             self.metrics.maximum_total = max(
                 self.metrics.maximum_total, self.metrics.total_active
             )
+            self.metrics.upload_order.append((self.profile, path.name))
             message_id = self.metrics.next_message_id
             self.metrics.next_message_id += 1
         try:
@@ -134,6 +149,7 @@ class _BatchUploader(StorageExecutorMixin):
         self._cancel_requested = set()
         self.events = []
         self.metrics = _UploadMetrics(parallel=parallel)
+        self.metrics.workspace = workspace
         self.session_fingerprints = {"default": "a" * 64, "archive": "b" * 64}
         self.config = SimpleNamespace(
             utility_workspace_root=workspace.parent,
@@ -340,6 +356,8 @@ class StorageUploadBatchTests(unittest.TestCase):
             for item in self.store.storage_upload_items("storage-command")
         }
         self.assertEqual(persisted["nested/already.bin"]["status"], "skipped")
+        self.assertEqual(persisted["nested/new.bin"]["profile"], "default")
+        self.assertEqual(persisted["other/other.txt"]["profile"], "archive")
 
     def test_telegram_upload_skips_duplicate_target_paths_within_flattened_batch(self):
         for relative in ("a/same.txt", "b/same.txt", "b/other.txt"):
@@ -616,47 +634,81 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertTrue(download.resource_keys & utility.resource_keys)
         self.assertFalse(download.resource_keys & sibling_upload.resource_keys)
 
-    def test_durable_batch_runs_fifo_files_in_parallel_with_one_file_per_upload_lane(self):
-        self._add_files("one.txt", "two.txt", "three.txt", "four.txt")
-        uploader = _BatchUploader(self.workspace, self.store, parallel=True)
+    def test_durable_batch_rotates_profiles_for_one_active_file_at_a_time(self):
+        self._add_files("one.txt", "two.txt", "three.txt")
+        uploader = _BatchUploader(self.workspace, self.store, parallel=False)
 
         result = uploader._storage_upload(uploader.command(self.workspace))
 
         self.assertEqual(result["outcome"], "succeeded")
-        self.assertEqual(result["succeeded"], 4)
-        self.assertGreaterEqual(uploader.metrics.maximum_total, 2)
+        self.assertEqual(result["succeeded"], 3)
+        self.assertEqual(uploader.metrics.maximum_total, 1)
         self.assertEqual(uploader.metrics.maximum, {"default": 1, "archive": 1})
+        self.assertEqual(
+            uploader.metrics.upload_order,
+            [("default", "one.txt"), ("archive", "three.txt"), ("default", "two.txt")],
+        )
         progress_snapshots = [
             kwargs.get("progress", {})
             for args, kwargs in uploader.events
             if len(args) > 2 and args[2] == "progress.snapshot"
         ]
-        overlapping_items = next(
-            (
-                snapshot.get("active_items")
-                for snapshot in progress_snapshots
-                if len(snapshot.get("active_items") or []) >= 2
-            ),
-            None,
-        )
-        self.assertIsNotNone(overlapping_items)
-        self.assertEqual(
-            {item["profile"] for item in overlapping_items},
-            {"default", "archive"},
-        )
-        self.assertEqual(len({item["name"] for item in overlapping_items}), 2)
+        active_items = [snapshot.get("active_items") or [] for snapshot in progress_snapshots]
+        self.assertTrue(active_items)
+        self.assertLessEqual(max(map(len, active_items)), 1)
         items = self.store.storage_upload_items("storage-command")
-        self.assertEqual([item["name"] for item in items], ["four.txt", "one.txt", "three.txt", "two.txt"])
+        self.assertEqual([item["name"] for item in items], ["one.txt", "three.txt", "two.txt"])
         self.assertTrue(all(item["status"] == "succeeded" for item in items))
         self.assertTrue(all(len(item["attempts"]) == 1 for item in items))
         self.assertEqual(
-            {item["profile"] for item in items},
-            {"default", "archive"},
+            {item["name"]: item["profile"] for item in items},
+            {"one.txt": "default", "three.txt": "archive", "two.txt": "default"},
         )
+
+    def test_durable_batch_falls_back_only_after_access_denial_and_removes_denied_sender(self):
+        self._add_files("one.txt", "two.txt", "three.txt")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={("default", "one.txt"): "denied"},
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(uploader.runtimes["default"].upload_tdl_client.uploads, ["one.txt"])
+        self.assertEqual(
+            uploader.runtimes["archive"].upload_tdl_client.uploads,
+            ["one.txt", "three.txt", "two.txt"],
+        )
+        self.assertEqual(uploader.metrics.maximum_total, 1)
+        items = {item["name"]: item for item in self.store.storage_upload_items("storage-command")}
+        self.assertEqual(items["one.txt"]["profile"], "archive")
+        self.assertEqual(items["two.txt"]["profile"], "archive")
+        self.assertEqual(items["three.txt"]["profile"], "archive")
+
+    def test_durable_telegram_move_removes_each_file_before_starting_the_next(self):
+        self._add_files("one.txt", "two.txt")
+        uploader = _BatchUploader(self.workspace, self.store)
+        command = uploader.command(self.workspace)
+        command["payload"].update({"transfer_mode": "move", "move_confirmed": True})
+
+        result = uploader._storage_upload(command)
+
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertFalse((self.workspace / "one.txt").exists())
+        self.assertFalse((self.workspace / "two.txt").exists())
+        second_upload = next(
+            observed
+            for observed in uploader.metrics.workspace_files_at_upload
+            if observed[1] == "two.txt"
+        )
+        self.assertNotIn("one.txt", second_upload[2])
+        self.assertIn("two.txt", second_upload[2])
 
     def test_durable_batch_checkpoints_successful_files_through_callback(self):
         self._add_files("one.txt", "two.txt")
-        uploader = _BatchUploader(self.workspace, self.store, parallel=True)
+        uploader = _BatchUploader(self.workspace, self.store, parallel=False)
         checkpoints = []
 
         result = uploader._storage_upload(
@@ -692,6 +744,10 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertTrue(items["safe.txt"]["retryable"])
         self.assertEqual(items["ambiguous.txt"]["status"], "needs_reconciliation")
         self.assertFalse(items["ambiguous.txt"]["retryable"])
+        self.assertEqual(
+            [attempt for attempt in uploader.metrics.upload_order if attempt[1] == "ambiguous.txt"],
+            [("default", "ambiguous.txt")],
+        )
         self.assertEqual(items["success.txt"]["status"], "succeeded")
         persisted = {item["name"]: item for item in self.store.storage_upload_items("storage-command")}
         self.assertEqual(persisted["ambiguous.txt"]["status"], "needs_reconciliation")
