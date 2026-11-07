@@ -52,10 +52,24 @@ function runBookmarklet({
   if (!bookmarklet) throw new Error('Copyable bookmarklet is missing from its documentation.');
   const parsedUrl = new URL(url);
   const outputs: FakeElement[] = [];
+  const flow = { nextVisible: false, secondStepVisible: false };
   const stepControl = stepButtonAvailable ? {
     disabled: false,
     getAttribute: () => null,
     getClientRects: () => [{}],
+    click: vi.fn(() => { flow.nextVisible = true; })
+  } : null;
+  const nextControl = stepButtonAvailable ? {
+    textContent: 'Next',
+    classList: { contains: () => false },
+    getAttribute: () => null,
+    getClientRects: () => flow.nextVisible ? [{}] : [],
+    click: vi.fn(() => { flow.secondStepVisible = true; })
+  } : null;
+  const secondStepControl = stepButtonAvailable ? {
+    disabled: false,
+    getAttribute: () => null,
+    getClientRects: () => flow.secondStepVisible ? [{}] : [],
     click: vi.fn()
   } : null;
   const currentPage = page === undefined ? {
@@ -89,6 +103,11 @@ function runBookmarklet({
       if (selector === '.step-btn') return stepControl;
       return null;
     },
+    querySelectorAll(selector: string) {
+      if (selector === '.step-btn') return [stepControl, secondStepControl].filter(Boolean);
+      if (selector === '.next,button,a,[role=button]') return [nextControl].filter(Boolean);
+      return [];
+    },
     getElementById: () => null,
     execCommand: vi.fn(() => true),
     createElement: (tagName: string) => element(tagName)
@@ -109,7 +128,7 @@ function runBookmarklet({
     (value: string) => Buffer.from(value, 'base64').toString('binary'),
     TextDecoder
   );
-  return { pending, fetch, location, outputs, copied, navigator, stepControl };
+  return { pending, fetch, location, outputs, copied, navigator, stepControl, nextControl, secondStepControl };
 }
 
 describe('copyable Safelink bookmarklet', () => {
@@ -196,7 +215,7 @@ describe('copyable Safelink bookmarklet', () => {
       .toContain('jalankan bookmarklet lagi');
   });
 
-  it('clicks one visible step button when the gate page has no Livewire state', async () => {
+  it('clicks step, waits for Next, clicks it, waits for another step, then clicks once', async () => {
     const result = runBookmarklet({
       url: 'https://new-shortlink.example.test/step/1',
       page: null,
@@ -207,8 +226,10 @@ describe('copyable Safelink bookmarklet', () => {
     await result.pending;
 
     expect(result.stepControl?.click).toHaveBeenCalledTimes(1);
+    expect(result.nextControl?.click).toHaveBeenCalledTimes(1);
+    expect(result.secondStepControl?.click).toHaveBeenCalledTimes(1);
     expect(result.fetch).not.toHaveBeenCalled();
-    expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
-      .toContain('Tombol verifikasi diklik');
+    expect(result.outputs.at(-1)?.children.find((child) => child.tagName === 'p')?.textContent)
+      .toContain('Tiga tombol tahap diklik');
   });
 });
