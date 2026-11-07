@@ -40,16 +40,24 @@ function runBookmarklet({
   stepText,
   bodyText,
   response,
+  stepButtonAvailable,
 }: {
   url: string;
   page?: Record<string, unknown> | null;
   stepText?: string;
   bodyText?: string;
   response?: Record<string, unknown>;
+  stepButtonAvailable?: boolean;
 }) {
   if (!bookmarklet) throw new Error('Copyable bookmarklet is missing from its documentation.');
   const parsedUrl = new URL(url);
   const outputs: FakeElement[] = [];
+  const stepControl = stepButtonAvailable ? {
+    disabled: false,
+    getAttribute: () => null,
+    getClientRects: () => [{}],
+    click: vi.fn()
+  } : null;
   const currentPage = page === undefined ? {
     fingerprint: { id: 'component-1', name: 'pages.show' },
     serverMemo: { data: { phase: 0, captcha: false, hasCaptcha: false }, checksum: 'test-checksum' }
@@ -78,6 +86,7 @@ function runBookmarklet({
       if (selector === '[wire\\:initial-data]') {
         return currentPage ? { getAttribute: () => JSON.stringify(currentPage) } : null;
       }
+      if (selector === '.step-btn') return stepControl;
       return null;
     },
     getElementById: () => null,
@@ -100,7 +109,7 @@ function runBookmarklet({
     (value: string) => Buffer.from(value, 'base64').toString('binary'),
     TextDecoder
   );
-  return { pending, fetch, location, outputs, copied, navigator };
+  return { pending, fetch, location, outputs, copied, navigator, stepControl };
 }
 
 describe('copyable Safelink bookmarklet', () => {
@@ -173,15 +182,33 @@ describe('copyable Safelink bookmarklet', () => {
     const result = runBookmarklet({
       url: 'https://crm.urlwebsite.com/v/example',
       page: null,
-      bodyText: 'Just a moment... Enable JavaScript and cookies to continue'
+      bodyText: 'Just a moment... Enable JavaScript and cookies to continue',
+      stepButtonAvailable: true
     });
 
     await result.pending;
 
     expect(result.fetch).not.toHaveBeenCalled();
+    expect(result.stepControl?.click).not.toHaveBeenCalled();
     expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
       .toContain('Cloudflare');
     expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
       .toContain('jalankan bookmarklet lagi');
+  });
+
+  it('clicks one visible step button when the gate page has no Livewire state', async () => {
+    const result = runBookmarklet({
+      url: 'https://new-shortlink.example.test/step/1',
+      page: null,
+      bodyText: 'Step 1/5 Click to verify',
+      stepButtonAvailable: true
+    });
+
+    await result.pending;
+
+    expect(result.stepControl?.click).toHaveBeenCalledTimes(1);
+    expect(result.fetch).not.toHaveBeenCalled();
+    expect(result.outputs[0]?.children.find((child) => child.tagName === 'p')?.textContent)
+      .toContain('Tombol verifikasi diklik');
   });
 });
