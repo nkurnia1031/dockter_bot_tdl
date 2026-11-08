@@ -100,6 +100,43 @@ class FakeRunner:
 
 
 class TDLClientTests(unittest.TestCase):
+    def test_tts_caption_lookup_uses_delivery_time_range(self):
+        class TtsLookupRunner:
+            def __init__(self):
+                self.command = None
+
+            def run(self, command, **kwargs):
+                del kwargs
+                self.command = command
+                output_path = Path(command[command.index("-o") + 1])
+                output_path.write_text(json.dumps({
+                    "messages": [
+                        {"id": 10, "date": 1_700_000_000, "caption": "Bab 4"},
+                        {"id": 11, "date": 1_700_000_050, "caption": "Bab 4 (1/2)"},
+                        {"id": 12, "date": 1_700_000_200, "caption": "Bab 4 (1/2)"},
+                    ]
+                }), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "ok", "")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = TtsLookupRunner()
+            client = TDLClient(Path(directory), "tts", runner=runner)
+            found = client.find_message_id_by_caption(
+                "-100123", "Bab 4 (1/2)", after_timestamp="2023-11-14T22:15:00+00:00"
+            )
+            absent = client.find_message_id_by_caption(
+                "-100123", "Bab 5", after_timestamp="2023-11-14T22:15:00+00:00"
+            )
+
+        self.assertEqual(found, 12)
+        self.assertIsNone(absent)
+        self.assertIn("-T", runner.command)
+        self.assertEqual(runner.command[runner.command.index("-T") + 1], "time")
+        start, end = runner.command[runner.command.index("-i") + 1].split(",", 1)
+        self.assertEqual(start, "1700000100")
+        self.assertGreater(int(end), int(start))
+        self.assertIn("--with-content", runner.command)
+
     def test_interrupt_current_delegates_to_the_clients_runner(self):
         class InterruptRunner:
             def __init__(self):

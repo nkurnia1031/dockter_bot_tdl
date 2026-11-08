@@ -5492,7 +5492,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn(artifact_ref, public_job.text + public_events.text)
         self.assertNotIn("chat_id", (public_job.text + public_events.text).lower())
 
-    def test_tts_retry_refuses_unconfirmed_delivery_to_prevent_duplicate_audio(self):
+    def test_tts_retry_dispatches_unconfirmed_delivery_for_worker_reconciliation(self):
         self.dispatcher.tts_ready = True
         self.jobs.set_tts_telegram_ready(True)
         headers = self.login()
@@ -5531,18 +5531,19 @@ class BackendApiTests(unittest.TestCase):
             },
             error={"code": "JOB_STALLED", "message": "Worker tidak merespons."},
         ))
+        self.dispatcher.tts_health_result["available_profiles"] = ["irang"]
         dispatch_count = len(self.dispatcher.commands)
 
         response = self.client.post(
             f"/api/v1/tts/jobs/{job_id}/retry", headers=headers
         )
 
-        self.assertEqual(response.status_code, 409, response.text)
-        self.assertEqual(
-            response.json()["error"]["code"],
-            "TTS_DELIVERY_RECONCILIATION_REQUIRED",
-        )
-        self.assertEqual(len(self.dispatcher.commands), dispatch_count)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.dispatcher.commands), dispatch_count + 1)
+        retried_command = self.dispatcher.commands[-1][1]
+        self.assertEqual(retried_command["job_id"], job_id)
+        self.assertTrue(retried_command["payload"]["_tts_reconcile_delivery"])
+        self.assertEqual(retried_command["payload"]["_tdl_sender_profiles"], ["irang"])
         self.assertEqual(
             self.jobs.get_tts_delivery(claimed[0]["id"])["status"], "claimed"
         )
@@ -5608,6 +5609,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(pending.status_code, 200, pending.text)
         item = pending.json()["items"][0]
         self.assertEqual(item["artifact_ref"], artifact_ref)
+        self.assertTrue(item["created_at"])
         delivery_id = item["id"]
         denied = self.client.patch(
             f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
@@ -5615,6 +5617,30 @@ class BackendApiTests(unittest.TestCase):
             json={"worker": "remote", "delivered": True},
         )
         self.assertEqual(denied.status_code, 403)
+
+        held = self.client.patch(
+            f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+            headers={"Authorization": "Bearer internal"},
+            json={
+                "worker": "local",
+                "delivered": False,
+                "reconciliation_required": True,
+            },
+        )
+        self.assertEqual(held.status_code, 200, held.text)
+        self.assertEqual(held.json()["status"], "reconciliation_required")
+        self.jobs.create_tts_deliveries(
+            job_id,
+            "local",
+            "Bab",
+            [{"artifact_ref": artifact_ref, "part_index": 1, "total_parts": 1, "byte_size": 512}],
+        )
+        pending = self.client.get(
+            pending_path,
+            headers={"Authorization": "Bearer internal"},
+        )
+        self.assertEqual(pending.status_code, 200, pending.text)
+        delivery_id = pending.json()["items"][0]["id"]
         completed = self.client.patch(
             f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
             headers={"Authorization": "Bearer internal"},

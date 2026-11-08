@@ -12,7 +12,7 @@ from typing import Any
 
 from tme3bot.domain.models import utc_now
 from tme3bot.infrastructure.http_client import request_json
-from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
+from tme3bot.tdl import tdl_access_denial_code, tdl_session_denial_code, tdl_write_denial_code
 from tme3bot.worker.tts_pipeline import TtsCancelled, TtsError, TtsPipeline
 
 LOGGER = logging.getLogger(__name__)
@@ -243,10 +243,31 @@ class TtsExecutorMixin:
             if selected_profile not in sender_profiles:
                 sender_profiles.insert(0, selected_profile)
             sender_profiles = list(dict.fromkeys(sender_profiles))
+            reconcile_delivery = bool(payload.get("_tts_reconcile_delivery"))
             runtime = self.profile_manager.runtime(selected_profile)
             self._append_job_log(
                 f"[TTS] mengirim lewat TDL profile={runtime.name} parts={len(result['artifacts'])}"
             )
+
+            def save_delivery_result(
+                delivery_id: str,
+                *,
+                delivered: bool,
+                reconciliation_required: bool = False,
+            ) -> None:
+                request_json(
+                    self.config.backend_api_url,
+                    self.config.backend_internal_token,
+                    "PATCH",
+                    f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
+                    {
+                        "worker": worker_name,
+                        "delivered": delivered,
+                        "reconciliation_required": reconciliation_required,
+                    },
+                    timeout=10,
+                )
+
             while True:
                 if self._job_cancelled(job_id):
                     request_json(
@@ -278,13 +299,10 @@ class TtsExecutorMixin:
                     total_parts = int(item.get("total_parts") or len(result["artifacts"]))
                     if not delivery_id or artifact_path is None:
                         if delivery_id:
-                            request_json(
-                                self.config.backend_api_url,
-                                self.config.backend_internal_token,
-                                "PATCH",
-                                f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
-                                {"worker": worker_name, "delivered": False},
-                                timeout=10,
+                            save_delivery_result(
+                                delivery_id,
+                                delivered=False,
+                                reconciliation_required=reconcile_delivery,
                             )
                         raise TtsError("Artifact TTS tidak tersedia untuk pengiriman")
                     if self._job_cancelled(job_id):
@@ -297,7 +315,126 @@ class TtsExecutorMixin:
                             timeout=10,
                         )
                         raise TtsCancelled("Job TTS dibatalkan")
-                    caption = title if total_parts == 1 else f"{title} ({part_index}/{total_parts})"
+                    caption = (
+                        title
+                        if total_parts == 1
+                        else f"{title} ({part_index}/{total_parts})"
+                    )
+                    if reconcile_delivery:
+                        created_at = str(item.get("created_at") or "").strip()
+                        if not created_at:
+                            save_delivery_result(
+                                delivery_id,
+                                delivered=False,
+                                reconciliation_required=True,
+                            )
+                            raise TtsError(
+                                "Waktu delivery tidak tersedia untuk pemeriksaan ulang.",
+                                code="TTS_DELIVERY_RECONCILIATION_FAILED",
+                            )
+
+                        accessible_profile: str | None = None
+                        denied_profiles: set[str] = set()
+                        existing_message_id: int | None = None
+                        for sender_profile in sender_profiles:
+                            try:
+                                sender_runtime = self.profile_manager.runtime(sender_profile)
+                                with sender_runtime.export_operation_lock:
+                                    with self._capture_tdl_output(
+                                        sender_runtime.export_tdl_client,
+                                        command_callback=self._command_callback(
+                                            profile=sender_profile, runtime="tts"
+                                        ),
+                                    ):
+                                        existing_message_id = (
+                                            sender_runtime.export_tdl_client.find_message_id_by_caption(
+                                                target_chat,
+                                                caption,
+                                                after_timestamp=created_at,
+                                            )
+                                        )
+                            except Exception as lookup_error:
+                                denial = tdl_access_denial_code(lookup_error)
+                                if denial:
+                                    denied_profiles.add(sender_profile)
+                                    self.publisher.emit(
+                                        job_id,
+                                        "running",
+                                        "tdl_access.profile_denied",
+                                        result={
+                                            "profile": sender_profile,
+                                            "error_code": denial,
+                                        },
+                                    )
+                                    self._append_job_log(
+                                        f"[TTS] akses pemeriksaan ditolak profile={sender_profile} code={denial}; mencoba profil berikutnya"
+                                    )
+                                    continue
+                                save_delivery_result(
+                                    delivery_id,
+                                    delivered=False,
+                                    reconciliation_required=True,
+                                )
+                                self._append_job_log(
+                                    f"[TTS] pemeriksaan ulang ambigu profile={sender_profile} error={type(lookup_error).__name__}"
+                                )
+                                raise TtsError(
+                                    "Pemeriksaan chat tujuan gagal atau tidak lengkap; bagian audio ditahan agar tidak terkirim ganda.",
+                                    code="TTS_DELIVERY_RECONCILIATION_FAILED",
+                                ) from None
+
+                            accessible_profile = sender_profile
+                            break
+
+                        if accessible_profile is None:
+                            save_delivery_result(
+                                delivery_id,
+                                delivered=False,
+                                reconciliation_required=True,
+                            )
+                            self._append_job_log(
+                                "[TTS] tidak ada profil lokal yang dapat mengakses chat tujuan melalui TDL"
+                            )
+                            raise TtsError(
+                                "Tidak ada profil lokal yang dapat mengakses chat tujuan melalui TDL. Periksa akses channel pada profil worker.",
+                                code="TTS_CHANNEL_UNAVAILABLE",
+                            )
+
+                        selected_profile = accessible_profile
+                        sender_profiles = [
+                            accessible_profile,
+                            *[
+                                profile
+                                for profile in sender_profiles
+                                if profile != accessible_profile and profile not in denied_profiles
+                            ],
+                        ]
+                        if existing_message_id is not None:
+                            save_delivery_result(delivery_id, delivered=True)
+                            self._append_job_log(
+                                f"[TTS] bagian={part_index}/{total_parts} sudah ditemukan di chat tujuan melalui TDL; upload dilewati"
+                            )
+                            state = request_json(
+                                self.config.backend_api_url,
+                                self.config.backend_internal_token,
+                                "GET",
+                                f"/internal/v1/tts/jobs/{job_id}/delivery?worker={worker_name}",
+                                timeout=10,
+                            )
+                            delivered = int(state.get("delivered_parts") or 0)
+                            total = int(state.get("total_parts") or len(result["artifacts"]))
+                            emit({"phase": "telegram_delivery", "current": delivered, "total": total})
+                            if state.get("status") == "delivered":
+                                self.delete_tts_artifacts(job_id)
+                                return {
+                                    "title": title,
+                                    "character_count": result["character_count"],
+                                    "part_count": result["part_count"],
+                                    "delivered_parts": delivered,
+                                    "sender_profile": selected_profile,
+                                }
+                            continue
+
                     try:
                         self._append_job_log(
                             f"[TTS] upload TDL bagian={part_index}/{total_parts}"
@@ -352,6 +489,11 @@ class TtsExecutorMixin:
                                         )
                                         continue
                                     if denial:
+                                        if reconcile_delivery:
+                                            raise TtsError(
+                                                "Tidak ada profil lokal yang dapat mengirim ke chat tujuan melalui TDL. Periksa akses channel pada profil worker.",
+                                                code="TTS_CHANNEL_UNAVAILABLE",
+                                            ) from None
                                         raise TtsError(
                                             f"{denial}: pengiriman TDL ditolak untuk profil pengirim.",
                                             code=denial,
@@ -365,13 +507,10 @@ class TtsExecutorMixin:
                             upload_path.unlink(missing_ok=True)
                     except Exception as exc:
                         try:
-                            request_json(
-                                self.config.backend_api_url,
-                                self.config.backend_internal_token,
-                                "PATCH",
-                                f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
-                                {"worker": worker_name, "delivered": False},
-                                timeout=10,
+                            save_delivery_result(
+                                delivery_id,
+                                delivered=False,
+                                reconciliation_required=True,
                             )
                         except Exception:
                             LOGGER.warning(
@@ -380,20 +519,18 @@ class TtsExecutorMixin:
                                 part_index,
                             )
                         denial = tdl_write_denial_code(exc) or tdl_session_denial_code(exc)
+                        if (
+                            isinstance(exc, TtsError)
+                            and exc.code == "TTS_CHANNEL_UNAVAILABLE"
+                        ):
+                            raise exc
                         if denial:
                             raise TtsError(
                                 f"{denial}: pengiriman TDL ditolak untuk profil pengirim.",
                                 code=denial,
                             ) from None
                         raise TtsError(f"Pengiriman TDL gagal ({type(exc).__name__})") from None
-                    request_json(
-                        self.config.backend_api_url,
-                        self.config.backend_internal_token,
-                        "PATCH",
-                        f"/internal/v1/tts/deliveries/{delivery_id}/worker-result",
-                        {"worker": worker_name, "delivered": True},
-                        timeout=10,
-                    )
+                    save_delivery_result(delivery_id, delivered=True)
                     state = request_json(
                         self.config.backend_api_url,
                         self.config.backend_internal_token,

@@ -1287,7 +1287,7 @@ class SqliteJobRepository:
                     "UPDATE job_tts_deliveries SET status = 'claimed', lease_until = ?, attempts = attempts + 1 WHERE id = ?",
                     (lease_until, delivery_id),
                 )
-                fields = "id, job_id, title, part_index, total_parts, byte_size, attempts"
+                fields = "id, job_id, title, part_index, total_parts, byte_size, attempts, created_at"
                 if include_artifact_ref:
                     fields += ", artifact_ref"
                 row = db.execute(
@@ -1306,7 +1306,11 @@ class SqliteJobRepository:
         return dict(row) if row is not None else None
 
     def complete_tts_delivery(
-        self, delivery_id: str, *, delivered: bool
+        self,
+        delivery_id: str,
+        *,
+        delivered: bool,
+        reconciliation_required: bool = False,
     ) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
         with self._db() as db:
@@ -1321,6 +1325,12 @@ class SqliteJobRepository:
                 db.execute(
                     "UPDATE job_tts_deliveries SET status = 'delivered', lease_until = NULL, delivered_at = ?, last_error_code = NULL WHERE id = ?",
                     (now.isoformat(), str(delivery_id)),
+                )
+            elif reconciliation_required:
+                delay = min(300, 2 ** min(int(row["attempts"]), 8))
+                db.execute(
+                    "UPDATE job_tts_deliveries SET status = 'reconciliation_required', lease_until = NULL, available_at = ?, last_error_code = 'TTS_DELIVERY_RECONCILIATION_FAILED' WHERE id = ?",
+                    ((now + timedelta(seconds=delay)).isoformat(), str(delivery_id)),
                 )
             else:
                 delay = min(300, 2 ** min(int(row["attempts"]), 8))

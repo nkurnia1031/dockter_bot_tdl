@@ -4026,20 +4026,21 @@ class ControlPlane:
         self.require_profile(actor, original.profile)
         if not original.status.terminal:
             raise DomainError("JOB_NOT_TERMINAL", "Job TTS masih aktif.", status_code=409)
+        needs_delivery_reconciliation = False
         delivery_summary = getattr(self.jobs, "tts_delivery_summary", None)
         if callable(delivery_summary):
             summary = delivery_summary(job_id)
             total_parts = int(summary.get("total_parts") or 0)
             delivered_parts = int(summary.get("delivered_parts") or 0)
-            if total_parts and delivered_parts < total_parts:
-                raise DomainError(
-                    "TTS_DELIVERY_RECONCILIATION_REQUIRED",
-                    "Sebagian hasil TTS belum terkonfirmasi terkirim. Retry otomatis dihentikan agar audio tidak terkirim ganda; periksa chat tujuan sebelum membuat job baru.",
-                    status_code=409,
-                )
+            needs_delivery_reconciliation = bool(
+                total_parts and delivered_parts < total_parts
+            )
         command_payload = self.jobs.command_payload(job_id)
         if not isinstance(command_payload, dict) or not str(command_payload.get("text") or ""):
             raise DomainError("RETRY_PAYLOAD_UNAVAILABLE", "Teks internal job TTS tidak tersedia untuk retry.", status_code=409)
+        if needs_delivery_reconciliation:
+            command_payload = deepcopy(command_payload)
+            command_payload["_tts_reconcile_delivery"] = True
         return self.submit_job(
             actor,
             "tts",

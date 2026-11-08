@@ -194,12 +194,29 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
         delivered = body.get("delivered")
         if type(delivered) is not bool:
             raise DomainError("TTS_DELIVERY_RESULT_INVALID", "Hasil delivery harus boolean.", status_code=422)
+        reconciliation_required = body.get("reconciliation_required", False)
+        if type(reconciliation_required) is not bool:
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Status rekonsiliasi delivery harus boolean.",
+                status_code=422,
+            )
+        if delivered and reconciliation_required:
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Delivery sukses tidak dapat ditandai masih memerlukan rekonsiliasi.",
+                status_code=422,
+            )
         item = context.control_plane.jobs.get_tts_delivery(delivery_id)
         if item is None:
             raise DomainError("TTS_DELIVERY_NOT_FOUND", "Delivery TTS tidak ditemukan.", status_code=404)
         if str(body.get("worker") or "").strip().lower() != str(item.get("worker") or "").lower():
             raise DomainError("JOB_WORKER_MISMATCH", "Worker bukan pemilik delivery TTS.", status_code=403)
-        updated = context.control_plane.jobs.complete_tts_delivery(delivery_id, delivered=delivered)
+        updated = context.control_plane.jobs.complete_tts_delivery(
+            delivery_id,
+            delivered=delivered,
+            reconciliation_required=reconciliation_required,
+        )
         return {"status": str(updated.get("status") if updated else "missing")}
 
     @app.post(

@@ -11,6 +11,7 @@ import threading
 import time
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -63,6 +64,11 @@ _TDL_SESSION_DENIAL_MARKERS = (
     "AUTH_KEY_INVALID",
     "SESSION_REVOKED",
 )
+_TDL_ACCESS_DENIAL_CODES = (
+    "CHAT_FORBIDDEN",
+    "USER_NOT_PARTICIPANT",
+    "CHANNEL_INVALID",
+)
 _TDL_SESSION_DENIAL_MARKERS = (
     "NOT AUTHORIZED",
     "PLEASE LOGIN FIRST",
@@ -97,6 +103,21 @@ def tdl_session_denial_code(exc: BaseException) -> str | None:
     if any(marker in text for marker in _TDL_SESSION_DENIAL_MARKERS):
         return "TDL_SESSION_UNAUTHORIZED"
     return None
+
+
+def tdl_access_denial_code(exc: BaseException) -> str | None:
+    """Return a stable code only when TDL explicitly denies chat access."""
+    denial = tdl_session_denial_code(exc) or tdl_write_denial_code(exc)
+    if denial:
+        return denial
+    sources = [str(exc)]
+    sources.extend(
+        value
+        for name in ("stdout", "stderr")
+        if isinstance((value := getattr(exc, name, None)), str)
+    )
+    text = "\n".join(sources).upper()
+    return next((code for code in _TDL_ACCESS_DENIAL_CODES if code in text), None)
 
 
 def tdl_session_denial_code(exc: BaseException) -> str | None:
@@ -781,6 +802,25 @@ def _message_contains_caption(message: dict[str, Any], normalized_caption: str) 
     return visit(message)
 
 
+def _timestamp_seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return float(text)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+
 class TDLClient:
     def __init__(
         self,
@@ -1081,6 +1121,64 @@ class TDLClient:
             "-o", str(export_path), "--with-content",
         ]
         return self._export_messages(export_path, export_args, require_content=True)
+
+    def find_message_id_by_caption(
+        self,
+        chat_ref: str,
+        caption: str,
+        *,
+        after_timestamp: str,
+    ) -> int | None:
+        """Find a recent message whose exported content contains ``caption``.
+
+        TTS retries use the delivery row's creation time as a lower bound. The
+        time-range export keeps this check bounded to messages around the
+        original send attempt instead of exporting the entire chat history.
+        """
+        cutoff = _timestamp_seconds(after_timestamp)
+        if cutoff is None:
+            raise TDLDataError("TTS delivery timestamp is missing or invalid.")
+        normalized_caption = _normalize_upload_caption(caption)
+        if not normalized_caption:
+            raise TDLDataError("TTS delivery caption is empty.")
+
+        export_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", prefix="tme3bot-tts-reconcile-", delete=False
+            ) as handle:
+                export_path = Path(handle.name)
+            exported = self.export_messages_by_time(
+                chat_ref,
+                int(cutoff),
+                int(time.time()) + 60,
+                export_path,
+                with_content=True,
+            )
+            matches: list[tuple[float, int]] = []
+            for message in exported.messages:
+                message_id = message.get("id")
+                if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 1:
+                    continue
+                if not _message_contains_caption(message, normalized_caption):
+                    continue
+                message_time = _timestamp_seconds(
+                    message.get("date", message.get("timestamp"))
+                )
+                # Older TDL JSON variants omit dates. Caption matching still
+                # works for those variants; its ambiguity is surfaced by the
+                # product behavior the operator accepted.
+                if message_time is not None and message_time < cutoff:
+                    continue
+                matches.append(
+                    (message_time if message_time is not None else float("-inf"), message_id)
+                )
+            if not matches:
+                return None
+            return max(matches, key=lambda item: (item[0], item[1]))[1]
+        finally:
+            if export_path is not None:
+                export_path.unlink(missing_ok=True)
 
     def _export_messages(
         self,
