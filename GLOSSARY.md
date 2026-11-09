@@ -154,6 +154,12 @@ _Avoid_: salinan state per worker.
 Pemulihan sesi lokal sebelumnya jika bundle baru gagal dipasang atau diuji. Sesi lama hanya boleh dipakai bila masih lolos pemeriksaan TDL dan identitasnya cocok.
 _Avoid_: fallback ke sumber profil lain.
 
+## Download
+
+**Unduhan Aria2**:
+Unduhan dari URI yang dikelola pada worker terpilih dan disimpan dalam folder Workspace worker tersebut.
+_Avoid_: Unduhan Storage, unduhan artifact ekspor.
+
 ## Storage
 
 **Unduhan Storage**:
