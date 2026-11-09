@@ -89,7 +89,7 @@
       protocol,
       host: window.location.hostname,
       port,
-      interface: `/api/v1/aria2-rpc-${worker}`
+      interface: `api/v1/aria2-rpc-${worker}`
     });
     return `/api/v1/aria2-ui/${encodeURIComponent(worker)}/index.html#!/settings/rpc/set?${config.toString()}`;
   }

@@ -42,7 +42,9 @@ describe('AriaNg worker readiness', () => {
     expect(screen.getByText('Engine: aria2 1.36.0')).toBeTruthy();
     expect(screen.getByText('Hook low-speed: siap')).toBeTruthy();
     expect(frame.getAttribute('src')).toContain('/api/v1/aria2-ui/remote-1/index.html');
-    expect(frame.getAttribute('src')).toContain('%2Fapi%2Fv1%2Faria2-rpc-remote-1');
+    const iframeUrl = new URL(frame.getAttribute('src')!, window.location.origin);
+    const iframeConfig = new URLSearchParams(iframeUrl.hash.split('?')[1] || '');
+    expect(iframeConfig.get('interface')).toBe('api/v1/aria2-rpc-remote-1');
     expect(frame.getAttribute('src')).not.toContain('secret');
     expect(apiMock).toHaveBeenCalledWith('/workers/remote-1/aria2/health');
   });
