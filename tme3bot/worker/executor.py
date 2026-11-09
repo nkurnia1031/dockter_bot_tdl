@@ -288,6 +288,16 @@ class WorkerJobExecutor(
     def aria2_health(self) -> dict[str, object]:
         return self.aria2_runtime.health()
 
+    def aria2_rpc(
+        self, request_payload: dict[str, Any], *, requested_directory: str = ""
+    ) -> dict[str, Any]:
+        return self.aria2_runtime.rpc(
+            request_payload, requested_directory=requested_directory
+        )
+
+    def aria2_ui_asset_path(self, asset_path: str) -> Path | None:
+        return self.aria2_runtime.ui_asset_path(asset_path)
+
     def storage_download_links(self) -> list[dict[str, str]]:
         return self.public_download_links.active_links()
 

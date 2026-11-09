@@ -38,6 +38,8 @@ class FakeExecutor:
             "engine": {"ready": True, "version": "1.36.0"},
             "hook": {"ready": True, "script_present": True, "configured": True},
         }
+        self.aria2_rpc_calls = []
+        self.aria2_ui_root = None
         self.profile_readiness_canary_requests = []
         self.profile_readiness_canary_status = {
             "id": "8ec4a6df-26f8-49eb-a1ae-c057d9fa4bc1",
@@ -189,6 +191,22 @@ class FakeExecutor:
 
     def aria2_health(self):
         return dict(self.aria2_health_result)
+
+    def aria2_rpc(self, payload, *, requested_directory=""):
+        self.aria2_rpc_calls.append((dict(payload), requested_directory))
+        return {"jsonrpc": "2.0", "id": payload.get("id"), "result": "OK"}
+
+    def aria2_ui_asset_path(self, asset_path):
+        if self.aria2_ui_root is None:
+            return None
+        from pathlib import Path
+        root = Path(self.aria2_ui_root).resolve()
+        try:
+            target = (root / asset_path).resolve(strict=True)
+            target.relative_to(root)
+            return target if target.is_file() else None
+        except (OSError, ValueError):
+            return None
 
     def diagnose_profile_export(self, profile):
         return {
@@ -846,6 +864,24 @@ class WorkerApiTests(unittest.TestCase):
         self.assertTrue(response.json()["ready"])
         self.assertEqual(response.json()["engine"]["version"], "1.36.0")
         self.assertNotIn("secret", response.text.lower())
+
+    def test_aria2_rpc_and_assets_require_worker_auth(self):
+        payload = {"jsonrpc": "2.0", "id": "one", "method": "aria2.getVersion", "params": []}
+        denied = self.client.post("/internal/v1/aria2/jsonrpc", json=payload)
+        self.assertEqual(denied.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        accepted = self.client.post("/internal/v1/aria2/jsonrpc", headers=headers, json=payload)
+        self.assertEqual(accepted.status_code, 200)
+        self.assertEqual(accepted.json()["result"], "OK")
+        self.assertEqual(self.executor.aria2_rpc_calls[0][0]["method"], "aria2.getVersion")
+
+        self.executor.aria2_ui_root = Path(self.temp.name)
+        (Path(self.temp.name) / "index.html").write_text("<html></html>", encoding="utf-8")
+        denied_asset = self.client.get("/internal/v1/aria2/ui/index.html")
+        self.assertEqual(denied_asset.status_code, 401)
+        asset = self.client.get("/internal/v1/aria2/ui/index.html", headers=headers)
+        self.assertEqual(asset.status_code, 200)
+        self.assertEqual(asset.text, "<html></html>")
 
     def test_worker_runtime_settings_are_internal_and_validate_storage_profile(self):
         headers = {"Authorization": "Bearer worker-secret"}

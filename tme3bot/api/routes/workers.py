@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from fastapi import Depends
+from fastapi import Depends, Response
 from tme3bot.api.schemas import (
     ObjectResponse,
     WorkerEnabledRequest,
@@ -201,6 +201,54 @@ def _tts_runtime_evidence(payload) -> tuple[bool, str, str]:
         ).encode("utf-8")
     ).hexdigest()
     return True, "", fingerprint
+
+
+def _aria2_rpc_setup_script(worker: str) -> str:
+    endpoint = json.dumps(f"/api/v1/aria2-rpc-{worker}")
+    folder_key = json.dumps(f"tme3-aria2-folder:{worker}")
+    return f"""(() => {{
+  const endpoint = {endpoint};
+  const folderKey = {folder_key};
+  const csrf = () => document.cookie.split('; ').find((part) => part.startsWith('tme3_csrf='))?.split('=').slice(1).join('') || '';
+  const isRpc = (url) => {{ try {{ return new URL(url, location.href).pathname === endpoint; }} catch {{ return false; }} }};
+  const withDirectory = (body) => {{
+    if (typeof body !== 'string') return body;
+    try {{
+      const call = JSON.parse(body);
+      if (!call || typeof call !== 'object' || !Array.isArray(call.params)) return body;
+      const index = {{ 'aria2.addUri': 1, 'aria2.addTorrent': 2, 'aria2.addMetalink': 1 }}[call.method];
+      if (index === undefined) return body;
+      while (call.params.length <= index) call.params.push(null);
+      const options = call.params[index] && typeof call.params[index] === 'object' ? call.params[index] : {{}};
+      options.dir = localStorage.getItem(folderKey) || '/workspace/aria2';
+      options['allow-overwrite'] = 'false';
+      options['auto-file-renaming'] = 'false';
+      call.params[index] = options;
+      return JSON.stringify(call);
+    }} catch {{ return body; }}
+  }};
+  const originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {{
+    this.__tme3Aria2Rpc = isRpc(url);
+    return originalOpen.call(this, method, url, ...rest);
+  }};
+  const originalSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.send = function(body) {{
+    if (this.__tme3Aria2Rpc) {{
+      this.setRequestHeader('X-CSRF-Token', csrf());
+      body = withDirectory(body);
+    }}
+    return originalSend.call(this, body);
+  }};
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = (input, init = {{}}) => {{
+    const url = input instanceof Request ? input.url : input;
+    if (!isRpc(url)) return originalFetch(input, init);
+    const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
+    headers.set('X-CSRF-Token', csrf());
+    return originalFetch(input, {{ ...init, headers, body: withDirectory(init.body) }});
+  }};
+}})();"""
 
 
 def _read_profile_inventory(context, worker: str, *, start_upload_prep: bool) -> dict:
@@ -2373,6 +2421,67 @@ def register_workers(app, context, *, current_actor):
                 "last_result": hook_last_result,
             },
         }
+
+    @app.post("/api/v1/aria2-rpc-{name}")
+    def aria2_rpc_proxy(name: str, body: dict, actor=Depends(current_actor)):
+        del actor
+        record = context.worker_registry.get(name)
+        if record is None:
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Worker tidak ditemukan."}}
+        if not bool(record.get("enabled", True)):
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Worker sedang nonaktif."}}
+        dispatcher = getattr(context.worker_dispatcher, "aria2_rpc", None)
+        if not callable(dispatcher):
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Bridge Aria2 belum tersedia."}}
+        try:
+            return dispatcher(name, body)
+        except Exception:
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Worker Aria2 tidak dapat dihubungi."}}
+
+    @app.get("/api/v1/aria2-ui/{name}/{asset_path:path}")
+    def aria2_ui_asset(name: str, asset_path: str, actor=Depends(current_actor)):
+        del actor
+        record = context.worker_registry.get(name)
+        if record is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        if not bool(record.get("enabled", True)):
+            raise DomainError("WORKER_DISABLED", "Worker sedang nonaktif.", status_code=409)
+        if asset_path == "rpc-setup.js":
+            return Response(
+                _aria2_rpc_setup_script(name),
+                media_type="application/javascript",
+                headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"},
+            )
+        fetch_asset = getattr(context.worker_dispatcher, "aria2_ui_asset", None)
+        if not callable(fetch_asset):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung AriaNg.", status_code=409)
+        try:
+            content, content_type = fetch_asset(name, asset_path or "index.html")
+        except Exception:
+            raise DomainError("ARIA2_UI_UNAVAILABLE", "AriaNg worker tidak dapat dimuat.", status_code=503) from None
+        if not isinstance(content, bytes):
+            raise DomainError("ARIA2_UI_UNAVAILABLE", "AriaNg worker mengembalikan asset tidak valid.", status_code=502)
+        if asset_path in {"", "index.html"} and "text/html" in str(content_type).lower():
+            page = content.decode("utf-8", errors="replace")
+            safe_name = json.dumps(name)[1:-1]
+            script = '<script src="/api/v1/aria2-ui/' + safe_name + '/rpc-setup.js"></script>'
+            if not re.search(r"<script[^>]+rpc-setup\.js", page, flags=re.IGNORECASE):
+                page, count = re.subn(
+                    r"</head\s*>",
+                    lambda match: script + match.group(0),
+                    page,
+                    count=1,
+                    flags=re.IGNORECASE,
+                )
+                if count == 0:
+                    page = script + page
+            content = page.encode("utf-8")
+        media_type = str(content_type).split(";", 1)[0].strip() or "application/octet-stream"
+        return Response(
+            content,
+            media_type=media_type,
+            headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"},
+        )
 
     @app.post(
         "/api/v1/workers/{name}/tts/helpers/{slot}/recover",

@@ -19,11 +19,28 @@ class _Aria2RpcHandler(BaseHTTPRequestHandler):
             status = 401
             body = {"error": {"code": 1, "message": "Unauthorized"}}
         else:
+            self.server.calls.append(request)
+            method = request.get("method")
+            if method in {"aria2.addUri", "aria2.addTorrent", "aria2.addMetalink"}:
+                result = "new-gid"
+            elif method == "aria2.getGlobalOption":
+                result = {
+                    "max-concurrent-downloads": "3",
+                    "max-overall-download-limit": "0",
+                    "rpc-secret": self.server.rpc_secret,
+                    "save-session": "/private/session",
+                }
+            elif method == "aria2.changeGlobalOption":
+                result = "OK"
+            elif method in {"aria2.remove", "aria2.removeDownloadResult"}:
+                result = "gid-one"
+            else:
+                result = {"version": "1.36.0", "enabledFeatures": ["BitTorrent"]}
             status = 200
             body = {
                 "jsonrpc": "2.0",
                 "id": request.get("id"),
-                "result": {"version": "1.36.0", "enabledFeatures": ["BitTorrent"]},
+                "result": result,
             }
         encoded = json.dumps(body).encode("utf-8")
         self.send_response(status)
@@ -49,6 +66,7 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.hook.chmod(0o755)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Aria2RpcHandler)
         self.server.rpc_secret = ""
+        self.server.calls = []
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.runtime = Aria2Runtime(
@@ -101,6 +119,196 @@ class Aria2RuntimeTests(unittest.TestCase):
 
         self.assertEqual(self.runtime.session_file.read_text(encoding="utf-8"), session)
         self.assertEqual(self.runtime.session_file.stat().st_mode & 0o777, 0o600)
+        config = self.runtime._read_config()
+        self.assertEqual(config["input-file"], str(self.runtime.session_file))
+        self.assertEqual(config["save-session"], str(self.runtime.session_file))
+        self.assertEqual(config["continue"], "true")
+        self.assertEqual(config["save-session-interval"], "30")
+        self.assertEqual(config["rpc-save-upload-metadata"], "true")
+        self.assertEqual(config["bt-save-metadata"], "true")
+        self.assertEqual(config["bt-load-saved-metadata"], "true")
+        self.assertEqual(config["dht-file-path"], str(self.state / "dht.dat"))
+        self.assertEqual(config["dht-file-path6"], str(self.state / "dht6.dat"))
+
+    def test_rpc_injects_private_secret_and_clamps_upload_to_workspace(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "add-1", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {"out": "file.bin"}],
+        }, requested_directory=str(self.destination))
+
+        self.assertEqual(result["result"], "new-gid")
+        forwarded = self.server.calls[-1]
+        self.assertEqual(forwarded["params"][0], f"token:{self.server.rpc_secret}")
+        options = forwarded["params"][2]
+        self.assertEqual(options["dir"], str(self.destination))
+        self.assertEqual(options["allow-overwrite"], "false")
+        self.assertEqual(options["auto-file-renaming"], "false")
+        self.assertNotIn(self.server.rpc_secret, json.dumps(result))
+
+    def test_rpc_rejects_paths_outside_workspace_and_managed_methods(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        before = len(self.server.calls)
+
+        outside = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "add-2", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {}],
+        }, requested_directory=str(self.root))
+        shutdown = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "bad", "method": "aria2.shutdown", "params": [],
+        })
+        managed_option = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "managed", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {"rpc-save-upload-metadata": "false"}],
+        })
+        command_hook = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "hook", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {"on-download-complete": "touch /tmp/x"}],
+        })
+
+        self.assertIn("error", outside)
+        self.assertIn("error", shutdown)
+        self.assertIn("error", managed_option)
+        self.assertIn("error", command_hook)
+        self.assertEqual(len(self.server.calls), before)
+
+    def test_rpc_uses_selected_workspace_folder_and_keeps_collision_policy(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        selected = self.workspace / "selected"
+        selected.mkdir()
+        existing = selected / "already-there.bin"
+        existing.write_bytes(b"keep existing data")
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "selected-folder", "method": "aria2.addUri",
+            "params": [["https://example.test/already-there.bin"], {
+                "dir": str(selected), "out": existing.name, "allow-overwrite": "true",
+                "auto-file-renaming": "true",
+            }],
+        })
+
+        self.assertEqual(result.get("result"), "new-gid")
+        options = self.server.calls[-1]["params"][2]
+        self.assertEqual(options["dir"], str(selected))
+        self.assertEqual(options["allow-overwrite"], "false")
+        self.assertEqual(options["auto-file-renaming"], "false")
+        self.assertEqual(existing.read_bytes(), b"keep existing data")
+
+    def test_rpc_defaults_to_private_aria2_folder_only_when_no_folder_was_selected(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "default-folder", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {}],
+        })
+
+        self.assertEqual(result.get("result"), "new-gid")
+        self.assertEqual(
+            self.server.calls[-1]["params"][2]["dir"],
+            str(self.destination),
+        )
+
+    def test_rpc_normalizes_torrent_options_without_a_uri_list(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        selected = self.workspace / "torrent-target"
+        selected.mkdir()
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "torrent", "method": "aria2.addTorrent",
+            "params": ["YmFzZTY0", {"dir": str(selected)}],
+        })
+
+        self.assertEqual(result.get("result"), "new-gid")
+        forwarded = self.server.calls[-1]["params"]
+        self.assertEqual(forwarded[2], [])
+        self.assertEqual(forwarded[3]["dir"], str(selected))
+        self.assertEqual(forwarded[3]["allow-overwrite"], "false")
+
+    def test_rpc_never_returns_managed_secrets_or_paths_from_global_options(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "options", "method": "aria2.getGlobalOption", "params": [],
+        })
+
+        self.assertEqual(result["result"], {
+            "max-concurrent-downloads": "3",
+            "max-overall-download-limit": "0",
+        })
+        self.assertNotIn(self.server.rpc_secret, json.dumps(result))
+
+    def test_safe_global_transfer_settings_are_persisted_for_container_restart(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "settings", "method": "aria2.changeGlobalOption",
+            "params": [{"max-overall-download-limit": "1M", "max-concurrent-downloads": "6"}],
+        })
+
+        self.assertEqual(result.get("result"), "OK")
+        self.assertEqual(self.runtime._read_config()["max-overall-download-limit"], "1048576")
+        self.assertEqual(self.runtime._read_config()["max-concurrent-downloads"], "6")
+        restarted = Aria2Runtime(
+            state_root=self.state,
+            workspace_root=self.workspace,
+            hook_script_path=self.hook,
+            rpc_url=f"http://127.0.0.1:{self.server.server_port}/jsonrpc",
+        )
+        restarted.ensure()
+        self.assertEqual(restarted._read_config()["max-overall-download-limit"], "1048576")
+
+    def test_unsafe_global_transfer_settings_are_rejected_before_rpc(self):
+        self.runtime.ensure()
+        before = len(self.server.calls)
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "unsafe", "method": "aria2.changeGlobalOption",
+            "params": [{"rpc-secret": "do-not-allow"}],
+        })
+
+        self.assertIn("error", result)
+        self.assertEqual(len(self.server.calls), before)
+
+    def test_out_of_range_global_transfer_settings_are_rejected_before_rpc(self):
+        self.runtime.ensure()
+        before = len(self.server.calls)
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "unsafe-range", "method": "aria2.changeGlobalOption",
+            "params": [{"max-concurrent-downloads": "99"}],
+        })
+
+        self.assertIn("error", result)
+        self.assertEqual(len(self.server.calls), before)
+
+    def test_cancel_and_remove_task_results_leave_workspace_partial_files_untouched(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        partial = self.destination / "partial.bin"
+        control = self.destination / "partial.bin.aria2"
+        partial.write_bytes(b"partial payload")
+        control.write_bytes(b"control state")
+
+        cancelled = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "cancel", "method": "aria2.remove", "params": ["gid-one"],
+        })
+        removed_result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "remove-result", "method": "aria2.removeDownloadResult",
+            "params": ["gid-one"],
+        })
+
+        self.assertEqual(cancelled.get("result"), "gid-one")
+        self.assertEqual(removed_result.get("result"), "gid-one")
+        self.assertEqual(partial.read_bytes(), b"partial payload")
+        self.assertEqual(control.read_bytes(), b"control state")
 
 
 if __name__ == "__main__":

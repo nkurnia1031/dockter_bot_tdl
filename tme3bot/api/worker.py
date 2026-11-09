@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 import uuid
 from dataclasses import dataclass
@@ -547,6 +548,23 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
                 status_code=404,
             )
         return probe()
+
+    @app.post("/internal/v1/aria2/jsonrpc", dependencies=[Depends(authorize)])
+    def aria2_jsonrpc(body: dict[str, Any]):
+        if len(json.dumps(body, separators=(",", ":")).encode("utf-8")) > 16 * 1024 * 1024:
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32600, "message": "Request is too large."}}
+        call = getattr(context.executor, "aria2_rpc", None)
+        if not callable(call):
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Aria2 bridge is unavailable."}}
+        return call(body)
+
+    @app.get("/internal/v1/aria2/ui/{asset_path:path}", dependencies=[Depends(authorize)])
+    def aria2_ui_asset(asset_path: str):
+        lookup = getattr(context.executor, "aria2_ui_asset_path", None)
+        path = lookup(asset_path) if callable(lookup) else None
+        if path is None:
+            raise DomainError("ARIA2_UI_ASSET_NOT_FOUND", "AriaNg asset tidak ditemukan.", status_code=404)
+        return FileResponse(str(path), headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"})
 
     @app.post("/internal/v1/tts/helpers/{slot}/recover", dependencies=[Depends(authorize)])
     def recover_tts_helper(slot: int = ApiPath(ge=1, le=3)):

@@ -133,6 +133,8 @@ class FakeDispatcher:
         }
         self.tts_health_calls = []
         self.aria2_health_calls = []
+        self.aria2_rpc_calls = []
+        self.aria2_asset_calls = []
         self.aria2_health_result = {
             "ready": True,
             "reason_code": "",
@@ -270,6 +272,14 @@ class FakeDispatcher:
     def aria2_health(self, worker):
         self.aria2_health_calls.append(worker)
         return dict(self.aria2_health_result)
+
+    def aria2_rpc(self, worker, payload):
+        self.aria2_rpc_calls.append((worker, dict(payload)))
+        return {"jsonrpc": "2.0", "id": payload.get("id"), "result": "gid-123"}
+
+    def aria2_ui_asset(self, worker, asset_path):
+        self.aria2_asset_calls.append((worker, asset_path))
+        return b"<html><head></head><body>AriaNg</body></html>", "text/html; charset=utf-8"
 
     def recover_tts_helper(self, worker, slot):
         self.tts_recoveries.append((worker, slot))
@@ -2964,6 +2974,32 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(payload["hook"]["last_result"], "retry-resumed")
         self.assertNotIn("secret", response.text.lower())
         self.assertEqual(self.dispatcher.aria2_health_calls, ["local"])
+
+    def test_aria2_bridge_is_authenticated_worker_scoped_and_hides_rpc_secret(self):
+        denied = self.client.post(
+            "/api/v1/aria2-rpc-local",
+            json={"jsonrpc": "2.0", "id": "one", "method": "aria2.addUri", "params": []},
+        )
+        self.assertEqual(denied.status_code, 401)
+        headers = self.login()
+        request = {"jsonrpc": "2.0", "id": "one", "method": "aria2.addUri", "params": []}
+        response = self.client.post("/api/v1/aria2-rpc-local", headers=headers, json=request)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["result"], "gid-123")
+        self.assertEqual(self.dispatcher.aria2_rpc_calls, [("local", request)])
+        self.assertNotIn("rpc-secret", response.text.lower())
+
+        page = self.client.get("/api/v1/aria2-ui/local/index.html", headers=headers)
+        self.assertEqual(page.status_code, 200, page.text)
+        self.assertIn("/api/v1/aria2-ui/local/rpc-setup.js", page.text)
+        self.assertEqual(self.dispatcher.aria2_asset_calls, [("local", "index.html")])
+
+        setup = self.client.get("/api/v1/aria2-ui/local/rpc-setup.js", headers=headers)
+        self.assertEqual(setup.status_code, 200)
+        self.assertIn("X-CSRF-Token", setup.text)
+        self.assertIn("allow-overwrite", setup.text)
+        self.assertIn("/workspace/aria2", setup.text)
+        self.assertNotIn("token:", setup.text)
 
     def test_worker_tts_helper_recovery_is_explicit_and_slot_limited(self):
         headers = self.login()

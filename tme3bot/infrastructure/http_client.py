@@ -53,6 +53,40 @@ class _RejectRedirects(HTTPRedirectHandler):
         return None
 
 
+def request_worker_bytes(
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    timeout: float = 30,
+) -> tuple[bytes, str]:
+    request = Request(
+        base_url.rstrip("/") + path,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "*/*",
+        },
+        method="GET",
+    )
+    opener = build_opener(ProxyHandler({}), _RejectRedirects())
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read(), str(response.headers.get("Content-Type") or "application/octet-stream")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            body = {}
+        message = (
+            body.get("error", {}).get("message")
+            if isinstance(body.get("error"), dict)
+            else body.get("detail")
+        ) or "Worker request failed."
+        raise JsonHttpError(exc.code, str(message), body) from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise JsonHttpError(503, "Worker request failed.") from exc
+
+
 def request_json(
     base_url: str,
     token: str,
@@ -800,6 +834,25 @@ class WorkerHttpDispatcher:
             "GET",
             "/internal/v1/aria2/health",
             timeout=8,
+        )
+
+    def aria2_rpc(self, worker: str, request_payload: dict[str, Any]) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/aria2/jsonrpc", request_payload, timeout=35,
+        )
+
+    def aria2_ui_asset(self, worker: str, asset_path: str) -> tuple[bytes, str]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        safe_path = quote(str(asset_path or "index.html"), safe="/")
+        return request_worker_bytes(
+            str(record["url"]), str(record["token"]),
+            f"/internal/v1/aria2/ui/{safe_path}", timeout=30,
         )
 
     def recover_tts_helper(self, worker: str, slot: int) -> dict[str, Any]:
