@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,27 +14,12 @@ from tme3bot.backup_service import BackupService, sha256_file
 LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class BackupNodeJob:
-    """Worker-neutral command payload for one node backup."""
-
-    backup_run_id: str
-    node_name: str
-    password: str
-    channel_ref: str
-    channel_id: int
-    volume_size: str
-
-
 class BackupCoordinator:
-    def __init__(self, config, bot, catalog, worker_registry=None, remote_router=None, local_worker=None) -> None:
+    def __init__(self, config, bot, catalog) -> None:
         self.config = config
         self.bot = bot
         self.catalog = catalog
         self.service = BackupService(config, catalog)
-        self.worker_registry = worker_registry
-        self.remote_router = remote_router
-        self.local_worker = local_worker
         self._lock = threading.RLock()
         self._active_run: str | None = None
 
@@ -61,26 +45,6 @@ class BackupCoordinator:
         try:
             password = self.service.password()
             self._run_gateway(run_id, password)
-            for worker_name in self._worker_names():
-                self.catalog.start_backup_run(run_id, worker_name)
-                job = BackupNodeJob(
-                    backup_run_id=run_id,
-                    node_name=worker_name,
-                    password=password,
-                    channel_ref=self.config.backup_channel_ref,
-                    channel_id=self.config.backup_channel_id,
-                    volume_size=self.config.backup_volume_size,
-                )
-                try:
-                    if self.remote_router is not None:
-                        self.remote_router.enqueue_backup(worker_name, job)
-                    elif self.local_worker is not None:
-                        self.local_worker.enqueue(job)
-                    else:
-                        self.catalog.finish_backup_run(run_id, worker_name, "offline", "Worker backend tidak tersedia.")
-                except Exception as exc:
-                    self.catalog.finish_backup_run(run_id, worker_name, "offline", str(exc))
-                    LOGGER.warning("Worker backup %s offline: %s", worker_name, exc)
         except Exception as exc:
             LOGGER.exception("Gateway backup failed")
             self.catalog.start_backup_run(run_id, self.config.backup_node_name)
@@ -157,15 +121,6 @@ class BackupCoordinator:
                 self.catalog.finish_backup_run(str(run["run_id"]), node_name, "cleanup_failed", "Gagal menghapus sebagian backup lama.")
             else:
                 self.catalog.delete_backup_run(str(run["run_id"]), node_name)
-
-    def _worker_names(self) -> list[str]:
-        if self.worker_registry is not None:
-            names = self.worker_registry.names()
-            if names:
-                return names
-        if self.local_worker is not None:
-            return ["worker-local"]
-        return []
 
     def status(self) -> list[dict[str, object]]:
         return self.catalog.backup_runs(limit=100)

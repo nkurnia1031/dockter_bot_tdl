@@ -61,7 +61,7 @@
   }
   async function run() {
     pending = true;
-    try { await post('/backups'); message = 'Backup seluruh node mulai dijalankan.'; await load(); }
+    try { await post('/backups'); message = 'Backup gateway mulai dijalankan.'; await load(); }
     finally { pending = false; }
   }
   async function saveSettings() {
@@ -232,7 +232,7 @@
   });
 </script>
 
-<header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">BACKUP</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Backup terenkripsi</h1><p class="muted mt-2">Status per node, jadwal, dan hasil upload channel.</p></div><div class="page-icon"><Archive size={23}/></div></header>
+<header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">BACKUP</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Backup terenkripsi</h1><p class="muted mt-2">Backup gateway, riwayat arsip worker lama, jadwal, dan hasil upload channel.</p></div><div class="page-icon"><Archive size={23}/></div></header>
 <section class="card mt-7 p-5 sm:p-6">
   <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Konfigurasi aktif</h2><p class="muted mt-1 text-sm">{data.schedule || '-'} · {data.timezone || '-'} · retensi {data.retention ?? '-'} · volume {data.volume_size || '-'}</p></div><div class="flex gap-2"><button class="button secondary" onclick={load}><RefreshCw size={15}/>Refresh</button><button class="button" onclick={run} disabled={pending || data.enabled === false}><Play size={15}/>{pending ? 'Memulai...' : 'Backup sekarang'}</button></div></div>
   {#if message}<p class="mt-4 rounded-xl bg-[var(--brand-soft)] p-3 text-sm">{message}</p>{/if}

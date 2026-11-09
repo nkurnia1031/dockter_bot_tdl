@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-from dataclasses import asdict
 
 import uvicorn
 
@@ -49,22 +47,6 @@ from tme3bot.worker.executor import WorkerEventPublisher, WorkerJobExecutor
 from tme3bot.worker_registry import WorkerRegistry
 
 LOGGER = logging.getLogger(__name__)
-
-
-class ControlPlaneBackupRouter:
-    def __init__(self, control_plane: ControlPlane, actor) -> None:
-        self.control_plane = control_plane
-        self.actor = actor
-
-    def enqueue_backup(self, worker_name: str, job) -> int:
-        created = self.control_plane.submit_job(
-            self.actor,
-            "backup_node",
-            asdict(job),
-            profile=self.actor.profile,
-            worker=worker_name,
-        )
-        return int(created.progress.get("position", 0))
 
 
 def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupScheduler]:
@@ -276,30 +258,29 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     storage_maintenance = StorageMaintenanceService(
         catalog, bot, config.storage_trash_retention_days
     )
-    coordinator = None
-    scheduler = BackupScheduler(config, _NullCoordinator())
-    try:
-        system_actor = _first_actor(control_plane, profiles)
-        coordinator = BackupCoordinator(
-            config,
-            bot,
-            catalog,
-            worker_registry=registry,
-            remote_router=ControlPlaneBackupRouter(control_plane, system_actor),
-        )
-        def backup_observer(event) -> None:
-            if event.status.value != "succeeded":
-                return
-            job = control_plane.jobs.get(event.job_id)
-            if job is not None and job.kind == "backup_node":
-                coordinator.prune_node(
-                    str(job.payload.get("node_name", job.worker))
-                )
+    coordinator = BackupCoordinator(config, bot, catalog)
+    scheduler = BackupScheduler(config, coordinator)
 
-        control_plane.add_event_observer(backup_observer)
-        scheduler = BackupScheduler(config, coordinator)
-    except RuntimeError:
-        LOGGER.warning("Backup scheduler menunggu setidaknya satu identity.")
+    def backup_observer(event) -> None:
+        job = control_plane.jobs.get(event.job_id)
+        if job is None or job.kind != "backup_node":
+            return
+        run_id = str(job.payload.get("backup_run_id") or "").strip()
+        node_name = str(job.payload.get("node_name") or job.worker).strip()
+        if not run_id or not node_name:
+            return
+        status = str(getattr(event.status, "value", event.status) or "").lower()
+        if status == "succeeded":
+            coordinator.prune_node(node_name)
+        elif status in {"failed", "cancelled"}:
+            catalog.finish_backup_run(
+                run_id,
+                node_name,
+                status,
+                "Backup worker dibatalkan." if status == "cancelled" else "Backup worker gagal.",
+            )
+
+    control_plane.add_event_observer(backup_observer)
     profile_distribution_service = ProfileDistributionService(
         config,
         bot,
@@ -407,26 +388,3 @@ def run_worker(config: AppConfig) -> None:
         port=config.worker_port,
         log_level=config.log_level.lower(),
     )
-
-
-def _first_actor(control_plane: ControlPlane, profiles: ProfileManager):
-    for profile in profiles.list_profiles():
-        config = profiles.runtime(profile).config
-        identity_path = config.state_file.parent / "identity.json"
-        try:
-            payload = json.loads(identity_path.read_text(encoding="utf-8"))
-            user_id = int(
-                payload.get("telegram_user_id", payload.get("tdl_user_id"))
-            )
-            return control_plane.actor(user_id)
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-    raise RuntimeError("No authorized identity")
-
-
-class _NullCoordinator:
-    def next_run(self):
-        raise RuntimeError("No backup coordinator")
-
-    def start_now(self):
-        raise RuntimeError("No backup coordinator")

@@ -237,8 +237,9 @@ delivery, dan backup dapat dipanggil melalui API maupun menu bot. Rename nama
 tampilan tersedia untuk semua user authorized; folder, keyword, dan delete
 tetap owner-only.
 
-Backup gateway dan worker dibuat sebagai 7z encrypted menggunakan password
-default Utility. Jalankan manual:
+Backup yang dijadwalkan membuat arsip gateway 7z terenkripsi menggunakan
+password default Utility. Coordinator tidak lagi mengirim job backup ke worker;
+arsip worker lama tetap bisa dilihat dan diverifikasi. Jalankan manual:
 
 ```bash
 python3 run.py backup now

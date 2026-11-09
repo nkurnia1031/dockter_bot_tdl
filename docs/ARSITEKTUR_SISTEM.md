@@ -65,7 +65,7 @@ flowchart LR
 | Control plane | Mengatur antrean, lifecycle job, retry, pause/resume, dispatch, dan event. | `tme3bot/application/control_plane.py` |
 | Domain | Menyimpan model job, actor, event, status, dan aturan perubahan status. | `tme3bot/domain/` |
 | Infrastructure | Menghubungkan aplikasi ke SQLite, autentikasi, dan API worker. | `tme3bot/infrastructure/` |
-| Worker | Menjalankan export, download, Quick Mode, utility, storage, backup, dan workspace. | `tme3bot/worker/` |
+| Worker | Menjalankan export, download, Quick Mode, utility, storage, dan workspace. Backup baru hanya dijalankan pada gateway. | `tme3bot/worker/` |
 | TTS | Worker membuat MP3 dengan tiga helper/Tor, lalu mengirim setiap bagian melalui sesi TDL `user1` pada profile job. Backend menyimpan outbox delivery agar progress dan retry tetap tahan restart. | `worker/tts_pipeline.py`, `worker/executor_tts.py`, `api/routes/tts.py` |
 | Runtime | Membuka sesi per profile dan menjalankan TDL, rclone, serta utility. | `profiles.py`, `service.py`, `tdl.py`, `rclone.py`, `utility.py` |
 
@@ -184,7 +184,7 @@ Detail konfigurasi dan rollout ada di [runbook TTS Novel](TTS_NOVEL_RUNBOOK.md).
 | Job, event, antrean, autentikasi, katalog export dan storage | SQLite backend, `/database/gateway/storage.db` | Menyimpan lifecycle job dan progress yang dibaca UI. Host memasang `DATABASE_ROOT` dari filesystem OS. |
 | Identity, profile, source, route worker, label, dan pengaturan | File JSON di `/data` | Credential dan token tidak boleh ditulis ke log atau dikirim ke Web. |
 | Sesi TDL | `/database/tdl/<profile>/<lane>/.tdl` pada masing-masing worker | Semua proses TDL berjalan sebagai root. Lane Export memakai lane `export`; Download `download`; Upload `upload`. Host memasang `DATABASE_ROOT` dari filesystem OS. |
-| SQLite worker | `/database/worker-command-journal.sqlite3` dan `/database/public-download-links.sqlite3` | Backup worker mengambil snapshot konsisten ke prefix arsip `database/`; verifier menerima format kanonis dan arsip lama. |
+| SQLite worker | `/database/worker-command-journal.sqlite3` dan `/database/public-download-links.sqlite3` | Coordinator tidak lagi membuat backup worker. Verifier masih menerima arsip worker lama. |
 | Artifact audio TTS | `/data/tts` pada worker | MP3 hasil job adalah data operasional, bukan database; cache atau database persisten TTS harus memakai `/database/tts`. |
 | File kerja dan staging | Workspace worker, `/workspace` | Operasi berjalan pada filesystem worker yang dipilih. |
 

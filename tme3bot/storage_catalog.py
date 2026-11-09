@@ -1417,7 +1417,7 @@ class StorageCatalog:
             )
 
     def finish_backup_run(self, run_id: str, node_name: str, status: str = "complete", error: str | None = None) -> None:
-        if status not in {"complete", "failed", "offline", "cleanup_failed"}:
+        if status not in {"complete", "failed", "cancelled", "offline", "cleanup_failed"}:
             raise ValueError("Status backup tidak valid.")
         with self._lock, self._db() as db:
             db.execute(
