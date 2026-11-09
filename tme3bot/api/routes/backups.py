@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-import uuid
 
 from fastapi import Depends, Header, Request, Response
 from tme3bot.api.schemas import BackupRuntimeSettingsRequest, BackupVerificationRequest, ItemListResponse, ObjectResponse
@@ -284,28 +283,11 @@ def register_backups(app, context, *, current_actor, job_dict):
 
     @app.post("/api/v1/backups", response_model=ObjectResponse)
     def start_backup(actor=Depends(current_actor)):
-        if context.backup_coordinator is not None:
-            return {"run_id": context.backup_coordinator.start_now()}
-        jobs = []
-        password = context.utility_settings.get().get("compress_password", "")
-        run_id = str(uuid.uuid4())
-        for worker in context.worker_registry.names():
-            jobs.append(
-                job_dict(
-                    context.control_plane.submit_job(
-                        actor,
-                        "backup_node",
-                        {
-                            "backup_run_id": run_id,
-                            "node_name": worker,
-                            "password": password,
-                            "channel_ref": context.config.backup_channel_ref,
-                            "channel_id": context.config.backup_channel_id,
-                            "volume_size": context.config.backup_volume_size,
-                        },
-                        profile=actor.profile,
-                        worker=worker,
-                    )
-                )
+        del actor
+        if context.backup_coordinator is None:
+            raise DomainError(
+                "BACKUP_UNAVAILABLE",
+                "Backup gateway belum tersedia.",
+                status_code=503,
             )
-        return {"run_id": run_id, "jobs": jobs}
+        return {"run_id": context.backup_coordinator.start_now()}

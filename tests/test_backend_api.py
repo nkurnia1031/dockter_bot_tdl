@@ -3022,6 +3022,15 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.context.config.backup_channel_id, -100789)
         self.assertEqual(self.context.control_plane.job_stall_timeout_seconds, 900)
 
+    def test_backup_without_gateway_coordinator_never_dispatches_worker_jobs(self):
+        self.context.backup_coordinator = None
+        response = self.client.post("/api/v1/backups", headers=self.login())
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "BACKUP_UNAVAILABLE")
+        self.assertEqual(self.jobs.list(), [])
+        self.assertEqual(self.dispatcher.commands, [])
+
     def test_backup_tdl_diagnostics_requires_auth_and_returns_worker_profile_pair(self):
         denied = self.client.post(
             "/api/v1/backups/tdl-diagnostics",
