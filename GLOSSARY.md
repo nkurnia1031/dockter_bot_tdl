@@ -178,6 +178,12 @@ _Avoid_: hitungan isi langsung, total ukuran parsial tanpa penanda.
 Pengaturan file dan folder pada root `rclone_destination` di worker terpilih: membuat folder, rename, copy, move, Trash, restore, dan hapus permanen. Operasi batch atau folder rekursif melaporkan hasil per item; benturan tidak menimpa data.
 _Avoid_: akses ke remote atau path di luar root yang dikonfigurasi.
 
+## Telegram
+
+**Pengiriman langsung ke chat**:
+Pengiriman file dari folder Workspace worker ke satu chat Telegram pilihan melalui profil TDL terpilih. Tiap file dikirim sebagai dokumen tersendiri; hasilnya tercatat di job, tanpa membuat item katalog Storage.
+_Avoid_: upload Storage, artifact Export, entri katalog cloud.
+
 ## Resolver
 
 **Bookmarklet Resolver**:
