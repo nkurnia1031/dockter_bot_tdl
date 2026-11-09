@@ -84,6 +84,10 @@ class JobRepository(Protocol):
 
     def update_result(self, job_id: str, result: dict[str, Any]) -> Job: ...
 
+    def complete_storage_upload_reconciliation(
+        self, job_id: str, result: dict[str, Any], *, progress: dict[str, Any]
+    ) -> Job: ...
+
     def record_late_worker_event(
         self, job_id: str, event: dict[str, Any]
     ) -> tuple[Job, bool]: ...

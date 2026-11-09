@@ -144,6 +144,11 @@ class StorageExecutorMixin:
             for item in source_items or []
             if isinstance(item, dict)
         }
+        provider = str(
+            payload.get("_storage_reconcile_provider") or payload.get("provider") or "telegram"
+        ).strip().lower()
+        if provider not in {"telegram", "rclone"}:
+            raise ValueError("STORAGE_RECONCILIATION_PROVIDER_INVALID")
         try:
             start_timestamp = int(payload.get("start_timestamp"))
             end_timestamp = int(payload.get("end_timestamp"))
@@ -165,12 +170,37 @@ class StorageExecutorMixin:
             checkpoint = source_by_path.get(path)
             profile = str(raw.get("profile") or "").strip().lower()
             name = str(raw.get("name") or (checkpoint or {}).get("name") or "File")[:255]
+            target_path = ""
+            if provider == "rclone":
+                saved_upload = (
+                    checkpoint.get("uploaded_item")
+                    if isinstance(checkpoint, dict)
+                    else None
+                )
+                saved_upload = saved_upload if isinstance(saved_upload, dict) else {}
+                target_path = str(saved_upload.get("target_path") or "").replace("\\", "/").strip()
+                requested_target = str(raw.get("target_path") or "").replace("\\", "/").strip()
+                remote_parts = PurePosixPath(target_path)
+                identity = saved_upload.get("source_identity")
+                if (
+                    checkpoint is None
+                    or saved_upload.get("provider") != "rclone"
+                    or not isinstance(identity, dict)
+                    or set(identity) != {"device", "inode", "size", "mtime_ns"}
+                    or not target_path
+                    or remote_parts.is_absolute()
+                    or any(part in {"", ".", ".."} for part in remote_parts.parts)
+                    or remote_parts.as_posix() != target_path
+                    or (requested_target and requested_target != target_path)
+                ):
+                    target_path = ""
             if (
                 not source_job_id
                 or not path
                 or (checkpoint or {}).get("status") != "needs_reconciliation"
                 or not name.strip()
                 or name == "File"
+                or (provider == "rclone" and not target_path)
             ):
                 outputs[index] = {
                     "index": index,
@@ -183,12 +213,19 @@ class StorageExecutorMixin:
                     "error": "Nama file upload tidak tersedia pada checkpoint; hasil tetap ambigu.",
                 }
                 continue
-            candidates.append({
+            candidate = {
                 "index": index,
                 "path": path,
                 "name": name,
                 "profile": profile,
-            })
+            }
+            if provider == "rclone":
+                candidate["target_path"] = target_path
+                candidate["source_identity"] = saved_upload["source_identity"]
+                candidate["source_command_id"] = str(source.get("command_id") or "")
+                candidate["source_attempt"] = int(checkpoint.get("attempt") or 0)
+                candidate["source_item"] = checkpoint
+            candidates.append(candidate)
 
         requested_profiles = payload.get("_tdl_sender_profiles")
         requested_profiles = {
@@ -199,19 +236,30 @@ class StorageExecutorMixin:
         reporter = ProgressReporter(self.publisher, str(command["job_id"]))
         reporter.report(
             phase="reconciling",
-            message="Memeriksa nama file pada rentang waktu job",
+            message=(
+                "Memeriksa nama file pada rentang waktu job"
+                if provider == "telegram"
+                else "Menyiapkan pemeriksaan file pada tujuan rclone"
+            ),
             overall={"current": 0, "total": len(submitted_items), "unit": "files"},
             counters={"succeeded": 0, "retryable": 0, "ambiguous": len(submitted_items)},
             force=True,
         )
-        target_chat = str(payload.get("tdl_access_target") or "").strip()
-        if not target_chat:
-            raise ValueError("TDL_ACCESS_TARGET_UNAVAILABLE")
-
         candidate_profiles = list(dict.fromkeys(
             [item["profile"] for item in candidates]
             + [str(item).strip().lower() for item in requested_profiles]
         ))
+        if provider == "rclone":
+            return self._storage_reconcile_rclone(
+                command,
+                payload,
+                candidates,
+                outputs,
+                submitted_items,
+            )
+        target_chat = str(payload.get("tdl_access_target") or "").strip()
+        if not target_chat:
+            raise ValueError("TDL_ACCESS_TARGET_UNAVAILABLE")
         messages = None
         error_code = "STORAGE_RECONCILIATION_SESSION_UNAVAILABLE"
         for profile in candidate_profiles:
@@ -339,6 +387,260 @@ class StorageExecutorMixin:
         )
         return {
             "outcome": outcome,
+            "source_job_id": source_job_id,
+            "total": len(results),
+            "succeeded": succeeded,
+            "retryable": retryable,
+            "ambiguous": unresolved,
+            "items": results,
+        }
+
+    def _storage_reconcile_rclone(
+        self,
+        command: dict[str, Any],
+        payload: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        outputs: dict[int, dict[str, Any]],
+        submitted_items: list[Any],
+    ) -> dict[str, Any]:
+        """Verify ambiguous Rclone targets by exact path and size, never re-upload."""
+        job_id = str(command.get("job_id") or "")
+        source_job_id = str(payload.get("source_job_id") or "").strip()
+        preparation_error = False
+        reporter = ProgressReporter(self.publisher, job_id)
+        reporter.report(
+            phase="reconciling",
+            message="Memeriksa ukuran file pada tujuan rclone tanpa mengunggah ulang",
+            overall={"current": 0, "total": len(submitted_items), "unit": "files"},
+            counters={"succeeded": 0, "retryable": 0, "ambiguous": len(submitted_items)},
+            force=True,
+        )
+        try:
+            root = self._workspace_path(str(payload.get("folder_path") or ""))
+            workspace = self._quick_workspace(self.config).resolve()
+            root = root.resolve()
+            root.relative_to(workspace)
+            destination = str(payload.get("rclone_destination") or "").strip()
+            config_path = Path(
+                getattr(self.config, "rclone_config_path", "/data/.config/rclone.conf")
+            ).resolve()
+            config_root = Path(getattr(self.config, "profile_root", "/data")).resolve()
+        except (OSError, TypeError, ValueError):
+            preparation_error = True
+            root = None
+            workspace = None
+            destination = ""
+            config_path = Path("/nonexistent/rclone.conf")
+            config_root = Path("/nonexistent")
+
+        valid: list[dict[str, Any]] = []
+        paths: list[Path] = []
+        remote_names: list[str] = []
+        if root is not None and workspace is not None and root.is_dir() and destination:
+            for item in candidates:
+                relative = str(item.get("path") or "")
+                parts = relative.split("/")
+                source = root.joinpath(*parts)
+                try:
+                    source.resolve(strict=True).relative_to(root)
+                    source.resolve(strict=True).relative_to(workspace)
+                except (OSError, ValueError):
+                    source = None
+                identity = item.get("source_identity")
+                if (
+                    source is None
+                    or source.is_symlink()
+                    or not source.is_file()
+                    or not isinstance(identity, dict)
+                    or not self._same_storage_source(source, identity)
+                ):
+                    outputs[int(item["index"])] = {
+                        "index": int(item["index"]),
+                        "name": str(item["name"]),
+                        "target_path": str(item["target_path"]),
+                        "profile": str(item.get("profile") or ""),
+                        "status": "needs_reconciliation",
+                        "match_count": 0,
+                        "retryable": False,
+                        "error_code": "STORAGE_SOURCE_CHANGED",
+                        "error": "File sumber berubah atau tidak tersedia; tujuan tidak dapat dicocokkan dengan aman.",
+                    }
+                    continue
+                valid.append(item)
+                paths.append(source)
+                remote_names.append(str(item["target_path"]))
+        else:
+            preparation_error = True
+            for item in candidates:
+                outputs[int(item["index"])] = {
+                    "index": int(item["index"]),
+                    "name": str(item["name"]),
+                    "target_path": str(item["target_path"]),
+                    "profile": str(item.get("profile") or ""),
+                    "status": "needs_reconciliation",
+                    "match_count": 0,
+                    "retryable": False,
+                    "error_code": "RCLONE_VERIFY_UNAVAILABLE",
+                    "error": "Worker tidak dapat menyiapkan pemeriksaan tujuan rclone; sumber dipertahankan.",
+                }
+
+        verification: dict[str, Any] = {"files": [], "missing": [], "errors": []}
+        verification_error = preparation_error
+        if valid:
+            try:
+                runner = RcloneRunner(
+                    log_callback=self._append_job_log,
+                    command_callback=self._command_callback(runtime="rclone_storage_reconcile"),
+                    stall_timeout_seconds=getattr(self.config, "job_stall_timeout_seconds", 600),
+                )
+                verification = runner.verify_files(
+                    paths,
+                    destination,
+                    config_path,
+                    workspace_root=workspace,
+                    config_root=config_root,
+                    remote_names=remote_names,
+                )
+            except Exception:
+                LOGGER.warning("Could not verify rclone Storage reconciliation for %s", job_id, exc_info=True)
+                verification_error = True
+
+        if not isinstance(verification, dict):
+            verification = {"files": [], "missing": [], "errors": []}
+            verification_error = True
+
+        found = {
+            str(item).replace("\\", "/").strip("/")
+            for item in verification.get("files", [])
+        } if isinstance(verification, dict) else set()
+        missing_by_name = {
+            str(item.get("name") or "").replace("\\", "/").strip("/"): str(item.get("error") or "")
+            for item in verification.get("missing", [])
+            if isinstance(item, dict)
+        } if isinstance(verification, dict) else {}
+        error_names = {
+            str(item.get("name") or "").replace("\\", "/").strip("/")
+            for item in verification.get("errors", [])
+            if isinstance(item, dict)
+        } if isinstance(verification, dict) else set()
+
+        for item in valid:
+            index = int(item["index"])
+            target_path = str(item["target_path"])
+            if not verification_error and target_path in found:
+                state = "succeeded"
+                retryable = False
+                code = ""
+                message = "Nama dan ukuran file cocok di tujuan rclone; upload tidak diulang."
+                match_count = 1
+            elif not verification_error and target_path in missing_by_name and "belum ditemukan" in missing_by_name[target_path].casefold():
+                state = "failed"
+                retryable = True
+                code = "RCLONE_UPLOAD_NOT_FOUND"
+                message = "File tidak ditemukan pada path tujuan rclone; file aman untuk Retry."
+                match_count = 0
+            else:
+                state = "needs_reconciliation"
+                retryable = False
+                code = (
+                    "RCLONE_VERIFY_UNAVAILABLE"
+                    if verification_error or target_path in error_names
+                    else "RCLONE_UPLOAD_SIZE_MISMATCH"
+                )
+                message = (
+                    "Rclone belum dapat membuktikan file di tujuan; sumber dipertahankan."
+                    if code == "RCLONE_VERIFY_UNAVAILABLE"
+                    else "Path ditemukan dengan ukuran berbeda atau hasil tidak lengkap; sumber dipertahankan."
+                )
+                match_count = 0
+            outputs[index] = {
+                "index": index,
+                "name": str(item["name"]),
+                "target_path": target_path,
+                "profile": str(item.get("profile") or ""),
+                "status": state,
+                "match_count": match_count,
+                "retryable": retryable,
+                "error_code": code,
+                "error": message,
+            }
+            if state == "succeeded":
+                store = getattr(self, "command_store", None)
+                persist = getattr(store, "record_storage_upload_item", None)
+                source_command_id = str(item.get("source_command_id") or "")
+                source_item = item.get("source_item")
+                saved_upload = (
+                    source_item.get("uploaded_item")
+                    if isinstance(source_item, dict)
+                    else None
+                )
+                if callable(persist) and source_command_id and isinstance(saved_upload, dict):
+                    transfer_mode = str(
+                        payload.get("transfer_mode")
+                        or saved_upload.get("transfer_mode")
+                        or "copy"
+                    ).strip().lower()
+                    updated_upload = {
+                        **saved_upload,
+                        "status": "succeeded",
+                        "upload_status": "succeeded",
+                        "error_code": "",
+                        "error": "",
+                        "cleanup_status": (
+                            "retained_ambiguous" if transfer_mode == "move" else "not_requested"
+                        ),
+                    }
+                    try:
+                        persist(
+                            source_command_id,
+                            str(item.get("path") or ""),
+                            file_name=str(item.get("name") or "File"),
+                            status="succeeded",
+                            attempt=int(item.get("source_attempt") or 0),
+                            retryable=False,
+                            result_item=updated_upload,
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "Could not persist rclone reconciliation checkpoint for %s",
+                            job_id,
+                            exc_info=True,
+                        )
+
+        for raw in submitted_items:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                index = int(raw.get("index"))
+            except (TypeError, ValueError):
+                continue
+            if index not in outputs:
+                outputs[index] = {
+                    "index": index,
+                    "name": str(raw.get("name") or "File")[:255],
+                    "target_path": str(raw.get("target_path") or ""),
+                    "status": "needs_reconciliation",
+                    "match_count": 0,
+                    "retryable": False,
+                    "error_code": "STORAGE_RECONCILIATION_INTERRUPTED",
+                    "error": "Pemeriksaan terhenti sebelum file dapat dipastikan.",
+                }
+        results = [outputs[key] for key in sorted(outputs)]
+        resolved = all(item["status"] in {"succeeded", "failed"} for item in results)
+        succeeded = sum(item["status"] == "succeeded" for item in results)
+        retryable = sum(item["retryable"] is True for item in results)
+        unresolved = sum(item["status"] == "needs_reconciliation" for item in results)
+        outcome = "succeeded" if resolved else "needs_reconciliation"
+        reporter.report(
+            phase=outcome,
+            message="Pemeriksaan rclone selesai" if resolved else "Sebagian file tetap ambigu",
+            overall={"current": len(results), "total": len(submitted_items), "unit": "files"},
+            counters={"succeeded": succeeded, "retryable": retryable, "ambiguous": unresolved},
+            force=True,
+        )
+        return {
+            "outcome": outcome,
+            "provider": "rclone",
             "source_job_id": source_job_id,
             "total": len(results),
             "succeeded": succeeded,
@@ -930,7 +1232,7 @@ class StorageExecutorMixin:
         if cleanup_status not in {"", "pending", "retained_ambiguous"}:
             return {"cleanup_status": cleanup_status}
         cleanup_status = self._storage_move_cleanup(candidate, root, expected)
-        updated = {**saved, "provider": "telegram", "upload_status": "succeeded", "cleanup_status": cleanup_status}
+        updated = {**saved, "upload_status": "succeeded", "cleanup_status": cleanup_status}
         persist = getattr(store, "record_storage_upload_item", None)
         if callable(persist):
             persist(

@@ -2013,6 +2013,36 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertIn("worker:local:quick-stage:stage-1", retry_plan.resource_keys)
         self.assertNotIn("profile:default:worker:local:tdl:export", retry_plan.resource_keys)
 
+    def test_rclone_storage_reconciliation_uses_rclone_and_move_workspace_locks(self):
+        plan = build_execution_plan(
+            "storage_reconcile",
+            "default",
+            "local",
+            {
+                "_storage_reconcile_provider": "rclone",
+                "folder_path": "/workspace/storage",
+                "transfer_mode": "move",
+            },
+        )
+        upload = build_execution_plan(
+            "storage_upload",
+            "default",
+            "local",
+            {
+                "provider": "rclone",
+                "folder_path": "/workspace/storage",
+                "transfer_mode": "move",
+            },
+        )
+        self.assertEqual(plan.lane, "rclone-storage-reconcile")
+        self.assertIn("worker:local:rclone:storage", plan.resource_keys)
+        self.assertIn(
+            "exclusive:worker:local:workspace:/workspace/storage",
+            plan.resource_keys,
+        )
+        self.assertNotIn("worker:local:tdl:storage", plan.resource_keys)
+        self.assertTrue(resource_sets_conflict(plan.resource_keys, upload.resource_keys))
+
     def test_artifact_delete_and_download_share_per_file_execution_fence(self):
         key = "export-20261107.json"
         delete_plan = build_execution_plan(
@@ -3111,18 +3141,125 @@ class ControlPlaneTests(unittest.TestCase):
             )
         )
         updated = self.jobs.get(source.id)
+        self.assertEqual(updated.status, JobStatus.FAILED)
         items = updated.result["value"]["items"]
         self.assertEqual(items[0]["status"], "succeeded")
         self.assertFalse(items[0]["retryable"])
         self.assertEqual(items[1]["status"], "failed")
         self.assertTrue(items[1]["retryable"])
         self.assertTrue(job_dict(updated)["retryable"])
-
         retry = self.control.retry_job(self.actor, source.id)
         retry_command = self.dispatcher.commands[-1]
         self.assertEqual(retry.kind, "storage_upload")
         self.assertEqual(retry_command["payload"]["_storage_retry_paths"], ["safe.txt"])
         self.assertEqual(retry_command["payload"]["tdl_access_target"], "-100123")
+
+    def test_rclone_storage_reconciliation_verifies_original_destination_and_completes_move_job(self):
+        source_item = {
+            "path": "archive.bin",
+            "name": "archive.bin",
+            "provider": "rclone",
+            "target_path": "quickmode/archive.bin",
+            "status": "needs_reconciliation",
+            "upload_status": "needs_reconciliation",
+            "cleanup_status": "retained_ambiguous",
+            "source_identity": {"device": 1, "inode": 2, "size": 4096, "mtime_ns": 3},
+            "retryable": False,
+        }
+        source = Job(
+            id="rclone-source-reconcile",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={
+                "provider": "rclone",
+                "rclone_destination": "googledrive:backup",
+                "folder_path": "/workspace/storage",
+                "transfer_mode": "move",
+            },
+            result={"value": {
+                "outcome": "needs_reconciliation",
+                "provider": "rclone",
+                "total": 1,
+                "succeeded": 0,
+                "skipped": 0,
+                "failed": [source_item],
+                "items": [source_item],
+            }},
+        )
+        self.jobs.create_with_private_values(source, {})
+        reconciled_deletes = []
+        source_events = []
+        self.control.add_event_observer(
+            lambda event: source_events.append(event)
+            if event.job_id == source.id
+            else None
+        )
+        self.dispatcher.storage_move_cleanup = lambda *args: (
+            reconciled_deletes.append(args) or {"cleanup_status": "deleted"}
+        )
+
+        reconciliation = self.control.reconcile_storage_upload(self.actor, source.id)
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(reconciliation.kind, "storage_reconcile")
+        self.assertEqual(payload["_storage_reconcile_provider"], "rclone")
+        self.assertEqual(payload["rclone_destination"], "googledrive:backup")
+        self.assertEqual(payload["folder_path"], "/workspace/storage")
+        self.assertEqual(payload["_storage_reconcile_items"][0]["target_path"], "quickmode/archive.bin")
+        self.assertNotIn("tdl_access_target", payload)
+
+        next_sequence = max(event.sequence for event in self.jobs.events(reconciliation.id)) + 1
+        self.control.append_worker_event(
+            JobEvent(reconciliation.id, next_sequence, JobStatus.RUNNING, "started")
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                reconciliation.id,
+                next_sequence + 1,
+                JobStatus.SUCCEEDED,
+                "storage.reconciliation_completed",
+                result={"value": {
+                    "outcome": "succeeded",
+                    "provider": "rclone",
+                    "source_job_id": source.id,
+                    "total": 1,
+                    "succeeded": 1,
+                    "retryable": 0,
+                    "ambiguous": 0,
+                    "items": [{
+                        "index": 0,
+                        "name": "archive.bin",
+                        "target_path": "quickmode/archive.bin",
+                        "status": "succeeded",
+                        "match_count": 1,
+                        "retryable": False,
+                    }],
+                }},
+            )
+        )
+
+        updated = self.jobs.get(source.id)
+        self.assertEqual(updated.status, JobStatus.SUCCEEDED)
+        self.assertIsNone(updated.error)
+        self.assertEqual(updated.result["value"]["outcome"], "succeeded")
+        self.assertEqual(updated.result["value"]["succeeded"], 1)
+        self.assertEqual(updated.result["value"]["failed"], [])
+        self.assertEqual(updated.result["value"]["items"][0]["status"], "succeeded")
+        self.assertEqual(updated.result["value"]["items"][0]["cleanup_status"], "deleted")
+        self.assertEqual(
+            reconciled_deletes,
+            [("local", source.id, "/workspace/storage", "archive.bin")],
+        )
+        self.assertIn(
+            "storage.reconciliation_applied",
+            [event.event_type for event in self.jobs.events(source.id)],
+        )
+        self.assertEqual(
+            [event.event_type for event in source_events],
+            ["storage.reconciliation_applied"],
+        )
 
 
 if __name__ == "__main__":

@@ -439,23 +439,50 @@ class ControlPlane:
             _, selected_worker = self.resolve_target(
                 actor, worker=worker
             )
-            sender_profiles = [
-                str(item).strip().lower()
-                for item in internal_payload.get("_tdl_sender_profiles", [])
-                if str(item).strip()
-            ]
-            internal_payload["_tdl_sender_profiles"] = list(dict.fromkeys(sender_profiles))
-            internal_payload["_tdl_sender_profile"] = (
-                internal_payload["_tdl_sender_profiles"][0]
-                if internal_payload["_tdl_sender_profiles"]
-                else owner_profile
-            )
-            if not private_values.get("tdl_storage_chat_ref"):
+            reconcile_provider = str(
+                internal_payload.get("_storage_reconcile_provider") or "telegram"
+            ).strip().lower()
+            if reconcile_provider not in {"telegram", "rclone"}:
                 raise DomainError(
-                    "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
-                    "Snapshot tujuan Storage untuk rekonsiliasi tidak tersedia.",
-                    status_code=409,
+                    "STORAGE_RECONCILIATION_PROVIDER_INVALID",
+                    "Provider rekonsiliasi Storage tidak didukung.",
+                    status_code=422,
                 )
+            if reconcile_provider == "rclone":
+                destination = str(
+                    internal_payload.get("rclone_destination") or ""
+                ).strip()
+                try:
+                    validate_rclone_destination(destination)
+                except ValueError as exc:
+                    raise DomainError(
+                        "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
+                        "Snapshot tujuan rclone untuk rekonsiliasi tidak tersedia.",
+                        status_code=409,
+                    ) from exc
+                internal_payload["_storage_reconcile_provider"] = "rclone"
+                internal_payload["rclone_destination"] = destination
+                internal_payload["_tdl_sender_profiles"] = []
+                private_values.pop("tdl_storage_chat_ref", None)
+            else:
+                sender_profiles = [
+                    str(item).strip().lower()
+                    for item in internal_payload.get("_tdl_sender_profiles", [])
+                    if str(item).strip()
+                ]
+                internal_payload["_storage_reconcile_provider"] = "telegram"
+                internal_payload["_tdl_sender_profiles"] = list(dict.fromkeys(sender_profiles))
+                internal_payload["_tdl_sender_profile"] = (
+                    internal_payload["_tdl_sender_profiles"][0]
+                    if internal_payload["_tdl_sender_profiles"]
+                    else owner_profile
+                )
+                if not private_values.get("tdl_storage_chat_ref"):
+                    raise DomainError(
+                        "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
+                        "Snapshot tujuan Storage untuk rekonsiliasi tidak tersedia.",
+                        status_code=409,
+                    )
         else:
             owner_profile, selected_worker = self.resolve_target(
                 actor,
@@ -2777,6 +2804,10 @@ class ControlPlane:
         if kind == "backup_verify":
             password = self.private_job_value(job_id, "backup_archive_password")
             return {**payload, **({"password": password} if password else {})}
+        if kind == "storage_reconcile" and str(
+            payload.get("_storage_reconcile_provider") or "telegram"
+        ).strip().lower() == "rclone":
+            return payload
         if kind in {"tts", "storage_upload", "storage_reconcile"}:
             if kind == "storage_upload":
                 payload = {
@@ -4248,6 +4279,13 @@ class ControlPlane:
         result_value = result_value if isinstance(result_value, dict) else {}
         source_items = result_value.get("items")
         source_items = source_items if isinstance(source_items, list) else []
+        provider = str(original.payload.get("provider") or "telegram").strip().lower()
+        if provider not in {"telegram", "rclone"}:
+            raise DomainError(
+                "STORAGE_RECONCILIATION_UNAVAILABLE",
+                "Provider upload tidak didukung untuk rekonsiliasi.",
+                status_code=409,
+            )
         ambiguous: list[dict[str, Any]] = []
         profiles: list[str] = []
         for index, item in enumerate(source_items):
@@ -4269,12 +4307,28 @@ class ControlPlane:
             profile_name = str(item.get("profile") or "").strip().lower()
             if profile_name:
                 profiles.append(profile_name)
-            ambiguous.append({
+            candidate = {
                 "index": index,
                 "path": raw_path,
                 "name": str(item.get("name") or path.name)[:255],
                 "profile": profile_name,
-            })
+            }
+            if provider == "rclone":
+                raw_target_path = str(item.get("target_path") or "").replace("\\", "/").strip()
+                target_path = PurePosixPath(raw_target_path)
+                if (
+                    not raw_target_path
+                    or target_path.is_absolute()
+                    or any(part in {"", ".", ".."} for part in target_path.parts)
+                    or target_path.as_posix() != raw_target_path
+                ):
+                    raise DomainError(
+                        "STORAGE_RECONCILIATION_ITEM_INVALID",
+                        "Path tujuan rclone untuk rekonsiliasi tidak valid.",
+                        status_code=409,
+                    )
+                candidate["target_path"] = raw_target_path
+            ambiguous.append(candidate)
         if not ambiguous:
             raise DomainError(
                 "STORAGE_RECONCILIATION_UNAVAILABLE",
@@ -4297,22 +4351,6 @@ class ControlPlane:
             ):
                 return candidate
 
-        target_chat = str(
-            self.private_job_value(original.id, "tdl_storage_chat_ref") or ""
-        ).strip()
-        profiles = list(dict.fromkeys(
-            [*profiles, *self._worker_profile_candidates(original.worker, "storage")]
-        ))
-        if not profiles:
-            profiles = [str(original.profile or "").strip().lower()]
-        profiles = [profile for profile in profiles if profile]
-        if not target_chat or not profiles:
-            raise DomainError(
-                "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
-                "Snapshot tujuan Storage untuk rekonsiliasi tidak tersedia.",
-                status_code=409,
-            )
-
         created_at = original.created_at
         if created_at.tzinfo is None:
             created_at = created_at.replace(tzinfo=timezone.utc)
@@ -4326,10 +4364,47 @@ class ControlPlane:
             "start_timestamp": start_timestamp,
             "end_timestamp": end_timestamp,
             "_storage_reconcile_items": ambiguous,
-            "_tdl_sender_profile": profiles[0],
-            "_tdl_sender_profiles": profiles,
         }
-        private_values = {"tdl_storage_chat_ref": target_chat}
+        if provider == "rclone":
+            destination = str(original.payload.get("rclone_destination") or "").strip()
+            try:
+                validate_rclone_destination(destination)
+            except ValueError as exc:
+                raise DomainError(
+                    "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
+                    "Snapshot tujuan rclone untuk rekonsiliasi tidak tersedia.",
+                    status_code=409,
+                ) from exc
+            payload.update(
+                _storage_reconcile_provider="rclone",
+                provider="rclone",
+                rclone_destination=destination,
+                folder_path=str(original.payload.get("folder_path") or ""),
+                transfer_mode=str(original.payload.get("transfer_mode") or "copy"),
+            )
+            private_values: dict[str, str] = {}
+        else:
+            target_chat = str(
+                self.private_job_value(original.id, "tdl_storage_chat_ref") or ""
+            ).strip()
+            profiles = list(dict.fromkeys(
+                [*profiles, *self._worker_profile_candidates(original.worker, "storage")]
+            ))
+            if not profiles:
+                profiles = [str(original.profile or "").strip().lower()]
+            profiles = [profile for profile in profiles if profile]
+            if not target_chat or not profiles:
+                raise DomainError(
+                    "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
+                    "Snapshot tujuan Storage untuk rekonsiliasi tidak tersedia.",
+                    status_code=409,
+                )
+            payload.update(
+                _storage_reconcile_provider="telegram",
+                _tdl_sender_profile=profiles[0],
+                _tdl_sender_profiles=profiles,
+            )
+            private_values = {"tdl_storage_chat_ref": target_chat}
         return self.submit_job(
             actor,
             "storage_reconcile",
@@ -4792,6 +4867,10 @@ class ControlPlane:
             or str(reconciliation_job.payload.get("source_job_id") or "") != source.id
         ):
             return
+        source_provider = str(source.payload.get("provider") or "telegram").strip().lower()
+        result_provider = str(result.get("provider") or "telegram").strip().lower()
+        if source_provider != result_provider:
+            return
         source_result = source.result if isinstance(source.result, dict) else {}
         wrapped = isinstance(source_result.get("value"), dict)
         value = source_result.get("value", source_result)
@@ -4814,6 +4893,11 @@ class ControlPlane:
             if not isinstance(current, dict) or current.get("status") != "needs_reconciliation":
                 continue
             if str(current.get("name") or "") != str(evidence.get("name") or ""):
+                continue
+            provider = str(source.payload.get("provider") or "telegram").strip().lower()
+            if provider == "rclone" and str(current.get("target_path") or "") != str(
+                evidence.get("target_path") or ""
+            ):
                 continue
             state = str(evidence.get("status") or "")
             if state == "succeeded" and match_count > 0:
@@ -4844,7 +4928,7 @@ class ControlPlane:
                 current.pop("error_code", None)
             if str(source.payload.get("transfer_mode") or "copy") == "move":
                 current["upload_status"] = state
-                if state == "succeeded" and str(source.payload.get("provider") or "telegram") == "telegram":
+                if state == "succeeded":
                     cleanup = getattr(self.dispatcher, "storage_move_cleanup", None)
                     try:
                         if callable(cleanup):
@@ -4861,18 +4945,89 @@ class ControlPlane:
                     except Exception:
                         current["cleanup_status"] = "cleanup_failed"
                     current.pop("source_identity", None)
-                elif state == "succeeded":
-                    current["cleanup_status"] = str(current.get("cleanup_status") or "not_requested")
                 else:
                     current["cleanup_status"] = "retained_ambiguous"
             updated_items[index] = current
         if not seen:
             return
         value["items"] = updated_items
+        value["total"] = len(updated_items)
+        value["succeeded"] = sum(
+            isinstance(item, dict) and item.get("status") == "succeeded"
+            for item in updated_items
+        )
+        value["skipped"] = sum(
+            isinstance(item, dict) and item.get("status") == "skipped"
+            for item in updated_items
+        )
+        unresolved_items = [
+            item for item in updated_items
+            if not isinstance(item, dict)
+            or item.get("status") not in {"succeeded", "skipped"}
+        ]
+        value["failed"] = unresolved_items
+        value["retryable"] = any(
+            isinstance(item, dict) and item.get("retryable") is True
+            for item in unresolved_items
+        )
+        if unresolved_items:
+            has_success = value["succeeded"] > 0 or value["skipped"] > 0
+            value["outcome"] = (
+                "partial_failure" if has_success
+                else "needs_reconciliation"
+                if any(
+                    isinstance(item, dict) and item.get("status") == "needs_reconciliation"
+                    for item in unresolved_items
+                )
+                else "failed"
+            )
+        else:
+            value["outcome"] = "succeeded"
+        value["skipped_items"] = [
+            item for item in updated_items
+            if isinstance(item, dict) and item.get("status") == "skipped"
+        ]
         next_result = {**source_result, **({"value": value} if wrapped else value)}
-        updater = getattr(self.jobs, "update_result", None)
-        if callable(updater):
-            updater(source.id, next_result)
+        complete_reconciliation = getattr(
+            self.jobs, "complete_storage_upload_reconciliation", None
+        )
+        if not unresolved_items and source.status == JobStatus.FAILED and callable(
+            complete_reconciliation
+        ):
+            completion_progress = {
+                "phase": "succeeded",
+                "message": "Semua file terkonfirmasi pada tujuan Storage; upload tidak diulang.",
+                "finished_at": utc_now().isoformat(),
+                "overall": {"current": len(updated_items), "total": len(updated_items), "unit": "files"},
+                "counters": {
+                    "succeeded": value["succeeded"],
+                    "failed": 0,
+                    "skipped": value["skipped"],
+                },
+            }
+            completed = complete_reconciliation(
+                source.id,
+                next_result,
+                progress=completion_progress,
+            )
+            if isinstance(completed, Job) and completed.status == JobStatus.SUCCEEDED:
+                applied = JobEvent(
+                    job_id=completed.id,
+                    sequence=completed.progress_sequence,
+                    status=JobStatus.SUCCEEDED,
+                    event_type="storage.reconciliation_applied",
+                    progress=completion_progress,
+                    result=next_result,
+                    error=None,
+                    created_at=completed.updated_at,
+                )
+                self._apply_event_side_effects(completed, applied)
+                for observer in tuple(self._event_observers):
+                    observer(applied)
+        else:
+            updater = getattr(self.jobs, "update_result", None)
+            if callable(updater):
+                updater(source.id, next_result)
 
 
 def _elapsed_since(timestamp: str, now: datetime) -> float:

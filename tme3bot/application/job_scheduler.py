@@ -150,17 +150,30 @@ def build_execution_plan(
                 keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
             lane = "tdl-storage"
     elif kind == "storage_reconcile":
-        keys = {
-            f"worker:{worker}:kind:storage_reconcile",
-            f"worker:{worker}:tdl:storage",
-        }
+        keys = {f"worker:{worker}:kind:storage_reconcile"}
         workspace_path = payload.get("folder_path") or payload.get("folder")
-        if workspace_path:
-            keys.update(_workspace_resource_keys(worker, [workspace_path]))
-        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
-        for sender_profile in sender_profiles:
-            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
-        lane = "tdl-storage-reconcile"
+        reconcile_provider = str(
+            payload.get("_storage_reconcile_provider") or "telegram"
+        ).strip().lower()
+        if reconcile_provider == "rclone":
+            keys.add(f"worker:{worker}:rclone:storage")
+            if workspace_path:
+                keys.update(
+                    _workspace_transfer_resource_key(
+                        worker,
+                        workspace_path,
+                        transfer_mode=str(payload.get("transfer_mode") or "copy"),
+                    )
+                )
+            lane = "rclone-storage-reconcile"
+        else:
+            keys.add(f"worker:{worker}:tdl:storage")
+            if workspace_path:
+                keys.update(_workspace_resource_keys(worker, [workspace_path]))
+            sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+            for sender_profile in sender_profiles:
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+            lane = "tdl-storage-reconcile"
     elif kind == "storage_sync":
         keys = {
             f"worker:{worker}:kind:storage_sync",

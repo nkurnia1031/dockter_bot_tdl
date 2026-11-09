@@ -1702,22 +1702,28 @@ class WorkerJobExecutor(
                 )
             else:
                 active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
-                requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
-                sender_profiles = (
-                    requested_senders
-                    if isinstance(requested_senders, list) and requested_senders
-                    else self.available_storage_profiles()
-                )
-                for sender_profile in sender_profiles:
-                    try:
-                        sender_runtime = self.profile_manager.runtime(str(sender_profile))
-                    except Exception:
-                        sender_runtime = None
-                    interrupt(
-                        f"Storage reconcile {sender_profile}",
-                        getattr(getattr(sender_runtime, "upload_tdl_client", None), "interrupt_current", None),
-                        owner_aware=True,
+                if str(
+                    active_payload.get("_storage_reconcile_provider") or "telegram"
+                ).strip().lower() == "rclone":
+                    if rclone_runner is not None:
+                        interrupt("storage rclone reconciliation", rclone_runner.cancel_current, owner_aware=True)
+                else:
+                    requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
+                    sender_profiles = (
+                        requested_senders
+                        if isinstance(requested_senders, list) and requested_senders
+                        else self.available_storage_profiles()
                     )
+                    for sender_profile in sender_profiles:
+                        try:
+                            sender_runtime = self.profile_manager.runtime(str(sender_profile))
+                        except Exception:
+                            sender_runtime = None
+                        interrupt(
+                            f"Storage reconcile {sender_profile}",
+                            getattr(getattr(sender_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                            owner_aware=True,
+                        )
         elif kind == "tdl_access_verify":
             active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
             purpose = str(active_payload.get("purpose") or "") if isinstance(active_payload, dict) else ""
@@ -2308,17 +2314,29 @@ class WorkerJobExecutor(
                 for sender_profile in sender_profiles:
                     keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         elif kind == "storage_reconcile":
-            keys = {
-                f"worker:{worker}:kind:storage_reconcile",
-                f"worker:{worker}:tdl:storage",
-            }
+            keys = {f"worker:{worker}:kind:storage_reconcile"}
             payload = command.get("payload") or {}
             workspace_path = payload.get("folder_path") or payload.get("folder")
-            if workspace_path:
-                keys.update(self._workspace_resource_keys(worker, [workspace_path]))
-            sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
-            for sender_profile in sender_profiles:
-                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+            reconcile_provider = str(
+                payload.get("_storage_reconcile_provider") or "telegram"
+            ).strip().lower()
+            if reconcile_provider == "rclone":
+                keys.add(f"worker:{worker}:rclone:storage")
+                if workspace_path:
+                    keys.update(
+                        self._workspace_transfer_resource_keys(
+                            worker,
+                            workspace_path,
+                            transfer_mode=str(payload.get("transfer_mode") or "copy"),
+                        )
+                    )
+            else:
+                keys.add(f"worker:{worker}:tdl:storage")
+                if workspace_path:
+                    keys.update(self._workspace_resource_keys(worker, [workspace_path]))
+                sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+                for sender_profile in sender_profiles:
+                    keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         elif kind == "storage_sync":
             keys = {
                 f"worker:{worker}:kind:storage_sync",

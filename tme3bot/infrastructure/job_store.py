@@ -2129,6 +2129,83 @@ class SqliteJobRepository:
             raise KeyError(f"Unknown job: {job_id}")
         return job
 
+    def complete_storage_upload_reconciliation(
+        self,
+        job_id: str,
+        result: dict[str, Any],
+        *,
+        progress: dict[str, Any],
+    ) -> Job:
+        """Atomically resolve a failed Storage upload after every item is verified."""
+        value = result.get("value", result) if isinstance(result, dict) else None
+        items = value.get("items") if isinstance(value, dict) else None
+        if (
+            not isinstance(items, list)
+            or not items
+            or any(
+                not isinstance(item, dict)
+                or item.get("status") not in {"succeeded", "skipped"}
+                for item in items
+            )
+        ):
+            raise ValueError("Storage upload reconciliation is not complete.")
+
+        job_key = str(job_id)
+        now = datetime.now(timezone.utc)
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_key,)).fetchone()
+            job = self._job(row)
+            if job is None:
+                raise KeyError(f"Unknown job: {job_key}")
+            if job.kind != "storage_upload" or job.status != JobStatus.FAILED:
+                raise ValueError("Only a failed Storage upload can be reconciled as succeeded.")
+            sequence = int(job.progress_sequence) + 1
+            event = JobEvent(
+                job_id=job_key,
+                sequence=sequence,
+                status=JobStatus.SUCCEEDED,
+                event_type="storage.reconciliation_applied",
+                progress={"phase": "succeeded", **dict(progress or {})},
+                result=result,
+                error=None,
+                created_at=now,
+            )
+            merged_progress = {**job.progress, **event.progress}
+            db.execute(
+                """INSERT INTO job_events(
+                    job_id, sequence, status, event_type, progress, result, error, created_at
+                ) VALUES(?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (
+                    job_key,
+                    sequence,
+                    JobStatus.SUCCEEDED.value,
+                    event.event_type,
+                    _dump(event.progress),
+                    _dump(result),
+                    now.isoformat(),
+                ),
+            )
+            db.execute(
+                """UPDATE jobs SET status = ?, progress = ?, result = ?, error = NULL,
+                    progress_sequence = ?, updated_at = ? WHERE id = ?""",
+                (
+                    JobStatus.SUCCEEDED.value,
+                    _dump(merged_progress),
+                    _dump(result),
+                    sequence,
+                    now.isoformat(),
+                    job_key,
+                ),
+            )
+            db.execute("DELETE FROM job_quickmode_slots WHERE job_id = ?", (job_key,))
+            updated = self._job(
+                db.execute("SELECT * FROM jobs WHERE id = ?", (job_key,)).fetchone()
+            )
+        if updated is None:
+            raise KeyError(f"Unknown job: {job_key}")
+        return updated
+
     def record_late_worker_event(
         self, job_id: str, event: dict[str, Any]
     ) -> tuple[Job, bool]:

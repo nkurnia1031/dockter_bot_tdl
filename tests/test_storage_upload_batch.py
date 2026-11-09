@@ -595,6 +595,32 @@ class StorageUploadBatchTests(unittest.TestCase):
             },
         )
 
+    def test_worker_rclone_reconciliation_uses_matching_rclone_and_move_locks(self):
+        executor = object.__new__(WorkerJobExecutor)
+        executor.config = SimpleNamespace(backup_node_name="local")
+        command = {
+            "kind": "storage_reconcile", "profile": "default", "worker": "local",
+            "payload": {
+                "_storage_reconcile_provider": "rclone",
+                "folder_path": "/workspace/shared",
+                "transfer_mode": "move",
+            },
+        }
+
+        actual = executor._resource_keys_for_command(command)
+        expected = build_execution_plan(
+            command["kind"], command["profile"], command["worker"], command["payload"]
+        ).resource_keys
+        self.assertEqual(actual, set(expected))
+        self.assertEqual(
+            actual,
+            {
+                "worker:local:kind:storage_reconcile",
+                "worker:local:rclone:storage",
+                "exclusive:worker:local:workspace:/workspace/shared",
+            },
+        )
+
     def test_rclone_management_jobs_share_storage_resource_lock_with_transfers(self):
         manage = build_execution_plan(
             "storage_rclone_manage", "default", "local",
@@ -1096,6 +1122,154 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertFalse(result["items"][0]["retryable"])
         self.assertNotIn("private runner failure detail", repr(result))
         self.assertNotIn(source_items[0]["caption"], repr(result))
+
+    def test_rclone_reconciliation_verifies_durable_target_without_uploading_again(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            selected_folder = workspace / "storage"
+            source = selected_folder / "nested" / "archive.bin"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"known uploaded content")
+            uploader = _BatchUploader(workspace, command_store=None)
+            uploader._workspace_path = lambda _path: selected_folder
+            identity = StorageExecutorMixin._storage_source_identity(source)
+
+            class _SourceCommandStore:
+                def storage_upload_items_for_job(self, job_id):
+                    self.job_id = job_id
+                    return {
+                        "command_id": "source-command",
+                        "items": [{
+                            "path": "nested/archive.bin",
+                            "name": "archive.bin",
+                            "status": "needs_reconciliation",
+                            "uploaded_item": {
+                                "provider": "rclone",
+                                "target_path": "quickmode/nested/archive.bin",
+                                "source_identity": identity,
+                                "transfer_mode": "move",
+                            },
+                        }],
+                    }
+
+            uploader.command_store = _SourceCommandStore()
+
+            class _VerifyOnlyRcloneRunner:
+                instances = []
+
+                def __init__(self, **kwargs):
+                    self.kwargs = kwargs
+                    self.verify_calls = []
+                    self.instances.append(self)
+
+                def verify_files(self, files, destination, _config, **kwargs):
+                    files = list(files)
+                    self.verify_calls.append((files, destination, kwargs["remote_names"]))
+                    return {
+                        "status": "complete",
+                        "files": ["quickmode/nested/archive.bin"],
+                        "missing": [],
+                        "errors": [],
+                    }
+
+                def copy_files(self, *_args, **_kwargs):
+                    raise AssertionError("reconciliation must never upload again")
+
+            command = {
+                "job_id": "rclone-reconcile-job",
+                "kind": "storage_reconcile",
+                "profile": "default",
+                "payload": {
+                    "source_job_id": "rclone-source-job",
+                    "_storage_reconcile_provider": "rclone",
+                    "folder_path": str(selected_folder),
+                    "rclone_destination": "googledrive:backup",
+                    "start_timestamp": 100,
+                    "end_timestamp": 200,
+                    "_storage_reconcile_items": [{
+                        "index": 0,
+                        "path": "nested/archive.bin",
+                        "name": "archive.bin",
+                        "target_path": "quickmode/nested/archive.bin",
+                    }],
+                },
+            }
+            with patch("tme3bot.worker.executor_storage.RcloneRunner", _VerifyOnlyRcloneRunner):
+                result = uploader._storage_reconcile(command)
+
+            self.assertEqual(result["outcome"], "succeeded")
+            self.assertEqual(result["provider"], "rclone")
+            self.assertEqual(result["items"][0]["status"], "succeeded")
+            self.assertEqual(result["items"][0]["target_path"], "quickmode/nested/archive.bin")
+            runner = _VerifyOnlyRcloneRunner.instances[-1]
+            self.assertEqual(
+                runner.verify_calls,
+                [([source.resolve()], "googledrive:backup", ["quickmode/nested/archive.bin"])],
+            )
+            source.write_bytes(b"changed since the upload checkpoint")
+            runner_count = len(_VerifyOnlyRcloneRunner.instances)
+            changed_result = uploader._storage_reconcile(command)
+            self.assertEqual(changed_result["items"][0]["status"], "needs_reconciliation")
+            self.assertEqual(len(_VerifyOnlyRcloneRunner.instances), runner_count)
+
+    def test_reconciled_move_cleanup_deletes_only_when_saved_identity_still_matches(self):
+        with TemporaryDirectory() as temp:
+            workspace = Path(temp) / "workspace"
+            selected_folder = workspace / "storage"
+            selected_folder.mkdir(parents=True)
+            source = selected_folder / "archive.bin"
+            source.write_bytes(b"original")
+            identity = StorageExecutorMixin._storage_source_identity(source)
+            saved_upload = {
+                "provider": "rclone",
+                "target_path": "quickmode/archive.bin",
+                "source_identity": identity,
+                "transfer_mode": "move",
+                "cleanup_status": "retained_ambiguous",
+            }
+
+            class _CleanupStore:
+                def __init__(self):
+                    self.updated = []
+
+                def storage_upload_items_for_job(self, job_id):
+                    self.job_id = job_id
+                    return {
+                        "command_id": "source-command",
+                        "items": [{
+                            "path": "archive.bin",
+                            "name": "archive.bin",
+                            "status": "succeeded",
+                            "attempt": 1,
+                            "uploaded_item": dict(saved_upload),
+                        }],
+                    }
+
+                def record_storage_upload_item(self, *args, **kwargs):
+                    self.updated.append((args, kwargs))
+
+            store = _CleanupStore()
+            uploader = _BatchUploader(workspace, store)
+            uploader._workspace_path = lambda _path: selected_folder
+
+            source.write_bytes(b"changed after upload")
+            retained = uploader.storage_move_cleanup_reconciled(
+                "rclone-source-job", str(selected_folder), "archive.bin"
+            )
+            self.assertEqual(retained["cleanup_status"], "skipped_source_changed")
+            self.assertTrue(source.is_file())
+
+            source.write_bytes(b"original")
+            fresh_identity = StorageExecutorMixin._storage_source_identity(source)
+            saved_upload["source_identity"] = fresh_identity
+            deleted = uploader.storage_move_cleanup_reconciled(
+                "rclone-source-job", str(selected_folder), "archive.bin"
+            )
+            self.assertEqual(deleted["cleanup_status"], "deleted")
+            self.assertFalse(source.exists())
+            self.assertEqual(len(store.updated), 2)
+            self.assertEqual(store.updated[-1][1]["result_item"]["provider"], "rclone")
 
 
 if __name__ == "__main__":
