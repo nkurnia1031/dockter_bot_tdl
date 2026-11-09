@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Callable, Iterable
@@ -1624,7 +1625,7 @@ class RcloneRunner:
         config_root: Path,
         remote_names: Iterable[str],
     ) -> dict[str, object]:
-        """Verify complete content via read-only rclone checksums/download reads."""
+        """Verify complete content via a read-only, exact-file rclone check."""
         paths = [Path(item).resolve() for item in files]
         names = list(remote_names)
         if len(paths) != len(names):
@@ -1642,19 +1643,80 @@ class RcloneRunner:
             except ValueError as exc:
                 raise RcloneError("File verifikasi harus berada di dalam workspace.") from exc
             target, normalized = self._remote_path(destination, str(name))
-            command = ["rclone", "check", str(path), target, "--download", "--one-way",
-                       "--config", str(config), "--log-level", "ERROR"]
             try:
-                result = self.runner.run(command, log_prefix="rclone-storage-full-verify",
-                                         output_callback=self.log_callback,
-                                         stall_timeout_seconds=self.stall_timeout_seconds,
-                                         command_callback=self.command_callback)
-            except (TDLStalledError, TDLCommandError, OSError) as exc:
+                result = self._check_single_file(
+                    path,
+                    target,
+                    config,
+                    log_prefix="rclone-storage-full-verify",
+                    download=True,
+                )
+            except (RcloneError, TDLStalledError, TDLCommandError, OSError) as exc:
                 return {"complete": False, "verified": verified, "reason_code": "RCLONE_VERIFY_UNAVAILABLE"}
             if result.returncode != 0:
                 return {"complete": False, "verified": verified, "reason_code": "RCLONE_CONTENT_MISMATCH"}
             verified.append(normalized)
         return {"complete": len(verified) == len(paths), "verified": verified, "reason_code": ""}
+
+    def _check_single_file(
+        self,
+        path: Path,
+        target: str,
+        config: Path,
+        *,
+        log_prefix: str,
+        download: bool,
+    ):
+        """Run `rclone check` with directory roots and an exact raw file list.
+
+        `rclone check` treats its two operands as filesystem roots. Passing a
+        single Google Drive object as the destination root fails with
+        `is a file not a directory`; scope the directory check to one filename
+        instead. The raw list also avoids interpreting glob characters in names.
+        """
+        file_name = path.name
+        if "\n" in file_name or "\r" in file_name:
+            raise RcloneError(
+                "Nama file tidak dapat diverifikasi dengan aman oleh rclone.",
+                code="RCLONE_VERIFY_UNAVAILABLE",
+            )
+        remote_relative = target.split(":", 1)[-1].rstrip("/")
+        remote_file_name = remote_relative.rsplit("/", 1)[-1]
+        if remote_file_name != file_name:
+            raise RcloneError(
+                "Nama file sumber dan tujuan rclone berbeda; verifikasi dibatalkan.",
+                code="RCLONE_VERIFY_UNAVAILABLE",
+            )
+        if "/" not in target:
+            remote_name, separator, _ = target.partition(":")
+            remote_parent = f"{remote_name}:" if separator else "."
+        else:
+            remote_parent = target.rsplit("/", 1)[0]
+
+        with tempfile.TemporaryDirectory(prefix="tme3bot-rclone-check-") as temp_dir:
+            files_from = Path(temp_dir) / "files-from-raw.txt"
+            files_from.write_text(file_name + "\n", encoding="utf-8")
+            command = [
+                "rclone",
+                "check",
+                str(path.parent),
+                remote_parent,
+                "--one-way",
+                "--files-from-raw",
+                str(files_from),
+                "--download" if download else "--size-only",
+                "--config",
+                str(config),
+                "--log-level",
+                "ERROR",
+            ]
+            return self.runner.run(
+                command,
+                log_prefix=log_prefix,
+                output_callback=self.log_callback,
+                stall_timeout_seconds=self.stall_timeout_seconds,
+                command_callback=self.command_callback,
+            )
 
     @staticmethod
     def _command_output(result) -> str:
@@ -1946,31 +2008,20 @@ class RcloneRunner:
             remote_parts = [part for part in remote_name.split("/") if part]
             if not remote_parts or any(part in {".", ".."} for part in remote_parts):
                 raise RcloneError(f"Nama tujuan rclone tidak valid untuk {path.name}.")
-            target = f"{destination.rstrip('/')}/{'/'.join(remote_parts)}"
-            command = [
-                "rclone",
-                "check",
-                str(path),
-                target,
-                "--size-only",
-                "--config",
-                str(config),
-                "--log-level",
-                "ERROR",
-            ]
             try:
-                result = self.runner.run(
-                    command,
+                target, normalized_name = self._remote_path(destination, remote_name)
+                result = self._check_single_file(
+                    path,
+                    target,
+                    config,
                     log_prefix="rclone-verify",
-                    output_callback=self.log_callback,
-                    stall_timeout_seconds=self.stall_timeout_seconds,
-                    command_callback=self.command_callback,
+                    download=False,
                 )
-            except (TDLStalledError, TDLCommandError, OSError) as exc:
+            except (RcloneError, TDLStalledError, TDLCommandError, OSError) as exc:
                 errors.append({"name": remote_name, "error": str(exc)[:300]})
                 continue
             if result.returncode == 0:
-                found.append(remote_name)
+                found.append(normalized_name)
             elif int(result.returncode) == 1:
                 recovered, has_name = inventory_matches(remote_name, path.stat().st_size)
                 if recovered:
