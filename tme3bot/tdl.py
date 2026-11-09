@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import os
@@ -26,6 +28,17 @@ from tme3bot.tdl_output import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _encode_string_slice_argument(value: str) -> str:
+    """Encode one value for TDL's pflag StringSlice options.
+
+    pflag parses StringSlice values as CSV, so an unquoted path containing a
+    comma is interpreted as multiple paths even when passed as one argv item.
+    """
+    output = io.StringIO(newline="")
+    csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="").writerow([value])
+    return output.getvalue()
 
 
 class ProcessStalledError(RuntimeError):
@@ -1447,7 +1460,13 @@ class TDLClient:
                 handle.write(json.dumps(str(caption), ensure_ascii=False))
                 handle.write("\n")
                 caption_path = Path(handle.name)
-            upload_args = ["up", "-p", str(file_path), "-c", chat_ref]
+            upload_args = [
+                "up",
+                "-p",
+                _encode_string_slice_argument(str(file_path)),
+                "-c",
+                chat_ref,
+            ]
             if as_photo:
                 upload_args.append("--photo")
             upload_args.extend(["--caption", str(caption_path)])
