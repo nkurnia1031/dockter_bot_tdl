@@ -844,10 +844,10 @@ class TDLClientTests(unittest.TestCase):
         self.assertEqual(progress.elapsed_seconds, 16.801)
         self.assertEqual(progress.transferred_bytes, 29 * 1024 * 1024)
 
-    def test_upload_builds_one_file_command_and_returns_message_id(self) -> None:
+    def test_upload_keeps_comma_path_as_one_file_argument(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            source = root / "a.pdf"
+            source = root / "Chapter 637 Morthex, the Pale Devourer.mp3"
             source.write_bytes(b"a")
             runner = FakeRunner("empty")
             result = TDLClient(root / "tdl", "default", runner=runner).upload(
@@ -858,7 +858,7 @@ class TDLClientTests(unittest.TestCase):
         self.assertEqual(command[0], "tdl")
         self.assertNotIn("runuser", command)
         self.assertEqual(command[command.index("up") : command.index("up") + 7], [
-            "up", "-p", str(source), "-c", "-100123", "--caption", command[-1]
+            "up", "-p", f'"{source}"', "-c", "-100123", "--caption", command[-1]
         ])
         self.assertTrue(command[-1].endswith(".txt"))
         self.assertEqual(json.loads(runner.caption_contents[0]), "caption")
