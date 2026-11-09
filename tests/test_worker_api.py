@@ -32,6 +32,12 @@ class FakeExecutor:
         self.rclone_storage_trash_requests = []
         self.storage_move_cleanup_requests = []
         self.safelink_probe_calls = 0
+        self.aria2_health_result = {
+            "ready": True,
+            "reason_code": "",
+            "engine": {"ready": True, "version": "1.36.0"},
+            "hook": {"ready": True, "script_present": True, "configured": True},
+        }
         self.profile_readiness_canary_requests = []
         self.profile_readiness_canary_status = {
             "id": "8ec4a6df-26f8-49eb-a1ae-c057d9fa4bc1",
@@ -180,6 +186,9 @@ class FakeExecutor:
                 for slot in range(1, 4)
             ],
         }
+
+    def aria2_health(self):
+        return dict(self.aria2_health_result)
 
     def diagnose_profile_export(self, profile):
         return {
@@ -827,6 +836,16 @@ class WorkerApiTests(unittest.TestCase):
         invalid = self.client.post("/internal/v1/tts/helpers/4/recover", headers=headers)
         self.assertEqual(invalid.status_code, 422)
         self.assertEqual(self.executor.tts_helper_recoveries, [2])
+
+    def test_aria2_health_requires_worker_auth_and_returns_no_secret(self):
+        denied = self.client.get("/internal/v1/aria2/health")
+        self.assertEqual(denied.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        response = self.client.get("/internal/v1/aria2/health", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["ready"])
+        self.assertEqual(response.json()["engine"]["version"], "1.36.0")
+        self.assertNotIn("secret", response.text.lower())
 
     def test_worker_runtime_settings_are_internal_and_validate_storage_profile(self):
         headers = {"Authorization": "Bearer worker-secret"}

@@ -24,6 +24,7 @@ COPY utility /app/utility
 CMD ["python3", "/app/bot.py"]
 
 FROM runtime-base AS worker
+ARG ARIANG_VERSION=1.3.14
 COPY requirements-tts.txt /tmp/requirements-tts.txt
 COPY requirements-verifier.txt /tmp/requirements-verifier.txt
 RUN python3 -m pip install --no-cache-dir \
@@ -31,8 +32,17 @@ RUN python3 -m pip install --no-cache-dir \
         -r /tmp/requirements-verifier.txt \
     && python3 -c "import py7zr" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends tor \
+    && apt-get install -y --no-install-recommends tor aria2 ca-certificates curl unzip \
+    && mkdir -p /opt/ariang \
+    && curl -fsSL "https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip" -o /tmp/ariang.zip \
+    && unzip -q /tmp/ariang.zip -d /tmp/ariang \
+    && ariang_index="$(find /tmp/ariang -type f -name index.html -print -quit)" \
+    && test -n "${ariang_index}" \
+    && cp -a "$(dirname "${ariang_index}")"/. /opt/ariang/ \
+    && rm -rf /tmp/ariang /tmp/ariang.zip \
     && rm -rf /var/lib/apt/lists/* /tmp/requirements-tts.txt /tmp/requirements-verifier.txt
+COPY docker/aria2/aria2-retry-on-low-speed.py /usr/local/bin/aria2-retry-on-low-speed.py
+RUN chmod 0755 /usr/local/bin/aria2-retry-on-low-speed.py
 COPY bot.py /app/bot.py
 COPY pkg_resources.py /app/pkg_resources.py
 COPY tme3bot /app/tme3bot

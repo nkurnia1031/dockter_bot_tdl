@@ -21,6 +21,7 @@
     { href: '/tts/', label: 'TTS Novel', icon: Volume2 },
     { href: '/profiles/', label: 'Profil', icon: UserRoundPlus },
     { href: '/downloads/', label: 'Download', icon: Download },
+    { href: '/aria2/', label: 'AriaNg', icon: Download },
     { href: '/utility/', label: 'Utility', icon: Wrench },
     { href: '/storage/', label: 'Storage', icon: HardDrive },
     { href: '/activity/', label: 'Aktivitas', icon: Activity },

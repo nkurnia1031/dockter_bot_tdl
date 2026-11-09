@@ -77,6 +77,7 @@ from tme3bot.worker.upload_lane import UploadLanePreparer
 from tme3bot.worker.command_runner import WorkerCommandRunner
 from tme3bot.worker.command_store import WorkerCommandStore
 from tme3bot.worker.public_download_links import PublicDownloadLinks
+from tme3bot.worker.aria2_runtime import Aria2Runtime
 
 LOGGER = logging.getLogger(__name__)
 from .executor_support import (
@@ -249,6 +250,11 @@ class WorkerJobExecutor(
             database_paths.sqlite("public-download-links.sqlite3"),
             Path(getattr(config, "utility_workspace_root", "/workspace")),
         )
+        self.aria2_runtime = Aria2Runtime(
+            state_root=database_paths.aria2_directory(),
+            workspace_root=Path(getattr(config, "utility_workspace_root", "/workspace")),
+            rpc_url=str(getattr(config, "aria2_rpc_url", "http://aria2:6800/jsonrpc")),
+        )
 
         self.command_runner = WorkerCommandRunner(self.command_store, self)
         self.profile_distribution_events = ProfileDistributionEventReporter(
@@ -278,6 +284,9 @@ class WorkerJobExecutor(
             job_id=job_id,
             provider=provider,
         )
+
+    def aria2_health(self) -> dict[str, object]:
+        return self.aria2_runtime.health()
 
     def storage_download_links(self) -> list[dict[str, str]]:
         return self.public_download_links.active_links()

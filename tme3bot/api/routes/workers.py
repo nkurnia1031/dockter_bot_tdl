@@ -2323,6 +2323,57 @@ def register_workers(app, context, *, current_actor):
             "helpers": safe_helpers,
         }
 
+    @app.get("/api/v1/workers/{name}/aria2/health")
+    def worker_aria2_health(name: str, actor=Depends(current_actor)):
+        del actor
+        if context.worker_registry.get(name) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        probe = getattr(context.worker_dispatcher, "aria2_health", None)
+        if not callable(probe):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Gateway belum mendukung Aria2.", status_code=409)
+        try:
+            raw = probe(name)
+        except Exception:
+            return {
+                "worker": name,
+                "ready": False,
+                "reason_code": "ARIA2_WORKER_UNAVAILABLE",
+                "engine": {"ready": False, "version": None},
+                "hook": {"ready": False, "script_present": False, "configured": False},
+            }
+        if not isinstance(raw, dict):
+            raw = {}
+        engine = raw.get("engine") if isinstance(raw.get("engine"), dict) else {}
+        hook = raw.get("hook") if isinstance(raw.get("hook"), dict) else {}
+        try:
+            hook_run_count = max(0, min(2_147_483_647, int(hook.get("run_count", 0) or 0)))
+        except (TypeError, ValueError):
+            hook_run_count = 0
+        allowed_hook_results = {
+            "never", "retry-queued", "retry-resumed", "retry-resumed-cleanup-error",
+            "ignored-not-low-speed", "skipped-state-changed", "hook-error", "unknown",
+        }
+        hook_last_result = str(hook.get("last_result") or "unknown")
+        if hook_last_result not in allowed_hook_results:
+            hook_last_result = "unknown"
+        return {
+            "worker": name,
+            "ready": raw.get("ready") is True,
+            "reason_code": str(raw.get("reason_code") or "ARIA2_WORKER_UNAVAILABLE"),
+            "engine": {
+                "ready": engine.get("ready") is True,
+                "version": str(engine.get("version"))[:80] if engine.get("version") else None,
+            },
+            "hook": {
+                "ready": hook.get("ready") is True,
+                "script_present": hook.get("script_present") is True,
+                "configured": hook.get("configured") is True,
+                "run_count": hook_run_count,
+                "last_run_at": str(hook.get("last_run_at") or "")[:40] or None,
+                "last_result": hook_last_result,
+            },
+        }
+
     @app.post(
         "/api/v1/workers/{name}/tts/helpers/{slot}/recover",
         response_model=WorkerTtsRecoveryResponse,

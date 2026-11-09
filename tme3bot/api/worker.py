@@ -537,6 +537,17 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
     def tts_health():
         return context.executor.tts_health()
 
+    @app.get("/internal/v1/aria2/health", dependencies=[Depends(authorize)])
+    def aria2_health():
+        probe = getattr(context.executor, "aria2_health", None)
+        if not callable(probe):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung health Aria2.",
+                status_code=404,
+            )
+        return probe()
+
     @app.post("/internal/v1/tts/helpers/{slot}/recover", dependencies=[Depends(authorize)])
     def recover_tts_helper(slot: int = ApiPath(ge=1, le=3)):
         try:

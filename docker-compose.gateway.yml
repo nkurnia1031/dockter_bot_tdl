@@ -104,9 +104,29 @@ services:
     environment:
       DATABASE_ROOT: /database/worker-local
       TTS_DATA_ROOT: /data/tts
+      ARIA2_RPC_URL: http://aria2:6800/jsonrpc
       STORAGE_DB_FILE: /database/worker-local/storage.db
       TDL_EXPORT_STORAGE: ""
       TDL_DOWNLOAD_STORAGE: ""
+
+  aria2:
+    image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
+    command: ["python3", "-m", "tme3bot.worker.aria2_runtime"]
+    restart: unless-stopped
+    environment:
+      ARIA2_STATE_ROOT: /state
+      ARIA2_RPC_URL: http://127.0.0.1:6800/jsonrpc
+      ARIA2_HOOK_PATH: /usr/local/bin/aria2-retry-on-low-speed.py
+      UTILITY_WORKSPACE_ROOT: ${UTILITY_WORKSPACE_ROOT:-/workspace}
+    volumes:
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2:/state
+      - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}
+    healthcheck:
+      test: ["CMD", "python3", "-m", "tme3bot.worker.aria2_runtime", "healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
 
   tts-1:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}

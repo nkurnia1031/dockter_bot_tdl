@@ -48,6 +48,11 @@ class DatabasePaths:
     def redis_directory(self) -> Path:
         return self._safe_join("redis")
 
+    def aria2_directory(self) -> Path:
+        """Resolve private aria2 RPC/session/config state for this worker."""
+
+        return self._safe_join("aria2")
+
     def worker_local_root(self) -> Path:
         return self._safe_join("worker-local")
 

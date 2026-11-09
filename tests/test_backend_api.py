@@ -132,6 +132,17 @@ class FakeDispatcher:
             ],
         }
         self.tts_health_calls = []
+        self.aria2_health_calls = []
+        self.aria2_health_result = {
+            "ready": True,
+            "reason_code": "",
+            "engine": {"ready": True, "version": "1.36.0"},
+            "hook": {
+                "ready": True, "script_present": True, "configured": True,
+                "run_count": 2, "last_run_at": "2026-11-09T10:00:00Z",
+                "last_result": "retry-resumed",
+            },
+        }
         self.tts_recoveries = []
         self.storage_fingerprint_overrides = {}
         self.rclone_browse_calls = []
@@ -255,6 +266,10 @@ class FakeDispatcher:
     def tts_health(self, worker):
         self.tts_health_calls.append(worker)
         return dict(self.tts_health_result)
+
+    def aria2_health(self, worker):
+        self.aria2_health_calls.append(worker)
+        return dict(self.aria2_health_result)
 
     def recover_tts_helper(self, worker, slot):
         self.tts_recoveries.append((worker, slot))
@@ -2934,6 +2949,21 @@ class BackendApiTests(unittest.TestCase):
         self.assertFalse(no_session.json()["ready"])
         self.assertTrue(no_session.json()["helpers_ready"])
         self.assertFalse(no_session.json()["profile_session_ready"])
+
+    def test_worker_aria2_health_is_authenticated_and_redacted(self):
+        denied = self.client.get("/api/v1/workers/local/aria2/health")
+        self.assertEqual(denied.status_code, 401)
+        headers = self.login()
+        response = self.client.get(
+            "/api/v1/workers/local/aria2/health", headers=headers
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["worker"], "local")
+        self.assertEqual(payload["hook"]["last_result"], "retry-resumed")
+        self.assertNotIn("secret", response.text.lower())
+        self.assertEqual(self.dispatcher.aria2_health_calls, ["local"])
 
     def test_worker_tts_helper_recovery_is_explicit_and_slot_limited(self):
         headers = self.login()
