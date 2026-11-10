@@ -10,6 +10,7 @@ describe('AriaNg worker readiness', () => {
   afterEach(cleanup);
   beforeEach(() => {
     vi.clearAllMocks();
+    window.localStorage.clear();
     apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
       if (path === '/workers') return { items: [{ name: 'remote-1', enabled: true }] };
       if (path.startsWith('/utility/tree?')) return {
@@ -51,6 +52,14 @@ describe('AriaNg worker readiness', () => {
 
   it('loads and saves only safe transfer settings through the authenticated bridge', async () => {
     render(Aria2Page);
+    const workerPicker = await screen.findByRole('combobox', { name: 'Worker' });
+    const settingsButton = screen.getByRole('button', { name: 'Pengaturan transfer' });
+    expect(workerPicker).toBeTruthy();
+    expect(settingsButton).toBeTruthy();
+    expect(screen.queryByRole('dialog', { name: 'Pengaturan transfer' })).toBeNull();
+
+    await fireEvent.click(settingsButton);
+    await screen.findByRole('dialog', { name: 'Pengaturan transfer' });
     const downloadLimit = await screen.findByLabelText(/Batas kecepatan unduh/);
     expect((downloadLimit as HTMLInputElement).value).toBe('0');
 
@@ -66,5 +75,19 @@ describe('AriaNg worker readiness', () => {
     const payload = JSON.parse(String(saveCall?.[1]?.body));
     expect(payload.params[0]['max-overall-download-limit']).toBe('2M');
     expect(JSON.stringify(payload)).not.toContain('rpc-secret');
+  });
+
+  it('opens the workspace folder picker separately and preserves the selected folder', async () => {
+    window.localStorage.setItem('tme3-aria2-folder:remote-1', '/workspace/aria2');
+    render(Aria2Page);
+
+    const folderButton = await screen.findByRole('button', { name: 'Pilih folder unduhan, saat ini /workspace/aria2' });
+    expect(screen.queryByRole('dialog', { name: 'Folder unduhan' })).toBeNull();
+    await fireEvent.click(folderButton);
+
+    await screen.findByRole('dialog', { name: 'Folder unduhan' });
+    const selectedFolder = await screen.findByRole('radio', { name: 'Pilih aria2' });
+    expect((selectedFolder as HTMLInputElement).checked).toBe(true);
+    expect(apiMock).toHaveBeenCalledWith('/utility/tree?path=%2Fworkspace&worker=remote-1');
   });
 });

@@ -43,12 +43,13 @@
     load('/' + crumbs.slice(0, index + 1).join('/'));
   }
 
-  let lastWorker = '';
+  let lastWorker: string | null = null;
   $effect(() => {
     if (worker && worker !== lastWorker) {
+      const changingWorker = lastWorker !== null;
       lastWorker = worker;
       current = '/workspace';
-      selected = [];
+      if (changingWorker) selected = [];
       load('/workspace');
     }
   });
