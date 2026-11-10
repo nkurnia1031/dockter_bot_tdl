@@ -1,5 +1,6 @@
 import hashlib
 import threading
+import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,10 +12,11 @@ from tme3bot.worker.executor_storage import StorageExecutorMixin
 
 
 class _FakeTdlClient:
-    def __init__(self, *, denied=False, error=None, message_id=10):
+    def __init__(self, *, denied=False, error=None, message_id=10, messages=None):
         self.denied = denied
         self.error = error
         self.message_id = message_id
+        self.messages = messages if messages is not None else []
         self.uploads = []
 
     def upload(self, path, target, caption, **_kwargs):
@@ -23,7 +25,20 @@ class _FakeTdlClient:
             raise RuntimeError("CHAT_WRITE_FORBIDDEN")
         if self.error:
             raise RuntimeError(self.error)
+        self.messages.append({
+            "id": self.message_id,
+            "date": time.time(),
+            "file_name": Path(path).name,
+            "caption": caption,
+        })
         return SimpleNamespace(message_id=self.message_id)
+
+    def export_messages_by_time(self, target, start, end, export_path, *, with_content=True):
+        del target, export_path, with_content
+        return SimpleNamespace(messages=[
+            message for message in self.messages
+            if start <= message["date"] <= end
+        ])
 
 
 class _StorageUploader(StorageExecutorMixin):
@@ -50,13 +65,16 @@ class _StorageUploader(StorageExecutorMixin):
 
     @staticmethod
     def _runtime(name: str, *, denied: bool, message_id: int):
+        messages = []
+        upload_client = _FakeTdlClient(denied=denied, message_id=message_id, messages=messages)
+        export_client = _FakeTdlClient(message_id=message_id, messages=messages)
         return SimpleNamespace(
             config=SimpleNamespace(
                 storage_channel_ref="-100123",
                 storage_channel_id=1000 + message_id,
             ),
-            export_tdl_client=_FakeTdlClient(message_id=message_id),
-            upload_tdl_client=_FakeTdlClient(denied=denied, message_id=message_id),
+            export_tdl_client=export_client,
+            upload_tdl_client=upload_client,
             export_operation_lock=threading.RLock(),
             upload_operation_lock=threading.RLock(),
         )
@@ -218,7 +236,7 @@ class StorageUploadLaneTests(unittest.TestCase):
             )
             self.assertEqual(len(executor.runtimes["archive"].upload_tdl_client.uploads), 1)
 
-    def test_storage_upload_does_not_wait_for_the_export_lane_lock(self):
+    def test_storage_upload_verifies_after_upload_using_the_export_lane_lock(self):
         with TemporaryDirectory() as raw:
             root = Path(raw)
             workspace = self._workspace(root)
@@ -238,12 +256,14 @@ class StorageUploadLaneTests(unittest.TestCase):
                     daemon=True,
                 )
                 thread.start()
-                completed_while_export_locked = finished.wait(2)
+                completed_while_export_locked = finished.wait(0.2)
+                self.assertFalse(completed_while_export_locked)
+                self.assertEqual(len(runtime.upload_tdl_client.uploads), 1)
             finally:
                 runtime.export_operation_lock.release()
             thread.join(timeout=2)
 
-            self.assertTrue(completed_while_export_locked)
+            self.assertTrue(finished.is_set())
             self.assertEqual(result[0]["succeeded"], 1)
             self.assertEqual(len(runtime.upload_tdl_client.uploads), 1)
             self.assertFalse(runtime.export_tdl_client.uploads)

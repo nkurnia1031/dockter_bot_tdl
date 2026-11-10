@@ -562,8 +562,136 @@ class JobStoreTests(unittest.TestCase):
             self.assertEqual(confirmed["artifact_ref"], artifact_ref)
             self.assertEqual(
                 reopened.tts_delivery_summary(job.id),
-                {"total_parts": 1, "delivered_parts": 1, "cancelled_parts": 0},
+                {
+                    "total_parts": 1,
+                    "delivered_parts": 1,
+                    "cancelled_parts": 0,
+                    "verification_pending_parts": 0,
+                    "unverified_uploaded_parts": 0,
+                },
             )
+
+    def test_tts_verification_lease_unlocks_next_part_and_recovers_without_resend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            job = Job(
+                id="tts-verify-order",
+                kind="tts",
+                profile="default",
+                actor_user_id=7,
+                worker="local",
+                status=JobStatus.RUNNING,
+                payload={"title": "Judul"},
+            )
+            store.create(job)
+            store.create_tts_deliveries(job.id, job.worker, "Judul", [
+                {"artifact_ref": "a" * 48, "part_index": 1, "total_parts": 2, "byte_size": 5},
+                {"artifact_ref": "b" * 48, "part_index": 2, "total_parts": 2, "byte_size": 5},
+            ])
+
+            first = store.claim_tts_deliveries(1, worker="local", job_id=job.id, include_artifact_ref=True)[0]
+            store.complete_tts_delivery(
+                first["id"],
+                delivered=False,
+                verification_pending=True,
+                uploaded_at=1_700_000_000,
+                sender_profile="irang",
+            )
+            second = store.claim_tts_deliveries(1, worker="local", job_id=job.id, include_artifact_ref=True)[0]
+            self.assertEqual(second["part_index"], 2)
+            store.complete_tts_delivery(second["id"], delivered=True)
+
+            with store._db() as db:
+                db.execute(
+                    "UPDATE job_tts_deliveries SET lease_until = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), first["id"]),
+                )
+
+            recovered = store.claim_tts_deliveries(1, worker="local", job_id=job.id, include_artifact_ref=True)[0]
+            self.assertEqual(recovered["id"], first["id"])
+            self.assertTrue(recovered["verification_pending"])
+            self.assertEqual(recovered["uploaded_at"], 1_700_000_000)
+            self.assertEqual(recovered["sender_profile"], "irang")
+            store.complete_tts_delivery(recovered["id"], delivered=True)
+
+            self.assertEqual(store.tts_delivery_summary(job.id)["delivered_parts"], 2)
+
+    def test_tts_cancel_preserves_sent_parts_waiting_for_export_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            job = Job(
+                id="tts-cancel-verify",
+                kind="tts",
+                profile="default",
+                actor_user_id=7,
+                worker="local",
+                status=JobStatus.RUNNING,
+                payload={"title": "Judul"},
+            )
+            store.create(job)
+            store.create_tts_deliveries(job.id, job.worker, "Judul", [
+                {"artifact_ref": "a" * 48, "part_index": 1, "total_parts": 2, "byte_size": 5},
+                {"artifact_ref": "b" * 48, "part_index": 2, "total_parts": 2, "byte_size": 5},
+            ])
+
+            sent = store.claim_tts_deliveries(1, worker="local", job_id=job.id)[0]
+            store.complete_tts_delivery(
+                sent["id"],
+                delivered=False,
+                verification_pending=True,
+                uploaded_at=1_700_000_000,
+                sender_profile="default",
+            )
+            unsent = store.claim_tts_deliveries(1, worker="local", job_id=job.id)[0]
+
+            store.cancel_tts_deliveries(job.id)
+
+            self.assertEqual(store.get_tts_delivery(sent["id"])["status"], "claimed")
+            self.assertEqual(store.get_tts_delivery(sent["id"])["uploaded_at"], 1_700_000_000)
+            self.assertEqual(store.get_tts_delivery(unsent["id"])["status"], "cancelled")
+
+    def test_tts_retry_keeps_upload_time_and_profile_for_exact_export_check(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            job = Job(
+                id="tts-retry-window",
+                kind="tts",
+                profile="default",
+                actor_user_id=7,
+                worker="local",
+                status=JobStatus.RUNNING,
+                payload={"title": "Judul"},
+            )
+            store.create(job)
+            parts = [{
+                "artifact_ref": "a" * 48,
+                "part_index": 1,
+                "total_parts": 1,
+                "byte_size": 5,
+            }]
+            store.create_tts_deliveries(job.id, job.worker, "Judul", parts)
+            sent = store.claim_tts_deliveries(
+                1, worker="local", job_id=job.id, include_artifact_ref=True
+            )[0]
+            store.complete_tts_delivery(
+                sent["id"],
+                delivered=False,
+                reconciliation_required=True,
+                uploaded_at=1_700_000_000,
+                sender_profile="irang",
+            )
+
+            store.create_tts_deliveries(job.id, job.worker, "Judul", [
+                {**parts[0], "artifact_ref": "b" * 48},
+            ])
+            retry = store.claim_tts_deliveries(
+                1, worker="local", job_id=job.id, include_artifact_ref=True
+            )[0]
+
+            self.assertTrue(retry["reconciliation_pending"])
+            self.assertEqual(retry["uploaded_at"], 1_700_000_000)
+            self.assertEqual(retry["sender_profile"], "irang")
+            self.assertEqual(retry["artifact_ref"], "a" * 48)
 
     def test_tts_telegram_readiness_expires_after_service_stops_heartbeating(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

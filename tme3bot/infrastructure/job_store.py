@@ -230,6 +230,8 @@ class SqliteJobRepository:
                     attempts INTEGER NOT NULL DEFAULT 0,
                     available_at TEXT NOT NULL,
                     lease_until TEXT,
+                    uploaded_at REAL,
+                    sender_profile TEXT,
                     delivered_at TEXT,
                     last_error_code TEXT,
                     created_at TEXT NOT NULL,
@@ -259,6 +261,14 @@ class SqliteJobRepository:
                 db.execute(
                     "ALTER TABLE jobs ADD COLUMN settings_version INTEGER NOT NULL DEFAULT 0"
                 )
+            tts_delivery_columns = {
+                str(row["name"])
+                for row in db.execute("PRAGMA table_info(job_tts_deliveries)").fetchall()
+            }
+            if "uploaded_at" not in tts_delivery_columns:
+                db.execute("ALTER TABLE job_tts_deliveries ADD COLUMN uploaded_at REAL")
+            if "sender_profile" not in tts_delivery_columns:
+                db.execute("ALTER TABLE job_tts_deliveries ADD COLUMN sender_profile TEXT")
             db.execute(
                 """
                 UPDATE jobs
@@ -1204,18 +1214,20 @@ class SqliteJobRepository:
                     INSERT INTO job_tts_deliveries(
                         id, job_id, worker, title, artifact_ref, byte_size,
                         part_index, total_parts, status, attempts, available_at,
-                        lease_until, delivered_at, last_error_code, created_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, NULL, ?)
+                        lease_until, uploaded_at, sender_profile, delivered_at, last_error_code, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, NULL, NULL, NULL, NULL, NULL, ?)
                     ON CONFLICT(job_id, part_index) DO UPDATE SET
                         worker = excluded.worker,
                         title = excluded.title,
-                        artifact_ref = CASE WHEN job_tts_deliveries.status = 'delivered' THEN job_tts_deliveries.artifact_ref ELSE excluded.artifact_ref END,
-                        byte_size = CASE WHEN job_tts_deliveries.status = 'delivered' THEN job_tts_deliveries.byte_size ELSE excluded.byte_size END,
+                        artifact_ref = CASE WHEN job_tts_deliveries.status = 'delivered' OR (job_tts_deliveries.status IN ('claimed', 'reconciliation_required') AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL) THEN job_tts_deliveries.artifact_ref ELSE excluded.artifact_ref END,
+                        byte_size = CASE WHEN job_tts_deliveries.status = 'delivered' OR (job_tts_deliveries.status IN ('claimed', 'reconciliation_required') AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL) THEN job_tts_deliveries.byte_size ELSE excluded.byte_size END,
                         total_parts = excluded.total_parts,
-                        status = CASE WHEN job_tts_deliveries.status = 'delivered' THEN 'delivered' ELSE 'pending' END,
+                        status = CASE WHEN job_tts_deliveries.status = 'delivered' THEN 'delivered' WHEN job_tts_deliveries.status = 'claimed' AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL THEN 'claimed' ELSE 'pending' END,
                         available_at = excluded.available_at,
-                        lease_until = NULL,
-                        last_error_code = NULL
+                        lease_until = CASE WHEN job_tts_deliveries.status = 'claimed' AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL THEN job_tts_deliveries.lease_until ELSE NULL END,
+                        uploaded_at = CASE WHEN job_tts_deliveries.status IN ('claimed', 'reconciliation_required') AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL THEN job_tts_deliveries.uploaded_at ELSE NULL END,
+                        sender_profile = CASE WHEN job_tts_deliveries.status IN ('claimed', 'reconciliation_required') AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL THEN job_tts_deliveries.sender_profile ELSE NULL END,
+                        last_error_code = CASE WHEN job_tts_deliveries.last_error_code = 'TELEGRAM_SEND_FAILED' AND job_tts_deliveries.uploaded_at IS NULL THEN job_tts_deliveries.last_error_code WHEN job_tts_deliveries.last_error_code = 'TDL_UPLOAD_IN_PROGRESS' AND job_tts_deliveries.uploaded_at IS NOT NULL AND job_tts_deliveries.sender_profile IS NOT NULL THEN job_tts_deliveries.last_error_code ELSE NULL END
                     """,
                     (
                         secrets.token_hex(16),
@@ -1263,7 +1275,7 @@ class SqliteJobRepository:
             if job_id is not None:
                 filters.append("d.job_id = ?")
                 params.append(str(job_id))
-            columns = "d.id"
+            columns = "d.id, d.status, d.attempts, d.uploaded_at, d.sender_profile, d.last_error_code"
             if include_artifact_ref:
                 columns += ", d.artifact_ref"
             rows = db.execute(
@@ -1276,6 +1288,11 @@ class SqliteJobRepository:
                         WHERE earlier.job_id = d.job_id
                           AND earlier.part_index < d.part_index
                           AND earlier.status != 'delivered'
+                          AND NOT (
+                              earlier.status = 'claimed'
+                              AND earlier.uploaded_at IS NOT NULL
+                              AND earlier.sender_profile IS NOT NULL
+                          )
                     )
                 ORDER BY d.created_at, d.part_index LIMIT ?
                 """,
@@ -1283,11 +1300,37 @@ class SqliteJobRepository:
             ).fetchall()
             for item in rows:
                 delivery_id = str(item["id"])
+                was_verification_pending = (
+                    str(item["status"]) == "claimed"
+                    and item["uploaded_at"] is not None
+                    and bool(item["sender_profile"])
+                    and str(item["last_error_code"] or "") != "TDL_UPLOAD_IN_PROGRESS"
+                )
+                was_reconciliation_pending = (
+                    str(item["status"]) in {"pending", "claimed"}
+                    and item["uploaded_at"] is not None
+                    and bool(item["sender_profile"])
+                    and (
+                        str(item["status"]) == "pending"
+                        or str(item["last_error_code"] or "") == "TDL_UPLOAD_IN_PROGRESS"
+                    )
+                )
+                first_attempt = int(item["attempts"] or 0) == 0
+                safe_retry = (
+                    str(item["last_error_code"] or "") == "TELEGRAM_SEND_FAILED"
+                    and item["uploaded_at"] is None
+                    and not item["sender_profile"]
+                )
+                upload_in_progress = (
+                    str(item["last_error_code"] or "") == "TDL_UPLOAD_IN_PROGRESS"
+                    and item["uploaded_at"] is not None
+                    and bool(item["sender_profile"])
+                )
                 db.execute(
                     "UPDATE job_tts_deliveries SET status = 'claimed', lease_until = ?, attempts = attempts + 1 WHERE id = ?",
                     (lease_until, delivery_id),
                 )
-                fields = "id, job_id, title, part_index, total_parts, byte_size, attempts, created_at"
+                fields = "id, job_id, title, part_index, total_parts, byte_size, attempts, created_at, uploaded_at, sender_profile"
                 if include_artifact_ref:
                     fields += ", artifact_ref"
                 row = db.execute(
@@ -1295,7 +1338,13 @@ class SqliteJobRepository:
                     (delivery_id,),
                 ).fetchone()
                 if row is not None:
-                    claimed.append(dict(row))
+                    claimed_item = dict(row)
+                    claimed_item["verification_pending"] = was_verification_pending
+                    claimed_item["reconciliation_pending"] = was_reconciliation_pending
+                    claimed_item["first_attempt"] = first_attempt
+                    claimed_item["safe_retry"] = safe_retry
+                    claimed_item["upload_in_progress"] = upload_in_progress
+                    claimed.append(claimed_item)
         return claimed
 
     def get_tts_delivery(self, delivery_id: str) -> dict[str, Any] | None:
@@ -1311,6 +1360,10 @@ class SqliteJobRepository:
         *,
         delivered: bool,
         reconciliation_required: bool = False,
+        verification_pending: bool = False,
+        upload_in_progress: bool = False,
+        uploaded_at: float | None = None,
+        sender_profile: str | None = None,
     ) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
         with self._db() as db:
@@ -1326,16 +1379,33 @@ class SqliteJobRepository:
                     "UPDATE job_tts_deliveries SET status = 'delivered', lease_until = NULL, delivered_at = ?, last_error_code = NULL WHERE id = ?",
                     (now.isoformat(), str(delivery_id)),
                 )
+            elif verification_pending and uploaded_at is not None and sender_profile:
+                db.execute(
+                    "UPDATE job_tts_deliveries SET status = 'claimed', lease_until = ?, uploaded_at = ?, sender_profile = ?, last_error_code = ? WHERE id = ?",
+                    (
+                        (now + timedelta(seconds=180)).isoformat(),
+                        float(uploaded_at),
+                        str(sender_profile).strip().lower(),
+                        "TDL_UPLOAD_IN_PROGRESS" if upload_in_progress else None,
+                        str(delivery_id),
+                    ),
+                )
             elif reconciliation_required:
                 delay = min(300, 2 ** min(int(row["attempts"]), 8))
                 db.execute(
-                    "UPDATE job_tts_deliveries SET status = 'reconciliation_required', lease_until = NULL, available_at = ?, last_error_code = 'TTS_DELIVERY_RECONCILIATION_FAILED' WHERE id = ?",
-                    ((now + timedelta(seconds=delay)).isoformat(), str(delivery_id)),
+                    "UPDATE job_tts_deliveries SET status = 'reconciliation_required', lease_until = NULL, available_at = ?, uploaded_at = COALESCE(?, uploaded_at), sender_profile = COALESCE(?, sender_profile), last_error_code = ? WHERE id = ?",
+                    (
+                        (now + timedelta(seconds=delay)).isoformat(),
+                        float(uploaded_at) if uploaded_at is not None else None,
+                        str(sender_profile).strip().lower() if sender_profile else None,
+                        "TDL_UPLOAD_IN_PROGRESS" if upload_in_progress else "TTS_DELIVERY_RECONCILIATION_FAILED",
+                        str(delivery_id),
+                    ),
                 )
             else:
                 delay = min(300, 2 ** min(int(row["attempts"]), 8))
                 db.execute(
-                    "UPDATE job_tts_deliveries SET status = 'pending', lease_until = NULL, available_at = ?, last_error_code = 'TELEGRAM_SEND_FAILED' WHERE id = ?",
+                    "UPDATE job_tts_deliveries SET status = 'pending', lease_until = NULL, available_at = ?, uploaded_at = NULL, sender_profile = NULL, last_error_code = 'TELEGRAM_SEND_FAILED' WHERE id = ?",
                     ((now + timedelta(seconds=delay)).isoformat(), str(delivery_id)),
                 )
         return self.get_tts_delivery(delivery_id)
@@ -1343,19 +1413,27 @@ class SqliteJobRepository:
     def tts_delivery_summary(self, job_id: str) -> dict[str, Any]:
         with self._db() as db:
             row = db.execute(
-                "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered, SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled FROM job_tts_deliveries WHERE job_id = ?",
+                "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered, SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled, SUM(CASE WHEN status = 'claimed' AND uploaded_at IS NOT NULL AND sender_profile IS NOT NULL THEN 1 ELSE 0 END) AS verification_pending, SUM(CASE WHEN status NOT IN ('delivered', 'cancelled') AND uploaded_at IS NOT NULL AND sender_profile IS NOT NULL THEN 1 ELSE 0 END) AS unverified_uploaded FROM job_tts_deliveries WHERE job_id = ?",
                 (str(job_id),),
             ).fetchone()
         return {
             "total_parts": int(row["total"] or 0),
             "delivered_parts": int(row["delivered"] or 0),
             "cancelled_parts": int(row["cancelled"] or 0),
+            "verification_pending_parts": int(row["verification_pending"] or 0),
+            "unverified_uploaded_parts": int(row["unverified_uploaded"] or 0),
         }
 
     def cancel_tts_deliveries(self, job_id: str) -> None:
         with self._db() as db:
             db.execute(
-                "UPDATE job_tts_deliveries SET status = 'cancelled', lease_until = NULL WHERE job_id = ? AND status != 'delivered'",
+                """
+                UPDATE job_tts_deliveries
+                SET status = 'cancelled', lease_until = NULL
+                WHERE job_id = ?
+                  AND status NOT IN ('delivered', 'reconciliation_required')
+                  AND NOT (uploaded_at IS NOT NULL AND sender_profile IS NOT NULL)
+                """,
                 (str(job_id),),
             )
 

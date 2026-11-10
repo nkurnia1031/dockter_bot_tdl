@@ -77,6 +77,13 @@ class _UploadClient:
             if action == "ambiguous_failure":
                 raise RuntimeError("connection lost after upload started")
             time.sleep(0.02)
+            if action != "no_verify":
+                self.export_messages.append({
+                    "id": message_id,
+                    "date": time.time(),
+                    "file_name": path.name,
+                    "caption": _caption,
+                })
             if status_callback:
                 status_callback("uploaded")
             return SimpleNamespace(message_id=message_id)
@@ -165,6 +172,8 @@ class _BatchUploader(StorageExecutorMixin):
                     storage_channel_id=1000 + message_id,
                 ),
                 upload_tdl_client=client,
+                export_tdl_client=client,
+                export_operation_lock=threading.RLock(),
                 upload_operation_lock=threading.RLock(),
             )
         self.profile_manager = SimpleNamespace(
@@ -758,6 +767,29 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertEqual(set(checkpoints[-1]), {"one.txt", "two.txt"})
         for previous, current in zip(checkpoints, checkpoints[1:]):
             self.assertTrue(set(previous).issubset(current))
+
+    def test_telegram_upload_requires_export_match_and_never_retries_unverified_file(self):
+        self._add_files("unmatched.zip")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={"unmatched.zip": "no_verify"},
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["succeeded"], 0)
+        self.assertEqual(result["outcome"], "needs_reconciliation")
+        item = result["items"][0]
+        self.assertEqual(item["status"], "needs_reconciliation")
+        self.assertEqual(item["error_code"], "TELEGRAM_UPLOAD_NOT_FOUND")
+        self.assertFalse(item["retryable"])
+        self.assertEqual(
+            [name for _profile, name in uploader.metrics.upload_order],
+            ["unmatched.zip"],
+        )
+        persisted = self.store.storage_upload_items("storage-command")
+        self.assertEqual(persisted[0]["status"], "needs_reconciliation")
 
     def test_batch_reports_partial_failure_and_marks_only_pre_send_failure_retryable(self):
         self._add_files("safe.txt", "ambiguous.txt", "success.txt")

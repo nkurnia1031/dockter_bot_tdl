@@ -195,16 +195,68 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
         if type(delivered) is not bool:
             raise DomainError("TTS_DELIVERY_RESULT_INVALID", "Hasil delivery harus boolean.", status_code=422)
         reconciliation_required = body.get("reconciliation_required", False)
+        verification_pending = body.get("verification_pending", False)
+        upload_in_progress = body.get("upload_in_progress", False)
+        uploaded_at = body.get("uploaded_at")
+        sender_profile = body.get("sender_profile")
         if type(reconciliation_required) is not bool:
             raise DomainError(
                 "TTS_DELIVERY_RESULT_INVALID",
                 "Status rekonsiliasi delivery harus boolean.",
                 status_code=422,
             )
-        if delivered and reconciliation_required:
+        if type(verification_pending) is not bool:
             raise DomainError(
                 "TTS_DELIVERY_RESULT_INVALID",
-                "Delivery sukses tidak dapat ditandai masih memerlukan rekonsiliasi.",
+                "Status verifikasi delivery harus boolean.",
+                status_code=422,
+            )
+        if type(upload_in_progress) is not bool:
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Status proses upload TDL harus boolean.",
+                status_code=422,
+            )
+        if uploaded_at is not None and (
+            isinstance(uploaded_at, bool) or not isinstance(uploaded_at, (int, float))
+        ):
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Waktu upload delivery tidak valid.",
+                status_code=422,
+            )
+        if sum((delivered, reconciliation_required, verification_pending)) > 1:
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Hasil delivery hanya boleh memiliki satu status akhir.",
+                status_code=422,
+            )
+        if (uploaded_at is None) != (sender_profile is None):
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Waktu upload dan profil pengirim harus diberikan bersama.",
+                status_code=422,
+            )
+        if verification_pending and uploaded_at is None:
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Waktu upload diperlukan untuk verifikasi tertunda.",
+                status_code=422,
+            )
+        if upload_in_progress and (delivered or uploaded_at is None):
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Upload yang sedang berjalan harus memiliki waktu/profil dan belum terkirim terkonfirmasi.",
+                status_code=422,
+            )
+        if sender_profile is not None and (
+            not isinstance(sender_profile, str)
+            or not sender_profile.strip()
+            or len(sender_profile.strip()) > 48
+        ):
+            raise DomainError(
+                "TTS_DELIVERY_RESULT_INVALID",
+                "Profil pengirim untuk verifikasi tidak valid.",
                 status_code=422,
             )
         item = context.control_plane.jobs.get_tts_delivery(delivery_id)
@@ -216,6 +268,10 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             delivery_id,
             delivered=delivered,
             reconciliation_required=reconciliation_required,
+            verification_pending=verification_pending,
+            upload_in_progress=upload_in_progress,
+            uploaded_at=float(uploaded_at) if uploaded_at is not None else None,
+            sender_profile=str(sender_profile) if sender_profile is not None else None,
         )
         return {"status": str(updated.get("status") if updated else "missing")}
 

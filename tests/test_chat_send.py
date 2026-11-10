@@ -14,6 +14,8 @@ class FakeUploadClient:
     def __init__(self, profile: str, calls: list[tuple[str, str, str]], outcomes=None) -> None:
         self.profile = profile
         self.calls = calls
+        self.sent_messages: list[dict[str, object]] = []
+        self.export_requests: list[tuple[str, int, int]] = []
         self.progress_callback = None
         self.outcomes = list(outcomes or [])
 
@@ -26,8 +28,28 @@ class FakeUploadClient:
             if isinstance(outcome, BaseException):
                 raise outcome
             if outcome is not None:
+                self.sent_messages.append({
+                    "id": getattr(outcome, "message_id", len(self.calls)),
+                    "date": time.time(),
+                    "file_name": Path(file_path).name,
+                    "caption": caption,
+                })
                 return outcome
+        self.sent_messages.append({
+            "id": len(self.calls),
+            "date": time.time(),
+            "file_name": Path(file_path).name,
+            "caption": caption,
+        })
         return SimpleNamespace(message_id=len(self.calls), output="ok")
+
+    def export_messages_by_time(self, chat_ref, start, end, export_path, *, with_content=True):
+        del export_path, with_content
+        self.export_requests.append((chat_ref, start, end))
+        return SimpleNamespace(messages=[
+            message for message in self.sent_messages
+            if start <= float(message["date"]) <= end
+        ])
 
 
 class FakeProfileManager:
@@ -37,6 +59,8 @@ class FakeProfileManager:
     def runtime(self, profile: str):
         return SimpleNamespace(
             upload_tdl_client=self.clients[profile],
+            export_tdl_client=self.clients[profile],
+            export_operation_lock=threading.RLock(),
             upload_operation_lock=threading.RLock(),
         )
 
@@ -219,6 +243,34 @@ class ChatSendWorkerTests(unittest.TestCase):
                 event["event_type"] == "chat_send.progress"
                 for event in emitted
             ))
+
+    def test_chat_send_verifies_each_file_through_same_profile_export_lane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            folder = workspace / "batch"
+            folder.mkdir()
+            (folder / "episode 7.mkv").write_bytes(b"video")
+            calls: list[tuple[str, str, str]] = []
+            client = FakeUploadClient("irang", calls)
+
+            result, _emitted = self._run_job(
+                workspace,
+                {"irang": client},
+                "chat-send-export-verification",
+                {
+                    "chat_ref": "@target",
+                    "folders": [str(folder)],
+                    "_tdl_sender_profiles": ["irang"],
+                },
+            )
+
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["items"][0]["message_id"], 1)
+        self.assertEqual(len(client.export_requests), 1)
+        self.assertEqual(client.export_requests[0][0], "@target")
+        self.assertLessEqual(
+            client.export_requests[0][2] - client.export_requests[0][1], 120
+        )
 
     def test_chat_send_does_not_follow_symlinks_or_escape_workspace(self):
         with tempfile.TemporaryDirectory() as temp_dir:

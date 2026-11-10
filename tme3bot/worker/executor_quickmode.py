@@ -55,6 +55,9 @@ from tme3bot.worker.quick_export import (
     visual_media,
     write_quick_manifest,
 )
+from tme3bot.worker.telegram_upload_verification import (
+    TELEGRAM_UPLOAD_VERIFICATION_METHOD,
+)
 from typing import (
     Any,
 )
@@ -63,7 +66,6 @@ from .executor_support import (
     BAR_ONLY_PROGRESS_KEY,
     LOGGER,
     _is_named_progress_key,
-    _quick_message_matches,
     jakarta_timestamp,
     json_value,
     progress_line_key,
@@ -1213,6 +1215,7 @@ class QuickModeExecutorMixin:
                                 "total": len(archive_files) + 1,
                                 "succeeded": len(items),
                                 "failed": [],
+                                "telegram_verification": TELEGRAM_UPLOAD_VERIFICATION_METHOD,
                                 "uploaded_items": list(items),
                             },
                             rclone_destination=rclone_destination,
@@ -1422,13 +1425,7 @@ class QuickModeExecutorMixin:
             upload_result = upload_result if isinstance(upload_result, dict) else {}
             uploaded_items = upload_result.get("uploaded_items")
             uploaded_items = uploaded_items if isinstance(uploaded_items, list) else []
-            caption = str(manifest.get("caption") or quick_storage_caption(folder_name, quick_year()))
             expected_names = [path.name for path in archive_files] + [thumbnail_path.name]
-            known_items = {
-                str(item.get("original_name") or item.get("display_name") or ""): item
-                for item in uploaded_items
-                if isinstance(item, dict)
-            }
 
             channel_found = 0
             channel_reason = ""
@@ -1441,81 +1438,31 @@ class QuickModeExecutorMixin:
                     fallback_path=worker_log,
                 )
 
-            storage_profile = self.storage_profile()
-            verify_root: Path | None = None
-            try:
-                storage_runtime = self.profile_manager.runtime(storage_profile)
-                client = storage_runtime.upload_tdl_client
-                channel_ref = str(getattr(storage_runtime.config, "storage_channel_ref", "") or "")
-                if not channel_ref:
-                    raise QuickModeError(
-                        "Storage channel belum dikonfigurasi.",
-                        code="TDL_ACCESS_TARGET_UNAVAILABLE",
+            if upload_result.get("telegram_verification") != TELEGRAM_UPLOAD_VERIFICATION_METHOD:
+                channel_reason = (
+                    "Upload Telegram pada staging ini belum menyimpan bukti verifikasi nama lampiran dan caption."
+                )
+            else:
+                verified_counts: dict[str, int] = {}
+                for item in uploaded_items:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        message_id = int(item.get("channel_message_id") or 0)
+                    except (TypeError, ValueError):
+                        message_id = 0
+                    name = str(item.get("original_name") or item.get("display_name") or "")
+                    if message_id > 0 and name:
+                        verified_counts[name] = verified_counts.get(name, 0) + 1
+                for name in expected_names:
+                    available = verified_counts.get(name, 0)
+                    if available > 0:
+                        verified_counts[name] = available - 1
+                        channel_found += 1
+                if channel_found < len(expected_names):
+                    channel_reason = (
+                        "Sebagian upload Telegram belum memiliki bukti verifikasi per-file."
                     )
-                verify_root = stage_root / ".quickmode-verify"
-                verify_root.mkdir(mode=0o770, parents=True, exist_ok=True)
-                ensure_quick_stage_writable(verify_root)
-                try:
-                    verify_root.chmod(0o770)
-                except OSError:
-                    LOGGER.warning(
-                        "Could not chmod Quick Mode verification directory %s",
-                        verify_root,
-                        exc_info=True,
-                    )
-                fallback_messages: list[dict[str, Any]] | None = None
-                with storage_runtime.upload_operation_lock:
-                    secrets = getattr(self._job_log, "secrets", None)
-                    if isinstance(secrets, list) and str(verify_root) not in secrets:
-                        secrets.append(str(verify_root))
-                    with self._capture_tdl_output(
-                        client,
-                        log_callback=verify_log,
-                        command_callback=self._command_callback(
-                            profile=storage_profile, runtime="upload"
-                        ),
-                    ):
-                        for name in expected_names:
-                            item = known_items.get(name)
-                            raw_id = item.get("channel_message_id") if isinstance(item, dict) else None
-                            try:
-                                message_id = int(raw_id) if raw_id is not None else None
-                            except (TypeError, ValueError):
-                                message_id = None
-                            if message_id is not None:
-                                target = verify_root / f"channel-{message_id}.json"
-                                exported = client.export_messages(
-                                    channel_ref,
-                                    message_id,
-                                    target,
-                                    with_content=True,
-                                    end_id=message_id,
-                                )
-                                matches = any(
-                                    _quick_message_matches(message, name, caption, message_id)
-                                    for message in exported.messages
-                                )
-                            else:
-                                if fallback_messages is None:
-                                    target = verify_root / "channel-recent.json"
-                                    fallback_messages = client.export_messages(
-                                        channel_ref,
-                                        1,
-                                        target,
-                                        with_content=True,
-                                        last_count=1000,
-                                    ).messages
-                                matches = any(
-                                    _quick_message_matches(message, name, caption)
-                                    for message in fallback_messages
-                                )
-                            if matches:
-                                channel_found += 1
-            except Exception as exc:
-                channel_reason = str(exc)[:500]
-            finally:
-                if verify_root is not None:
-                    shutil.rmtree(verify_root, ignore_errors=True)
 
             drive_found = 0
             drive_reason = ""

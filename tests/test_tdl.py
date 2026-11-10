@@ -863,7 +863,7 @@ class TDLClientTests(unittest.TestCase):
         self.assertTrue(command[-1].endswith(".txt"))
         self.assertEqual(json.loads(runner.caption_contents[0]), "caption")
 
-    def test_upload_waits_for_delayed_message_id(self) -> None:
+    def test_upload_returns_without_polling_chat_history_when_id_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = root / "backup.7z.001"
@@ -873,8 +873,6 @@ class TDLClientTests(unittest.TestCase):
                 root / "tdl",
                 "default",
                 runner=runner,
-                upload_resolve_timeout_seconds=1,
-                upload_resolve_interval_seconds=0,
             )
             result = client.upload(
                 source,
@@ -882,12 +880,9 @@ class TDLClientTests(unittest.TestCase):
                 "Backup node=local run=abc\nPart: backup.7z.001",
             )
 
-        self.assertEqual(result.message_id, 4321)
-        self.assertGreaterEqual(runner.export_calls, 2)
-        self.assertTrue(all(mode & 0o222 for mode in runner.export_output_modes))
-        resolve_command = next(command for command in runner.commands if "export" in command)
-        self.assertIn("--with-content", resolve_command)
-        self.assertIn("last", resolve_command)
+        self.assertIsNone(result.message_id)
+        self.assertEqual(runner.export_calls, 0)
+        self.assertEqual(len(runner.commands), 1)
 
     def test_upload_can_force_image_as_telegram_photo(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -29,6 +29,10 @@ from tme3bot.storage_sync import parse_storage_export
 from tme3bot.worker.quick_export import (
     QuickModeError,
 )
+from tme3bot.worker.telegram_upload_verification import (
+    TELEGRAM_UPLOAD_VERIFICATION_METHOD,
+    TelegramUploadBatchVerifier,
+)
 from typing import (
     Any,
 )
@@ -54,6 +58,12 @@ def _storage_upload_target_path(root: Path, path: Path, preserve_structure: bool
 
 
 class StorageExecutorMixin:
+
+    def _storage_upload_verifier(self, job_id: str) -> TelegramUploadBatchVerifier:
+        factory = getattr(self, "_telegram_upload_verifier", None)
+        if callable(factory):
+            return factory(job_id)
+        return TelegramUploadBatchVerifier.for_profile_manager(self.profile_manager)
 
     def _job_cancelled(self, job_id: str) -> bool:
         """Fallback for focused mixin harnesses; the full executor adds fencing."""
@@ -1870,7 +1880,8 @@ class StorageExecutorMixin:
         }
         uploaded_items: list[dict[str, Any]] = []
         completed_bytes = 0
-        last_message_id: int | None = None
+        verifier = self._storage_upload_verifier(str(command["job_id"]))
+        pending_verifications: list[tuple[Path, str, str, str, bool, int, int, str, str, Any]] = []
         reporter.milestone(
             "phase_changed",
             progress=reporter.report(
@@ -2011,29 +2022,6 @@ class StorageExecutorMixin:
 
                     def upload_phase(phase: str) -> None:
                         upload_state["phase"] = phase
-                        if phase == "resolving_message":
-                            reporter.report(
-                                phase=phase,
-                                message=f"Menunggu konfirmasi Telegram untuk {path.name}",
-                                overall={
-                                    "current": index - 1,
-                                    "total": len(files),
-                                    "unit": "files",
-                                },
-                                item={
-                                    "name": path.name,
-                                    "index": index,
-                                    "total": len(files),
-                                    "size_bytes": size,
-                                    "percent": 100,
-                                },
-                                counters={
-                                    "succeeded": succeeded,
-                                    "failed": len(failed),
-                                },
-                                indeterminate=True,
-                                force=True,
-                            )
 
                     try:
                         physical_upload_succeeded = False
@@ -2086,10 +2074,6 @@ class StorageExecutorMixin:
                             force=True,
                         )
                         upload_kwargs = {"status_callback": upload_phase}
-                        if last_message_id is not None:
-                            # Do not resolve the previous message until this
-                            # upload was accepted by Telegram.
-                            upload_kwargs["resolve_after_id"] = last_message_id
                         if path.name in photo_names:
                             upload_kwargs["as_photo"] = True
                         result = None
@@ -2141,7 +2125,52 @@ class StorageExecutorMixin:
                         # publishing progress or registering the catalog event
                         # must not turn that physical upload into a false failure.
                         physical_upload_succeeded = True
-                        last_message_id = int(result.message_id)
+                        verification = verifier.record_upload(
+                            profile=sender_profile,
+                            chat_ref=target_chat,
+                            filename=path.name,
+                            caption=caption,
+                        )
+                        if verification.status != "verified" or verification.message_id is None:
+                            pending_verifications.append((
+                                path,
+                                sender_profile,
+                                logical_folder,
+                                relative_parent,
+                                caption_override,
+                                index,
+                                size,
+                                upload_id,
+                                caption,
+                                verification,
+                            ))
+                            completed_bytes += file_sizes[path]
+                            reporter.report(
+                                phase="verifying",
+                                message=f"Memeriksa {path.name} melalui lane Export {sender_profile}",
+                                overall={
+                                    "current": index - 1,
+                                    "total": len(files),
+                                    "unit": "files",
+                                    "bytes_current": min(total_bytes, completed_bytes),
+                                    "bytes_total": total_bytes,
+                                },
+                                item={
+                                    "name": path.name,
+                                    "index": index,
+                                    "total": len(files),
+                                    "size_bytes": size,
+                                    "profile": sender_profile,
+                                    "percent": 100,
+                                },
+                                counters={
+                                    "succeeded": succeeded,
+                                    "failed": len(failed),
+                                },
+                                force=True,
+                            )
+                            continue
+                        message_id = verification.message_id
                         reporter.report(
                             phase="registering",
                             message=f"Mencatat {path.name}",
@@ -2170,7 +2199,7 @@ class StorageExecutorMixin:
                             "owner_user_id": int(payload["owner_user_id"]),
                             "owner_profile": str(payload["owner_profile"]),
                             "channel_id": runtime.config.storage_channel_id,
-                            "channel_message_id": result.message_id,
+                            "channel_message_id": message_id,
                             "original_name": path.name,
                             "display_name": path.name,
                             "folder": logical_folder,
@@ -2279,6 +2308,108 @@ class StorageExecutorMixin:
                             progress=progress_payload,
                             error={"message": str(exc)[:500], "item": path.name},
                         )
+        if pending_verifications:
+            verifier.finalize()
+            for (
+                path,
+                profile,
+                logical_folder,
+                relative_parent,
+                caption_override,
+                index,
+                size,
+                upload_id,
+                caption,
+                verification,
+            ) in pending_verifications:
+                if verification.status == "verified" and verification.message_id is not None:
+                    runtime = sender_runtimes[profile]
+                    item = {
+                        "upload_id": upload_id,
+                        "owner_user_id": int(payload["owner_user_id"]),
+                        "owner_profile": str(payload["owner_profile"]),
+                        "channel_id": runtime.config.storage_channel_id,
+                        "channel_message_id": verification.message_id,
+                        "original_name": path.name,
+                        "display_name": path.name,
+                        "folder": logical_folder,
+                        "folder_id": payload.get("destination_folder_id"),
+                        "relative_folder": relative_parent,
+                        "keywords": str(payload.get("keywords", "")),
+                        "caption": caption,
+                        "caption_override": caption_override,
+                        "file_size": size,
+                        "mime_type": mimetypes.guess_type(path.name)[0] or "",
+                        "sha256": "",
+                        "status": "active",
+                        "uploaded_at": None,
+                    }
+                    uploaded_items.append(dict(item))
+                    succeeded += 1
+                    if upload_item_callback is not None:
+                        try:
+                            upload_item_callback(list(uploaded_items))
+                        except Exception:
+                            LOGGER.warning(
+                                "Storage upload evidence callback failed for %s",
+                                path,
+                                exc_info=True,
+                            )
+                    progress_payload = reporter.report(
+                        phase="registering",
+                        message=f"{path.name} terverifikasi di Telegram",
+                        overall={
+                            "current": index,
+                            "total": len(files),
+                            "percent": completed_bytes * 100 / total_bytes if total_bytes else 100,
+                            "unit": "files",
+                            "bytes_current": completed_bytes,
+                            "bytes_total": total_bytes,
+                        },
+                        item={"name": path.name, "index": index, "total": len(files), "size_bytes": size, "percent": 100},
+                        counters={"succeeded": succeeded, "failed": len(failed)},
+                        force=True,
+                    )
+                    reporter.milestone(
+                        "storage.item_uploaded",
+                        progress=progress_payload,
+                        result={"item": item},
+                    )
+                else:
+                    failed.append({
+                        "name": path.name,
+                        "status": "needs_reconciliation",
+                        "retryable": False,
+                        "error_code": verification.error_code or "TELEGRAM_UPLOAD_NOT_VERIFIED",
+                        "error": (
+                            "Upload diterima TDL tetapi belum terverifikasi pada ekspor waktu; "
+                            "file tidak dikirim ulang."
+                        ),
+                    })
+                    progress_payload = reporter.report(
+                        phase="needs_reconciliation",
+                        message=f"Belum terverifikasi: {path.name}",
+                        overall={
+                            "current": index,
+                            "total": len(files),
+                            "percent": completed_bytes * 100 / total_bytes if total_bytes else 100,
+                            "unit": "files",
+                            "bytes_current": completed_bytes,
+                            "bytes_total": total_bytes,
+                        },
+                        item={"name": path.name, "index": index, "total": len(files), "size_bytes": size, "percent": 100},
+                        counters={"succeeded": succeeded, "failed": len(failed)},
+                        force=True,
+                    )
+                    reporter.milestone(
+                        "item_failed",
+                        progress=progress_payload,
+                        error={
+                            "code": verification.error_code or "TELEGRAM_UPLOAD_NOT_VERIFIED",
+                            "message": "Upload belum terverifikasi pada ekspor waktu.",
+                            "item": path.name,
+                        },
+                    )
         reporter.report(
             phase="completed",
             message=f"Upload selesai: {succeeded} berhasil, {len(skipped_items)} dilewati, {len(failed)} gagal",
@@ -2300,6 +2431,7 @@ class StorageExecutorMixin:
             "skipped_items": skipped_items,
             "failed": failed,
             "provider": "telegram",
+            "telegram_verification": TELEGRAM_UPLOAD_VERIFICATION_METHOD,
             "uploaded_items": uploaded_items,
         }
 
@@ -2948,6 +3080,9 @@ class StorageExecutorMixin:
         skipped_count = 0
         in_flight = 0
         active_items: dict[str, dict[str, Any]] = {}
+        verifier = self._storage_upload_verifier(job_id)
+        pending_verifications: list[tuple[dict[str, Any], Any, str, str, str, str, bool]] = []
+        pending_verifications_lock = threading.RLock()
         next_sender: str | None = sender_profiles[0] if sender_profiles else None
         priority_task: dict[str, Any] | None = None
         lane_condition = threading.Condition(lanes_lock)
@@ -3374,7 +3509,6 @@ class StorageExecutorMixin:
                     def status_callback(phase: str) -> None:
                         mapped = {
                             "uploading": "sending",
-                            "resolving_message": "resolving",
                             "uploaded": "accepted",
                         }.get(str(phase), "sending")
                         phase_state["value"] = mapped
@@ -3386,17 +3520,6 @@ class StorageExecutorMixin:
                             profile=profile,
                             retryable=False,
                         )
-                        if mapped == "resolving":
-                            report_progress(
-                                phase="resolving_message",
-                                message=f"Menunggu konfirmasi Telegram untuk {path.name}",
-                                relative=relative,
-                                name=path.name,
-                                profile=profile,
-                                attempt=attempt,
-                                force=True,
-                            )
-
                     def transfer_progress(progress_value) -> None:
                         if not _has_transfer_telemetry(progress_value):
                             return
@@ -3419,9 +3542,6 @@ class StorageExecutorMixin:
                     upload_kwargs: dict[str, Any] = {"status_callback": status_callback}
                     if path.name in photo_names:
                         upload_kwargs["as_photo"] = True
-                    resolve_after_id = last_message_id_by_profile.get(profile)
-                    if resolve_after_id is not None:
-                        upload_kwargs["resolve_after_id"] = resolve_after_id
                     try:
                         with runtime.upload_operation_lock:
                             with self._capture_tdl_output(
@@ -3556,8 +3676,51 @@ class StorageExecutorMixin:
                             )
                         continue
 
-                    message_id = int(uploaded.message_id)
-                    last_message_id_by_profile[profile] = message_id
+                    verification = verifier.record_upload(
+                        profile=profile,
+                        chat_ref=target_chat,
+                        filename=path.name,
+                        caption=caption,
+                    )
+                    if verification.status != "verified":
+                        persist(
+                            relative,
+                            path.name,
+                            status="accepted",
+                            attempt=attempt,
+                            profile=profile,
+                            retryable=False,
+                            caption=caption,
+                        )
+                        with results_lock:
+                            active_items[relative].update(
+                                phase="verifying", percent=100, bytes_current=size
+                            )
+                        with pending_verifications_lock:
+                            pending_verifications.append((
+                                task,
+                                verification,
+                                profile,
+                                logical_folder,
+                                relative_parent,
+                                upload_id,
+                                caption_override,
+                            ))
+                        report_progress(
+                            phase="verifying",
+                            message=f"Memeriksa {path.name} melalui lane Export {profile}",
+                            relative=relative,
+                            name=path.name,
+                            profile=profile,
+                            attempt=attempt,
+                            item_percent=100,
+                            force=True,
+                        )
+                        continue
+
+                    message_id = verification.message_id
+                    if message_id is None:
+                        raise RuntimeError("TELEGRAM_UPLOAD_NOT_VERIFIED")
                     item = {
                         "upload_id": upload_id,
                         "owner_user_id": int(payload["owner_user_id"]),
@@ -3658,6 +3821,141 @@ class StorageExecutorMixin:
                 error_message="Tidak ada lane Upload siap untuk file ini; Telegram belum menerima file.",
             )
 
+        if pending_verifications:
+            verifier.finalize()
+            for (
+                task,
+                verification,
+                profile,
+                logical_folder,
+                relative_parent,
+                upload_id,
+                caption_override,
+            ) in pending_verifications:
+                path = task["path"]
+                relative = task["relative"]
+                attempt = int(task.get("attempt") or 0)
+                if verification.status == "verified" and verification.message_id is not None:
+                    runtime = sender_runtimes[profile]
+                    item = {
+                        "upload_id": upload_id,
+                        "owner_user_id": int(payload["owner_user_id"]),
+                        "owner_profile": str(payload["owner_profile"]),
+                        "channel_id": runtime.config.storage_channel_id,
+                        "channel_message_id": verification.message_id,
+                        "original_name": path.name,
+                        "display_name": path.name,
+                        "folder": logical_folder,
+                        "folder_id": payload.get("destination_folder_id"),
+                        "relative_folder": relative_parent,
+                        "keywords": str(payload.get("keywords", "")),
+                        "caption": str(payload.get("caption") or "") if caption_override else build_storage_caption(
+                            logical_folder, path.name, str(payload.get("keywords", ""))
+                        ),
+                        "caption_override": caption_override,
+                        "file_size": metadata.get(relative, 0),
+                        "mime_type": mimetypes.guess_type(path.name)[0] or "",
+                        "sha256": "",
+                        "status": "active",
+                        "uploaded_at": None,
+                    }
+                    finish_item(
+                        task,
+                        status="succeeded",
+                        profile=profile,
+                        retryable=False,
+                        message_id=verification.message_id,
+                        uploaded_item=item,
+                    )
+                    if callable(upload_item_callback):
+                        with checkpoint_lock:
+                            with results_lock:
+                                checkpoint_items = [
+                                    dict(uploaded_by_path[relative_path])
+                                    for relative_path in sorted(uploaded_by_path)
+                                ]
+                            try:
+                                upload_item_callback(checkpoint_items)
+                            except Exception:
+                                LOGGER.warning(
+                                    "Could not checkpoint verified Storage item %s",
+                                    path.name,
+                                    exc_info=True,
+                                )
+                    progress = report_progress(
+                        phase="registering",
+                        message=f"{path.name} terverifikasi di Telegram",
+                        relative=relative,
+                        name=path.name,
+                        profile=profile,
+                        attempt=attempt,
+                        item_percent=100,
+                        force=True,
+                    )
+                    try:
+                        self.publisher.emit(
+                            job_id,
+                            "running",
+                            "storage.item_uploaded",
+                            progress=progress,
+                            result={"item": item, "file": outcomes.get(relative)},
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "Verified Storage item event could not be queued for %s",
+                            path.name,
+                            exc_info=True,
+                        )
+                else:
+                    finish_item(
+                        task,
+                        status="needs_reconciliation",
+                        profile=profile,
+                        retryable=False,
+                        error_code=verification.error_code or "TELEGRAM_UPLOAD_NOT_VERIFIED",
+                        error_message=(
+                            "Upload selesai, tetapi nama file dan caption belum ditemukan "
+                            "pada ekspor lane Export; file sumber dipertahankan dan tidak dikirim ulang."
+                        ),
+                    )
+                    progress = report_progress(
+                        phase="needs_reconciliation",
+                        message=f"Belum terverifikasi: {path.name}",
+                        relative=relative,
+                        name=path.name,
+                        profile=profile,
+                        attempt=attempt,
+                        item_percent=100,
+                        force=True,
+                    )
+                    try:
+                        self.publisher.emit(
+                            job_id,
+                            "running",
+                            "storage.item_failed",
+                            progress=progress,
+                            error={
+                                "code": verification.error_code or "TELEGRAM_UPLOAD_NOT_VERIFIED",
+                                "message": "Upload diterima TDL tetapi belum terverifikasi pada ekspor waktu.",
+                                "item": path.name,
+                            },
+                            result={
+                                "item": {
+                                    "path": relative,
+                                    "name": path.name,
+                                    "status": "needs_reconciliation",
+                                    "profile": profile,
+                                    "retryable": False,
+                                }
+                            },
+                        )
+                    except Exception:
+                        LOGGER.warning(
+                            "Unverified Storage item event could not be queued for %s",
+                            path.name,
+                            exc_info=True,
+                        )
+
         result_items_raw = read_items(command_id)
         result_items = []
         for item in result_items_raw:
@@ -3726,5 +4024,6 @@ class StorageExecutorMixin:
             "items": result_items,
             "retryable": retryable,
             "provider": "telegram",
+            "telegram_verification": TELEGRAM_UPLOAD_VERIFICATION_METHOD,
             "uploaded_items": uploaded_items,
         }

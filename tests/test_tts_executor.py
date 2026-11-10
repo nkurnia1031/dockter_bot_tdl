@@ -182,6 +182,8 @@ class TtsExecutorTests(unittest.TestCase):
                     "part_index": 1,
                     "total_parts": 1,
                 }]},
+                {"status": "pending"},
+                {"status": "pending"},
                 {"status": "delivered"},
                 {"status": "delivered", "delivered_parts": 1, "total_parts": 1},
             ])
@@ -226,6 +228,7 @@ class TtsExecutorTests(unittest.TestCase):
                     "part_index": 1,
                     "total_parts": 1,
                 }]},
+                {},
                 {},
             ])
             command = {

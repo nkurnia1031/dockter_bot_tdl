@@ -1,6 +1,7 @@
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
@@ -30,6 +31,7 @@ from tme3bot.worker.quick_export import (
     scan_quick_stages,
     write_quick_manifest,
 )
+from tme3bot.worker.telegram_upload_verification import TELEGRAM_UPLOAD_VERIFICATION_METHOD
 
 
 class WorkerExecutorTestCase(unittest.TestCase):
@@ -398,6 +400,7 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
                     "caption": caption,
                     "rclone_destination": "googledrive:backup",
                     "upload_result": {
+                        "telegram_verification": TELEGRAM_UPLOAD_VERIFICATION_METHOD,
                         "uploaded_items": [
                             {"original_name": "batch.7z.001", "channel_message_id": 101},
                             {"original_name": "batch.png", "channel_message_id": 102},
@@ -409,7 +412,11 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
             class StorageClient:
                 output_callback = None
 
+                def __init__(self):
+                    self.exports = []
+
                 def export_messages(self, channel, start_id, target, **kwargs):
+                    self.exports.append((channel, start_id, target, kwargs))
                     name = "photo-without-original-name.jpg" if int(start_id) == 102 else "batch.7z.001"
                     return SimpleNamespace(
                         messages=[
@@ -481,7 +488,8 @@ class QuickThumbnailTests(WorkerExecutorTestCase):
             self.assertEqual(result["drive_found"], 1)
             self.assertTrue(result["staging_cleaned"])
             self.assertFalse(stage.exists())
-            ensure_writable.assert_called_once_with(stage / ".quickmode-verify")
+            self.assertEqual(storage_runtime.export_tdl_client.exports, [])
+            ensure_writable.assert_not_called()
 
     def test_four_photos_without_videos_do_not_invoke_video_processing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1223,6 +1231,7 @@ class QuickPipelineTests(WorkerExecutorTestCase):
             class UploadClient:
                 def __init__(self):
                     self.calls = []
+                    self.messages = []
                     self.output_callback = None
                     self.progress_callback = None
 
@@ -1231,24 +1240,40 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                     path,
                     channel,
                     caption,
-                    resolve_after_id=None,
                     status_callback=None,
                     as_photo=False,
                 ):
+                    message_id = 100 + len(self.calls) + 1
                     self.calls.append(
                         {
                             "path": path,
                             "channel": channel,
                             "caption": caption,
-                            "resolve_after_id": resolve_after_id,
                             "as_photo": as_photo,
                         }
                     )
-                    return SimpleNamespace(message_id=100 + len(self.calls))
+                    self.messages.append({
+                        "id": message_id,
+                        "date": time.time(),
+                        "file_name": path.name,
+                        "caption": caption,
+                    })
+                    return SimpleNamespace(message_id=message_id)
+
+                def export_messages_by_time(self, chat, start, end, _path, *, with_content):
+                    self.assert_export = (chat, start, end, with_content)
+                    return SimpleNamespace(
+                        messages=[
+                            message for message in self.messages
+                            if start <= message["date"] <= end
+                        ]
+                    )
 
             publisher = Publisher()
             download_service = DownloadService()
             upload_client = UploadClient()
+            storage_export_client = UploadClient()
+            storage_export_client.messages = upload_client.messages
             runtime_config = SimpleNamespace(
                 tdl_export_storage=str(storage_session),
                 storage_channel_ref="-100123",
@@ -1278,7 +1303,7 @@ class QuickPipelineTests(WorkerExecutorTestCase):
             )
             storage_runtime = SimpleNamespace(
                 config=runtime_config,
-                export_tdl_client=UploadClient(),
+                export_tdl_client=storage_export_client,
                 upload_tdl_client=upload_client,
                 export_operation_lock=threading.RLock(),
                 upload_operation_lock=threading.RLock(),
@@ -1436,8 +1461,10 @@ class QuickPipelineTests(WorkerExecutorTestCase):
                 {call["path"].name: call["as_photo"] for call in upload_client.calls},
                 {"batch.7z.001": False, "batch.png": True},
             )
-            self.assertEqual(upload_client.calls[0]["resolve_after_id"], None)
-            self.assertEqual(upload_client.calls[1]["resolve_after_id"], 101)
+            self.assertEqual(
+                {message["file_name"] for message in upload_client.messages},
+                {"batch.7z.001", "batch.png"},
+            )
             self.assertEqual(result["storage_folder"], "ModeCepat/2026")
             self.assertTrue(result["thumbnail_uploaded_as_photo"])
             self.assertTrue(result["staging_cleaned"])

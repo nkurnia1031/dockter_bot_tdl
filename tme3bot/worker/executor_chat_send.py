@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from contextlib import ExitStack
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -90,6 +91,8 @@ class ChatSendExecutorMixin:
                 total_bytes += max(0, identity[2])
         succeeded = failed = ambiguous = completed_bytes = 0
         results: list[dict[str, Any]] = []
+        verifier = self._telegram_upload_verifier(job_id)
+        pending_verifications: list[tuple[dict[str, Any], Any, Path, list[Path], tuple[int, int, int, int], str, int]] = []
         self._chat_send_progress(
             job_id, phase="scanning", message=f"Menemukan {len(targets)} file untuk dikirim",
             current=0, total=len(targets), succeeded=0, failed=0, ambiguous=0,
@@ -174,14 +177,33 @@ class ChatSendExecutorMixin:
                 )
                 fallback_allowed = bool(attempt_result.pop("_fallback_allowed", False))
                 last_fallback_allowed = fallback_allowed
+                result = attempt_result
+                if result["status"] == "accepted":
+                    verification = verifier.record_upload(
+                        profile=sender,
+                        chat_ref=chat_ref,
+                        filename=path.name,
+                        caption=path.name,
+                        uploaded_at=float(result.pop("_uploaded_at", time.time())),
+                    )
+                    if verification.status == "verified":
+                        result["status"] = "succeeded"
+                        result["message_id"] = verification.message_id
+                    else:
+                        result["status"] = "pending_verification"
+                        pending_verifications.append((
+                            result, verification, path, roots, source_identity,
+                            transfer_mode, index,
+                        ))
+                    sender_index = (current_sender_index + 1) % len(profiles)
                 attempts.append({
                     "profile": sender,
-                    "status": attempt_result["status"],
+                    "status": result["status"],
                     **({"error_code": attempt_result["error_code"]} if attempt_result.get("error_code") else {}),
                 })
-                result = attempt_result
                 if result["status"] == "succeeded":
-                    sender_index = (current_sender_index + 1) % len(profiles)
+                    break
+                if result["status"] == "pending_verification":
                     break
                 if not fallback_allowed:
                     break
@@ -199,6 +221,9 @@ class ChatSendExecutorMixin:
                     )
             elif result["status"] == "ambiguous":
                 ambiguous += 1
+                if transfer_mode == "move":
+                    result["cleanup_status"] = "retained_ambiguous"
+            elif result["status"] == "pending_verification":
                 if transfer_mode == "move":
                     result["cleanup_status"] = "retained_ambiguous"
             else:
@@ -226,6 +251,57 @@ class ChatSendExecutorMixin:
                 force=True,
             )
             results.append(result)
+
+        if pending_verifications:
+            verifier.finalize()
+            for result, verification, path, roots, source_identity, mode, index in pending_verifications:
+                if verification.status == "verified":
+                    result["status"] = "succeeded"
+                    result["message_id"] = verification.message_id
+                    result.pop("error_code", None)
+                    succeeded += 1
+                    if mode == "move":
+                        result["cleanup_status"] = self._chat_send_remove_source(
+                            path, roots, source_identity
+                        )
+                else:
+                    result["status"] = "ambiguous"
+                    result["error_code"] = verification.error_code or "TELEGRAM_UPLOAD_NOT_FOUND"
+                    result["retryable"] = False
+                    ambiguous += 1
+                    if mode == "move":
+                        result["cleanup_status"] = "retained_ambiguous"
+                if result.get("attempts"):
+                    result["attempts"][-1]["status"] = result["status"]
+                self._chat_send_progress(
+                    job_id,
+                    phase="verifying",
+                    message=(
+                        f"Terverifikasi: {path.name}"
+                        if verification.status == "verified"
+                        else f"Belum terverifikasi: {path.name}"
+                    ),
+                    current=index,
+                    total=len(targets),
+                    succeeded=succeeded,
+                    failed=failed,
+                    ambiguous=ambiguous,
+                    bytes_current=completed_bytes,
+                    bytes_total=total_bytes,
+                    item={
+                        "name": path.name,
+                        "path": result["path"],
+                        "index": index,
+                        "total": len(targets),
+                        "profile": result.get("profile"),
+                        "status": result["status"],
+                        "cleanup_status": result.get("cleanup_status"),
+                        "error_code": result.get("error_code"),
+                        "percent": 100,
+                    },
+                    indeterminate=False,
+                    force=True,
+                )
 
         outcome = "succeeded"
         if failed or ambiguous:
@@ -314,15 +390,14 @@ class ChatSendExecutorMixin:
                     stack.enter_context(capture_progress(client, update_transfer))
                 uploaded = client.upload(path, chat_ref, path.name, status_callback=upload_phase)
             message_id = getattr(uploaded, "message_id", None)
-            if isinstance(message_id, bool) or not isinstance(message_id, int) or message_id < 1:
-                return self._chat_send_item(
-                    path, relative, status="ambiguous", profile=profile,
-                    attempt=attempt, error_code="TDL_MESSAGE_UNCONFIRMED", retryable=False,
-                )
-            return self._chat_send_item(
-                path, relative, status="succeeded", profile=profile,
-                attempt=attempt, message_id=message_id, retryable=False,
+            accepted = self._chat_send_item(
+                path, relative, status="accepted", profile=profile,
+                attempt=attempt, retryable=False,
             )
+            if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
+                accepted["message_id_hint"] = message_id
+            accepted["_uploaded_at"] = time.time()
+            return accepted
         except Exception as exc:
             if self._job_cancelled(job_id):
                 status = "ambiguous" if command_started else "cancelled"

@@ -78,12 +78,14 @@ from tme3bot.worker.command_runner import WorkerCommandRunner
 from tme3bot.worker.command_store import WorkerCommandStore
 from tme3bot.worker.public_download_links import PublicDownloadLinks
 from tme3bot.worker.aria2_runtime import Aria2Runtime
+from tme3bot.worker.telegram_upload_verification import TelegramUploadBatchVerifier
 
 LOGGER = logging.getLogger(__name__)
 from .executor_support import (
     BAR_ONLY_PROGRESS_KEY,
     CommandMilestoneRecorder,
     ScopedCommandMilestoneRecorder,
+    JobOwnerCommandCallback,
     JAKARTA_TZ,
     JobLogSnapshot,
     RUNTIME_STATS_KEY,
@@ -3158,6 +3160,16 @@ class WorkerJobExecutor(
                     pass
             if hasattr(client, "command_callback"):
                 client.command_callback = previous_command
+
+    def _telegram_upload_verifier(self, job_id: str) -> TelegramUploadBatchVerifier:
+        """Create a batch verifier backed by each sender profile's Export lane."""
+        return TelegramUploadBatchVerifier.for_profile_manager(
+            self.profile_manager,
+            capture_export=lambda _profile, client: self._capture_tdl_output(
+                client,
+                command_callback=JobOwnerCommandCallback(str(job_id)),
+            ),
+        )
 
     @contextmanager
     def _capture_tdl_commands(self, client):

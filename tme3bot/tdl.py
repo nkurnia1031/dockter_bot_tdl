@@ -213,7 +213,7 @@ class StorageHistoryExport:
 
 @dataclass
 class UploadResult:
-    message_id: int
+    message_id: int | None
     output: str
 
 
@@ -848,8 +848,6 @@ class TDLClient:
         output_callback: OutputCallback | None = None,
         raw_output_callback: RawOutputCallback | None = None,
         command_callback: CommandCallback | None = None,
-        upload_resolve_timeout_seconds: float | None = None,
-        upload_resolve_interval_seconds: float | None = None,
     ) -> None:
         self.storage_root = storage_root
         self.namespace = namespace
@@ -862,16 +860,6 @@ class TDLClient:
         self.output_callback = output_callback
         self.raw_output_callback = raw_output_callback
         self.command_callback = command_callback
-        self.upload_resolve_timeout_seconds = (
-            float(upload_resolve_timeout_seconds)
-            if upload_resolve_timeout_seconds is not None
-            else float(os.getenv("TDL_UPLOAD_RESOLVE_TIMEOUT_SECONDS", "300"))
-        )
-        self.upload_resolve_interval_seconds = (
-            float(upload_resolve_interval_seconds)
-            if upload_resolve_interval_seconds is not None
-            else float(os.getenv("TDL_UPLOAD_RESOLVE_INTERVAL_SECONDS", "5"))
-        )
 
     def interrupt_current(self, owner_job_id: str | None = None) -> bool:
         """Interrupt this client's currently running TDL subprocess, if any."""
@@ -1437,11 +1425,15 @@ class TDLClient:
         file_path: Path,
         chat_ref: str,
         caption: str,
-        resolve_after_id: int | None = None,
         status_callback: Callable[[str], None] | None = None,
         as_photo: bool = False,
     ) -> UploadResult:
-        """Upload one file and optionally force it to Telegram photo media."""
+        """Upload one file and optionally force it to Telegram photo media.
+
+        If TDL omits the message ID, higher-level job verification uses the
+        profile's Export lane and a bounded time range. This command does not
+        poll chat history while holding the upload lane.
+        """
         if not file_path.is_file():
             raise TDLDataError(f"File upload tidak ditemukan: {file_path}")
         # tdl parses --caption as an expression. Passing raw text makes values
@@ -1485,88 +1477,12 @@ class TDLClient:
             )
             self._ensure_success(command, result)
             message_id = parse_upload_message_id(f"{result.stdout}\n{result.stderr}")
-            if message_id is None:
-                if status_callback is not None:
-                    status_callback("resolving_message")
-                message_id = self._wait_for_upload_message_id(
-                    chat_ref,
-                    caption,
-                    resolve_after_id=resolve_after_id,
-                )
-            if message_id is None:
-                raise TDLDataError(
-                    "TDL upload selesai tetapi channel message ID tidak ditemukan "
-                    f"dalam {self.upload_resolve_timeout_seconds:g} detik."
-                )
             if status_callback is not None:
                 status_callback("uploaded")
             return UploadResult(message_id=message_id, output=f"{result.stdout}\n{result.stderr}")
         finally:
             if caption_path is not None:
                 caption_path.unlink(missing_ok=True)
-
-    def _wait_for_upload_message_id(
-        self,
-        chat_ref: str,
-        caption: str,
-        *,
-        resolve_after_id: int | None = None,
-    ) -> int | None:
-        """Resolve delayed TDL upload results by polling channel history.
-
-        Some TDL versions return exit code 0 and ``done!`` but omit the
-        message id.  The upload itself is still valid; exporting the channel
-        history lets us find the message once Telegram has committed it.
-        The timeout is deliberately bounded so a genuinely broken upload does
-        not leave a worker job running forever.
-        """
-        timeout = max(0.0, self.upload_resolve_timeout_seconds)
-        interval = max(0.0, self.upload_resolve_interval_seconds)
-        deadline = time.monotonic() + timeout
-        start_id = max(1, int(resolve_after_id or 0) + 1)
-        normalized_caption = _normalize_upload_caption(caption)
-
-        while True:
-            export_path: Path | None = None
-            try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".json", prefix="tme3bot-upload-resolve-", delete=False
-                ) as handle:
-                    export_path = Path(handle.name)
-                exported = self.export_messages(
-                    chat_ref,
-                    start_id,
-                    export_path,
-                    with_content=True,
-                    last_count=(
-                        None
-                        if resolve_after_id is not None
-                        else max(
-                            1,
-                            int(os.getenv("TDL_UPLOAD_RESOLVE_LAST_COUNT", "100")),
-                        )
-                    ),
-                )
-                for message in reversed(exported.messages):
-                    message_id = message.get("id")
-                    if isinstance(message_id, int) and _message_contains_caption(
-                        message, normalized_caption
-                    ):
-                        LOGGER.info(
-                            "%s upload message id resolved after delayed TDL result: %s",
-                            self.log_prefix,
-                            message_id,
-                        )
-                        return message_id
-            except (TDLCommandError, TDLDataError, OSError, json.JSONDecodeError) as exc:
-                LOGGER.warning("%s upload result lookup failed; retrying: %s", self.log_prefix, exc)
-            finally:
-                if export_path is not None:
-                    export_path.unlink(missing_ok=True)
-
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
 
     def cancel_current(self) -> bool:
         return self.runner.cancel_current()

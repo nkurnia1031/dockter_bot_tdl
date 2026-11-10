@@ -245,6 +245,9 @@ class TtsExecutorMixin:
             sender_profiles = list(dict.fromkeys(sender_profiles))
             reconcile_delivery = bool(payload.get("_tts_reconcile_delivery"))
             runtime = self.profile_manager.runtime(selected_profile)
+            verifier = self._telegram_upload_verifier(job_id)
+            pending_upload_verifications: list[tuple[str, Any]] = []
+            preserve_artifacts_for_reconciliation = False
             self._append_job_log(
                 f"[TTS] mengirim lewat TDL profile={runtime.name} parts={len(result['artifacts'])}"
             )
@@ -254,6 +257,10 @@ class TtsExecutorMixin:
                 *,
                 delivered: bool,
                 reconciliation_required: bool = False,
+                verification_pending: bool = False,
+                upload_in_progress: bool = False,
+                uploaded_at: float | None = None,
+                sender_profile: str | None = None,
             ) -> None:
                 request_json(
                     self.config.backend_api_url,
@@ -264,20 +271,78 @@ class TtsExecutorMixin:
                         "worker": worker_name,
                         "delivered": delivered,
                         "reconciliation_required": reconciliation_required,
+                        "verification_pending": verification_pending,
+                        "upload_in_progress": upload_in_progress,
+                        "uploaded_at": uploaded_at,
+                        "sender_profile": sender_profile,
                     },
+                    timeout=10,
+                )
+
+            def finalize_upload_verifications() -> bool:
+                if not pending_upload_verifications:
+                    return True
+                verifier.finalize()
+                all_verified = True
+                for delivery_id, verification in pending_upload_verifications:
+                    if verification.status == "verified" and verification.message_id is not None:
+                        save_delivery_result(delivery_id, delivered=True)
+                    else:
+                        all_verified = False
+                        save_delivery_result(
+                            delivery_id,
+                            delivered=False,
+                            reconciliation_required=True,
+                            uploaded_at=verification.uploaded_at,
+                            sender_profile=verification.profile,
+                        )
+                pending_upload_verifications.clear()
+                return all_verified
+
+            def cancel_remaining_deliveries() -> None:
+                nonlocal preserve_artifacts_for_reconciliation
+                # An upload accepted by TDL must not disappear into "cancelled"
+                # just because cancellation arrived before its final batch check.
+                # If persistence of the verification result fails, the backend
+                # retains its uploaded_at/profile claim so a retry can verify it.
+                if pending_upload_verifications:
+                    try:
+                        preserve_artifacts_for_reconciliation = not finalize_upload_verifications()
+                    except Exception:
+                        preserve_artifacts_for_reconciliation = True
+                        self._append_job_log(
+                            "[TTS] finalisasi verifikasi tertunda gagal saat pembatalan; bukti upload dipertahankan untuk retry"
+                        )
+                try:
+                    state = request_json(
+                        self.config.backend_api_url,
+                        self.config.backend_internal_token,
+                        "GET",
+                        f"/internal/v1/tts/jobs/{job_id}/delivery?worker={worker_name}",
+                        timeout=10,
+                    )
+                    if int(state.get("unverified_uploaded_parts") or 0) > 0:
+                        preserve_artifacts_for_reconciliation = True
+                except Exception:
+                    # If the outbox cannot be read during cancellation, retain
+                    # artifacts rather than risk deleting the source for a
+                    # durable accepted-but-unverified delivery.
+                    preserve_artifacts_for_reconciliation = True
+                    self._append_job_log(
+                        "[TTS] status outbox tidak tersedia saat pembatalan; artefak dipertahankan"
+                    )
+                request_json(
+                    self.config.backend_api_url,
+                    self.config.backend_internal_token,
+                    "POST",
+                    f"/internal/v1/tts/jobs/{job_id}/cancel-delivery",
+                    {"worker": worker_name},
                     timeout=10,
                 )
 
             while True:
                 if self._job_cancelled(job_id):
-                    request_json(
-                        self.config.backend_api_url,
-                        self.config.backend_internal_token,
-                        "POST",
-                        f"/internal/v1/tts/jobs/{job_id}/cancel-delivery",
-                        {"worker": worker_name},
-                        timeout=10,
-                    )
+                    cancel_remaining_deliveries()
                     raise TtsCancelled("Job TTS dibatalkan")
                 if pause_event.is_set():
                     publish_paused()
@@ -294,49 +359,91 @@ class TtsExecutorMixin:
                     item = items[0] if isinstance(items[0], dict) else {}
                     delivery_id = str(item.get("id") or "")
                     artifact_ref = str(item.get("artifact_ref") or "")
-                    artifact_path = self.tts_artifact_path(job_id, artifact_ref)
                     part_index = int(item.get("part_index") or 1)
                     total_parts = int(item.get("total_parts") or len(result["artifacts"]))
-                    if not delivery_id or artifact_path is None:
-                        if delivery_id:
-                            save_delivery_result(
-                                delivery_id,
-                                delivered=False,
-                                reconciliation_required=reconcile_delivery,
-                            )
-                        raise TtsError("Artifact TTS tidak tersedia untuk pengiriman")
+                    if not delivery_id:
+                        raise TtsError("ID delivery TTS tidak tersedia")
                     if self._job_cancelled(job_id):
-                        request_json(
-                            self.config.backend_api_url,
-                            self.config.backend_internal_token,
-                            "POST",
-                            f"/internal/v1/tts/jobs/{job_id}/cancel-delivery",
-                            {"worker": worker_name},
-                            timeout=10,
-                        )
+                        cancel_remaining_deliveries()
                         raise TtsCancelled("Job TTS dibatalkan")
                     caption = (
                         title
                         if total_parts == 1
                         else f"{title} ({part_index}/{total_parts})"
                     )
-                    if reconcile_delivery:
-                        created_at = str(item.get("created_at") or "").strip()
-                        if not created_at:
+                    if item.get("verification_pending") is True:
+                        try:
+                            uploaded_at = float(item.get("uploaded_at"))
+                            sender_profile = str(item.get("sender_profile") or "").strip().lower()
+                            if not sender_profile:
+                                raise ValueError("sender profile missing")
+                            verification = verifier.record_upload(
+                                profile=sender_profile,
+                                chat_ref=target_chat,
+                                filename=tts_delivery_filename(title, part_index, total_parts),
+                                caption=caption,
+                                uploaded_at=uploaded_at,
+                            )
+                        except (TypeError, ValueError):
                             save_delivery_result(
                                 delivery_id,
                                 delivered=False,
                                 reconciliation_required=True,
                             )
                             raise TtsError(
-                                "Waktu delivery tidak tersedia untuk pemeriksaan ulang.",
+                                "Data waktu/profil upload tidak tersedia; bagian audio tetap ambigu.",
+                                code="TTS_DELIVERY_RECONCILIATION_FAILED",
+                            ) from None
+                        if verification.status == "verified":
+                            save_delivery_result(delivery_id, delivered=True)
+                        else:
+                            save_delivery_result(
+                                delivery_id,
+                                delivered=False,
+                                verification_pending=True,
+                                uploaded_at=uploaded_at,
+                                sender_profile=sender_profile,
+                            )
+                            pending_upload_verifications.append((delivery_id, verification))
+                        continue
+                    if (
+                        (reconcile_delivery or item.get("upload_in_progress") is True)
+                        and not item.get("first_attempt")
+                        and not item.get("safe_retry")
+                    ):
+                        prior_uploaded_at = item.get("uploaded_at")
+                        prior_sender = str(item.get("sender_profile") or "").strip().lower()
+                        if (
+                            (
+                                item.get("reconciliation_pending") is not True
+                                and item.get("upload_in_progress") is not True
+                            )
+                            or prior_uploaded_at is None
+                            or not prior_sender
+                        ):
+                            save_delivery_result(
+                                delivery_id,
+                                delivered=False,
+                                reconciliation_required=True,
+                            )
+                            raise TtsError(
+                                "Waktu/profil upload asal tidak tersedia; bagian lama tetap ambigu dan tidak dikirim ulang.",
                                 code="TTS_DELIVERY_RECONCILIATION_FAILED",
                             )
+
+                        created_timestamp = float(prior_uploaded_at)
+                        retry_sender_profiles = [prior_sender]
+                        time_start = int(created_timestamp) - 60
+                        time_end = (
+                            int(time.time()) + 60
+                            if item.get("upload_in_progress") is True
+                            else int(created_timestamp) + 60
+                        )
 
                         accessible_profile: str | None = None
                         denied_profiles: set[str] = set()
                         existing_message_id: int | None = None
-                        for sender_profile in sender_profiles:
+                        for sender_profile in retry_sender_profiles:
                             try:
                                 sender_runtime = self.profile_manager.runtime(sender_profile)
                                 with sender_runtime.export_operation_lock:
@@ -346,13 +453,18 @@ class TtsExecutorMixin:
                                             profile=sender_profile, runtime="tts"
                                         ),
                                     ):
-                                        existing_message_id = (
-                                            sender_runtime.export_tdl_client.find_message_id_by_caption(
-                                                target_chat,
-                                                caption,
-                                                after_timestamp=created_at,
-                                            )
+                                        existing = verifier.find_existing_upload(
+                                            profile=sender_profile,
+                                            chat_ref=target_chat,
+                                            filename=tts_delivery_filename(
+                                                title, part_index, total_parts
+                                            ),
+                                            caption=caption,
+                                            start=time_start,
+                                            end=time_end,
+                                            reference_time=created_timestamp,
                                         )
+                                        existing_message_id = existing.message_id
                             except Exception as lookup_error:
                                 denial = tdl_access_denial_code(lookup_error)
                                 if denial:
@@ -435,6 +547,34 @@ class TtsExecutorMixin:
                                 }
                             continue
 
+                    artifact_path = self.tts_artifact_path(job_id, artifact_ref)
+                    if artifact_path is None:
+                        # A retry regenerates artifacts, while the outbox may
+                        # retain the old ref for an upload whose send result
+                        # was ambiguous. Once export proves the file absent,
+                        # use the newly generated artifact for the resend.
+                        regenerated = next(
+                            (
+                                artifact
+                                for artifact in result["artifacts"]
+                                if int(artifact.get("part_index") or 0) == part_index
+                            ),
+                            None,
+                        )
+                        if isinstance(regenerated, dict):
+                            artifact_ref = str(regenerated.get("artifact_ref") or "")
+                            artifact_path = self.tts_artifact_path(job_id, artifact_ref)
+                    if artifact_path is None:
+                        save_delivery_result(
+                            delivery_id,
+                            delivered=False,
+                            reconciliation_required=reconcile_delivery,
+                        )
+                        raise TtsError("Artifact TTS tidak tersedia untuk pengiriman")
+
+                    upload_started = False
+                    uploaded_at: float | None = None
+                    uploaded_profile: str | None = None
                     try:
                         self._append_job_log(
                             f"[TTS] upload TDL bagian={part_index}/{total_parts}"
@@ -448,6 +588,18 @@ class TtsExecutorMixin:
                             for sender_index, sender_profile in enumerate(sender_profiles):
                                 sender_runtime = self.profile_manager.runtime(sender_profile)
                                 try:
+                                    attempt_at = time.time()
+                                    save_delivery_result(
+                                        delivery_id,
+                                        delivered=False,
+                                        verification_pending=True,
+                                        upload_in_progress=True,
+                                        uploaded_at=attempt_at,
+                                        sender_profile=sender_profile,
+                                    )
+                                    uploaded_at = attempt_at
+                                    uploaded_profile = sender_profile
+                                    upload_started = True
                                     with sender_runtime.export_operation_lock:
                                         with self._capture_tdl_output(
                                             sender_runtime.export_tdl_client,
@@ -465,6 +617,15 @@ class TtsExecutorMixin:
                                             f"[TTS] memakai profil pengirim cadangan={sender_profile} setelah penolakan izin eksplisit"
                                         )
                                         selected_profile = sender_profile
+                                    uploaded_at = time.time()
+                                    save_delivery_result(
+                                        delivery_id,
+                                        delivered=False,
+                                        verification_pending=True,
+                                        upload_in_progress=False,
+                                        uploaded_at=uploaded_at,
+                                        sender_profile=sender_profile,
+                                    )
                                     uploaded = True
                                     break
                                 except Exception as send_error:
@@ -506,11 +667,19 @@ class TtsExecutorMixin:
                         finally:
                             upload_path.unlink(missing_ok=True)
                     except Exception as exc:
+                        denial = tdl_write_denial_code(exc) or tdl_session_denial_code(exc)
+                        known_not_accepted = bool(denial) or (
+                            isinstance(exc, TtsError)
+                            and exc.code == "TTS_CHANNEL_UNAVAILABLE"
+                        ) or not upload_started
                         try:
                             save_delivery_result(
                                 delivery_id,
                                 delivered=False,
-                                reconciliation_required=True,
+                                reconciliation_required=not known_not_accepted,
+                                upload_in_progress=not known_not_accepted and upload_started,
+                                uploaded_at=None if known_not_accepted else uploaded_at,
+                                sender_profile=None if known_not_accepted else uploaded_profile,
                             )
                         except Exception:
                             LOGGER.warning(
@@ -518,7 +687,6 @@ class TtsExecutorMixin:
                                 job_id[:8],
                                 part_index,
                             )
-                        denial = tdl_write_denial_code(exc) or tdl_session_denial_code(exc)
                         if (
                             isinstance(exc, TtsError)
                             and exc.code == "TTS_CHANNEL_UNAVAILABLE"
@@ -530,7 +698,34 @@ class TtsExecutorMixin:
                                 code=denial,
                             ) from None
                         raise TtsError(f"Pengiriman TDL gagal ({type(exc).__name__})") from None
-                    save_delivery_result(delivery_id, delivered=True)
+                    if uploaded_at is None or uploaded_profile is None:
+                        save_delivery_result(
+                            delivery_id,
+                            delivered=False,
+                            reconciliation_required=True,
+                        )
+                        raise TtsError(
+                            "TDL menerima upload tanpa metadata waktu/profil untuk verifikasi.",
+                            code="TTS_DELIVERY_RECONCILIATION_FAILED",
+                        )
+                    verification = verifier.record_upload(
+                        profile=uploaded_profile,
+                        chat_ref=target_chat,
+                        filename=upload_path.name,
+                        caption=caption,
+                        uploaded_at=uploaded_at,
+                    )
+                    if verification.status == "verified":
+                        save_delivery_result(delivery_id, delivered=True)
+                    else:
+                        save_delivery_result(
+                            delivery_id,
+                            delivered=False,
+                            verification_pending=True,
+                            uploaded_at=uploaded_at,
+                            sender_profile=uploaded_profile,
+                        )
+                        pending_upload_verifications.append((delivery_id, verification))
                     state = request_json(
                         self.config.backend_api_url,
                         self.config.backend_internal_token,
@@ -569,6 +764,33 @@ class TtsExecutorMixin:
                         "delivered_parts": int(state.get("delivered_parts") or len(result["artifacts"])),
                         "sender_profile": selected_profile,
                     }
+                if pending_upload_verifications:
+                    self._append_job_log(
+                        "[TTS] semua bagian batch selesai dikirim; memverifikasi ulang bagian yang belum cocok"
+                    )
+                    all_verified = finalize_upload_verifications()
+                    state = request_json(
+                        self.config.backend_api_url,
+                        self.config.backend_internal_token,
+                        "GET",
+                        f"/internal/v1/tts/jobs/{job_id}/delivery?worker={worker_name}",
+                        timeout=10,
+                    )
+                    if all_verified and state.get("status") == "delivered":
+                        self._append_job_log("[TTS] seluruh bagian terverifikasi lewat ekspor waktu")
+                        self.delete_tts_artifacts(job_id)
+                        return {
+                            "title": title,
+                            "character_count": result["character_count"],
+                            "part_count": result["part_count"],
+                            "delivered_parts": int(state.get("delivered_parts") or len(result["artifacts"])),
+                            "sender_profile": selected_profile,
+                        }
+                    if not all_verified:
+                        raise TtsError(
+                            "Sebagian audio belum ditemukan pada ekspor waktu setelah verifikasi batch; bagian tersebut tidak dikirim ulang.",
+                            code="TTS_DELIVERY_NOT_VERIFIED",
+                        )
                 if state.get("status") in {"cancelled", "failed"}:
                     raise TtsCancelled("Job TTS dibatalkan") if state.get("status") == "cancelled" else TtsError("Delivery TTS gagal")
                 delivered = int(state.get("delivered_parts") or 0)
@@ -576,7 +798,8 @@ class TtsExecutorMixin:
                 emit({"phase": "telegram_delivery", "current": delivered, "total": total})
                 time.sleep(3.0)
         except TtsCancelled:
-            self.delete_tts_artifacts(job_id)
+            if not preserve_artifacts_for_reconciliation:
+                self.delete_tts_artifacts(job_id)
             raise
         except TtsError:
             raise
