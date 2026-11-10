@@ -68,6 +68,9 @@
           {#if progress.item.index}
             <span class="rounded bg-sky-100 px-1.5 py-0.5 text-xs font-bold text-sky-800 dark:bg-sky-950 dark:text-sky-200">{job.kind === 'utility' && job.payload?.utility === 'extract' ? 'Arsip' : 'File'} {progress.item.index}/{progress.item.total || '?'}</span>
           {/if}
+          {#if job.kind === 'chat_send' && progress.item.profile}
+            <span class="rounded bg-violet-100 px-1.5 py-0.5 text-xs font-bold text-violet-800 dark:bg-violet-950 dark:text-violet-200">Profil {progress.item.profile}</span>
+          {/if}
           {#if job.kind === 'utility' && job.payload?.utility === 'extract' && progress.item.pass_name}
             <span class="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-bold text-amber-800 dark:bg-amber-950 dark:text-amber-200">
               {progress.item.pass_name === 'retry' ? 'Retry pool' : 'Password awal'}
@@ -106,6 +109,11 @@
               <span class="rounded bg-rose-100 px-1.5 py-0.5 text-rose-800 dark:bg-rose-950/70 dark:text-rose-300" title="Gagal">
                 ✕ <b>{progress.counters.failed}</b>
               </span>
+              {#if job.kind === 'chat_send' && progress.counters.ambiguous}
+                <span class="rounded bg-amber-100 px-1.5 py-0.5 text-amber-800 dark:bg-amber-950/70 dark:text-amber-300" title="Belum terkonfirmasi">
+                  ? <b>{progress.counters.ambiguous}</b>
+                </span>
+              {/if}
             </div>
           </div>
         </div>
@@ -123,6 +131,11 @@
           <div class="mt-1 flex flex-wrap justify-between gap-2 text-[11px] font-mono text-[var(--muted)]">
             <span class="min-w-0 truncate">{progress.item.name}</span>
             <span>{formatBytes(progress.transfer.bytes_current)}{progress.transfer.bytes_total !== undefined ? ` / ${formatBytes(progress.transfer.bytes_total)}` : ''}</span>
+          </div>
+        {/if}
+        {#if job.kind === 'chat_send' && progress.item.path}
+          <div class="mt-1 text-[11px] font-mono text-[var(--muted)]">
+            <span class="block break-all">{progress.item.path}</span>
           </div>
         {/if}
         {#if job.kind === 'storage_upload' && progress.activeItems.length}

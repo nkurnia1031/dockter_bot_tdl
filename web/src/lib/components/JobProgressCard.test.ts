@@ -37,6 +37,24 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('1')).toBeTruthy();
   });
 
+  it('shows the relative Workspace path during direct chat delivery', () => {
+    render(JobProgressCard, {
+      job: {
+        kind: 'chat_send', status: 'running', profile: 'default', worker: 'local',
+        created_at: new Date().toISOString(),
+        progress: {
+          phase: 'uploading', message: 'Mengirim chapter.txt',
+          overall: { current: 0, total: 1, percent: 0, unit: 'files' },
+          item: { name: 'chapter.txt', path: 'Books/Volume 1/chapter.txt', index: 1, total: 1, profile: 'default', percent: 12 },
+          transfer: {}, counters: { succeeded: 0, failed: 0, ambiguous: 0 },
+        },
+      },
+      onReport: vi.fn(), onLog: vi.fn(), onTerminate: vi.fn(),
+    });
+
+    expect(screen.getByText('Books/Volume 1/chapter.txt')).toBeTruthy();
+  });
+
   it('shows rclone transfer bytes and per-file plus batch progress', () => {
     render(JobProgressCard, {
       job: {

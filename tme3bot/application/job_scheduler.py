@@ -149,6 +149,18 @@ def build_execution_plan(
             for sender_profile in sender_profiles:
                 keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
             lane = "tdl-storage"
+    elif kind == "chat_send":
+        keys = set()
+        transfer_mode = str(payload.get("transfer_mode") or "copy").strip().lower()
+        folders = payload.get("folders") or []
+        for folder in folders if isinstance(folders, list) else []:
+            keys.update(_workspace_transfer_resource_key(
+                worker, folder, transfer_mode=transfer_mode
+            ))
+        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+        for sender_profile in sender_profiles:
+            keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+        lane = "tdl-chat-send"
     elif kind == "storage_reconcile":
         keys = {f"worker:{worker}:kind:storage_reconcile"}
         workspace_path = payload.get("folder_path") or payload.get("folder")
@@ -289,7 +301,7 @@ def build_execution_plan(
         resource_keys=frozenset(key for key in keys if key),
         queue_group=(
             f"worker:{worker}:kind:{kind}"
-            if kind in {"tts", "safelink_resolve"}
+            if kind in {"tts", "safelink_resolve", "chat_send"}
             or (kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "rclone")
             or (kind == "storage_download" and str(payload.get("provider") or "").strip().lower() == "rclone")
             else f"profile:{profile}:worker:{worker}:kind:{kind}"

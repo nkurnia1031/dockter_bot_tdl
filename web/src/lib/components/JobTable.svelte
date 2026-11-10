@@ -242,16 +242,20 @@
     const quick = Boolean(job.payload?.quick_mode);
     const tts = job.kind === 'tts';
     const storage = job.kind === 'storage_upload';
+    const chatSend = job.kind === 'chat_send';
     const confirmation = storage
       ? 'Retry hanya mengirim file yang dipastikan belum diterima Telegram. File dengan hasil ambigu tidak ikut dikirim. Lanjutkan?'
+      : chatSend ? 'Retry hanya mengirim file yang dipastikan gagal sebelum terkirim. File ambigu tidak akan diulang. Lanjutkan?'
       : tts ? 'Kirim ulang audio TTS ke chat tujuan?' : quick ? 'Jalankan ulang Quick Mode dari export awal?' : 'Jalankan ulang export dari awal?';
-    if ((storage || job.status === 'succeeded') && !window.confirm(confirmation)) return;
+    if ((storage || chatSend || job.status === 'succeeded') && !window.confirm(confirmation)) return;
     retrying = { ...retrying, [job.id]: true };
     try {
-      await post(tts ? `/tts/jobs/${encodeURIComponent(job.id)}/retry` : `/jobs/${encodeURIComponent(job.id)}/retry`);
+      await post(chatSend
+        ? `/chat-send/jobs/${encodeURIComponent(job.id)}/retry`
+        : tts ? `/tts/jobs/${encodeURIComponent(job.id)}/retry` : `/jobs/${encodeURIComponent(job.id)}/retry`);
       toastMessage = job.status === 'succeeded'
-        ? (storage ? 'Retry upload Storage masuk antrean.' : tts ? 'Kirim ulang TTS masuk antrean.' : quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
-        : (storage ? 'Retry upload Storage masuk antrean.' : tts ? 'Retry TTS masuk antrean.' : quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
+        ? (storage ? 'Retry upload Storage masuk antrean.' : chatSend ? 'Retry file aman Kirim ke Chat masuk antrean.' : tts ? 'Kirim ulang TTS masuk antrean.' : quick ? 'Quick Mode baru masuk antrean.' : 'Export baru masuk antrean.')
+        : (storage ? 'Retry upload Storage masuk antrean.' : chatSend ? 'Retry file aman Kirim ke Chat masuk antrean.' : tts ? 'Retry TTS masuk antrean.' : quick ? 'Retry Quick Mode masuk antrean.' : 'Retry export masuk antrean.');
       toastOpen = true;
       await load();
     } catch (cause) {
@@ -454,6 +458,9 @@
           {#if retryable && job.kind === 'storage_upload' && job.retryable && ['failed','cancelled'].includes(job.status)}
             <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>Retry file aman</button>
           {/if}
+          {#if retryable && job.kind === 'chat_send' && job.retryable && ['failed','cancelled'].includes(job.status)}
+            <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>Retry file aman</button>
+          {/if}
         </div>
       </article>
     {/each}
@@ -508,6 +515,30 @@
                 {/each}
               </article>
             {/each}
+          </section>
+        {/if}
+        {#if selected.kind === 'chat_send' && Array.isArray(utilityResult.items)}
+          <section class="record-card mb-4" aria-label="Hasil kirim ke chat per file">
+            <h3 class="font-bold">Hasil Kirim ke Chat per file</h3>
+            <p class="muted mt-1 text-sm">{utilityResult.succeeded || 0} terkirim · {utilityResult.failed || 0} gagal · {utilityResult.ambiguous || 0} belum terkonfirmasi</p>
+            <div class="mt-2 space-y-2">
+              {#each utilityResult.items as item, index (`${item.path || item.name || 'file'}:${index}`)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{item.name || item.path || `File ${index + 1}`}</b>
+                    <span class="badge {item.status === 'succeeded' ? 'succeeded' : item.status === 'failed' ? 'failed' : 'queued'}">{item.status === 'succeeded' ? 'Terkirim' : item.status === 'ambiguous' ? 'Belum pasti' : item.status === 'cancelled' ? 'Dibatalkan' : 'Gagal'}</span>
+                    {#if item.profile}<span class="muted text-xs">Profil {item.profile}</span>{/if}
+                    {#if item.retryable}<span class="text-xs font-semibold text-amber-700">Aman untuk Retry</span>{/if}
+                    {#if item.cleanup_status}<span class={`text-xs font-semibold ${item.cleanup_status === 'deleted' ? 'text-emerald-700' : 'text-amber-700'}`}>Sumber: {item.cleanup_status}</span>{/if}
+                  </div>
+                  <small class="muted mt-1 block break-all">{item.path}</small>
+                  {#if item.error_code}<small class="mt-1 block text-rose-700 dark:text-rose-300">{item.error_code}</small>{/if}
+                  {#if item.attempts?.length > 1}
+                    <details class="mt-2"><summary class="muted cursor-pointer text-xs">Percobaan profil ({item.attempts.length})</summary><ul class="mt-1 space-y-1 text-xs">{#each item.attempts as attempt}<li>{attempt.profile} · {attempt.status}{#if attempt.error_code} · {attempt.error_code}{/if}</li>{/each}</ul></details>
+                  {/if}
+                </article>
+              {/each}
+            </div>
           </section>
         {/if}
         {#if selected.kind === 'storage_upload' && Array.isArray(selected.result?.value?.items || selected.result?.items)}

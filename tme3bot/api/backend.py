@@ -196,6 +196,12 @@ def job_dict(job: Job) -> dict[str, Any]:
         and item.get("retryable") is True
         for item in storage_items
     )
+    chat_send_retryable = job.kind == "chat_send" and job.status.terminal and any(
+        isinstance(item, dict)
+        and item.get("status") == "failed"
+        and item.get("retryable") is True
+        for item in storage_items
+    )
     export_start_id = job.progress.get("export_start_id")
     if export_start_id is None:
         export_start_id = result_value.get("export_start_id", result_value.get("start_id"))
@@ -235,7 +241,7 @@ def job_dict(job: Job) -> dict[str, Any]:
         "error": job.error,
         "archived_at": job.archived_at.isoformat() if job.archived_at else None,
         "queue_position": job.progress.get("position"),
-        "retryable": (job.kind == "export" and job.status.terminal) or storage_retryable,
+        "retryable": (job.kind == "export" and job.status.terminal) or storage_retryable or chat_send_retryable,
         "retry_of": retry_meta.get("retry_of"),
         "retry_phase": retry_meta.get("retry_phase"),
         "export_start_id": export_start_id,
@@ -1244,6 +1250,13 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         operations,
         current_actor=current_actor,
         retry_guard=guard_operation_retry,
+    )
+    from tme3bot.api.routes.chat_send import register_chat_send
+    register_chat_send(
+        app,
+        context,
+        current_actor=current_actor,
+        job_dict=job_dict,
     )
     from tme3bot.api.routes.activity import register_activity
     register_activity(

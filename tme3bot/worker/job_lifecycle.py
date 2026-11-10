@@ -69,6 +69,11 @@ WORKER_JOB_LIFECYCLE: dict[str, JobLifecyclePolicy] = {
         ("telegram_or_rclone_upload", "move_source_cleanup", "storage_catalog"),
         "report_reconciliation", ("succeeded", "failed", "cancelled"),
     ),
+    "chat_send": JobLifecyclePolicy(
+        True, ("selected_profile_upload_tdl_client",), "between_files",
+        ("telegram_chat_send",), "report_reconciliation",
+        ("succeeded", "failed", "cancelled"),
+    ),
     "storage_download": JobLifecyclePolicy(
         True, ("download_tdl_client", "rclone_runner"),
         "between_files_and_download_phases",

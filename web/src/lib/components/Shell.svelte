@@ -8,7 +8,7 @@
   import RequestIndicator from './RequestIndicator.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
-    Code2, KeyRound, LayoutDashboard, LogOut, Menu, Moon, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, Zap
+    Code2, KeyRound, LayoutDashboard, LogOut, Menu, MessageCircle, Moon, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, Zap
   } from '@lucide/svelte';
 
   let { children } = $props();
@@ -24,6 +24,7 @@
     { href: '/aria2/', label: 'AriaNg', icon: Download },
     { href: '/utility/', label: 'Utility', icon: Wrench },
     { href: '/storage/', label: 'Storage', icon: HardDrive },
+    { href: '/chat-send/', label: 'Kirim ke Chat', icon: MessageCircle },
     { href: '/activity/', label: 'Aktivitas', icon: Activity },
     { href: '/development/', label: 'Pengembangan', icon: Code2 },
     { href: '/workers/', label: 'Workers', icon: Users },

@@ -8,7 +8,7 @@ export type NormalizedProgress = {
   item: Record<string, any>;
   activeItems: Record<string, any>[];
   transfer: Record<string, any>;
-  counters: { succeeded: number; failed: number; skipped: number };
+  counters: { succeeded: number; failed: number; skipped: number; ambiguous: number };
   indeterminate: boolean;
   elapsedSeconds?: number;
 };
@@ -41,7 +41,8 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
       counters: {
         succeeded: number(raw.counters?.succeeded) || 0,
         failed: number(raw.counters?.failed) || 0,
-        skipped: number(raw.counters?.skipped) || 0
+        skipped: number(raw.counters?.skipped) || 0,
+        ambiguous: number(raw.counters?.ambiguous) || 0
       },
       indeterminate: Boolean(raw.indeterminate),
       elapsedSeconds: number(raw.elapsed_seconds)
@@ -77,7 +78,8 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
     counters: {
       succeeded: number(raw.success_count ?? raw.succeeded) || 0,
       failed: number(raw.failed_count ?? raw.failed) || 0,
-      skipped: number(raw.skipped) || 0
+      skipped: number(raw.skipped) || 0,
+      ambiguous: number(raw.ambiguous) || 0
     },
     indeterminate: percent === undefined,
     elapsedSeconds: number(raw.elapsed_seconds)

@@ -573,6 +573,16 @@ class TtsJobRequest(BaseModel):
     worker: str | None = Field(default=None, min_length=1, max_length=48)
 
 
+class ChatSendJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    worker: str = Field(min_length=1, max_length=48)
+    chat_ref: str = Field(min_length=1, max_length=2048)
+    folders: list[str] = Field(min_length=1, max_length=500)
+    profiles: list[str] = Field(min_length=1, max_length=50)
+    transfer_mode: Literal["copy", "move"] = "copy"
+    move_confirmed: bool = False
+
+
 class TdlAccessVerificationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     purpose: Literal["tts", "storage"]

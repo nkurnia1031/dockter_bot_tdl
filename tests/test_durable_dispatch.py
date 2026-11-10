@@ -674,6 +674,61 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertEqual(independent["status"], "accepted")
         self.assertEqual([worker for worker, _ in self.dispatcher.commands], ["local", "remote-2"])
 
+    def test_chat_send_durable_submission_uses_selected_upload_profiles_without_catalog(self):
+        operation, _ = self.operations.submit(
+            self.actor,
+            kind="job.submit",
+            target={"worker": "local"},
+            input_data={
+                "job_kind": "chat_send",
+                "payload": {
+                    "chat_ref": "@destination",
+                    "folders": ["/workspace/books", "/workspace/books/series"],
+                    "profiles": ["archive", "default", "archive"],
+                },
+            },
+            idempotency_key="chat-send-durable-submission",
+        )
+
+        job = self.jobs.get(operation.job_id)
+        payload = self.jobs.command_payload(job.id)["payload"]
+        plan = self.jobs.execution_plan(job.id)
+        self.assertEqual(job.kind, "chat_send")
+        self.assertEqual(job.profile, "default")
+        self.assertEqual(job.worker, "local")
+        self.assertEqual(job.payload["profiles"], ["archive", "default"])
+        self.assertNotIn("_tdl_sender_profiles", job.payload)
+        self.assertEqual(payload["_tdl_sender_profiles"], ["archive", "default"])
+        self.assertEqual(payload["folders"], ["/workspace/books"])
+        self.assertEqual(payload["chat_ref"], "destination")
+        self.assertEqual(
+            set(plan["resource_keys"]),
+            {
+                "shared:worker:local:workspace:/workspace/books",
+                "profile:archive:worker:local:tdl:upload",
+                "profile:default:worker:local:tdl:upload",
+            },
+        )
+        self.assertIsNone(self.control.storage_catalog)
+        self.assertEqual(self.dispatcher.commands, [])
+
+    def test_chat_send_move_requires_explicit_confirmation(self):
+        with self.assertRaises(DomainError) as error:
+            self.control.prepare_durable_job(
+                self.actor,
+                {"worker": "local"},
+                {
+                    "job_kind": "chat_send",
+                    "payload": {
+                        "chat_ref": "123456",
+                        "folders": ["/workspace/books"],
+                        "profiles": ["default"],
+                        "transfer_mode": "move",
+                    },
+                },
+            )
+        self.assertEqual(error.exception.code, "CHAT_SEND_MOVE_CONFIRMATION_REQUIRED")
+
 
 if __name__ == "__main__":
     unittest.main()

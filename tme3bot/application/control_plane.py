@@ -41,7 +41,7 @@ from tme3bot.safelink import normalize_shortlink_url
 
 _DURABLE_JOB_KINDS = frozenset({
     "export", "leave", "download", "utility", "storage_upload", "storage_download", "tts",
-    "safelink_resolve", "tdl_access_verify", "backup_verify",
+    "safelink_resolve", "tdl_access_verify", "backup_verify", "chat_send",
 })
 _STORAGE_DURABLE_DISPATCH_KEY = "_storage_durable_dispatch"
 
@@ -213,7 +213,7 @@ class ControlPlane:
             "export", "leave", "download", "download_clear_failed",
             "storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts",
             "tdl_access_verify", "backup_verify", "artifact_inventory",
-            "artifact_delete", "backup_node",
+            "artifact_delete", "backup_node", "chat_send",
         }:
             return
         registry = getattr(self.profile_manager, "profile_registry", None)
@@ -226,7 +226,7 @@ class ControlPlane:
         candidates = [profile]
         if rclone_storage:
             candidates = []
-        elif kind in {"storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts"}:
+        elif kind in {"storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts", "chat_send"}:
             candidates = values.get("_tdl_sender_profiles") or candidates
         elif kind == "tdl_access_verify":
             candidates = values.get("candidate_profiles") or candidates
@@ -700,7 +700,7 @@ class ControlPlane:
             raise DomainError("OPERATION_TARGET_INVALID", "Target hanya boleh berisi profile dan worker.", status_code=422)
         owner_profile = (
             actor.profile
-            if kind in {"leave", "tts", "storage_upload", "tdl_access_verify"}
+            if kind in {"leave", "tts", "storage_upload", "tdl_access_verify", "chat_send"}
             else self.require_profile(actor, str(target.get("profile") or actor.profile))
         )
         execution_profile = owner_profile
@@ -740,6 +740,8 @@ class ControlPlane:
         payload = self._prepare_durable_payload(
             actor, kind, payload, owner_profile, selected_worker
         )
+        if kind == "chat_send":
+            execution_profile = payload["_tdl_sender_profiles"][0]
         quick_storage_snapshot = None
         if kind == "export" and bool(payload.get("quick_mode")):
             quick_storage_snapshot = self._quick_storage_access_snapshot(
@@ -1074,6 +1076,10 @@ class ControlPlane:
             "tts": {"title", "text"},
             "tdl_access_verify": {"purpose"},
             "safelink_resolve": {"url"},
+            "chat_send": {
+                "chat_ref", "folders", "profiles", "transfer_mode",
+                "move_confirmed", "retry_paths",
+            },
         }
         if set(payload) - allowed[kind]:
             raise DomainError(
@@ -1215,6 +1221,89 @@ class ControlPlane:
                     validate_rclone_destination(values["rclone_destination"])
                 except ValueError as exc:
                     raise DomainError("RCLONE_DESTINATION_INVALID", "Root rclone yang dikonfigurasi tidak valid.", status_code=409) from exc
+            return values
+
+        if kind == "chat_send":
+            try:
+                chat_ref = normalize_tdl_chat_ref(str(payload.get("chat_ref") or "").strip())
+            except ValueError as exc:
+                raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
+
+            raw_folders = payload.get("folders")
+            if not isinstance(raw_folders, list) or not raw_folders or len(raw_folders) > 500:
+                raise DomainError("CHAT_SEND_FOLDERS_REQUIRED", "Pilih satu atau beberapa folder Workspace.", status_code=422)
+            folders: list[str] = []
+            seen_folders: set[str] = set()
+            for raw in raw_folders:
+                raw_path = str(raw or "").strip()
+                path = PurePosixPath(raw_path)
+                if (
+                    not raw_path or len(raw_path) > 2048
+                    or not path.is_absolute() or len(path.parts) < 2
+                    or path.parts[1] != "workspace" or ".." in path.parts
+                    or "\\" in raw_path or any(ord(char) < 32 for char in raw_path)
+                ):
+                    raise DomainError("CHAT_SEND_FOLDER_INVALID", "Folder harus berupa path absolut di dalam /workspace.", status_code=422)
+                normalized = str(path)
+                if normalized not in seen_folders:
+                    folders.append(normalized)
+                    seen_folders.add(normalized)
+            folders.sort(key=lambda value: (len(PurePosixPath(value).parts), value.casefold(), value))
+            pruned: list[str] = []
+            for folder in folders:
+                if any(folder == parent or folder.startswith(parent.rstrip("/") + "/") for parent in pruned):
+                    continue
+                pruned.append(folder)
+
+            from tme3bot.names import normalize_profile_name
+
+            raw_profiles = payload.get("profiles")
+            if not isinstance(raw_profiles, list) or not raw_profiles or len(raw_profiles) > 50:
+                raise DomainError("CHAT_SEND_PROFILES_REQUIRED", "Pilih setidaknya satu profil TDL.", status_code=422)
+            selected_profiles: list[str] = []
+            for raw_profile in raw_profiles:
+                profile_name = normalize_profile_name(str(raw_profile or ""))
+                if not profile_name:
+                    raise DomainError("CHAT_SEND_PROFILE_INVALID", "Nama profil TDL tidak valid.", status_code=422)
+                self.require_profile(actor, profile_name)
+                if profile_name not in selected_profiles:
+                    selected_profiles.append(profile_name)
+
+            transfer_mode = str(payload.get("transfer_mode") or "copy").strip().lower()
+            move_confirmed = payload.get("move_confirmed", False)
+            if transfer_mode not in {"copy", "move"} or type(move_confirmed) is not bool:
+                raise DomainError("CHAT_SEND_MODE_INVALID", "Mode transfer tidak valid.", status_code=422)
+            if transfer_mode == "move" and not move_confirmed:
+                raise DomainError("CHAT_SEND_MOVE_CONFIRMATION_REQUIRED", "Move memerlukan konfirmasi eksplisit.", status_code=422)
+
+            retry_paths = payload.get("retry_paths")
+            if retry_paths is not None:
+                if not isinstance(retry_paths, list) or not retry_paths or len(retry_paths) > 100_000:
+                    raise DomainError("CHAT_SEND_RETRY_INVALID", "Daftar file Retry tidak valid.", status_code=422)
+                normalized_retry_paths: list[str] = []
+                for raw_path in retry_paths:
+                    item_path = str(raw_path or "")
+                    item = PurePosixPath(item_path)
+                    if (
+                        not item_path or item.is_absolute() or ".." in item.parts
+                        or any(part in {"", "."} for part in item.parts)
+                        or item.as_posix() != item_path or len(item_path) > 2048
+                    ):
+                        raise DomainError("CHAT_SEND_RETRY_INVALID", "Path file Retry tidak valid.", status_code=422)
+                    if item_path not in normalized_retry_paths:
+                        normalized_retry_paths.append(item_path)
+                retry_paths = sorted(normalized_retry_paths)
+
+            values: dict[str, Any] = {
+                "chat_ref": chat_ref,
+                "folders": pruned,
+                "profiles": selected_profiles,
+                "_tdl_sender_profiles": selected_profiles,
+                "transfer_mode": transfer_mode,
+                "move_confirmed": move_confirmed,
+            }
+            if retry_paths is not None:
+                values["_retry_paths"] = retry_paths
             return values
 
         if kind == "leave":
@@ -4532,6 +4621,14 @@ class ControlPlane:
                 "provider": provider,
                 "selection_count": int(selection_count),
                 "publish_public_links": payload.get("publish_public_links") is True,
+            }
+        if kind == "chat_send":
+            return {
+                "chat_ref": str(payload.get("chat_ref") or ""),
+                "folders": list(payload.get("folders") or []),
+                "profiles": list(payload.get("profiles") or []),
+                "transfer_mode": str(payload.get("transfer_mode") or "copy"),
+                "move_confirmed": payload.get("move_confirmed") is True,
             }
         if kind not in {"backup_node", "utility", "export"}:
             return dict(payload)

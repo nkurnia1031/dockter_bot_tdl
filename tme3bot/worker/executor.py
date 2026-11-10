@@ -129,6 +129,7 @@ from .executor_support import (
 
 from .executor_backup import BackupExecutorMixin
 from .executor_backup_verify import BackupVerificationExecutorMixin
+from .executor_chat_send import ChatSendExecutorMixin
 from .executor_downloads import DownloadExecutorMixin
 from .executor_quickmode import QuickModeExecutorMixin
 from .executor_storage import StorageExecutorMixin
@@ -149,6 +150,7 @@ WORKER_JOB_HANDLER_METHODS = {
     "artifact_delete": "_artifact_delete",
     "utility": "_utility",
     "storage_upload": "_storage_upload",
+    "chat_send": "_chat_send",
     "storage_download": "_storage_download",
     "storage_rclone_manage": "_storage_rclone_manage",
     "storage_reconcile": "_storage_reconcile",
@@ -162,6 +164,7 @@ WORKER_JOB_HANDLER_METHODS = {
 
 class WorkerJobExecutor(
     QuickModeExecutorMixin,
+    ChatSendExecutorMixin,
     DownloadExecutorMixin,
     UtilityExecutorMixin,
     StorageExecutorMixin,
@@ -1682,8 +1685,32 @@ class WorkerJobExecutor(
                     ),
                     owner_aware=True,
                 )
-        elif kind in {"storage_upload", "storage_reconcile", "storage_sync"}:
-            if kind == "storage_upload":
+        elif kind in {"chat_send", "storage_upload", "storage_reconcile", "storage_sync"}:
+            if kind == "chat_send":
+                active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
+                requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
+                sender_profiles = [
+                    str(item).strip().lower()
+                    for item in requested_senders
+                    if str(item).strip()
+                ] if isinstance(requested_senders, list) else []
+                selected_profile = (
+                    str(active_command.get("profile") or profile).strip().lower()
+                    if isinstance(active_command, dict)
+                    else profile
+                )
+                sender_profiles = list(dict.fromkeys([*sender_profiles, selected_profile]))
+                for sender_profile in sender_profiles:
+                    try:
+                        sender_runtime = self.profile_manager.runtime(sender_profile)
+                    except Exception:
+                        sender_runtime = None
+                    interrupt(
+                        f"Kirim ke Chat {sender_profile}",
+                        getattr(getattr(sender_runtime, "upload_tdl_client", None), "interrupt_current", None),
+                        owner_aware=True,
+                    )
+            elif kind == "storage_upload":
                 active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
                 requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
                 sender_profiles = [
@@ -2332,6 +2359,18 @@ class WorkerJobExecutor(
                 sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
                 for sender_profile in sender_profiles:
                     keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
+        elif kind == "chat_send":
+            payload = command.get("payload") or {}
+            keys = set()
+            folders = payload.get("folders") or []
+            transfer_mode = str(payload.get("transfer_mode") or "copy").strip().lower()
+            for folder in folders if isinstance(folders, list) else []:
+                keys.update(self._workspace_transfer_resource_keys(
+                    worker, folder, transfer_mode=transfer_mode
+                ))
+            sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+            for sender_profile in sender_profiles:
+                keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         elif kind == "storage_reconcile":
             keys = {f"worker:{worker}:kind:storage_reconcile"}
             payload = command.get("payload") or {}
@@ -2461,6 +2500,7 @@ class WorkerJobExecutor(
         if kind in {
             "export", "leave", "download", "download_clear_failed", "tts",
             "storage_upload", "storage_download", "storage_sync", "storage_reconcile",
+            "chat_send",
         }:
             return
         purpose = {
@@ -2592,6 +2632,7 @@ class WorkerJobExecutor(
                         if kind in {
                             "storage_upload", "storage_reconcile", "storage_download",
                             "storage_rclone_manage", "artifact_inventory", "artifact_delete",
+                            "chat_send",
                         } and isinstance(result, dict)
                         else {}
                     ),
@@ -2606,7 +2647,7 @@ class WorkerJobExecutor(
                 )
                 storage_outcome = (
                     str(result.get("outcome") or "")
-                    if kind in {"storage_upload", "storage_reconcile", "storage_download", "storage_rclone_manage"} and isinstance(result, dict)
+                    if kind in {"storage_upload", "storage_reconcile", "storage_download", "storage_rclone_manage", "chat_send"} and isinstance(result, dict)
                     else ""
                 )
                 utility_outcome = (
@@ -2671,6 +2712,19 @@ class WorkerJobExecutor(
                         )
                         event_type = "storage.rclone_manage_completed"
                         unit = "items"
+                    elif kind == "chat_send":
+                        error_code = (
+                            "CHAT_SEND_PARTIAL"
+                            if storage_outcome == "partial_failure"
+                            else "CHAT_SEND_FAILED"
+                        )
+                        error_message = (
+                            "Sebagian file gagal atau belum terkonfirmasi; periksa hasil per file."
+                            if storage_outcome == "partial_failure"
+                            else "Tidak ada file yang berhasil dikirim; periksa hasil per file."
+                        )
+                        event_type = "chat_send.completed"
+                        unit = "files"
                     else:
                         error_code = (
                         "STORAGE_DOWNLOAD_PARTIAL"
