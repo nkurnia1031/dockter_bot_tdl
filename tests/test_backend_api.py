@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -3000,6 +3001,153 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("allow-overwrite", setup.text)
         self.assertIn("/workspace/aria2", setup.text)
         self.assertNotIn("token:", setup.text)
+
+    def test_aria2_rpc_recovers_browser_session_without_access_cookie_or_page_reload(self):
+        headers = self.browser_login()
+        self.client.cookies.set("tme3_access", "", path="/")
+        request = {
+            "jsonrpc": "2.0",
+            "id": "session-recovery",
+            "method": "aria2.getVersion",
+            "params": [],
+        }
+
+        response = self.client.post(
+            "/api/v1/aria2-rpc-local",
+            headers=headers,
+            json=request,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["result"], "gid-123")
+        self.assertIn("tme3_access", response.headers.get("set-cookie", ""))
+        self.assertEqual(self.dispatcher.aria2_rpc_calls[-1], ("local", request))
+
+    def test_aria2_rpc_session_recovery_still_requires_valid_browser_csrf(self):
+        headers = self.browser_login()
+        self.client.cookies.set("tme3_access", "", path="/")
+        headers["X-CSRF-Token"] = "wrong-csrf-token"
+
+        response = self.client.post(
+            "/api/v1/aria2-rpc-local",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": "blocked", "method": "aria2.getVersion", "params": []},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"]["code"], "CSRF_INVALID")
+        self.assertEqual(self.dispatcher.aria2_rpc_calls, [])
+
+    def test_aria2_rpc_parallel_session_recovery_reuses_rotated_pair_briefly(self):
+        csrf = "csrf-parallel-recovery"
+        self.browser_login(csrf=csrf)
+        refresh = self.client.cookies.get("tme3_refresh")
+        cookie = f"tme3_refresh={refresh}; tme3_csrf={csrf}"
+        start = threading.Barrier(2)
+
+        def send_rpc(request_id):
+            client = TestClient(self.app)
+            start.wait(timeout=2)
+            return client.post(
+                "/api/v1/aria2-rpc-local",
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                    "Cookie": cookie,
+                },
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "aria2.getVersion",
+                    "params": [],
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(send_rpc, ("parallel-a", "parallel-b")))
+
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(len(self.dispatcher.aria2_rpc_calls), 2)
+
+    def test_aria2_rpc_recovery_shares_refresh_with_parallel_browser_refresh(self):
+        csrf = "csrf-shared-recovery"
+        self.browser_login(csrf=csrf)
+        refresh = self.client.cookies.get("tme3_refresh")
+        cookie = f"tme3_refresh={refresh}; tme3_csrf={csrf}"
+        start = threading.Barrier(2)
+
+        def request(path, body=None):
+            client = TestClient(self.app)
+            start.wait(timeout=2)
+            return client.post(
+                path,
+                headers={
+                    "Origin": "http://testserver",
+                    "X-CSRF-Token": csrf,
+                    "Cookie": cookie,
+                },
+                json=body,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            refresh_future = executor.submit(request, "/api/v1/auth/browser/refresh")
+            rpc_future = executor.submit(
+                request,
+                "/api/v1/aria2-rpc-local",
+                {"jsonrpc": "2.0", "id": "mixed", "method": "aria2.getVersion", "params": []},
+            )
+            responses = (refresh_future.result(), rpc_future.result())
+
+        self.assertEqual([response.status_code for response in responses], [200, 200])
+        self.assertEqual(len(self.dispatcher.aria2_rpc_calls), 1)
+
+    def test_aria2_rpc_recovery_does_not_restore_an_older_refresh_cookie(self):
+        old_csrf = "csrf-old-recovery"
+        self.browser_login(csrf=old_csrf)
+        old_refresh = self.client.cookies.get("tme3_refresh")
+        self.client.cookies.set("tme3_access", "", path="/")
+
+        def response_cookie(response, name):
+            prefix = f"{name}="
+            for header in response.headers.get_list("set-cookie"):
+                if header.startswith(prefix):
+                    return header.split(";", 1)[0][len(prefix):]
+            raise AssertionError(f"response did not set {name}")
+
+        recovered = self.client.post(
+            "/api/v1/aria2-rpc-local",
+            headers={"Origin": "http://testserver", "X-CSRF-Token": old_csrf},
+            json={"jsonrpc": "2.0", "id": "first", "method": "aria2.getVersion", "params": []},
+        )
+        self.assertEqual(recovered.status_code, 200, recovered.text)
+        current_refresh = response_cookie(recovered, "tme3_refresh")
+        current_csrf = response_cookie(recovered, "tme3_csrf")
+        refresh_client = TestClient(self.app)
+        advanced = refresh_client.post(
+            "/api/v1/auth/browser/refresh",
+            headers={
+                "Origin": "http://testserver",
+                "X-CSRF-Token": current_csrf,
+                "Cookie": f"tme3_refresh={current_refresh}; tme3_csrf={current_csrf}",
+            },
+        )
+        self.assertEqual(advanced.status_code, 200, advanced.text)
+
+        stale_client = TestClient(self.app)
+        stale = stale_client.post(
+            "/api/v1/aria2-rpc-local",
+            headers={
+                "Origin": "http://testserver",
+                "X-CSRF-Token": old_csrf,
+                "Cookie": f"tme3_refresh={old_refresh}; tme3_csrf={old_csrf}",
+            },
+            json={"jsonrpc": "2.0", "id": "late", "method": "aria2.getVersion", "params": []},
+        )
+
+        self.assertEqual(stale.status_code, 200, stale.text)
+        self.assertIn("tme3_access=", stale.headers.get("set-cookie", ""))
+        self.assertNotIn("tme3_refresh=", stale.headers.get("set-cookie", ""))
+        self.assertNotIn("tme3_csrf=", stale.headers.get("set-cookie", ""))
 
     def test_worker_tts_helper_recovery_is_explicit_and_slot_limited(self):
         headers = self.login()

@@ -6,6 +6,7 @@ import hmac
 import logging
 import re
 import secrets
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -80,6 +81,8 @@ from tme3bot.utility import utility_setting_specs
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
 _REMEMBER_ME_COOKIE_MAX_AGE = 2_147_483_647
+_BROWSER_REFRESH_RECOVERY_SECONDS = 5.0
+_BROWSER_REFRESH_RECOVERY_MAX_ENTRIES = 128
 
 
 @dataclass
@@ -512,8 +515,11 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         csrf_header = request.headers.get("x-csrf-token", "")
         return bool(csrf_cookie and csrf_header and hmac.compare_digest(csrf_cookie, csrf_header))
 
-    def _set_session(response: Response, pair: Any) -> None:
+    def _set_access_cookie(response: Response, pair: Any) -> None:
         _set_cookie(response, "tme3_access", str(pair.access_token), max_age=int(pair.expires_in))
+
+    def _set_session(response: Response, pair: Any) -> None:
+        _set_access_cookie(response, pair)
         refresh_max_age = (
             _REMEMBER_ME_COOKIE_MAX_AGE
             if bool(getattr(pair, "remember_me", False))
@@ -522,6 +528,36 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         _set_cookie(response, "tme3_refresh", str(pair.refresh_token), max_age=refresh_max_age)
         _set_cookie(response, "tme3_csrf", secrets.token_urlsafe(24), max_age=refresh_max_age, http_only=False)
 
+    browser_refresh_lock = threading.Lock()
+    browser_refresh_recovery: dict[bytes, tuple[float, Any]] = {}
+
+    def _refresh_browser_session(refresh_token: str) -> tuple[Any, bool]:
+        """Share a just-rotated session pair with concurrent browser requests."""
+        token_key = hashlib.sha256(refresh_token.encode("utf-8")).digest()
+        with browser_refresh_lock:
+            now = time.monotonic()
+            for key, (expires_at, _) in tuple(browser_refresh_recovery.items()):
+                if expires_at <= now:
+                    browser_refresh_recovery.pop(key, None)
+            cached = browser_refresh_recovery.get(token_key)
+            if cached is not None:
+                pair = cached[1]
+                context.auth.decode_access(str(pair.access_token))
+                return pair, True
+
+            pair = context.auth.refresh(refresh_token)
+            browser_refresh_recovery[token_key] = (
+                time.monotonic() + _BROWSER_REFRESH_RECOVERY_SECONDS,
+                pair,
+            )
+            while len(browser_refresh_recovery) > _BROWSER_REFRESH_RECOVERY_MAX_ENTRIES:
+                oldest_key = min(
+                    browser_refresh_recovery,
+                    key=lambda key: browser_refresh_recovery[key][0],
+                )
+                browser_refresh_recovery.pop(oldest_key, None)
+            return pair, False
+
     def _clear_session(response: Response) -> None:
         for name in ("tme3_access", "tme3_refresh", "tme3_profile", "tme3_challenge", "tme3_poll"):
             _clear_cookie(response, name)
@@ -529,6 +565,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     def raw_token(
         request: Request,
+        response: Response,
         credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
     ) -> str:
         if credentials is not None and credentials.scheme.lower() == "bearer":
@@ -536,6 +573,22 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             return credentials.credentials
         token = request.cookies.get("tme3_access", "")
         if not token:
+            refresh_token = request.cookies.get("tme3_refresh", "")
+            if refresh_token and request.url.path.startswith("/api/v1/aria2-rpc-"):
+                if not _valid_browser_mutation(request):
+                    raise DomainError(
+                        "CSRF_INVALID",
+                        "Request browser ditolak karena CSRF atau Origin tidak valid.",
+                        status_code=403,
+                    )
+                pair, reused = _refresh_browser_session(refresh_token)
+                if reused:
+                    # A concurrent response must not overwrite a newer refresh/CSRF cookie.
+                    _set_access_cookie(response, pair)
+                else:
+                    _set_session(response, pair)
+                request.state.cookie_auth = True
+                return str(pair.access_token)
             raise DomainError("TOKEN_REQUIRED", "Bearer token atau sesi browser wajib diisi.", status_code=401)
         request.state.cookie_auth = True
         if request.method.upper() in {"POST", "PUT", "PATCH", "DELETE"} and not _valid_browser_mutation(request):
@@ -720,8 +773,12 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         refresh_token = request.cookies.get("tme3_refresh", "")
         if not refresh_token:
             raise DomainError("REFRESH_REQUIRED", "Sesi browser sudah berakhir.", status_code=401)
-        pair = context.auth.refresh(refresh_token)
-        _set_session(response, pair)
+        pair, reused = _refresh_browser_session(refresh_token)
+        if reused:
+            # A concurrent response must not overwrite a newer refresh/CSRF cookie.
+            _set_access_cookie(response, pair)
+        else:
+            _set_session(response, pair)
         payload = context.auth.decode_access(pair.access_token)
         actor = context.control_plane.actor(int(payload["telegram_user_id"]))
         selected = _read_profile_cookie(request.cookies.get("tme3_profile"))
