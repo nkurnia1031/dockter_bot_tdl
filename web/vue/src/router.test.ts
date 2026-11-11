@@ -4,6 +4,8 @@ import { createAppRouter, navigationGroups, routeDefinitions } from './router';
 import DownloadsPage from './pages/DownloadsPage.vue';
 import Aria2Page from './pages/Aria2Page.vue';
 import ChatSendPage from './pages/ChatSendPage.vue';
+import ExportPage from './pages/ExportPage.vue';
+import TtsPage from './pages/TtsPage.vue';
 
 describe('Vue route map', () => {
   it('registers every existing static URL, including the nested Vault page', () => {
@@ -31,6 +33,11 @@ describe('Vue route map', () => {
 
   it('mounts the Vue Chat Send page instead of the migration placeholder', () => {
     expect(routeDefinitions.find(({ path }) => path === '/chat-send/')?.component).toBe(ChatSendPage);
+  });
+
+  it('mounts the Vue Export and TTS pages instead of migration placeholders', () => {
+    expect(routeDefinitions.find(({ path }) => path === '/exports/')?.component).toBe(ExportPage);
+    expect(routeDefinitions.find(({ path }) => path === '/tts/')?.component).toBe(TtsPage);
   });
 
   it('redirects slashless feature URLs to the existing trailing-slash form', async () => {

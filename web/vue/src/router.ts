@@ -11,6 +11,8 @@ import StoragePage from './pages/StoragePage.vue';
 import DownloadsPage from './pages/DownloadsPage.vue';
 import Aria2Page from './pages/Aria2Page.vue';
 import ChatSendPage from './pages/ChatSendPage.vue';
+import ExportPage from './pages/ExportPage.vue';
+import TtsPage from './pages/TtsPage.vue';
 import PlaceholderPage from './pages/PlaceholderPage.vue';
 
 export type AppRouteDefinition = {
@@ -32,9 +34,9 @@ export const routeDefinitions: AppRouteDefinition[] = [
   { path: '/downloads/', label: 'Download', section: 'Transfer', description: 'Kelola antrean dan riwayat unduhan.', component: DownloadsPage },
   { path: '/aria2/', label: 'AriaNg', section: 'Transfer', description: 'Kirim dan pantau tugas aria2 pada worker.', component: Aria2Page },
   { path: '/chat-send/', label: 'Kirim ke Chat', section: 'Transfer', description: 'Kirim file Workspace ke chat Telegram.', component: ChatSendPage },
-  placeholder('/exports/', 'Export', 'Pemrosesan', 'Ekspor pesan dari sumber Telegram.'),
+  { path: '/exports/', label: 'Export', section: 'Pemrosesan', description: 'Ekspor pesan dari sumber Telegram.', component: ExportPage },
   placeholder('/quick-mode/', 'Quick Mode', 'Pemrosesan', 'Jalankan alur Quick Mode.'),
-  placeholder('/tts/', 'TTS', 'Pemrosesan', 'Proses dan kirim audio TTS.'),
+  { path: '/tts/', label: 'TTS', section: 'Pemrosesan', description: 'Proses dan kirim audio TTS.', component: TtsPage },
   placeholder('/decrypt/', 'Dekripsi', 'Pemrosesan', 'Dekripsi teks dan tautan.'),
   placeholder('/utility/', 'Utility', 'Pemrosesan', 'Jalankan alat pada folder Workspace.'),
   placeholder('/backups/', 'Backup', 'Pemrosesan', 'Kelola backup dan pemulihan.'),
