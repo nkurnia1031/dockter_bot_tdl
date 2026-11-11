@@ -72,6 +72,18 @@ jobs:
         working-directory: web
         run: pnpm build
 
+      - name: Check Vue migration preview
+        working-directory: web
+        run: pnpm check:vue
+
+      - name: Test Vue migration preview
+        working-directory: web
+        run: pnpm test:vue
+
+      - name: Build Vue migration preview
+        working-directory: web
+        run: pnpm build:vue
+
   browser-e2e-linux:
     name: Trusted-device browser E2E (Linux)
     runs-on: ubuntu-24.04

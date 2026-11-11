@@ -8,6 +8,11 @@
     "build": "svelte-kit sync && vite build",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
+    "dev:vue": "vite --config vite.vue.config.ts --host 0.0.0.0",
+    "build:vue": "vue-tsc --noEmit -p tsconfig.vue.json && vite build --config vite.vue.config.ts",
+    "check:vue": "vue-tsc --noEmit -p tsconfig.vue.json",
+    "test:vue": "vitest run --config vitest.vue.config.ts",
+    "preview:vue": "vite preview --config vite.vue.config.ts",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -15,7 +20,9 @@
     "bits-ui": "^1.0.0",
     "crypto-js": "^4.2.0",
     "flowbite-svelte": "^1.33.1",
-    "svelte": "^5.0.0"
+    "svelte": "^5.0.0",
+    "vue": "^3.5.45",
+    "vue-router": "^4.6.4"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.0",
@@ -24,12 +31,15 @@
     "@tailwindcss/vite": "^4.1.0",
     "@testing-library/svelte": "^5.0.0",
     "@types/crypto-js": "^4.2.2",
+    "@vitejs/plugin-vue": "^5.2.4",
+    "@vue/test-utils": "^2.5.1",
     "jsdom": "^26.0.0",
     "svelte-check": "^4.0.0",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.0.0",
     "vite": "^6.0.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "vue-tsc": "^3.3.14"
   },
   "packageManager": "pnpm@10.20.0"
 }
