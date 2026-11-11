@@ -21,7 +21,7 @@ berjalan di VPS terpisah.
 ```mermaid
 flowchart LR
   Browser[Browser]
-  Web["Web statis<br/>SvelteKit"]
+  Web["Web statis<br/>Vue 3 + Vite"]
   Telegram[Telegram UI / Bot API]
   TGApp["Aplikasi bot Telegram"]
   Backend["Backend API<br/>FastAPI"]
@@ -241,7 +241,7 @@ Untuk menelusuri source:
 - Worker API dan eksekusi: `tme3bot/api/worker.py`,
   `tme3bot/worker/executor.py`, `tme3bot/worker/executor_*.py`.
 - API Web: `web/src/lib/api.ts`; UI Quick Mode:
-  `web/src/lib/components/QuickModePage.svelte`.
+  `web/vue/src/pages/QuickModePage.vue`.
 - Batas arsitektur: `tests/test_architecture_boundaries.py`.
 
 ## Yang sudah diterapkan

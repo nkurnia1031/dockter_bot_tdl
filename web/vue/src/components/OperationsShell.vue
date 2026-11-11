@@ -138,7 +138,7 @@ onMounted(() => {
         </div>
       </header>
 
-      <div v-if="isDev" class="preview-banner"><span class="preview-dot"></span>Preview migrasi Vue · perubahan ini belum menggantikan UI production</div>
+      <div v-if="isDev" class="preview-banner"><span class="preview-dot"></span>Mode pengembangan · perubahan lokal belum dideploy</div>
       <section class="page-content">
         <RouterView v-slot="{ Component, route: viewRoute }">
           <Transition name="route" mode="out-in">

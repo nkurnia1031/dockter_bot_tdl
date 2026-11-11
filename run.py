@@ -1195,8 +1195,8 @@ def _install_static_release(source: Path, target: Path) -> None:
         old = target / relative
         if old.is_file() or old.is_symlink():
             old.unlink(missing_ok=True)
-    # Empty directories from a previous Svelte route are harmless, but stale
-    # immutable assets are not useful and can consume a lot of disk space.
+    # Old route directories are harmless, but stale immutable assets are not
+    # useful and can consume a lot of disk space.
     shutil.rmtree(target / "_app", ignore_errors=True)
     for path in source.rglob("*"):
         relative = path.relative_to(source)

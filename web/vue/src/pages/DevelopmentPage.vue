@@ -34,7 +34,7 @@ const nextCandidates = [
     suggestion:
       "Ukur durasi query, jumlah row, dan biaya parse di GitHub Actions dengan volume fixture bertingkat. Pilih ringkasan inkremental atau pembacaan lebih sempit hanya jika metrik menunjukkan biaya yang berarti.",
     source:
-      "JobTable.svelte · SqliteJobRepository.monitor_metrics()",
+      "Monitor aktivitas · SqliteJobRepository.monitor_metrics()",
     priority: "Prioritas berikutnya",
   },
   {
@@ -71,7 +71,7 @@ const nextCandidates = [
         <h2 id="tests-title">Tes otomatis</h2>
         <ul>
           <li><strong>Backend:</strong> compile, unit, dan integration tests Python.</li>
-          <li><strong>Web:</strong> Svelte check, Vitest, dan build static tetap menjadi rilis aktif; Vue check, Vitest, build, dan browser E2E divalidasi paralel sampai cutover.</li>
+          <li><strong>Web:</strong> Vue type-check, Vitest, build static, dan browser E2E berjalan di GitHub Actions dengan API palsu.</li>
           <li><strong>Browser E2E:</strong> trusted-device flow di Linux dan Windows.</li>
         </ul>
         <a href="https://github.com/nkurnia1031/dockter_bot_tdl/actions" target="_blank" rel="noopener noreferrer">Buka GitHub Actions ↗</a>

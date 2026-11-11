@@ -192,7 +192,9 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertIn("rq==2.12.0", requirements)
 
     def test_deployment_archive_includes_split_configs(self) -> None:
-        names = {path.name for path in build.iter_files()}
+        files = build.iter_files()
+        names = {path.name for path in files}
+        paths = {path.relative_to(PROJECT_ROOT).as_posix() for path in files}
         self.assertIn("docker-compose.gateway.yml", names)
         self.assertIn("docker-compose.worker.yml", names)
         self.assertIn("docker-compose.resolver.yml", names)
@@ -208,7 +210,9 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertNotIn(".env.example", names)
         self.assertNotIn(".env.worker.example", names)
         self.assertIn("package.json", names)
-        self.assertIn("svelte.config.js", names)
+        self.assertIn("web/vite.config.ts", paths)
+        self.assertIn("web/vue/src/main.ts", paths)
+        self.assertNotIn("web/svelte.config.js", paths)
         self.assertIn("DEPLOYMENT_RUNBOOK.md", names)
 
     def test_migration_archive_contains_prebuilt_images(self) -> None:

@@ -57,9 +57,7 @@ workers.json
 /images
 web/node_modules/
 web/.next/
-web/.svelte-kit/
 web/build/
-web/build-vue/
 web/*.tsbuildinfo
 web/playwright-report/
 web/test-results/

@@ -19,7 +19,7 @@ Diperbarui 2026-09-24 (Asia/Jakarta). Pada saat handoff:
   `origin/main` berada pada commit yang sama;
 - sebelum pembaruan dokumen ini worktree bersih; perubahan yang diharapkan
   setelahnya hanya pembaruan `AGENTS.md` ini;
-- web tetap berupa SvelteKit static; tidak ada Next.js, Node runtime, atau
+- Web sudah dipindahkan ke Vue 3 + TypeScript + Vite static SPA; tidak ada Next.js, Node runtime, atau
   container web di produksi. Target static UI aaPanel tetap
   `/www/wwwroot/ui.utama.naufix.space`;
 - Quick Mode sudah memiliki staging/recovery, retry dengan stage/job ID yang
@@ -300,7 +300,7 @@ Profile default memakai `/data`; profile tambahan memakai `/data/profiles/<name>
 
 ## Download Manager: aturan penting
 
-- Membuka `web/src/lib/components/DownloadsPage.svelte` hanya melakukan GET
+- Membuka `web/vue/src/pages/DownloadsPage.vue` hanya melakukan GET
   katalog. Tidak ada reconcile otomatis dan tidak ada polling inventory saat
   halaman dibuka. Tombol reconcile yang terlihat adalah aksi manual operator.
 - Pemeriksaan fisik artifact terjadi ketika job download dikirim. Worker
