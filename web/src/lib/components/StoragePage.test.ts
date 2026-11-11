@@ -577,20 +577,20 @@ describe('Storage file manager', () => {
     expect(await screen.findByText('report.pdf dikirim ke Telegram.')).toBeTruthy();
     expect(screen.getByRole('dialog', {name:'Detail file'})).toBeTruthy();
     await fireEvent.click(closeButton);
-    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(document.activeElement).toBe(fileButton);
 
     await fireEvent.click(fileButton);
     dialog = await screen.findByRole('dialog', {name:'Detail file'});
     const backdrop = screen.getByRole('button', {name:'Tutup detail file melalui latar'});
     await fireEvent.click(backdrop);
-    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(document.activeElement).toBe(fileButton);
 
     await fireEvent.click(fileButton);
     dialog = await screen.findByRole('dialog', {name:'Detail file'});
     await fireEvent.keyDown(dialog, {key:'Escape'});
-    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(document.activeElement).toBe(fileButton);
   }, 15000);
 

@@ -34,6 +34,14 @@ if (typeof globalThis.localStorage === 'undefined') {
 if (!Element.prototype.animate) {
   Object.defineProperty(Element.prototype, 'animate', {
     configurable: true,
-    value: () => ({ onfinish: null, cancel() {}, play() {} })
+    value: () => {
+      const animation: { onfinish: ((event: Event) => void) | null; cancel?: () => void; play?: () => void } = {
+        onfinish: null,
+        cancel() {},
+        play() {}
+      };
+      setTimeout(() => animation.onfinish?.(new Event('finish')), 0);
+      return animation;
+    }
   });
 }

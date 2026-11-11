@@ -585,7 +585,7 @@
           </div>
           <div class="flex flex-wrap items-center gap-2">
             {#if activeJob}
-              <span class="badge running animate-pulse">Sedang processing (#{activeJob.id.slice(0, 8)})</span>
+              <span class="badge running">Sedang processing (#{activeJob.id.slice(0, 8)})</span>
               <button class="button danger !py-1.5 !px-3 text-xs" onclick={() => cancelStage(item)} disabled={stageAction === actionKey}>
                 <XCircle size={15}/>Cancel
               </button>

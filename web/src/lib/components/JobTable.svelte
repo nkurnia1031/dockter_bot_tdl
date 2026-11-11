@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Modal, Toast } from 'flowbite-svelte';
+  import { modalMotion } from '$lib/motion';
   import { AlertTriangle, ClipboardList, Copy, Download, FileText, RefreshCw, SquareTerminal, XCircle } from '@lucide/svelte';
   import { api, post } from '$lib/api';
   import { formatBytes, formatDate, jobMessage, resultEntries, textValue } from '$lib/presentation';
@@ -468,7 +469,7 @@
   </div>
 </section>
 
-<Modal bind:open={reportOpen} title={selected ? `Detail ${selected.kind.replaceAll('_',' ')}` : 'Detail job'} size="xl" classes={{body:'!p-0'}}>
+<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={reportOpen} title={selected ? `Detail ${selected.kind.replaceAll('_',' ')}` : 'Detail job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex max-h-[78dvh] min-h-0 flex-col">
     <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span>{#if selected.kind==='storage_upload'}<span class="badge">{selected.payload?.provider || 'telegram'}</span><span class="muted text-sm">{selected.payload?.provider==='rclone'?`Tujuan rclone: ${selected.payload?.rclone_destination || 'root'}${selected.payload?.rclone_path?`/${selected.payload.rclone_path}`:''}`:`Tujuan Telegram: ${selected.payload?.destination_folder_path || 'My Drive'}`}</span><span class="muted text-sm">{selected.payload?.transfer_mode || 'copy'}</span>{/if}</div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>{#if backupVerificationReport(selected)}<button class="button secondary" onclick={() => downloadBackupVerificationReport(selected!)}><Download size={15}/>Unduh JSON verifikasi</button>{/if}</div>
     <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
@@ -663,7 +664,7 @@
   </div>{/if}
 </Modal>
 
-<Modal bind:open={logOpen} title={selected ? `Log ${selected.id.slice(0,12)}` : 'Log job'} size="xl" classes={{body:'!p-0'}}>
+<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={logOpen} title={selected ? `Log ${selected.id.slice(0,12)}` : 'Log job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex h-[78dvh] min-h-0 flex-col bg-[#080d19] text-slate-100">
     <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-700 px-4 py-3"><div><b>{displayLogLines.length} baris</b>{#if liveLog?.log?.truncated || latestSnapshot?.result?.log?.truncated}<span class="ml-2 text-xs text-amber-300">log lama dipangkas · terbaru di atas</span>{/if}</div><div class="flex gap-2"><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={loadEvents} disabled={loadingEvents}><RefreshCw class={loadingEvents ? 'animate-spin' : ''} size={15}/>Refresh</button><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={() => copy(displayLogLines.join('\n'))}><Copy size={15}/>Copy</button></div></div>
     {#if selectedProgress}<div class="grid shrink-0 gap-2 border-b border-slate-700 bg-slate-900/80 p-3 text-xs sm:grid-cols-4">
@@ -676,7 +677,7 @@
   </div>{/if}
 </Modal>
 
-<Modal bind:open={confirmOpen} title={confirmTarget === 'all' ? 'Terminate semua job aktif?' : 'Terminate job ini?'} size="sm" permanent>
+<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={confirmOpen} title={confirmTarget === 'all' ? 'Terminate semua job aktif?' : 'Terminate job ini?'} size="sm" permanent>
   <div class="flex gap-3"><AlertTriangle class="shrink-0 text-rose-600" size={23}/><p>Sinyal seperti Ctrl+C akan dikirim. Proses dapat membutuhkan beberapa saat untuk mengirim status terakhir.</p></div><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => confirmOpen = false}>Batal</button><button class="button danger" onclick={terminate}>Terminate</button></div>
 </Modal>
 <Toast bind:toastStatus={toastOpen} position="bottom-right" color="primary">{toastMessage}</Toast>

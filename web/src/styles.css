@@ -202,6 +202,10 @@ a { color: inherit; }
 .card { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: var(--shadow); }
 .record-card { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); padding: .9rem; transition: transform .18s ease, border-color .18s ease, box-shadow .18s ease; }
 .record-card:hover { border-color: color-mix(in srgb, var(--brand) 38%, var(--line)); box-shadow: var(--shadow); }
+.page-content .space-y-6 > :not(:first-child) { margin-block-start: 1rem; }
+.page-content .space-y-5 > :not(:first-child) { margin-block-start: .85rem; }
+.page-content .space-y-4 > :not(:first-child) { margin-block-start: .7rem; }
+.page-content .rounded-2xl.border { border-radius: 13px; }
 .page-icon { display: grid; width: 2.65rem; height: 2.65rem; place-items: center; border: 1px solid color-mix(in srgb, var(--brand) 28%, var(--line)); border-radius: 11px; background: var(--brand-soft); color: var(--brand); }
 .field { width: 100%; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-strong); color: var(--ink); padding: .62rem .72rem; transition: border-color .18s ease, box-shadow .18s ease, background .18s ease; }
 .field::placeholder { color: color-mix(in srgb, var(--muted) 72%, transparent); }
@@ -234,6 +238,8 @@ td { color: var(--ink); font-size: .72rem; }
 th, td { padding: .62rem .72rem; border-bottom: 1px solid color-mix(in srgb, var(--line) 78%, transparent); }
 tbody tr:hover { background: color-mix(in srgb, var(--panel-hover) 48%, transparent); }
 .responsive-card-table { width: 100%; overflow-x: auto; }
+.themed-modal { border-color: var(--line); background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
+.themed-modal::backdrop { background: rgba(2, 7, 12, .68); backdrop-filter: blur(3px); }
 dialog[open] { max-width: calc(100vw - 1rem); max-height: calc(100dvh - 1rem); color: var(--ink); }
 dialog::backdrop { background: rgba(2, 7, 12, .68); backdrop-filter: blur(3px); }
 

@@ -256,7 +256,7 @@
     <section class={`pointer-events-auto w-full overflow-hidden rounded-2xl border bg-[var(--panel)] shadow-2xl transition ${notice.job.status==='succeeded'?'border-emerald-300 dark:border-emerald-800':notice.job.status==='failed'?'border-rose-300 dark:border-rose-800':'border-violet-300 dark:border-violet-800'}`} role="alert">
       <div class="flex items-start gap-3 p-4">
         <div class={`grid size-10 shrink-0 place-items-center rounded-xl ${notice.job.status==='succeeded'?'bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300':notice.job.status==='failed'?'bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300':'bg-violet-100 text-violet-700 dark:bg-violet-950 dark:text-violet-300'}`}>
-          {#if notice.job.status==='succeeded'}<CheckCircle2 size={21}/>{:else if notice.job.status==='failed'}<CircleAlert size={21}/>{:else}<LoaderCircle class="animate-spin" size={21}/>{/if}
+          {#if notice.job.status==='succeeded'}<CheckCircle2 size={21}/>{:else if notice.job.status==='failed'}<CircleAlert size={21}/>{:else}<LoaderCircle size={21}/>{/if}
         </div>
         <div class="min-w-0 flex-1">
           <div class="flex items-center justify-between gap-2"><b>{notice.job.status==='succeeded'?'Export selesai':notice.job.status==='failed'?'Export gagal':'Export masuk antrean'}</b><button class="rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--brand-soft)]" onclick={() => dismiss(notice.job.id)} aria-label="Tutup notifikasi export"><X size={16}/></button></div>
@@ -272,7 +272,7 @@
           {/if}
         </div>
       </div>
-      {#if activeStatuses.includes(notice.job.status)}<div class="h-1 overflow-hidden bg-violet-100 dark:bg-violet-950"><div class="h-full w-1/2 animate-pulse rounded-full bg-violet-600"></div></div>{/if}
+      {#if activeStatuses.includes(notice.job.status)}<div class="h-1 bg-violet-100 dark:bg-violet-950"><div class="h-full w-1/2 rounded-full bg-violet-600"></div></div>{/if}
     </section>
   {/each}
 </div>

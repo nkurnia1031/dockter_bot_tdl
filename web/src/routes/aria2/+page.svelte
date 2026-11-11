@@ -348,14 +348,14 @@
 {#if settingsOpen}
   <dialog
     use:presentModal
-    transition:fade={{ duration: modalDuration(130) }}
+    transition:fade={{ duration: modalDuration(220) }}
     class="fixed inset-0 z-[100] m-0 flex h-full w-full max-w-none items-center justify-center overflow-y-auto border-0 bg-black/55 p-3 sm:p-5"
     aria-modal="true"
     aria-labelledby="aria2-settings-title"
     onkeydown={(event) => handleModalKeydown(event, closeSettings)}
     onclick={(event) => { if (event.target === event.currentTarget) closeSettings(); }}
   >
-    <section transition:fly={{ y: 12, duration: modalDuration(170) }} class="max-h-[94vh] w-full max-w-5xl overflow-y-auto rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-2xl sm:p-6">
+    <section transition:fly={{ y: 12, duration: modalDuration(220) }} class="max-h-[94vh] w-full max-w-5xl overflow-y-auto rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-2xl sm:p-6">
       <header class="mb-4 flex items-start justify-between gap-3">
         <div>
           <p class="eyebrow">WORKER {selectedWorker}</p>
@@ -392,14 +392,14 @@
 {#if folderPickerOpen}
   <dialog
     use:presentModal
-    transition:fade={{ duration: modalDuration(130) }}
+    transition:fade={{ duration: modalDuration(220) }}
     class="fixed inset-0 z-[100] m-0 flex h-full w-full max-w-none items-center justify-center overflow-y-auto border-0 bg-black/55 p-3 sm:p-5"
     aria-modal="true"
     aria-labelledby="aria2-folder-title"
     onkeydown={(event) => handleModalKeydown(event, () => closeFolderPicker(false))}
     onclick={(event) => { if (event.target === event.currentTarget) closeFolderPicker(false); }}
   >
-    <section transition:fly={{ y: 12, duration: modalDuration(170) }} class="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-2xl sm:p-5">
+    <section transition:fly={{ y: 12, duration: modalDuration(220) }} class="max-h-[92vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-4 shadow-2xl sm:p-5">
       <header class="mb-3 flex items-start justify-between gap-3">
         <div><p class="eyebrow">WORKER {selectedWorker}</p><h2 id="aria2-folder-title" class="mt-1 text-lg font-extrabold">Folder unduhan</h2><p class="muted mt-1 break-all font-mono text-xs">{selectedFolder()}</p></div>
         <button class="button secondary !p-2" onclick={() => closeFolderPicker(false)} aria-label="Tutup pemilih folder"><X size={17}/></button>

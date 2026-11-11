@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { Modal } from 'flowbite-svelte';
+  import { modalMotion } from '$lib/motion';
   import { api, post, remove } from '$lib/api';
   import { normalizeTdlChatRef } from '$lib/chatRef';
   import { formatBytes, formatDate } from '$lib/presentation';
@@ -235,4 +236,4 @@
   </tbody></table></div>
 </section>
 <JobTable kind="download" title="Progress & riwayat download" scope="global" />
-<Modal open={Boolean(confirm)} onclose={() => confirm=null} title={confirm==='purge'?'Purge metadata?':'Hapus file artifact terpilih?'} size="sm"><p>{confirm==='purge'?'Metadata akan dihapus permanen.':'File JSON pending/failed pada worker asal akan dihapus, metadata history tetap dipertahankan.'}</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => confirm=null}>Batal</button><button class="button danger" onclick={destructive}>Lanjutkan</button></div></Modal>
+<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} open={Boolean(confirm)} onclose={() => confirm=null} title={confirm==='purge'?'Purge metadata?':'Hapus file artifact terpilih?'} size="sm"><p>{confirm==='purge'?'Metadata akan dihapus permanen.':'File JSON pending/failed pada worker asal akan dihapus, metadata history tetap dipertahankan.'}</p><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => confirm=null}>Batal</button><button class="button danger" onclick={destructive}>Lanjutkan</button></div></Modal>

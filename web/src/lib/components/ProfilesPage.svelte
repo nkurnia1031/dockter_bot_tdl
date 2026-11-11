@@ -4,6 +4,7 @@ import { api, post, remove } from '$lib/api';
 import { session } from '$lib/session.svelte';
 import { normalizeRuntimeReadiness, runtimeReadinessFor, runtimeReadinessForWorker, type RuntimeReadinessAttempt, type RuntimeReadinessSnapshot } from '$lib/profile-catalog';
   import { profileDiagnosticLabel } from '$lib/tdl-lanes';
+import { modalMotion } from '$lib/motion';
 import { CircleAlert, KeyRound, Plus, RefreshCw, ShieldCheck, Trash2, Upload, UserRoundPlus, X } from '@lucide/svelte';
 
   type Worker = { name: string; enabled: boolean; selected?: boolean };
@@ -1430,7 +1431,7 @@ async function cancelProfileProvisioning() {
   {/if}
 
 {#if runtimeLogDialog}
-  <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4">
+  <div class="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4" transition:modalMotion={{ y: 10, duration: 220 }}>
     <dialog
       open
       class="relative inset-auto m-0 max-h-[85vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-5 shadow-2xl"
@@ -1477,7 +1478,7 @@ async function cancelProfileProvisioning() {
 {/if}
 
 {#if workerScanLogDialog}
-  <div class="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 p-3 sm:p-5">
+  <div class="fixed inset-0 z-[110] flex items-center justify-center bg-black/60 p-3 sm:p-5" transition:modalMotion={{ y: 10, duration: 220 }}>
     <dialog open class="relative inset-auto m-0 flex max-h-[92vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-[var(--line)] bg-[var(--panel)] p-0 shadow-2xl" aria-modal="true" aria-labelledby="worker-scan-log-title">
       <header class="flex items-start justify-between gap-3 border-b border-[var(--line)] p-4 sm:p-5">
         <div>
