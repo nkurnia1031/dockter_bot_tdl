@@ -7,6 +7,7 @@ import ProfileVaultPage from './pages/ProfileVaultPage.vue';
 import WorkersPage from './pages/WorkersPage.vue';
 import SettingsPage from './pages/SettingsPage.vue';
 import DevelopmentPage from './pages/DevelopmentPage.vue';
+import StoragePage from './pages/StoragePage.vue';
 import PlaceholderPage from './pages/PlaceholderPage.vue';
 
 export type AppRouteDefinition = {
@@ -24,7 +25,7 @@ const placeholder = (path: string, label: string, section: string, description: 
 export const routeDefinitions: AppRouteDefinition[] = [
   { path: '/', label: 'Ringkasan', section: 'Monitor', description: 'Job aktif, worker, layanan, dan kegagalan terbaru.', component: OverviewPage },
   { path: '/activity/', label: 'Aktivitas', section: 'Monitor', description: 'Monitor job realtime.', component: ActivityPage },
-  placeholder('/storage/', 'Storage', 'Transfer', 'Jelajahi dan kelola penyimpanan Telegram atau rclone.'),
+  { path: '/storage/', label: 'Storage', section: 'Transfer', description: 'Jelajahi dan kelola penyimpanan Telegram atau rclone.', component: StoragePage },
   placeholder('/downloads/', 'Download', 'Transfer', 'Kelola antrean dan riwayat unduhan.'),
   placeholder('/aria2/', 'AriaNg', 'Transfer', 'Kirim dan pantau tugas aria2 pada worker.'),
   placeholder('/chat-send/', 'Kirim ke Chat', 'Transfer', 'Kirim file Workspace ke chat Telegram.'),
