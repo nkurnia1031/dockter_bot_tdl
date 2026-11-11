@@ -2,6 +2,8 @@ import { createRouter, createWebHistory, type RouterHistory } from 'vue-router';
 import type { Component } from 'vue';
 import OverviewPage from './pages/OverviewPage.vue';
 import ActivityPage from './pages/ActivityPage.vue';
+import ProfilesPage from './pages/ProfilesPage.vue';
+import ProfileVaultPage from './pages/ProfileVaultPage.vue';
 import PlaceholderPage from './pages/PlaceholderPage.vue';
 
 export type AppRouteDefinition = {
@@ -29,8 +31,8 @@ export const routeDefinitions: AppRouteDefinition[] = [
   placeholder('/decrypt/', 'Dekripsi', 'Pemrosesan', 'Dekripsi teks dan tautan.'),
   placeholder('/utility/', 'Utility', 'Pemrosesan', 'Jalankan alat pada folder Workspace.'),
   placeholder('/backups/', 'Backup', 'Pemrosesan', 'Kelola backup dan pemulihan.'),
-  placeholder('/profiles/', 'Profil / Vault', 'Sistem', 'Periksa profil dan distribusikan sesi.'),
-  placeholder('/profiles/vault/', 'Vault', 'Sistem', 'Kelola berkas profil aktif.'),
+  { path: '/profiles/', label: 'Profil / Vault', section: 'Sistem', description: 'Periksa profil dan distribusikan sesi.', component: ProfilesPage },
+  { path: '/profiles/vault/', label: 'Vault', section: 'Sistem', description: 'Kelola berkas profil aktif.', component: ProfileVaultPage },
   placeholder('/workers/', 'Workers', 'Sistem', 'Lihat status dan rute worker.'),
   placeholder('/settings/', 'Pengaturan', 'Sistem', 'Kelola pengaturan aplikasi.'),
   placeholder('/development/', 'Pengembangan', 'Sistem', 'Catatan dan laporan pengembangan.')

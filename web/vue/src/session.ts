@@ -120,6 +120,23 @@ export const sessionActions = {
     }
     return next;
   },
+  async refreshProfileCatalog(): Promise<void> {
+    try {
+      const result = await api<Record<string, unknown>>('/profiles/local');
+      const items = Array.isArray(result.profiles) ? result.profiles : [];
+      session.profileCatalog = items.filter((item): item is ProfileOption =>
+        Boolean(item && typeof item === 'object' && typeof (item as ProfileOption).name === 'string')
+      );
+      if (!session.profileCatalog.some((item) => item.name === session.selectedTargetProfile)) {
+        const preferred = session.current.actor?.profile || '';
+        session.selectedTargetProfile = session.profileCatalog.some((item) => item.name === preferred)
+          ? preferred
+          : session.profileCatalog[0]?.name || '';
+      }
+    } catch {
+      // Keep the last known catalogue when a refresh fails transiently.
+    }
+  },
   async chooseProfile(profile: string): Promise<void> {
     if (session.switching || profile === session.current.actor?.profile) return;
     session.switching = true;

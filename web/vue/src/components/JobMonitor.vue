@@ -589,7 +589,7 @@ onUnmounted(() => {
   </section>
 
   <div v-if="detailOpen && selected" class="modal-backdrop" @click.self="closeDetails">
-    <section ref="detailDialog" class="modal-card job-detail-modal" role="dialog" :aria-modal="confirmTarget ? undefined : 'true'" :aria-hidden="confirmTarget ? 'true' : undefined" :inert="confirmTarget ? '' : null" tabindex="-1" :aria-label="`Detail job ${selected.id}`" @keydown="handleDialogKeydown($event, 'detail')">
+    <section ref="detailDialog" class="modal-card job-detail-modal" role="dialog" :aria-modal="confirmTarget ? undefined : 'true'" :aria-hidden="confirmTarget ? 'true' : undefined" :inert="confirmTarget ? true : undefined" tabindex="-1" :aria-label="`Detail job ${selected.id}`" @keydown="handleDialogKeydown($event, 'detail')">
       <header class="modal-heading"><div><p class="eyebrow">JOB · {{ selected.id.slice(0, 12) }}</p><h2>{{ jobTitle(selected) }}</h2></div><button ref="detailCloseButton" class="icon-button" aria-label="Tutup detail" @click="closeDetails">×</button></header>
       <nav class="detail-tabs" aria-label="Tab detail"><button v-for="tab in (['summary', 'events', 'log', 'raw'] as const)" :key="tab" :class="{ active: detailTab === tab }" :aria-pressed="detailTab === tab" @click="detailTab = tab">{{ tab === 'summary' ? 'Ringkasan' : tab === 'events' ? 'Event' : tab === 'log' ? 'Log' : 'JSON mentah' }}</button><button class="button button-secondary button-small" :disabled="detailLoading" @click="openDetails(selected, detailTab)">Refresh detail</button></nav>
       <div v-if="detailLoading" class="empty-state">Memuat detail…</div>
