@@ -67,6 +67,7 @@ describe('ExportPage', () => {
     expect(posted[0]).not.toHaveProperty('start_id');
     await fireEvent.click(screen.getByRole('switch', { name: /Overwrite Start ID/ }));
     await fireEvent.input(screen.getByLabelText('Start message ID'), { target: { value: '12' } });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Mulai export' })).toBeTruthy());
     await fireEvent.click(screen.getByRole('button', { name: 'Mulai export' }));
     await waitFor(() => expect(posted).toHaveLength(2));
     expect(posted[1]).toMatchObject({ chat_ref: 'example', start_id: 12, use_url_message_id: true });

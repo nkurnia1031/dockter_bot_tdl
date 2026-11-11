@@ -36,7 +36,7 @@ describe('DecryptPage', () => {
     expect(link.getAttribute('rel')).toBe('noopener noreferrer');
     expect(mocks.requests.find(({ path, init }) => path.startsWith('/decrypt/history') && init?.method === 'POST')?.init?.body).toBe(JSON.stringify({ result }));
     expect(await screen.findByText('Dekripsi selesai dan hasilnya disimpan di riwayat.')).toBeTruthy();
-    expect(await screen.findByRole('button', { name: /Tampilkan hasil dekripsi/ })).toBeTruthy();
+    expect(await screen.findAllByRole('button', { name: /Tampilkan hasil dekripsi/ })).toHaveLength(1);
   });
 
   it('returns history to the first page when a new result is saved', async () => {
@@ -65,7 +65,7 @@ describe('DecryptPage', () => {
     await fireEvent.input(screen.getByRole('textbox', { name: 'Teks terenkripsi' }), { target: { value: 'a77894319ebfd94509a5db3c280d9aee30d8f20e48773993e3a07eda5632fcf4050a8da670fb4831a28b1f68f6cef20af063b32024485302' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Dekripsi' }));
     expect(await screen.findByText('https://files.example/0.zip')).toBeTruthy();
-    expect(screen.getByText('https://qiwi.gg/file/aHda4057-HDHTIND884')).toBeTruthy();
+    expect(await screen.findByRole('link', { name: 'https://qiwi.gg/file/aHda4057-HDHTIND884' })).toBeTruthy();
     expect(mocks.requests.some(({ path }) => path.includes('offset=0'))).toBe(true);
   });
 
@@ -83,7 +83,7 @@ describe('DecryptPage', () => {
       throw new Error(`Unexpected API request ${path}`);
     });
     render(DecryptPage);
-    await screen.findByRole('button', { name: /Tampilkan hasil dekripsi/ });
+    await screen.findAllByRole('button', { name: /Tampilkan hasil dekripsi/ });
     await fireEvent.click(screen.getByRole('button', { name: 'Berikutnya' }));
     expect(await screen.findByText('https://files.example/page-2.zip')).toBeTruthy();
     expect(mocks.requests.some(({ path }) => path.includes('offset=5'))).toBe(true);
@@ -102,7 +102,7 @@ describe('DecryptPage', () => {
     });
     render(DecryptPage);
     expect(await screen.findByText('Resolver dinonaktifkan sementara. Job dan hasil sebelumnya tetap tersedia di bawah.')).toBeTruthy();
-    expect(await screen.findByText('#resolver')).toBeTruthy();
+    expect(await screen.findByText(/#resolver · succeeded · remote-1/)).toBeTruthy();
     expect(await screen.findByRole('link', { name: destination })).toBeTruthy();
     expect(screen.queryByLabelText('URL shortlink')).toBeNull();
     expect(mocks.requests.some(({ path }) => path === '/safelink/workers')).toBe(false);

@@ -123,17 +123,6 @@ async function loadSources(profile = targetProfile.value) {
   } finally { if (!disposed && request === sourceGeneration) sourceLoading.value = false; }
 }
 
-async function refreshReadiness() {
-  try {
-    const response = await api<{ profiles?: unknown[]; runtime_readiness?: unknown }>('/profiles/local');
-    readiness.value = normalizeRuntimeReadiness(response.runtime_readiness);
-    if (Array.isArray(response.profiles)) {
-      profileCatalog.value = response.profiles as typeof session.profileCatalog;
-      session.profileCatalog = profileCatalog.value;
-    }
-  } catch { /* Stored readiness is informational. */ }
-}
-
 async function loadStats() {
   statsLoading.value = true;
   try {
@@ -183,18 +172,19 @@ async function loadStaging() {
 
 function stageSourcePayload() {
   const normalized = url.value.trim() ? null : normalizeTdlChatRef(chatRef.value);
-  return {
+  const source: { url?: string; chat_ref?: string; label?: string; start_id?: number; use_url_message_id?: boolean } = {
     ...(url.value.trim() ? { url: url.value.trim() } : normalized ? { chat_ref: normalized } : {}),
     ...(label.value.trim() ? { label: label.value.trim() } : {}),
     ...(overwriteStartId.value ? { start_id: Number(startId.value), use_url_message_id: true } : {})
   };
+  return source;
 }
 
 async function recoverStage(item: Stage, resumePhase?: string) {
   const profile = stageProfile(item);
   const source = stageSourcePayload();
   if (!profile) { message.value = 'Pilih profile pada form Quick Mode sebelum mengimport folder ini.'; return; }
-  if (!item.json_present && !item.actual_media_count && !item.archive_parts && !source.url && !source.chat_ref) {
+  if (!item.json_present && !item.actual_media_count && !item.archive_parts && !('url' in source) && !('chat_ref' in source)) {
     message.value = 'Folder ini tidak memiliki JSON. Isi URL atau chat ID untuk export ulang.';
     return;
   }

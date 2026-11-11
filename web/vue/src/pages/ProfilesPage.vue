@@ -360,7 +360,7 @@ function runtimeName(runtime: string) {
 }
 function runtimeLogTitle(dialog: RuntimeLogDialog) {
   const profile = dialog.profile ? ` profil ${dialog.profile}` : "";
-  return `Log uji ${runtimeName(dialog.runtime)}${profile} worker ${dialog.worker}`;
+  return `Log uji ${runtimeName(dialog.runtime)}${profile ? ` · Profil ${dialog.profile}` : ""} · Worker ${dialog.worker}`;
 }
 function readinessLabel(status: string) {
   return runtimeLabels[status] || "Belum dipindai";
@@ -1491,8 +1491,20 @@ async function startScan(path: string, body?: Record<string, string>) {
         disabled = legacy.workers.filter(
           (item) => item.status === "disabled",
         ).length;
+      if (failed) {
+        failure.value = codeMessage(
+          legacy.workers.find((item) => item.status === "failed")?.error_code ||
+            "WORKER_SCAN_FAILED",
+        );
+      }
       notice.value = `Scan selesai: ${successful} worker berhasil, ${failed} gagal, ${disabled} nonaktif.`;
       scanning.value = false;
+      if (selectedWorker.value) {
+        const currentGeneration = progressGeneration;
+        await refreshDeleteOperations(selectedWorker.value, currentGeneration);
+        await refreshVaultProfiles(selectedWorker.value, currentGeneration);
+        scheduleProgressRefresh();
+      }
       return;
     }
     scanOperation.value = operation;
@@ -1595,7 +1607,7 @@ function runtimeMatrix(worker: string, profile?: string) {
     result: profile
       ? profileRuntimeReadiness(worker, profile, runtime)
       : workerRuntimeReadiness(worker, runtime),
-    scannable: runtime !== "upload",
+    scannable: runtime !== "upload" && runtime !== "quick_mode",
   }));
 }
 function exportReadinessFor(profile: LocalProfile, worker: string) {
@@ -1642,8 +1654,8 @@ onUnmounted(() => {
         </p>
       </div>
       <div class="heading-actions">
-        <RouterLink class="button button-secondary" to="/profiles/vault/"
-          >Kelola Vault</RouterLink
+        <a class="button button-secondary" href="/profiles/vault/"
+          >Kelola Vault</a
         >
       </div>
     </header>
@@ -1687,7 +1699,7 @@ onUnmounted(() => {
         ><label
           >Nama profil<input
             v-model="profileName"
-            aria-label="Nama profil baru"
+            aria-label="Nama profil"
             autocomplete="off"
             placeholder="mis. profil-baru"
         /></label>
@@ -2303,9 +2315,6 @@ onUnmounted(() => {
           </p>
         </article>
       </section>
-      <p v-if="notice" class="notice notice-success" role="status">
-        {{ notice }}
-      </p>
       <p v-if="vaultStatusFailure" class="muted" role="status">
         Status Vault gagal dimuat; adopsi dinonaktifkan.
       </p>
@@ -2371,7 +2380,7 @@ onUnmounted(() => {
                   adoptionIsActive(profile.name)
                     ? "Menyimpan…"
                     : "Adopsi ke Vault"
-                }}</button
+                }}</button>
             </div>
           </div>
           <div class="diagnostic-grid">
@@ -2425,6 +2434,9 @@ onUnmounted(() => {
                       ? "Gagal"
                       : "Belum diperiksa"
               }}</span>
+              <span v-if="profile.upload_lane?.status === 'running'" class="muted">
+                {{ profile.upload_lane.progress }}%
+              </span>
             </div>
             <p class="muted">
               {{ profile.upload_lane?.phase || "Belum ada progres"
@@ -2436,6 +2448,7 @@ onUnmounted(() => {
               v-if="profile.upload_lane?.status === 'running'"
               :value="profile.upload_lane.progress"
               max="100"
+              :aria-label="`Progress lane Upload ${profile.name}`"
             ></progress>
           </div>
         </article>

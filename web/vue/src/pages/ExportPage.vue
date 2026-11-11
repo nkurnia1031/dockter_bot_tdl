@@ -231,7 +231,7 @@ async function submit() {
 async function deleteSource(source: Source) {
   try {
     await remove(`/sources/${encodeURIComponent(source.chat_ref)}`);
-    if (selected.value === source.chat_ref) choose('');
+    if (selected.value === source.chat_ref) chooseSource('');
     await loadSources();
   } catch (cause) {
     sourcesError.value = cause instanceof Error ? cause.message : 'Source gagal dihapus.';
@@ -260,7 +260,7 @@ onMounted(() => {
   void Promise.all([loadSources(), refreshReadiness()]);
   try {
     const saved = JSON.parse(sessionStorage.getItem('tme3-export-notices') || '[]');
-    const ids = Array.isArray(saved) ? saved.filter((id): id is string => typeof id === 'string' && id.trim()).slice(0, 4) : [];
+    const ids = Array.isArray(saved) ? saved.filter((id): id is string => typeof id === 'string' && Boolean(id.trim())).slice(0, 4) : [];
     void Promise.all(ids.map((id) => api<unknown>(`/jobs/${encodeURIComponent(id)}`).catch(() => null)))
       .then((jobs) => { notices.value = jobs.flatMap((job) => isExportJob(job) ? [{ job }] : []); persistNotices(); schedulePoll(); });
   } catch { sessionStorage.removeItem('tme3-export-notices'); }
@@ -286,7 +286,6 @@ onUnmounted(() => {
           <p v-if="noticeItem.job.status === 'succeeded' && quickCompletionDetails(resultValue(noticeItem.job))" class="muted">{{ quickCompletionDetails(resultValue(noticeItem.job)) }}</p>
           <p v-if="noticeItem.job.status === 'succeeded'" class="muted">{{ resultValue(noticeItem.job).chat_ref || chatRef }}<template v-if="resultValue(noticeItem.job).requested_label"> · {{ resultValue(noticeItem.job).requested_label }}</template></p>
         </div>
-        <div v-if="activeStatuses.includes(noticeItem.job.status)" class="notice-progress"></div>
       </article>
     </div>
 
@@ -339,8 +338,7 @@ onUnmounted(() => {
 .target-controls label,.export-form>label,.export-input-grid label{display:grid;gap:.35rem;font-size:.67rem;font-weight:750}
 .readiness-notice{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .75rem}.readiness-notice small{width:100%}.notice-success{color:var(--success);border-color:color-mix(in srgb,var(--success) 35%,var(--line))}
 .export-grid{display:grid;grid-template-columns:minmax(20rem,.9fr) minmax(18rem,1.1fr);gap:.85rem;align-items:start}.export-form{display:grid;gap:.75rem;padding:.85rem}.export-input-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.65rem}.wide-field{grid-column:1/-1}
-.switch-option{display:flex;align-items:flex-start;gap:.55rem;padding:.65rem .7rem;border:1px solid var(--line);border-radius:9px;background:var(--panel-soft)}.switch-option span{display:grid;gap:.2rem;font-size:.68rem}.switch-option small{color:var(--muted);font-size:.61rem;font-weight:400;line-height:1.4}.quick-option{border-color:color-mix(in srgb,var(--brand) 40%,var(--line))}.numeric-option{border-color:color-mix(in srgb,var(--warning) 40%,var(--line))}.label-chips,.form-actions{display:flex;flex-wrap:wrap;gap:.4rem}.chip-button{border:1px solid var(--line);border-radius:99px;padding:.28rem .55rem;font-size:.62rem;font-weight:700}.form-actions{justify-content:space-between;margin-top:.15rem}.source-list{max-height:25rem;overflow:auto}.source-row{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.7rem .85rem;border-bottom:1px solid var(--line)}.source-select{display:grid;min-width:0;gap:.2rem;text-align:left}.source-select strong,.source-select small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-select strong{font-size:.72rem}.source-select small{font-size:.62rem}.empty-state{display:grid;gap:.25rem;place-items:center;padding:2rem;text-align:center;color:var(--muted);font-size:.7rem}.export-notice-viewport{position:fixed;inset-inline-end:max(1rem,env(safe-area-inset-right));bottom:max(1rem,env(safe-area-inset-bottom));z-index:1000;display:grid;width:min(390px,calc(100vw - 2rem));gap:.5rem;max-height:calc(100dvh - 2rem);overflow:auto;pointer-events:none}.export-notice{pointer-events:auto;padding:.6rem .75rem;border-color:color-mix(in srgb,var(--brand) 35%,var(--line))}.notice-content{display:grid;gap:.3rem}.notice-content p{margin:0;font-size:.66rem}.notice-top{display:flex;align-items:center;justify-content:space-between;font-size:.72rem}.notice-error-text{color:var(--danger)}.notice-progress{height:3px;margin:.55rem -.75rem -.6rem;background:linear-gradient(90deg,var(--brand) 0 48%,transparent 48% 100%);animation:notice-slide 1s linear infinite}@keyframes notice-slide{to{background-position:180px 0}}
+.switch-option{display:flex;align-items:flex-start;gap:.55rem;padding:.65rem .7rem;border:1px solid var(--line);border-radius:9px;background:var(--panel-soft)}.switch-option span{display:grid;gap:.2rem;font-size:.68rem}.switch-option small{color:var(--muted);font-size:.61rem;font-weight:400;line-height:1.4}.quick-option{border-color:color-mix(in srgb,var(--brand) 40%,var(--line))}.numeric-option{border-color:color-mix(in srgb,var(--warning) 40%,var(--line))}.label-chips,.form-actions{display:flex;flex-wrap:wrap;gap:.4rem}.chip-button{border:1px solid var(--line);border-radius:99px;padding:.28rem .55rem;font-size:.62rem;font-weight:700}.form-actions{justify-content:space-between;margin-top:.15rem}.source-list{max-height:25rem;overflow:auto}.source-row{display:flex;align-items:center;justify-content:space-between;gap:.5rem;padding:.7rem .85rem;border-bottom:1px solid var(--line)}.source-select{display:grid;min-width:0;gap:.2rem;text-align:left}.source-select strong,.source-select small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.source-select strong{font-size:.72rem}.source-select small{font-size:.62rem}.empty-state{display:grid;gap:.25rem;place-items:center;padding:2rem;text-align:center;color:var(--muted);font-size:.7rem}.export-notice-viewport{position:fixed;inset-inline-end:max(1rem,env(safe-area-inset-right));bottom:max(1rem,env(safe-area-inset-bottom));z-index:1000;display:grid;width:min(390px,calc(100vw - 2rem));gap:.5rem;max-height:calc(100dvh - 2rem);overflow:auto;pointer-events:none}.export-notice{pointer-events:auto;padding:.6rem .75rem;border-color:color-mix(in srgb,var(--brand) 35%,var(--line))}.notice-content{display:grid;gap:.3rem}.notice-content p{margin:0;font-size:.66rem}.notice-top{display:flex;align-items:center;justify-content:space-between;font-size:.72rem}.notice-error-text{color:var(--danger)}
 @media(max-width:850px){.export-grid{grid-template-columns:1fr}.target-controls{width:100%;min-width:0}}
 @media(max-width:560px){.target-controls,.export-input-grid{grid-template-columns:1fr}.wide-field{grid-column:auto}.form-actions>*{flex:1}}
-@media(prefers-reduced-motion:reduce){.notice-progress{animation:none}}
 </style>

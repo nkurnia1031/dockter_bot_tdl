@@ -28,7 +28,7 @@ export default defineConfig({
   },
   test: {
     environment: 'jsdom',
-    include: ['vue/src/**/*.test.ts', 'src/lib/*.test.ts'],
-    setupFiles: ['./vue/src/test-setup.ts']
+    include: [join(fileURLToPath(new URL('./', import.meta.url)), 'vue/src/**/*.test.ts'), join(fileURLToPath(new URL('./', import.meta.url)), 'src/lib/*.test.ts')],
+    setupFiles: [fileURLToPath(new URL('./vue/src/test-setup.ts', import.meta.url))]
   }
 });

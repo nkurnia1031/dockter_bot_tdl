@@ -410,10 +410,10 @@ describe("ProfilesPage", () => {
     const wrapper = mountPage();
     await flushPromises();
     await wrapper
-      .get('select[aria-label="Worker penambahan"]')
+      .get('select[aria-label="Worker untuk menyiapkan sesi"]')
       .setValue("remote-1");
     await wrapper
-      .get('input[aria-label="Nama profil baru"]')
+      .get('input[aria-label="Nama profil"]')
       .setValue("newprofile");
     await wrapper.get('button[aria-pressed="false"]').trigger("click");
     const startLogin = wrapper

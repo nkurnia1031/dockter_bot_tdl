@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
 import { api, patch, post, put, remove } from "../lib/api";
-import { session } from "../session";
+import { session, sessionActions } from "../session";
 
 type Worker = {
   name: string;
@@ -127,7 +127,7 @@ async function selectWorker(worker: Worker) {
   if (worker.enabled === false) return;
   failure.value = "";
   try {
-    await session.chooseWorker(worker.name);
+    await sessionActions.chooseWorker(worker.name);
     message.value = `Job baru akan memakai ${worker.name}.`;
     await loadWorkers();
   } catch (cause) {
@@ -482,7 +482,7 @@ onUnmounted(() => window.removeEventListener("tme3:context-changed", contextChan
               <section class="runtime-subsection">
                 <div class="operation-heading"><div><h4>Mesin TTS</h4><p class="muted">Setiap helper menjalankan Tor lokal. Diagnosis hanya berjalan saat diminta.</p></div><button class="button button-secondary button-small" type="button" :aria-label="`Periksa ulang TTS ${worker.name}`" :disabled="ttsHealthLoading[worker.name]" @click="refreshTtsHealth(worker)">{{ ttsHealthLoading[worker.name] ? "Memeriksa…" : "Periksa ulang" }}</button></div>
                 <template v-if="ttsHealth[worker.name]">
-                  <p class="muted">Status job TTS: {{ ttsHealth[worker.name].ready ? "siap" : ttsHealth[worker.name].reason_code }} · Helper/Tor: {{ ttsHealth[worker.name].helpers_ready ? "siap" : "belum siap" }} · Profil yang terverifikasi mengirim: {{ ttsHealth[worker.name].verified_profiles?.length ? ttsHealth[worker.name].verified_profiles.join(", ") : "belum ada" }}</p>
+                  <p class="muted">Status job TTS: {{ ttsHealth[worker.name]?.ready ? "siap" : ttsHealth[worker.name]?.reason_code || "belum siap" }} · Helper/Tor: {{ ttsHealth[worker.name]?.helpers_ready ? "siap" : "belum siap" }} · Profil yang terverifikasi mengirim: {{ ttsHealth[worker.name]?.verified_profiles?.join(", ") || "belum ada" }}</p>
                   <a class="muted" href="/api/v1/diagnostics/tts/logs?limit=100" target="_blank" rel="noreferrer">Log diagnosis TTS JSON</a>
                   <div class="helper-grid">
                     <article v-for="helper in ttsHealth[worker.name].helpers" :key="helper.slot" class="helper-card" :data-testid="`tts-helper-${worker.name}-${helper.slot}`">

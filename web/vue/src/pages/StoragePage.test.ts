@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/vue";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import StoragePage from "./StoragePage.vue";
 
@@ -47,27 +47,43 @@ function setupApi() {
   mocks.patch.mockResolvedValue({});
 }
 
+const projectFolderSummary = "2 file · 1 folder · 30 B";
+const findSummary = (expected: string) => screen.findByText((_, element) => element?.textContent?.replace(/\s+/g, " ").trim() === expected);
+const findProjectFolderButton = async () => {
+  const summary = await findSummary(projectFolderSummary);
+  const button = summary.closest("button.entry-main");
+  if (!button) throw new Error("Folder Projects tidak memiliki tombol buka.");
+  return button;
+};
+const openRcloneFolderButton = async (name: string) => {
+  const checkbox = await screen.findByRole("checkbox", { name: `Pilih folder ${name}` });
+  const row = checkbox.closest(".storage-entry");
+  const button = row?.querySelector("button.entry-main");
+  if (!button) throw new Error(`Folder rclone ${name} tidak memiliki tombol buka.`);
+  return button;
+};
+
 describe("StoragePage", () => {
-  beforeEach(() => { vi.clearAllMocks(); setupApi(); });
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
+  beforeEach(() => { window.history.replaceState({}, "", "/"); vi.clearAllMocks(); setupApi(); });
+  afterEach(() => { cleanup(); window.history.replaceState({}, "", "/"); vi.restoreAllMocks(); vi.unstubAllGlobals(); localStorage.clear(); });
 
   it("keeps Telegram navigation and recursive folder summaries", async () => {
     render(StoragePage);
-    expect(await screen.findByText("2 file · 1 folder · 30 B")).toBeTruthy();
+    expect(await findSummary("2 file · 1 folder · 30 B")).toBeTruthy();
     expect(await screen.findByText("Storage siap")).toBeTruthy();
     expect(mocks.api).toHaveBeenCalledWith("/profiles/local");
     expect(screen.getByRole("button", { name: "Recycle Bin" })).toBeTruthy();
     expect(screen.queryByText("Folder bersama")).toBeNull();
-    await fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
-    expect(await screen.findByText("report.pdf")).toBeTruthy();
+    await fireEvent.click(await findProjectFolderButton());
+    expect((await screen.findAllByText("report.pdf")).length).toBeGreaterThan(0);
     expect(mocks.api.mock.calls.some(([path]) => String(path).includes("folder_id=1"))).toBe(true);
   });
 
   it("purges the currently listed Telegram Trash after explicit bulk selection", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("button", { name: "Recycle Bin" }));
-    expect(await screen.findByText("trashed.zip")).toBeTruthy();
+    expect((await screen.findAllByText("trashed.zip")).length).toBeGreaterThan(0);
     await fireEvent.click(screen.getByRole("button", { name: "Kosongkan Trash" }));
     expect(await screen.findByRole("heading", { name: "Hapus permanen?" })).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Purge permanen" }));
@@ -76,9 +92,9 @@ describe("StoragePage", () => {
 
   it("submits Telegram upload with the selected worker, workspace path, and safe Move confirmation", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("button", { name: "Upload" }));
-    await screen.findByText("3 folder · 1 file");
+    await findSummary("1 folder · 3 file");
     await fireEvent.click(screen.getByRole("button", { name: "Pilih folder" }));
     await fireEvent.change(screen.getByLabelText("Transfer"), { target: { value: "move" } });
     const confirmation = screen.getByRole("checkbox", { name: /file Workspace dihapus per file/ });
@@ -105,7 +121,7 @@ describe("StoragePage", () => {
     render(StoragePage);
     expect(await screen.findByText("Storage belum siap")).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Upload" }));
-    await screen.findByText("3 folder · 1 file");
+    await findSummary("1 folder · 3 file");
     await fireEvent.click(screen.getByRole("button", { name: "Pilih folder" }));
     await fireEvent.click(screen.getByRole("button", { name: "Mulai upload" }));
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith("/storage/uploads", expect.objectContaining({ worker: "local", provider: "telegram", transfer_mode: "copy" })));
@@ -119,9 +135,8 @@ describe("StoragePage", () => {
       ? { runtime_readiness: { cells: [{ worker: "local", profile: "default", runtime: "download", status: "not_ready", reason_code: "PROFILE_CANARY_DOWNLOAD_FAILED" }] } }
       : baseImplementation!(path));
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
-    await fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
-    await screen.findByText("report.pdf");
+    await fireEvent.click(await findProjectFolderButton());
+    await screen.findAllByText("report.pdf");
     await fireEvent.click(screen.getByRole("checkbox", { name: "Pilih file report.pdf" }));
     await fireEvent.click(screen.getByRole("button", { name: "Download" }));
     expect(await screen.findByLabelText("Profil dengan lane Download siap")).toBeTruthy();
@@ -134,7 +149,7 @@ describe("StoragePage", () => {
 
   it("creates and renames rclone folders and entries with the selected worker", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
     await fireEvent.click(await screen.findByRole("button", { name: "Folder baru" }));
     await fireEvent.input(screen.getByLabelText("Nama folder"), { target: { value: "2026" } });
@@ -148,7 +163,7 @@ describe("StoragePage", () => {
 
   it("loads recursive rclone summaries once and resets selection when worker changes", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
     expect(await screen.findByText("4 file · 2 folder · Ukuran tidak lengkap")).toBeTruthy();
     const summaryCalls = mocks.api.mock.calls.filter(([path]) => String(path).startsWith("/storage/rclone/folder-summaries?"));
@@ -162,9 +177,9 @@ describe("StoragePage", () => {
 
   it("browses rclone folders read-only under the selected worker", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
-    await fireEvent.click(await screen.findByRole("button", { name: /Archive/ }));
+    await fireEvent.click(await openRcloneFolderButton("Archive"));
     expect(await screen.findByText("nested.txt")).toBeTruthy();
     expect(mocks.api.mock.calls.some(([path]) => String(path).includes("worker=local") && String(path).includes("path=Archive"))).toBe(true);
     expect(mocks.post).not.toHaveBeenCalled();
@@ -172,13 +187,13 @@ describe("StoragePage", () => {
 
   it("submits recursive rclone download for the selected worker and workspace destination", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
     await screen.findByRole("checkbox", { name: "Pilih folder Archive" });
     await fireEvent.click(screen.getByRole("checkbox", { name: "Pilih folder Archive" }));
     await fireEvent.click(screen.getByRole("button", { name: "Download 1 dipilih" }));
     await screen.findByRole("heading", { name: "Download ke worker" });
-    await screen.findByText("3 folder · 1 file");
+    await findSummary("1 folder · 3 file");
     await fireEvent.click(screen.getByRole("radio", { name: "Pilih downloads" }));
     await fireEvent.click(screen.getByRole("checkbox", { name: "Buat link publik tanpa kedaluwarsa untuk setiap file" }));
     await fireEvent.click(screen.getByRole("button", { name: "Mulai download" }));
@@ -189,7 +204,7 @@ describe("StoragePage", () => {
 
   it("submits copy management as an asynchronous rclone job", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
     await fireEvent.click(await screen.findByRole("checkbox", { name: "Pilih file report.zip" }));
     await fireEvent.click(screen.getByRole("button", { name: "Copy ke sini" }));
@@ -201,7 +216,7 @@ describe("StoragePage", () => {
 
   it("selects visible rclone entries and explains the remote Trash restore boundary", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
     await screen.findByRole("checkbox", { name: "Pilih folder Archive" });
     await fireEvent.click(screen.getByRole("button", { name: "Pilih semua di halaman" }));
@@ -244,10 +259,10 @@ describe("StoragePage", () => {
       return { id: "job-12345678" };
     });
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.change(screen.getByLabelText("Worker target"), { target: { value: "remote-1" } });
     expect(await screen.findByText("file.zip")).toBeTruthy();
-    expect(screen.getByText(/Worker nonaktif/)).toBeTruthy();
+    expect(screen.getAllByText(/Worker nonaktif/).length).toBeGreaterThan(0);
     await fireEvent.click(screen.getByRole("tab", { name: "Rclone" }));
     expect((await screen.findByRole("button", { name: "Upload ke folder ini" }) as HTMLButtonElement).disabled).toBe(true);
     expect(mocks.post).not.toHaveBeenCalledWith("/storage/downloads", expect.anything());
@@ -263,7 +278,7 @@ describe("StoragePage", () => {
       ? { id: "sync-1", status: "succeeded", result: { value: { history_complete: false, catalog: { recovered: 1, updated: 2, restored: 0, deleted: 0, deletion_held: 3 } } } }
       : baseImplementation!(path));
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("button", { name: "Sinkronkan sekarang" }));
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith("/storage/sync", { worker: "local", profile: "default" }));
     window.dispatchEvent(new CustomEvent("tme3:job-finished", { detail: { jobIds: ["sync-1"] } }));
@@ -280,7 +295,7 @@ describe("StoragePage", () => {
       return baseImplementation!(path);
     });
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
+    await findProjectFolderButton();
     await fireEvent.click(screen.getByRole("button", { name: "Scan worker" }));
     expect(await screen.findByText("Pemeriksaan selesai: 1/2 profil dapat mengirim ke Storage.")).toBeTruthy();
     expect(screen.getByText("archive")).toBeTruthy();
@@ -299,9 +314,8 @@ describe("StoragePage", () => {
 
   it("closes the file detail dialog on Escape and restores focus to its trigger", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
-    await fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
-    await screen.findByText("report.pdf");
+    await fireEvent.click(await findProjectFolderButton());
+    await screen.findAllByText("report.pdf");
     const trigger = screen.getByRole("button", { name: "Detail report.pdf" });
     await fireEvent.click(trigger);
     const dialog = await screen.findByRole("dialog", { name: "Detail file" });
@@ -314,18 +328,17 @@ describe("StoragePage", () => {
 
   it("moves a dragged Telegram file through the existing catalogue action", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
-    await fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
-    await screen.findByText("report.pdf");
-    await fireEvent.drop(screen.getByRole("list"), { dataTransfer: { getData: () => JSON.stringify({ kind: "item", id: 9 }) } });
+    await fireEvent.click(await findProjectFolderButton());
+    await screen.findAllByText("report.pdf");
+    const browser = screen.getByRole("region", { name: "Browser Telegram Storage" });
+    await fireEvent.drop(within(browser).getByRole("list"), { dataTransfer: { getData: () => JSON.stringify({ kind: "item", id: 9 }) } });
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith("/storage/actions/move", { item_ids: [9], folder_ids: [], destination_folder_id: 1 }));
   });
 
   it("keeps keyboard focus inside the file detail dialog", async () => {
     render(StoragePage);
-    await screen.findByRole("button", { name: /Projects/ });
-    await fireEvent.click(screen.getByRole("button", { name: /Projects/ }));
-    await screen.findByText("report.pdf");
+    await fireEvent.click(await findProjectFolderButton());
+    await screen.findAllByText("report.pdf");
     await fireEvent.click(screen.getByRole("button", { name: "Detail report.pdf" }));
     const close = screen.getByRole("button", { name: "Tutup detail file" });
     const last = screen.getByRole("button", { name: "Pindahkan ke Trash" });

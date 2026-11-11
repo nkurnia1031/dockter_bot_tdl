@@ -26,7 +26,9 @@ const pendingArtifact = {
 };
 const missingArtifact = {
   id: 'artifact-missing', filename: 'missing.json', profile: 'archive', worker: 'remote-1',
-  status: 'deleted', available: false, missing_at: '2026-11-10T10:00:00Z'
+  status: 'deleted', available: false, label: 'Old', chat_ref: '@oldchat',
+  message_count: 0, json_bytes: 0, created_at: '2026-11-10T09:00:00Z',
+  missing_at: '2026-11-10T10:00:00Z'
 };
 
 function setupApi(items = [pendingArtifact]) {
@@ -62,9 +64,9 @@ describe('DownloadsPage', () => {
   afterEach(() => { cleanup(); vi.useRealTimers(); });
 
   it('loads the global catalog without reconciling and stays idle until manual refresh', async () => {
-    vi.useFakeTimers();
     render(DownloadsPage);
-    expect(await screen.findByText('backup.json')).toBeTruthy();
+    expect((await screen.findAllByText('backup.json')).length).toBeGreaterThan(0);
+    vi.useFakeTimers();
     const initialReads = mocks.api.mock.calls.filter(([path]) => String(path).startsWith('/downloads/artifacts?')).length;
     expect(initialReads).toBe(2);
     expect(mocks.post).not.toHaveBeenCalled();
@@ -80,12 +82,14 @@ describe('DownloadsPage', () => {
 
   it('passes origin filters to catalog and manual reconcile only', async () => {
     render(DownloadsPage);
-    await screen.findByText('backup.json');
+    await screen.findAllByText('backup.json');
     await fireEvent.change(screen.getByLabelText('Profile'), { target: { value: 'archive' } });
     await fireEvent.change(screen.getByLabelText('Worker / VPS'), { target: { value: 'remote-1' } });
     await fireEvent.input(screen.getByPlaceholderText('Cari label'), { target: { value: 'quarterly' } });
-    await fireEvent.change(screen.getByPlaceholderText('@username, link, ID, atau telepon'), { target: { value: '@teamstore' } });
-    await fireEvent.click(screen.getByRole('button', { name: 'Reconcile global' }));
+    await fireEvent.change(screen.getByPlaceholderText('Cari label'));
+    await fireEvent.input(screen.getByPlaceholderText('@username, link, ID, atau telepon'), { target: { value: '@teamstore' } });
+    await fireEvent.change(screen.getByPlaceholderText('@username, link, ID, atau telepon'));
+    await fireEvent.click(screen.getByRole('button', { name: /Reconcile global/ }));
 
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/downloads/artifacts/reconcile?scope=global&profile=archive&worker=remote-1'));
     const listCalls = mocks.api.mock.calls.map(([path]) => String(path)).filter((path) => path.startsWith('/downloads/artifacts?'));
@@ -93,7 +97,7 @@ describe('DownloadsPage', () => {
       const params = new URLSearchParams(path.split('?')[1]);
       return params.get('scope') === 'global' && params.get('profile') === 'archive' && params.get('worker') === 'remote-1'
         && params.get('label') === 'quarterly' && params.get('chat_ref') === '@teamstore';
-    })).toBe(true);
+    }), JSON.stringify(listCalls)).toBe(true);
   });
 
   it('queries pending separately so older pending artifacts are not hidden by the global limit', async () => {
@@ -103,14 +107,14 @@ describe('DownloadsPage', () => {
     })).concat([pendingArtifact] as never[]);
     setupApi(items as typeof pendingArtifact[]);
     render(DownloadsPage);
-    expect(await screen.findByText('backup.json')).toBeTruthy();
+    expect((await screen.findAllByText('backup.json')).length).toBeGreaterThan(0);
     expect(mocks.api.mock.calls.some(([path]) => new URLSearchParams(String(path).split('?')[1]).get('status') === 'pending')).toBe(true);
   });
 
   it('submits downloads despite an unready informational scan result', async () => {
     render(DownloadsPage);
     expect(await screen.findByText('Scan terakhir: belum siap')).toBeTruthy();
-    const start = screen.getByRole('button', { name: 'Mulai' });
+    const start = screen.getAllByRole('button', { name: 'Mulai' })[0];
     expect((start as HTMLButtonElement).disabled).toBe(false);
     await fireEvent.click(start);
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/downloads/batch', { artifact_ids: ['artifact-pending'], priority: 'normal' }));
@@ -119,9 +123,9 @@ describe('DownloadsPage', () => {
   it('keeps missing artifacts in history without offering retry or starting a scan', async () => {
     setupApi([missingArtifact]);
     render(DownloadsPage);
-    await screen.findByText('Tidak ada artifact pada tab ini.');
+    await screen.findAllByText('Tidak ada artifact pada tab ini.');
     await fireEvent.click(screen.getByRole('tab', { name: 'History' }));
-    expect(await screen.findByText('missing.json')).toBeTruthy();
+    expect((await screen.findAllByText('missing.json')).length).toBeGreaterThan(0);
     expect(screen.getByText('File tidak tersedia')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Mulai' })).toBeNull();
     expect(mocks.post).not.toHaveBeenCalled();
@@ -132,8 +136,8 @@ describe('DownloadsPage', () => {
     setupApi([archived]);
     render(DownloadsPage);
     await fireEvent.click(await screen.findByRole('tab', { name: 'Archived' }));
-    expect(await screen.findByText('old.json')).toBeTruthy();
-    await fireEvent.click(screen.getByRole('button', { name: 'Purge' }));
+    expect((await screen.findAllByText('old.json')).length).toBeGreaterThan(0);
+    await fireEvent.click(screen.getAllByRole('button', { name: 'Purge' })[0]);
     expect(await screen.findByRole('dialog')).toBeTruthy();
     expect(mocks.remove).not.toHaveBeenCalled();
     await fireEvent.click(screen.getByRole('button', { name: 'Lanjutkan' }));

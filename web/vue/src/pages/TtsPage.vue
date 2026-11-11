@@ -41,7 +41,7 @@ const workerReason = (code: string) => ({
   worker_unavailable: 'Worker tidak dapat dihubungi', worker_update_required: 'Perlu update worker',
   helpers_not_ready: 'Helper gTTS atau Tor belum siap', tdl_access_unverified: 'Belum ada hasil command terbaru; job tetap dapat dicoba',
   tts_capability_missing: 'Capability TTS belum dilaporkan', capability_unavailable: 'Capability worker belum dapat diperiksa'
-} as Record<string, string>)[code] || code || 'Status belum diketahui');
+} as Record<string, string>)[code] || code || 'Status belum diketahui';
 
 async function loadWorkers() {
   workersLoading.value = true;

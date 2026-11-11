@@ -50,7 +50,7 @@ describe('ChatSendPage', () => {
     renderPage();
     await screen.findByRole('checkbox', { name: /default/ });
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
-    const archiveProfile = await screen.findByRole('checkbox', { name: /archive/ });
+    const archiveProfile = await screen.findByRole('checkbox', { name: 'archive' });
     await fireEvent.click(archiveProfile);
     const defaultProfile = await screen.findByRole('checkbox', { name: /default/ });
     if ((defaultProfile as HTMLInputElement).checked) await fireEvent.click(defaultProfile);

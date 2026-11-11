@@ -12,64 +12,30 @@ yang disetujui pengguna.
 
 ## Status handoff
 
-Diperbarui 2026-09-24 (Asia/Jakarta). Pada saat handoff:
+Diperbarui 2026-11-11 (UTC). Verifikasi awal setiap sesi tetap memakai `git status`,
+`git log`, dan source aktual. Pada pembaruan ini:
 
-- branch `main` berada pada commit `853faab`
-  (`fix(quickmode): reconcile cleanup stages with remote uploads`), dan
-  `origin/main` berada pada commit yang sama;
-- sebelum pembaruan dokumen ini worktree bersih; perubahan yang diharapkan
-  setelahnya hanya pembaruan `AGENTS.md` ini;
-- Web sudah dipindahkan ke Vue 3 + TypeScript + Vite static SPA; tidak ada Next.js, Node runtime, atau
-  container web di produksi. Target static UI aaPanel tetap
+- branch kerja adalah `main`; `origin/main` masih di `76ff0b7` sebelum rangkaian
+  migrasi Vue lokal. Periksa `git status` dan `git log` sebelum menganggap
+  perubahan sudah dipush atau dideploy;
+- semua 17 route Web sudah memakai Vue 3, TypeScript, Vite, dan Vue Router dalam
+  static SPA. Route memuat halaman secara lazy. API gateway, login, cookie,
+  CSRF, dan kontrak endpoint tetap menjadi jalur data. Tidak ada Node runtime
+  atau container Web produksi; bundle static tetap diletakkan di
   `/www/wwwroot/ui.utama.naufix.space`;
-- Quick Mode sudah memiliki staging/recovery, retry dengan stage/job ID yang
-  stabil, dua clone `.tdl`, manifest `quickmode.json`, `worker.log`,
-  thumbnail, compress, upload Telegram dan rclone Google Drive;
-- telemetry worker sudah diperbaiki untuk retry dengan job ID stabil: backend
-  meneruskan `event_sequence_start`, worker melanjutkan sequence, event worker
-  mencatat send/delivered/ignored/failed, dan heartbeat berjalan berkala;
-- snapshot log dikembalikan newest-first, progress berulang diringkas per
-  transfer, timestamp memakai timezone Asia/Jakarta, serta command milestone
-  mencatat command tersanitasi dan tail output;
-- crosscheck Quick Mode sekarang berjalan untuk fase `uploading` maupun
-  `cleanup` yang tidak aktif. Verifikasi Telegram mempercayai
-  `channel_message_id` dari manifest; verifikasi Google Drive memakai
-  `rclone check` dengan fallback inventory `rclone lsjson` untuk duplicate
-  filename. Kegagalan crosscheck mempertahankan staging;
-- command verifikasi sekarang ikut ditulis ke `worker.log`. Jangan menghapus
-  staging hanya karena job backend terminal; hapus hanya setelah seluruh file
-  Telegram dan archive Google Drive terverifikasi;
-- verifikasi source terakhir: 281 unittest Python lulus, compileall lulus,
-  test backend/rclone terkait lulus, `graphify update .` berhasil, dan
-  `git diff --check` bersih sebelum perubahan dokumen ini. Verifikasi Web
-  terakhir yang diketahui: `pnpm check` tanpa error/warning, test frontend
-  lulus, dan `pnpm build` sukses;
-- build Docker/Go produksi belum dijalankan pada handoff ini. Jika task
-  menyentuh image, gunakan builder lokal yang memiliki base image
-  `tme3bot-base:py310-tdl0203`; jangan build di VPS 1 GB.
-
-### Catatan diagnosis produksi terakhir
-
-- Binary lokal yang sudah diverifikasi: `C:\tdl\tdl.exe` versi `0.20.4` dan
-  `D:\Downloads\Compressed\rclone-v1.75.1-windows-amd64\rclone.exe` versi
-  `v1.75.1`. Config rclone lokal berada di
-  `C:\Users\Admin\.config\rclone\rclone.conf`; jangan menampilkan isinya.
-- Pemeriksaan langsung channel `1588718424` berhasil. Message ID `442` dan
-  `443` adalah archive `.7z.001`/`.7z.002`, sedangkan ID `444` adalah thumbnail
-  photo yang oleh TDL direpresentasikan sebagai nama JPG yang dibuat Telegram.
-  Ini menjelaskan mengapa pencocokan lama melaporkan Telegram `2/3` walaupun
-  thumbnail benar-benar ada.
-- Pemeriksaan langsung Google Drive menemukan archive dengan ukuran yang
-  sesuai di `googledrive:backup/quickmode`. Nama export memakai tanggal sumber
-  (`20260921`), jadi tanggal nama file bukan bukti bahwa upload hari ini gagal.
-  `rclone copyto` juga dapat mempertahankan modtime object lama ketika object
-  yang sama ditulis ulang.
-- Setelah deploy commit `853faab`, buka Quick Mode Manager dan lakukan
-  `Refresh scan`. Hasil yang diharapkan untuk stage terkait adalah Telegram
-  `3/3`, Google Drive `2/2`, kemudian staging dihapus. Jika belum, baca
-  `/workspace/quickmode/<stage_job_id>/worker.log` dan
-  `/workspace/quickmode/<stage_job_id>/quickmode.json` di worker; jangan
-  mencetak credential, password, atau isi sesi `.tdl`.
+- workflow CI menjalankan pemeriksaan TypeScript, tes komponen Vue, build SPA,
+  lalu Playwright pada static bundle dengan API palsu lokal. E2E tersebut tidak
+  mengakses production dan tidak memakai credential production;
+- verifikasi lokal terakhir: 177 tes Web lulus, `pnpm check` dan `pnpm build`
+  lulus, entry JavaScript build 134.72 kB (51.35 kB gzip), dua tes static
+  browser E2E lulus, compile Python lulus, dan 1180 tes Python lulus dengan 11
+  tes terlewati secara eksplisit;
+- handoff ini tidak melakukan push atau deploy. Deploy static hanya dilakukan
+  setelah bundle dipush dan CI selesai, menggunakan prosedur Web pada bagian
+  Operasional di bawah;
+- build Docker/Go produksi tidak dijalankan. Jika task menyentuh image, gunakan
+  builder lokal yang memiliki base image `tme3bot-base:py310-tdl0203`; jangan
+  build di VPS 1 GB.
 
 ### Langkah operasional berikutnya
 
@@ -77,8 +43,7 @@ Diperbarui 2026-09-24 (Asia/Jakarta). Pada saat handoff:
   `git pull --ff-only origin main` lalu `python3 run.py deploy gateway --pull`.
   Pada worker remote jalankan `git pull --ff-only origin main` lalu
   `python3 run.py deploy worker --pull`.
-- Perubahan terakhir hanya backend/worker; static Web tidak perlu dipublish
-  ulang kecuali ada perubahan di `web/`.
+- Perubahan Web perlu melalui CI sebelum static bundle dipublish.
 - Jika source diubah lagi, jalankan minimal compileall, unittest terkait,
   `git diff --check`, dan `graphify update .`; untuk perubahan Web tambahkan
   `cd web && pnpm check && pnpm test && pnpm build`.

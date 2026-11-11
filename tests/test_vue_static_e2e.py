@@ -232,7 +232,7 @@ class VueStaticBundleE2ETests(unittest.TestCase):
             mobile_nav = page.get_by_role("dialog", name="Navigasi mobile")
             mobile_nav.get_by_role("link", name="Download").click()
             page.locator(".page-content main h1").filter(has_text="Download manager").wait_for(state="visible")
-            self.assertFalse(mobile_nav.is_visible())
+            mobile_nav.wait_for(state="hidden")
 
             self.assertEqual(external_requests, [], "The static E2E must never request any non-local origin")
             self.assertEqual(runtime_errors, [], "Vue routes must not produce uncaught browser errors")

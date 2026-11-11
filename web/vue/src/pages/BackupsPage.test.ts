@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/vue';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import BackupsPage from './BackupsPage.vue';
 
@@ -49,20 +49,38 @@ describe('BackupsPage', () => {
     await waitFor(() => expect(mocks.post).toHaveBeenCalledWith('/backups'));
     expect(await screen.findByText('Backup gateway mulai dijalankan.')).toBeTruthy();
     await fireEvent.click(screen.getByText('Ubah pengaturan backup dan operasi'));
-    await fireEvent.change(screen.getByLabelText('Zona waktu'), { target: { value: 'UTC' } });
+    await fireEvent.update(screen.getByLabelText('Zona waktu'), 'UTC');
     await fireEvent.click(screen.getByRole('button', { name: 'Simpan pengaturan' }));
     await waitFor(() => expect(mocks.put).toHaveBeenCalledWith('/backups/settings', expect.objectContaining({ timezone: 'UTC', retention: 7 })));
     expect(screen.queryByLabelText(/password/i)).toBeNull();
-    expect(screen.getByText('full-run-id-for-test')).toBeTruthy();
+    expect(screen.getAllByText('full-run-id-for-test').length).toBeGreaterThan(0);
+  });
+
+  it('renders worker backup history as mobile cards with status, timestamps, and error details', async () => {
+    mocks.api.mockImplementation(async (path: string) => {
+      if (path === '/backups/status') return { enabled: true, items: [{ run_id: 'mobile-run-id', node_name: 'remote-2', status: 'failed', started_at: '2026-11-10T12:00:00Z', completed_at: '2026-11-10T12:05:00Z', error: 'Backup upload failed' }] };
+      if (path === '/workers') return { items: [] };
+      if (path === '/profiles/local') return { profiles: [] };
+      throw new Error(`Unexpected API request ${path}`);
+    });
+
+    renderPage();
+    const card = await screen.findByTestId('backup-run-card');
+    expect(within(card).getByText('remote-2')).toBeTruthy();
+    expect(within(card).getByText('mobile-run-id')).toBeTruthy();
+    expect(within(card).getByText('failed')).toBeTruthy();
+    expect(within(card).getByText('Backup upload failed')).toBeTruthy();
+    expect(within(card).getAllByText(/2026/)).toHaveLength(2);
   });
 
   it('requests the selected worker and profile for TDL diagnosis and exposes structured results', async () => {
     renderPage();
     const worker = await screen.findByRole('combobox', { name: 'Worker' });
-    await fireEvent.change(worker, { target: { value: 'remote-2' } });
+    await screen.findByRole('option', { name: 'remote-2' });
+    await fireEvent.update(worker, 'remote-2');
     const profile = screen.getByRole('combobox', { name: 'Profil' });
-    expect([...((profile as HTMLSelectElement).options)].map((option) => option.value)).toEqual(['', 'default', 'remote-only']);
-    await fireEvent.change(profile, { target: { value: 'default' } });
+    await waitFor(() => expect([...((profile as HTMLSelectElement).options)].map((option) => option.value)).toEqual(['', 'default', 'remote-only']));
+    await fireEvent.update(profile, 'default');
     await fireEvent.click(screen.getByRole('button', { name: 'Buat JSON diagnosis' }));
     expect(await screen.findByText('remote-2 / default · Ada sesi yang gagal')).toBeTruthy();
     expect(mocks.post).toHaveBeenCalledWith('/backups/tdl-diagnostics', { worker: 'remote-2', profile: 'default' });
@@ -74,21 +92,23 @@ describe('BackupsPage', () => {
 
   it('submits the selected backup run and renders verification progress and report details', async () => {
     renderPage();
-    await fireEvent.change(await screen.findByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
-    await fireEvent.change(screen.getByRole('combobox', { name: 'Profil' }), { target: { value: 'default' } });
-    expect((await screen.findByRole('combobox', { name: 'Run backup lengkap untuk remote-2' }) as HTMLSelectElement).value).toBe('full-run-id-for-test');
+    const worker = await screen.findByRole('combobox', { name: 'Worker' });
+    await screen.findByRole('option', { name: 'remote-2' });
+    await fireEvent.update(worker, 'remote-2');
+    await fireEvent.update(screen.getByRole('combobox', { name: 'Profil' }), 'default');
+    expect((await screen.findByRole('combobox', { name: /Run backup lengkap/ }) as HTMLSelectElement).value).toBe('full-run-id-for-test');
     await fireEvent.click(screen.getByRole('button', { name: 'Unduh dari channel & uji sesi' }));
     const submit = mocks.calls.find(({ path, init }) => path === '/backups/verify' && init?.method === 'POST');
     expect(JSON.parse(String(submit?.init?.body))).toEqual({ worker: 'remote-2', profile: 'default', run_id: 'full-run-id-for-test' });
     expect(new Headers(submit?.init?.headers).get('Idempotency-Key')).toBeTruthy();
-    expect(await screen.findByText('Job verifikasi · remote-2 / default')).toBeTruthy();
+    expect(screen.getAllByTestId('backup-job-monitor').some((item) => item.textContent?.includes('Job verifikasi arsip backup · backup_verify · history'))).toBe(true);
     await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
     expect(await screen.findByText('Sesi TDL lolos; bukti siap ditinjau untuk canary.')).toBeTruthy();
     expect(screen.getByText('Sesi Download · TDL lolos')).toBeTruthy();
     expect(screen.getByText('Sesi Export · TDL lolos')).toBeTruthy();
     await fireEvent.click(screen.getByText('Lihat part dan message ID yang diunduh'));
     expect(screen.getByText('733')).toBeTruthy();
-    expect(screen.getByTestId('backup-job-monitor').textContent).toContain('backup_verify · history');
+    expect(screen.getAllByTestId('backup-job-monitor').some((item) => item.textContent?.includes('backup_verify · history'))).toBe(true);
   });
 
   it('distinguishes a succeeded job with a failed archive report', async () => {
@@ -103,10 +123,10 @@ describe('BackupsPage', () => {
     });
     renderPage();
     await waitFor(() => expect((screen.getByRole('combobox', { name: 'Worker' }) as HTMLSelectElement).value).toBe('remote-2'));
-    await waitFor(() => expect((screen.getByRole('combobox', { name: 'Run backup lengkap untuk remote-2' }) as HTMLSelectElement).value).toBe('full-run-id-for-test'));
+    await waitFor(() => expect((screen.getByRole('combobox', { name: /Run backup lengkap/ }) as HTMLSelectElement).value).toBe('full-run-id-for-test'));
     await fireEvent.click(await screen.findByRole('button', { name: 'Unduh dari channel & uji sesi' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Muat status' }));
     expect(await screen.findByText(/Job selesai dijalankan, tetapi ekstraksi atau pengujian isi gagal/)).toBeTruthy();
-    expect(screen.getByText(/BACKUP_ARCHIVE_EXTRACTION_FAILED/)).toBeTruthy();
+    expect(screen.getAllByText(/BACKUP_ARCHIVE_EXTRACTION_FAILED/).length).toBeGreaterThan(0);
   });
 });

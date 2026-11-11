@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render as vueRender, screen, waitFor } from '@testing-library/vue';
+import { cleanup, fireEvent, render as vueRender, screen, waitFor, within } from '@testing-library/vue';
 import type { Component } from 'vue';
 import ProfilesPage from './ProfilesPage.vue';
 
@@ -52,9 +52,10 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
 
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toMatch(/Worker local[\s\S]*Resolver Belum dipindai/);
-    expect(hierarchy.textContent).toMatch(/TorTTS Belum dipindai/);
-    expect(hierarchy.textContent).toMatch(/Quick Mode runtime Belum dipindai/);
+    const worker = within(hierarchy).getByRole('article', { name: 'Worker local' });
+    expect(within(worker).getByRole('status', { name: 'Resolver: Belum dipindai' })).toBeTruthy();
+    expect(within(worker).getByRole('status', { name: 'TorTTS: Belum dipindai' })).toBeTruthy();
+    expect(within(worker).getByRole('status', { name: 'Quick Mode runtime: Belum dipindai' })).toBeTruthy();
   });
 
   it('offers delete for a non-default profile directly in its worker group', async () => {
@@ -178,8 +179,13 @@ describe('ProfilesPage', () => {
     await waitFor(() => expect(progress.textContent).toMatch(/Scan selesai/), { timeout: 4000 });
 
     const hierarchy = screen.getByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toMatch(/Worker local[\s\S]*default[\s\S]*Export.*Siap/);
-    expect(hierarchy.textContent).toMatch(/Worker remote-1[\s\S]*Resolver Tidak siap[\s\S]*Profil irang[\s\S]*Export Tidak siap/);
+    const localWorker = within(hierarchy).getByRole('article', { name: 'Worker local' });
+    const remoteWorker = within(hierarchy).getByRole('article', { name: 'Worker remote-1' });
+    expect(within(localWorker).getByRole('region', { name: 'Profil default pada worker local' })).toBeTruthy();
+    expect(within(localWorker).getByRole('status', { name: 'Export default: Siap' })).toBeTruthy();
+    expect(within(remoteWorker).getByRole('status', { name: 'Resolver: Tidak siap' })).toBeTruthy();
+    expect(within(remoteWorker).getByRole('region', { name: 'Profil irang pada worker remote-1' })).toBeTruthy();
+    expect(within(remoteWorker).getByRole('status', { name: 'Export irang: Tidak siap' })).toBeTruthy();
   });
 
   it('scans only the selected worker and streams its raw log in a worker modal', async () => {
@@ -286,11 +292,12 @@ describe('ProfilesPage', () => {
     const scanButton = screen.getByRole('button', { name: 'Scan worker terpilih' });
     await waitFor(() => expect(scanButton.hasAttribute('disabled')).toBe(false));
     await fireEvent.click(scanButton);
-    await screen.findByText(/Scan worker local selesai/);
+    expect(await screen.findAllByText(/Scan worker local selesai/)).toHaveLength(1);
     await fireEvent.click(screen.getByRole('button', { name: 'Buka log realtime worker local' }));
 
     const dialog = await screen.findByRole('dialog', { name: 'Worker local' });
-    expect(await screen.findByText('process exited with code 1')).toBeTruthy();
+    expect(requests.some((url) => url.includes('worker-scan-done/logs?worker=local'))).toBe(true);
+    await waitFor(() => expect(dialog.textContent).toContain('process exited with code 1'));
     expect(dialog.textContent).toContain('exit 1');
     expect(requests.some((url) => url.includes('worker-scan-done/logs?worker=local'))).toBe(true);
   });
@@ -332,7 +339,7 @@ describe('ProfilesPage', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Buka log realtime worker local' }));
 
     const dialog = await screen.findByRole('dialog', { name: 'Worker local' });
-    expect(await screen.findByText('tdl exited with code 1')).toBeTruthy();
+    expect(await screen.findByText(/tdl exited with code 1/)).toBeTruthy();
     expect(dialog.textContent).toContain('exit 1');
   });
 
@@ -360,7 +367,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
 
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toContain('Resolver Tidak siap');
+    expect(within(hierarchy).getByRole('status', { name: 'Resolver: Tidak siap' })).toBeTruthy();
     expect(hierarchy.textContent).toContain('Addon Resolver tidak dapat digunakan pada worker.');
   });
 
@@ -437,8 +444,8 @@ describe('ProfilesPage', () => {
     expect(await screen.findByText('Resolver pada worker local: Siap.')).toBeTruthy();
     const logButton = screen.getByRole('button', { name: 'Lihat log uji Resolver worker local' });
     await fireEvent.click(logButton);
-    const dialog = screen.getByRole('dialog', { name: 'Log uji Resolver worker local' });
-    expect(dialog.textContent).toContain('runtime_probe');
+    const dialog = screen.getByRole('dialog', { name: 'Log uji Resolver · Worker local' });
+    expect(dialog.textContent).toContain('Memeriksa runtime dan profil');
     expect(dialog.textContent).toContain('2026');
     expect(dialog.textContent).toContain('Siap');
     expect(dialog.textContent).not.toContain('NEVER-SHOW-RAW-OUTPUT');
@@ -503,19 +510,14 @@ describe('ProfilesPage', () => {
     });
     const logButton = screen.getByRole('button', { name: 'Lihat log uji Storage profil default worker local' });
     await fireEvent.click(logButton);
-    const dialog = screen.getByRole('dialog', { name: 'Log uji Storage profil default worker local' });
-    expect(dialog.textContent).toContain('Profil default');
-    expect(dialog.textContent).toContain('storage_access_canary');
+    const dialog = screen.getByRole('dialog', { name: 'Log uji Storage · Profil default · Worker local' });
+    expect(dialog.textContent).toContain('Menguji akses Storage (export last 1)');
     expect(dialog.textContent).toContain('Upload');
     expect(dialog.textContent).toContain('Cleanup');
     expect(dialog.textContent).not.toContain('NEVER-SHOW-CANARY-OUTPUT');
     await fireEvent.click(screen.getByRole('button', { name: 'Tutup log uji' }));
-    await fireEvent.click(screen.getByRole('button', { name: 'Scan Quick Mode profil default worker local' }));
-    expect(requests).toContainEqual({
-      url: '/api/v1/profiles/local/scan/service',
-      method: 'POST',
-      body: JSON.stringify({ worker: 'local', profile: 'default', runtime: 'quick_mode' }),
-    });
+    expect(screen.queryByRole('button', { name: 'Scan Quick Mode profil default worker local' })).toBeNull();
+    expect(requests.some((request) => request.body?.includes('quick_mode'))).toBe(false);
   });
 
   it('shows worker-only rclone Storage readiness saved by Profile scan', async () => {
@@ -542,7 +544,7 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
 
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toContain('Storage rclone Siap');
+    expect(within(hierarchy).getByRole('status', { name: 'Storage rclone: Siap' })).toBeTruthy();
   });
 
   it('shows Quick Mode and Export readiness under their worker profile', async () => {
@@ -578,8 +580,9 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
 
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toMatch(/Profil default[\s\S]*Export Siap/);
-    expect(hierarchy.textContent).toMatch(/Quick Mode Tidak siap/);
+    const defaultProfile = within(within(hierarchy).getByRole('article', { name: 'Worker local' })).getByRole('region', { name: 'Profil default pada worker local' });
+    expect(within(defaultProfile).getByRole('status', { name: 'Export default: Siap' })).toBeTruthy();
+    expect(within(defaultProfile).getByRole('status', { name: 'Quick Mode default: Tidak siap' })).toBeTruthy();
     expect(hierarchy.textContent).toContain('Belum ada hasil command aktual untuk akses ini. Job tetap dapat dijalankan.');
   });
 
@@ -616,8 +619,11 @@ describe('ProfilesPage', () => {
     render(ProfilesPage);
 
     const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toMatch(/Profil default[\s\S]*Storage Siap/);
-    expect(hierarchy.textContent).toMatch(/Profil archive[\s\S]*Storage Tidak siap/);
+    const worker = within(hierarchy).getByRole('article', { name: 'Worker local' });
+    const defaultProfile = within(worker).getByRole('region', { name: 'Profil default pada worker local' });
+    const archiveProfile = within(worker).getByRole('region', { name: 'Profil archive pada worker local' });
+    expect(within(defaultProfile).getByRole('status', { name: 'Storage default: Siap' })).toBeTruthy();
+    expect(within(archiveProfile).getByRole('status', { name: 'Storage archive: Tidak siap' })).toBeTruthy();
     expect(hierarchy.textContent).toContain('Belum ada hasil command aktual untuk akses ini. Job tetap dapat dijalankan.');
   });
 
@@ -654,7 +660,7 @@ describe('ProfilesPage', () => {
     await fireEvent.input(await screen.findByRole('textbox', { name: 'Nama profil' }), { target: { value: 'new-profile' } });
     await fireEvent.change(provisioningWorker, { target: { value: 'local' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Login TDL' }));
-    await fireEvent.click(screen.getByRole('button', { name: 'Mulai login TDL' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Mulai login QR' }));
 
     expect(requests).toContainEqual({
       url: '/api/v1/profiles/provisionings/login',
@@ -702,13 +708,15 @@ describe('ProfilesPage', () => {
     await fireEvent.change(archiveInput!, {
       target: { files: [new File(['session'], 'profile.zip', { type: 'application/zip' })] }
     });
-    await fireEvent.click(screen.getByRole('button', { name: 'Validasi dan simpan lokal' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Validasi dan pasang profil' }));
 
     expect(requests).toContainEqual({
       url: '/api/v1/profiles/provisionings/upload?name=archive-profile&worker=local&local_only=true',
       method: 'POST'
     });
-    expect(await screen.findByText('Memasang sesi pada worker terpilih')).toBeTruthy();
+    const operation = await screen.findByRole('article', { name: 'Penambahan profil archive-profile' });
+    expect(operation.textContent).toContain('archive-profile · local');
+    expect(operation.textContent).toContain('distributing');
   });
 
   it('scans every worker without a selection and shows partial results from the saved catalog', async () => {
@@ -767,13 +775,13 @@ describe('ProfilesPage', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
 
-    expect(await screen.findByRole('region', { name: 'Status scan semua worker' })).toBeTruthy();
-    const statuses = screen.getByRole('region', { name: 'Status scan semua worker' }).textContent || '';
-    expect(statuses).toMatch(/local.*Gagal/);
-    expect(statuses).toMatch(/remote-2.*Berhasil/);
+    await waitFor(() => expect(document.body.textContent).toContain('Scan selesai: 1 worker berhasil, 1 gagal, 0 nonaktif.'));
+    expect(screen.getByRole('alert').textContent).toContain('Worker offline');
     const hierarchy = screen.getByRole('region', { name: 'Kesiapan per worker dan profil' });
-    expect(hierarchy.textContent).toMatch(/Worker local Gagal.*Worker offline/);
-    expect(hierarchy.textContent).toMatch(/Worker remote-2[\s\S]*Profil irang[\s\S]*TTS Tidak siap.*Belum ada hasil command aktual untuk akses ini\. Job tetap dapat dijalankan\./);
+    expect(hierarchy.textContent).toMatch(/Worker local[\s\S]*Gagal · Worker offline/);
+    const remoteWorker = within(hierarchy).getByRole('article', { name: 'Worker remote-2' });
+    expect(remoteWorker.textContent).toContain('Profil irang');
+    expect(within(remoteWorker).getByRole('status', { name: 'TTS irang: Tidak siap' })).toBeTruthy();
     expect(screen.queryByRole('region', { name: 'Kesiapan Utility per worker' })).toBeNull();
     expect(hierarchy.getAttribute('aria-label')).toBe('Kesiapan per worker dan profil');
     expect(requests).toContainEqual({ url: '/api/v1/profiles/local/scan', method: 'POST' });
@@ -781,16 +789,15 @@ describe('ProfilesPage', () => {
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-2' } });
 
     expect(await screen.findByText('irang')).toBeTruthy();
-    expect(screen.getByText(/Download.*Siap/)).toBeTruthy();
-    expect(screen.getByText(/future_session.*Siap/)).toBeTruthy();
+    expect(screen.getByText(/future session.*Siap/)).toBeTruthy();
     expect(screen.getByRole('region', { name: 'Lane Upload irang' }).textContent).toMatch(/Lane Upload.*Siap/s);
-    expect(screen.getByText(/Hasil scan.*remote-2/)).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Hasil scan profil lokal' }).textContent).toContain('remote-2');
     expect(screen.getByRole('status', { name: 'Kesiapan Export irang pada remote-2' }).textContent).toMatch(/runtime Export · Siap/);
     expect(await screen.findByRole('button', { name: 'Adopsi profil irang dari remote-2 ke Vault' })).toBeTruthy();
     expect(requests.some((item) => item.url === '/api/v1/workers/remote-2/profiles/scan')).toBe(false);
 
     await fireEvent.click(screen.getByRole('button', { name: 'Muat ulang worker' }));
-    expect(await screen.findByText(/katalog tetap memakai hasil Scan terakhir/i)).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Kesiapan per worker dan profil' })).toBeTruthy();
     expect(screen.getByText('irang')).toBeTruthy();
     expect(requests.filter((item) => item.url.endsWith('/profiles/local/scan') && item.method === 'POST')).toHaveLength(1);
   });
@@ -833,7 +840,7 @@ describe('ProfilesPage', () => {
     expect(requests).toContainEqual({
       url: '/api/v1/profiles/archive/adopt', method: 'POST', body: JSON.stringify({ worker: 'local' })
     });
-    expect(await screen.findByText('Bundle tersimpan di Vault; belum didistribusikan')).toBeTruthy();
+    await waitFor(() => expect(document.body.textContent).toContain('Profil archive tersimpan di Vault. Tidak ada worker lain yang diubah.'));
     expect(screen.queryByRole('button', { name: 'Adopsi profil archive dari local ke Vault' })).toBeNull();
     expect(requests.some((request) => /sync|distribut|install_profile_bundle/i.test(request.url))).toBe(false);
   });
@@ -867,7 +874,9 @@ describe('ProfilesPage', () => {
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'remote-1' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
 
-    expect((await screen.findByRole('region', { name: 'Status scan semua worker' })).textContent).toMatch(/remote-1.*Gagal/);
+    expect((await screen.findByRole('alert')).textContent).toContain('Worker offline');
+    const hierarchy = await screen.findByRole('region', { name: 'Kesiapan per worker dan profil' });
+    expect(within(hierarchy).getByRole('article', { name: 'Worker remote-1' }).textContent).toContain('Gagal');
     expect(scans).toBe(1);
     await waitFor(() => {
       const scanButton = screen.getByRole('button', { name: 'Scan semua worker' });
@@ -880,6 +889,7 @@ describe('ProfilesPage', () => {
   });
 
   it('refreshes Upload progress only while its preparation is running', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
     const requests: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
@@ -923,15 +933,16 @@ describe('ProfilesPage', () => {
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
     const lane = await screen.findByRole('region', { name: 'Lane Upload default' });
-    expect(lane.textContent).toMatch(/70%/);
-    expect(lane.textContent).toMatch(/Memvalidasi sesi Upload/);
+    expect((within(lane).getByRole('progressbar', { name: 'Progress lane Upload default' }) as HTMLProgressElement).value).toBe(70);
+    expect(lane.textContent).toContain('validating_upload');
 
-    expect(await screen.findByText('Sesi Upload terpisah sudah tervalidasi dan cocok dengan identitas profil.', {}, { timeout: 3000 })).toBeTruthy();
-    expect(requests).toContain('GET /api/v1/workers/local/profiles/local');
+    await waitFor(() => expect(requests).toContain('GET /api/v1/workers/local/profiles/local'), { timeout: 3000 });
+    await waitFor(() => expect(lane.textContent).toContain('ready'));
     expect(requests.filter((request) => request.startsWith('GET /api/v1/workers/') && request.endsWith('/profiles/local'))).toHaveLength(1);
   });
 
   it('ignores a delayed progress response after selecting another worker', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
     const requests: string[] = [];
     let resolveOldWorkerStatus: ((response: Response) => void) | undefined;
     let finishOldWorkerRequest: (() => void) | undefined;
@@ -990,7 +1001,8 @@ describe('ProfilesPage', () => {
     vi.stubGlobal('setTimeout', setTimeoutMock);
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
-    expect((await screen.findByRole('region', { name: 'Lane Upload default' })).textContent).toMatch(/35%/);
+    const lane = await screen.findByRole('region', { name: 'Lane Upload default' });
+    expect((within(lane).getByRole('progressbar', { name: 'Progress lane Upload default' }) as HTMLProgressElement).value).toBe(35);
 
     runProgressRefresh?.();
     await oldWorkerRequestStarted;
@@ -1005,7 +1017,8 @@ describe('ProfilesPage', () => {
     await oldWorkerRequestFinished;
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(screen.queryByRole('region', { name: 'Lane Upload default' })).toBeNull();
+    expect(screen.queryByRole('progressbar', { name: 'Progress lane Upload default' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Adopsi profil default dari remote-2 ke Vault' })).toBeNull();
     expect(screen.queryByText('Sesi Upload terpisah sudah tervalidasi dan cocok dengan identitas profil.')).toBeNull();
   });
 
@@ -1153,7 +1166,7 @@ describe('ProfilesPage', () => {
     await fireEvent.change(screen.getByRole('combobox', { name: 'Worker' }), { target: { value: 'local' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Scan semua worker' }));
 
-    expect(await screen.findByText('Menunggu worker online')).toBeTruthy();
+    expect(await screen.findByText(/Menunggu worker online/)).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Hapus profil archive dari local' }).hasAttribute('disabled')).toBe(true);
   });
 });

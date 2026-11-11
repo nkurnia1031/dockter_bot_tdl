@@ -6,6 +6,13 @@ const mocks = vi.hoisted(() => ({ api: vi.fn() }));
 vi.mock("../lib/api", () => ({ ...mocks, patch: vi.fn(), post: vi.fn(), put: vi.fn(), remove: vi.fn() }));
 
 describe("WorkspaceExplorer", () => {
+  const findSummary = (expected: string) => screen.findByText((_, element) => element?.textContent?.replace(/\s+/g, " ").trim() === expected);
+  const findFolderButton = async () => {
+    const summary = await findSummary("1 folder · 2 file");
+    const button = summary.closest("button.workspace-open");
+    if (!button) throw new Error("Folder media tidak memiliki tombol buka.");
+    return button;
+  };
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.api.mockImplementation(async (path: string) => {
@@ -22,8 +29,7 @@ describe("WorkspaceExplorer", () => {
       data: () => ({ selected: [] as string[] }),
     };
     render(Harness);
-    await screen.findByText("2 folder · 1 file");
-    await fireEvent.click(screen.getByRole("button", { name: "media" }));
+    await fireEvent.click(await findFolderButton());
     expect(await screen.findByText("/workspace/media")).toBeTruthy();
     await fireEvent.click(screen.getByRole("button", { name: "Folder induk" }));
     await waitFor(() => expect(screen.getByText("/workspace")).toBeTruthy());
@@ -37,7 +43,7 @@ describe("WorkspaceExplorer", () => {
       data: () => ({ selected: ["/workspace/old"], worker: "remote-1" }),
     };
     render(Harness);
-    await screen.findByText("2 folder · 1 file");
+    await findFolderButton();
     await fireEvent.click(screen.getByRole("button", { name: "Ganti worker" }));
     await waitFor(() => expect(screen.getByText("/workspace")).toBeTruthy());
     expect(screen.queryByText("/workspace/old ×")).toBeNull();

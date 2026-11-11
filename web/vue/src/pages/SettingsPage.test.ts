@@ -81,7 +81,7 @@ describe("SettingsPage", () => {
   it("saves ordinary settings through their existing endpoint", async () => {
     render(SettingsPage);
     await screen.findByText("Batas move");
-    await fireEvent.input(screen.getByLabelText("Nilai baru"), {
+    await fireEvent.input(screen.getAllByLabelText("Nilai baru")[0], {
       target: { value: "12GB" },
     });
     await fireEvent.click(screen.getAllByRole("button", { name: "Simpan" })[0]);

@@ -91,7 +91,6 @@ describe('QuickModePage', () => {
 
   it('shows manual stats and limit refresh controls with per-worker limit updates', async () => {
     renderPage();
-    await screen.findByText('local');
     const limit = await screen.findByLabelText('Maksimum aktif') as HTMLInputElement;
     await fireEvent.input(limit, { target: { value: '4' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Simpan' }));

@@ -2,7 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { api, patch, post } from "../lib/api";
 import { formatBytes, formatDate } from "../../../src/lib/presentation";
-import { session } from "../session";
+import { session, sessionActions } from "../session";
 import WorkspaceExplorer from "../components/WorkspaceExplorer.vue";
 import JobMonitor from "../components/JobMonitor.vue";
 
@@ -210,6 +210,8 @@ function setProvider(next: "telegram" | "rclone") {
 }
 function openFolder(id: number | null) { folderId.value = id; scope.value = "current"; clearTelegramSelection(); void loadTelegram(); }
 function chooseScope(next: typeof scope.value) { scope.value = next; folderId.value = null; clearTelegramSelection(); void loadTelegram(); }
+function persistSort() { localStorage.setItem("storage-sort", sort.value); }
+function persistView() { localStorage.setItem("storage-view", view.value); }
 function openRemote(path: string) { remotePath.value = path; remoteView.value = "active"; remoteOffset.value = 0; remoteTarget.value = path; remoteTargetSelected.value = true; clearRemoteSelection(); void loadRemote(true); }
 function toggleItem(id: number) { selectedItems.value = selectedItems.value.includes(id) ? selectedItems.value.filter((value) => value !== id) : [...selectedItems.value, id]; }
 function toggleFolder(id: number) { selectedFolders.value = selectedFolders.value.includes(id) ? selectedFolders.value.filter((value) => value !== id) : [...selectedFolders.value, id]; }
@@ -370,7 +372,7 @@ async function refreshScan() {
         const result = await api<{ profiles?: ReadinessProfile[] }>(`/tdl-access/verification?purpose=storage&worker=${encodeURIComponent(worker.value)}`);
         scanProfiles.value = result.profiles || [];
         scanMessage.value = `Pemeriksaan selesai: ${scanProfiles.value.filter((item) => item.ready).length}/${scanProfiles.value.length} profil dapat mengirim ke Storage.`;
-        void session.refreshProfileCatalog();
+        void sessionActions.refreshProfileCatalog();
         void loadReadiness(worker.value);
       } else scanError.value = operation.error?.message || `Pemeriksaan berakhir dengan status ${operation.status}.`;
       return;
@@ -495,7 +497,7 @@ onUnmounted(() => { if (scanTimer) clearTimeout(scanTimer); if (jobFinishedHandl
 
     <section v-if="provider === 'telegram'" class="panel browser-panel" aria-label="Browser Telegram Storage">
       <header class="storage-toolbar"><div class="scope-tabs" aria-label="Lokasi katalog"><button v-for="item in [['current','My Drive'],['global','All Files'],['recent','Recent'],['trash','Recycle Bin']] as const" :key="item[0]" :aria-pressed="scope === item[0]" :class="{ active: scope === item[0] }" @click="chooseScope(item[0])">{{ item[1] }}</button></div><div class="toolbar-actions"><button v-if="scope !== 'trash'" class="button button-secondary button-small" @click="createOpen = true">Folder baru</button><button v-if="scope !== 'trash'" class="button button-primary button-small" :disabled="!enabledWorker" @click="openUpload">Upload</button><button class="button button-secondary button-small" :disabled="loading" @click="loadTelegram">{{ loading ? "Memuat…" : "Refresh" }}</button></div></header>
-      <div class="browser-controls"><div class="breadcrumbs"><button @click="openFolder(null)">Drive</button><template v-for="crumb in browser.breadcrumbs" :key="crumb.id"><span>›</span><button @click="openFolder(crumb.id)">{{ crumb.name }}</button></template><strong>{{ currentFolderName }}</strong></div><label class="search-field"><span class="sr-only">Cari file atau folder</span><input v-model="query" class="field" placeholder="Cari file atau folder" @keydown.enter="loadTelegram" /></label><select v-model="sort" class="field compact" aria-label="Urutkan Storage" @change="localStorage.setItem('storage-sort', sort); loadTelegram()"><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select><button class="button button-secondary button-small" @click="order = order === 'asc' ? 'desc' : 'asc'; loadTelegram()">{{ order === "asc" ? "A–Z" : "Z–A" }}</button><button class="button button-secondary button-small" aria-label="Tampilan daftar" :aria-pressed="view === 'list'" @click="view = 'list'; localStorage.setItem('storage-view', view)">Daftar</button><button class="button button-secondary button-small" aria-label="Tampilan grid" :aria-pressed="view === 'grid'" @click="view = 'grid'; localStorage.setItem('storage-view', view)">Grid</button></div>
+      <div class="browser-controls"><div class="breadcrumbs"><button @click="openFolder(null)">Drive</button><template v-for="crumb in browser.breadcrumbs" :key="crumb.id"><span>›</span><button @click="openFolder(crumb.id)">{{ crumb.name }}</button></template><strong>{{ currentFolderName }}</strong></div><label class="search-field"><span class="sr-only">Cari file atau folder</span><input v-model="query" class="field" placeholder="Cari file atau folder" @keydown.enter="loadTelegram" /></label><select v-model="sort" class="field compact" aria-label="Urutkan Storage" @change="persistSort(); loadTelegram()"><option value="name">Nama</option><option value="updated_at">Terbaru</option><option value="size">Ukuran</option><option value="type">Tipe</option></select><button class="button button-secondary button-small" @click="order = order === 'asc' ? 'desc' : 'asc'; loadTelegram()">{{ order === "asc" ? "A–Z" : "Z–A" }}</button><button class="button button-secondary button-small" aria-label="Tampilan daftar" :aria-pressed="view === 'list'" @click="view = 'list'; persistView()">Daftar</button><button class="button button-secondary button-small" aria-label="Tampilan grid" :aria-pressed="view === 'grid'" @click="view = 'grid'; persistView()">Grid</button></div>
       <div v-if="activeSelectionCount || (scope === 'trash' && (browser.items.length || browser.folders.length))" class="selection-toolbar">
         <strong>{{ activeSelectionCount }} dipilih</strong>
         <button class="button button-secondary button-small" @click="selectAll">Pilih semua</button>

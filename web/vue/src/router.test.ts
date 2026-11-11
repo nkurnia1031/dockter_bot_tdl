@@ -11,6 +11,12 @@ import DecryptPage from './pages/DecryptPage.vue';
 import UtilityPage from './pages/UtilityPage.vue';
 import BackupsPage from './pages/BackupsPage.vue';
 
+async function resolveRoutePage(path: string) {
+  const component = routeDefinitions.find((route) => route.path === path)?.component;
+  if (!component) throw new Error(`Missing route ${path}`);
+  return (await component()).default;
+}
+
 describe('Vue route map', () => {
   it('registers every existing static URL, including the nested Vault page', () => {
     expect(routeDefinitions.map(({ path }) => path)).toEqual([
@@ -27,31 +33,31 @@ describe('Vue route map', () => {
     );
   });
 
-  it('mounts the Vue Download Manager instead of the migration placeholder', () => {
-    expect(routeDefinitions.find(({ path }) => path === '/downloads/')?.component).toBe(DownloadsPage);
+  it('lazy-loads the Vue Download Manager instead of the migration placeholder', async () => {
+    expect(await resolveRoutePage('/downloads/')).toBe(DownloadsPage);
   });
 
-  it('mounts the Vue AriaNg page instead of the migration placeholder', () => {
-    expect(routeDefinitions.find(({ path }) => path === '/aria2/')?.component).toBe(Aria2Page);
+  it('lazy-loads the Vue AriaNg page instead of the migration placeholder', async () => {
+    expect(await resolveRoutePage('/aria2/')).toBe(Aria2Page);
   });
 
-  it('mounts the Vue Chat Send page instead of the migration placeholder', () => {
-    expect(routeDefinitions.find(({ path }) => path === '/chat-send/')?.component).toBe(ChatSendPage);
+  it('lazy-loads the Vue Chat Send page instead of the migration placeholder', async () => {
+    expect(await resolveRoutePage('/chat-send/')).toBe(ChatSendPage);
   });
 
-  it('mounts the Vue Export and TTS pages instead of migration placeholders', () => {
-    expect(routeDefinitions.find(({ path }) => path === '/exports/')?.component).toBe(ExportPage);
-    expect(routeDefinitions.find(({ path }) => path === '/tts/')?.component).toBe(TtsPage);
+  it('lazy-loads the Vue Export and TTS pages instead of migration placeholders', async () => {
+    expect(await resolveRoutePage('/exports/')).toBe(ExportPage);
+    expect(await resolveRoutePage('/tts/')).toBe(TtsPage);
   });
 
-  it('mounts the Vue Quick Mode page instead of the migration placeholder', () => {
-    expect(routeDefinitions.find(({ path }) => path === '/quick-mode/')?.component).toBe(QuickModePage);
+  it('lazy-loads the Vue Quick Mode page instead of the migration placeholder', async () => {
+    expect(await resolveRoutePage('/quick-mode/')).toBe(QuickModePage);
   });
 
-  it('mounts the Vue Decrypt, Utility, and Backup pages instead of migration placeholders', () => {
-    expect(routeDefinitions.find(({ path }) => path === '/decrypt/')?.component).toBe(DecryptPage);
-    expect(routeDefinitions.find(({ path }) => path === '/utility/')?.component).toBe(UtilityPage);
-    expect(routeDefinitions.find(({ path }) => path === '/backups/')?.component).toBe(BackupsPage);
+  it('lazy-loads Vue Decrypt, Utility, and Backup pages instead of migration placeholders', async () => {
+    expect(await resolveRoutePage('/decrypt/')).toBe(DecryptPage);
+    expect(await resolveRoutePage('/utility/')).toBe(UtilityPage);
+    expect(await resolveRoutePage('/backups/')).toBe(BackupsPage);
   });
 
   it('redirects slashless feature URLs to the existing trailing-slash form', async () => {
