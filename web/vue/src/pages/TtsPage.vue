@@ -112,6 +112,7 @@ async function submit() {
     const payload: { title: string; text: string; worker?: string } = { title: title.value.trim(), text: text.value.trim() };
     if (worker.value) payload.worker = worker.value;
     await post('/tts/jobs', payload);
+    window.dispatchEvent(new CustomEvent('tme3:data-mutated', { detail: { path: '/tts/jobs' } }));
     notice.value = 'Job TTS masuk antrean.';
     text.value = '';
   } catch (cause) {

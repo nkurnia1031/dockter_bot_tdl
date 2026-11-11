@@ -216,6 +216,7 @@ async function submit() {
   try {
     const response = await post<unknown>('/exports', payload);
     if (!isExportJob(response)) throw new Error('Respons export dari backend tidak valid.');
+    window.dispatchEvent(new CustomEvent('tme3:data-mutated', { detail: { path: '/exports' } }));
     remember(response);
     schedulePoll();
     exportCooldown.value = true;
