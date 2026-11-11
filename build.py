@@ -62,6 +62,7 @@ EXCLUDED_NAMES = {
     ".venv",
     "node_modules",
     ".next",
+    ".svelte-kit",
     "build",
     "test-results",
     "playwright-report",

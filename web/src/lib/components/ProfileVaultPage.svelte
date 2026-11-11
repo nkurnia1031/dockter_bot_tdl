@@ -1,0 +1,281 @@
+<script lang="ts">
+  import { onMount } from 'svelte';
+  import { api } from '$lib/api';
+  import { CircleAlert, RefreshCw, Send, ShieldCheck, Trash2 } from '@lucide/svelte';
+
+  type Worker = { name: string; enabled: boolean; online: boolean; secure: boolean };
+  type WorkerState = {
+    worker: string;
+    status: string;
+    error?: string;
+    desired_revision?: number | null;
+    installed_revision?: number | null;
+    updated_at?: string;
+  };
+  type Profile = { name: string; status: string; vault: boolean; desired_revision?: number; error?: string; workers: WorkerState[] };
+  type Management = { items: Profile[]; workers: Worker[] };
+  type DistributionWorker = {
+    worker: string; status: string; phase: string; reason_code: string;
+    archive_message_id?: number | null; updated_at: string;
+  };
+  type DistributionOperation = {
+    id: string; profile: string; revision: number; target_workers: string[];
+    status: string; created_at: string; updated_at: string; workers: DistributionWorker[];
+  };
+  type DistributionEvents = {
+    items: Array<{ id: number; worker: string; sequence: number | null; phase: string; status: string; code: string; created_at: string }>;
+    active: boolean; next_after_id: number;
+  };
+
+  let profiles = $state<Profile[]>([]);
+  let workers = $state<Worker[]>([]);
+  let loading = $state(false);
+  let failure = $state('');
+  let notice = $state('');
+  let checkedAt = $state('');
+  let deletingProfile = $state('');
+  let distributionBusy = $state('');
+  let distributionOperations = $state<Record<string, DistributionOperation[]>>({});
+  let distributionEvents = $state<Record<string, DistributionEvents>>({});
+
+  const statusLabel = (status: string) => ({
+    ready: 'Tersimpan pada worker', stored: 'Tersimpan di Vault', queued: 'Dalam antrean', running: 'Berjalan', waiting: 'Menunggu worker', waiting_worker: 'Menunggu worker',
+    active: 'Aktif di Vault',
+    succeeded: 'Selesai', cancelled: 'Dibatalkan',
+    not_assigned: 'Belum ditugaskan', worker_unavailable: 'Worker tidak terjangkau', worker_update_required: 'Perlu diperbarui',
+    failed: 'Gagal', unavailable: 'Tidak tersedia'
+  } as Record<string, string>)[status] || status || 'Belum diperiksa';
+  const phaseLabel = (phase: string) => ({
+    queued: 'Antrean', archive_upload: 'Unggah arsip terenkripsi', archive_download: 'Unduh arsip dari channel', bundle_validation: 'Validasi bundle',
+    session_validation: 'Validasi sesi', session_install: 'Pasang sesi', session_commit: 'Simpan sesi',
+    download_staging: 'Siapkan lane Download', download_validation: 'Validasi lane Download', download_install: 'Pasang lane Download',
+    export_staging: 'Siapkan lane Export', export_validation: 'Validasi lane Export', export_install: 'Pasang lane Export',
+    upload_staging: 'Salin lane Upload', upload_validation: 'Validasi lane Upload', upload_install: 'Pasang lane Upload',
+    identity_install: 'Pasang metadata identitas', transaction_rollback: 'Pulihkan seluruh lane',
+    installation_reused: 'Pemasangan sudah tercatat',
+    worker_unreachable: 'Worker tidak terjangkau',
+    worker_dispatch: 'Kirim perintah ke worker', completed: 'Selesai', cancelled: 'Dibatalkan', failed: 'Gagal'
+  } as Record<string, string>)[phase] || phase;
+  async function loadDistributionOperations() {
+    const vaulted = profiles.filter((profile) => profile.vault);
+    await Promise.all(vaulted.map(async (profile) => {
+      try {
+        const result = await api<{ items: DistributionOperation[] }>(`/profiles/${encodeURIComponent(profile.name)}/distributions`);
+        const items = Array.isArray(result.items) ? result.items : [];
+        distributionOperations = { ...distributionOperations, [profile.name]: items };
+        await Promise.all(items.map(async (operation) => {
+          try {
+            const events = await api<DistributionEvents>(`/profile-distributions/${encodeURIComponent(operation.id)}/events?limit=100`);
+            distributionEvents = { ...distributionEvents, [operation.id]: events };
+          } catch {
+            distributionEvents = { ...distributionEvents, [operation.id]: { items: [], active: false, next_after_id: 0 } };
+          }
+        }));
+      } catch {
+        distributionOperations = { ...distributionOperations, [profile.name]: [] };
+      }
+    }));
+  }
+
+  function idempotencyKey() {
+    return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `profile-distribution-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+
+  async function distribute(profile: Profile) {
+    if (distributionBusy) return;
+    distributionBusy = profile.name;
+    failure = '';
+    notice = '';
+    try {
+      const operation = await api<DistributionOperation>(`/profiles/${encodeURIComponent(profile.name)}/distributions`, {
+        method: 'POST', headers: { 'Idempotency-Key': idempotencyKey() }
+      });
+      notice = `Distribusi ${profile.name} revision ${operation.revision} masuk antrean (${operation.id}).`;
+      await loadDistributionOperations();
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Distribusi ${profile.name} gagal dimulai.`;
+    } finally {
+      distributionBusy = '';
+    }
+  }
+
+  async function retryDistribution(operation: DistributionOperation, worker: string) {
+    const key = `${operation.id}:${worker}`;
+    if (distributionBusy) return;
+    distributionBusy = key;
+    failure = '';
+    notice = '';
+    try {
+      await api(`/profile-distributions/${encodeURIComponent(operation.id)}/workers/${encodeURIComponent(worker)}/retry`, {
+        method: 'POST', headers: { 'Idempotency-Key': idempotencyKey() }
+      });
+      notice = `Retry ${worker} masuk antrean pada revision ${operation.revision}.`;
+      await loadDistributionOperations();
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Retry ${worker} gagal dimulai.`;
+    } finally {
+      distributionBusy = '';
+    }
+  }
+
+  async function load() {
+    loading = true;
+    failure = '';
+    try {
+      const result = await api<Management>('/profiles/management');
+      profiles = Array.isArray(result.items) ? result.items : [];
+      workers = Array.isArray(result.workers) ? result.workers : [];
+      checkedAt = new Date().toLocaleString();
+      await loadDistributionOperations();
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : 'Status Vault gagal dimuat.';
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function deleteBundle(profile: Profile) {
+    if (deletingProfile) return;
+    if (typeof window !== 'undefined' && !window.confirm(`Hapus bundle terenkripsi "${profile.name}" dari Vault? Sesi pada worker lokal tidak akan dihapus atau diubah.`)) return;
+    deletingProfile = profile.name;
+    failure = '';
+    notice = '';
+    try {
+      await api(`/profiles/${encodeURIComponent(profile.name)}/vault`, { method: 'DELETE' });
+      profiles = profiles.map((item) => item.name === profile.name
+        ? { ...item, vault: false, status: 'legacy', workers: [], error: undefined }
+        : item);
+      notice = `Bundle ${profile.name} dihapus dari Vault. Sesi worker lokal tetap utuh.`;
+    } catch (cause) {
+      failure = cause instanceof Error ? cause.message : `Bundle ${profile.name} gagal dihapus dari Vault.`;
+    } finally {
+      deletingProfile = '';
+    }
+  }
+
+  onMount(() => {
+    void load();
+    const timer = window.setInterval(() => {
+      if (Object.values(distributionOperations).flat().some((operation) => ['queued', 'running', 'waiting'].includes(operation.status))) {
+        void loadDistributionOperations();
+      }
+    }, 3000);
+    return () => window.clearInterval(timer);
+  });
+</script>
+
+<svelte:head><title>Vault profil · tme3</title></svelte:head>
+
+<header class="flex flex-wrap items-end justify-between gap-4">
+  <div>
+    <p class="eyebrow">PROFIL BERSAMA</p>
+    <h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Vault profil</h1>
+    <p class="muted mt-2">Simpan profil aktif di satu tempat dan distribusikan salinannya ke worker.</p>
+  </div>
+  <div class="flex items-center gap-2">
+    <a class="button secondary" href="/profiles/">Profil lokal</a>
+    <button class="button secondary" onclick={load} disabled={loading} aria-label="Muat ulang status Vault">
+      <RefreshCw size={16}/>{loading ? 'Memeriksa...' : 'Muat ulang'}
+    </button>
+  </div>
+</header>
+
+{#if failure}
+  <div class="mt-5 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-100" role="alert">
+    <CircleAlert size={17} class="mt-0.5 shrink-0"/>{failure}
+  </div>
+{/if}
+{#if notice}
+  <p class="mt-5 text-sm text-violet-700 dark:text-violet-200" role="status">{notice}</p>
+{/if}
+
+<section class="card mt-6 p-5 sm:p-6" aria-label="Status Vault">
+  <div class="flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h2 class="font-extrabold">Profil dan distribusi worker</h2>
+      <p class="muted mt-1 text-sm">Profil aktif setelah disimpan. Status pemasangan di worker hanya informasi dan tidak menahan job.</p>
+    </div>
+    {#if checkedAt}<p class="muted text-xs">Diperiksa {checkedAt}</p>{/if}
+  </div>
+
+  {#if loading && profiles.length === 0}
+    <p class="muted mt-5">Memuat status Vault...</p>
+  {:else}
+    {@const vaultedProfiles = profiles.filter((profile) => profile.vault)}
+    {#if vaultedProfiles.length === 0}
+      <p class="muted mt-5 rounded-xl border border-dashed border-[var(--line)] p-5 text-center">Belum ada profil yang tersimpan di Vault.</p>
+    {:else}
+      <div class="mt-5 space-y-4">
+        {#each vaultedProfiles as profile (profile.name)}
+          <article class="rounded-2xl border border-[var(--line)] bg-[var(--panel-strong)] p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <h3 class="font-extrabold">{profile.name}</h3>
+              <div class="flex items-center gap-2">
+                <span class="badge">{statusLabel(profile.status)}</span>
+                {#if profile.desired_revision && workers.length > 0}
+                  <button class="button" onclick={() => distribute(profile)} disabled={Boolean(distributionBusy)} aria-label={`Distribusikan ${profile.name} revision ${profile.desired_revision} ke semua worker`}>
+                    <Send size={15}/>{distributionBusy === profile.name ? 'Mengantrikan...' : `Distribusikan r${profile.desired_revision}`}
+                  </button>
+                {/if}
+                <button class="button secondary" onclick={() => deleteBundle(profile)} disabled={Boolean(deletingProfile)} aria-label={`Hapus bundle ${profile.name} dari Vault`}>
+                  <Trash2 size={15}/>{deletingProfile === profile.name ? 'Menghapus...' : 'Hapus dari Vault'}
+                </button>
+              </div>
+            </div>
+            {#if profile.error}<p class="mt-2 text-sm text-rose-600">{profile.error}</p>{/if}
+            {#each (distributionOperations[profile.name] || []).slice(0, 3) as operation (operation.id)}
+              {@const operationEvents = distributionEvents[operation.id]}
+              <section class="mt-4 rounded-xl border border-violet-200 bg-violet-50/60 p-3 dark:border-violet-900 dark:bg-violet-950/30" aria-label={`Operasi distribusi ${profile.name} revision ${operation.revision}`}>
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div><b class="text-sm">Distribusi revision {operation.revision}</b><p class="muted mt-1 text-xs">ID {operation.id} · snapshot: {operation.target_workers.join(', ')}</p></div>
+                  <span class="badge">{statusLabel(operation.status)}</span>
+                </div>
+                <div class="mt-3 grid gap-2 lg:grid-cols-2">
+                  {#each operation.workers as target (target.worker)}
+                    {@const targetEvents = (operationEvents?.items || []).filter((event) => event.worker === target.worker).slice(-5).reverse()}
+                    <div class="rounded-lg border border-[var(--line)] bg-[var(--panel)] p-3">
+                      <div class="flex flex-wrap items-center justify-between gap-2"><b class="text-sm">{target.worker}</b><span class="text-xs font-bold">{statusLabel(target.status)} · {phaseLabel(target.phase)}</span></div>
+                      {#if target.reason_code}<p class="mt-1 text-xs text-rose-600">{target.reason_code}</p>{/if}
+                      {#if target.status === 'failed'}
+                        <button class="button secondary mt-2" onclick={() => retryDistribution(operation, target.worker)} disabled={Boolean(distributionBusy)} aria-label={`Retry distribusi ${operation.id} pada ${target.worker}`}>
+                          <RefreshCw size={14}/>{distributionBusy === `${operation.id}:${target.worker}` ? 'Mengantrikan...' : 'Retry worker'}
+                        </button>
+                      {/if}
+                      {#if targetEvents.length}
+                        <ol class="mt-2 space-y-1 border-t border-[var(--line)] pt-2">
+                          {#each targetEvents as event (event.id)}
+                            <li class="flex items-start justify-between gap-2 text-xs"><span>{phaseLabel(event.phase)} · {statusLabel(event.status)}{#if event.code}<span class="muted"> ({event.code})</span>{/if}</span><time class="muted shrink-0">{new Date(event.created_at).toLocaleTimeString()}</time></li>
+                          {/each}
+                        </ol>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              </section>
+            {/each}
+            {#if profile.workers.length === 0 && !(distributionOperations[profile.name]?.length)}
+              <p class="muted mt-3 text-sm">Belum ada status distribusi worker untuk profil ini.</p>
+            {:else}
+              <div class="mt-3 grid gap-2 lg:grid-cols-2">
+                {#each profile.workers as item (`${profile.name}:${item.worker}`)}
+                  <div class="rounded-xl border border-[var(--line)] bg-[var(--panel)] p-3">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <b>{item.worker}</b>
+                      <span class="text-sm font-bold">{statusLabel(item.status)}</span>
+                    </div>
+                    <p class="muted mt-2 text-xs">Revision terpasang {item.installed_revision ?? '-'} dari {item.desired_revision ?? profile.desired_revision ?? '-'}{#if item.updated_at} · {new Date(item.updated_at).toLocaleString()}{/if}</p>
+                    {#if item.error}<p class="mt-2 text-sm text-rose-600">{item.error}</p>{/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </article>
+        {/each}
+      </div>
+    {/if}
+  {/if}
+
+  <p class="muted mt-5 flex items-start gap-2 text-xs"><ShieldCheck size={15} class="mt-0.5 shrink-0 text-emerald-600"/>Menghapus bundle hanya mengosongkan Vault; sesi pada worker lokal tetap ada. Status distribusi tidak menjadi gate job; worker menguji sesi melalui perintah yang dijalankan.</p>
+</section>

@@ -13,29 +13,22 @@ yang disetujui pengguna.
 ## Status handoff
 
 Diperbarui 2026-11-11 (UTC). Verifikasi awal setiap sesi tetap memakai `git status`,
-`git log`, dan source aktual. Pada pembaruan ini:
+`git log`, dan source aktual. Web kembali memakai SvelteKit 5 + Svelte 5 dengan
+adapter-static. Semua 17 route diprerender, `trailingSlash` disetel `always`,
+dan fallback `200.html` tetap tersedia untuk static host. API gateway, login,
+cookie, CSRF, dan kontrak endpoint tidak berubah. Tidak ada Node runtime atau
+container Web di production; bundle tetap berada di
+`/www/wwwroot/ui.utama.naufix.space`.
 
-- branch kerja adalah `main`; `origin/main` masih di `76ff0b7` sebelum rangkaian
-  migrasi Vue lokal. Periksa `git status` dan `git log` sebelum menganggap
-  perubahan sudah dipush atau dideploy;
-- semua 17 route Web sudah memakai Vue 3, TypeScript, Vite, dan Vue Router dalam
-  static SPA. Route memuat halaman secara lazy. API gateway, login, cookie,
-  CSRF, dan kontrak endpoint tetap menjadi jalur data. Tidak ada Node runtime
-  atau container Web produksi; bundle static tetap diletakkan di
-  `/www/wwwroot/ui.utama.naufix.space`;
-- workflow CI menjalankan pemeriksaan TypeScript, tes komponen Vue, build SPA,
-  lalu Playwright pada static bundle dengan API palsu lokal. E2E tersebut tidak
-  mengakses production dan tidak memakai credential production;
-- verifikasi lokal terakhir: 177 tes Web lulus, `pnpm check` dan `pnpm build`
-  lulus, entry JavaScript build 134.72 kB (51.35 kB gzip), dua tes static
-  browser E2E lulus, compile Python lulus, dan 1180 tes Python lulus dengan 11
-  tes terlewati secara eksplisit;
-- handoff ini tidak melakukan push atau deploy. Deploy static hanya dilakukan
-  setelah bundle dipush dan CI selesai, menggunakan prosedur Web pada bagian
-  Operasional di bawah;
-- build Docker/Go produksi tidak dijalankan. Jika task menyentuh image, gunakan
-  builder lokal yang memiliki base image `tme3bot-base:py310-tdl0203`; jangan
-  build di VPS 1 GB.
+GitHub Actions memakai `pnpm check`, `pnpm test`, dan `pnpm build` untuk Svelte,
+lalu mem-publish bundle static `web-latest`. Verifikasi rollback terakhir:
+`pnpm check` tanpa error/warning, 139 tes dari 29 file lulus, build static
+berhasil, seluruh 17 route memiliki entry langsung dan `200.html` tersedia;
+11 tes `tests.test_container` juga lulus. Deploy bundle memakai
+`python3 run.py deploy web` dari root gateway.
+
+Jika task menyentuh Docker image, gunakan builder lokal yang memiliki base
+image `tme3bot-base:py310-tdl0203`; jangan build di VPS 1 GB.
 
 ### Langkah operasional berikutnya
 
@@ -265,7 +258,7 @@ Profile default memakai `/data`; profile tambahan memakai `/data/profiles/<name>
 
 ## Download Manager: aturan penting
 
-- Membuka `web/vue/src/pages/DownloadsPage.vue` hanya melakukan GET
+- Membuka `web/src/lib/components/DownloadsPage.svelte` hanya melakukan GET
   katalog. Tidak ada reconcile otomatis dan tidak ada polling inventory saat
   halaman dibuka. Tombol reconcile yang terlihat adalah aksi manual operator.
 - Pemeriksaan fisik artifact terjadi ketika job download dikirim. Worker

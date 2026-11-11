@@ -210,9 +210,10 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertNotIn(".env.example", names)
         self.assertNotIn(".env.worker.example", names)
         self.assertIn("package.json", names)
-        self.assertIn("web/vite.config.ts", paths)
-        self.assertIn("web/vue/src/main.ts", paths)
-        self.assertNotIn("web/svelte.config.js", paths)
+        self.assertIn("web/svelte.config.js", paths)
+        self.assertIn("web/src/routes/+layout.svelte", paths)
+        self.assertNotIn("web/vue/src/main.ts", paths)
+        self.assertFalse(any(path.startswith("web/.svelte-kit/") for path in paths))
         self.assertIn("DEPLOYMENT_RUNBOOK.md", names)
 
     def test_migration_archive_contains_prebuilt_images(self) -> None:

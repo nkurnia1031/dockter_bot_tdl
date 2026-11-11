@@ -13,7 +13,7 @@ tidak membutuhkan Node.js atau container web di VPS target.
 | GitHub Actions | Build dan publish base, gateway, serta worker ke GHCR | Push ke `main` |
 | VPS gateway | `backend`, `telegram`, `worker-local` | `python3 run.py deploy gateway --pull` |
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
-| aaPanel UI | Vue 3 static SPA di document root | `python3 run.py deploy web` |
+| aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
 
 ## Build dan pull image bertahap
 

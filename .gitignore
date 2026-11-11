@@ -57,6 +57,7 @@ workers.json
 /images
 web/node_modules/
 web/.next/
+web/.svelte-kit/
 web/build/
 web/*.tsbuildinfo
 web/playwright-report/

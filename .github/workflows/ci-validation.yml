@@ -60,7 +60,7 @@ jobs:
         working-directory: web
         run: pnpm install --frozen-lockfile
 
-      - name: Check Vue and TypeScript
+      - name: Check Svelte and TypeScript
         working-directory: web
         run: pnpm check
 
@@ -68,25 +68,9 @@ jobs:
         working-directory: web
         run: pnpm test
 
-      - name: Build Vue static site
+      - name: Build static site
         working-directory: web
         run: pnpm build
-
-      - name: Set up Python for static browser E2E
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
-
-      - name: Install Chromium for static browser E2E
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install "playwright==1.64.0"
-          python -m playwright install --with-deps chromium
-
-      - name: Test Vue static bundle with a fake API
-        env:
-          TME3_RUN_VUE_STATIC_E2E: "1"
-        run: python -m unittest tests.test_vue_static_e2e -v
 
   browser-e2e-linux:
     name: Trusted-device browser E2E (Linux)

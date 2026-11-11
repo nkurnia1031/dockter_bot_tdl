@@ -1,17 +1,4 @@
 {
-  "compilerOptions": {
-    "target": "ES2022",
-    "useDefineForClassFields": true,
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "strict": true,
-    "jsx": "preserve",
-    "resolveJsonModule": true,
-    "isolatedModules": true,
-    "verbatimModuleSyntax": true,
-    "skipLibCheck": true,
-    "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["vite/client", "vitest/globals"]
-  },
-  "include": ["vue/src/**/*.ts", "vue/src/**/*.vue", "src/lib/**/*.ts", "vite.config.ts"]
+  "extends": "./.svelte-kit/tsconfig.json",
+  "compilerOptions": { "allowJs": true, "checkJs": true, "esModuleInterop": true, "forceConsistentCasingInFileNames": true, "strict": true, "skipLibCheck": true }
 }
