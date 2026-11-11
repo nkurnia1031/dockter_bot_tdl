@@ -93,6 +93,29 @@ jobs:
           python -m pip install -r requirements.txt "playwright==1.64.0"
           python -m playwright install --with-deps chromium
 
+      - name: Set up pnpm for static Web browser tests
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10.20.0
+
+      - name: Set up Node.js for static Web browser tests
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install and build static Web
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Run static Web browser E2E
+        env:
+          TME3_RUN_WEB_STATIC_E2E: "1"
+        run: python -m unittest tests.test_web_static_e2e -v
+
       - name: Run Linux browser E2E
         env:
           TME3_RUN_TRUSTED_DEVICE_BROWSER_E2E: "1"
