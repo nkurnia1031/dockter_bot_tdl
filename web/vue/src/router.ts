@@ -9,6 +9,7 @@ import SettingsPage from './pages/SettingsPage.vue';
 import DevelopmentPage from './pages/DevelopmentPage.vue';
 import StoragePage from './pages/StoragePage.vue';
 import DownloadsPage from './pages/DownloadsPage.vue';
+import Aria2Page from './pages/Aria2Page.vue';
 import PlaceholderPage from './pages/PlaceholderPage.vue';
 
 export type AppRouteDefinition = {
@@ -28,7 +29,7 @@ export const routeDefinitions: AppRouteDefinition[] = [
   { path: '/activity/', label: 'Aktivitas', section: 'Monitor', description: 'Monitor job realtime.', component: ActivityPage },
   { path: '/storage/', label: 'Storage', section: 'Transfer', description: 'Jelajahi dan kelola penyimpanan Telegram atau rclone.', component: StoragePage },
   { path: '/downloads/', label: 'Download', section: 'Transfer', description: 'Kelola antrean dan riwayat unduhan.', component: DownloadsPage },
-  placeholder('/aria2/', 'AriaNg', 'Transfer', 'Kirim dan pantau tugas aria2 pada worker.'),
+  { path: '/aria2/', label: 'AriaNg', section: 'Transfer', description: 'Kirim dan pantau tugas aria2 pada worker.', component: Aria2Page },
   placeholder('/chat-send/', 'Kirim ke Chat', 'Transfer', 'Kirim file Workspace ke chat Telegram.'),
   placeholder('/exports/', 'Export', 'Pemrosesan', 'Ekspor pesan dari sumber Telegram.'),
   placeholder('/quick-mode/', 'Quick Mode', 'Pemrosesan', 'Jalankan alur Quick Mode.'),
