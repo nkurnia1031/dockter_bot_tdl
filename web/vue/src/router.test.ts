@@ -1,6 +1,7 @@
 import { createMemoryHistory } from 'vue-router';
 import { describe, expect, it } from 'vitest';
 import { createAppRouter, navigationGroups, routeDefinitions } from './router';
+import DownloadsPage from './pages/DownloadsPage.vue';
 
 describe('Vue route map', () => {
   it('registers every existing static URL, including the nested Vault page', () => {
@@ -16,6 +17,10 @@ describe('Vue route map', () => {
     expect(navigationGroups.flatMap(({ links }) => links.map(({ path }) => path)).sort()).toEqual(
       routeDefinitions.filter(({ path }) => path !== '/profiles/vault/').map(({ path }) => path).sort()
     );
+  });
+
+  it('mounts the Vue Download Manager instead of the migration placeholder', () => {
+    expect(routeDefinitions.find(({ path }) => path === '/downloads/')?.component).toBe(DownloadsPage);
   });
 
   it('redirects slashless feature URLs to the existing trailing-slash form', async () => {
