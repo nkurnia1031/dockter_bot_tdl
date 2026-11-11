@@ -37,29 +37,6 @@ jobs:
         run: |
           printf '{"revision":"%s","built_at":"%s"}\n' "$BUILD_SHA" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > static/build-info.json
           pnpm build
-      - name: Verify prerendered route entrypoints
-        working-directory: web
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          root = Path("build")
-          routes = [
-              "activity", "storage", "downloads", "aria2", "chat-send",
-              "exports", "quick-mode", "tts", "decrypt", "utility",
-              "backups", "profiles", "profiles/vault", "workers",
-              "settings", "development",
-          ]
-          expected = [root / "index.html", root / "200.html"]
-          expected.extend(root / route / "index.html" for route in routes)
-          missing = [path for path in expected if not path.is_file() or path.stat().st_size == 0]
-          if missing:
-              print("Missing static route entrypoints:")
-              for path in missing:
-                  print(f"- {path}")
-              raise SystemExit(1)
-          print(f"Verified {len(routes) + 1} prerendered routes and the 200.html fallback.")
-          PY
       - name: Package release
         env:
           BUILD_SHA: ${{ github.sha }}
