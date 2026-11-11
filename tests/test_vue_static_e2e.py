@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 try:
     from playwright.sync_api import BrowserContext, Page, Route, sync_playwright
@@ -90,6 +90,27 @@ def _api_fixture(path: str) -> dict[str, object]:
         return {"items": [{"name": "local", "enabled": True}]}
     if path == "/storage/settings":
         return {"title": "Test Storage", "channel_id": 0}
+    if path == "/storage/browser":
+        return {
+            "current_folder": None,
+            "breadcrumbs": [],
+            "folders": [],
+            "items": [{
+                "id": 1,
+                "display_name": "test-archive.zip",
+                "original_name": "test-archive.zip",
+                "file_size": 128,
+                "mime_type": "application/zip",
+                "owner_profile": "default",
+                "uploaded_at": "2026-11-11T00:00:00Z",
+                "folder": "My Drive",
+                "status": "active",
+            }],
+            "total_folders": 0,
+            "total_items": 1,
+        }
+    if path == "/storage/folders/tree":
+        return {"items": []}
     return empty
 
 
@@ -164,6 +185,20 @@ class VueStaticBundleE2ETests(unittest.TestCase):
 
             api_path = parsed.path.removeprefix("/api/v1")
             method = route.request.method.upper()
+            if api_path == "/jobs":
+                kind = parse_qs(parsed.query).get("kind", [""])[0]
+                items = [{
+                    "id": "local-history-job-1",
+                    "kind": "storage_upload",
+                    "status": "succeeded",
+                    "worker": "local",
+                    "created_at": "2026-11-11T00:00:00Z",
+                    "updated_at": "2026-11-11T00:00:01Z",
+                    "progress": {},
+                    "result": {"message": "Completed"},
+                }] if kind == "storage_upload" else []
+                route.fulfill(json={"items": items})
+                return
             if api_path == "/auth/browser/session" and not authenticated:
                 route.fulfill(status=401, json={"error": {"message": "local signed-out fixture"}})
                 return
@@ -236,6 +271,69 @@ class VueStaticBundleE2ETests(unittest.TestCase):
 
             self.assertEqual(external_requests, [], "The static E2E must never request any non-local origin")
             self.assertEqual(runtime_errors, [], "Vue routes must not produce uncaught browser errors")
+        finally:
+            context.close()
+
+    def test_static_bundle_has_direct_entrypoints_for_every_known_route(self) -> None:
+        index_html = (BUILD_ROOT / "index.html").read_bytes()
+        for path, _ in ROUTES:
+            if path == "/":
+                continue
+            with self.subTest(path=path):
+                route_entry = BUILD_ROOT / path.strip("/") / "index.html"
+                self.assertTrue(route_entry.is_file(), f"Static route entrypoint missing: {route_entry}")
+                self.assertEqual(route_entry.read_bytes(), index_html)
+
+    def test_storage_history_table_styles_and_detail_modal_geometry(self) -> None:
+        context, external_requests, _ = self._context()
+        page = context.new_page()
+        try:
+            page.goto(self.origin + "/storage/", wait_until="domcontentloaded")
+            page.get_by_role("heading", name="Cloud Storage").wait_for(state="visible")
+            page.wait_for_timeout(400)
+
+            table = page.locator(".activity-table").first
+            table.wait_for(state="visible")
+            styles = page.evaluate("""() => {
+              const table = document.querySelector('.activity-table');
+              const header = table?.querySelector('th');
+              const wrapper = table?.closest('.activity-table-wrap');
+              return {
+                overflowX: wrapper && getComputedStyle(wrapper).overflowX,
+                wrapperBorder: wrapper && getComputedStyle(wrapper).borderTopWidth,
+                headerPadding: header && getComputedStyle(header).paddingTop,
+                headerBorder: header && getComputedStyle(header).borderBottomWidth,
+                headerTransform: header && getComputedStyle(header).textTransform,
+              };
+            }""")
+            self.assertEqual(styles["overflowX"], "auto")
+            self.assertGreater(float(str(styles["wrapperBorder"]).removesuffix("px")), 0)
+            self.assertGreater(float(str(styles["headerPadding"]).removesuffix("px")), 0)
+            self.assertGreater(float(str(styles["headerBorder"]).removesuffix("px")), 0)
+            self.assertEqual(styles["headerTransform"], "uppercase")
+
+            page.get_by_role("button", name="Detail test-archive.zip").click()
+            dialog = page.get_by_role("dialog", name="Detail file")
+            dialog.wait_for(state="visible")
+            geometry = page.evaluate("""() => {
+              const backdrop = document.querySelector('.modal-backdrop');
+              const rect = backdrop.getBoundingClientRect();
+              return {
+                position: getComputedStyle(backdrop).position,
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+                viewportWidth: innerWidth,
+                viewportHeight: innerHeight,
+              };
+            }""")
+            self.assertEqual(geometry["position"], "fixed")
+            self.assertAlmostEqual(geometry["x"], 0, delta=1)
+            self.assertAlmostEqual(geometry["y"], 0, delta=1)
+            self.assertAlmostEqual(geometry["width"], geometry["viewportWidth"], delta=1)
+            self.assertAlmostEqual(geometry["height"], geometry["viewportHeight"], delta=1)
+            self.assertEqual(external_requests, [])
         finally:
             context.close()
 

@@ -615,6 +615,15 @@ onUnmounted(() => {
 
 <style scoped>
 .activity-card{--surface-soft:var(--panel-soft)}
+.activity-table-wrap{min-width:0;overflow-x:auto;border:1px solid var(--line);border-radius:.7rem}
+.activity-table{width:100%;min-width:860px;border-collapse:collapse;font-size:.7rem}
+.activity-table th,.activity-table td{padding:.62rem .68rem;text-align:left;vertical-align:top}
+.activity-table th{border-bottom:1px solid var(--line);background:var(--panel-soft);color:var(--muted);font-family:"DM Mono",monospace;font-size:.59rem;font-weight:600;letter-spacing:.075em;text-transform:uppercase;white-space:nowrap}
+.activity-table td{border-bottom:1px solid var(--line)}
+.activity-table tbody tr:hover{background:var(--panel-hover)}
+.activity-table tbody tr:last-child td{border-bottom:0}
+.activity-table .progress-cell{min-width:14rem;max-width:25rem;overflow-wrap:anywhere}
+.activity-table .row-actions{min-width:10rem;white-space:nowrap}
 .command-line{margin:.5rem 0;overflow-wrap:anywhere;font: .72rem/1.55 ui-monospace,monospace;color:var(--ink)}
 .command-output{max-height:12rem;overflow:auto;margin:.45rem 0;padding:.65rem;border-radius:.55rem;background:#09111d;color:#d9fbe7;white-space:pre-wrap;overflow-wrap:anywhere;font:.7rem/1.5 ui-monospace,monospace}
 .raw-body{background:#09111d;color:#d9fbe7}.raw-body pre{max-height:55dvh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font:.72rem/1.55 ui-monospace,monospace}
