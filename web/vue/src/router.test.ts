@@ -6,6 +6,7 @@ import Aria2Page from './pages/Aria2Page.vue';
 import ChatSendPage from './pages/ChatSendPage.vue';
 import ExportPage from './pages/ExportPage.vue';
 import TtsPage from './pages/TtsPage.vue';
+import QuickModePage from './pages/QuickModePage.vue';
 
 describe('Vue route map', () => {
   it('registers every existing static URL, including the nested Vault page', () => {
@@ -38,6 +39,10 @@ describe('Vue route map', () => {
   it('mounts the Vue Export and TTS pages instead of migration placeholders', () => {
     expect(routeDefinitions.find(({ path }) => path === '/exports/')?.component).toBe(ExportPage);
     expect(routeDefinitions.find(({ path }) => path === '/tts/')?.component).toBe(TtsPage);
+  });
+
+  it('mounts the Vue Quick Mode page instead of the migration placeholder', () => {
+    expect(routeDefinitions.find(({ path }) => path === '/quick-mode/')?.component).toBe(QuickModePage);
   });
 
   it('redirects slashless feature URLs to the existing trailing-slash form', async () => {
