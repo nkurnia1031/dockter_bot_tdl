@@ -4,6 +4,9 @@ import OverviewPage from './pages/OverviewPage.vue';
 import ActivityPage from './pages/ActivityPage.vue';
 import ProfilesPage from './pages/ProfilesPage.vue';
 import ProfileVaultPage from './pages/ProfileVaultPage.vue';
+import WorkersPage from './pages/WorkersPage.vue';
+import SettingsPage from './pages/SettingsPage.vue';
+import DevelopmentPage from './pages/DevelopmentPage.vue';
 import PlaceholderPage from './pages/PlaceholderPage.vue';
 
 export type AppRouteDefinition = {
@@ -33,9 +36,9 @@ export const routeDefinitions: AppRouteDefinition[] = [
   placeholder('/backups/', 'Backup', 'Pemrosesan', 'Kelola backup dan pemulihan.'),
   { path: '/profiles/', label: 'Profil / Vault', section: 'Sistem', description: 'Periksa profil dan distribusikan sesi.', component: ProfilesPage },
   { path: '/profiles/vault/', label: 'Vault', section: 'Sistem', description: 'Kelola berkas profil aktif.', component: ProfileVaultPage },
-  placeholder('/workers/', 'Workers', 'Sistem', 'Lihat status dan rute worker.'),
-  placeholder('/settings/', 'Pengaturan', 'Sistem', 'Kelola pengaturan aplikasi.'),
-  placeholder('/development/', 'Pengembangan', 'Sistem', 'Catatan dan laporan pengembangan.')
+  { path: '/workers/', label: 'Workers', section: 'Sistem', description: 'Lihat status dan rute worker.', component: WorkersPage },
+  { path: '/settings/', label: 'Pengaturan', section: 'Sistem', description: 'Kelola pengaturan aplikasi.', component: SettingsPage },
+  { path: '/development/', label: 'Pengembangan', section: 'Sistem', description: 'Catatan dan laporan pengembangan.', component: DevelopmentPage }
 ];
 
 export const navigationGroups = ['Monitor', 'Transfer', 'Pemrosesan', 'Sistem'].map((label) => ({
