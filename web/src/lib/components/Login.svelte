@@ -20,8 +20,8 @@
 
 <main class="grid min-h-screen place-items-center p-5">
   <section class="card w-full max-w-md p-8 page-enter">
-    <div class="grid size-12 place-items-center rounded-2xl bg-gradient-to-br from-violet-600 to-indigo-500 text-white shadow-xl shadow-violet-500/25"><LockKeyhole size={22}/></div>
-    <p class="eyebrow mt-6">TME3 CONTROL CENTER</p>
+    <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+    <p class="eyebrow mt-6">TME3BOT · OPERATIONS</p>
     <h1 class="mt-2 text-3xl font-black tracking-tight">Masuk dengan Telegram</h1>
     <p class="muted mt-3">Otorisasi dilakukan lewat bot. Token akses dilindungi oleh cookie HttpOnly.</p>
     {#if session.challenge}

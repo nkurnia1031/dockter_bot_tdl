@@ -1,53 +1,82 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
+  import { fade, fly } from 'svelte/transition';
   import { page } from '$app/state';
-  import { Drawer, Dropdown, DropdownItem, Sidebar, Toast, Tooltip } from 'flowbite-svelte';
   import { session } from '$lib/session.svelte';
   import { profileOptionLabel } from '$lib/profile-catalog';
   import Login from './Login.svelte';
   import RequestIndicator from './RequestIndicator.svelte';
   import {
-    Activity, Archive, Boxes, ChevronLeft, ChevronRight, Download, FileDown, HardDrive,
-    Code2, KeyRound, LayoutDashboard, LogOut, Menu, MessageCircle, Moon, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, Zap
+    Activity, Archive, Boxes, ChevronLeft, ChevronRight, Code2, Download, FileDown,
+    HardDrive, KeyRound, LayoutDashboard, LogOut, Menu, MessageCircle, Moon,
+    Monitor, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, X, Zap
   } from '@lucide/svelte';
 
   let { children } = $props();
 
   type Theme = 'light' | 'dark' | 'system';
-  const links = [
-    { href: '/', label: 'Ringkasan', icon: LayoutDashboard },
-    { href: '/exports/', label: 'Export', icon: FileDown },
-    { href: '/quick-mode/', label: 'Quick Mode', icon: Zap },
-    { href: '/tts/', label: 'TTS Novel', icon: Volume2 },
-    { href: '/profiles/', label: 'Profil', icon: UserRoundPlus },
-    { href: '/downloads/', label: 'Download', icon: Download },
-    { href: '/aria2/', label: 'AriaNg', icon: Download },
-    { href: '/utility/', label: 'Utility', icon: Wrench },
-    { href: '/storage/', label: 'Storage', icon: HardDrive },
-    { href: '/chat-send/', label: 'Kirim ke Chat', icon: MessageCircle },
-    { href: '/activity/', label: 'Aktivitas', icon: Activity },
-    { href: '/development/', label: 'Pengembangan', icon: Code2 },
-    { href: '/workers/', label: 'Workers', icon: Users },
-    { href: '/backups/', label: 'Backup', icon: Archive },
-    { href: '/settings/', label: 'Pengaturan', icon: Settings }
+  type NavigationLink = { href: string; label: string; icon: typeof LayoutDashboard };
+  const navigationGroups: Array<{ label: string; links: NavigationLink[] }> = [
+    { label: 'Monitor', links: [
+      { href: '/', label: 'Ringkasan', icon: LayoutDashboard },
+      { href: '/activity/', label: 'Aktivitas', icon: Activity }
+    ] },
+    { label: 'Transfer', links: [
+      { href: '/storage/', label: 'Storage', icon: HardDrive },
+      { href: '/downloads/', label: 'Download', icon: Download },
+      { href: '/aria2/', label: 'AriaNg', icon: Boxes },
+      { href: '/chat-send/', label: 'Kirim ke Chat', icon: MessageCircle }
+    ] },
+    { label: 'Pemrosesan', links: [
+      { href: '/exports/', label: 'Export', icon: FileDown },
+      { href: '/quick-mode/', label: 'Quick Mode', icon: Zap },
+      { href: '/tts/', label: 'TTS', icon: Volume2 },
+      { href: '/decrypt/', label: 'Dekripsi', icon: KeyRound },
+      { href: '/utility/', label: 'Utility', icon: Wrench },
+      { href: '/backups/', label: 'Backup', icon: Archive }
+    ] },
+    { label: 'Sistem', links: [
+      { href: '/profiles/', label: 'Profil / Vault', icon: UserRoundPlus },
+      { href: '/workers/', label: 'Workers', icon: Users },
+      { href: '/settings/', label: 'Pengaturan', icon: Settings },
+      { href: '/development/', label: 'Pengembangan', icon: Code2 }
+    ] }
   ];
 
   let mobileOpen = $state(false);
   let collapsed = $state(false);
-  let theme = $state<Theme>('light');
+  let theme = $state<Theme>('dark');
   let themeMenuOpen = $state(false);
   let actorMenuOpen = $state(false);
-  let contextToast = $state(false);
-  let contextError = $state('');
+  let mobileTrigger: HTMLButtonElement | null = $state(null);
+  let mobileCloseButton: HTMLButtonElement | null = $state(null);
+  let mobileDrawer: HTMLElement | null = $state(null);
+  let themeMenuElement: HTMLDivElement | null = $state(null);
+  let accountMenuElement: HTMLDivElement | null = $state(null);
+  let motionDuration = $state(220);
 
-  const active = (href: string) => page.url.pathname === href || (href !== '/' && page.url.pathname.startsWith(href));
+  const active = (href: string) => href === '/' ? page.url.pathname === '/' : page.url.pathname === href || page.url.pathname.startsWith(href);
+  const titleForPath = (pathname: string) => {
+    if (pathname.startsWith('/profiles/vault')) return 'Vault profil';
+    for (const group of navigationGroups) {
+      const match = group.links.find((link) => active(link.href));
+      if (match) return match.label;
+    }
+    return 'TME3Bot';
+  };
   const labelForTheme = (value: Theme) => value === 'light' ? 'Terang' : value === 'dark' ? 'Gelap' : 'Sistem';
+
+  function applyTheme(value: Theme) {
+    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const dark = value === 'dark' || (value === 'system' && systemDark);
+    document.documentElement.classList.toggle('dark', dark);
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  }
 
   function setTheme(next: Theme) {
     theme = next;
     localStorage.setItem('tme3-theme', next);
-    const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-    document.documentElement.classList.toggle('dark', next === 'dark' || (next === 'system' && systemDark));
+    applyTheme(next);
     themeMenuOpen = false;
   }
 
@@ -60,134 +89,196 @@
     session.chooseTargetProfile(value);
   }
 
-  async function chooseWorker(value: string) {
-    try {
-      await session.chooseWorker(value);
-    } catch (cause) {
-      contextError = cause instanceof Error ? cause.message : 'Worker gagal diganti.';
-      contextToast = true;
+  async function openMobileNav() {
+    mobileOpen = true;
+    await tick();
+    mobileCloseButton?.focus();
+  }
+
+  async function closeMobileNav() {
+    mobileOpen = false;
+    await tick();
+    mobileTrigger?.focus();
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if (event.defaultPrevented) return;
+    if (event.key === 'Escape') {
+      if (mobileOpen) void closeMobileNav();
+      themeMenuOpen = false;
+      actorMenuOpen = false;
+    }
+  }
+
+  function handleWindowClick(event: MouseEvent) {
+    const target = event.target;
+    if (!(target instanceof Node)) return;
+    if (themeMenuOpen && !themeMenuElement?.contains(target)) themeMenuOpen = false;
+    if (actorMenuOpen && !accountMenuElement?.contains(target)) actorMenuOpen = false;
+  }
+
+  function handleDrawerKeydown(event: KeyboardEvent) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      void closeMobileNav();
+      return;
+    }
+    if (event.key !== 'Tab' || !mobileDrawer) return;
+    const focusable = [...mobileDrawer.querySelectorAll<HTMLElement>(
+      'a[href], button:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )].filter((element) => !element.hasAttribute('hidden'));
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
     }
   }
 
   onMount(() => {
     collapsed = localStorage.getItem('tme3-sidebar-collapsed') === 'true';
     const savedTheme = localStorage.getItem('tme3-theme');
-    setTheme(savedTheme === 'dark' || savedTheme === 'system' ? savedTheme : 'light');
+    theme = savedTheme === 'light' || savedTheme === 'system' ? savedTheme : 'dark';
+    applyTheme(theme);
+    const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+    motionDuration = motionQuery.matches ? 0 : 220;
+    const updateMotion = (event: MediaQueryListEvent) => { motionDuration = event.matches ? 0 : 220; };
+    motionQuery.addEventListener?.('change', updateMotion);
+    const themeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const updateSystemTheme = () => { if (theme === 'system') applyTheme(theme); };
+    themeQuery.addEventListener?.('change', updateSystemTheme);
     session.restore();
+    return () => {
+      motionQuery.removeEventListener?.('change', updateMotion);
+      themeQuery.removeEventListener?.('change', updateSystemTheme);
+    };
   });
 </script>
 
+<svelte:window onkeydown={handleGlobalKeydown} onclick={handleWindowClick} />
+<a class="skip-link" href="#main-content">Lewati ke konten</a>
 <RequestIndicator />
 
-{#snippet navigation(compact = false, onNavigate: (() => void) | undefined = undefined, scope = 'nav')}
-  <nav class="grid gap-1.5" aria-label="Menu utama">
-    {#each links as link}
-      {@const Icon = link.icon}
-      <a
-        id={`${scope}-${link.label.toLowerCase()}`}
-        class:active={active(link.href)}
-        class:compact
-        class="nav-link group"
-        href={link.href}
-        onclick={onNavigate}
-      >
-        <Icon size={18} strokeWidth={2.1} />
-        <span class="nav-label">{link.label}</span>
-      </a>
-      {#if compact}<Tooltip triggeredBy={`#${scope}-${link.label.toLowerCase()}`} placement="right">{link.label}</Tooltip>{/if}
+{#snippet navigation(scope: string, onNavigate: (() => void) | undefined = undefined)}
+  <nav class="side-nav" aria-label="Menu utama">
+    {#each navigationGroups as group}
+      <section class="nav-group" aria-label={group.label}>
+        <h2 class="nav-group-title">{group.label}</h2>
+        {#each group.links as link}
+          {@const Icon = link.icon}
+          {@const id = `${scope}-${link.href === '/' ? 'home' : link.href.replaceAll('/', '-')}`}
+          <a
+            id={id}
+            class="nav-link"
+            class:active={active(link.href)}
+            href={link.href}
+            title={collapsed && scope === 'desktop-nav' ? link.label : undefined}
+            aria-label={collapsed && scope === 'desktop-nav' ? link.label : undefined}
+            aria-current={active(link.href) ? 'page' : undefined}
+            onclick={onNavigate}
+          >
+            <span class="nav-symbol"><Icon size={17} strokeWidth={1.9}/></span>
+            <span class="nav-label">{link.label}</span>
+            {#if active(link.href)}<span class="nav-active-mark" aria-hidden="true"></span>{/if}
+          </a>
+        {/each}
+      </section>
     {/each}
   </nav>
 {/snippet}
 
 {#if session.loading}
-  <main class="grid min-h-screen place-items-center p-5">
-    <div class="card w-full max-w-sm p-7 text-center page-enter"><div class="mx-auto mb-4 size-9 animate-pulse rounded-xl bg-violet-200"></div><p class="font-semibold">Memuat sesi aman...</p><p class="muted mt-1 text-sm">Menyiapkan control center Anda.</p></div>
+  <main class="boot-screen" id="main-content">
+    <section class="boot-card"><div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div><p class="eyebrow">TME3BOT · OPERATIONS</p><h1>Menyiapkan ruang kerja</h1><p class="muted">Memuat sesi aman dan status control plane.</p></section>
   </main>
 {:else if !session.current.authenticated}
   <Login />
 {:else}
-  <div class:sidebar-collapsed={collapsed} class="app-shell min-h-screen lg:grid lg:grid-cols-[17.5rem_1fr]">
-    <aside class="app-sidebar hidden border-r border-[var(--line)] lg:block">
-      <Sidebar disableBreakpoints isOpen={true} class="!static !block !h-full !w-full !bg-transparent" classes={{ div: '!overflow-visible !bg-transparent !p-4' }}>
-        <div class="flex h-full flex-col">
-          <div class="mb-8 flex items-center gap-3 px-2">
-            <div class="grid size-10 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-500 text-white shadow-lg shadow-violet-500/20"><Boxes size={21}/></div>
-            <div class="brand-copy min-w-0"><b class="block text-base tracking-tight">tme3</b><p class="muted text-xs">Control center</p></div>
-            <button class="collapse-button button ghost ms-auto hidden size-8 !p-0 lg:inline-flex" onclick={toggleCollapsed} aria-label={collapsed ? 'Lebarkan sidebar' : 'Ringkas sidebar'}>{#if collapsed}<ChevronRight size={17}/>{:else}<ChevronLeft size={17}/>{/if}</button>
-          </div>
-          {@render navigation(collapsed, undefined, 'desktop-nav')}
-          <div class="mt-auto pt-6">
-            <div class="worker-card rounded-2xl p-3.5">
-              <p class="worker-label text-xs font-bold uppercase tracking-[.13em]">Worker aktif</p>
-              <b class="mt-1 block truncate text-sm">{session.current.actor?.worker_route || '-'}</b>
-              <span class="mt-2 inline-flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Tersambung</span>
-            </div>
-          </div>
-        </div>
-      </Sidebar>
+  <div class="application" class:sidebar-is-collapsed={collapsed}>
+    <aside class="app-sidebar" aria-label="Navigasi utama">
+      <div class="sidebar-brand">
+        <a class="brand-lockup" href="/" aria-label="TME3Bot Ringkasan">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="brand-name"><strong>TME3Bot</strong><small>Operations</small></span>
+        </a>
+        <button class="icon-button collapse-control" type="button" onclick={toggleCollapsed} aria-label={collapsed ? 'Lebarkan sidebar' : 'Ringkas sidebar'} aria-expanded={!collapsed}>
+          {#if collapsed}<ChevronRight size={16}/>{:else}<ChevronLeft size={16}/>{/if}
+        </button>
+      </div>
+      {@render navigation('desktop-nav')}
+      <footer class="sidebar-footer">
+        <div class="worker-summary"><span class="route-mark"><Server size={14}/></span><span class="worker-summary-text"><strong>{session.current.actor?.worker_route || 'Belum dipilih'}</strong><small>Worker route profil</small></span></div>
+        <span class="sidebar-version">TME3BOT CONTROL</span>
+      </footer>
     </aside>
 
-    <main class="min-w-0">
-      <header class="topbar sticky top-0 z-20 border-b border-[var(--line)] bg-[color:var(--panel)]/92 px-3 py-2.5 backdrop-blur-xl sm:px-6 sm:py-3">
-        <div class="flex min-w-0 items-center justify-between gap-2 sm:gap-3">
-          <div class="topbar-left flex min-w-0 flex-1 items-center gap-2">
-            <button class="button secondary menu-trigger size-10 shrink-0 !rounded-xl !p-0 lg:hidden" onclick={() => mobileOpen = true} aria-label="Buka navigasi"><Menu size={19}/></button>
-            <label class="flex min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-1.5">
-              <Users class="shrink-0 text-violet-500" size={15}/>
-              <span class="sr-only">Profil target default</span>
-              <select
-                class="max-w-28 cursor-pointer truncate bg-transparent text-sm font-bold outline-none sm:max-w-36"
-                value={session.selectedTargetProfile}
-                onchange={(event) => chooseTargetProfile(event.currentTarget.value)}
-                disabled={session.profileCatalog.length < 2}
-                aria-label="Profil target default"
-              >
-                {#if !session.profileCatalog.length}<option value="">Belum scan</option>{/if}
-                {#each session.profileCatalog as profile}<option value={profile.name}>{profileOptionLabel(profile)}</option>{/each}
-              </select>
-            </label>
-            <div class="hidden min-w-0 items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--panel-strong)] px-3 py-2 md:flex"><Server class="shrink-0 text-sky-500" size={15}/><div><p class="muted text-[.65rem] font-bold uppercase tracking-[.12em]">Target</p><span class="text-xs font-semibold text-[var(--muted)]">Dipilih per fitur</span></div></div>
-            <span class="hidden items-center gap-1.5 rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-bold text-emerald-700 md:inline-flex dark:bg-emerald-950 dark:text-emerald-300"><i class="size-1.5 rounded-full bg-emerald-500"></i>Backend online</span>
+    <div class="main-column">
+      <div id="main-content" class="sr-only" tabindex="-1"></div>
+      <header class="topbar">
+        <div class="topbar-start">
+          <button bind:this={mobileTrigger} class="icon-button mobile-menu" type="button" aria-label="Buka navigasi" aria-expanded={mobileOpen} onclick={openMobileNav}><Menu size={19}/></button>
+          <div class="breadcrumb"><span>OPERATIONS</span><i aria-hidden="true">/</i><strong>{titleForPath(page.url.pathname)}</strong></div>
+        </div>
+        <div class="topbar-end">
+          <label class="target-picker"><span>Profil target</span>
+            <select aria-label="Profil target default" value={session.selectedTargetProfile} onchange={(event) => chooseTargetProfile(event.currentTarget.value)} disabled={session.profileCatalog.length < 2}>
+              {#if !session.profileCatalog.length}<option value="">Belum scan</option>{/if}
+              {#each session.profileCatalog as profile}<option value={profile.name}>{profileOptionLabel(profile)}</option>{/each}
+            </select>
+          </label>
+          <span class="backend-status"><i></i><span>Backend online</span></span>
+          <a class="icon-button decrypt-shortcut" href="/decrypt/" aria-label="Buka dekripsi teks" title="Dekripsi teks"><KeyRound size={16}/></a>
+          <div bind:this={themeMenuElement} class="theme-menu">
+            <button class="icon-button" type="button" aria-label="Pilih tema" aria-expanded={themeMenuOpen} onclick={() => themeMenuOpen = !themeMenuOpen}>
+              {#if theme === 'dark'}<Moon size={16}/>{:else if theme === 'light'}<Sun size={16}/>{:else}<Monitor size={16}/>{/if}
+            </button>
+            {#if themeMenuOpen}
+              <div class="theme-popover" role="menu" aria-label="Pilihan tema">
+                {#each ['dark', 'light', 'system'] as option}
+                  <button role="menuitem" class:chosen={theme === option} type="button" onclick={() => setTheme(option as Theme)}>{labelForTheme(option as Theme)}{#if theme === option}<span aria-hidden="true">✓</span>{/if}</button>
+                {/each}
+              </div>
+            {/if}
           </div>
-          <div class="topbar-actions flex shrink-0 items-center gap-1.5 sm:gap-2">
-            <a class="button secondary h-10 !rounded-xl !px-2.5 sm:!px-3" href="/decrypt/" aria-label="Buka dekripsi teks" title="Dekripsi teks"><KeyRound size={16}/><span class="hidden sm:inline">Dekripsi</span></a>
-            <button id="theme-trigger" class="button secondary theme-trigger hidden size-10 !rounded-xl !p-0 sm:inline-flex" aria-label="Pilih tema"><span class="sr-only">Tema {labelForTheme(theme)}</span>{#if theme === 'dark'}<Moon size={17}/>{:else}<Sun size={17}/>{/if}</button>
-            <Dropdown bind:isOpen={themeMenuOpen} triggeredBy="#theme-trigger" placement="bottom-end" class="!z-50 !w-40 !rounded-xl !border-[var(--line)] !bg-[var(--panel-strong)] !p-1 !shadow-xl" simple>
-              {#each ['light', 'dark', 'system'] as option}<DropdownItem onclick={() => setTheme(option as Theme)} class="!rounded-lg !px-3 !py-2 !text-sm !text-[var(--ink)] hover:!bg-[var(--brand-soft)]">{labelForTheme(option as Theme)}{#if theme === option}<span class="float-right text-violet-600">&#10003;</span>{/if}</DropdownItem>{/each}
-            </Dropdown>
-            <button id="actor-trigger" class="button secondary flex size-10 max-w-40 items-center justify-center gap-2 !rounded-xl !p-0 sm:h-10 sm:justify-start sm:!px-3" aria-label="Menu akun"><span class="grid size-6 place-items-center rounded-full bg-violet-100 text-xs font-bold text-violet-700 dark:bg-violet-900 dark:text-violet-200">{String(session.current.actor?.telegram_user_id || '?').slice(-2)}</span><span class="hidden truncate text-xs font-bold sm:block">{session.current.actor?.telegram_user_id}</span></button>
-            <Dropdown bind:isOpen={actorMenuOpen} triggeredBy="#actor-trigger" placement="bottom-end" class="!z-50 !w-52 !rounded-xl !border-[var(--line)] !bg-[var(--panel-strong)] !p-1 !shadow-xl" simple>
-              <div class="border-b border-[var(--line)] px-3 py-2 text-xs"><p class="muted">Telegram user</p><b class="text-[var(--ink)]">{session.current.actor?.telegram_user_id}</b><p class="muted mt-1">Identity profile: {session.current.actor?.profile || '-'}</p></div>
-              <DropdownItem onclick={() => session.logout()} class="!mt-1 !rounded-lg !px-3 !py-2 !text-rose-600 hover:!bg-rose-50 dark:hover:!bg-rose-950"><LogOut size={15} class="mr-2 inline"/>Keluar</DropdownItem>
-            </Dropdown>
+          <div bind:this={accountMenuElement} class="account-menu">
+            <button class="account-trigger" type="button" aria-label="Menu akun" aria-expanded={actorMenuOpen} onclick={() => actorMenuOpen = !actorMenuOpen}>
+              <span class="account-avatar">{String(session.current.actor?.telegram_user_id || '?').slice(-2)}</span>
+              <span class="account-id">{session.current.actor?.telegram_user_id}</span>
+              <span aria-hidden="true">⌄</span>
+            </button>
+            {#if actorMenuOpen}
+              <div class="account-popover">
+                <small>Telegram user</small><strong>{session.current.actor?.telegram_user_id}</strong>
+                <small>Identity profile</small><strong>{session.current.actor?.profile || '—'}</strong>
+                <button class="logout-button" type="button" onclick={() => session.logout()}><LogOut size={14}/>Keluar</button>
+              </div>
+            {/if}
           </div>
         </div>
       </header>
-      <section class="mx-auto max-w-[96rem] p-4 sm:p-6 lg:p-8"><div class="page-enter">{@render children?.()}</div></section>
-    </main>
+
+      <section class="page-content">
+        {#key page.url.pathname}
+          <div class="route-transition">{@render children?.()}</div>
+        {/key}
+      </section>
+    </div>
   </div>
 
-  <Drawer bind:open={mobileOpen} placement="left" outsideclose={true} class="!w-[18rem] !border-r !border-[var(--line)] !bg-[var(--panel-strong)] !p-0" transitionParams={{ x: -28, duration: 240 }} aria-label="Navigasi mobile">
-    <div class="flex min-h-full flex-col p-4">
-      <div class="mb-8 flex items-center gap-3 px-2"><div class="grid size-10 place-items-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-500 text-white"><Boxes size={21}/></div><div><b>tme3</b><p class="muted text-xs">Control center</p></div></div>
-      {@render navigation(false, () => mobileOpen = false, 'mobile-nav')}
-      <div class="mt-auto worker-card rounded-2xl p-3.5"><p class="worker-label text-xs font-bold uppercase tracking-[.13em]">Worker aktif</p><b class="mt-1 block truncate text-sm">{session.current.actor?.worker_route || '-'}</b></div>
+  {#if mobileOpen}
+    <div class="mobile-overlay" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) void closeMobileNav(); }} transition:fade={{ duration: motionDuration }}>
+      <div bind:this={mobileDrawer} class="mobile-drawer" role="dialog" aria-modal="true" aria-label="Navigasi mobile" tabindex="-1" onkeydown={handleDrawerKeydown} transition:fly={{ x: -22, duration: motionDuration }}>
+        <div class="sidebar-brand">
+          <a class="brand-lockup" href="/" onclick={closeMobileNav}><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><span class="brand-name"><strong>TME3Bot</strong><small>Operations</small></span></a>
+          <button bind:this={mobileCloseButton} class="icon-button" type="button" aria-label="Tutup navigasi" onclick={closeMobileNav}><X size={17}/></button>
+        </div>
+        {@render navigation('mobile-nav', closeMobileNav)}
+        <div class="worker-summary mobile-worker"><span class="route-mark"><Server size={14}/></span><span class="worker-summary-text"><strong>{session.current.actor?.worker_route || 'Belum dipilih'}</strong><small>Worker route profil</small></span></div>
+      </div>
     </div>
-  </Drawer>
-  <Toast bind:toastStatus={contextToast} position="bottom-right" color="red">{contextError}</Toast>
+  {/if}
 {/if}
-
-<style>
-  .app-shell { transition: grid-template-columns .24s cubic-bezier(.16, 1, .3, 1); }
-  .topbar { box-shadow: 0 1px 0 color-mix(in srgb, var(--line) 75%, transparent); }
-  .app-sidebar { background: color-mix(in srgb, var(--panel-strong) 92%, transparent); }
-  .sidebar-collapsed { grid-template-columns: 5.5rem 1fr; }
-  .sidebar-collapsed .brand-copy, .sidebar-collapsed .nav-label, .sidebar-collapsed .worker-card { display: none; }
-  .sidebar-collapsed .collapse-button { margin-left: auto; }
-  :global(.nav-link) { display: flex; align-items: center; gap: .72rem; border-radius: .8rem; padding: .72rem .8rem; color: var(--muted); font-size: .9rem; font-weight: 650; text-decoration: none; transition: background .18s ease, color .18s ease, transform .18s ease; }
-  :global(.nav-link:hover) { color: var(--ink); background: var(--brand-soft); transform: translateX(2px); }
-  :global(.nav-link.active) { color: var(--brand-strong); background: var(--brand-soft); box-shadow: inset 3px 0 0 var(--brand); }
-  :global(.nav-link.compact) { justify-content: center; padding-inline: .5rem; }
-  .worker-card { border: 1px solid color-mix(in srgb, var(--brand) 20%, var(--line)); background: linear-gradient(135deg, color-mix(in srgb, var(--brand-soft) 86%, transparent), transparent); }
-  .worker-label { color: var(--brand); }
-</style>
