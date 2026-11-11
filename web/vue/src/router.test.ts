@@ -7,6 +7,9 @@ import ChatSendPage from './pages/ChatSendPage.vue';
 import ExportPage from './pages/ExportPage.vue';
 import TtsPage from './pages/TtsPage.vue';
 import QuickModePage from './pages/QuickModePage.vue';
+import DecryptPage from './pages/DecryptPage.vue';
+import UtilityPage from './pages/UtilityPage.vue';
+import BackupsPage from './pages/BackupsPage.vue';
 
 describe('Vue route map', () => {
   it('registers every existing static URL, including the nested Vault page', () => {
@@ -43,6 +46,12 @@ describe('Vue route map', () => {
 
   it('mounts the Vue Quick Mode page instead of the migration placeholder', () => {
     expect(routeDefinitions.find(({ path }) => path === '/quick-mode/')?.component).toBe(QuickModePage);
+  });
+
+  it('mounts the Vue Decrypt, Utility, and Backup pages instead of migration placeholders', () => {
+    expect(routeDefinitions.find(({ path }) => path === '/decrypt/')?.component).toBe(DecryptPage);
+    expect(routeDefinitions.find(({ path }) => path === '/utility/')?.component).toBe(UtilityPage);
+    expect(routeDefinitions.find(({ path }) => path === '/backups/')?.component).toBe(BackupsPage);
   });
 
   it('redirects slashless feature URLs to the existing trailing-slash form', async () => {

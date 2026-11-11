@@ -14,7 +14,9 @@ import ChatSendPage from './pages/ChatSendPage.vue';
 import ExportPage from './pages/ExportPage.vue';
 import TtsPage from './pages/TtsPage.vue';
 import QuickModePage from './pages/QuickModePage.vue';
-import PlaceholderPage from './pages/PlaceholderPage.vue';
+import DecryptPage from './pages/DecryptPage.vue';
+import UtilityPage from './pages/UtilityPage.vue';
+import BackupsPage from './pages/BackupsPage.vue';
 
 export type AppRouteDefinition = {
   path: string;
@@ -23,10 +25,6 @@ export type AppRouteDefinition = {
   description: string;
   component: Component;
 };
-
-const placeholder = (path: string, label: string, section: string, description: string): AppRouteDefinition => ({
-  path, label, section, description, component: PlaceholderPage
-});
 
 export const routeDefinitions: AppRouteDefinition[] = [
   { path: '/', label: 'Ringkasan', section: 'Monitor', description: 'Job aktif, worker, layanan, dan kegagalan terbaru.', component: OverviewPage },
@@ -38,9 +36,9 @@ export const routeDefinitions: AppRouteDefinition[] = [
   { path: '/exports/', label: 'Export', section: 'Pemrosesan', description: 'Ekspor pesan dari sumber Telegram.', component: ExportPage },
   { path: '/quick-mode/', label: 'Quick Mode', section: 'Pemrosesan', description: 'Jalankan dan pulihkan alur Quick Mode.', component: QuickModePage },
   { path: '/tts/', label: 'TTS', section: 'Pemrosesan', description: 'Proses dan kirim audio TTS.', component: TtsPage },
-  placeholder('/decrypt/', 'Dekripsi', 'Pemrosesan', 'Dekripsi teks dan tautan.'),
-  placeholder('/utility/', 'Utility', 'Pemrosesan', 'Jalankan alat pada folder Workspace.'),
-  placeholder('/backups/', 'Backup', 'Pemrosesan', 'Kelola backup dan pemulihan.'),
+  { path: '/decrypt/', label: 'Dekripsi', section: 'Pemrosesan', description: 'Dekripsi teks dan tautan.', component: DecryptPage },
+  { path: '/utility/', label: 'Utility', section: 'Pemrosesan', description: 'Jalankan alat pada folder Workspace.', component: UtilityPage },
+  { path: '/backups/', label: 'Backup', section: 'Pemrosesan', description: 'Kelola backup dan pemulihan.', component: BackupsPage },
   { path: '/profiles/', label: 'Profil / Vault', section: 'Sistem', description: 'Periksa profil dan distribusikan sesi.', component: ProfilesPage },
   { path: '/profiles/vault/', label: 'Vault', section: 'Sistem', description: 'Kelola berkas profil aktif.', component: ProfileVaultPage },
   { path: '/workers/', label: 'Workers', section: 'Sistem', description: 'Lihat status dan rute worker.', component: WorkersPage },
