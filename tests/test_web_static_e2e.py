@@ -11,17 +11,49 @@ from urllib.parse import urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB_BUILD = ROOT / "web" / "build"
+WEB_BUILD = Path(os.environ.get("TME3_WEB_BUILD_DIR", ROOT / "web" / "build"))
 RUN_E2E = os.environ.get("TME3_RUN_WEB_STATIC_E2E") == "1"
+
+ROUTE_TITLES = {
+    "/": "Ringkasan",
+    "/activity/": "Aktivitas",
+    "/storage/": "Storage",
+    "/downloads/": "Download",
+    "/aria2/": "AriaNg",
+    "/chat-send/": "Kirim ke Chat",
+    "/exports/": "Export",
+    "/quick-mode/": "Quick Mode",
+    "/tts/": "TTS",
+    "/decrypt/": "Dekripsi",
+    "/utility/": "Utility",
+    "/backups/": "Backup",
+    "/profiles/": "Profil / Vault",
+    "/profiles/vault/": "Vault profil",
+    "/workers/": "Workers",
+    "/settings/": "Pengaturan",
+    "/development/": "Pengembangan",
+}
+
+
+def source_static_routes() -> list[tuple[str, str]]:
+    route_root = ROOT / "web" / "src" / "routes"
+    routes: list[tuple[str, str]] = []
+    for page in sorted(route_root.rglob("+page.svelte")):
+        segments = page.parent.relative_to(route_root).parts
+        # Route groups do not contribute URL segments. Dynamic routes need
+        # explicit prerender entries and are covered by their own tests.
+        segments = tuple(segment for segment in segments if not (segment.startswith("(") and segment.endswith(")")))
+        if any("[" in segment or "]" in segment for segment in segments):
+            continue
+        path = "/" if not segments else f"/{'/'.join(segments)}/"
+        routes.append((path, ROUTE_TITLES.get(path, "")))
+    return routes
+
+
+STATIC_ROUTES = source_static_routes()
 
 
 class QuietStaticHandler(SimpleHTTPRequestHandler):
-    def send_head(self):
-        requested_path = urlsplit(self.path).path
-        if not Path(self.translate_path(requested_path)).exists() and not Path(requested_path).suffix:
-            self.path = "/200.html"
-        return super().send_head()
-
     def log_message(self, _format: str, *_args: object) -> None:
         pass
 
@@ -30,6 +62,24 @@ class QuietStaticHandler(SimpleHTTPRequestHandler):
             super().copyfile(source, outputfile)
         except BrokenPipeError:
             pass
+
+
+@unittest.skipUnless(WEB_BUILD.is_dir(), "Build web/ first with pnpm build")
+class StaticWebPrerenderArtifactTests(unittest.TestCase):
+    def test_every_public_route_has_a_static_index_document(self) -> None:
+        source_routes = {path for path, _title in STATIC_ROUTES}
+        self.assertEqual(
+            source_routes,
+            set(ROUTE_TITLES),
+            "Update the public route contract whenever a Svelte page route is added or removed.",
+        )
+        for path, _title in STATIC_ROUTES:
+            relative = "index.html" if path == "/" else f"{path.strip('/')}/index.html"
+            with self.subTest(route=path):
+                self.assertTrue(
+                    (WEB_BUILD / relative).is_file(),
+                    f"Static bundle is missing {relative}; direct production request would 404.",
+                )
 
 
 def api_payload(path: str, authenticated: bool) -> dict[str, object]:
@@ -158,36 +208,20 @@ class StaticWebPlaywrightE2ETests(unittest.TestCase):
         return context, context.new_page()
 
     def test_all_static_deep_links_render_their_shell_and_route_context(self) -> None:
-        routes = [
-            ("/", "Ringkasan"),
-            ("/activity/", "Aktivitas"),
-            ("/storage/", "Storage"),
-            ("/downloads/", "Download"),
-            ("/aria2/", "AriaNg"),
-            ("/chat-send/", "Kirim ke Chat"),
-            ("/exports/", "Export"),
-            ("/quick-mode/", "Quick Mode"),
-            ("/tts/", "TTS"),
-            ("/decrypt/", "Dekripsi"),
-            ("/utility/", "Utility"),
-            ("/backups/", "Backup"),
-            ("/profiles/", "Profil / Vault"),
-            ("/profiles/vault/", "Vault profil"),
-            ("/workers/", "Workers"),
-            ("/settings/", "Pengaturan"),
-            ("/development/", "Pengembangan"),
-        ]
         context, page = self.make_page()
         errors: list[str] = []
         page.on("pageerror", lambda error: errors.append(f"{page.url}: {error}"))
         try:
-            for path, title in routes:
+            for path, title in STATIC_ROUTES:
                 response = page.goto(f"{self.origin}{path}", wait_until="domcontentloaded")
                 self.assertIsNotNone(response, path)
                 self.assertEqual(response.status, 200, path)
                 breadcrumb = page.locator(".breadcrumb strong")
                 breadcrumb.wait_for(state="visible", timeout=10000)
-                self.assertEqual(breadcrumb.inner_text(), title, path)
+                if title:
+                    self.assertEqual(breadcrumb.inner_text(), title, path)
+                else:
+                    self.assertTrue(breadcrumb.inner_text().strip(), path)
                 if path == "/":
                     duration = page.locator(".route-transition").evaluate(
                         "element => getComputedStyle(element).animationDuration"

@@ -33,6 +33,10 @@ workspace/
 exports/
 download/
 downloads/
+!web/src/routes/exports/
+!web/src/routes/exports/+page.svelte
+!web/src/routes/downloads/
+!web/src/routes/downloads/+page.svelte
 *.log
 *.kv
 identity.json

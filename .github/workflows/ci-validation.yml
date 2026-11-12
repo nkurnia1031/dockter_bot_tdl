@@ -72,6 +72,9 @@ jobs:
         working-directory: web
         run: pnpm build
 
+      - name: Verify every source route is prerendered
+        run: python -m unittest tests.test_web_static_e2e.StaticWebPrerenderArtifactTests -v
+
   browser-e2e-linux:
     name: Trusted-device browser E2E (Linux)
     runs-on: ubuntu-24.04
