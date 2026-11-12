@@ -160,6 +160,22 @@ _Avoid_: fallback ke sumber profil lain.
 Unduhan dari URI yang dikelola pada worker terpilih dan disimpan dalam folder Workspace worker tersebut.
 _Avoid_: Unduhan Storage, unduhan artifact ekspor.
 
+**Ambang pemulihan kecepatan Aria2**:
+Nilai per worker untuk mengenali unduhan yang kecepatannya rendah secara persisten. Ambang ini terpisah dari batas kecepatan bawaan aria2; nilai nol menonaktifkan intervensi kecepatan.
+_Avoid_: batas pembatalan bawaan aria2.
+
+**Pemantauan kecepatan Aria2**:
+Pengamatan unduhan aktif untuk membandingkan kecepatan rata-rata dengan Ambang pemulihan kecepatan Aria2. Pemantauan berlaku pada semua protokol dan tidak menganggap antrean atau pause sebagai unduhan lambat.
+_Avoid_: retry error, polling task selesai.
+
+**Siklus pemulihan kecepatan Aria2**:
+Upaya memulihkan unduhan yang tetap aktif tetapi lambat secara persisten, tanpa menandainya sebagai job error. Ini terpisah dari retry setelah aria2 menghentikan percobaan otomatis.
+_Avoid_: retry error, pembatalan karena kecepatan rendah.
+
+**Fallback retry error Aria2**:
+Percobaan ulang eksternal setelah aria2 tidak lagi mencoba otomatis dan satu unduhan berada pada status stopped karena error. Fallback tidak menggantikan atau mengurangi retry bawaan aria2.
+_Avoid_: retry native aria2, pemulihan pause/cancel manual.
+
 ## Storage
 
 **Unduhan Storage**:
