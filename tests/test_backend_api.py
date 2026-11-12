@@ -146,6 +146,8 @@ class FakeDispatcher:
                 "last_result": "retry-resumed",
             },
         }
+        self.aria2_recovery_settings_calls = []
+        self.aria2_recovery_settings_value = {"speed_threshold_bytes_per_second": 100000}
         self.tts_recoveries = []
         self.storage_fingerprint_overrides = {}
         self.rclone_browse_calls = []
@@ -273,6 +275,15 @@ class FakeDispatcher:
     def aria2_health(self, worker):
         self.aria2_health_calls.append(worker)
         return dict(self.aria2_health_result)
+
+    def aria2_recovery_settings(self, worker):
+        self.aria2_recovery_settings_calls.append((worker, "get"))
+        return dict(self.aria2_recovery_settings_value)
+
+    def update_aria2_recovery_settings(self, worker, payload):
+        self.aria2_recovery_settings_calls.append((worker, dict(payload)))
+        self.aria2_recovery_settings_value = dict(payload)
+        return dict(payload)
 
     def aria2_rpc(self, worker, payload):
         self.aria2_rpc_calls.append((worker, dict(payload)))
@@ -2975,6 +2986,32 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(payload["hook"]["last_result"], "retry-resumed")
         self.assertNotIn("secret", response.text.lower())
         self.assertEqual(self.dispatcher.aria2_health_calls, ["local"])
+
+    def test_aria2_recovery_settings_are_authenticated_worker_scoped_and_bounded(self):
+        denied = self.client.get("/api/v1/workers/local/aria2/recovery-settings")
+        self.assertEqual(denied.status_code, 401)
+        headers = self.login()
+        loaded = self.client.get(
+            "/api/v1/workers/local/aria2/recovery-settings", headers=headers
+        )
+        self.assertEqual(loaded.status_code, 200)
+        self.assertEqual(loaded.json(), {"speed_threshold_bytes_per_second": 100000})
+        saved = self.client.put(
+            "/api/v1/workers/local/aria2/recovery-settings",
+            headers=headers,
+            json={"speed_threshold_bytes_per_second": 0},
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.json(), {"speed_threshold_bytes_per_second": 0})
+        invalid = self.client.put(
+            "/api/v1/workers/local/aria2/recovery-settings",
+            headers=headers,
+            json={"speed_threshold_bytes_per_second": 1_073_741_825},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(self.dispatcher.aria2_recovery_settings_calls[-1], (
+            "local", {"speed_threshold_bytes_per_second": 0}
+        ))
 
     def test_aria2_bridge_is_authenticated_worker_scoped_and_hides_rpc_secret(self):
         denied = self.client.post(

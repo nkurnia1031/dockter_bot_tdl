@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import signal
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 from tme3bot.worker.aria2_runtime import Aria2Runtime
 
@@ -129,6 +131,8 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertEqual(config["bt-load-saved-metadata"], "true")
         self.assertEqual(config["dht-file-path"], str(self.state / "dht.dat"))
         self.assertEqual(config["dht-file-path6"], str(self.state / "dht6.dat"))
+        self.assertEqual(config["lowest-speed-limit"], "0")
+        self.assertEqual(config["max-tries"], "0")
 
     def test_rpc_injects_private_secret_and_clamps_upload_to_workspace(self):
         self.runtime.ensure()
@@ -146,6 +150,8 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertEqual(options["dir"], str(self.destination))
         self.assertEqual(options["allow-overwrite"], "false")
         self.assertEqual(options["auto-file-renaming"], "false")
+        self.assertEqual(options["lowest-speed-limit"], "0")
+        self.assertEqual(options["max-tries"], "0")
         self.assertNotIn(self.server.rpc_secret, json.dumps(result))
 
     def test_rpc_rejects_paths_outside_workspace_and_managed_methods(self):
@@ -289,6 +295,25 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertEqual(len(self.server.calls), before)
 
+    def test_native_speed_abort_and_retry_limit_are_locked_to_disabled_and_unlimited(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        self.runtime.config_file.write_text(
+            "lowest-speed-limit=102400\nmax-tries=7\n", encoding="utf-8"
+        )
+        self.runtime.ensure()
+        config = self.runtime._read_config()
+        self.assertEqual(config["lowest-speed-limit"], "0")
+        self.assertEqual(config["max-tries"], "0")
+
+        before = len(self.server.calls)
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "native-options", "method": "aria2.changeGlobalOption",
+            "params": [{"lowest-speed-limit": "100K", "max-tries": "5"}],
+        })
+        self.assertIn("error", result)
+        self.assertEqual(len(self.server.calls), before)
+
     def test_cancel_and_remove_task_results_leave_workspace_partial_files_untouched(self):
         self.runtime.ensure()
         self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
@@ -309,6 +334,54 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertEqual(removed_result.get("result"), "gid-one")
         self.assertEqual(partial.read_bytes(), b"partial payload")
         self.assertEqual(control.read_bytes(), b"control state")
+
+    def test_intentional_signal_shutdown_does_not_report_aria2_as_failed(self):
+        handlers = {}
+
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.signalled = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -signal.SIGTERM
+
+            def wait(self, timeout=None):
+                del timeout
+                if not self.signalled:
+                    self.signalled = True
+                    handlers[signal.SIGTERM](signal.SIGTERM, None)
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -signal.SIGKILL
+
+        class FakeCoordinator:
+            interval_seconds = 1
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def tick(self):
+                pass
+
+        def install_handler(number, handler):
+            previous = handlers.get(number)
+            handlers[number] = handler
+            return previous
+
+        process = FakeProcess()
+        with (
+            patch("tme3bot.worker.aria2_runtime.subprocess.Popen", return_value=process),
+            patch("tme3bot.worker.aria2_runtime.Aria2RecoveryCoordinator", FakeCoordinator),
+            patch("tme3bot.worker.aria2_runtime.signal.signal", side_effect=install_handler),
+        ):
+            self.runtime.run()
+
+        self.assertEqual(process.returncode, -signal.SIGTERM)
 
 
 if __name__ == "__main__":

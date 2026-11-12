@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 from contextlib import nullcontext
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -16,15 +20,20 @@ from typing import Any
 from urllib.request import ProxyHandler, Request, build_opener
 
 from tme3bot.database_paths import ensure_private_directory
+from tme3bot.worker.aria2_recovery import (
+    Aria2RecoveryCoordinator,
+    Aria2RecoveryStateStore,
+)
 
 
 DEFAULT_RPC_URL = "http://aria2:6800/jsonrpc"
 DEFAULT_HOOK_PATH = Path("/usr/local/bin/aria2-retry-on-low-speed.py")
+LOGGER = logging.getLogger(__name__)
 RPC_OPENER = build_opener(ProxyHandler({}))
 ARIA2_RPC_METHODS = frozenset({
     "aria2.getVersion", "aria2.getSessionInfo", "aria2.getGlobalStat",
     "aria2.getGlobalOption", "aria2.changeGlobalOption", "aria2.tellActive",
-    "aria2.tellWaiting", "aria2.tellStopped", "aria2.getFiles", "aria2.getUris",
+    "aria2.tellWaiting", "aria2.tellStopped", "aria2.tellStatus", "aria2.getFiles", "aria2.getUris",
     "aria2.getPeers", "aria2.getServers", "aria2.getStatus", "aria2.getOption",
     "aria2.changeOption", "aria2.addUri", "aria2.addTorrent", "aria2.addMetalink",
     "aria2.remove", "aria2.forceRemove", "aria2.pause", "aria2.forcePause",
@@ -35,7 +44,7 @@ ARIA2_RPC_METHODS = frozenset({
 SAFE_GLOBAL_OPTIONS = frozenset({
     "max-overall-download-limit", "max-overall-upload-limit",
     "max-concurrent-downloads", "max-connection-per-server", "split",
-    "disk-cache", "lowest-speed-limit", "max-tries", "retry-wait", "timeout",
+    "disk-cache", "retry-wait", "timeout",
     "connect-timeout", "file-allocation",
 })
 BLOCKED_OPTIONS = frozenset({
@@ -71,6 +80,9 @@ class Aria2Runtime:
         self.secret_file = self.state_root / "rpc.secret"
         self.session_file = self.state_root / "aria2.session"
         self.hook_status_file = self.state_root / "aria2-hook-status.json"
+        self.recovery_store = Aria2RecoveryStateStore(
+            self.state_root / "aria2-recovery.json"
+        )
         self._settings_lock = threading.Lock()
 
     def ensure(self) -> None:
@@ -122,11 +134,77 @@ class Aria2Runtime:
             "reason_code": reason_code,
             "engine": engine,
             "hook": hook,
+            "recovery": {
+                "speed_threshold_bytes_per_second": self.recovery_store.get_speed_threshold(),
+                "external_retry_limit": 10,
+            },
         }
 
     def run(self) -> None:
         self.ensure()
-        os.execvp("aria2c", ["aria2c", f"--conf-path={self.config_file}", "--daemon=false"])
+        process = subprocess.Popen(
+            ["aria2c", f"--conf-path={self.config_file}", "--daemon=false"]
+        )
+        secret = self.secret_file.read_text(encoding="utf-8").strip()
+
+        def call(method: str, *params):
+            return self._internal_rpc(secret, method, *params)
+
+        coordinator = Aria2RecoveryCoordinator(
+            call,
+            self.recovery_store,
+            workspace_root=self.workspace_root,
+        )
+        stopping = threading.Event()
+        previous_handlers = {}
+
+        def stop(signum, _frame):
+            del signum
+            stopping.set()
+            if process.poll() is None:
+                process.terminate()
+
+        for signal_number in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signal_number] = signal.signal(signal_number, stop)
+        try:
+            while process.poll() is None and not stopping.is_set():
+                try:
+                    coordinator.tick()
+                except Exception:
+                    # RPC failures can contain transfer URLs or credentials.
+                    LOGGER.warning("Aria2 recovery coordinator tick failed")
+                try:
+                    process.wait(timeout=coordinator.interval_seconds)
+                except subprocess.TimeoutExpired:
+                    pass
+            if process.poll() is None:
+                process.terminate()
+            return_code = process.wait(timeout=10)
+            if return_code and not stopping.is_set():
+                raise SystemExit(return_code)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            for signal_number, handler in previous_handlers.items():
+                signal.signal(signal_number, handler)
+
+    def recovery_settings(self) -> dict[str, int]:
+        return {
+            "speed_threshold_bytes_per_second": self.recovery_store.get_speed_threshold()
+        }
+
+    def update_recovery_settings(self, payload: object) -> dict[str, int]:
+        if not isinstance(payload, dict) or set(payload) != {"speed_threshold_bytes_per_second"}:
+            raise ValueError("Only the Aria2 speed threshold can be changed here.")
+        threshold = self.recovery_store.set_speed_threshold(
+            payload["speed_threshold_bytes_per_second"]
+        )
+        return {"speed_threshold_bytes_per_second": threshold}
 
     def rpc(
         self, request_payload: dict[str, Any], *, requested_directory: str = ""
@@ -297,6 +375,10 @@ class Aria2Runtime:
                 return None, "Download filename is invalid."
         options["allow-overwrite"] = "false"
         options["auto-file-renaming"] = "false"
+        # Existing AriaNg per-download options and restored session entries must
+        # not re-enable Aria2's native slow-speed abort or finite retry cap.
+        options["lowest-speed-limit"] = "0"
+        options["max-tries"] = "0"
         return options, ""
 
     def _ensure_secret(self) -> str:
@@ -353,7 +435,9 @@ class Aria2Runtime:
             "max-connection-per-server": "5",
             "max-overall-download-limit": "0",
             "max-overall-upload-limit": "0",
-            "lowest-speed-limit": "102400",
+            # Native low-speed abort is disabled; the coordinator uses its own
+            # dynamic threshold and never asks aria2 to cancel a slow job.
+            "lowest-speed-limit": "0",
             "max-tries": "0",
             "retry-wait": "0",
             "timeout": "60",
@@ -378,6 +462,8 @@ class Aria2Runtime:
         for key, value in (overrides or {}).items():
             if key in SAFE_GLOBAL_OPTIONS:
                 managed[key] = value
+        managed["lowest-speed-limit"] = "0"
+        managed["max-tries"] = "0"
         return "# aria2 configuration managed by tme3bot\n" + "".join(
             f"{key}={value}\n" for key, value in managed.items()
         )
@@ -436,6 +522,26 @@ class Aria2Runtime:
         version = result.get("version") if isinstance(result, dict) else None
         return str(version) if version else None
 
+    def _internal_rpc(self, secret: str, method: str, *params: object) -> object:
+        body = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "aria2-recovery-coordinator",
+            "method": f"aria2.{method}",
+            "params": [f"token:{secret}", *params],
+        }).encode("utf-8")
+        request = Request(
+            self.rpc_url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with RPC_OPENER.open(request, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        if not isinstance(payload, dict) or "error" in payload:
+            error = payload.get("error", {}) if isinstance(payload, dict) else {}
+            raise RuntimeError(str(error.get("message") or "Aria2 RPC failed."))
+        return payload.get("result")
+
 
 def _safe_global_options(raw_options: dict[str, Any]) -> tuple[dict[str, str] | None, str]:
     options: dict[str, str] = {}
@@ -444,7 +550,7 @@ def _safe_global_options(raw_options: dict[str, Any]) -> tuple[dict[str, str] | 
         value = str(raw_value)
         if key not in SAFE_GLOBAL_OPTIONS:
             return None, "Only safe transfer settings can be changed."
-        if key in {"max-concurrent-downloads", "max-connection-per-server", "split", "max-tries", "retry-wait", "timeout", "connect-timeout"}:
+        if key in {"max-concurrent-downloads", "max-connection-per-server", "split", "retry-wait", "timeout", "connect-timeout"}:
             try:
                 parsed = int(value)
             except ValueError:
@@ -453,7 +559,6 @@ def _safe_global_options(raw_options: dict[str, Any]) -> tuple[dict[str, str] | 
                 "max-concurrent-downloads": (1, 20),
                 "max-connection-per-server": (1, 16),
                 "split": (1, 32),
-                "max-tries": (0, 100),
                 "retry-wait": (0, 3600),
                 "timeout": (1, 600),
                 "connect-timeout": (1, 60),
@@ -461,7 +566,7 @@ def _safe_global_options(raw_options: dict[str, Any]) -> tuple[dict[str, str] | 
             if not bounds[0] <= parsed <= bounds[1]:
                 return None, "Transfer setting value is outside the supported range."
             value = str(parsed)
-        elif key in {"max-overall-download-limit", "max-overall-upload-limit", "disk-cache", "lowest-speed-limit"}:
+        elif key in {"max-overall-download-limit", "max-overall-upload-limit", "disk-cache"}:
             if not re.fullmatch(r"\d+(?:[KMG])?", value, re.IGNORECASE):
                 return None, "Transfer limit format is invalid."
             numeric = int(re.match(r"\d+", value).group(0))

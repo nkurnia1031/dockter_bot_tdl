@@ -2399,11 +2399,18 @@ def register_workers(app, context, *, current_actor):
             hook_run_count = 0
         allowed_hook_results = {
             "never", "retry-queued", "retry-resumed", "retry-resumed-cleanup-error",
-            "ignored-not-low-speed", "skipped-state-changed", "hook-error", "unknown",
+            "ignored-not-low-speed", "ignored-low-speed-coordinator",
+            "coordinator-observes-error", "missing-gid", "skipped-state-changed",
+            "hook-error", "unknown",
         }
         hook_last_result = str(hook.get("last_result") or "unknown")
         if hook_last_result not in allowed_hook_results:
             hook_last_result = "unknown"
+        recovery = raw.get("recovery") if isinstance(raw.get("recovery"), dict) else {}
+        try:
+            speed_threshold = int(recovery.get("speed_threshold_bytes_per_second", 100_000))
+        except (TypeError, ValueError):
+            speed_threshold = 100_000
         return {
             "worker": name,
             "ready": raw.get("ready") is True,
@@ -2420,7 +2427,56 @@ def register_workers(app, context, *, current_actor):
                 "last_run_at": str(hook.get("last_run_at") or "")[:40] or None,
                 "last_result": hook_last_result,
             },
+            "recovery": {
+                "speed_threshold_bytes_per_second": max(0, min(1_073_741_824, speed_threshold)),
+                "external_retry_limit": 10,
+            },
         }
+
+    @app.get("/api/v1/workers/{name}/aria2/recovery-settings")
+    def aria2_recovery_settings(name: str, actor=Depends(current_actor)):
+        del actor
+        if context.worker_registry.get(name) is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        get_settings = getattr(context.worker_dispatcher, "aria2_recovery_settings", None)
+        if not callable(get_settings):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung Aria2.", status_code=409)
+        try:
+            result = get_settings(name)
+        except Exception:
+            raise DomainError("ARIA2_WORKER_UNAVAILABLE", "Pengaturan pemulihan Aria2 tidak dapat dimuat.", status_code=503) from None
+        if not isinstance(result, dict):
+            result = {}
+        try:
+            threshold = int(result.get("speed_threshold_bytes_per_second", 100_000))
+        except (TypeError, ValueError):
+            threshold = 100_000
+        return {"speed_threshold_bytes_per_second": max(0, min(1_073_741_824, threshold))}
+
+    @app.put("/api/v1/workers/{name}/aria2/recovery-settings")
+    def update_aria2_recovery_settings(name: str, body: dict, actor=Depends(current_actor)):
+        del actor
+        record = context.worker_registry.get(name)
+        if record is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        if not bool(record.get("enabled", True)):
+            raise DomainError("WORKER_DISABLED", "Worker sedang nonaktif.", status_code=409)
+        value = body.get("speed_threshold_bytes_per_second") if isinstance(body, dict) else None
+        if not isinstance(body, dict) or set(body) != {"speed_threshold_bytes_per_second"}:
+            raise DomainError("ARIA2_RECOVERY_SETTINGS_INVALID", "Hanya ambang pemulihan yang dapat diubah.", status_code=422)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise DomainError("ARIA2_RECOVERY_SETTINGS_INVALID", "Ambang harus berupa bilangan bulat.", status_code=422)
+        threshold = value
+        if threshold < 0 or threshold > 1_073_741_824:
+            raise DomainError("ARIA2_RECOVERY_SETTINGS_INVALID", "Ambang di luar rentang yang didukung.", status_code=422)
+        update = getattr(context.worker_dispatcher, "update_aria2_recovery_settings", None)
+        if not callable(update):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung Aria2.", status_code=409)
+        try:
+            update(name, {"speed_threshold_bytes_per_second": threshold})
+        except Exception:
+            raise DomainError("ARIA2_WORKER_UNAVAILABLE", "Pengaturan pemulihan Aria2 tidak dapat disimpan.", status_code=503) from None
+        return {"speed_threshold_bytes_per_second": threshold}
 
     @app.post("/api/v1/aria2-rpc-{name}")
     def aria2_rpc_proxy(name: str, body: dict, actor=Depends(current_actor)):

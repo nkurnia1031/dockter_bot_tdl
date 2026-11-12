@@ -836,6 +836,26 @@ class WorkerHttpDispatcher:
             timeout=8,
         )
 
+    def aria2_recovery_settings(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "GET",
+            "/internal/v1/aria2/recovery-settings", timeout=8,
+        )
+
+    def update_aria2_recovery_settings(
+        self, worker: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "PUT",
+            "/internal/v1/aria2/recovery-settings", payload, timeout=8,
+        )
+
     def aria2_rpc(self, worker: str, request_payload: dict[str, Any]) -> dict[str, Any]:
         record = self.worker_registry.get(worker)
         if not record:

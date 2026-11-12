@@ -19,15 +19,15 @@
       last_run_at?: string | null;
       last_result?: string;
     };
+    recovery?: { speed_threshold_bytes_per_second: number; external_retry_limit?: number };
   };
+  type RecoverySettings = { speed_threshold_bytes_per_second: number };
   type TransferSettings = {
     'max-overall-download-limit': string;
     'max-overall-upload-limit': string;
     'max-concurrent-downloads': string;
     'max-connection-per-server': string;
     split: string;
-    'lowest-speed-limit': string;
-    'max-tries': string;
     'retry-wait': string;
     timeout: string;
     'connect-timeout': string;
@@ -42,8 +42,6 @@
     'max-concurrent-downloads': '3',
     'max-connection-per-server': '5',
     split: '5',
-    'lowest-speed-limit': '102400',
-    'max-tries': '0',
     'retry-wait': '0',
     timeout: '60',
     'connect-timeout': '10',
@@ -55,8 +53,6 @@
     { key: 'max-concurrent-downloads', label: 'Unduhan bersamaan', hint: '1–20.' },
     { key: 'max-connection-per-server', label: 'Koneksi per server', hint: '1–16.' },
     { key: 'split', label: 'Koneksi per unduhan', hint: '1–32.' },
-    { key: 'lowest-speed-limit', label: 'Batas minimum hook', hint: '0 menonaktifkan batas; contoh 100K.', text: true },
-    { key: 'max-tries', label: 'Jumlah percobaan', hint: '0 tanpa batas; maksimum 100.' },
     { key: 'retry-wait', label: 'Jeda retry (detik)', hint: '0–3600.' },
     { key: 'timeout', label: 'Timeout (detik)', hint: '1–600.' },
     { key: 'connect-timeout', label: 'Timeout koneksi (detik)', hint: '1–60.' },
@@ -76,6 +72,11 @@
   let savingSettings = $state(false);
   let settingsMessage = $state('');
   let settingsError = $state('');
+  let recoveryThreshold = $state(100000);
+  let loadingRecoverySettings = $state(false);
+  let savingRecoverySettings = $state(false);
+  let recoverySettingsMessage = $state('');
+  let recoverySettingsError = $state('');
   let settingsOpen = $state(false);
   let folderPickerOpen = $state(false);
   let folderSelectionBeforeOpen: string[] = [];
@@ -144,6 +145,52 @@
       if (worker === selectedWorker) settingsError = cause instanceof Error ? cause.message : 'Pengaturan aria2 gagal dimuat.';
     } finally {
       if (worker === selectedWorker) loadingSettings = false;
+    }
+  }
+
+  async function loadRecoverySettings(worker = selectedWorker) {
+    if (!worker) return;
+    loadingRecoverySettings = true;
+    recoverySettingsError = '';
+    recoverySettingsMessage = '';
+    try {
+      const result = await api<RecoverySettings>(`/workers/${encodeURIComponent(worker)}/aria2/recovery-settings`);
+      if (worker === selectedWorker) recoveryThreshold = result.speed_threshold_bytes_per_second;
+    } catch (cause) {
+      if (worker === selectedWorker) recoverySettingsError = cause instanceof Error ? cause.message : 'Ambang pemulihan gagal dimuat.';
+    } finally {
+      if (worker === selectedWorker) loadingRecoverySettings = false;
+    }
+  }
+
+  async function saveRecoverySettings() {
+    const worker = selectedWorker;
+    if (!worker || !Number.isSafeInteger(recoveryThreshold) || recoveryThreshold < 0 || recoveryThreshold > 1_073_741_824) {
+      recoverySettingsError = 'Ambang harus berupa bilangan bulat 0–1.073.741.824 B/s.';
+      return;
+    }
+    savingRecoverySettings = true;
+    recoverySettingsError = '';
+    recoverySettingsMessage = '';
+    try {
+      const result = await api<RecoverySettings>(`/workers/${encodeURIComponent(worker)}/aria2/recovery-settings`, {
+        method: 'PUT',
+        body: JSON.stringify({ speed_threshold_bytes_per_second: recoveryThreshold })
+      });
+      if (worker === selectedWorker) {
+        recoveryThreshold = result.speed_threshold_bytes_per_second;
+        if (health?.worker === worker) {
+          health = {
+            ...health,
+            recovery: { ...health.recovery, speed_threshold_bytes_per_second: recoveryThreshold }
+          };
+        }
+        recoverySettingsMessage = 'Ambang diperbarui langsung untuk unduhan worker ini.';
+      }
+    } catch (cause) {
+      if (worker === selectedWorker) recoverySettingsError = cause instanceof Error ? cause.message : 'Ambang pemulihan gagal disimpan.';
+    } finally {
+      if (worker === selectedWorker) savingRecoverySettings = false;
     }
   }
 
@@ -235,7 +282,7 @@
       health = result;
       if (result.ready) {
         iframeSrc = makeAriaNgUrl(name);
-        await loadSettings(name);
+        await Promise.all([loadSettings(name), loadRecoverySettings(name)]);
       }
     } catch (cause) {
       if (name === selectedWorker) {
@@ -258,6 +305,11 @@
     loadingSettings = false;
     savingSettings = false;
     settingsError = '';
+    loadingRecoverySettings = false;
+    savingRecoverySettings = false;
+    recoveryThreshold = 100000;
+    recoverySettingsMessage = '';
+    recoverySettingsError = '';
     settingsMessage = '';
     settingsOpen = false;
     void inspect(selectedWorker);
@@ -321,9 +373,10 @@
             {health.ready ? 'Siap' : health.reason_code || 'Belum siap'}
           </span>
           <span class="muted text-sm">Engine: {health.engine.ready ? `aria2 ${health.engine.version || ''}` : 'tidak tersedia'}</span>
-          <span class="muted text-sm">Hook low-speed: {health.hook.ready ? 'siap' : 'tidak siap'}</span>
+          <span class="muted text-sm">Hook pemantau: {health.hook.ready ? 'siap' : 'tidak siap'}</span>
+          {#if health.recovery}<span class="muted text-sm">Ambang: {health.recovery.speed_threshold_bytes_per_second.toLocaleString()} B/s</span>{/if}
           {#if health.hook.last_result && health.hook.last_result !== 'never'}
-            <span class="muted text-sm">Percobaan hook terakhir: {health.hook.last_result}</span>
+            <span class="muted text-sm">Pemanggilan hook terakhir: {health.hook.last_result}</span>
           {/if}
         </div>
       {/if}
@@ -360,7 +413,7 @@
         <div>
           <p class="eyebrow">WORKER {selectedWorker}</p>
           <h2 id="aria2-settings-title" class="mt-1 text-xl font-extrabold">Pengaturan transfer</h2>
-          <p class="muted mt-1 text-sm">Limit dan retry tersimpan di database worker; RPC dan hook tetap dikelola backend.</p>
+          <p class="muted mt-1 text-sm">Pengaturan transfer aria2 dan ambang pengendali disimpan terpisah di database worker.</p>
         </div>
         <button bind:this={settingsCloseButton} class="button secondary !p-2" onclick={closeSettings} aria-label="Tutup pengaturan"><X size={17}/></button>
       </header>
@@ -374,6 +427,28 @@
           </label>
         {/each}
       </div>
+      <section class="mt-5 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-4" aria-labelledby="aria2-recovery-title">
+        <div class="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h3 id="aria2-recovery-title" class="font-extrabold">Pemulihan kecepatan</h3>
+            <p class="muted mt-1 max-w-2xl text-xs">Ambang rata-rata unduhan setelah pemanasan 60 detik. Pemantau memberi 10 detik pengukuran, lalu pause 3 detik dan resume. Nilai 0 menonaktifkan pemulihan kecepatan; retry error tetap aktif.</p>
+          </div>
+          <label class="w-full text-sm font-bold sm:max-w-xs">Ambang (B/s)
+            <input class="field mt-1" type="number" min="0" max="1073741824" step="1" bind:value={recoveryThreshold} disabled={loadingRecoverySettings || savingRecoverySettings} />
+            <span class="muted mt-1 block text-xs font-normal">Default 100.000 B/s · retry error eksternal maksimal 10 kali; retry bawaan aria2 tetap tanpa batas.</span>
+          </label>
+        </div>
+        {#if recoverySettingsError}<div class="alert error mt-3" role="alert">{recoverySettingsError}</div>{/if}
+        {#if recoverySettingsMessage}<div class="alert success mt-3" role="status">{recoverySettingsMessage}</div>{/if}
+        <div class="mt-3 flex flex-wrap justify-end gap-2">
+          <button class="button secondary" onclick={() => loadRecoverySettings()} disabled={loadingRecoverySettings || savingRecoverySettings}>
+            <RefreshCw size={15} class={loadingRecoverySettings ? 'animate-spin' : ''}/>{loadingRecoverySettings ? 'Memuat…' : 'Muat ambang'}
+          </button>
+          <button class="button primary" onclick={saveRecoverySettings} disabled={loadingRecoverySettings || savingRecoverySettings}>
+            <Save size={15}/>{savingRecoverySettings ? 'Menyimpan…' : 'Simpan ambang'}
+          </button>
+        </div>
+      </section>
       <footer class="mt-5 flex flex-wrap justify-between gap-2 border-t border-[var(--line)] pt-4">
         <button class="button secondary" onclick={() => loadSettings()} disabled={loadingSettings || savingSettings}>
           <RefreshCw size={15} class={loadingSettings ? 'animate-spin' : ''}/>{loadingSettings ? 'Memuat…' : 'Muat pengaturan'}

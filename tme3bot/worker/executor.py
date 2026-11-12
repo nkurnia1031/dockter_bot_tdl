@@ -293,6 +293,12 @@ class WorkerJobExecutor(
     def aria2_health(self) -> dict[str, object]:
         return self.aria2_runtime.health()
 
+    def aria2_recovery_settings(self) -> dict[str, int]:
+        return self.aria2_runtime.recovery_settings()
+
+    def update_aria2_recovery_settings(self, payload: object) -> dict[str, int]:
+        return self.aria2_runtime.update_recovery_settings(payload)
+
     def aria2_rpc(
         self, request_payload: dict[str, Any], *, requested_directory: str = ""
     ) -> dict[str, Any]:

@@ -549,6 +549,51 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             )
         return probe()
 
+    @app.get("/internal/v1/aria2/recovery-settings", dependencies=[Depends(authorize)])
+    def aria2_recovery_settings():
+        probe = getattr(context.executor, "aria2_recovery_settings", None)
+        if not callable(probe):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pengaturan pemulihan Aria2.",
+                status_code=404,
+            )
+        return probe()
+
+    @app.put("/internal/v1/aria2/recovery-settings", dependencies=[Depends(authorize)])
+    def update_aria2_recovery_settings(body: dict[str, Any]):
+        if not isinstance(body, dict) or set(body) != {"speed_threshold_bytes_per_second"}:
+            raise DomainError(
+                "ARIA2_RECOVERY_SETTINGS_INVALID",
+                "Hanya ambang pemulihan yang dapat diubah.",
+                status_code=422,
+            )
+        threshold = body.get("speed_threshold_bytes_per_second")
+        if (
+            isinstance(threshold, bool)
+            or not isinstance(threshold, int)
+            or threshold < 0
+            or threshold > 1_073_741_824
+        ):
+            raise DomainError(
+                "ARIA2_RECOVERY_SETTINGS_INVALID",
+                "Ambang harus berupa bilangan bulat 0–1.073.741.824 B/s.",
+                status_code=422,
+            )
+        update = getattr(context.executor, "update_aria2_recovery_settings", None)
+        if not callable(update):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung pengaturan pemulihan Aria2.",
+                status_code=404,
+            )
+        try:
+            return update(body)
+        except ValueError as exc:
+            raise DomainError(
+                "ARIA2_RECOVERY_SETTINGS_INVALID", str(exc), status_code=422
+            ) from exc
+
     @app.post("/internal/v1/aria2/jsonrpc", dependencies=[Depends(authorize)])
     def aria2_jsonrpc(body: dict[str, Any]):
         if len(json.dumps(body, separators=(",", ":")).encode("utf-8")) > 16 * 1024 * 1024:

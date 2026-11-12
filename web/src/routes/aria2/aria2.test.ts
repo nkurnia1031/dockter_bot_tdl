@@ -30,8 +30,13 @@ describe('AriaNg worker readiness', () => {
       if (path === '/workers/remote-1/aria2/health') return {
         worker: 'remote-1', ready: true, reason_code: '',
         engine: { ready: true, version: '1.36.0' },
-        hook: { ready: true, script_present: true, configured: true, run_count: 1, last_result: 'retry-resumed' }
+        hook: { ready: true, script_present: true, configured: true, run_count: 1, last_result: 'retry-resumed' },
+        recovery: { speed_threshold_bytes_per_second: 100000, external_retry_limit: 10 }
       };
+      if (path === '/workers/remote-1/aria2/recovery-settings' && init?.method === 'PUT') {
+        return JSON.parse(String(init.body));
+      }
+      if (path === '/workers/remote-1/aria2/recovery-settings') return { speed_threshold_bytes_per_second: 100000 };
       throw new Error(`Unexpected request ${path}`);
     });
   });
@@ -41,7 +46,7 @@ describe('AriaNg worker readiness', () => {
     await screen.findByText('remote-1');
     const frame = await screen.findByTitle('aria2 remote-1');
     expect(screen.getByText('Engine: aria2 1.36.0')).toBeTruthy();
-    expect(screen.getByText('Hook low-speed: siap')).toBeTruthy();
+    expect(screen.getByText('Hook pemantau: siap')).toBeTruthy();
     expect(frame.getAttribute('src')).toContain('/api/v1/aria2-ui/remote-1/index.html');
     const iframeUrl = new URL(frame.getAttribute('src')!, window.location.origin);
     const iframeConfig = new URLSearchParams(iframeUrl.hash.split('?')[1] || '');
@@ -75,6 +80,26 @@ describe('AriaNg worker readiness', () => {
     const payload = JSON.parse(String(saveCall?.[1]?.body));
     expect(payload.params[0]['max-overall-download-limit']).toBe('2M');
     expect(JSON.stringify(payload)).not.toContain('rpc-secret');
+    expect(payload.params[0]).not.toHaveProperty('lowest-speed-limit');
+    expect(payload.params[0]).not.toHaveProperty('max-tries');
+  });
+
+  it('loads and updates the live adaptive speed threshold separately from native aria2 settings', async () => {
+    render(Aria2Page);
+    await screen.findByTitle('aria2 remote-1');
+    await fireEvent.click(screen.getByRole('button', { name: 'Pengaturan transfer' }));
+    await screen.findByRole('dialog', { name: 'Pengaturan transfer' });
+    const threshold = await screen.findByLabelText(/Ambang \(B\/s\)/);
+    expect((threshold as HTMLInputElement).value).toBe('100000');
+
+    await fireEvent.input(threshold, { target: { value: '0' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Simpan ambang' }));
+    await screen.findByText('Ambang diperbarui langsung untuk unduhan worker ini.');
+    expect(apiMock).toHaveBeenCalledWith('/workers/remote-1/aria2/recovery-settings', expect.objectContaining({
+      method: 'PUT',
+      body: JSON.stringify({ speed_threshold_bytes_per_second: 0 })
+    }));
+    expect(apiMock.mock.calls.some(([path]) => String(path).includes('rpc-secret'))).toBe(false);
   });
 
   it('opens the workspace folder picker separately and preserves the selected folder', async () => {

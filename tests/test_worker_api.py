@@ -38,6 +38,7 @@ class FakeExecutor:
             "engine": {"ready": True, "version": "1.36.0"},
             "hook": {"ready": True, "script_present": True, "configured": True},
         }
+        self.aria2_recovery_settings_value = {"speed_threshold_bytes_per_second": 100000}
         self.aria2_rpc_calls = []
         self.aria2_ui_root = None
         self.profile_readiness_canary_requests = []
@@ -191,6 +192,13 @@ class FakeExecutor:
 
     def aria2_health(self):
         return dict(self.aria2_health_result)
+
+    def aria2_recovery_settings(self):
+        return dict(self.aria2_recovery_settings_value)
+
+    def update_aria2_recovery_settings(self, payload):
+        self.aria2_recovery_settings_value = dict(payload)
+        return dict(payload)
 
     def aria2_rpc(self, payload, *, requested_directory=""):
         self.aria2_rpc_calls.append((dict(payload), requested_directory))
@@ -864,6 +872,39 @@ class WorkerApiTests(unittest.TestCase):
         self.assertTrue(response.json()["ready"])
         self.assertEqual(response.json()["engine"]["version"], "1.36.0")
         self.assertNotIn("secret", response.text.lower())
+
+    def test_aria2_recovery_settings_are_worker_authenticated_and_validate_threshold(self):
+        denied = self.client.get("/internal/v1/aria2/recovery-settings")
+        self.assertEqual(denied.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        current = self.client.get("/internal/v1/aria2/recovery-settings", headers=headers)
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(current.json(), {"speed_threshold_bytes_per_second": 100000})
+        changed = self.client.put(
+            "/internal/v1/aria2/recovery-settings",
+            headers=headers,
+            json={"speed_threshold_bytes_per_second": 0},
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertEqual(changed.json(), {"speed_threshold_bytes_per_second": 0})
+        invalid = self.client.put(
+            "/internal/v1/aria2/recovery-settings",
+            headers=headers,
+            json={"speed_threshold_bytes_per_second": -1},
+        )
+        self.assertEqual(invalid.status_code, 422)
+        invalid_boolean = self.client.put(
+            "/internal/v1/aria2/recovery-settings",
+            headers=headers,
+            json={"speed_threshold_bytes_per_second": True},
+        )
+        self.assertEqual(invalid_boolean.status_code, 422)
+        invalid_extra = self.client.put(
+            "/internal/v1/aria2/recovery-settings",
+            headers=headers,
+            json={"speed_threshold_bytes_per_second": 100000, "max-tries": 0},
+        )
+        self.assertEqual(invalid_extra.status_code, 422)
 
     def test_aria2_rpc_and_assets_require_worker_auth(self):
         payload = {"jsonrpc": "2.0", "id": "one", "method": "aria2.getVersion", "params": []}
