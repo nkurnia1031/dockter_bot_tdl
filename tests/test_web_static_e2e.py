@@ -16,6 +16,12 @@ RUN_E2E = os.environ.get("TME3_RUN_WEB_STATIC_E2E") == "1"
 
 
 class QuietStaticHandler(SimpleHTTPRequestHandler):
+    def send_head(self):
+        requested_path = urlsplit(self.path).path
+        if not Path(self.translate_path(requested_path)).exists() and not Path(requested_path).suffix:
+            self.path = "/200.html"
+        return super().send_head()
+
     def log_message(self, _format: str, *_args: object) -> None:
         pass
 
