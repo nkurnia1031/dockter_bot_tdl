@@ -61,6 +61,7 @@
 
   let workers: Worker[] = $state([]);
   let selectedWorker = $state('');
+  let ariaNgZoom = $state(100);
   let selectedFolders = $state<string[]>([]);
   let health = $state<Health | null>(null);
   let iframeSrc = $state('');
@@ -102,6 +103,20 @@
   }
 
   function folderStorageKey(worker: string) { return `tme3-aria2-folder:${worker}`; }
+  function zoomStorageKey(worker: string) { return `tme3-aria2-zoom:${worker}`; }
+  function readZoom(worker: string) {
+    if (typeof window === 'undefined') return 100;
+    const stored = Number(localStorage.getItem(zoomStorageKey(worker)));
+    if (!Number.isFinite(stored) || stored < 80 || stored > 150) return 100;
+    return 80 + Math.round((stored - 80) / 10) * 10;
+  }
+  function setZoom(value: number) {
+    if (!selectedWorker) return;
+    ariaNgZoom = Math.max(80, Math.min(150, Math.round(value / 10) * 10));
+    localStorage.setItem(zoomStorageKey(selectedWorker), String(ariaNgZoom));
+  }
+  function changeZoom(amount: number) { setZoom(ariaNgZoom + amount); }
+  function resetZoom() { setZoom(100); }
   function selectedFolder(worker = selectedWorker) {
     return selectedFolders[0] || (typeof window !== 'undefined' ? localStorage.getItem(folderStorageKey(worker)) : '') || '/workspace/aria2';
   }
@@ -262,7 +277,10 @@
           ? [localStorage.getItem(folderStorageKey(selectedWorker)) || '/workspace/aria2']
           : [];
       }
-      if (selectedWorker) await inspect(selectedWorker);
+      if (selectedWorker) {
+        ariaNgZoom = readZoom(selectedWorker);
+        await inspect(selectedWorker);
+      }
     } catch (cause) {
       error = cause instanceof Error ? cause.message : 'Daftar worker gagal dimuat.';
     } finally {
@@ -296,6 +314,7 @@
 
   function changeWorker(event: Event) {
     selectedWorker = (event.currentTarget as HTMLSelectElement).value;
+    ariaNgZoom = readZoom(selectedWorker);
     selectedFolders = selectedWorker
       ? [localStorage.getItem(folderStorageKey(selectedWorker)) || '/workspace/aria2']
       : [];
@@ -383,9 +402,16 @@
     </div>
 
     {#if health?.ready}
-      <div class="card min-w-0 overflow-hidden p-0">
+      <div class="card min-w-0 overflow-auto p-0">
         {#if iframeSrc}
-          <iframe class="h-[calc(100vh-16rem)] min-h-[480px] w-full border-0 bg-white sm:min-h-[520px]" src={iframeSrc} title={`aria2 ${selectedWorker}`} referrerpolicy="no-referrer"></iframe>
+          <div class="flex items-center justify-end gap-1 border-b border-[var(--line)] bg-[var(--panel)] px-3 py-2" role="group" aria-label="Zoom AriaNg">
+            <span class="muted mr-2 text-xs">Zoom</span>
+            <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(-10)} disabled={ariaNgZoom <= 80} aria-label="Perkecil tampilan AriaNg" title="Perkecil tampilan">−</button>
+            <output class="min-w-12 text-center text-sm font-semibold tabular-nums" aria-live="polite">{ariaNgZoom}%</output>
+            <button class="button secondary !px-2 !py-1" onclick={resetZoom} aria-label="Reset zoom AriaNg" title="Reset zoom">Reset</button>
+            <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(10)} disabled={ariaNgZoom >= 150} aria-label="Perbesar tampilan AriaNg" title="Perbesar tampilan">+</button>
+          </div>
+          <iframe class="h-[calc(100vh-18rem)] min-h-[460px] w-full border-0 bg-white sm:min-h-[500px]" style={`zoom: ${ariaNgZoom / 100};`} src={iframeSrc} title={`aria2 ${selectedWorker}`} referrerpolicy="no-referrer"></iframe>
         {:else}
           <div class="grid min-h-[480px] place-items-center p-8 text-center">
             <div><Activity class="mx-auto mb-3 text-violet-500" size={28}/><h2 class="font-extrabold">Aria2 belum siap</h2><p class="muted mt-1 text-sm">Perbaiki status engine dan hook worker, lalu periksa layanan kembali.</p></div>

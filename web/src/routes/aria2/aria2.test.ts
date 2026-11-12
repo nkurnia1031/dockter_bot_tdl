@@ -12,12 +12,15 @@ describe('AriaNg worker readiness', () => {
     vi.clearAllMocks();
     window.localStorage.clear();
     apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
-      if (path === '/workers') return { items: [{ name: 'remote-1', enabled: true }] };
+      if (path === '/workers') return { items: [
+        { name: 'remote-1', enabled: true },
+        { name: 'remote-2', enabled: true }
+      ] };
       if (path.startsWith('/utility/tree?')) return {
         path: '/workspace',
         items: [{ name: 'aria2', path: '/workspace/aria2', kind: 'directory', directories: 0, files: 0 }]
       };
-      if (path === '/aria2-rpc-remote-1' && init?.method === 'POST') {
+      if (path.startsWith('/aria2-rpc-') && init?.method === 'POST') {
         const request = JSON.parse(String(init.body));
         if (request.method === 'aria2.getGlobalOption') return { result: {
           'max-overall-download-limit': '0', 'max-overall-upload-limit': '0',
@@ -27,16 +30,17 @@ describe('AriaNg worker readiness', () => {
         } };
         if (request.method === 'aria2.changeGlobalOption') return { result: 'OK' };
       }
-      if (path === '/workers/remote-1/aria2/health') return {
-        worker: 'remote-1', ready: true, reason_code: '',
+      const healthMatch = path.match(/^\/workers\/([^/]+)\/aria2\/health$/);
+      if (healthMatch) return {
+        worker: healthMatch[1], ready: true, reason_code: '',
         engine: { ready: true, version: '1.36.0' },
         hook: { ready: true, script_present: true, configured: true, run_count: 1, last_result: 'retry-resumed' },
         recovery: { speed_threshold_bytes_per_second: 100000, external_retry_limit: 10 }
       };
-      if (path === '/workers/remote-1/aria2/recovery-settings' && init?.method === 'PUT') {
+      if (/^\/workers\/[^/]+\/aria2\/recovery-settings$/.test(path) && init?.method === 'PUT') {
         return JSON.parse(String(init.body));
       }
-      if (path === '/workers/remote-1/aria2/recovery-settings') return { speed_threshold_bytes_per_second: 100000 };
+      if (/^\/workers\/[^/]+\/aria2\/recovery-settings$/.test(path)) return { speed_threshold_bytes_per_second: 100000 };
       throw new Error(`Unexpected request ${path}`);
     });
   });
@@ -114,5 +118,41 @@ describe('AriaNg worker readiness', () => {
     const selectedFolder = await screen.findByRole('radio', { name: 'Pilih aria2' });
     expect((selectedFolder as HTMLInputElement).checked).toBe(true);
     expect(apiMock).toHaveBeenCalledWith('/utility/tree?path=%2Fworkspace&worker=remote-1');
+  });
+
+  it('zooms AriaNg and remembers a separate zoom level for each worker', async () => {
+    render(Aria2Page);
+    await screen.findByTitle('aria2 remote-1');
+    expect(screen.getByText('100%')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Perbesar tampilan AriaNg' }));
+    expect(screen.getByText('110%')).toBeTruthy();
+    expect(window.localStorage.getItem('tme3-aria2-zoom:remote-1')).toBe('110');
+
+    const workerPicker = screen.getByRole('combobox', { name: 'Worker' });
+    await fireEvent.change(workerPicker, { target: { value: 'remote-2' } });
+    await screen.findByTitle('aria2 remote-2');
+    expect(screen.getByText('100%')).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Perbesar tampilan AriaNg' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Perbesar tampilan AriaNg' }));
+    expect(screen.getByText('120%')).toBeTruthy();
+
+    await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
+    await screen.findByTitle('aria2 remote-1');
+    expect(screen.getByText('110%')).toBeTruthy();
+    expect(window.localStorage.getItem('tme3-aria2-zoom:remote-2')).toBe('120');
+  });
+
+  it('bounds zoom changes and resets the selected worker to 100 percent', async () => {
+    window.localStorage.setItem('tme3-aria2-zoom:remote-1', '150');
+    render(Aria2Page);
+    await screen.findByTitle('aria2 remote-1');
+    expect(screen.getByText('150%')).toBeTruthy();
+    expect((screen.getByRole('button', { name: 'Perbesar tampilan AriaNg' }) as HTMLButtonElement).disabled).toBe(true);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Reset zoom AriaNg' }));
+    expect(screen.getByText('100%')).toBeTruthy();
+    expect(window.localStorage.getItem('tme3-aria2-zoom:remote-1')).toBe('100');
   });
 });
