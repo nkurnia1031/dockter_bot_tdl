@@ -36,6 +36,38 @@ jobs:
       - name: Run backend tests
         run: python -m unittest discover -s tests -v
 
+  utility-extract-e2e:
+    name: Utility archive extraction E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install archive tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends p7zip-full unar
+          command -v 7z
+          command -v unar
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run archive extraction end-to-end matrix
+        env:
+          TME3_RUN_UTILITY_EXTRACT_E2E: "1"
+        run: python -m unittest tests.test_utility_extract_e2e -v
+
   web:
     name: Web checks, tests, and build
     runs-on: ubuntu-24.04
