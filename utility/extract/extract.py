@@ -98,21 +98,22 @@ def _unique_output_directory(filepath: Path) -> Path:
         suffix += 1
 
 
-def _command_for(filepath: Path, password: str, output: Path) -> list[str]:
+def _command_for(
+    filepath: Path, password: str | None, output: Path
+) -> list[str]:
     lower = filepath.name.lower()
     if lower.endswith((".7z", ".7z.001", ".zip")):
-        return ["7z", "x", f"-p{password}", "-y", str(filepath), f"-o{output}", "-bsp0"]
+        command = ["7z", "x"]
+        if password is not None:
+            command.append(f"-p{password}")
+        command.extend(["-y", str(filepath), f"-o{output}", "-bsp0"])
+        return command
     if lower.endswith(".rar"):
-        return [
-            "unar",
-            "-force-overwrite",
-            "-no-directory",
-            "-password",
-            password,
-            "-output-directory",
-            str(output),
-            str(filepath),
-        ]
+        command = ["unar", "-force-overwrite", "-no-directory"]
+        if password is not None:
+            command.extend(["-password", password])
+        command.extend(["-output-directory", str(output), str(filepath)])
+        return command
     raise ValueError("Format arsip tidak didukung.")
 
 
@@ -176,7 +177,7 @@ def _remove_archive_parts(filepath: Path) -> str:
 
 def _attempt_archive(
     filepath: Path,
-    password: str,
+    password: str | None,
     *,
     index: int,
     total: int,
@@ -236,7 +237,7 @@ def _finalize_result(
         "output": str(output) if output is not None else None,
         "cleanup_status": cleanup_status,
         "error": (
-            "Semua kandidat password gagal atau arsip tidak dapat diekstrak."
+            "Ekstraksi tanpa password maupun dengan kandidat yang tersedia gagal."
             if status == "failed"
             else None
         ),
@@ -260,13 +261,17 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
     succeeded = 0
 
     for index, filepath in enumerate(archives, start=1):
-        tried: list[str] = []
+        tried: list[str | None] = []
         output: Path | None = None
         candidates = archive_password_candidates(filepath, supplied_password)
         for candidate in candidates:
             if candidate not in password_pool:
                 password_pool.append(candidate)
-        for attempt, candidate in enumerate(candidates, start=1):
+        # Some archive tools reject an unrelated explicit password even when
+        # the archive is not encrypted. Try the established candidates first,
+        # then run once without any password option.
+        first_pass_candidates: list[str | None] = [*candidates, None]
+        for attempt, candidate in enumerate(first_pass_candidates, start=1):
             tried.append(candidate)
             ok, output = _attempt_archive(
                 filepath,
