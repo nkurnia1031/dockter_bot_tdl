@@ -11,6 +11,32 @@ from tme3bot.utility import UtilityFlattenPreviewStaleError, UtilityRunner
 
 
 class UtilityFeatureTests(unittest.TestCase):
+    def _fake_partial_unar(self, root: Path) -> tuple[Path, dict[str, str]]:
+        bin_root = root / "bin"
+        bin_root.mkdir(parents=True)
+        executable = bin_root / "unar"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "output = Path(args[args.index('-output-directory') + 1])\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "(output / 'good.txt').write_text('ok', encoding='utf-8')\n"
+            "(output / 'broken.txt').write_text('partial bytes', encoding='utf-8')\n"
+            "with open(os.environ['UTILITY_TEST_CALLS'], 'a', encoding='utf-8') as f:\n"
+            "    f.write('attempt\\n')\n"
+            "print('good.txt (2 B)... OK.')\n"
+            "print('broken.txt (13 B)... Failed! (read error)')\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return bin_root, {
+            "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+            "UTILITY_TEST_CALLS": str(root / "calls.txt"),
+        }
+
     def _fake_7z(self, root: Path, passwords: dict[str, str]) -> tuple[Path, dict[str, str]]:
         bin_root = root / "bin"
         bin_root.mkdir(parents=True)
@@ -27,6 +53,7 @@ class UtilityFeatureTests(unittest.TestCase):
             "(output / 'partial.txt').write_text('partial', encoding='utf-8')\n"
             "accepted = json.loads(os.environ['UTILITY_TEST_PASSWORDS'])\n"
             "if password != accepted.get(archive.name):\n"
+            "    print(f'ERROR: Wrong password : {output / \"partial.txt\"}')\n"
             "    raise SystemExit(2)\n"
             "(output / 'partial.txt').unlink()\n"
             "(output / 'contents.txt').write_text('extracted', encoding='utf-8')\n",
@@ -38,6 +65,45 @@ class UtilityFeatureTests(unittest.TestCase):
             "UTILITY_TEST_PASSWORDS": json.dumps(passwords),
         }
         return bin_root, env
+
+    def test_extract_keeps_successful_members_when_another_member_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "partial-archive"
+            folder.mkdir()
+            archive = folder / "sample.rar"
+            archive.write_bytes(b"archive")
+            bin_root, env = self._fake_partial_unar(root)
+            progress: list[dict[str, object]] = []
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                progress_callback=progress.append,
+                workspace_root=root,
+            )
+
+            with patch.dict(os.environ, env):
+                result = runner.run("extract", [str(folder)])
+
+            self.assertEqual(result.outcome, "succeeded")
+            self.assertEqual(result.summary["archives_succeeded"], 1)
+            self.assertEqual(result.summary["archives_partial"], 1)
+            self.assertEqual(result.summary["archives_failed"], 0)
+            item = result.archive_results[0]
+            self.assertEqual(item["status"], "succeeded")
+            self.assertTrue(item["partial"])
+            self.assertEqual(item["files_extracted"], 1)
+            self.assertEqual(item["failed_files"], 1)
+            self.assertEqual(item["cleanup_status"], "retained_partial")
+            self.assertTrue(archive.is_file())
+            output = Path(str(item["output"]))
+            self.assertEqual((output / "good.txt").read_text(encoding="utf-8"), "ok")
+            self.assertFalse((output / "broken.txt").exists())
+            self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["attempt"])
+            self.assertEqual(
+                [event["attempt"] for event in progress if event.get("phase") == "archive_attempt"],
+                [1],
+            )
+            self.assertFalse(list(folder.glob(".extract-attempt-*")))
 
     def test_extract_retries_earlier_archives_with_folder_pool_and_keeps_secrets_private(self):
         with tempfile.TemporaryDirectory() as temp_dir:

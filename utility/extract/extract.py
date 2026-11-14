@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +104,9 @@ def _command_for(
 ) -> list[str]:
     lower = filepath.name.lower()
     if lower.endswith((".7z", ".7z.001", ".zip")):
-        command = ["7z", "x"]
+        # Per-member output is needed to distinguish a genuine partial extract
+        # from zero-byte files left behind after a password prompt/error.
+        command = ["7z", "x", "-bb1"]
         if password is not None:
             command.append(f"-p{password}")
         command.extend(["-y", str(filepath), f"-o{output}", "-bsp0"])
@@ -126,35 +129,167 @@ def run_extract(
     index: int,
     total: int,
     attempt: int,
-) -> bool:
+) -> "ExtractorRun":
     """Run one isolated extraction attempt and keep the job heartbeat alive."""
     started = time.monotonic()
+    with tempfile.TemporaryFile() as tool_log:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(filepath.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=tool_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=False,
+            )
+        except OSError:
+            return ExtractorRun(returncode=None, output="")
+
+        while process.poll() is None:
+            time.sleep(2)
+            elapsed = time.monotonic() - started
+            emit_progress(
+                phase="archive_extracting",
+                pass_name=pass_name,
+                index=index,
+                total=total,
+                name=filepath.name,
+                attempt=attempt,
+                elapsed_seconds=round(elapsed, 1),
+                indeterminate=True,
+            )
+        tool_log.seek(0)
+        tool_output = tool_log.read().decode("utf-8", errors="replace")
+    return ExtractorRun(returncode=process.returncode, output=tool_output)
+
+
+@dataclass(frozen=True)
+class ExtractorRun:
+    returncode: int | None
+    output: str
+
+
+@dataclass(frozen=True)
+class ArchiveAttempt:
+    succeeded: bool
+    output: Path | None = None
+    partial: bool = False
+    files_extracted: int = 0
+    failed_files: int = 0
+
+
+_UNAR_MEMBER_RESULT = re.compile(
+    r"^\s*(?P<member>.+)\s+\([^)]*\)\.\.\.\s+(?P<status>OK\.?|Failed!|This archive requires a password to unpack\.)(?:\s|$)",
+    re.IGNORECASE,
+)
+_SEVEN_Z_MEMBER_ERROR = re.compile(
+    # 7z prefixes member failures with an error description that may itself
+    # contain a colon (e.g. "ERROR: Wrong password : file.zip"). Match the
+    # final separator so the failed member path is not mistaken for a
+    # successfully extracted file.
+    r"^\s*ERROR:.*:\s*(?P<member>.+?)\s*$", re.IGNORECASE
+)
+_SEVEN_Z_MEMBER_SUCCESS = re.compile(r"^\s*-\s+(?P<member>.+?)\s*$")
+
+
+def _regular_output_files(output: Path) -> list[Path]:
+    if not output.is_dir() or output.is_symlink():
+        return []
+    files: list[Path] = []
+    for path in output.rglob("*"):
+        try:
+            if not path.is_symlink() and path.is_file():
+                files.append(path)
+        except OSError:
+            continue
+    return files
+
+
+def _member_files(members: list[str], output: Path, files: list[Path]) -> set[Path]:
+    matched: set[Path] = set()
+    for raw_member in members:
+        member = raw_member.strip().strip("\"'").replace("\\", "/")
+        while member.startswith("./"):
+            member = member[2:]
+        member = member.lstrip("/")
+        if not member:
+            continue
+        matches = [
+            path
+            for path in files
+            if (
+                path.relative_to(output).as_posix() == member
+                or path.relative_to(output).as_posix().endswith("/" + member)
+            )
+        ]
+        if not matches:
+            basename = member.rsplit("/", 1)[-1]
+            matches = [path for path in files if path.name == basename]
+        matched.update(matches)
+    return matched
+
+
+def _staged_file_results(
+    command: list[str], tool_output: str, output: Path
+) -> tuple[list[Path], int]:
+    files = _regular_output_files(output)
+    successful_members: list[str] = []
+    failed_members: list[str] = []
+    tool = Path(command[0]).name.lower()
+    for line in tool_output.splitlines():
+        if tool == "unar":
+            match = _UNAR_MEMBER_RESULT.match(line)
+            if not match:
+                continue
+            status = match.group("status").lower()
+            if status.startswith("failed") or status.startswith(
+                "this archive requires a password"
+            ):
+                failed_members.append(match.group("member"))
+            else:
+                successful_members.append(match.group("member"))
+        elif tool in {"7z", "7zz"}:
+            failed_match = _SEVEN_Z_MEMBER_ERROR.match(line)
+            if failed_match:
+                failed_members.append(failed_match.group("member"))
+                continue
+            successful_match = _SEVEN_Z_MEMBER_SUCCESS.match(line)
+            if successful_match:
+                successful_members.append(successful_match.group("member"))
+
+    failed_files = _member_files(failed_members, output, files)
+    # Partial success must be explicit in the extractor's per-member output.
+    # Inferring success from files merely present in staging misclassifies
+    # zero-byte placeholders left by bad passwords or corrupt archives.
+    successful_files = _member_files(successful_members, output, files)
+    successful_files.difference_update(failed_files)
+    if tool in {"7z", "7zz"}:
+        # With -bb1, 7z emits "- member" before attempting to write it. A
+        # password prompt can therefore leave that line plus a zero-byte
+        # placeholder even though no member was extracted. A non-empty file
+        # without a matching ERROR is the smallest reliable partial-success
+        # signal available from 7z's per-member output.
+        successful_files = {
+            path for path in successful_files if path.stat().st_size > 0
+        }
+    return sorted(successful_files), len(failed_members)
+
+
+def _retain_only_staged_files(output: Path, keep: list[Path]) -> bool:
+    kept_files = set(keep)
+    entries = sorted(output.rglob("*"), key=lambda path: len(path.parts), reverse=True)
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=str(filepath.parent),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=False,
-        )
+        for path in entries:
+            if path.is_symlink():
+                path.unlink()
+            elif path.is_dir():
+                if not any(path.iterdir()):
+                    path.rmdir()
+            elif path not in kept_files:
+                path.unlink()
     except OSError:
         return False
-
-    while process.poll() is None:
-        time.sleep(2)
-        elapsed = time.monotonic() - started
-        emit_progress(
-            phase="archive_extracting",
-            pass_name=pass_name,
-            index=index,
-            total=total,
-            name=filepath.name,
-            attempt=attempt,
-            elapsed_seconds=round(elapsed, 1),
-            indeterminate=True,
-        )
-    return process.returncode == 0 and output.is_dir()
+    return True
 
 
 def _publish_staging(staging: Path, destination: Path) -> None:
@@ -183,7 +318,7 @@ def _attempt_archive(
     total: int,
     pass_name: str,
     attempt: int,
-) -> tuple[bool, Path | None]:
+) -> ArchiveAttempt:
     with tempfile.TemporaryDirectory(
         prefix=".extract-attempt-", dir=str(filepath.parent)
     ) as temporary:
@@ -191,7 +326,7 @@ def _attempt_archive(
         try:
             command = _command_for(filepath, password, staging)
         except ValueError:
-            return False, None
+            return ArchiveAttempt(succeeded=False)
         emit_progress(
             phase="archive_attempt",
             pass_name=pass_name,
@@ -201,7 +336,7 @@ def _attempt_archive(
             attempt=attempt,
             indeterminate=True,
         )
-        if not run_extract(
+        run = run_extract(
             command,
             filepath=filepath,
             output=staging,
@@ -209,14 +344,32 @@ def _attempt_archive(
             index=index,
             total=total,
             attempt=attempt,
-        ):
-            return False, None
+        )
+        successful_files, failed_files = _staged_file_results(
+            command, run.output, staging
+        )
+        complete = (
+            run.returncode == 0
+            and staging.is_dir()
+            and failed_files == 0
+        )
+        partial = not complete and bool(successful_files)
+        if not complete and not partial:
+            return ArchiveAttempt(succeeded=False, failed_files=failed_files)
+        if partial and not _retain_only_staged_files(staging, successful_files):
+            return ArchiveAttempt(succeeded=False, failed_files=failed_files)
         destination = _unique_output_directory(filepath)
         try:
             _publish_staging(staging, destination)
         except OSError:
-            return False, None
-        return True, destination
+            return ArchiveAttempt(succeeded=False, failed_files=failed_files)
+        return ArchiveAttempt(
+            succeeded=True,
+            output=destination,
+            partial=partial,
+            files_extracted=(len(successful_files) if partial else len(_regular_output_files(destination))),
+            failed_files=failed_files,
+        )
 
 
 def _finalize_result(
@@ -226,8 +379,15 @@ def _finalize_result(
     pass_name: str,
     attempts: int,
     output: Path | None,
+    partial: bool = False,
+    files_extracted: int = 0,
+    failed_files: int = 0,
 ) -> dict[str, Any]:
-    cleanup_status = _remove_archive_parts(filepath) if status == "succeeded" else "retained_failed"
+    cleanup_status = (
+        "retained_partial"
+        if status == "succeeded" and partial
+        else (_remove_archive_parts(filepath) if status == "succeeded" else "retained_failed")
+    )
     return {
         "name": filepath.name,
         "path": str(filepath),
@@ -235,7 +395,15 @@ def _finalize_result(
         "pass": "retry" if pass_name == "retry" else "first",
         "attempt_count": attempts,
         "output": str(output) if output is not None else None,
+        "partial": partial,
+        "files_extracted": files_extracted,
+        "failed_files": failed_files,
         "cleanup_status": cleanup_status,
+        "warning": (
+            "Sebagian file arsip gagal diekstrak; hasil yang berhasil dipublikasikan dan arsip sumber dipertahankan."
+            if partial
+            else None
+        ),
         "error": (
             "Ekstraksi tanpa password maupun dengan kandidat yang tersedia gagal."
             if status == "failed"
@@ -262,7 +430,6 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
 
     for index, filepath in enumerate(archives, start=1):
         tried: list[str | None] = []
-        output: Path | None = None
         candidates = archive_password_candidates(filepath, supplied_password)
         for candidate in candidates:
             if candidate not in password_pool:
@@ -273,7 +440,7 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
         first_pass_candidates: list[str | None] = [*candidates, None]
         for attempt, candidate in enumerate(first_pass_candidates, start=1):
             tried.append(candidate)
-            ok, output = _attempt_archive(
+            attempt_result = _attempt_archive(
                 filepath,
                 candidate,
                 index=index,
@@ -281,13 +448,16 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
                 pass_name="first_pass",
                 attempt=attempt,
             )
-            if ok:
+            if attempt_result.succeeded:
                 record = _finalize_result(
                     filepath,
                     status="succeeded",
                     pass_name="first_pass",
                     attempts=len(tried),
-                    output=output,
+                    output=attempt_result.output,
+                    partial=attempt_result.partial,
+                    files_extracted=attempt_result.files_extracted,
+                    failed_files=attempt_result.failed_files,
                 )
                 records.append(record)
                 succeeded += 1
@@ -300,6 +470,9 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
                     attempt_count=len(tried),
                     succeeded=succeeded,
                     failed=0,
+                    partial=attempt_result.partial,
+                    files_extracted=attempt_result.files_extracted,
+                    failed_files=attempt_result.failed_files,
                     percent=100,
                     indeterminate=False,
                 )
@@ -330,13 +503,12 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
             failed=failed,
             indeterminate=True,
         )
-        output = None
         for candidate in password_pool:
             if candidate in tried:
                 continue
             tried.append(candidate)
             item["attempt_count"] = int(item["attempt_count"]) + 1
-            ok, output = _attempt_archive(
+            attempt_result = _attempt_archive(
                 filepath,
                 candidate,
                 index=index,
@@ -344,13 +516,16 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
                 pass_name="retry",
                 attempt=int(item["attempt_count"]),
             )
-            if ok:
+            if attempt_result.succeeded:
                 record = _finalize_result(
                     filepath,
                     status="succeeded",
                     pass_name="retry",
                     attempts=int(item["attempt_count"]),
-                    output=output,
+                    output=attempt_result.output,
+                    partial=attempt_result.partial,
+                    files_extracted=attempt_result.files_extracted,
+                    failed_files=attempt_result.failed_files,
                 )
                 records.append(record)
                 succeeded += 1
@@ -363,6 +538,9 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
                     attempt_count=int(item["attempt_count"]),
                     succeeded=succeeded,
                     failed=failed,
+                    partial=attempt_result.partial,
+                    files_extracted=attempt_result.files_extracted,
+                    failed_files=attempt_result.failed_files,
                     percent=100,
                     indeterminate=False,
                 )
@@ -397,6 +575,7 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
         "summary": {
             "archives_processed": len(records),
             "archives_succeeded": succeeded,
+            "archives_partial": sum(bool(item.get("partial")) for item in records),
             "archives_failed": failed,
         },
         "outcome": outcome,

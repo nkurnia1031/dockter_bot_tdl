@@ -290,6 +290,37 @@ class UtilityExtractE2ETests(unittest.TestCase):
         self.assertFalse(list(multipart_folder.glob(".extract-attempt-*")))
         self.assertTrue(all(item["cleanup_status"] == "retained_failed" for item in result.archive_results))
 
+    def test_archive_with_one_successful_member_is_successful_and_keeps_only_that_file(self) -> None:
+        folder = self._selected_folder("mixed-result")
+        good_source = self._payload(folder, "good.txt", 31)
+        secret_source = self._payload(folder, "secret.txt", 47)
+        archive = folder / "mixed.zip"
+        self._run_archive_builder(
+            ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(archive), good_source.name],
+            folder,
+        )
+        self._run_archive_builder(
+            [
+                "7z", "a", "-y", "-bso0", "-bsp0", "-tzip", "-pactual-secret",
+                str(archive), secret_source.name,
+            ],
+            folder,
+        )
+
+        result = self._extract(folder, password="wrong-test-password")
+
+        self.assertEqual(result.outcome, "succeeded", result.archive_results)
+        item = self._assert_success(result, archive.name, folder)
+        self.assertTrue(item["partial"])
+        self.assertEqual(item["files_extracted"], 1)
+        self.assertEqual(item["failed_files"], 1)
+        self.assertEqual(item["cleanup_status"], "retained_partial")
+        self.assertTrue(archive.is_file(), "partial archives remain available for recovery")
+        output = Path(str(item["output"]))
+        self.assertEqual((output / good_source.name).read_bytes(), good_source.read_bytes())
+        self.assertFalse((output / secret_source.name).exists())
+        self.assertFalse(list(folder.glob(".extract-attempt-*")))
+
     def test_split_7z_is_detected_as_one_archive_and_all_parts_are_deleted_only_after_success(self) -> None:
         folder = self._selected_folder("split-7z")
         source = self._large_payload(folder)

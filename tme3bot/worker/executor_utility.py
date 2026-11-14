@@ -162,13 +162,16 @@ class UtilityExecutorMixin:
             )
             archive_mode = utility_name == "extract"
             archive_succeeded = int(result.get("summary", {}).get("archives_succeeded", 0))
+            archive_partial = int(result.get("summary", {}).get("archives_partial", 0))
             archive_failed = int(result.get("summary", {}).get("archives_failed", 0))
             failed_outcome = result.get("outcome") in {"failed", "partial_failure"}
             reporter.report(
                 phase="extract_failed" if archive_mode and failed_outcome else "completed",
                 message=(
                     (
-                        f"Extract selesai: {archive_succeeded} arsip berhasil, "
+                        f"Extract selesai: {archive_succeeded} arsip berhasil"
+                        + (f" ({archive_partial} parsial)" if archive_partial else "")
+                        + ", "
                         f"{archive_failed} gagal"
                     )
                     if archive_mode

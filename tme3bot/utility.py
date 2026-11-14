@@ -574,6 +574,10 @@ class UtilityRunner:
                     detail["archives_succeeded"] = sum(
                         item.get("status") == "succeeded" for item in normalized_archives
                     )
+                    detail["archives_partial"] = sum(
+                        item.get("status") == "succeeded" and item.get("partial")
+                        for item in normalized_archives
+                    )
                     detail["archives_failed"] = len(archive_failures)
                     details.append(detail)
                     if archive_failures:
@@ -671,6 +675,10 @@ class UtilityRunner:
                 {
                     "archives_processed": len(archive_results),
                     "archives_succeeded": len(archive_results) - len(failed_archives),
+                    "archives_partial": sum(
+                        item.get("status") == "succeeded" and item.get("partial")
+                        for item in archive_results
+                    ),
                     "archives_failed": len(failed_archives),
                     "failed_archives": failed_archives,
                 }
