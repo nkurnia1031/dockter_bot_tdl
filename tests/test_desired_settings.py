@@ -53,11 +53,20 @@ class DesiredSettingsTests(unittest.TestCase):
 
     def test_expected_version_is_compare_and_swap(self) -> None:
         snapshot = self.store.update(
-            "worker", {"tts_part_retries": 4}, expected_version=0, worker="remote-1"
+            "worker",
+            {"tts_part_retries": 4, "tdl_upload_stall_timeout_seconds": 1800},
+            expected_version=0,
+            worker="remote-1",
         )
         self.assertEqual(snapshot["desired_version"], 1)
         self.assertEqual(snapshot["applied_version"], 0)
         self.assertEqual(snapshot["status"], "pending")
+        self.assertEqual(
+            self.store.get_values("worker", worker="remote-1")[
+                "tdl_upload_stall_timeout_seconds"
+            ],
+            1800,
+        )
         with self.assertRaises(SettingsConflict) as caught:
             self.store.update(
                 "worker", {"tts_part_retries": 5}, expected_version=0, worker="remote-1"

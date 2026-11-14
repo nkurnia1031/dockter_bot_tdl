@@ -13,6 +13,7 @@
     job_stall_timeout_seconds: number;
     tdl_export_stall_timeout_seconds: number;
     tdl_download_stall_timeout_seconds: number;
+    tdl_upload_stall_timeout_seconds: number;
     storage_profile: string;
     storage_profile_available: boolean;
     available_storage_profiles: string[];
@@ -27,7 +28,7 @@
     retry_base_seconds: string;
     newnym_after_retries: string;
   };
-  type WorkerOpsDraft = { job_stall: string; export_stall: string; download_stall: string };
+  type WorkerOpsDraft = { job_stall: string; export_stall: string; download_stall: string; upload_stall: string };
   type TtsHelperStatus = 'ready' | 'bootstrapping' | 'tor_unreachable' | 'helper_unreachable';
   type TtsHelper = { slot: number; status: TtsHelperStatus; bootstrap_percent: number | null; checked_at: string | null };
   type TtsHealth = { worker: string; ready: boolean; helpers_ready: boolean; capability_ready: boolean; profile_session_ready: boolean; verified_profiles?: string[]; reason_code: string; helpers: TtsHelper[] };
@@ -74,6 +75,7 @@
         job_stall: String(result.job_stall_timeout_seconds ?? 600),
         export_stall: String(result.tdl_export_stall_timeout_seconds ?? 300),
         download_stall: String(result.tdl_download_stall_timeout_seconds ?? 300),
+        upload_stall: String(result.tdl_upload_stall_timeout_seconds ?? 1800),
       } };
       ttsDrafts = {
         ...ttsDrafts,
@@ -125,6 +127,7 @@
         job_stall_timeout_seconds: Number(draft.job_stall),
         tdl_export_stall_timeout_seconds: Number(draft.export_stall),
         tdl_download_stall_timeout_seconds: Number(draft.download_stall),
+        tdl_upload_stall_timeout_seconds: Number(draft.upload_stall),
       });
       workerSettings = { ...workerSettings, [worker.name]: result };
       message = `Timeout worker ${worker.name} disimpan untuk job berikutnya.`;
@@ -290,10 +293,11 @@
                 <div class="mt-6 border-t border-[var(--line)] pt-5">
                   <h4 class="text-sm font-extrabold">Timeout job worker</h4>
                   <p class="muted mt-1 text-xs">Angka 0 menonaktifkan batas stall. Perubahan hanya berlaku untuk job berikutnya dan ditolak saat worker sedang menjalankan job.</p>
-                  <div class="mt-4 grid gap-3 sm:grid-cols-3">
+                  <div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                     <label class="text-sm font-bold">Semua job<input class="field mt-2" type="number" min="0" max="86400" value={ops.job_stall} oninput={(event) => opsDrafts = { ...opsDrafts, [worker.name]: { ...ops, job_stall: event.currentTarget.value } }}/></label>
                     <label class="text-sm font-bold">Export TDL<input class="field mt-2" type="number" min="0" max="86400" value={ops.export_stall} oninput={(event) => opsDrafts = { ...opsDrafts, [worker.name]: { ...ops, export_stall: event.currentTarget.value } }}/></label>
                     <label class="text-sm font-bold">Download TDL<input class="field mt-2" type="number" min="0" max="86400" value={ops.download_stall} oninput={(event) => opsDrafts = { ...opsDrafts, [worker.name]: { ...ops, download_stall: event.currentTarget.value } }}/></label>
+                    <label class="text-sm font-bold">Upload TDL<input class="field mt-2" type="number" min="0" max="86400" value={ops.upload_stall} oninput={(event) => opsDrafts = { ...opsDrafts, [worker.name]: { ...ops, upload_stall: event.currentTarget.value } }}/></label>
                   </div>
                   <button class="button mt-4" onclick={() => saveOperationalSettings(worker)} disabled={settingsSaving[worker.name]}>{settingsSaving[worker.name] ? 'Menyimpan...' : 'Simpan timeout'}</button>
                 </div>

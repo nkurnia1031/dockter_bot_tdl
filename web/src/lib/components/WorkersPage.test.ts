@@ -1,16 +1,17 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { apiMock, postMock } = vi.hoisted(() => ({
+const { apiMock, postMock, putMock } = vi.hoisted(() => ({
   apiMock: vi.fn(),
   postMock: vi.fn(),
+  putMock: vi.fn(),
 }));
 
 vi.mock('$lib/api', () => ({
   api: apiMock,
   patch: vi.fn(),
   post: postMock,
-  put: vi.fn(),
+  put: putMock,
   remove: vi.fn(),
 }));
 
@@ -29,6 +30,7 @@ const workerSettings = {
   job_stall_timeout_seconds: 600,
   tdl_export_stall_timeout_seconds: 300,
   tdl_download_stall_timeout_seconds: 300,
+  tdl_upload_stall_timeout_seconds: 1800,
   storage_profile: 'default',
   storage_profile_available: true,
   available_storage_profiles: ['default'],
@@ -58,6 +60,7 @@ function setupApi() {
     throw new Error(`Unexpected GET ${path}`);
   });
   postMock.mockResolvedValue({ worker: 'remote-tts', slot: 2, accepted: true, status: 'restarting' });
+  putMock.mockResolvedValue(workerSettings);
 }
 
 describe('WorkersPage TTS health controls', () => {
@@ -108,5 +111,21 @@ describe('WorkersPage TTS health controls', () => {
       token: 'worker-token-value',
     }));
     expect(await screen.findByText(/Domain link publik: belum diatur/)).toBeTruthy();
+  });
+
+  it('saves an independent TDL upload stall timeout for a worker', async () => {
+    render(WorkersPage);
+    await screen.findByText('remote-tts');
+    await fireEvent.click(screen.getByRole('button', { name: /Runtime/ }));
+
+    await fireEvent.input(screen.getByLabelText('Upload TDL'), {
+      target: { value: '2400' },
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Simpan timeout' }));
+
+    await waitFor(() => expect(putMock).toHaveBeenCalledWith(
+      '/workers/remote-tts/settings',
+      expect.objectContaining({ tdl_upload_stall_timeout_seconds: 2400 }),
+    ));
   });
 });

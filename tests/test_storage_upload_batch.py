@@ -33,6 +33,7 @@ class _UploadClient:
         self.profile = profile
         self.metrics = metrics
         self.behavior = behavior or {}
+        self.stall_timeout_seconds = 0
         self.uploads = []
         self.captions = {}
         self.export_messages = []
@@ -404,6 +405,81 @@ class StorageUploadBatchTests(unittest.TestCase):
         skipped = result["skipped_items"][0]
         self.assertEqual(skipped["reason_code"], "STORAGE_TARGET_EXISTS")
         self.assertEqual(skipped["cleanup_status"], "not_requested")
+
+    def test_telegram_upload_without_tdl_telemetry_is_reported_as_indeterminate(self):
+        self._add_files("large.bin")
+        uploader = _BatchUploader(self.workspace, self.store)
+        real_reporter = __import__(
+            "tme3bot.progress_reporter", fromlist=["ProgressReporter"]
+        ).ProgressReporter
+
+        def unthrottled_reporter(publisher, job_id):
+            return real_reporter(publisher, job_id, min_interval_seconds=0)
+
+        with patch(
+            "tme3bot.worker.executor_storage.ProgressReporter",
+            side_effect=unthrottled_reporter,
+        ):
+            uploader._storage_upload(uploader.command(self.workspace))
+
+        snapshots = [
+            kwargs["progress"]
+            for args, kwargs in uploader.events
+            if len(args) > 2 and args[2] == "progress.snapshot"
+        ]
+        active = next(snapshot for snapshot in snapshots if snapshot.get("active_items"))
+        self.assertTrue(active["indeterminate"])
+        self.assertTrue(active["active_items"][0]["indeterminate"])
+        self.assertNotIn("percent", active["active_items"][0])
+
+    def test_telegram_upload_uses_worker_upload_timeout_override(self):
+        self._add_files("large.bin")
+        uploader = _BatchUploader(self.workspace, self.store)
+        uploader.runtime_settings = SimpleNamespace(
+            operational_settings=lambda: {"tdl_upload_stall_timeout_seconds": 2400}
+        )
+
+        uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(
+            uploader.runtimes["default"].upload_tdl_client.stall_timeout_seconds,
+            2400,
+        )
+
+    def test_telegram_batch_bytes_only_count_confirmed_uploads(self):
+        self._add_files("a-confirmed.bin", "z-ambiguous.bin")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={"z-ambiguous.bin": "ambiguous_failure"},
+        )
+        real_reporter = __import__(
+            "tme3bot.progress_reporter", fromlist=["ProgressReporter"]
+        ).ProgressReporter
+
+        def unthrottled_reporter(publisher, job_id):
+            return real_reporter(publisher, job_id, min_interval_seconds=0)
+
+        with patch(
+            "tme3bot.worker.executor_storage.ProgressReporter",
+            side_effect=unthrottled_reporter,
+        ):
+            result = uploader._storage_upload(uploader.command(self.workspace))
+
+        snapshots = [
+            kwargs["progress"]
+            for args, kwargs in uploader.events
+            if len(args) > 2 and args[2] == "progress.snapshot"
+        ]
+        final = snapshots[-1]
+        confirmed_bytes = (self.workspace / "a-confirmed.bin").stat().st_size
+        total_bytes = sum(path.stat().st_size for path in self.workspace.iterdir())
+        self.assertEqual(result["outcome"], "partial_failure")
+        self.assertEqual(final["overall"]["current"], 2)
+        self.assertEqual(final["overall"]["bytes_current"], confirmed_bytes)
+        self.assertAlmostEqual(
+            final["overall"]["percent"], confirmed_bytes * 100 / total_bytes
+        )
 
     def test_rclone_storage_upload_publishes_active_file_and_batch_transfer_metrics(self):
         self._add_files("one.bin", "two.bin")

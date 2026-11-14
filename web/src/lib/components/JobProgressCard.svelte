@@ -17,6 +17,12 @@
   const overallPercent = $derived(progress.overall.percent);
   const itemPercent = $derived(progress.item.percent);
   const activePercent = $derived(overallPercent ?? itemPercent);
+  const uploadTelemetryMissing = $derived(
+    job.kind === 'storage_upload' && progress.activeItems.some((active) => active.indeterminate)
+  );
+  const showIndeterminate = $derived(
+    progress.indeterminate && (activePercent === undefined || uploadTelemetryMissing)
+  );
   const speed = $derived(progress.transfer.speed_bps ? `${formatBytes(progress.transfer.speed_bps)}/dtk` : progress.transfer.speed_text || 'Menghitung...');
   const headline = $derived(job.kind === 'tts' ? job.payload?.title || progress.message : progress.batch.name || progress.item.name || progress.message);
   const elapsed = $derived(formatDuration(progress.elapsedSeconds ?? ((Date.now() - new Date(job.created_at).getTime()) / 1000)));
@@ -85,11 +91,11 @@
         <!-- Progress Bar, Percentage, Speed, ETA, Counters -->
         <div class="mt-2.5 flex flex-col gap-2 sm:flex-row sm:items-center">
           <div class="flex min-w-0 flex-1 items-center gap-2.5">
-            <div class={`progress-track flex-1 !h-2.5 ${progress.indeterminate && activePercent === undefined ? 'indeterminate' : ''}`}>
+            <div class={`progress-track flex-1 !h-2.5 ${showIndeterminate ? 'indeterminate' : ''}`}>
               <div class="progress-fill" style={`width:${activePercent ?? 0}%`}></div>
             </div>
             <span class="w-12 shrink-0 text-right font-mono text-xs font-bold text-[var(--ink)]">
-              {activePercent !== undefined ? `${activePercent.toFixed(1)}%` : '...'}
+              {showIndeterminate ? '...' : activePercent !== undefined ? `${activePercent.toFixed(1)}%` : '...'}
             </span>
           </div>
 
@@ -149,12 +155,17 @@
                   </div>
                   <span class="shrink-0 text-[10px] font-semibold text-[var(--muted)]">{phaseLabel(String(active.phase || progress.phase))}</span>
                 </div>
-                <div class="progress-track mt-2 !h-1.5">
+                <div class={`progress-track mt-2 !h-1.5 ${active.indeterminate ? 'indeterminate' : ''}`}>
                   <div class="progress-fill" style={`width:${active.percent ?? 0}%`}></div>
                 </div>
                 <div class="mt-1.5 flex justify-between gap-2 font-mono text-[10px] text-[var(--muted)]">
-                  <span>{active.size_bytes ? `${formatBytes(active.bytes_current || 0)} / ${formatBytes(active.size_bytes)}` : 'Ukuran belum diketahui'}</span>
-                  <span>{active.percent !== undefined ? `${active.percent.toFixed(0)}%` : '...'}</span>
+                  {#if active.indeterminate}
+                    <span class="font-sans">Progres byte TDL belum tersedia; upload masih berjalan.</span>
+                    <span>...</span>
+                  {:else}
+                    <span>{active.size_bytes ? `${formatBytes(active.bytes_current || 0)} / ${formatBytes(active.size_bytes)}` : 'Ukuran belum diketahui'}</span>
+                    <span>{active.percent !== undefined ? `${active.percent.toFixed(0)}%` : '...'}</span>
+                  {/if}
                 </div>
               </div>
             {/each}

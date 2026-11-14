@@ -62,6 +62,7 @@ class AppConfig:
     tdl_download_stall_timeout_seconds: int
     temp_root: Path
     log_level: str
+    tdl_upload_stall_timeout_seconds: int = 1800
     database_root: Path = Path("/database")
     app_role: str = "backend"
     leave_helper_binary: str = "/usr/local/bin/tdl-leave"
@@ -232,6 +233,9 @@ class AppConfig:
         tdl_download_stall_timeout_seconds = int(
             os.getenv("TDL_DOWNLOAD_STALL_TIMEOUT_SECONDS", "300")
         )
+        tdl_upload_stall_timeout_seconds = int(
+            os.getenv("TDL_UPLOAD_STALL_TIMEOUT_SECONDS", "1800")
+        )
         temp_root = Path(os.getenv("TEMP_ROOT", "/data/tmp"))
         log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
         utility_workspace_root = Path(os.getenv("UTILITY_WORKSPACE_ROOT", "/workspace"))
@@ -321,6 +325,7 @@ class AppConfig:
             tdl_download_namespace=tdl_download_namespace,
             tdl_export_stall_timeout_seconds=tdl_export_stall_timeout_seconds,
             tdl_download_stall_timeout_seconds=tdl_download_stall_timeout_seconds,
+            tdl_upload_stall_timeout_seconds=tdl_upload_stall_timeout_seconds,
             temp_root=temp_root,
             log_level=log_level,
             leave_helper_binary=os.getenv("LEAVE_HELPER_BINARY", "/usr/local/bin/tdl-leave"),

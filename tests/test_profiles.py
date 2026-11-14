@@ -49,6 +49,7 @@ class ProfileTests(unittest.TestCase):
             tdl_download_namespace="default",
             tdl_export_stall_timeout_seconds=300,
             tdl_download_stall_timeout_seconds=1800,
+            tdl_upload_stall_timeout_seconds=1800,
             temp_root=root / "tmp",
             log_level="INFO",
         )
@@ -417,6 +418,45 @@ class ProfileTests(unittest.TestCase):
             self.assertIs(runtime.upload_operation_lock, upload_lock)
             self.assertIsNot(runtime.upload_tdl_client, runtime.export_tdl_client)
             self.assertIs(runtime.export_operation_lock, locks[0])
+
+    def test_upload_tdl_client_uses_its_own_stall_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = replace(self.make_config(root), app_role="worker")
+
+            runtime = build_profile_runtime(
+                "default",
+                config,
+                state_store=StateStore(config.state_file, config.legacy_max_json),
+            )
+
+            self.assertEqual(runtime.export_tdl_client.stall_timeout_seconds, 300)
+            self.assertEqual(runtime.upload_tdl_client.stall_timeout_seconds, 1800)
+
+    def test_upload_stall_timeout_is_configurable_independently(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_ROLE": "worker"}, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            default_config = AppConfig.from_env()
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "APP_ROLE": "worker",
+                    "TDL_EXPORT_STALL_TIMEOUT_SECONDS": "300",
+                    "TDL_UPLOAD_STALL_TIMEOUT_SECONDS": "2400",
+                },
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            config = AppConfig.from_env()
+
+        self.assertEqual(default_config.tdl_upload_stall_timeout_seconds, 1800)
+        self.assertEqual(config.tdl_export_stall_timeout_seconds, 300)
+        self.assertEqual(config.tdl_upload_stall_timeout_seconds, 2400)
 
     def test_profile_registry_rejects_one_telegram_identity_on_two_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

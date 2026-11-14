@@ -579,7 +579,13 @@ def build_profile_runtime(
         debug=config.log_level == "DEBUG",
         home=upload_home,
         log_prefix=f"tdl-upload:{profile_name}",
-        stall_timeout_seconds=config.tdl_export_stall_timeout_seconds,
+        stall_timeout_seconds=int(
+            getattr(
+                config,
+                "tdl_upload_stall_timeout_seconds",
+                config.tdl_export_stall_timeout_seconds,
+            )
+        ),
     )
     export_service = ExportService(config, state_store, export_tdl_client)
     download_service = BatchDownloadService(

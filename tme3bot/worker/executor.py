@@ -209,6 +209,7 @@ class WorkerJobExecutor(
                 "job_stall_timeout_seconds": int(getattr(config, "job_stall_timeout_seconds", 600)),
                 "tdl_export_stall_timeout_seconds": int(getattr(config, "tdl_export_stall_timeout_seconds", 300)),
                 "tdl_download_stall_timeout_seconds": int(getattr(config, "tdl_download_stall_timeout_seconds", 300)),
+                "tdl_upload_stall_timeout_seconds": int(getattr(config, "tdl_upload_stall_timeout_seconds", 1800)),
             },
             default_tts_settings={
                 "tts_helper_urls": tuple(getattr(config, "tts_helper_urls", ())),

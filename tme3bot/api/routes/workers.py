@@ -2649,7 +2649,8 @@ def register_workers(app, context, *, current_actor):
                     key: value for key, value in payload.items()
                     if key in {
                         "job_stall_timeout_seconds", "tdl_export_stall_timeout_seconds",
-                        "tdl_download_stall_timeout_seconds", "storage_profile", "tts_helper_urls",
+                        "tdl_download_stall_timeout_seconds", "tdl_upload_stall_timeout_seconds",
+                        "storage_profile", "tts_helper_urls",
                         "tts_tor_control_hosts", "tts_tor_control_ports", "tts_part_retries",
                         "tts_retry_base_seconds", "tts_newnym_after_retries",
                     }

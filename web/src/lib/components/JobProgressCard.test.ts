@@ -110,6 +110,33 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('72%')).toBeTruthy();
   });
 
+  it('shows indeterminate progress while a TDL upload has no byte telemetry', () => {
+    render(JobProgressCard, {
+      job: {
+        kind: 'storage_upload',
+        status: 'running',
+        profile: 'default',
+        worker: 'remote-1',
+        created_at: new Date().toISOString(),
+        progress: {
+          phase: 'uploading',
+          message: 'Mengupload large.bin melalui lane Upload default',
+          overall: { current: 0, total: 1, percent: 0, bytes_current: 0, bytes_total: 500000000 },
+          item: { name: 'large.bin', index: 1, total: 1, size_bytes: 500000000 },
+          active_items: [
+            { profile: 'default', name: 'large.bin', phase: 'uploading', size_bytes: 500000000, bytes_current: 0, indeterminate: true },
+          ],
+          indeterminate: true,
+        },
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn(),
+    });
+
+    expect(screen.getByText('Progres byte TDL belum tersedia; upload masih berjalan.')).toBeTruthy();
+  });
+
   it('shows each Storage download result and its public link status', async () => {
     render(JobProgressCard, {
       job: {

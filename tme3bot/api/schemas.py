@@ -447,6 +447,7 @@ class WorkerRuntimeSettingsRequest(BaseModel):
     job_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
     tdl_export_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
     tdl_download_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
+    tdl_upload_stall_timeout_seconds: int | None = Field(default=None, ge=0, le=86400)
     storage_profile: str | None = Field(default=None, min_length=1, max_length=48)
     tts_helper_urls: list[str] | None = Field(default=None, min_length=3, max_length=3)
     tts_tor_control_hosts: list[str] | None = Field(default=None, min_length=3, max_length=3)

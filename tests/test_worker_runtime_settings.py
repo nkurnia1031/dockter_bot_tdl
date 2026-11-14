@@ -89,6 +89,7 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
                 "job_stall_timeout_seconds": 600,
                 "tdl_export_stall_timeout_seconds": 300,
                 "tdl_download_stall_timeout_seconds": 300,
+                "tdl_upload_stall_timeout_seconds": 1800,
             }
             path = root / "worker_settings.json"
             settings = WorkerRuntimeSettings(
@@ -96,13 +97,17 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
                 default_storage_profile="default",
                 default_operational_settings=defaults,
             )
-            settings.set_operational_settings({"tdl_export_stall_timeout_seconds": 480})
+            settings.set_operational_settings({
+                "tdl_export_stall_timeout_seconds": 480,
+                "tdl_upload_stall_timeout_seconds": 2100,
+            })
             reloaded = WorkerRuntimeSettings(
                 path,
                 default_storage_profile="default",
                 default_operational_settings=defaults,
             )
             self.assertEqual(reloaded.operational_settings()["tdl_export_stall_timeout_seconds"], 480)
+            self.assertEqual(reloaded.operational_settings()["tdl_upload_stall_timeout_seconds"], 2100)
 
             executor = self._executor_with_tts_settings(root)
             executor.runtime_settings.default_operational_settings = defaults
@@ -110,12 +115,15 @@ class WorkerRuntimeSettingsTests(unittest.TestCase):
                 {
                     "job_stall_timeout_seconds": 900,
                     "tdl_download_stall_timeout_seconds": 420,
+                    "tdl_upload_stall_timeout_seconds": 2400,
                 }
             )
             self.assertEqual(updated["job_stall_timeout_seconds"], 900)
             self.assertEqual(updated["tdl_download_stall_timeout_seconds"], 420)
+            self.assertEqual(updated["tdl_upload_stall_timeout_seconds"], 2400)
             self.assertEqual(executor.config.job_stall_timeout_seconds, 900)
             self.assertEqual(executor.config.tdl_download_stall_timeout_seconds, 420)
+            self.assertEqual(executor.config.tdl_upload_stall_timeout_seconds, 2400)
 
     def test_operational_settings_cannot_change_while_any_job_is_active(self):
         with tempfile.TemporaryDirectory() as directory:

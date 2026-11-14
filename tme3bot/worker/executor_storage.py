@@ -3181,7 +3181,6 @@ class StorageExecutorMixin:
                 )
                 with results_lock:
                     completed_files += 1
-                    completed_bytes += int(file_sizes.get(path, 0))
                     failed_count += 1
                     outcomes[relative] = {
                         "path": relative,
@@ -3236,7 +3235,9 @@ class StorageExecutorMixin:
                         active_item["phase"] = phase
                         if item_percent is not None:
                             active_item["percent"] = item_percent
+                            active_item["indeterminate"] = False
                         if transfer is not None:
+                            active_item["indeterminate"] = False
                             for key in ("bytes_current", "bytes_total", "speed_bps", "eta_seconds"):
                                 value = transfer.get(key)
                                 if value is not None:
@@ -3258,6 +3259,8 @@ class StorageExecutorMixin:
                     "total": len(files),
                     "percent": current_bytes * 100 / total_bytes if total_bytes else 100,
                     "unit": "files",
+                    "files_current": current,
+                    "files_total": len(files),
                     "bytes_current": min(total_bytes, current_bytes),
                     "bytes_total": total_bytes,
                 }
@@ -3274,7 +3277,11 @@ class StorageExecutorMixin:
                     },
                     extra={"active_items": active_items_snapshot},
                     force=force,
-                    indeterminate=item_percent is None and phase in {"sending", "resolving_message"},
+                    indeterminate=(
+                        item_percent is None
+                        and phase in {"sending", "resolving_message", "uploading"}
+                        and bool(active_item and active_item.get("indeterminate", True))
+                    ),
                 )
 
         def finish_item(
@@ -3350,8 +3357,8 @@ class StorageExecutorMixin:
                 active_bytes.pop(relative, None)
                 active_items.pop(relative, None)
                 completed_files += 1
-                completed_bytes += int(file_sizes.get(path, 0))
                 if status == "succeeded":
+                    completed_bytes += int(file_sizes.get(path, 0))
                     succeeded += 1
                 elif status == "skipped":
                     skipped_count += 1
@@ -3477,9 +3484,9 @@ class StorageExecutorMixin:
                             "profile": profile,
                             "attempt": attempt,
                             "phase": "uploading",
-                            "percent": 0,
                             "size_bytes": size,
                             "bytes_current": 0,
+                            "indeterminate": True,
                         }
                     progress = report_progress(
                         phase="uploading",
@@ -3488,7 +3495,6 @@ class StorageExecutorMixin:
                         name=path.name,
                         profile=profile,
                         attempt=attempt,
-                        item_percent=0,
                         force=True,
                     )
                     with progress_lock:
@@ -3543,6 +3549,25 @@ class StorageExecutorMixin:
                     if path.name in photo_names:
                         upload_kwargs["as_photo"] = True
                     try:
+                        runtime_settings = getattr(self, "runtime_settings", None)
+                        operational_settings = getattr(
+                            runtime_settings, "operational_settings", None
+                        )
+                        current_settings = (
+                            operational_settings()
+                            if callable(operational_settings)
+                            else {}
+                        )
+                        upload_timeout = current_settings.get(
+                            "tdl_upload_stall_timeout_seconds",
+                            getattr(
+                                self.config,
+                                "tdl_upload_stall_timeout_seconds",
+                                getattr(client, "stall_timeout_seconds", 0),
+                            ),
+                        )
+                        if hasattr(client, "stall_timeout_seconds"):
+                            client.stall_timeout_seconds = int(upload_timeout)
                         with runtime.upload_operation_lock:
                             with self._capture_tdl_output(
                                 client,
@@ -4007,9 +4032,11 @@ class StorageExecutorMixin:
             overall={
                 "current": len(result_items),
                 "total": len(files),
-                "percent": 100,
+                "percent": completed_bytes * 100 / total_bytes if total_bytes else 100,
                 "unit": "files",
-                "bytes_current": total_bytes,
+                "files_current": len(result_items),
+                "files_total": len(files),
+                "bytes_current": min(total_bytes, completed_bytes),
                 "bytes_total": total_bytes,
             },
             counters={"succeeded": file_succeeded, "failed": len(failure_items), "skipped": file_skipped},
