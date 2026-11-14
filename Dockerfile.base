@@ -39,7 +39,6 @@ RUN apt-get update \
         tar \
         util-linux \
         p7zip-full \
-        unar \
     && rm -rf /var/lib/apt/lists/*
 
 USER root

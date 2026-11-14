@@ -12,23 +12,32 @@ from utility.extract.extract import _copy_partial_member_no_follow, _discard_par
 
 
 class UtilityFeatureTests(unittest.TestCase):
-    def _fake_partial_unar(self, root: Path) -> tuple[Path, dict[str, str]]:
+    def _fake_partial_unrar(self, root: Path) -> tuple[Path, dict[str, str]]:
         bin_root = root / "bin"
         bin_root.mkdir(parents=True)
-        executable = bin_root / "unar"
+        executable = bin_root / "unrar"
         executable.write_text(
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             "from pathlib import Path\n"
             "args = sys.argv[1:]\n"
-            "output = Path(args[args.index('-output-directory') + 1])\n"
+            "archive_index = next(index for index, value in enumerate(args) if value.endswith('.rar'))\n"
+            "archive = Path(args[archive_index])\n"
+            "output = Path(args[archive_index + 1])\n"
             "output.mkdir(parents=True, exist_ok=True)\n"
-            "(output / 'good.txt').write_text('ok', encoding='utf-8')\n"
-            "(output / 'broken.txt').write_text('partial bytes', encoding='utf-8')\n"
+            "member_root = archive.stem\n"
+            "(output / member_root / 'good.txt').parent.mkdir(parents=True)\n"
+            "(output / member_root / 'good.txt').write_text('ok', encoding='utf-8')\n"
+            "(output / member_root / '中文' / '成功.txt').parent.mkdir(parents=True)\n"
+            "(output / member_root / '中文' / '成功.txt').write_text('ok', encoding='utf-8')\n"
+            "(output / member_root / 'broken.txt').write_text('partial bytes', encoding='utf-8')\n"
+            "prefix = output / member_root\n"
             "with open(os.environ['UTILITY_TEST_CALLS'], 'a', encoding='utf-8') as f:\n"
             "    f.write('attempt\\n')\n"
-            "print('good.txt (2 B)... OK.')\n"
-            "print('broken.txt (13 B)... Failed! (read error)')\n"
+            "print(f\"Extracting  {prefix / 'good.txt'}     \\x08\\x08  0%\\x08\\x08  OK\")\n"
+            "print(f\"Extracting  {prefix / '中文/成功.txt'}     \\x08\\x08  1%\\x08\\x08  OK\")\n"
+            "print(f\"Extracting  {prefix / 'broken.txt'}                                                 0%\")\n"
+            "print(f\"CRC failed in encrypted file {prefix / 'broken.txt'}\")\n"
             "raise SystemExit(1)\n",
             encoding="utf-8",
         )
@@ -178,14 +187,14 @@ class UtilityFeatureTests(unittest.TestCase):
         }
         return bin_root, env
 
-    def test_extract_keeps_successful_members_when_another_member_fails(self):
+    def test_rar_extract_uses_unrar_and_keeps_successful_unicode_members(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             folder = root / "partial-archive"
             folder.mkdir()
             archive = folder / "sample.rar"
             archive.write_bytes(b"archive")
-            bin_root, env = self._fake_partial_unar(root)
+            bin_root, env = self._fake_partial_unrar(root)
             progress: list[dict[str, object]] = []
             runner = UtilityRunner(
                 Path(__file__).resolve().parents[1] / "utility",
@@ -203,13 +212,20 @@ class UtilityFeatureTests(unittest.TestCase):
             item = result.archive_results[0]
             self.assertEqual(item["status"], "succeeded")
             self.assertTrue(item["partial"])
-            self.assertEqual(item["files_extracted"], 1)
+            self.assertEqual(item["files_extracted"], 2)
             self.assertEqual(item["failed_files"], 1)
             self.assertEqual(item["cleanup_status"], "retained_partial")
             self.assertTrue(archive.is_file())
             output = Path(str(item["output"]))
-            self.assertEqual((output / "good.txt").read_text(encoding="utf-8"), "ok")
-            self.assertFalse((output / "broken.txt").exists())
+            self.assertEqual(
+                (output / "sample" / "good.txt").read_text(encoding="utf-8"),
+                "ok",
+            )
+            self.assertEqual(
+                (output / "sample" / "中文" / "成功.txt").read_text(encoding="utf-8"),
+                "ok",
+            )
+            self.assertFalse((output / "sample" / "broken.txt").exists())
             self.assertEqual(
                 (root / "calls.txt").read_text(encoding="utf-8").splitlines(),
                 ["attempt", "attempt"],

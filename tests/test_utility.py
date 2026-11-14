@@ -47,7 +47,7 @@ class UtilitySummaryTests(unittest.TestCase):
             before = list(workspace.iterdir())
             bin_root = root / "bin"
             bin_root.mkdir()
-            commands = ("bash", "python3", "7z", "unar", "du", "cut", "ffmpeg", "ffprobe", "rclone")
+            commands = ("bash", "python3", "7z", "du", "cut", "ffmpeg", "ffprobe", "rclone")
             command_paths = {}
             for command in commands:
                 path = bin_root / command
@@ -162,6 +162,37 @@ class UtilitySummaryTests(unittest.TestCase):
 
             def which(name):
                 return None if name == "7z" else f"/usr/bin/{name}"
+
+            with patch("tme3bot.utility.shutil.which", side_effect=which):
+                result = probe_utility_runtime(utility_root, workspace)
+
+            self.assertFalse(result["ready"])
+            self.assertEqual(result["reason_code"], "UTILITY_COMMAND_MISSING")
+            self.assertFalse(any(workspace.iterdir()))
+
+    def test_runtime_probe_reports_missing_unrar_without_mutating_workspace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            utility_root = root / "utility"
+            workspace = root / "workspace"
+            workspace.mkdir()
+            for relative in (
+                "extract/extract.py",
+                "flatten/flatten.py",
+                "compress/compress.sh",
+                "export/telegram_messages_to_json.py",
+                "export/organize_media_from_json.py",
+                "pindah/pindah.sh",
+                "pindah/pindah4.py",
+                "pindah/pindah.py",
+                "pindah/pindah2.py",
+            ):
+                path = utility_root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("# probe fixture\n", encoding="utf-8")
+
+            def which(name):
+                return None if name == "unrar" else f"/usr/bin/{name}"
 
             with patch("tme3bot.utility.shutil.which", side_effect=which):
                 result = probe_utility_runtime(utility_root, workspace)

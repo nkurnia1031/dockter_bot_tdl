@@ -53,7 +53,7 @@ UTILITY_RUNTIME_SCRIPTS = (
     "pindah/pindah.py",
     "pindah/pindah2.py",
 )
-UTILITY_RUNTIME_COMMANDS = ("python3", "bash", "7z", "unar", "du", "cut")
+UTILITY_RUNTIME_COMMANDS = ("python3", "bash", "7z", "unrar", "du", "cut")
 UTILITY_SETTING_SPECS = {
     "move_size": {
         "label": "Batas ukuran grup pindah",

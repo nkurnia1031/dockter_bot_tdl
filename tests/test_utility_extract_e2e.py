@@ -22,7 +22,7 @@ RUN_EXTRACT_E2E = os.getenv("TME3_RUN_UTILITY_EXTRACT_E2E") == "1"
 class UtilityExtractE2ETests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        missing = [name for name in ("7z", "unar") if shutil.which(name) is None]
+        missing = [name for name in ("7z", "unrar") if shutil.which(name) is None]
         if missing:
             raise unittest.SkipTest(f"archive tools unavailable: {', '.join(missing)}")
         repo_root = Path(__file__).resolve().parents[1]
