@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tme3bot.utility import UtilityFlattenPreviewStaleError, UtilityRunner
+from utility.extract.extract import _copy_partial_member_no_follow, _discard_partial_output
 
 
 class UtilityFeatureTests(unittest.TestCase):
@@ -35,6 +36,117 @@ class UtilityFeatureTests(unittest.TestCase):
         return bin_root, {
             "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
             "UTILITY_TEST_CALLS": str(root / "calls.txt"),
+        }
+
+    def _fake_7z_partial_with_missing_failed_member(
+        self, root: Path
+    ) -> tuple[Path, dict[str, str]]:
+        bin_root = root / "bin"
+        bin_root.mkdir(parents=True)
+        executable = bin_root / "7z"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "output = Path(next(arg[2:] for arg in args if arg.startswith('-o')))\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "(output / 'empty.txt').touch()\n"
+            "print('- empty.txt')\n"
+            "print('- missing.txt')\n"
+            "print('ERROR: Data Error : missing.txt')\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return bin_root, {
+            "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+
+    def _fake_7z_unclassified_partial_error(
+        self, root: Path
+    ) -> tuple[Path, dict[str, str]]:
+        bin_root = root / "bin"
+        bin_root.mkdir(parents=True)
+        executable = bin_root / "7z"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "output = Path(next(arg[2:] for arg in args if arg.startswith('-o')))\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "(output / 'partial.txt').write_bytes(b'not a completed member')\n"
+            "print('- partial.txt')\n"
+            "print('ERROR: Data Error')\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return bin_root, {
+            "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+
+    def _fake_7z_colon_member_failure(
+        self, root: Path
+    ) -> tuple[Path, dict[str, str]]:
+        bin_root = root / "bin"
+        bin_root.mkdir(parents=True)
+        executable = bin_root / "7z"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "output = Path(next(arg[2:] for arg in args if arg.startswith('-o')))\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "(output / 'foo:bar.txt').touch()\n"
+            "print('- foo:bar.txt')\n"
+            "print('ERROR: Wrong password : foo:bar.txt')\n"
+            "raise SystemExit(2)\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return bin_root, {
+            "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
+
+    def _fake_7z_duplicate_member_names(self, root: Path) -> tuple[Path, dict[str, str]]:
+        bin_root = root / "bin"
+        bin_root.mkdir(parents=True)
+        executable = bin_root / "7z"
+        executable.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "archive = next(Path(arg) for arg in args if arg.endswith(('.zip', '.7z', '.rar')))\n"
+            "password = next((arg[2:] for arg in args if arg.startswith('-p')), '')\n"
+            "output = Path(next(arg[2:] for arg in args if arg.startswith('-o')))\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "if archive.name == 'first.zip':\n"
+            "    if password == 'later-secret':\n"
+            "        target = output / 'dirC' / 'other.txt'\n"
+            "        target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        target.write_text('other', encoding='utf-8')\n"
+            "        print('- dirC/other.txt')\n"
+            "        print('- dirA/item.txt')\n"
+            "        print('ERROR: Data Error : dirA/item.txt')\n"
+            "    else:\n"
+            "        target = output / 'dirB' / 'item.txt'\n"
+            "        target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "        target.write_text('item', encoding='utf-8')\n"
+            "        print('- dirB/item.txt')\n"
+            "        print('- dirC/other.txt')\n"
+            "        print('ERROR: Data Error : dirC/other.txt')\n"
+            "    raise SystemExit(2)\n"
+            "(output / 'later.txt').write_text('later', encoding='utf-8')\n"
+            "print('- later.txt')\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o755)
+        return bin_root, {
+            "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
         }
 
     def _fake_7z(self, root: Path, passwords: dict[str, str]) -> tuple[Path, dict[str, str]]:
@@ -98,12 +210,176 @@ class UtilityFeatureTests(unittest.TestCase):
             output = Path(str(item["output"]))
             self.assertEqual((output / "good.txt").read_text(encoding="utf-8"), "ok")
             self.assertFalse((output / "broken.txt").exists())
-            self.assertEqual((root / "calls.txt").read_text(encoding="utf-8").splitlines(), ["attempt"])
+            self.assertEqual(
+                (root / "calls.txt").read_text(encoding="utf-8").splitlines(),
+                ["attempt", "attempt"],
+            )
             self.assertEqual(
                 [event["attempt"] for event in progress if event.get("phase") == "archive_attempt"],
-                [1],
+                [1, 2],
             )
             self.assertFalse(list(folder.glob(".extract-attempt-*")))
+            output = Path(str(item["output"]))
+            self.assertEqual(
+                [path.name for path in folder.iterdir() if path.is_dir()],
+                [output.name],
+            )
+
+    def test_extract_keeps_empty_success_when_failed_member_has_no_staged_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "partial-archive"
+            folder.mkdir()
+            archive = folder / "sample.zip"
+            archive.write_bytes(b"archive")
+            _, env = self._fake_7z_partial_with_missing_failed_member(root)
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(os.environ, env):
+                result = runner.run("extract", [str(folder)])
+
+            self.assertEqual(result.outcome, "succeeded", result.archive_results)
+            item = result.archive_results[0]
+            self.assertEqual(item["status"], "succeeded")
+            self.assertTrue(item["partial"])
+            self.assertEqual(item["files_extracted"], 1)
+            self.assertEqual(item["failed_files"], 1)
+            output = Path(str(item["output"]))
+            self.assertTrue((output / "empty.txt").is_file())
+            self.assertEqual((output / "empty.txt").stat().st_size, 0)
+            self.assertTrue(archive.is_file())
+
+    def test_extract_rejects_nonempty_member_when_7z_error_is_unclassified(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "partial-archive"
+            folder.mkdir()
+            archive = folder / "sample.zip"
+            archive.write_bytes(b"archive")
+            _, env = self._fake_7z_unclassified_partial_error(root)
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(os.environ, env):
+                result = runner.run("extract", [str(folder)])
+
+            self.assertEqual(result.outcome, "failed", result.archive_results)
+            self.assertEqual(result.archive_results[0]["status"], "failed")
+            self.assertEqual(result.archive_results[0]["failed_files"], 1)
+            self.assertIsNone(result.archive_results[0]["output"])
+            self.assertTrue(archive.is_file())
+            self.assertFalse((folder / "sample").exists())
+
+    def test_extract_does_not_misclassify_colon_in_failed_member_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "colon-member"
+            folder.mkdir()
+            archive = folder / "sample.zip"
+            archive.write_bytes(b"archive")
+            _, env = self._fake_7z_colon_member_failure(root)
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(os.environ, env):
+                result = runner.run("extract", [str(folder)])
+
+            self.assertEqual(result.outcome, "failed", result.archive_results)
+            self.assertEqual(result.archive_results[0]["failed_files"], 1)
+            self.assertTrue(archive.is_file())
+            self.assertFalse((folder / "sample").exists())
+
+    def test_extract_does_not_resolve_failed_member_by_duplicate_basename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "duplicate-member-names"
+            first_folder = folder / "A"
+            later_folder = folder / "B"
+            first_folder.mkdir(parents=True)
+            later_folder.mkdir()
+            first_archive = first_folder / "first.zip"
+            later_archive = later_folder / "second.zip"
+            first_archive.write_bytes(b"archive")
+            later_archive.write_bytes(b"archive")
+            (later_folder / ".pass").write_text("later-secret", encoding="utf-8")
+            _, env = self._fake_7z_duplicate_member_names(root)
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(os.environ, env):
+                result = runner.run("extract", [str(folder)])
+
+            first = next(item for item in result.archive_results if item["name"] == "first.zip")
+            self.assertEqual(first["status"], "succeeded")
+            self.assertTrue(first["partial"])
+            self.assertEqual(first["failed_files"], 1)
+            output = Path(str(first["output"]))
+            self.assertTrue((output / "dirB" / "item.txt").is_file())
+            self.assertTrue((output / "dirC" / "other.txt").is_file())
+            self.assertTrue(first_archive.is_file())
+
+    def test_partial_member_copy_failure_never_publishes_truncated_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_root = root / "source"
+            destination_root = root / "destination"
+            (source_root / "nested").mkdir(parents=True)
+            destination_root.mkdir()
+            (source_root / "nested" / "payload.bin").write_bytes(b"complete payload")
+            real_write = os.write
+            write_calls = 0
+
+            def fail_after_partial_write(descriptor, data):
+                nonlocal write_calls
+                write_calls += 1
+                if write_calls == 1:
+                    real_write(descriptor, data[:4])
+                raise OSError("simulated disk write failure")
+
+            with patch("utility.extract.extract.os.write", side_effect=fail_after_partial_write):
+                copied = _copy_partial_member_no_follow(
+                    source_root,
+                    destination_root,
+                    Path("nested") / "payload.bin",
+                )
+
+            self.assertFalse(copied)
+            self.assertFalse((destination_root / "nested" / "payload.bin").exists())
+            self.assertEqual(list((destination_root / "nested").iterdir()), [])
+
+    def test_partial_cleanup_rejects_workspace_parent_replaced_by_symlink(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            selected = workspace / "selected"
+            outside = root / "outside"
+            selected.mkdir(parents=True)
+            outside.mkdir()
+            moved = workspace / "selected-original"
+            selected.rename(moved)
+            (outside / "archive").mkdir()
+            (outside / "archive" / "keep.txt").write_text("keep")
+            selected.symlink_to(outside, target_is_directory=True)
+
+            removed = _discard_partial_output(
+                selected / "archive.zip",
+                selected / "archive",
+                workspace.resolve(),
+            )
+
+            self.assertFalse(removed)
+            self.assertEqual(
+                (outside / "archive" / "keep.txt").read_text(), "keep"
+            )
 
     def test_extract_retries_earlier_archives_with_folder_pool_and_keeps_secrets_private(self):
         with tempfile.TemporaryDirectory() as temp_dir:

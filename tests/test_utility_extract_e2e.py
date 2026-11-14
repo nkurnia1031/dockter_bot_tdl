@@ -321,6 +321,133 @@ class UtilityExtractE2ETests(unittest.TestCase):
         self.assertFalse((output / secret_source.name).exists())
         self.assertFalse(list(folder.glob(".extract-attempt-*")))
 
+    def test_partial_extract_preserves_successful_empty_members(self) -> None:
+        folder = self._selected_folder("mixed-empty-result")
+        empty_source = folder / "empty.txt"
+        empty_source.touch()
+        secret_source = self._payload(folder, "secret.txt", 47)
+        archive = folder / "mixed-empty.zip"
+        self._run_archive_builder(
+            ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(archive), empty_source.name],
+            folder,
+        )
+        self._run_archive_builder(
+            [
+                "7z", "a", "-y", "-bso0", "-bsp0", "-tzip", "-pactual-secret",
+                str(archive), secret_source.name,
+            ],
+            folder,
+        )
+
+        result = self._extract(folder, password="wrong-test-password")
+
+        self.assertEqual(result.outcome, "succeeded", result.archive_results)
+        item = self._assert_success(result, archive.name, folder)
+        self.assertTrue(item["partial"])
+        self.assertEqual(item["files_extracted"], 1)
+        self.assertEqual(item["failed_files"], 1)
+        self.assertEqual(item["cleanup_status"], "retained_partial")
+        output = Path(str(item["output"]))
+        self.assertTrue((output / empty_source.name).is_file())
+        self.assertEqual((output / empty_source.name).stat().st_size, 0)
+        self.assertFalse((output / secret_source.name).exists())
+        self.assertTrue(archive.is_file())
+        self.assertFalse(list(folder.glob(".extract-attempt-*")))
+
+    def test_partial_archive_retries_with_password_found_in_later_archive(self) -> None:
+        folder = self._selected_folder("late-password-pool")
+        first_folder = folder / "A"
+        later_folder = folder / "B"
+        first_folder.mkdir()
+        later_folder.mkdir()
+        plain_source = self._payload(first_folder, "plain.txt", 31)
+        secret_source = self._payload(first_folder, "secret.txt", 47)
+        first_archive = first_folder / "first.zip"
+        self._run_archive_builder(
+            ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(first_archive), plain_source.name],
+            first_folder,
+        )
+        self._run_archive_builder(
+            [
+                "7z", "a", "-y", "-bso0", "-bsp0", "-tzip", "-pactual-secret",
+                str(first_archive), secret_source.name,
+            ],
+            first_folder,
+        )
+
+        later_source = self._payload(later_folder, "later.txt", 19)
+        later_archive = later_folder / "second.zip"
+        self._run_archive_builder(
+            ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(later_archive), later_source.name],
+            later_folder,
+        )
+        (later_folder / ".pass").write_text("actual-secret", encoding="utf-8")
+
+        result = self._extract(folder)
+
+        first = self._assert_success(result, first_archive.name, first_folder)
+        self.assertEqual(first["pass"], "retry")
+        self.assertFalse(first["partial"])
+        self.assertEqual(first["files_extracted"], 2)
+        first_output = Path(str(first["output"]))
+        self.assertEqual((first_output / plain_source.name).read_bytes(), plain_source.read_bytes())
+        self.assertEqual((first_output / secret_source.name).read_bytes(), secret_source.read_bytes())
+        self.assertEqual(
+            [path.name for path in first_folder.iterdir() if path.is_dir()],
+            [first_output.name],
+        )
+        self.assertFalse(first_archive.exists())
+        self.assertFalse(later_archive.exists())
+
+    def test_partial_results_from_distinct_passwords_are_combined(self) -> None:
+        folder = self._selected_folder("combine-partial-passwords")
+        first_folder = folder / "A"
+        later_folder = folder / "B"
+        first_folder.mkdir()
+        later_folder.mkdir()
+
+        first_source = self._payload(first_folder, "first.txt", 31)
+        second_source = self._payload(first_folder, "second.txt", 47)
+        first_archive = first_folder / "first.zip"
+        self._run_archive_builder(
+            [
+                "7z", "a", "-y", "-bso0", "-bsp0", "-tzip", "-pfirst-secret",
+                str(first_archive), first_source.name,
+            ],
+            first_folder,
+        )
+        self._run_archive_builder(
+            [
+                "7z", "a", "-y", "-bso0", "-bsp0", "-tzip", "-psecond-secret",
+                str(first_archive), second_source.name,
+            ],
+            first_folder,
+        )
+        (first_folder / ".pass").write_text("first-secret", encoding="utf-8")
+
+        later_source = self._payload(later_folder, "later.txt", 19)
+        later_archive = later_folder / "second.zip"
+        self._run_archive_builder(
+            ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(later_archive), later_source.name],
+            later_folder,
+        )
+        (later_folder / ".pass").write_text("second-secret", encoding="utf-8")
+
+        result = self._extract(folder)
+
+        first = self._assert_success(result, first_archive.name, first_folder)
+        self.assertEqual(first["pass"], "retry")
+        self.assertFalse(first["partial"])
+        self.assertEqual(first["files_extracted"], 2)
+        output = Path(str(first["output"]))
+        self.assertEqual((output / first_source.name).read_bytes(), first_source.read_bytes())
+        self.assertEqual((output / second_source.name).read_bytes(), second_source.read_bytes())
+        self.assertFalse(first_archive.exists())
+        self.assertEqual(
+            [path.name for path in first_folder.iterdir() if path.is_dir()],
+            [output.name],
+        )
+
     def test_split_7z_is_detected_as_one_archive_and_all_parts_are_deleted_only_after_success(self) -> None:
         folder = self._selected_folder("split-7z")
         source = self._large_payload(folder)
