@@ -12,7 +12,12 @@ from typing import Any
 
 from tme3bot.domain.models import utc_now
 from tme3bot.infrastructure.http_client import request_json
-from tme3bot.tdl import tdl_access_denial_code, tdl_session_denial_code, tdl_write_denial_code
+from tme3bot.tdl import (
+    tdl_access_denial_code,
+    tdl_session_denial_code,
+    tdl_upload_no_progress_bytes,
+    tdl_write_denial_code,
+)
 from tme3bot.worker.tts_pipeline import TtsCancelled, TtsError, TtsPipeline
 
 LOGGER = logging.getLogger(__name__)
@@ -575,6 +580,7 @@ class TtsExecutorMixin:
                     upload_started = False
                     uploaded_at: float | None = None
                     uploaded_profile: str | None = None
+                    upload_verification = None
                     try:
                         self._append_job_log(
                             f"[TTS] upload TDL bagian={part_index}/{total_parts}"
@@ -649,6 +655,62 @@ class TtsExecutorMixin:
                                             f"[TTS] profil pengirim ditolak={sender_profile} code={denial}; mencoba profil berikutnya"
                                         )
                                         continue
+                                    no_progress_bytes = tdl_upload_no_progress_bytes(send_error)
+                                    if no_progress_bytes is not None:
+                                        if no_progress_bytes > 0:
+                                            attempt_verification = verifier.record_upload(
+                                                profile=sender_profile,
+                                                chat_ref=target_chat,
+                                                filename=upload_path.name,
+                                                caption=caption,
+                                                uploaded_at=attempt_at,
+                                            )
+                                            if attempt_verification.status == "verified":
+                                                upload_verification = attempt_verification
+                                                uploaded_at = attempt_at
+                                                uploaded_profile = sender_profile
+                                                save_delivery_result(
+                                                    delivery_id,
+                                                    delivered=True,
+                                                )
+                                                uploaded = True
+                                                break
+                                            if attempt_verification.error_code:
+                                                save_delivery_result(
+                                                    delivery_id,
+                                                    delivered=False,
+                                                    reconciliation_required=True,
+                                                    uploaded_at=attempt_at,
+                                                    sender_profile=sender_profile,
+                                                )
+                                                raise TtsError(
+                                                    "Upload sempat mentransfer data, tetapi Export tidak dapat memastikan hasilnya.",
+                                                    code="TTS_DELIVERY_RECONCILIATION_FAILED",
+                                                ) from None
+                                            attempt_verification.status = "not_found"
+
+                                        # A byte-stall with no confirmed chat message is
+                                        # safe to try on the next selected profile.
+                                        upload_started = False
+                                        uploaded_at = None
+                                        uploaded_profile = None
+                                        save_delivery_result(
+                                            delivery_id,
+                                            delivered=False,
+                                            verification_pending=False,
+                                            upload_in_progress=False,
+                                            uploaded_at=None,
+                                            sender_profile=None,
+                                        )
+                                        if sender_index + 1 < len(sender_profiles):
+                                            self._append_job_log(
+                                                f"[TTS] tidak ada pertambahan byte untuk profil={sender_profile}; mencoba profil berikutnya"
+                                            )
+                                            continue
+                                        raise TtsError(
+                                            "Tidak ada pertambahan byte pada semua profil pengirim; bagian audio dinyatakan gagal.",
+                                            code="TTS_UPLOAD_NO_PROGRESS_ALL_PROFILES",
+                                        ) from None
                                     if denial:
                                         if reconcile_delivery:
                                             raise TtsError(
@@ -708,7 +770,7 @@ class TtsExecutorMixin:
                             "TDL menerima upload tanpa metadata waktu/profil untuk verifikasi.",
                             code="TTS_DELIVERY_RECONCILIATION_FAILED",
                         )
-                    verification = verifier.record_upload(
+                    verification = upload_verification or verifier.record_upload(
                         profile=uploaded_profile,
                         chat_ref=target_chat,
                         filename=upload_path.name,

@@ -432,6 +432,9 @@ class ProfileTests(unittest.TestCase):
 
             self.assertEqual(runtime.export_tdl_client.stall_timeout_seconds, 300)
             self.assertEqual(runtime.upload_tdl_client.stall_timeout_seconds, 1800)
+            self.assertEqual(
+                runtime.upload_tdl_client.upload_progress_stall_timeout_seconds, 60
+            )
 
     def test_upload_stall_timeout_is_configurable_independently(self) -> None:
         with (
@@ -447,6 +450,7 @@ class ProfileTests(unittest.TestCase):
                     "APP_ROLE": "worker",
                     "TDL_EXPORT_STALL_TIMEOUT_SECONDS": "300",
                     "TDL_UPLOAD_STALL_TIMEOUT_SECONDS": "2400",
+                    "TDL_UPLOAD_PROGRESS_STALL_TIMEOUT_SECONDS": "75",
                 },
                 clear=True,
             ),
@@ -455,8 +459,28 @@ class ProfileTests(unittest.TestCase):
             config = AppConfig.from_env()
 
         self.assertEqual(default_config.tdl_upload_stall_timeout_seconds, 1800)
+        self.assertEqual(
+            default_config.tdl_upload_progress_stall_timeout_seconds, 60
+        )
         self.assertEqual(config.tdl_export_stall_timeout_seconds, 300)
         self.assertEqual(config.tdl_upload_stall_timeout_seconds, 2400)
+        self.assertEqual(config.tdl_upload_progress_stall_timeout_seconds, 75)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "APP_ROLE": "worker",
+                    "TDL_UPLOAD_PROGRESS_STALL_TIMEOUT_SECONDS": "0",
+                },
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            disabled_config = AppConfig.from_env()
+        self.assertEqual(
+            disabled_config.tdl_upload_progress_stall_timeout_seconds, 0
+        )
 
     def test_profile_registry_rejects_one_telegram_identity_on_two_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

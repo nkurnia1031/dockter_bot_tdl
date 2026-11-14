@@ -14,6 +14,7 @@ from tme3bot.tdl import (
     TDLCommandError,
     TDLDataError,
     TDLStalledError,
+    TDLTransferStalledError,
     clean_tdl_output_line,
     decode_process_output,
     is_nonsemantic_tdl_output_line,
@@ -30,6 +31,7 @@ class FakeRunner:
         self.caption_contents: list[str] = []
         self.export_output_modes: list[int] = []
         self.export_calls = 0
+        self.transfer_stall_timeouts: list[int] = []
 
     def run(
         self,
@@ -40,7 +42,9 @@ class FakeRunner:
         progress_callback=None,
         output_callback=None,
         quiet_output: bool = False,
+        transfer_stall_timeout_seconds: int = 0,
     ) -> subprocess.CompletedProcess[str]:
+        self.transfer_stall_timeouts.append(transfer_stall_timeout_seconds)
         self.commands.append(command)
         self.envs.append(env)
         if "--caption" in command:
@@ -100,6 +104,23 @@ class FakeRunner:
 
 
 class TDLClientTests(unittest.TestCase):
+    def test_upload_passes_configured_byte_stall_timeout_to_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "sample.txt"
+            source.write_text("sample", encoding="utf-8")
+            runner = FakeRunner("success")
+            client = TDLClient(
+                root / "tdl",
+                "test",
+                runner=runner,
+                upload_progress_stall_timeout_seconds=60,
+            )
+
+            client.upload(source, "@target", "sample.txt")
+
+        self.assertEqual(runner.transfer_stall_timeouts, [60])
+
     def test_tts_caption_lookup_uses_delivery_time_range(self):
         class TtsLookupRunner:
             def __init__(self):
@@ -828,6 +849,44 @@ class TDLClientTests(unittest.TestCase):
             )
 
         self.assertEqual(raised.exception.timeout_seconds, 1)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_runner_stops_upload_when_transferred_bytes_do_not_increase(self) -> None:
+        class FastClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+                self.lock = threading.Lock()
+
+            def monotonic(self) -> float:
+                with self.lock:
+                    return self.value
+
+            def sleep(self, seconds: float) -> None:
+                time.sleep(0.01)
+                with self.lock:
+                    self.value += seconds
+
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import time; "
+                "print('Upload File(10):123 -> /tmp/sample.bin ... 1% [2 B in 1s; 0/s]', flush=True); "
+                "time.sleep(10)"
+            ),
+        ]
+        clock = FastClock()
+        started = time.monotonic()
+        with self.assertRaises(TDLTransferStalledError) as raised:
+            SubprocessRunner(clock=clock).run(
+                command,
+                env={**os.environ, "TDL_FORCE_PTY": "0"},
+                transfer_stall_timeout_seconds=2,
+            )
+
+        self.assertEqual(raised.exception.code, "TDL_UPLOAD_NO_PROGRESS")
+        self.assertEqual(raised.exception.transferred_bytes, 2)
+        self.assertEqual(raised.exception.timeout_seconds, 2)
         self.assertLess(time.monotonic() - started, 5)
 
     def test_parses_full_upload_progress_line(self) -> None:

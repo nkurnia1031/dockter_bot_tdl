@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tme3bot.tdl import TDLTransferStalledError
 from tme3bot.worker.executor import WorkerJobExecutor
 
 
@@ -20,9 +21,21 @@ class _BackupUploadClient:
         self.uploads: list[tuple] = []
         self.output_callback = None
         self.command_callback = None
+        self.outcomes = []
 
     def upload(self, path, chat_ref, caption, *, status_callback=None):
         self.uploads.append((Path(path), chat_ref, caption))
+        if self.outcomes:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                if getattr(outcome, "telegram_message", False):
+                    self.messages.append({
+                        "id": len(self.messages) + 1,
+                        "date": time.time(),
+                        "file_name": Path(path).name,
+                        "caption": caption,
+                    })
+                raise outcome
         self.messages.append({
             "id": len(self.messages) + 1,
             "date": time.time(),
@@ -43,19 +56,23 @@ class BackupUploadVerificationTests(unittest.TestCase):
     def _run_backup(self, root: Path, client: _BackupUploadClient):
         part = root / "backup.7z.001"
         part.write_bytes(b"backup-part")
-        runtime = SimpleNamespace(
-            export_tdl_client=client,
-            export_operation_lock=threading.RLock(),
-            download_operation_lock=threading.RLock(),
-        )
+        clients = client if isinstance(client, dict) else {"default": client}
+        runtimes = {
+            profile: SimpleNamespace(
+                export_tdl_client=profile_client,
+                export_operation_lock=threading.RLock(),
+                download_operation_lock=threading.RLock(),
+            )
+            for profile, profile_client in clients.items()
+        }
         executor = WorkerJobExecutor.__new__(WorkerJobExecutor)
         executor.config = SimpleNamespace(
             backup_node_name="local",
             backup_volume_size="1g",
         )
         executor.profile_manager = SimpleNamespace(
-            list_profiles=lambda: ["default"],
-            runtime=lambda _profile: runtime,
+            list_profiles=lambda: list(runtimes),
+            runtime=lambda profile: runtimes[profile],
         )
         executor.publisher = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
         executor._lock = threading.RLock()
@@ -101,6 +118,41 @@ class BackupUploadVerificationTests(unittest.TestCase):
 
             self.assertEqual(len(client.uploads), 1)
             self.assertEqual(len(client.exports), 2)
+            self.assertTrue((Path(raw) / "backup.7z.001").exists())
+
+    def test_backup_tries_next_profile_after_no_byte_progress_timeout(self):
+        with tempfile.TemporaryDirectory() as raw:
+            default = _BackupUploadClient()
+            archive = _BackupUploadClient()
+            archive.outcomes.append(TDLTransferStalledError([], -15, "", "", 60, 0))
+
+            result, part = self._run_backup(
+                Path(raw), {"default": default, "archive": archive}
+            )
+
+            self.assertEqual(result["parts"], 1)
+            self.assertEqual(len(archive.uploads), 1)
+            self.assertEqual(len(default.uploads), 1)
+            self.assertFalse(part.exists())
+
+    def test_backup_does_not_reverify_partial_attempt_after_all_profiles_stall(self):
+        with tempfile.TemporaryDirectory() as raw:
+            archive = _BackupUploadClient()
+            default = _BackupUploadClient()
+            archive.outcomes.append(
+                TDLTransferStalledError([], -15, "", "", 60, 128)
+            )
+            default.outcomes.append(
+                TDLTransferStalledError([], -15, "", "", 60, 0)
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "dicoba pada semua profil"):
+                self._run_backup(Path(raw), {"default": default, "archive": archive})
+
+            self.assertEqual(len(archive.uploads), 1)
+            self.assertEqual(len(default.uploads), 1)
+            self.assertEqual(len(archive.exports), 1)
+            self.assertEqual(len(default.exports), 0)
             self.assertTrue((Path(raw) / "backup.7z.001").exists())
 
 

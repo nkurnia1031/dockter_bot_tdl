@@ -20,6 +20,7 @@ from .executor_support import (
     _has_transfer_telemetry,
 )
 from .telegram_upload_verification import TelegramUploadBatchVerifier
+from tme3bot.tdl import tdl_upload_no_progress_bytes
 
 class BackupExecutorMixin:
 
@@ -77,9 +78,6 @@ class BackupExecutorMixin:
                         self._backup_services.pop(job_id, None)
         if not runtimes:
             raise RuntimeError("Tidak ada profile runtime untuk upload backup.")
-        uploader = runtimes[0].export_tdl_client
-        uploader_runtime = runtimes[0]
-        uploader_profile = profiles[0]
         verifier_factory = getattr(self, "_telegram_upload_verifier", None)
         verifier = (
             verifier_factory(str(command["job_id"]))
@@ -91,6 +89,7 @@ class BackupExecutorMixin:
         completed_bytes = 0
         sent = 0
         pending_verifications: list[tuple[dict[str, Any], Any, int, int]] = []
+        failed_parts: list[str] = []
 
         def publish_verified_part(part_payload: dict[str, Any], index: int, size: int) -> None:
             nonlocal sent, completed_bytes
@@ -123,14 +122,182 @@ class BackupExecutorMixin:
                 result={"part": part_payload},
             )
 
-        with self._capture_tdl_output(uploader):
-            for index, part in enumerate(archive.parts, start=1):
-                size = part_sizes[part]
-                upload_state = {"phase": "uploading"}
-                reporter.reset_transfer()
+        for index, part in enumerate(archive.parts, start=1):
+            size = part_sizes[part]
+            upload_state = {"phase": "uploading"}
+            reporter.reset_transfer()
+            reporter.report(
+                phase="verifying",
+                message=f"Memverifikasi {part.name}",
+                overall={
+                    "current": sent,
+                    "total": len(archive.parts),
+                    "unit": "parts",
+                },
+                item={
+                    "name": part.name,
+                    "index": index,
+                    "total": len(archive.parts),
+                    "size_bytes": size,
+                },
+                counters={"succeeded": sent},
+                indeterminate=True,
+                force=True,
+            )
+            digest, size = sha256_file(part)
+
+            def part_progress(progress) -> None:
+                if (
+                    upload_state["phase"] != "uploading"
+                    or not _has_transfer_telemetry(progress)
+                ):
+                    return
+                transfer = reporter.tdl_transfer(progress, total_bytes=size)
+                current_bytes = int(transfer.get("bytes_current") or 0)
+                overall_bytes = min(total_bytes, completed_bytes + current_bytes)
+                reporter.report(
+                    phase="uploading_parts",
+                    message=f"Mengupload {part.name}",
+                    overall={
+                        "current": sent,
+                        "total": len(archive.parts),
+                        "percent": (
+                            overall_bytes * 100 / total_bytes if total_bytes else None
+                        ),
+                        "unit": "parts",
+                        "bytes_current": overall_bytes,
+                        "bytes_total": total_bytes,
+                    },
+                    item={
+                        "name": part.name,
+                        "index": index,
+                        "total": len(archive.parts),
+                        "size_bytes": size,
+                        "percent": progress.percent,
+                    },
+                    transfer=transfer,
+                    counters={"succeeded": sent},
+                    indeterminate=progress.percent is None,
+                )
+
+            def part_phase(phase: str) -> None:
+                upload_state["phase"] = phase
+
+            caption = (
+                f"Backup node={payload['node_name']} "
+                f"run={str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
+            )
+            verification = None
+            upload_returned = False
+            for sender_profile in profiles:
+                sender_runtime = self.profile_manager.runtime(sender_profile)
+                uploader = sender_runtime.export_tdl_client
+                attempt_at = time.time()
+                try:
+                    with self._capture_tdl_output(
+                        uploader,
+                        command_callback=self._command_callback(
+                            profile=sender_profile, runtime="backup_upload"
+                        ),
+                    ):
+                        with sender_runtime.export_operation_lock:
+                            with self._capture_tdl_progress(uploader, part_progress):
+                                uploader.upload(
+                                    part,
+                                    str(payload["channel_ref"]),
+                                    caption,
+                                    status_callback=part_phase,
+                                )
+                except Exception as upload_error:
+                    no_progress_bytes = tdl_upload_no_progress_bytes(upload_error)
+                    if no_progress_bytes is None:
+                        raise
+                    if no_progress_bytes > 0:
+                        verification = verifier.record_upload(
+                            profile=sender_profile,
+                            chat_ref=str(payload["channel_ref"]),
+                            filename=part.name,
+                            caption=caption,
+                            uploaded_at=attempt_at,
+                        )
+                        if verification.status == "verified":
+                            upload_returned = True
+                            break
+                        if verification.error_code:
+                            break
+                        # An Export succeeded and found no item for this attempt.
+                        verification = None
+                    upload_state["phase"] = "uploading"
+                    reporter.report(
+                        phase="uploading_parts",
+                        message=f"Tidak ada progres untuk {part.name}; lanjut ke profil berikutnya",
+                        overall={
+                            "current": sent,
+                            "total": len(archive.parts),
+                            "unit": "parts",
+                        },
+                        item={
+                            "name": part.name,
+                            "index": index,
+                            "total": len(archive.parts),
+                            "size_bytes": size,
+                        },
+                        counters={"succeeded": sent},
+                        indeterminate=True,
+                        force=True,
+                    )
+                    continue
+
+                upload_returned = True
+                verification = verifier.record_upload(
+                    profile=sender_profile,
+                    chat_ref=str(payload["channel_ref"]),
+                    filename=part.name,
+                    caption=caption,
+                    uploaded_at=time.time(),
+                )
+                break
+
+            if not upload_returned and verification is None:
+                failed_parts.append(part.name)
+                reporter.report(
+                    phase="failed",
+                    message=f"Upload {part.name} tidak menunjukkan byte baru pada semua profil",
+                    overall={
+                        "current": sent + len(failed_parts),
+                        "total": len(archive.parts),
+                        "unit": "parts",
+                    },
+                    item={
+                        "name": part.name,
+                        "index": index,
+                        "total": len(archive.parts),
+                        "size_bytes": size,
+                    },
+                    counters={"succeeded": sent, "failed": len(failed_parts)},
+                    force=True,
+                )
+                continue
+
+            part_payload = {
+                "run_id": str(payload["backup_run_id"]),
+                "node_name": str(payload["node_name"]),
+                "part_name": part.name,
+                "channel_id": int(payload["channel_id"]),
+                "channel_message_id": verification.message_id,
+                "file_size": size,
+                "sha256": digest,
+                "uploaded_at": archive.created_at,
+                "status": "active",
+            }
+            if verification.status == "verified" and verification.message_id is not None:
+                publish_verified_part(part_payload, index, size)
+            else:
+                part_payload.pop("channel_message_id", None)
+                pending_verifications.append((part_payload, verification, index, size))
                 reporter.report(
                     phase="verifying",
-                    message=f"Memverifikasi {part.name}",
+                    message=f"Menunggu verifikasi Telegram untuk {part.name}",
                     overall={
                         "current": sent,
                         "total": len(archive.parts),
@@ -141,110 +308,15 @@ class BackupExecutorMixin:
                         "index": index,
                         "total": len(archive.parts),
                         "size_bytes": size,
+                        "percent": 100,
                     },
                     counters={"succeeded": sent},
                     indeterminate=True,
                     force=True,
                 )
-                digest, size = sha256_file(part)
-
-                def part_progress(progress) -> None:
-                    if (
-                        upload_state["phase"] != "uploading"
-                        or not _has_transfer_telemetry(progress)
-                    ):
-                        return
-                    transfer = reporter.tdl_transfer(progress, total_bytes=size)
-                    current_bytes = int(transfer.get("bytes_current") or 0)
-                    overall_bytes = min(total_bytes, completed_bytes + current_bytes)
-                    reporter.report(
-                        phase="uploading_parts",
-                        message=f"Mengupload {part.name}",
-                        overall={
-                            "current": sent,
-                            "total": len(archive.parts),
-                            "percent": (
-                                overall_bytes * 100 / total_bytes
-                                if total_bytes
-                                else None
-                            ),
-                            "unit": "parts",
-                            "bytes_current": overall_bytes,
-                            "bytes_total": total_bytes,
-                        },
-                        item={
-                            "name": part.name,
-                            "index": index,
-                            "total": len(archive.parts),
-                            "size_bytes": size,
-                            "percent": progress.percent,
-                        },
-                        transfer=transfer,
-                        counters={"succeeded": sent},
-                        indeterminate=progress.percent is None,
-                    )
-
-                def part_phase(phase: str) -> None:
-                    upload_state["phase"] = phase
-
-                caption = (
-                    f"Backup node={payload['node_name']} "
-                    f"run={str(payload['backup_run_id'])[:12]}\nPart: {part.name}"
-                )
-                with uploader_runtime.export_operation_lock:
-                    with self._capture_tdl_progress(uploader, part_progress):
-                        uploader.upload(
-                            part,
-                            str(payload["channel_ref"]),
-                            caption,
-                            status_callback=part_phase,
-                        )
-                uploaded_at = time.time()
-                verification = verifier.record_upload(
-                    profile=uploader_profile,
-                    chat_ref=str(payload["channel_ref"]),
-                    filename=part.name,
-                    caption=caption,
-                    uploaded_at=uploaded_at,
-                )
-                part_payload = {
-                    "run_id": str(payload["backup_run_id"]),
-                    "node_name": str(payload["node_name"]),
-                    "part_name": part.name,
-                    "channel_id": int(payload["channel_id"]),
-                    "channel_message_id": verification.message_id,
-                    "file_size": size,
-                    "sha256": digest,
-                    "uploaded_at": archive.created_at,
-                    "status": "active",
-                }
-                if verification.status == "verified" and verification.message_id is not None:
-                    publish_verified_part(part_payload, index, size)
-                else:
-                    part_payload.pop("channel_message_id", None)
-                    pending_verifications.append((part_payload, verification, index, size))
-                    reporter.report(
-                        phase="verifying",
-                        message=f"Menunggu verifikasi Telegram untuk {part.name}",
-                        overall={
-                            "current": sent,
-                            "total": len(archive.parts),
-                            "unit": "parts",
-                        },
-                        item={
-                            "name": part.name,
-                            "index": index,
-                            "total": len(archive.parts),
-                            "size_bytes": size,
-                            "percent": 100,
-                        },
-                        counters={"succeeded": sent},
-                        indeterminate=True,
-                        force=True,
-                    )
         if pending_verifications:
             verifier.finalize()
-            unresolved: list[str] = []
+            unresolved: list[str] = list(failed_parts)
             for part_payload, verification, index, size in pending_verifications:
                 if verification.status == "verified" and verification.message_id is not None:
                     part_payload["channel_message_id"] = verification.message_id
@@ -264,8 +336,12 @@ class BackupExecutorMixin:
                     force=True,
                 )
                 raise RuntimeError(
-                    "Sebagian part backup belum ditemukan dengan nama lampiran dan caption yang sama pada ekspor waktu."
+                    "Sebagian part backup gagal atau belum ditemukan dengan nama lampiran dan caption yang sama pada ekspor waktu."
                 )
+        elif failed_parts:
+            raise RuntimeError(
+                "Sebagian part backup tidak menunjukkan progres setelah dicoba pada semua profil."
+            )
         reporter.report(
             phase="completed",
             message=f"Backup selesai: {sent} part tersimpan",

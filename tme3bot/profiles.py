@@ -561,6 +561,9 @@ def build_profile_runtime(
         home=config.tdl_export_home,
         log_prefix=f"tdl-export:{profile_name}",
         stall_timeout_seconds=config.tdl_export_stall_timeout_seconds,
+        upload_progress_stall_timeout_seconds=getattr(
+            config, "tdl_upload_progress_stall_timeout_seconds", 60
+        ),
     )
     download_tdl_client = TDLClient(
         storage_root=config.tdl_download_storage,
@@ -569,6 +572,9 @@ def build_profile_runtime(
         home=config.tdl_download_home,
         log_prefix=f"tdl-download:{profile_name}",
         stall_timeout_seconds=config.tdl_download_stall_timeout_seconds,
+        upload_progress_stall_timeout_seconds=getattr(
+            config, "tdl_upload_progress_stall_timeout_seconds", 60
+        ),
         progress_callback=download_progress.update_tdl_progress,
     )
     upload_storage = DatabasePaths(config.database_root).tdl(profile_name, "upload")
@@ -585,6 +591,9 @@ def build_profile_runtime(
                 "tdl_upload_stall_timeout_seconds",
                 config.tdl_export_stall_timeout_seconds,
             )
+        ),
+        upload_progress_stall_timeout_seconds=getattr(
+            config, "tdl_upload_progress_stall_timeout_seconds", 60
         ),
     )
     export_service = ExportService(config, state_store, export_tdl_client)

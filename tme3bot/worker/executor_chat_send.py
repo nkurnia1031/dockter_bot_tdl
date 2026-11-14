@@ -7,7 +7,7 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
 
-from tme3bot.tdl import tdl_access_denial_code
+from tme3bot.tdl import tdl_access_denial_code, tdl_upload_no_progress_bytes
 
 
 class ChatSendExecutorMixin:
@@ -178,7 +178,8 @@ class ChatSendExecutorMixin:
                 fallback_allowed = bool(attempt_result.pop("_fallback_allowed", False))
                 last_fallback_allowed = fallback_allowed
                 result = attempt_result
-                if result["status"] == "accepted":
+                partial_stall = result["status"] == "partial_stall"
+                if result["status"] in {"accepted", "partial_stall"}:
                     verification = verifier.record_upload(
                         profile=sender,
                         chat_ref=chat_ref,
@@ -189,6 +190,16 @@ class ChatSendExecutorMixin:
                     if verification.status == "verified":
                         result["status"] = "succeeded"
                         result["message_id"] = verification.message_id
+                    elif partial_stall and verification.error_code:
+                        result["status"] = "ambiguous"
+                        result["error_code"] = verification.error_code
+                        fallback_allowed = False
+                    elif partial_stall:
+                        verification.status = "not_found"
+                        result["status"] = "failed"
+                        result["error_code"] = "TDL_UPLOAD_NO_PROGRESS"
+                        result["retryable"] = True
+                        fallback_allowed = True
                     else:
                         result["status"] = "pending_verification"
                         pending_verifications.append((
@@ -196,6 +207,7 @@ class ChatSendExecutorMixin:
                             transfer_mode, index,
                         ))
                     sender_index = (current_sender_index + 1) % len(profiles)
+                last_fallback_allowed = fallback_allowed
                 attempts.append({
                     "profile": sender,
                     "status": result["status"],
@@ -211,6 +223,20 @@ class ChatSendExecutorMixin:
             assert result is not None
             if result["status"] != "succeeded" and last_fallback_allowed:
                 sender_index = (file_start_index + 1) % len(profiles)
+                if (
+                    len(attempts) == len(order)
+                    and result["status"] == "failed"
+                    and all(
+                        attempt.get("error_code") == "TDL_UPLOAD_NO_PROGRESS"
+                        for attempt in attempts
+                    )
+                ):
+                    result["error_code"] = "TDL_UPLOAD_NO_PROGRESS_ALL_PROFILES"
+                    result["error"] = (
+                        "Tidak ada pertambahan byte selama batas waktu pada semua profil "
+                        "yang dicoba; file dinyatakan gagal."
+                    )
+                    result["retryable"] = True
             result["attempts"] = attempts
             result["attempt"] = len(attempts)
             if result["status"] == "succeeded":
@@ -318,6 +344,7 @@ class ChatSendExecutorMixin:
         size: int, source_identity: tuple[int, int, int, int],
     ) -> dict[str, Any]:
         command_started = False
+        upload_started_at = time.time()
 
         def update_transfer(progress) -> None:
             percent = getattr(progress, "percent", None)
@@ -411,6 +438,22 @@ class ChatSendExecutorMixin:
                 item = self._chat_send_item(
                     path, relative, status="failed", profile=profile, attempt=attempt,
                     error_code=denial, retryable=True,
+                )
+                item["_fallback_allowed"] = True
+                return item
+            no_progress_bytes = tdl_upload_no_progress_bytes(exc)
+            if no_progress_bytes is not None:
+                if no_progress_bytes > 0:
+                    item = self._chat_send_item(
+                        path, relative, status="partial_stall", profile=profile,
+                        attempt=attempt, error_code="TDL_UPLOAD_NO_PROGRESS_PARTIAL",
+                        retryable=False,
+                    )
+                    item["_uploaded_at"] = upload_started_at
+                    return item
+                item = self._chat_send_item(
+                    path, relative, status="failed", profile=profile, attempt=attempt,
+                    error_code="TDL_UPLOAD_NO_PROGRESS", retryable=True,
                 )
                 item["_fallback_allowed"] = True
                 return item

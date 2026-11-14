@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from tme3bot.tdl import TDLTransferStalledError
 from tme3bot.worker.executor import WorkerJobExecutor
 
 
@@ -26,6 +27,13 @@ class FakeUploadClient:
         if self.outcomes:
             outcome = self.outcomes.pop(0)
             if isinstance(outcome, BaseException):
+                if getattr(outcome, "telegram_message", False):
+                    self.sent_messages.append({
+                        "id": len(self.calls),
+                        "date": time.time(),
+                        "file_name": Path(file_path).name,
+                        "caption": caption,
+                    })
                 raise outcome
             if outcome is not None:
                 self.sent_messages.append({
@@ -121,6 +129,12 @@ class FakePublisher:
 
 
 class ChatSendWorkerTests(unittest.TestCase):
+    @staticmethod
+    def _stalled_upload(transferred_bytes: int, *, telegram_message: bool = False):
+        error = TDLTransferStalledError([], -15, "", "", 60, transferred_bytes)
+        error.telegram_message = telegram_message
+        return error
+
     def _run_job(
         self,
         workspace: Path,
@@ -339,6 +353,74 @@ class ChatSendWorkerTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["status"], "succeeded")
             self.assertEqual([attempt["profile"] for attempt in result["items"][0]["attempts"]], ["default", "archive"])
             self.assertEqual(result["items"][1]["profile"], "default")
+
+    def test_chat_send_tries_each_selected_profile_after_zero_byte_stall(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            folder = workspace / "batch"
+            folder.mkdir()
+            (folder / "one.txt").write_text("one")
+            calls: list[tuple[str, str, str]] = []
+            result, _ = self._run_job(workspace, {
+                "default": FakeUploadClient(
+                    "default", calls, [self._stalled_upload(0)]
+                ),
+                "archive": FakeUploadClient("archive", calls),
+            }, "chat-send-stall-fallback", {
+                "chat_ref": "@target", "folders": [str(folder)],
+                "_tdl_sender_profiles": ["default", "archive"],
+            })
+
+        self.assertEqual([item[0] for item in calls], ["default", "archive"])
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["items"][0]["profile"], "archive")
+
+    def test_chat_send_fails_when_every_selected_profile_stalls_without_bytes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            folder = workspace / "batch"
+            folder.mkdir()
+            (folder / "one.txt").write_text("one")
+            calls: list[tuple[str, str, str]] = []
+            result, _ = self._run_job(workspace, {
+                "default": FakeUploadClient(
+                    "default", calls, [self._stalled_upload(0)]
+                ),
+                "archive": FakeUploadClient(
+                    "archive", calls, [self._stalled_upload(0)]
+                ),
+            }, "chat-send-stall-exhausted", {
+                "chat_ref": "@target", "folders": [str(folder)],
+                "_tdl_sender_profiles": ["default", "archive"],
+            })
+
+        self.assertEqual([item[0] for item in calls], ["default", "archive"])
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(
+            result["items"][0]["error_code"],
+            "TDL_UPLOAD_NO_PROGRESS_ALL_PROFILES",
+        )
+
+    def test_chat_send_verifies_partial_stall_before_using_another_profile(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace = Path(temp_dir)
+            folder = workspace / "batch"
+            folder.mkdir()
+            (folder / "one.txt").write_text("one")
+            calls: list[tuple[str, str, str]] = []
+            result, _ = self._run_job(workspace, {
+                "default": FakeUploadClient(
+                    "default", calls, [self._stalled_upload(128, telegram_message=True)]
+                ),
+                "archive": FakeUploadClient("archive", calls),
+            }, "chat-send-partial-stall", {
+                "chat_ref": "@target", "folders": [str(folder)],
+                "_tdl_sender_profiles": ["default", "archive"],
+            })
+
+        self.assertEqual([item[0] for item in calls], ["default"])
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["items"][0]["profile"], "default")
 
     def test_chat_send_rotates_starting_profile_after_all_senders_are_denied(self):
         with tempfile.TemporaryDirectory() as temp_dir:

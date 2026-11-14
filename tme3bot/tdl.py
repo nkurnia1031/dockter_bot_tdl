@@ -133,6 +133,16 @@ def tdl_access_denial_code(exc: BaseException) -> str | None:
     return next((code for code in _TDL_ACCESS_DENIAL_CODES if code in text), None)
 
 
+def tdl_upload_no_progress_bytes(exc: BaseException) -> int | None:
+    """Return transferred bytes for the TDL upload-progress timeout only."""
+    if getattr(exc, "code", None) != "TDL_UPLOAD_NO_PROGRESS":
+        return None
+    try:
+        return max(0, int(getattr(exc, "transferred_bytes", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def tdl_session_denial_code(exc: BaseException) -> str | None:
     """Return a stable code only for explicit TDL authentication failures."""
     sources = [str(exc)]
@@ -183,6 +193,25 @@ class TDLStalledError(TDLCommandError):
         self.args = (
             f"TDL command stalled for {timeout_seconds}s: {' '.join(command)}",
         )
+
+
+class TDLTransferStalledError(TDLCommandError):
+    """Raised when an upload stops increasing its transferred byte count."""
+
+    def __init__(
+        self,
+        command: list[str],
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        timeout_seconds: int,
+        transferred_bytes: int,
+    ) -> None:
+        self.code = "TDL_UPLOAD_NO_PROGRESS"
+        self.timeout_seconds = timeout_seconds
+        self.transferred_bytes = max(0, int(transferred_bytes))
+        super().__init__(command, returncode, stdout, stderr)
+        self.args = (f"TDL upload made no byte progress for {timeout_seconds}s",)
 
 
 class TDLDataError(RuntimeError):
@@ -287,7 +316,8 @@ def notify_command_completed(
 
 
 class SubprocessRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Any = time) -> None:
+        self._clock = clock
         self._lock = threading.RLock()
         self._pause_condition = threading.Condition(self._lock)
         self._pause_requested = False
@@ -298,6 +328,8 @@ class SubprocessRunner:
         self._current_owner: str | None = None
         self._last_output_at: float | None = None
         self._last_progress_signature: tuple[Any, ...] | None = None
+        self._last_transfer_progress_at: float | None = None
+        self._last_transferred_bytes = 0
 
     @staticmethod
     def _emit_raw_output(
@@ -323,6 +355,7 @@ class SubprocessRunner:
         process_started_callback: Callable[[], None] | None = None,
         quiet_output: bool = False,
         output_filter: OutputFilter | None = None,
+        transfer_stall_timeout_seconds: int = 0,
     ) -> subprocess.CompletedProcess[str]:
         command_owner = str(getattr(command_callback, "job_id", "") or "") or None
         with self._pause_condition:
@@ -345,11 +378,13 @@ class SubprocessRunner:
         if output_callback is not None:
             output_callback(f"$ {' '.join(command)}")
         started_at = time.time()
-        started_monotonic = time.monotonic()
+        started_monotonic = self._clock.monotonic()
         output_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         stdout_lines: list[str] = []
         stderr_lines: list[str] = []
         stalled = False
+        transfer_stalled = False
+        transfer_bytes_at_exit = 0
 
         try:
             # Cancellation uses the same lock to inspect/interrupt the active
@@ -372,6 +407,8 @@ class SubprocessRunner:
                 self._current_owner = command_owner
                 self._last_output_at = started_at
                 self._last_progress_signature = None
+                self._last_transfer_progress_at = started_monotonic
+                self._last_transferred_bytes = 0
         except OSError as exc:
             self._emit_raw_output(
                 raw_output_callback,
@@ -388,7 +425,7 @@ class SubprocessRunner:
                     command,
                     -1,
                     str(exc),
-                    max(0.0, time.monotonic() - started_monotonic),
+                    max(0.0, self._clock.monotonic() - started_monotonic),
                     log_prefix,
                 )
             raise TDLCommandError(command, -1, "", str(exc)) from exc
@@ -437,7 +474,19 @@ class SubprocessRunner:
                     self._terminate_process(process)
                     stalled = True
                     break
-                time.sleep(0.2)
+                if (
+                    transfer_stall_timeout_seconds > 0
+                    and self._is_transfer_stalled(transfer_stall_timeout_seconds)
+                ):
+                    LOGGER.error(
+                        "%s upload made no byte progress for %ss; terminating process",
+                        log_prefix,
+                        transfer_stall_timeout_seconds,
+                    )
+                    self._terminate_process(process)
+                    transfer_stalled = True
+                    break
+                self._clock.sleep(0.2)
 
             stdout_thread.join(timeout=2)
             stderr_thread.join(timeout=2)
@@ -458,11 +507,14 @@ class SubprocessRunner:
         finally:
             with self._lock:
                 if self._current_process is process:
+                    transfer_bytes_at_exit = self._last_transferred_bytes
                     self._current_process = None
                     self._current_command = None
                     self._current_owner = None
                     self._last_output_at = None
                     self._last_progress_signature = None
+                    self._last_transfer_progress_at = None
+                    self._last_transferred_bytes = 0
                     self._paused = False
                     self._pause_requested = False
                     self._pause_owner = None
@@ -492,9 +544,18 @@ class SubprocessRunner:
                 command,
                 int(returncode),
                 f"{stdout}\n{stderr}",
-                max(0.0, time.monotonic() - started_monotonic),
+                max(0.0, self._clock.monotonic() - started_monotonic),
                 log_prefix,
                 command_id,
+            )
+        if transfer_stalled:
+            raise TDLTransferStalledError(
+                command,
+                returncode,
+                stdout,
+                stderr,
+                transfer_stall_timeout_seconds,
+                transfer_bytes_at_exit,
             )
         if stalled:
             raise TDLStalledError(
@@ -550,6 +611,7 @@ class SubprocessRunner:
             self._pause_owner = None
             if process is not None:
                 self._last_output_at = time.time()
+                self._last_transfer_progress_at = self._clock.monotonic()
             self._pause_condition.notify_all()
             return resumed
 
@@ -677,6 +739,13 @@ class SubprocessRunner:
                 ):  # pragma: no cover - progress UI should never kill tdl
                     LOGGER.exception("Progress callback failed")
 
+            transferred_bytes = progress.transferred_bytes
+            if transferred_bytes is not None:
+                with self._lock:
+                    if transferred_bytes > self._last_transferred_bytes:
+                        self._last_transferred_bytes = transferred_bytes
+                        self._last_transfer_progress_at = self._clock.monotonic()
+
             if stream_name == "stderr":
                 LOGGER.warning("%s stderr | %s", log_prefix, clean_line)
             else:
@@ -719,6 +788,14 @@ class SubprocessRunner:
         if last_output_at is None:
             return False
         return time.time() - last_output_at > stall_timeout_seconds
+
+    def _is_transfer_stalled(self, timeout_seconds: int) -> bool:
+        with self._lock:
+            last_progress_at = self._last_transfer_progress_at
+            paused = self._paused
+        if paused or last_progress_at is None:
+            return False
+        return self._clock.monotonic() - last_progress_at > timeout_seconds
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[bytes]) -> None:
@@ -844,6 +921,7 @@ class TDLClient:
         home: Path | None = None,
         log_prefix: str = "tdl",
         stall_timeout_seconds: int = 0,
+        upload_progress_stall_timeout_seconds: int = 0,
         progress_callback: ProgressCallback | None = None,
         output_callback: OutputCallback | None = None,
         raw_output_callback: RawOutputCallback | None = None,
@@ -856,6 +934,9 @@ class TDLClient:
         self.home = home
         self.log_prefix = log_prefix
         self.stall_timeout_seconds = stall_timeout_seconds
+        self.upload_progress_stall_timeout_seconds = max(
+            0, int(upload_progress_stall_timeout_seconds)
+        )
         self.progress_callback = progress_callback
         self.output_callback = output_callback
         self.raw_output_callback = raw_output_callback
@@ -1470,6 +1551,7 @@ class TDLClient:
                 env=self._command_env(),
                 log_prefix=f"{self.log_prefix}:upload",
                 stall_timeout_seconds=self.stall_timeout_seconds,
+                transfer_stall_timeout_seconds=self.upload_progress_stall_timeout_seconds,
                 progress_callback=self.progress_callback,
                 output_callback=self.output_callback,
                 **({"raw_output_callback": self.raw_output_callback} if self.raw_output_callback is not None else {}),

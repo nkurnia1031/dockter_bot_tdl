@@ -5,10 +5,12 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from pathlib import (
     Path,
     PurePosixPath,
@@ -17,7 +19,12 @@ from tme3bot.progress_reporter import (
     ProgressReporter,
 )
 from tme3bot.media import has_downloadable_media
-from tme3bot.tdl import tdl_session_denial_code, tdl_write_denial_code
+from tme3bot.tdl import (
+    TDLTransferStalledError,
+    tdl_session_denial_code,
+    tdl_upload_no_progress_bytes,
+    tdl_write_denial_code,
+)
 from tme3bot.rclone import (
     RcloneError,
     RcloneRunner,
@@ -2077,8 +2084,11 @@ class StorageExecutorMixin:
                         if path.name in photo_names:
                             upload_kwargs["as_photo"] = True
                         result = None
+                        attempt_verification = None
+                        no_progress_exhausted = False
                         for sender_index, sender_profile in enumerate(sender_profiles):
                             sender_runtime = sender_runtimes[sender_profile]
+                            upload_started_at = time.time()
                             try:
                                 with self._capture_tdl_progress(
                                     sender_runtime.upload_tdl_client, upload_progress
@@ -2097,6 +2107,30 @@ class StorageExecutorMixin:
                                     runtime = sender_runtime
                                 break
                             except Exception as send_error:
+                                no_progress_bytes = tdl_upload_no_progress_bytes(send_error)
+                                if no_progress_bytes is not None:
+                                    if no_progress_bytes > 0:
+                                        attempt_verification = verifier.record_upload(
+                                            profile=sender_profile,
+                                            chat_ref=target_chat,
+                                            filename=path.name,
+                                            caption=caption,
+                                            uploaded_at=upload_started_at,
+                                        )
+                                        if attempt_verification.status == "verified":
+                                            result = SimpleNamespace(
+                                                message_id=attempt_verification.message_id
+                                            )
+                                            break
+                                        if attempt_verification.error_code:
+                                            raise RuntimeError(
+                                                "STORAGE_UPLOAD_AMBIGUOUS: partial upload could not be checked by Export."
+                                            ) from None
+                                        attempt_verification.status = "not_found"
+                                    if sender_index + 1 < len(sender_profiles):
+                                        continue
+                                    no_progress_exhausted = True
+                                    break
                                 denial = tdl_write_denial_code(send_error)
                                 session_denial = tdl_session_denial_code(send_error)
                                 access_denial = denial or session_denial
@@ -2120,16 +2154,21 @@ class StorageExecutorMixin:
                                     f"{code}: upload Storage tidak berhasil."
                                 ) from None
                         if result is None:
+                            if no_progress_exhausted:
+                                raise RuntimeError(
+                                    "TDL_UPLOAD_NO_PROGRESS_ALL_PROFILES: no selected profile increased transferred bytes."
+                                )
                             raise RuntimeError("TDL_WRITE_FORBIDDEN: tidak ada profil yang dapat mengirim.")
                         # Telegram has accepted the file. Failures while
                         # publishing progress or registering the catalog event
                         # must not turn that physical upload into a false failure.
                         physical_upload_succeeded = True
-                        verification = verifier.record_upload(
+                        verification = attempt_verification or verifier.record_upload(
                             profile=sender_profile,
                             chat_ref=target_chat,
                             filename=path.name,
                             caption=caption,
+                            uploaded_at=time.time(),
                         )
                         if verification.status != "verified" or verification.message_id is None:
                             pending_verifications.append((
@@ -3087,16 +3126,19 @@ class StorageExecutorMixin:
         priority_task: dict[str, Any] | None = None
         lane_condition = threading.Condition(lanes_lock)
 
-        def next_active_sender(profile: str) -> str | None:
+        def next_active_sender(
+            profile: str, *, excluded: set[str] | None = None
+        ) -> str | None:
             if not active_lanes:
                 return None
+            excluded = excluded or set()
             try:
                 start = sender_profiles.index(profile)
             except ValueError:
                 start = -1
             for offset in range(1, len(sender_profiles) + 1):
                 candidate = sender_profiles[(start + offset) % len(sender_profiles)]
-                if candidate in active_lanes:
+                if candidate in active_lanes and candidate not in excluded:
                     return candidate
             return None
 
@@ -3436,6 +3478,9 @@ class StorageExecutorMixin:
                 path = task["path"]
                 relative = task["relative"]
                 attempt = int(task["attempt"])
+                next_sender_override: str | None = None
+                verification = None
+                upload_started_at = time.time()
                 try:
                     if self._job_cancelled(job_id):
                         return
@@ -3582,6 +3627,153 @@ class StorageExecutorMixin:
                                         caption,
                                         **upload_kwargs,
                                     )
+                    except TDLTransferStalledError as send_error:
+                        no_progress_bytes = tdl_upload_no_progress_bytes(send_error) or 0
+                        tried_profiles = list(
+                            dict.fromkeys(
+                                [
+                                    *(
+                                        str(item)
+                                        for item in task.get("tried_profiles", [])
+                                    ),
+                                    profile,
+                                ]
+                            )
+                        )
+                        verification_error = ""
+                        if no_progress_bytes > 0:
+                            verification = verifier.record_upload(
+                                profile=profile,
+                                chat_ref=target_chat,
+                                filename=path.name,
+                                caption=caption,
+                                uploaded_at=upload_started_at,
+                            )
+                            if verification.status == "verified":
+                                task["tried_profiles"] = tried_profiles
+                            elif verification.error_code:
+                                verification.status = "unverified"
+                                verification_error = verification.error_code
+                            else:
+                                # Export completed and found no message for this
+                                # attempt, so the next sender may safely proceed.
+                                verification.status = "not_found"
+
+                        if verification is not None and verification.status == "verified":
+                            # Reuse the immediate Export result below.
+                            pass
+                        elif verification_error:
+                            terminal_status = "needs_reconciliation"
+                            terminal_code = verification_error
+                            terminal_message = (
+                                "Upload sempat mentransfer data, tetapi Export tidak dapat "
+                                "memastikan apakah file sudah masuk ke Telegram."
+                            )
+                            finish_item(
+                                task,
+                                status=terminal_status,
+                                profile=profile,
+                                retryable=False,
+                                error_code=terminal_code,
+                                error_message=terminal_message,
+                            )
+                            report_progress(
+                                phase=terminal_status,
+                                message=f"Upload {path.name} perlu ditinjau",
+                                relative=relative,
+                                name=path.name,
+                                profile=profile,
+                                attempt=attempt,
+                                force=True,
+                            )
+                            continue
+                        else:
+                            candidate = next_active_sender(
+                                profile, excluded=set(tried_profiles)
+                            )
+                            if candidate:
+                                retry_task = {
+                                    **task,
+                                    "attempt": attempt + 1,
+                                    "tried_profiles": tried_profiles,
+                                }
+                                with lane_condition:
+                                    priority_task = retry_task
+                                    next_sender_override = candidate
+                                    lane_condition.notify_all()
+                                retry_message = (
+                                    "TDL tidak menambah byte selama batas waktu; "
+                                    "mencoba profil berikutnya."
+                                )
+                                persist(
+                                    relative,
+                                    path.name,
+                                    status="pending",
+                                    attempt=attempt + 1,
+                                    profile=profile,
+                                    retryable=True,
+                                    error_code="TDL_UPLOAD_NO_PROGRESS",
+                                    error_message=retry_message,
+                                )
+                                with results_lock:
+                                    active_items.pop(relative, None)
+                                    active_bytes.pop(relative, None)
+                                report_progress(
+                                    phase="uploading",
+                                    message=f"Mencoba {path.name} melalui profil {candidate}",
+                                    relative=relative,
+                                    name=path.name,
+                                    profile=candidate,
+                                    attempt=attempt + 1,
+                                    force=True,
+                                )
+                                continue
+                            timeout_seconds = max(
+                                1, int(getattr(send_error, "timeout_seconds", 60) or 60)
+                            )
+                            terminal_code = "TDL_UPLOAD_NO_PROGRESS_ALL_PROFILES"
+                            terminal_message = (
+                                f"Tidak ada pertambahan byte selama {timeout_seconds} detik "
+                                "pada semua profil yang dicoba; file dinyatakan gagal."
+                            )
+                            finish_item(
+                                task,
+                                status="failed",
+                                profile=profile,
+                                retryable=True,
+                                error_code=terminal_code,
+                                error_message=terminal_message,
+                            )
+                            progress = report_progress(
+                                phase="failed",
+                                message=f"Upload {path.name} gagal pada semua profil",
+                                relative=relative,
+                                name=path.name,
+                                profile=profile,
+                                attempt=attempt,
+                                force=True,
+                            )
+                            with progress_lock:
+                                reporter.milestone(
+                                    "storage.item_failed",
+                                    progress=progress,
+                                    error={
+                                        "code": terminal_code,
+                                        "message": terminal_message,
+                                        "item": path.name,
+                                    },
+                                    result={
+                                        "item": {
+                                            "path": relative,
+                                            "name": path.name,
+                                            "status": "failed",
+                                            "attempt": attempt,
+                                            "profile": profile,
+                                            "retryable": True,
+                                        }
+                                    },
+                                )
+                            continue
                     except Exception as send_error:
                         denial = tdl_write_denial_code(send_error)
                         session_denial = tdl_session_denial_code(send_error)
@@ -3701,12 +3893,13 @@ class StorageExecutorMixin:
                             )
                         continue
 
-                    verification = verifier.record_upload(
-                        profile=profile,
-                        chat_ref=target_chat,
-                        filename=path.name,
-                        caption=caption,
-                    )
+                    if verification is None:
+                        verification = verifier.record_upload(
+                            profile=profile,
+                            chat_ref=target_chat,
+                            filename=path.name,
+                            caption=caption,
+                        )
                     if verification.status != "verified":
                         persist(
                             relative,
@@ -3818,7 +4011,7 @@ class StorageExecutorMixin:
                 finally:
                     with lane_condition:
                         in_flight -= 1
-                        next_sender = next_active_sender(profile)
+                        next_sender = next_sender_override or next_active_sender(profile)
                         lane_condition.notify_all()
 
         with ThreadPoolExecutor(

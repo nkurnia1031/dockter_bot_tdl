@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from tme3bot.worker.executor_tts import tts_delivery_filename
 from tme3bot.worker.executor import WorkerJobExecutor
+from tme3bot.tdl import TDLTransferStalledError
 from tme3bot.worker.tts_pipeline import TtsError
 
 
@@ -47,9 +48,14 @@ class _FakeTdl:
     def __init__(self):
         self.uploads = []
         self.error = None
+        self.outcomes = []
 
     def upload(self, path, chat_ref, caption):
         self.uploads.append((Path(path), chat_ref, caption))
+        if self.outcomes:
+            outcome = self.outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
         if self.error is not None:
             raise self.error
 
@@ -75,10 +81,11 @@ class _Executor(WorkerJobExecutor):
         self.events = []
         self.publisher = SimpleNamespace(emit=lambda *args, **kwargs: self.events.append((args, kwargs)))
         self.tdl = _FakeTdl()
+        self.tdl_by_profile = {}
         self.profile_manager = SimpleNamespace(
             runtime=lambda profile: SimpleNamespace(
                 name=profile,
-                export_tdl_client=self.tdl,
+                export_tdl_client=self.tdl_by_profile.get(profile, self.tdl),
                 export_operation_lock=threading.RLock(),
             )
         )
@@ -215,6 +222,64 @@ class TtsExecutorTests(unittest.TestCase):
             self.assertEqual(chat_ref, "+1123456789")
             self.assertEqual(caption, "Bab 1")
             self.assertEqual(path.name, "Bab 1.mp3")
+
+    def test_tts_tries_next_profile_after_no_byte_progress_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executor = _Executor(directory)
+            default_tdl = _FakeTdl()
+            default_tdl.outcomes.append(
+                TDLTransferStalledError([], -15, "", "", 60, 0)
+            )
+            archive_tdl = _FakeTdl()
+            executor.tdl_by_profile.update({
+                "default": default_tdl,
+                "archive": archive_tdl,
+            })
+            request_index = {"value": 0}
+
+            def request(*args, **kwargs):
+                del kwargs
+                path = str(args[3])
+                method = str(args[2])
+                if path.endswith("/artifacts/ready"):
+                    return {"registered_parts": 1, "chat_ref": "-100123"}
+                if "/deliveries/worker-pending" in path:
+                    if request_index["value"] == 0:
+                        request_index["value"] += 1
+                        return {"items": [{
+                            "id": "delivery-stall",
+                            "artifact_ref": "a" * 48,
+                            "part_index": 1,
+                            "total_parts": 1,
+                        }]}
+                    return {"items": []}
+                if method == "GET" and "/delivery?worker=" in path:
+                    return {
+                        "status": "delivered",
+                        "delivered_parts": 1,
+                        "total_parts": 1,
+                    }
+                return {}
+
+            command = {
+                "job_id": "job-tts-stall-fallback",
+                "kind": "tts",
+                "profile": "default",
+                "worker": "local",
+                "payload": {
+                    "title": "Bab 2",
+                    "text": "Isi",
+                    "_tdl_sender_profiles": ["default", "archive"],
+                },
+            }
+            with patch.object(executor, "_tts_pipeline", return_value=_FakePipeline()), patch(
+                "tme3bot.worker.executor_tts.request_json", side_effect=request
+            ):
+                result = executor._tts(command)
+
+        self.assertEqual(result["delivered_parts"], 1)
+        self.assertEqual(len(default_tdl.uploads), 1)
+        self.assertEqual(len(archive_tdl.uploads), 1)
 
     def test_tts_sender_permission_failure_emits_scoped_profile_denial(self):
         with tempfile.TemporaryDirectory() as directory:

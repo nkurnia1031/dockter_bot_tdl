@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from tme3bot.application.job_scheduler import build_execution_plan
 from tme3bot.rclone import RcloneError
+from tme3bot.tdl import TDLTransferStalledError
 from tme3bot.worker.command_store import WorkerCommandStore
 from tme3bot.worker.executor import WorkerJobExecutor
 from tme3bot.worker.executor_storage import StorageExecutorMixin
@@ -26,6 +27,11 @@ class _UploadMetrics:
         self.upload_order = []
         self.workspace = None
         self.workspace_files_at_upload = []
+
+
+class _UploadNoProgressTimeout(TDLTransferStalledError):
+    def __init__(self, transferred_bytes=0):
+        super().__init__([], -15, "", "", 60, transferred_bytes)
 
 
 class _UploadClient:
@@ -48,6 +54,21 @@ class _UploadClient:
             raise RuntimeError("failure before tdl starts upload")
         if action == "denied":
             raise RuntimeError("CHAT_WRITE_FORBIDDEN")
+        if action in {"stall_no_progress", "stall_after_progress", "stall_after_progress_found"}:
+            if status_callback:
+                status_callback("uploading")
+            with self.metrics.lock:
+                self.metrics.upload_order.append((self.profile, path.name))
+            transferred_bytes = 0 if action == "stall_no_progress" else 128
+            if action == "stall_after_progress_found":
+                self.export_messages.append({
+                    "id": self.metrics.next_message_id,
+                    "date": time.time(),
+                    "file_name": path.name,
+                    "caption": _caption,
+                })
+                self.metrics.next_message_id += 1
+            raise _UploadNoProgressTimeout(transferred_bytes)
         if status_callback:
             status_callback("uploading")
         with self.metrics.lock:
@@ -806,6 +827,97 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertEqual(items["one.txt"]["profile"], "archive")
         self.assertEqual(items["two.txt"]["profile"], "archive")
         self.assertEqual(items["three.txt"]["profile"], "archive")
+
+    def test_durable_upload_tries_next_profile_after_one_minute_without_byte_progress(self):
+        self._add_files("slow.bin")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={("default", "slow.bin"): "stall_no_progress"},
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["outcome"], "succeeded", result)
+        self.assertEqual(
+            uploader.metrics.upload_order,
+            [("default", "slow.bin"), ("archive", "slow.bin")],
+        )
+        self.assertEqual(result["items"][0]["profile"], "archive")
+        self.assertEqual(self.store.storage_upload_items("storage-command")[0]["status"], "succeeded")
+
+    def test_durable_upload_fails_after_every_profile_stalls_without_bytes(self):
+        self._add_files("slow.bin")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={
+                ("default", "slow.bin"): "stall_no_progress",
+                ("archive", "slow.bin"): "stall_no_progress",
+            },
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["outcome"], "failed", result)
+        self.assertEqual(
+            uploader.metrics.upload_order,
+            [("default", "slow.bin"), ("archive", "slow.bin")],
+        )
+        self.assertEqual(result["items"][0]["status"], "failed")
+        self.assertEqual(result["items"][0]["error_code"], "TDL_UPLOAD_NO_PROGRESS_ALL_PROFILES")
+        persisted = self.store.storage_upload_items("storage-command")[0]
+        self.assertEqual(persisted["status"], "failed")
+        self.assertTrue(persisted["retryable"])
+
+    def test_durable_upload_verifies_partial_stall_before_switching_profile(self):
+        self._add_files("slow.bin")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={("default", "slow.bin"): "stall_after_progress"},
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["outcome"], "succeeded", result)
+        self.assertEqual(
+            uploader.metrics.upload_order,
+            [("default", "slow.bin"), ("archive", "slow.bin")],
+        )
+        self.assertEqual(result["items"][0]["profile"], "archive")
+        self.assertEqual(len(uploader.runtimes["default"].upload_tdl_client.export_calls), 1)
+
+    def test_durable_upload_accepts_partial_stall_when_export_finds_file(self):
+        self._add_files("slow.bin")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={("default", "slow.bin"): "stall_after_progress_found"},
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["outcome"], "succeeded", result)
+        self.assertEqual(uploader.metrics.upload_order, [("default", "slow.bin")])
+        self.assertEqual(result["items"][0]["profile"], "default")
+
+    def test_durable_upload_stops_ambiguous_when_partial_export_fails(self):
+        self._add_files("slow.bin")
+        uploader = _BatchUploader(
+            self.workspace,
+            self.store,
+            behavior={
+                ("default", "slow.bin"): "stall_after_progress",
+                "reconcile_export": "failure",
+            },
+        )
+
+        result = uploader._storage_upload(uploader.command(self.workspace))
+
+        self.assertEqual(result["outcome"], "needs_reconciliation", result)
+        self.assertEqual(uploader.metrics.upload_order, [("default", "slow.bin")])
+        self.assertEqual(result["items"][0]["status"], "needs_reconciliation")
 
     def test_durable_telegram_move_removes_each_file_before_starting_the_next(self):
         self._add_files("one.txt", "two.txt")
