@@ -356,10 +356,13 @@ Gateway compose hanya menjalankan `backend`, `telegram`, dan `worker-local`.
 Worker `remote-1` berada di VPS `138.2.34.55` dan dideploy melalui SSH dari
 root `/www/wwwroot/downloads/bot` pada host tersebut. `HostKeyAlias` memakai
 hostname worker yang sudah dipercaya untuk memvalidasi host key saat koneksi
-menggunakan IP:
+menggunakan IP. Worker `remote-2` berada di `aapanel2.naufix.space`; root
+repo dan Compose project yang benar adalah `/www/wwwroot/dockter_bot_tdl` dan
+`dockter_bot_tdl`:
 
 ```bash
 ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && git pull --ff-only origin main && python3 run.py deploy worker --pull'
+ssh -i ~/.ssh/id_ed25519_dockter_gateway -o IdentitiesOnly=yes root@aapanel2.naufix.space 'cd /www/wwwroot/dockter_bot_tdl && git pull --ff-only origin main && python3 run.py deploy worker --pull'
 ```
 
 Web static sekarang berada dan dideploy pada gateway yang sama dengan backend,
@@ -373,9 +376,12 @@ python3 run.py deploy web
 
 Sebelum deploy gateway, verifikasi label Compose `project.working_dir` dan
 `project` pada container gateway; sebelum deploy worker, verifikasi label yang
-sama pada container `remote-1`. Selalu jalankan setiap deploy dari root yang
+sama pada container `remote-1` atau `remote-2` sesuai host tujuan. Untuk
+`remote-2`, pastikan `project.working_dir=/www/wwwroot/dockter_bot_tdl` dan
+`project=dockter_bot_tdl`; jangan memakai path gateway/worker lain yang
+kebetulan juga memiliki checkout. Selalu jalankan setiap deploy dari root yang
 ditetapkan agar Compose memakai stack dan volume data yang benar; jangan
-membuat clone/deployment project kedua. Untuk SSH ke `remote-1`, gunakan host
+membuat clone/deployment project kedua. Untuk SSH ke kedua worker, gunakan host
 key tepercaya dan agent/key yang tersedia. Deploy rutin tidak memerlukan
 enrollment atau pembuatan key baru. Jangan tampilkan private key atau
 passphrase.
