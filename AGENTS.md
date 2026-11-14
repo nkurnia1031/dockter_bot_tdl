@@ -360,6 +360,14 @@ menggunakan IP. Worker `remote-2` berada di `aapanel2.naufix.space`; root
 repo dan Compose project yang benar adalah `/www/wwwroot/dockter_bot_tdl` dan
 `dockter_bot_tdl`:
 
+Untuk setiap perubahan image atau kode worker, cakupan default adalah ketiga
+target worker: `worker-local` melalui deploy gateway, `remote-1`, dan
+`remote-2`. Deploy belum selesai sampai image versi yang sama sudah berjalan
+pada ketiganya. Jalankan kedua perintah SSH di bawah; keberhasilan deploy
+gateway atau `remote-1` saja tidak mencakup `remote-2`. Abaikan target hanya
+jika pengguna secara eksplisit membatasi deployment ke subset tertentu, lalu
+sebutkan target yang tidak dideploy pada laporan akhir.
+
 ```bash
 ssh -i ~/.ssh/id_ed25519_dockter_gateway -o HostKeyAlias=bot.worker1.naufix.space root@138.2.34.55 'cd /www/wwwroot/downloads/bot && git pull --ff-only origin main && python3 run.py deploy worker --pull'
 ssh -i ~/.ssh/id_ed25519_dockter_gateway -o IdentitiesOnly=yes root@aapanel2.naufix.space 'cd /www/wwwroot/dockter_bot_tdl && git pull --ff-only origin main && python3 run.py deploy worker --pull'
@@ -376,7 +384,9 @@ python3 run.py deploy web
 
 Sebelum deploy gateway, verifikasi label Compose `project.working_dir` dan
 `project` pada container gateway; sebelum deploy worker, verifikasi label yang
-sama pada container `remote-1` atau `remote-2` sesuai host tujuan. Untuk
+sama pada container worker di masing-masing host `remote-1` dan `remote-2`.
+Verifikasi dan deploy kedua host secara terpisah, termasuk saat nama direktori
+checkout mereka sama dengan direktori gateway. Untuk
 `remote-2`, pastikan `project.working_dir=/www/wwwroot/dockter_bot_tdl` dan
 `project=dockter_bot_tdl`; jangan memakai path gateway/worker lain yang
 kebetulan juga memiliki checkout. Selalu jalankan setiap deploy dari root yang
