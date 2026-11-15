@@ -1,3 +1,4 @@
 # Test-only dependencies for the full backend suite.
 -r requirements-verifier.txt
+-r requirements-tts.txt
 PyYAML>=6,<7
