@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
@@ -11,6 +13,7 @@ from tme3bot.worker.aria2_bunkr import (
     BunkrFile,
     BunkrLinkError,
     BunkrResolver,
+    BunkrTaskStore,
     redact_aria2_response,
 )
 
@@ -19,6 +22,8 @@ class FakeResolver:
     def __init__(self):
         self.size = 100
         self.ranges = True
+        self.etag = '"stable-file-v1"'
+        self.last_modified = ""
         self.fail_resolve = False
         self.direct = "https://cdn.example.invalid/file?token=secret"
 
@@ -50,6 +55,14 @@ class FakeResolver:
 
     def probe(self, _url):
         return self.size, self.ranges
+
+    def probe_metadata(self, _url):
+        return SimpleNamespace(
+            size=self.size,
+            range_supported=self.ranges,
+            etag=self.etag,
+            last_modified=self.last_modified,
+        )
 
 
 class FakeRpc:
@@ -141,6 +154,54 @@ class Aria2BunkrLinksTests(unittest.TestCase):
         self.assertNotIn("source-secret", repr(result))
         self.assertNotIn("cdn.example.invalid", repr(result))
 
+    def test_existing_task_database_adds_validator_columns_in_place(self):
+        path = self.root / "database" / "legacy-aria2-link-tasks.sqlite3"
+        path.parent.mkdir(exist_ok=True)
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """CREATE TABLE aria2_link_tasks (
+                    task_key TEXT PRIMARY KEY,
+                    gid TEXT UNIQUE,
+                    kind TEXT NOT NULL,
+                    source_url TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    album_name TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    route TEXT NOT NULL,
+                    expected_size INTEGER,
+                    range_supported INTEGER NOT NULL DEFAULT 0,
+                    source_scheme TEXT NOT NULL DEFAULT 'https',
+                    source_port INTEGER NOT NULL DEFAULT 443,
+                    status TEXT NOT NULL,
+                    reason_code TEXT NOT NULL DEFAULT '',
+                    refresh_attempts INTEGER NOT NULL DEFAULT 0,
+                    retry_at REAL NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                )"""
+            )
+
+        store = BunkrTaskStore(path)
+        store.reserve({
+            "kind": "bunkr",
+            "source_url": "https://bunkr.cr/f/one",
+            "item_id": "one",
+            "album_name": "",
+            "file_name": "one.bin",
+            "destination": str(self.workspace / "one.bin"),
+            "route": "non",
+            "expected_size": 100,
+            "range_supported": True,
+            "source_scheme": "https",
+            "source_port": 443,
+            "expected_etag": '"stable-file-v1"',
+            "expected_last_modified": "Tue, 12 Nov 2024 10:00:00 GMT",
+        }, destination_exists=False)
+
+        row = store.tasks()[0]
+        self.assertEqual(row["expected_etag"], '"stable-file-v1"')
+        self.assertEqual(row["expected_last_modified"], "Tue, 12 Nov 2024 10:00:00 GMT")
+
     def test_album_enqueue_creates_one_task_per_selected_file_in_album_folder(self):
         result = self.links.enqueue({
             "sources": ["https://bunkr.cr/a/album"],
@@ -218,14 +279,34 @@ class Aria2BunkrLinksTests(unittest.TestCase):
         self.assertEqual(held_task["status"], "held")
         self.assertEqual(held_task["reason_code"], "ARIA2_TOR_UNAVAILABLE")
 
-    def test_tor_route_rejects_protocols_without_http_proxy_support(self):
+    def test_tor_route_rejects_unrecognized_protocols(self):
         result = self.links.enqueue({
-            "sources": ["sftp://files.example.invalid/archive.zip"],
+            "sources": ["gopher://files.example.invalid/archive.zip"],
             "selections": {}, "directory": str(self.workspace), "route": "tor",
         })
         self.assertEqual(result["items"][0]["status"], "failed")
-        self.assertEqual(result["items"][0]["reason_code"], "ARIA2_TOR_UNSUPPORTED_PROTOCOL")
         self.assertFalse(any(call[0] == "addUri" for call in self.rpc.calls))
+
+    def test_tor_route_supports_aria2_protocols_and_nonstandard_http_ports(self):
+        urls = [
+            "http://example.invalid:8080/http.bin",
+            "https://example.invalid:8443/https.bin",
+            "ftp://example.invalid:21/ftp.bin",
+            "sftp://example.invalid:22/sftp.bin",
+        ]
+        result = self.links.enqueue({
+            "sources": urls,
+            "selections": {},
+            "directory": str(self.workspace),
+            "route": "tor",
+        })
+
+        self.assertEqual([item["status"] for item in result["items"]], ["queued"] * 4)
+        calls = [call for call in self.rpc.calls if call[0] == "addUri"]
+        self.assertEqual(len(calls), 4)
+        for _method, params in calls:
+            self.assertIn("all-proxy", params[1])
+            self.assertEqual(params[1]["proxy-method"], "tunnel")
 
     def test_task_route_change_requires_paused_task_and_changes_only_that_task(self):
         created = self.links.enqueue({
@@ -291,6 +372,80 @@ class Aria2BunkrLinksTests(unittest.TestCase):
         task = next(item for item in self.links.tasks()["items"] if item["gid"] == gid)
         self.assertEqual(task["status"], "held")
         self.assertEqual(task["reason_code"], "ARIA2_TOR_UNAVAILABLE")
+
+    def test_tor_route_remains_attached_when_unavailable_and_resume_cannot_bypass_it(self):
+        queued = self.links.enqueue({
+            "sources": ["https://example.invalid/direct.zip"],
+            "selections": {}, "directory": str(self.workspace), "route": "non",
+        })["items"][0]
+        gid = queued["gid"]
+        self.links.pause(gid)
+        self.links.tor_ready = lambda: False
+
+        with self.assertRaisesRegex(BunkrLinkError, "ARIA2_TOR_UNAVAILABLE"):
+            self.links.set_route(gid, "tor")
+
+        self.assertEqual(self.links.store.get(gid)["route"], "tor")
+        with self.assertRaisesRegex(BunkrLinkError, "ARIA2_TOR_UNAVAILABLE"):
+            self.links.resume(gid)
+        self.assertFalse(any(call[0] == "unpause" and call[1][0] == gid for call in self.rpc.calls))
+
+        self.links.tor_ready = lambda: True
+        self.links.resume(gid)
+        route_change_index = max(
+            index for index, call in enumerate(self.rpc.calls)
+            if call[0] == "changeOption" and call[1][0] == gid
+        )
+        resume_index = max(
+            index for index, call in enumerate(self.rpc.calls)
+            if call[0] == "unpause" and call[1][0] == gid
+        )
+        self.assertLess(route_change_index, resume_index)
+        route_options = self.rpc.calls[route_change_index][1][1]
+        self.assertTrue(route_options["all-proxy"].startswith("http://aria2:"))
+        self.assertEqual(route_options["proxy-method"], "tunnel")
+
+    def test_aria2_http_authorization_error_code_refreshes_same_bunkr_task(self):
+        result = self.links.enqueue({
+            "sources": ["https://bunkr.cr/f/single"],
+            "selections": {"0": ["single"]},
+            "directory": str(self.workspace), "route": "non",
+        })["items"][0]
+        gid = result["gid"]
+        self.rpc.status[gid].update({
+            "status": "active",
+            "completedLength": "0",
+            "totalLength": "100",
+            "errorCode": "24",
+            "errorMessage": "Authorization failed.",
+        })
+
+        self.links.tick()
+
+        self.assertEqual(len([call for call in self.rpc.calls if call[0] == "changeUri"]), 1)
+        self.assertEqual(len(self.links.store.tasks()), 1)
+
+    def test_same_size_partial_with_different_etag_is_held_for_review(self):
+        result = self.links.enqueue({
+            "sources": ["https://bunkr.cr/f/single"],
+            "selections": {"0": ["single"]},
+            "directory": str(self.workspace), "route": "non",
+        })["items"][0]
+        gid = result["gid"]
+        self.rpc.status[gid].update({
+            "status": "active",
+            "completedLength": "50",
+            "totalLength": "100",
+            "errorMessage": "HTTP 403 Forbidden",
+        })
+        self.resolver.etag = '"different-file-v2"'
+
+        self.links.tick()
+
+        row = self.links.store.get(gid)
+        self.assertEqual(row["status"], "held")
+        self.assertEqual(row["reason_code"], "BUNKR_PARTIAL_METADATA_MISMATCH")
+        self.assertFalse(any(call[0] == "changeUri" for call in self.rpc.calls))
 
     def test_expired_url_is_replaced_on_same_gid_and_mismatch_holds_partial(self):
         result = self.links.enqueue({
@@ -420,6 +575,8 @@ class BunkrResolverTests(unittest.TestCase):
                 headers={
                     "Content-Range": "bytes 0-0/1234",
                     "Accept-Ranges": "bytes",
+                    "ETag": '"stable-file-v1"',
+                    "Last-Modified": "Tue, 12 Nov 2024 10:00:00 GMT",
                 },
             )
 
@@ -435,6 +592,11 @@ class BunkrResolverTests(unittest.TestCase):
 
         self.assertEqual(size, 1234)
         self.assertTrue(supports_ranges)
+        metadata = resolver.probe_metadata(
+            "https://cdn.bunkr.cr/archive.zip?token=signed-secret&ex=123"
+        )
+        self.assertEqual(metadata.etag, '"stable-file-v1"')
+        self.assertEqual(metadata.last_modified, "Tue, 12 Nov 2024 10:00:00 GMT")
         self.assertNotIn("signed-secret", "\n".join(captured.output))
 
     def test_preview_returns_safe_file_metadata_and_resolve_signs_url(self):

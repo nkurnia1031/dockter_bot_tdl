@@ -89,6 +89,14 @@ class BunkrFile:
     direct_url: str = ""
 
 
+@dataclass(frozen=True)
+class RemoteFileMetadata:
+    size: int | None
+    range_supported: bool
+    etag: str = ""
+    last_modified: str = ""
+
+
 class BunkrResolver:
     """Resolver using direct, non-proxied requests to Bunkr pages and APIs."""
 
@@ -339,8 +347,8 @@ class BunkrResolver:
             raise BunkrLinkError("Format metadata unduhan Bunkr tidak dikenal.")
         return value
 
-    def probe(self, direct_url: str) -> tuple[int | None, bool]:
-        """Return file size and byte-range support without downloading the body."""
+    def probe_metadata(self, direct_url: str) -> RemoteFileMetadata:
+        """Read size, range support, and stable validators without downloading the body."""
         try:
             with self.client_factory(
                 timeout=12,
@@ -358,11 +366,18 @@ class BunkrResolver:
                     supports_ranges = response.status_code == 206 or response.headers.get(
                         "accept-ranges", ""
                     ).lower() == "bytes"
+                    etag = str(response.headers.get("etag") or "").strip()[:512]
+                    last_modified = str(response.headers.get("last-modified") or "").strip()[:512]
                     # Closing a streaming response after headers avoids fetching a
                     # full object from servers that ignore Range.
-                    return size, supports_ranges
+                    return RemoteFileMetadata(size, supports_ranges, etag, last_modified)
         except Exception:
-            return None, False
+            return RemoteFileMetadata(None, False)
+
+    def probe(self, direct_url: str) -> tuple[int | None, bool]:
+        """Return the legacy size/range pair for callers that do not need validators."""
+        metadata = self.probe_metadata(direct_url)
+        return metadata.size, metadata.range_supported
 
 
 class BunkrTaskStore:
@@ -397,6 +412,8 @@ class BunkrTaskStore:
                     range_supported INTEGER NOT NULL DEFAULT 0,
                     source_scheme TEXT NOT NULL DEFAULT 'https',
                     source_port INTEGER NOT NULL DEFAULT 443,
+                    expected_etag TEXT NOT NULL DEFAULT '',
+                    expected_last_modified TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     reason_code TEXT NOT NULL DEFAULT '',
                     refresh_attempts INTEGER NOT NULL DEFAULT 0,
@@ -417,6 +434,14 @@ class BunkrTaskStore:
             if "source_port" not in columns:
                 connection.execute(
                     "ALTER TABLE aria2_link_tasks ADD COLUMN source_port INTEGER NOT NULL DEFAULT 443"
+                )
+            if "expected_etag" not in columns:
+                connection.execute(
+                    "ALTER TABLE aria2_link_tasks ADD COLUMN expected_etag TEXT NOT NULL DEFAULT ''"
+                )
+            if "expected_last_modified" not in columns:
+                connection.execute(
+                    "ALTER TABLE aria2_link_tasks ADD COLUMN expected_last_modified TEXT NOT NULL DEFAULT ''"
                 )
         self.path.chmod(0o600)
 
@@ -441,14 +466,15 @@ class BunkrTaskStore:
                 """INSERT INTO aria2_link_tasks
                 (task_key, kind, source_url, item_id, album_name, file_name,
                  destination, route, expected_size, range_supported, source_scheme,
-                 source_port, status, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'resolving', ?)""",
+                 source_port, expected_etag, expected_last_modified, status, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'resolving', ?)""",
                 (
                     task_key, row["kind"], row["source_url"], row["item_id"],
                     row["album_name"], row["file_name"], row["destination"],
                     row["route"], row.get("expected_size"),
                     1 if row.get("range_supported") else 0,
                     row.get("source_scheme", "https"), row.get("source_port", 443),
+                    row.get("expected_etag", ""), row.get("expected_last_modified", ""),
                     time.time(),
                 ),
             )
@@ -471,7 +497,7 @@ class BunkrTaskStore:
     def update(self, gid: str, **values: Any) -> None:
         allowed = {
             "route", "expected_size", "range_supported", "status", "reason_code",
-            "refresh_attempts", "retry_at", "updated_at",
+            "expected_etag", "expected_last_modified", "refresh_attempts", "retry_at", "updated_at",
         }
         patch = {key: value for key, value in values.items() if key in allowed}
         if not patch:
@@ -563,6 +589,20 @@ class Aria2BunkrLinks:
         self._tor_health_checked_at = now
         self._tor_health_cache = ready
         return ready
+
+    def _probe_metadata(self, direct_url: str) -> RemoteFileMetadata:
+        probe_metadata = getattr(self.resolver, "probe_metadata", None)
+        if callable(probe_metadata):
+            value = probe_metadata(direct_url)
+            return RemoteFileMetadata(
+                size=_as_optional_nonnegative_int(getattr(value, "size", None)),
+                range_supported=bool(getattr(value, "range_supported", False)),
+                etag=str(getattr(value, "etag", "") or "").strip()[:512],
+                last_modified=str(getattr(value, "last_modified", "") or "").strip()[:512],
+            )
+        # Keep the worker boundary compatible with older resolver adapters.
+        size, range_supported = self.resolver.probe(direct_url)
+        return RemoteFileMetadata(_as_optional_nonnegative_int(size), bool(range_supported))
 
     @staticmethod
     def _probe_tor() -> bool:
@@ -682,15 +722,13 @@ class Aria2BunkrLinks:
     ) -> dict[str, Any]:
         file_name = self._safe_component(file_name)
         destination = directory / file_name
-        expected_size, supports_ranges = self.resolver.probe(direct_url) if kind == "bunkr" else (None, False)
+        metadata = self._probe_metadata(direct_url) if kind == "bunkr" else RemoteFileMetadata(None, False)
         parsed_url = urlsplit(direct_url)
         source_scheme = parsed_url.scheme.lower()
         try:
             source_port = parsed_url.port or {"http": 80, "https": 443, "ftp": 21, "sftp": 22}.get(source_scheme, 0)
         except ValueError as exc:
             raise BunkrLinkError("URL unduhan tidak valid.") from exc
-        if route == "tor" and (source_scheme not in {"http", "https"} or source_port not in {80, 443}):
-            raise BunkrLinkError("ARIA2_TOR_UNSUPPORTED_PROTOCOL: Tor Links mendukung URL HTTP/HTTPS pada port 80/443.")
         tor_proxy = self.tor_proxy_url() if route == "tor" else ""
         held_for_tor = route == "tor" and not tor_available
         task_key = self.store.reserve({
@@ -701,8 +739,10 @@ class Aria2BunkrLinks:
             "file_name": file_name,
             "destination": str(destination),
             "route": route,
-            "expected_size": expected_size,
-            "range_supported": supports_ranges,
+            "expected_size": metadata.size,
+            "range_supported": metadata.range_supported,
+            "expected_etag": metadata.etag,
+            "expected_last_modified": metadata.last_modified,
             "source_scheme": source_scheme,
             "source_port": source_port,
         }, destination_exists=destination.exists() or destination.is_symlink())
@@ -715,6 +755,7 @@ class Aria2BunkrLinks:
         }
         if route == "tor":
             options["all-proxy"] = tor_proxy
+            options["proxy-method"] = "tunnel"
             if held_for_tor:
                 # Keep the task visible and persistent in aria2 without starting
                 # a transfer until the operator confirms Tor has recovered.
@@ -862,7 +903,7 @@ class Aria2BunkrLinks:
         return {"gid": gid, "status": str(result or "paused")}
 
     def set_route(self, gid: str, route: object) -> dict[str, Any]:
-        row = self._require_managed_gid(gid)
+        self._require_managed_gid(gid)
         mode = str(route or "").lower()
         if mode not in {"non", "tor"}:
             raise BunkrLinkError("Mode jaringan tidak valid.")
@@ -870,14 +911,12 @@ class Aria2BunkrLinks:
         if not isinstance(status, dict) or status.get("status") != "paused":
             raise BunkrLinkError("Jeda task sebelum mengganti mode jaringan.")
         if mode == "tor" and not self._tor_available(force=True):
-            self.store.update(gid, status="held", reason_code="ARIA2_TOR_UNAVAILABLE")
+            self.store.update(gid, route="tor", status="held", reason_code="ARIA2_TOR_UNAVAILABLE")
             raise BunkrLinkError("ARIA2_TOR_UNAVAILABLE: layanan Tor worker belum siap.")
-        if mode == "tor" and (
-            str(row.get("source_scheme") or "").lower() not in {"http", "https"}
-            or int(row.get("source_port") or 0) not in {80, 443}
-        ):
-            raise BunkrLinkError("ARIA2_TOR_UNSUPPORTED_PROTOCOL: Tor Links mendukung URL HTTP/HTTPS pada port 80/443.")
-        options = {"all-proxy": self.tor_proxy_url() if mode == "tor" else ""}
+        options = {
+            "all-proxy": self.tor_proxy_url() if mode == "tor" else "",
+            "proxy-method": "tunnel" if mode == "tor" else "get",
+        }
         self.rpc("changeOption", gid, options)
         self.store.update(gid, route=mode, status="paused", reason_code="")
         return {"gid": gid, "route": mode, "status": "paused"}
@@ -888,9 +927,14 @@ class Aria2BunkrLinks:
         if not isinstance(status, dict) or status.get("status") != "paused":
             raise BunkrLinkError("Task tidak sedang dijeda.")
         row = self.store.get(gid) or {}
-        if row.get("route") == "tor" and not self._tor_available(force=True):
+        route = str(row.get("route") or "non")
+        if route == "tor" and not self._tor_available(force=True):
             self.store.update(gid, status="held", reason_code="ARIA2_TOR_UNAVAILABLE")
             raise BunkrLinkError("ARIA2_TOR_UNAVAILABLE: layanan Tor worker belum siap.")
+        self.rpc("changeOption", gid, {
+            "all-proxy": self.tor_proxy_url() if route == "tor" else "",
+            "proxy-method": "tunnel" if route == "tor" else "get",
+        })
         result = self.rpc("unpause", gid)
         self.store.update(gid, status="active", reason_code="")
         return {"gid": gid, "status": str(result or "active")}
@@ -976,7 +1020,10 @@ class Aria2BunkrLinks:
                 continue
             if current.get("status") == "paused":
                 continue
-            expired = bool(_HTTP_ERROR.search(str(current.get("errorMessage") or "")))
+            expired = (
+                bool(_HTTP_ERROR.search(str(current.get("errorMessage") or "")))
+                or str(current.get("errorCode") or "").strip() == "24"
+            )
             if not expired:
                 continue
             if not self.store.reserve_refresh(gid, now):
@@ -985,11 +1032,33 @@ class Aria2BunkrLinks:
                 item = self.resolver.resolve_file(row["source_url"], row["item_id"])
                 total = _as_nonnegative_int(current.get("totalLength"))
                 completed = _as_nonnegative_int(current.get("completedLength"))
-                new_size, new_ranges = self.resolver.probe(item.direct_url)
+                metadata = self._probe_metadata(item.direct_url)
+                new_size = metadata.size
+                new_ranges = metadata.range_supported
                 expected = _as_nonnegative_int(row.get("expected_size"))
+                expected_etag = str(row.get("expected_etag") or "").strip()
+                expected_last_modified = str(row.get("expected_last_modified") or "").strip()
+                etag_mismatch = bool(
+                    expected_etag and metadata.etag and expected_etag != metadata.etag
+                )
+                last_modified_mismatch = bool(
+                    expected_last_modified
+                    and metadata.last_modified
+                    and expected_last_modified != metadata.last_modified
+                )
+                matching_validator = bool(
+                    (expected_etag and metadata.etag and expected_etag == metadata.etag)
+                    or (
+                        expected_last_modified
+                        and metadata.last_modified
+                        and expected_last_modified == metadata.last_modified
+                    )
+                )
+                validators_mismatch = etag_mismatch or last_modified_mismatch
                 if completed > 0 and (
                     not expected or new_size != expected
                     or not bool(row.get("range_supported")) or not new_ranges
+                    or not matching_validator or validators_mismatch
                 ):
                     try:
                         self.rpc("forcePause", gid)
@@ -997,7 +1066,7 @@ class Aria2BunkrLinks:
                         pass
                     self.store.update(gid, status="held", reason_code="BUNKR_PARTIAL_METADATA_MISMATCH")
                     continue
-                if expected and new_size and expected != new_size:
+                if (expected and new_size and expected != new_size) or validators_mismatch:
                     try:
                         self.rpc("forcePause", gid)
                     except Exception:
@@ -1019,6 +1088,8 @@ class Aria2BunkrLinks:
                     gid,
                     expected_size=new_size or expected or total or None,
                     range_supported=new_ranges,
+                    expected_etag=metadata.etag or expected_etag,
+                    expected_last_modified=metadata.last_modified or expected_last_modified,
                     status="active",
                     reason_code="",
                     refresh_attempts=0,
@@ -1039,6 +1110,13 @@ class Aria2BunkrLinks:
                 recovery_store.consume_error_events(managed_error_events)
             except Exception:
                 pass
+
+
+def _as_optional_nonnegative_int(value: object) -> int | None:
+    try:
+        return max(0, int(str(value)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _as_nonnegative_int(value: object) -> int:

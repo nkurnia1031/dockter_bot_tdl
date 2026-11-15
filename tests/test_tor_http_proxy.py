@@ -148,6 +148,25 @@ class TorHttpProxyTests(unittest.TestCase):
             self.assertEqual(client.recv(1024), b"echo:hello")
         self.assertIn(("download.example", 443), self.socks.destinations)
 
+    def test_connect_tunnels_nonstandard_http_ftp_and_sftp_ports(self):
+        for port in (21, 22, 8080, 8443):
+            with self.subTest(port=port):
+                with socket.create_connection(self.proxy.address, timeout=3) as client:
+                    client.settimeout(3)
+                    client.sendall(
+                        f"CONNECT download.example:{port} HTTP/1.1\r\n"
+                        f"Host: download.example:{port}\r\n".encode("ascii")
+                        + self.proxy_authorization
+                        + b"\r\n"
+                    )
+                    response = client.recv(1024)
+                    self.assertIn(b"200 Connection Established", response)
+                    client.sendall(b"hello")
+                    self.assertEqual(client.recv(1024), b"echo:hello")
+        self.assertTrue({
+            ("download.example", port) for port in (21, 22, 8080, 8443)
+        }.issubset(set(self.socks.destinations)))
+
     def test_http_forward_request_strips_proxy_credentials_and_uses_tor(self):
         with socket.create_connection(self.proxy.address, timeout=3) as client:
             client.settimeout(3)
@@ -170,6 +189,24 @@ class TorHttpProxyTests(unittest.TestCase):
         self.assertTrue(forwarded.startswith(b"GET /file.bin?sig=private HTTP/1.1"))
         self.assertNotIn(b"Proxy-Authorization", forwarded)
         self.assertNotIn(b"test-proxy-token", forwarded)
+
+    def test_http_forward_accepts_nonstandard_port(self):
+        with socket.create_connection(self.proxy.address, timeout=3) as client:
+            client.settimeout(3)
+            client.sendall(
+                b"GET http://download.example:8080/file.bin HTTP/1.1\r\n"
+                b"Host: download.example:8080\r\n"
+                + self.proxy_authorization
+                + b"\r\n"
+            )
+            response = bytearray()
+            while True:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        self.assertIn(b"200 OK", response)
+        self.assertIn(("download.example", 8080), self.socks.destinations)
 
     def test_missing_auth_and_private_destination_are_rejected_before_tor(self):
         with socket.create_connection(self.proxy.address, timeout=3) as client:

@@ -1,4 +1,4 @@
-"""Authenticated HTTP proxy that tunnels HTTP(S) requests through Tor SOCKS."""
+"""Authenticated HTTP proxy that tunnels TCP connections through Tor SOCKS."""
 
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ class TorHttpProxyServer:
 
             def _connect(self, authority: str, owner: "TorHttpProxyServer") -> None:
                 host, port = owner._parse_authority(authority)
-                if port != 443 or not owner._safe_host(host):
+                if not 1 <= port <= 65535 or not owner._safe_host(host):
                     self._respond(403, "Forbidden")
                     return
                 upstream = owner._connect_via_tor(host, port)
@@ -142,7 +142,7 @@ class TorHttpProxyServer:
                     parsed.scheme.lower() != "http"
                     or parsed.username is not None
                     or parsed.password is not None
-                    or port != 80
+                    or not 1 <= port <= 65535
                     or not owner._safe_host(host)
                 ):
                     self._respond(403, "Forbidden")
