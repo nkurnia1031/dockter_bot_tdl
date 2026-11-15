@@ -357,6 +357,30 @@ class Aria2BunkrLinksTests(unittest.TestCase):
         self.assertFalse(self.links.is_bunkr_task(direct["gid"]))
         self.assertTrue(self.links.is_bunkr_task(bunkr["gid"]))
 
+    def test_bunkr_error_event_refreshes_task_without_waiting_for_stopped_scan(self):
+        result = self.links.enqueue({
+            "sources": ["https://bunkr.cr/f/single"],
+            "selections": {"0": ["single"]},
+            "directory": str(self.workspace),
+            "route": "non",
+        })["items"][0]
+        gid = result["gid"]
+        self.rpc.status[gid].update({
+            "status": "error",
+            "completedLength": "0",
+            "totalLength": "100",
+            "errorCode": "24",
+            "errorMessage": "Authorization failed.",
+        })
+        recovery = FakeRecoveryEvents([gid])
+        self.links._last_stopped_scan_at = 995.0
+
+        self.links.tick(recovery)
+
+        self.assertFalse(any(call[0] == "tellStopped" for call in self.rpc.calls))
+        self.assertEqual(len([call for call in self.rpc.calls if call[0] == "changeUri"]), 1)
+        self.assertEqual(recovery.consumed, [gid])
+
     def test_resume_keeps_tor_task_held_when_tor_is_still_unhealthy(self):
         queued = self.links.enqueue({
             "sources": ["https://example.invalid/direct.zip"],

@@ -995,6 +995,7 @@ class Aria2BunkrLinks:
                 self.store.update(gid, status="held", reason_code="ARIA2_TOR_UNAVAILABLE")
                 observed[gid] = {**current, "status": "paused"}
         managed_error_events: list[str] = []
+        processed_error_events: list[str] = []
         if recovery_store is not None:
             try:
                 events = recovery_store.read().get("error_event_gids", [])
@@ -1003,6 +1004,17 @@ class Aria2BunkrLinks:
                         managed_error_events.append(gid)
             except Exception:
                 pass
+        for gid in managed_error_events:
+            try:
+                current = self.rpc("tellStatus", gid, [
+                    "gid", "status", "errorCode", "errorMessage", "completedLength", "totalLength",
+                ])
+            except Exception:
+                continue
+            if not isinstance(current, dict) or not current.get("status"):
+                continue
+            observed[gid] = current
+            processed_error_events.append(gid)
         for gid, row in bunkr_rows.items():
             if gid in observed or row.get("status") != "refreshing" or float(row.get("retry_at") or 0) > now:
                 continue
@@ -1105,9 +1117,9 @@ class Aria2BunkrLinks:
                     refresh_attempts=attempts,
                     retry_at=now + delay,
                 )
-        if recovery_store is not None and managed_error_events:
+        if recovery_store is not None and processed_error_events:
             try:
-                recovery_store.consume_error_events(managed_error_events)
+                recovery_store.consume_error_events(processed_error_events)
             except Exception:
                 pass
 
