@@ -176,6 +176,18 @@ _Avoid_: retry error, pembatalan karena kecepatan rendah.
 Percobaan ulang eksternal setelah aria2 tidak lagi mencoba otomatis dan satu unduhan berada pada status stopped karena error. Fallback tidak menggantikan atau mengurangi retry bawaan aria2.
 _Avoid_: retry native aria2, pemulihan pause/cancel manual.
 
+**Sumber unduhan Bunkr**:
+URL file atau album Bunkr yang disimpan sebagai rujukan task agar URL unduh sementara dapat diperbarui ketika kedaluwarsa.
+_Avoid_: URL direct sementara sebagai sumber permanen.
+
+**Penyegaran URL Bunkr**:
+Proses memperoleh URL unduh baru untuk file Bunkr yang task-nya gagal karena URL lama kedaluwarsa. Penyegaran mempertahankan task dan data parsial yang masih cocok; kegagalan sementara dicoba lagi sampai berhasil atau task dibatalkan operator.
+_Avoid_: membuat unduhan duplikat, menghapus parsial tanpa pemeriksaan.
+
+**Mode Tor Aria2**:
+Pilihan per task untuk mengirim koneksi unduh melalui Tor atau jaringan langsung. Mode default adalah jaringan langsung; perubahan pada task aktif dilakukan setelah task dijeda.
+_Avoid_: pengaturan proxy global, fallback Tor diam-diam.
+
 ## Storage
 
 **Unduhan Storage**:
