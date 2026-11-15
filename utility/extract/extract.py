@@ -104,28 +104,24 @@ def _command_for(
     filepath: Path, password: str | None, output: Path
 ) -> list[str]:
     lower = filepath.name.lower()
-    if lower.endswith((".7z", ".7z.001", ".zip")):
+    if lower.endswith((".7z", ".7z.001", ".zip", ".rar")):
         # Per-member output is needed to distinguish a genuine partial extract
         # from zero-byte files left behind after a password prompt/error.
-        command = ["7z", "x", "-bb1"]
+        # Exclude text and URL files before writing archive members. Linux 7z
+        # matches case-sensitively by default, so opt into case-insensitive
+        # matching to cover names such as README.TXT and Link.URL too.
+        command = [
+            "7z",
+            "x",
+            "-bb1",
+            "-ssc-",
+            "-xr!*.txt",
+            "-xr!*.url",
+        ]
         if password is not None:
             command.append(f"-p{password}")
         command.extend(["-y", str(filepath), f"-o{output}", "-bsp0"])
         return command
-    if lower.endswith(".rar"):
-        # unar and the p7zip build in our worker cannot decode some RAR5
-        # compression methods. RARLab's UnRAR handles the same archives as
-        # aaPanel and accepts non-ASCII member names without shell parsing.
-        password_switch = f"-p{password}" if password is not None else "-p-"
-        return [
-            "unrar",
-            "x",
-            "-y",
-            "-o+",
-            password_switch,
-            str(filepath),
-            f"{output}{os.sep}",
-        ]
     raise ValueError("Format arsip tidak didukung.")
 
 
@@ -143,17 +139,12 @@ def run_extract(
     started = time.monotonic()
     with tempfile.TemporaryFile() as tool_log:
         try:
-            environment = None
-            if Path(command[0]).name.lower() == "unrar":
-                environment = os.environ.copy()
-                environment["LC_ALL"] = "C.UTF-8"
             process = subprocess.Popen(
                 command,
                 cwd=str(filepath.parent),
                 stdin=subprocess.DEVNULL,
                 stdout=tool_log,
                 stderr=subprocess.STDOUT,
-                env=environment,
                 start_new_session=False,
             )
         except OSError:
@@ -195,21 +186,6 @@ class ArchiveAttempt:
     unclassified_failure: bool = False
 
 
-_UNRAR_MEMBER_SUCCESS = re.compile(
-    r"^\s*Extracting\s+(?P<member>.+?)(?:\s+\d{1,3}%)*\s+OK\s*$",
-    re.IGNORECASE,
-)
-_UNRAR_MEMBER_FAILURE = re.compile(
-    r"^\s*(?:CRC failed in (?:encrypted file )?|Data error in encrypted file|"
-    r"Checksum error in (?:the )?encrypted file|Cannot create (?:file )?|"
-    r"Can't create (?:file )?|"
-    r"Write error in (?:file )?)\s*(?P<member>.+?)\s*$",
-    re.IGNORECASE,
-)
-_UNRAR_ERROR_MARKER = re.compile(
-    r"\b(?:error|failed|cannot|can't|unsupported|unexpected end)\b",
-    re.IGNORECASE,
-)
 _SEVEN_Z_MEMBER_ERROR = re.compile(
     # 7z separates the error description from the member with " : ". Match
     # that first spaced separator so colons inside a member filename survive.
@@ -244,23 +220,6 @@ def _member_name_relative_to_output(raw_member: str, output: Path) -> str:
     if member.startswith(output_prefix):
         member = member[len(output_prefix) :]
     return member
-
-
-def _unrar_member_relative_to_output(
-    raw_member: str, filepath: Path | None, output: Path
-) -> str:
-    member = raw_member.strip().strip("\"'").replace("\\", "/")
-    member_path = Path(member)
-    if member_path.is_absolute():
-        roots = [output]
-        if filepath is not None:
-            roots.append(filepath.parent)
-        for root in roots:
-            try:
-                return member_path.relative_to(root).as_posix()
-            except ValueError:
-                continue
-    return _normalize_member_name(member)
 
 
 def _member_files(
@@ -298,8 +257,6 @@ def _staged_file_results(
     tool_output: str,
     output: Path,
     returncode: int | None,
-    *,
-    filepath: Path | None = None,
 ) -> tuple[list[Path], tuple[str, ...], bool]:
     files = _regular_output_files(output)
     successful_members: list[str] = []
@@ -307,27 +264,7 @@ def _staged_file_results(
     has_unclassified_error = False
     tool = Path(command[0]).name.lower()
     for line in tool_output.replace("\x08", "").splitlines():
-        if tool == "unrar":
-            success_match = _UNRAR_MEMBER_SUCCESS.match(line)
-            if success_match:
-                member = _unrar_member_relative_to_output(
-                    success_match.group("member"), filepath, output
-                )
-                successful_members.append(member)
-                continue
-            failed_match = _UNRAR_MEMBER_FAILURE.match(line)
-            if failed_match:
-                member = _unrar_member_relative_to_output(
-                    failed_match.group("member"), filepath, output
-                )
-                failed_members.append(member)
-                continue
-            if (
-                _UNRAR_ERROR_MARKER.search(line)
-                and not re.match(r"^\s*Total errors?:\s*\d+\s*$", line, re.IGNORECASE)
-            ):
-                has_unclassified_error = True
-        elif tool in {"7z", "7zz"}:
+        if tool in {"7z", "7zz"}:
             failed_match = _SEVEN_Z_MEMBER_ERROR.match(line)
             if failed_match:
                 failed_members.append(failed_match.group("member"))
@@ -360,14 +297,6 @@ def _staged_file_results(
             not failed_members or has_unclassified_error
         ):
             successful_files = set()
-    elif tool == "unrar":
-        # Only retain partial output when UnRAR named the failed members and
-        # emitted no additional error that cannot be tied to a specific file.
-        if has_unclassified_error or (
-            returncode not in (None, 0) and not failed_members
-        ):
-            successful_files = set()
-            has_unclassified_error = True
     normalized_failures = {
         _member_name_relative_to_output(member, output) for member in failed_members
     }
@@ -742,11 +671,11 @@ def _attempt_archive(
             attempt=attempt,
         )
         successful_files, failed_members, unclassified_failure = _staged_file_results(
-            command, run.output, staging, run.returncode, filepath=filepath
+            command, run.output, staging, run.returncode
         )
         failed_file_count = len(failed_members)
         if (
-            Path(command[0]).name.lower() in {"7z", "7zz", "unrar"}
+            Path(command[0]).name.lower() in {"7z", "7zz"}
             and run.returncode != 0
             and not failed_members
         ):

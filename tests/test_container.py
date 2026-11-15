@@ -11,6 +11,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ContainerBuildTests(unittest.TestCase):
+    def test_worker_image_installs_the_7z_rar_module_without_unrar(self) -> None:
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        worker_stage = dockerfile.split("FROM runtime-base AS worker", 1)[1]
+
+        self.assertIn("p7zip-rar", worker_stage)
+        self.assertIn("command -v 7z", worker_stage)
+        self.assertNotIn("unrar", worker_stage)
+
     def test_dockerfile_prefers_host_tdl_with_fixed_fallback(self) -> None:
         dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
         basefile = (PROJECT_ROOT / "Dockerfile.base").read_text(encoding="utf-8")

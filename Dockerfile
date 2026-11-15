@@ -40,8 +40,9 @@ RUN set -eu; \
         sed -i -E '/^Components:/ { /(^|[[:space:]])multiverse([[:space:]]|$)/! s/$/ multiverse/; }' "$source_file"; \
     done; \
     apt-get update; \
-    apt-get install -y --no-install-recommends tor aria2 ca-certificates curl unzip unrar; \
-    command -v unrar >/dev/null; \
+    apt-get install -y --no-install-recommends tor aria2 ca-certificates curl unzip p7zip-rar; \
+    command -v 7z >/dev/null; \
+    dpkg-query -W -f='${Status}' p7zip-rar | grep -q '^install ok installed$'; \
     mkdir -p /opt/ariang; \
     curl -fsSL "https://github.com/mayswind/AriaNg/releases/download/${ARIANG_VERSION}/AriaNg-${ARIANG_VERSION}.zip" -o /tmp/ariang.zip; \
     unzip -q /tmp/ariang.zip -d /tmp/ariang; \

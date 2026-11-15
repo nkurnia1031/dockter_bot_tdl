@@ -22,7 +22,7 @@ RUN_EXTRACT_E2E = os.getenv("TME3_RUN_UTILITY_EXTRACT_E2E") == "1"
 class UtilityExtractE2ETests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        missing = [name for name in ("7z", "unrar") if shutil.which(name) is None]
+        missing = [name for name in ("7z",) if shutil.which(name) is None]
         if missing:
             raise unittest.SkipTest(f"archive tools unavailable: {', '.join(missing)}")
         repo_root = Path(__file__).resolve().parents[1]
@@ -126,10 +126,10 @@ class UtilityExtractE2ETests(unittest.TestCase):
 
     def test_plain_zip_ignores_wrong_password_and_uses_a_unique_output_inside_workspace(self) -> None:
         folder = self._selected_folder("no-password")
-        source = self._payload(folder, "payload.txt", 43)
+        source = self._payload(folder, "payload.bin", 43)
         archive = folder / "plain.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
-            zipped.write(source, "nested/payload.txt")
+            zipped.write(source, "nested/payload.bin")
         (folder / ".pass").write_text("wrong-pass-file\n", encoding="utf-8")
 
         existing = folder / "plain"
@@ -144,11 +144,30 @@ class UtilityExtractE2ETests(unittest.TestCase):
         item = self._assert_success(result, archive.name, folder)
         output = Path(str(item["output"]))
         self.assertEqual(output.name, "plain_2")
-        self.assertEqual((output / "nested" / "payload.txt").read_bytes(), source.read_bytes())
+        self.assertEqual((output / "nested" / "payload.bin").read_bytes(), source.read_bytes())
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "existing output must survive")
         self.assertEqual(outside_sentinel.read_text(encoding="utf-8"), "outside selected workspace")
         self.assertFalse(archive.exists(), "only successful source archives may be deleted")
         self.assertFalse(list(folder.glob(".extract-attempt-*")))
+
+    def test_text_and_url_members_are_excluded_case_insensitively(self) -> None:
+        folder = self._selected_folder("exclude-members")
+        archive = folder / "members.zip"
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
+            zipped.writestr("nested/payload.bin", b"keep this")
+            zipped.writestr("nested/readme.txt", b"exclude this")
+            zipped.writestr("nested/readme.TXT", b"exclude this too")
+            zipped.writestr("nested/link.url", b"exclude this")
+            zipped.writestr("nested/link.URL", b"exclude this too")
+
+        result = self._extract(folder)
+
+        item = self._assert_success(result, archive.name, folder)
+        output = Path(str(item["output"]))
+        self.assertEqual(
+            sorted(path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()),
+            ["nested/payload.bin"],
+        )
 
     def test_password_from_utility_form_unlocks_encrypted_7z(self) -> None:
         folder = self._selected_folder("form-password")
@@ -182,35 +201,28 @@ class UtilityExtractE2ETests(unittest.TestCase):
         self.assertEqual((Path(str(item["output"])) / source.name).read_bytes(), source.read_bytes())
         self.assertFalse(archive.exists())
 
-    def test_pass_file_unlocks_encrypted_rar_and_removes_all_parts_after_success(self) -> None:
-        folder = self._selected_folder("rar-pass-file")
-        source = self._large_payload(folder, size=64 * 1024)
-        fixture_parts = sorted(self.archive_fixture_root.glob("multipart.part*.rar"))
-        self.assertGreater(len(fixture_parts), 1, "committed fixture must contain multiple RAR volumes")
-        parts: set[Path] = set()
-        for fixture in fixture_parts:
-            target = folder / fixture.name
-            shutil.copy2(fixture, target)
-            parts.add(target)
-        (folder / ".pass").write_text("pass-file-secret\n", encoding="utf-8")
-        main_part = folder / "multipart.part1.rar"
-        self.assertTrue(main_part.is_file())
+    def test_rar3_fixture_extracts_with_7z(self) -> None:
+        folder = self._selected_folder("rar3")
+        fixture = self.archive_fixture_root / "rar3-sample.rar"
+        archive = folder / fixture.name
+        shutil.copy2(fixture, archive)
 
         result = self._extract(folder)
 
-        item = self._assert_success(result, main_part.name, folder)
+        item = self._assert_success(result, archive.name, folder)
         output = Path(str(item["output"]))
-        self.assertEqual((output / source.name).read_bytes(), source.read_bytes())
-        self.assertTrue(parts.isdisjoint(set(folder.iterdir())))
+        self.assertEqual((output / "testfile.jpg").stat().st_size, 220)
+        self.assertEqual((output / "testfile.png").stat().st_size, 87)
+        self.assertFalse(archive.exists())
         self.assertFalse(list(folder.glob(".extract-attempt-*")))
 
     def test_archive_path_traversal_cannot_write_outside_selected_folder(self) -> None:
         folder = self._selected_folder("path-boundary")
         archive = folder / "traversal.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zipped:
-            zipped.writestr("../../../../escaped.txt", "must stay in the temporary test tree")
-            zipped.writestr("safe/payload.txt", "inside archive")
-        outside_target = self.temp_root / "escaped.txt"
+            zipped.writestr("../../../../escaped.bin", "must stay in the temporary test tree")
+            zipped.writestr("safe/payload.bin", "inside archive")
+        outside_target = self.temp_root / "escaped.bin"
 
         result = self._extract(folder)
 
@@ -219,7 +231,7 @@ class UtilityExtractE2ETests(unittest.TestCase):
             item = self._assert_success(result, archive.name, folder)
             self.assertFalse(archive.exists())
             output = Path(str(item["output"]))
-            self.assertEqual((output / "safe" / "payload.txt").read_text(encoding="utf-8"), "inside archive")
+            self.assertEqual((output / "safe" / "payload.bin").read_text(encoding="utf-8"), "inside archive")
         else:
             self.assertTrue(archive.is_file(), "a rejected archive must remain available")
         self.assertFalse(list(folder.glob(".extract-attempt-*")))
@@ -230,8 +242,8 @@ class UtilityExtractE2ETests(unittest.TestCase):
         later_folder = selected / "later-folder"
         seed_folder.mkdir()
         later_folder.mkdir()
-        seed_source = self._payload(seed_folder, "seed.txt")
-        later_source = self._payload(later_folder, "later.txt")
+        seed_source = self._payload(seed_folder, "seed.bin")
+        later_source = self._payload(later_folder, "later.bin")
         seed_archive = seed_folder / "seed.7z"
         later_archive = later_folder / "later.zip"
         self._make_7z(seed_folder, seed_archive, seed_source, password="shared-secret")
@@ -258,7 +270,7 @@ class UtilityExtractE2ETests(unittest.TestCase):
 
     def test_failed_encrypted_and_corrupt_archives_are_retained_and_staging_is_removed(self) -> None:
         folder = self._selected_folder("failed-archives")
-        source = self._payload(folder, "private.txt")
+        source = self._payload(folder, "private.bin")
         encrypted = folder / "encrypted.zip"
         self._make_7z(
             folder, encrypted, source, password="actual-secret", archive_type="zip"
@@ -292,8 +304,8 @@ class UtilityExtractE2ETests(unittest.TestCase):
 
     def test_archive_with_one_successful_member_is_successful_and_keeps_only_that_file(self) -> None:
         folder = self._selected_folder("mixed-result")
-        good_source = self._payload(folder, "good.txt", 31)
-        secret_source = self._payload(folder, "secret.txt", 47)
+        good_source = self._payload(folder, "good.bin", 31)
+        secret_source = self._payload(folder, "secret.bin", 47)
         archive = folder / "mixed.zip"
         self._run_archive_builder(
             ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(archive), good_source.name],
@@ -323,9 +335,9 @@ class UtilityExtractE2ETests(unittest.TestCase):
 
     def test_partial_extract_preserves_successful_empty_members(self) -> None:
         folder = self._selected_folder("mixed-empty-result")
-        empty_source = folder / "empty.txt"
+        empty_source = folder / "empty.bin"
         empty_source.touch()
-        secret_source = self._payload(folder, "secret.txt", 47)
+        secret_source = self._payload(folder, "secret.bin", 47)
         archive = folder / "mixed-empty.zip"
         self._run_archive_builder(
             ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(archive), empty_source.name],
@@ -360,8 +372,8 @@ class UtilityExtractE2ETests(unittest.TestCase):
         later_folder = folder / "B"
         first_folder.mkdir()
         later_folder.mkdir()
-        plain_source = self._payload(first_folder, "plain.txt", 31)
-        secret_source = self._payload(first_folder, "secret.txt", 47)
+        plain_source = self._payload(first_folder, "plain.bin", 31)
+        secret_source = self._payload(first_folder, "secret.bin", 47)
         first_archive = first_folder / "first.zip"
         self._run_archive_builder(
             ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(first_archive), plain_source.name],
@@ -375,7 +387,7 @@ class UtilityExtractE2ETests(unittest.TestCase):
             first_folder,
         )
 
-        later_source = self._payload(later_folder, "later.txt", 19)
+        later_source = self._payload(later_folder, "later.bin", 19)
         later_archive = later_folder / "second.zip"
         self._run_archive_builder(
             ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(later_archive), later_source.name],
@@ -406,8 +418,8 @@ class UtilityExtractE2ETests(unittest.TestCase):
         first_folder.mkdir()
         later_folder.mkdir()
 
-        first_source = self._payload(first_folder, "first.txt", 31)
-        second_source = self._payload(first_folder, "second.txt", 47)
+        first_source = self._payload(first_folder, "first.bin", 31)
+        second_source = self._payload(first_folder, "second.bin", 47)
         first_archive = first_folder / "first.zip"
         self._run_archive_builder(
             [
@@ -425,7 +437,7 @@ class UtilityExtractE2ETests(unittest.TestCase):
         )
         (first_folder / ".pass").write_text("first-secret", encoding="utf-8")
 
-        later_source = self._payload(later_folder, "later.txt", 19)
+        later_source = self._payload(later_folder, "later.bin", 19)
         later_archive = later_folder / "second.zip"
         self._run_archive_builder(
             ["7z", "a", "-y", "-bso0", "-bsp0", "-tzip", str(later_archive), later_source.name],

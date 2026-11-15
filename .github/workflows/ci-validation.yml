@@ -54,9 +54,8 @@ jobs:
       - name: Install archive tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends p7zip-full unrar
+          sudo apt-get install -y --no-install-recommends p7zip-full p7zip-rar
           command -v 7z
-          command -v unrar
 
       - name: Install Python dependencies
         run: |

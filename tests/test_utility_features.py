@@ -12,39 +12,50 @@ from utility.extract.extract import _copy_partial_member_no_follow, _discard_par
 
 
 class UtilityFeatureTests(unittest.TestCase):
-    def _fake_partial_unrar(self, root: Path) -> tuple[Path, dict[str, str]]:
+    def _fake_7z_rar_with_exclusions(self, root: Path) -> tuple[Path, dict[str, str]]:
         bin_root = root / "bin"
         bin_root.mkdir(parents=True)
-        executable = bin_root / "unrar"
+        executable = bin_root / "7z"
         executable.write_text(
             "#!/usr/bin/env python3\n"
-            "import os, sys\n"
+            "import fnmatch, json, os, sys\n"
             "from pathlib import Path\n"
             "args = sys.argv[1:]\n"
-            "archive_index = next(index for index, value in enumerate(args) if value.endswith('.rar'))\n"
-            "archive = Path(args[archive_index])\n"
-            "output = Path(args[archive_index + 1])\n"
-            "output.mkdir(parents=True, exist_ok=True)\n"
-            "member_root = archive.stem\n"
-            "(output / member_root / 'good.txt').parent.mkdir(parents=True)\n"
-            "(output / member_root / 'good.txt').write_text('ok', encoding='utf-8')\n"
-            "(output / member_root / '中文' / '成功.txt').parent.mkdir(parents=True)\n"
-            "(output / member_root / '中文' / '成功.txt').write_text('ok', encoding='utf-8')\n"
-            "(output / member_root / 'broken.txt').write_text('partial bytes', encoding='utf-8')\n"
-            "prefix = output / member_root\n"
             "with open(os.environ['UTILITY_TEST_CALLS'], 'a', encoding='utf-8') as f:\n"
-            "    f.write('attempt\\n')\n"
-            "print(f\"Extracting  {prefix / 'good.txt'}     \\x08\\x08  0%\\x08\\x08  OK\")\n"
-            "print(f\"Extracting  {prefix / '中文/成功.txt'}     \\x08\\x08  1%\\x08\\x08  OK\")\n"
-            "print(f\"Extracting  {prefix / 'broken.txt'}                                                 0%\")\n"
-            "print(f\"CRC failed in encrypted file {prefix / 'broken.txt'}\")\n"
-            "raise SystemExit(1)\n",
+            "    f.write(json.dumps(args, ensure_ascii=False) + '\\n')\n"
+            "if os.environ.get('UTILITY_TEST_7Z_FAIL') == '1':\n"
+            "    print('ERROR: Unsupported Method : nested/payload.bin')\n"
+            "    raise SystemExit(2)\n"
+            "archive = Path(next(value for value in args if value.endswith('.rar')))\n"
+            "output = Path(next(value[2:] for value in args if value.startswith('-o')))\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "patterns = [arg[4:] for arg in args if arg.startswith('-xr!')]\n"
+            "case_sensitive = '-ssc-' not in args\n"
+            "members = ('nested/payload.bin', 'nested/readme.TXT', 'nested/link.Url')\n"
+            "for member in members:\n"
+            "    candidate = member if case_sensitive else member.casefold()\n"
+            "    normalized = patterns if case_sensitive else [p.casefold() for p in patterns]\n"
+            "    if any(fnmatch.fnmatchcase(candidate, pattern) for pattern in normalized):\n"
+            "        continue\n"
+            "    target = output / member\n"
+            "    target.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    target.write_text('kept', encoding='utf-8')\n"
+            "    print(f'- {member}')\n",
             encoding="utf-8",
         )
         executable.chmod(0o755)
+        for fallback_name in ("unrar", "unar"):
+            fallback = bin_root / fallback_name
+            fallback.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' {fallback_name} >> \"$UTILITY_TEST_FALLBACK_CALLS\"\n",
+                encoding="utf-8",
+            )
+            fallback.chmod(0o755)
         return bin_root, {
-            "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+            "PATH": f"{bin_root}{os.pathsep}/usr/bin{os.pathsep}/bin",
             "UTILITY_TEST_CALLS": str(root / "calls.txt"),
+            "UTILITY_TEST_FALLBACK_CALLS": str(root / "fallback-calls.txt"),
         }
 
     def _fake_7z_partial_with_missing_failed_member(
@@ -187,18 +198,16 @@ class UtilityFeatureTests(unittest.TestCase):
         }
         return bin_root, env
 
-    def test_rar_extract_uses_unrar_and_keeps_successful_unicode_members(self):
+    def test_rar_extract_uses_7z_and_excludes_text_and_url_members(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             folder = root / "partial-archive"
             folder.mkdir()
             archive = folder / "sample.rar"
             archive.write_bytes(b"archive")
-            bin_root, env = self._fake_partial_unrar(root)
-            progress: list[dict[str, object]] = []
+            _, env = self._fake_7z_rar_with_exclusions(root)
             runner = UtilityRunner(
                 Path(__file__).resolve().parents[1] / "utility",
-                progress_callback=progress.append,
                 workspace_root=root,
             )
 
@@ -206,40 +215,46 @@ class UtilityFeatureTests(unittest.TestCase):
                 result = runner.run("extract", [str(folder)])
 
             self.assertEqual(result.outcome, "succeeded")
-            self.assertEqual(result.summary["archives_succeeded"], 1)
-            self.assertEqual(result.summary["archives_partial"], 1)
-            self.assertEqual(result.summary["archives_failed"], 0)
             item = result.archive_results[0]
             self.assertEqual(item["status"], "succeeded")
-            self.assertTrue(item["partial"])
-            self.assertEqual(item["files_extracted"], 2)
-            self.assertEqual(item["failed_files"], 1)
-            self.assertEqual(item["cleanup_status"], "retained_partial")
-            self.assertTrue(archive.is_file())
             output = Path(str(item["output"]))
-            self.assertEqual(
-                (output / "sample" / "good.txt").read_text(encoding="utf-8"),
-                "ok",
-            )
-            self.assertEqual(
-                (output / "sample" / "中文" / "成功.txt").read_text(encoding="utf-8"),
-                "ok",
-            )
-            self.assertFalse((output / "sample" / "broken.txt").exists())
-            self.assertEqual(
-                (root / "calls.txt").read_text(encoding="utf-8").splitlines(),
-                ["attempt", "attempt"],
-            )
-            self.assertEqual(
-                [event["attempt"] for event in progress if event.get("phase") == "archive_attempt"],
-                [1, 2],
-            )
+            self.assertEqual(item["files_extracted"], 1)
+            self.assertTrue((output / "nested" / "payload.bin").is_file())
+            self.assertFalse(any(path.suffix.casefold() in {".txt", ".url"} for path in output.rglob("*")))
+            command_args = json.loads((root / "calls.txt").read_text(encoding="utf-8"))
+            self.assertEqual(command_args[0], "x")
+            self.assertIn("-xr!*.txt", command_args)
+            self.assertIn("-xr!*.url", command_args)
+            self.assertIn("-ssc-", command_args)
+            self.assertFalse((root / "fallback-calls.txt").exists())
+            self.assertFalse(archive.exists())
             self.assertFalse(list(folder.glob(".extract-attempt-*")))
-            output = Path(str(item["output"]))
             self.assertEqual(
                 [path.name for path in folder.iterdir() if path.is_dir()],
                 [output.name],
             )
+
+    def test_rar_extract_does_not_fallback_when_7z_fails(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "failed-archive"
+            folder.mkdir()
+            archive = folder / "sample.rar"
+            archive.write_bytes(b"archive")
+            _, env = self._fake_7z_rar_with_exclusions(root)
+            env["UTILITY_TEST_7Z_FAIL"] = "1"
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(os.environ, env):
+                result = runner.run("extract", [str(folder)])
+
+            self.assertEqual(result.outcome, "failed")
+            self.assertEqual(result.archive_results[0]["status"], "failed")
+            self.assertTrue(archive.is_file())
+            self.assertFalse((root / "fallback-calls.txt").exists())
 
     def test_extract_keeps_empty_success_when_failed_member_has_no_staged_file(self):
         with tempfile.TemporaryDirectory() as temp_dir:

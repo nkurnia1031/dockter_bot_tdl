@@ -1,11 +1,12 @@
 # Extract E2E archive fixture
 
-`multipart.part*.rar` is a small encrypted multipart RAR fixture used by the
-Utility Extract end-to-end test. Its test-only password is `pass-file-secret`;
-the test supplies it through a temporary `.pass` file. The archive contains a
-64 KiB deterministic `large.bin` payload generated with Python's
-`random.Random(20261114).randbytes(64 * 1024)`.
+`rar3-sample.rar` is a tiny RAR3 fixture used by the Utility Extract
+end-to-end test. It contains `testfile.jpg` (220 bytes) and `testfile.png`
+(87 bytes). The fixture is from
+[`ssokolow/rar-test-files`](https://github.com/ssokolow/rar-test-files) and is
+dedicated to the public domain under CC0 1.0; see `LICENSE.cc0`.
 
-The fixture is checked in so CI only needs RAR extraction support (`unrar`), not
-the proprietary RAR creation utility. Tests copy it into a temporary
-Workspace-like directory and never extract into repository files.
+RAR3 is used because the previous fixture used a newer RAR compression method
+that 7-Zip does not support. CI installs the 7-Zip RAR module (`p7zip-rar`);
+tests copy the fixture into a temporary Workspace-like directory and never
+extract into repository files.

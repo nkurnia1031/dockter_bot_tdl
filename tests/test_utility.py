@@ -170,7 +170,7 @@ class UtilitySummaryTests(unittest.TestCase):
             self.assertEqual(result["reason_code"], "UTILITY_COMMAND_MISSING")
             self.assertFalse(any(workspace.iterdir()))
 
-    def test_runtime_probe_reports_missing_unrar_without_mutating_workspace(self):
+    def test_runtime_probe_does_not_require_unrar_without_mutating_workspace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             utility_root = root / "utility"
@@ -197,8 +197,8 @@ class UtilitySummaryTests(unittest.TestCase):
             with patch("tme3bot.utility.shutil.which", side_effect=which):
                 result = probe_utility_runtime(utility_root, workspace)
 
-            self.assertFalse(result["ready"])
-            self.assertEqual(result["reason_code"], "UTILITY_COMMAND_MISSING")
+            self.assertTrue(result["ready"])
+            self.assertEqual(result["reason_code"], "")
             self.assertFalse(any(workspace.iterdir()))
 
     def test_runner_classifies_process_start_failure_as_utility_runtime_failure(self):
