@@ -865,6 +865,47 @@ class WorkerHttpDispatcher:
             "/internal/v1/aria2/jsonrpc", request_payload, timeout=35,
         )
 
+    def aria2_links_preview(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/aria2/links/preview", payload, timeout=90,
+        )
+
+    def aria2_links_enqueue(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/aria2/links/enqueue", payload, timeout=120,
+        )
+
+    def aria2_links_tasks(self, worker: str) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "GET",
+            "/internal/v1/aria2/links/tasks", timeout=20,
+        )
+
+    def aria2_link_task_control(
+        self, worker: str, gid: str, action: str, payload: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if action not in {"pause", "route", "resume"}:
+            raise ValueError("Aksi task Aria2 tidak valid.")
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            f"/internal/v1/aria2/links/tasks/{quote(str(gid), safe='')}/{action}",
+            payload or {}, timeout=20,
+        )
+
     def aria2_ui_asset(self, worker: str, asset_path: str) -> tuple[bytes, str]:
         record = self.worker_registry.get(worker)
         if not record:

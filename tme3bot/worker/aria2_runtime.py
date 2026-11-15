@@ -17,9 +17,15 @@ from contextlib import nullcontext
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Any
+from urllib.parse import quote
 from urllib.request import ProxyHandler, Request, build_opener
 
 from tme3bot.database_paths import ensure_private_directory
+from tme3bot.worker.aria2_bunkr import (
+    Aria2BunkrLinks,
+    redact_aria2_response,
+    redact_sensitive_urls_in_text,
+)
 from tme3bot.worker.aria2_recovery import (
     Aria2RecoveryCoordinator,
     Aria2RecoveryStateStore,
@@ -57,6 +63,7 @@ BLOCKED_OPTIONS = frozenset({
     "on-download-complete", "on-bt-download-complete",
     "load-cookies", "save-cookies", "netrc-path", "ca-certificate",
     "certificate", "private-key", "ssh-host-key-md",
+    "all-proxy", "all-proxy-user", "all-proxy-passwd",
 })
 
 
@@ -78,10 +85,22 @@ class Aria2Runtime:
         self.rpc_url = str(rpc_url or DEFAULT_RPC_URL)
         self.config_file = self.state_root / "aria2.conf"
         self.secret_file = self.state_root / "rpc.secret"
+        self.tor_proxy_token_file = Path(
+            os.environ.get(
+                "ARIA2_TOR_PROXY_TOKEN_FILE",
+                str(self.state_root / "tor-proxy.token"),
+            )
+        )
         self.session_file = self.state_root / "aria2.session"
         self.hook_status_file = self.state_root / "aria2-hook-status.json"
         self.recovery_store = Aria2RecoveryStateStore(
             self.state_root / "aria2-recovery.json"
+        )
+        self.bunkr_links = Aria2BunkrLinks(
+            workspace_root=self.workspace_root,
+            state_root=self.state_root,
+            rpc=self._bunkr_rpc,
+            tor_proxy_url=self._tor_proxy_url,
         )
         self._settings_lock = threading.Lock()
 
@@ -94,6 +113,8 @@ class Aria2Runtime:
             raise ValueError("Aria2 destination must stay within Workspace.")
 
         secret = self._ensure_secret()
+        ensure_private_directory(self.tor_proxy_token_file.parent)
+        self._ensure_tor_proxy_token()
         if not self.session_file.exists():
             self._write_private(self.session_file, "")
         self._write_private_atomic(self.config_file, self._config_text(secret))
@@ -143,8 +164,21 @@ class Aria2Runtime:
     def run(self) -> None:
         self.ensure()
         process = subprocess.Popen(
-            ["aria2c", f"--conf-path={self.config_file}", "--daemon=false"]
+            ["aria2c", f"--conf-path={self.config_file}", "--daemon=false"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
+        output_thread = threading.Thread(
+            target=self._forward_aria2_output,
+            args=(process.stdout,),
+            daemon=True,
+            name="aria2-log-forwarder",
+        )
+        output_thread.start()
         secret = self.secret_file.read_text(encoding="utf-8").strip()
 
         def call(method: str, *params):
@@ -154,6 +188,7 @@ class Aria2Runtime:
             call,
             self.recovery_store,
             workspace_root=self.workspace_root,
+            ignore_error_gid=self.bunkr_links.is_bunkr_task,
         )
         stopping = threading.Event()
         previous_handlers = {}
@@ -169,6 +204,7 @@ class Aria2Runtime:
         try:
             while process.poll() is None and not stopping.is_set():
                 try:
+                    self.bunkr_links.tick(self.recovery_store)
                     coordinator.tick()
                 except Exception:
                     # RPC failures can contain transfer URLs or credentials.
@@ -190,8 +226,22 @@ class Aria2Runtime:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
+            output_thread.join()
+            if process.stdout is not None:
+                process.stdout.close()
             for signal_number, handler in previous_handlers.items():
                 signal.signal(signal_number, handler)
+
+    @staticmethod
+    def _forward_aria2_output(stream) -> None:
+        if stream is None:
+            return
+        try:
+            for line in stream:
+                sys.stdout.write(redact_sensitive_urls_in_text(line))
+                sys.stdout.flush()
+        except (OSError, ValueError):
+            LOGGER.warning("Aria2 output stream closed before it was fully read")
 
     def recovery_settings(self) -> dict[str, int]:
         return {
@@ -309,6 +359,7 @@ class Aria2Runtime:
                     )
         if not isinstance(result, dict):
             return _rpc_error(request_id, -32000, "Aria2 returned an invalid response.")
+        result = self._redact_managed_result(method, params, result)
         result["jsonrpc"] = "2.0"
         result["id"] = request_id
         if method == "aria2.getGlobalOption" and isinstance(result.get("result"), dict):
@@ -317,6 +368,64 @@ class Aria2Runtime:
                 if key in SAFE_GLOBAL_OPTIONS
             }
         return result
+
+    def bunkr_links_preview(self, payload: object) -> dict[str, Any]:
+        return self.bunkr_links.preview(payload)
+
+    def bunkr_links_enqueue(self, payload: object) -> dict[str, Any]:
+        return self.bunkr_links.enqueue(payload)
+
+    def bunkr_links_tasks(self) -> dict[str, Any]:
+        return self.bunkr_links.tasks()
+
+    def bunkr_link_task_control(self, gid: str, action: str, payload: object = None) -> dict[str, Any]:
+        if action == "pause":
+            return self.bunkr_links.pause(gid)
+        if action == "resume":
+            return self.bunkr_links.resume(gid)
+        if action == "route":
+            route = payload.get("route") if isinstance(payload, dict) else None
+            return self.bunkr_links.set_route(gid, route)
+        raise ValueError("Aria2 task action is unsupported.")
+
+    def _bunkr_rpc(self, method: str, *params: object) -> object:
+        secret = self.secret_file.read_text(encoding="utf-8").strip()
+        if not secret:
+            raise RuntimeError("Aria2 RPC is not configured.")
+        return self._internal_rpc(secret, method, *params)
+
+    def _redact_managed_result(
+        self, method: str, params: list[Any], response: dict[str, Any]
+    ) -> dict[str, Any]:
+        result = response.get("result")
+        gids: set[str] = set()
+        if method in {"aria2.getUris", "aria2.getFiles", "aria2.getOption", "aria2.tellStatus", "aria2.getStatus"} and params:
+            gids.add(str(params[0]))
+        elif method in {"aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped"}:
+            if isinstance(result, list):
+                gids.update(str(item.get("gid")) for item in result if isinstance(item, dict))
+        if not gids or not any(self.bunkr_links.store.contains(gid) for gid in gids):
+            return response
+        managed = {gid for gid in gids if self.bunkr_links.store.contains(gid)}
+        if method in {"aria2.getUris", "aria2.getFiles", "aria2.getOption", "aria2.tellStatus", "aria2.getStatus"} and managed:
+            response["result"] = redact_aria2_response(result)
+            return response
+
+        def sanitize(value: Any) -> Any:
+            if isinstance(value, list):
+                return [sanitize(item) for item in value]
+            if isinstance(value, dict):
+                gid = str(value.get("gid") or "")
+                if gid in managed:
+                    return redact_aria2_response(value)
+                updated = dict(value)
+                for key, item in updated.items():
+                    updated[key] = sanitize(item)
+                return updated
+            return value
+
+        response["result"] = sanitize(result)
+        return response
 
     def ui_asset_path(self, asset_path: str) -> Path | None:
         root = Path(os.environ.get("ARIA2_UI_ROOT", "/opt/ariang"))
@@ -397,6 +506,27 @@ class Aria2Runtime:
                 output.write(secret + "\n")
         self.secret_file.chmod(0o600)
         return secret
+
+    def _ensure_tor_proxy_token(self) -> str:
+        try:
+            self.tor_proxy_token_file.lstat()
+            if not self.tor_proxy_token_file.is_file() or self.tor_proxy_token_file.is_symlink():
+                raise ValueError("Aria2 Tor proxy token path must be a regular file.")
+            token = self.tor_proxy_token_file.read_text(encoding="utf-8").strip()
+            if token:
+                self.tor_proxy_token_file.chmod(0o600)
+                return token
+        except FileNotFoundError:
+            pass
+        token = secrets.token_urlsafe(32)
+        self._write_private_atomic(self.tor_proxy_token_file, token + "\n")
+        return token
+
+    def _tor_proxy_url(self) -> str:
+        token = self.tor_proxy_token_file.read_text(encoding="utf-8").strip()
+        if not token:
+            raise RuntimeError("Aria2 Tor proxy token is not configured.")
+        return f"http://aria2:{quote(token, safe='')}@tts-1:8118"
 
     def _read_config(self) -> dict[str, str]:
         values: dict[str, str] = {}

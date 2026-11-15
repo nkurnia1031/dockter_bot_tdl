@@ -310,6 +310,20 @@ class WorkerJobExecutor(
     def aria2_ui_asset_path(self, asset_path: str) -> Path | None:
         return self.aria2_runtime.ui_asset_path(asset_path)
 
+    def aria2_bunkr_links_preview(self, payload: object) -> dict[str, Any]:
+        return self.aria2_runtime.bunkr_links_preview(payload)
+
+    def aria2_bunkr_links_enqueue(self, payload: object) -> dict[str, Any]:
+        return self.aria2_runtime.bunkr_links_enqueue(payload)
+
+    def aria2_bunkr_links_tasks(self) -> dict[str, Any]:
+        return self.aria2_runtime.bunkr_links_tasks()
+
+    def aria2_bunkr_link_task_control(
+        self, gid: str, action: str, payload: object = None
+    ) -> dict[str, Any]:
+        return self.aria2_runtime.bunkr_link_task_control(gid, action, payload)
+
     def storage_download_links(self) -> list[dict[str, str]]:
         return self.public_download_links.active_links()
 

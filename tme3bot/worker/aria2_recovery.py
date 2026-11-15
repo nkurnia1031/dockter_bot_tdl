@@ -322,11 +322,13 @@ class Aria2RecoveryCoordinator:
         workspace_root: Path | str = "/workspace",
         clock: Callable[[], float] = time.time,
         interval_seconds: float = 1.0,
+        ignore_error_gid: Callable[[str], bool] | None = None,
     ):
         self.rpc = rpc
         self.store = state_store
         self.workspace_root = Path(workspace_root).resolve(strict=False)
         self.clock = clock
+        self.ignore_error_gid = ignore_error_gid or (lambda _gid: False)
         self.interval_seconds = max(0.1, float(interval_seconds))
         self.boot_id = str(uuid.uuid4())
         self.observations: dict[str, dict[str, Any]] = {}
@@ -410,9 +412,14 @@ class Aria2RecoveryCoordinator:
         stopped_by_gid = {
             str(item.get("gid")): item
             for item in stopped
-            if item.get("gid") and item.get("status") == "error"
+            if item.get("gid")
+            and item.get("status") == "error"
+            and not self.ignore_error_gid(str(item.get("gid")))
         }
-        stopped_by_gid.update({str(item["gid"]): item for item in error_events})
+        stopped_by_gid.update({
+            str(item["gid"]): item for item in error_events
+            if not self.ignore_error_gid(str(item.get("gid") or ""))
+        })
         stopped_errors = list(stopped_by_gid.values())
         self._retry_stopped_errors(active, waiting, stopped_errors, active_by_gid, waiting_by_gid, now)
         self.store.consume_error_events(consumed_events)

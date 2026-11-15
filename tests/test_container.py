@@ -130,9 +130,30 @@ class ContainerBuildTests(unittest.TestCase):
             services = yaml.safe_load(
                 (PROJECT_ROOT / filename).read_text(encoding="utf-8")
             )["services"]
+            aria2 = services["aria2"]
+            self.assertEqual(
+                aria2["environment"]["ARIA2_TOR_PROXY_TOKEN_FILE"],
+                "/aria2-proxy/token",
+            )
+            self.assertTrue(
+                any("aria2-proxy:/aria2-proxy" in volume for volume in aria2["volumes"])
+            )
             for name in ("tts-1", "tts-2", "tts-3"):
                 self.assertIn(name, services)
                 self.assertNotIn("profiles", services[name])
+                helper = services[name]
+                self.assertEqual(helper["expose"], ["8090", "8118"])
+                self.assertNotIn("ports", helper)
+                self.assertEqual(
+                    helper["environment"]["ARIA2_TOR_PROXY_TOKEN_FILE"],
+                    "/aria2-proxy/token",
+                )
+                self.assertTrue(
+                    any("/aria2-proxy:ro" in volume for volume in helper["volumes"])
+                )
+                self.assertFalse(
+                    any("/aria2:/aria2-state" in volume for volume in helper["volumes"])
+                )
 
     def test_gateway_queue_uses_private_persistent_redis_without_worker_mounts(self) -> None:
         for filename in ("docker-compose.gateway.yml", "docker-compose.yml"):

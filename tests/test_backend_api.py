@@ -136,6 +136,7 @@ class FakeDispatcher:
         self.aria2_health_calls = []
         self.aria2_rpc_calls = []
         self.aria2_asset_calls = []
+        self.aria2_links_calls = []
         self.aria2_health_result = {
             "ready": True,
             "reason_code": "",
@@ -288,6 +289,22 @@ class FakeDispatcher:
     def aria2_rpc(self, worker, payload):
         self.aria2_rpc_calls.append((worker, dict(payload)))
         return {"jsonrpc": "2.0", "id": payload.get("id"), "result": "gid-123"}
+
+    def aria2_links_preview(self, worker, payload):
+        self.aria2_links_calls.append(("preview", worker, dict(payload)))
+        return {"items": [{"source_index": 0, "kind": "album", "title": "Album", "files": [{"item_id": "one", "file_name": "one.bin", "thumbnail_url": ""}], "error": ""}]}
+
+    def aria2_links_enqueue(self, worker, payload):
+        self.aria2_links_calls.append(("enqueue", worker, dict(payload)))
+        return {"items": [{"gid": "0000000000000001", "file_name": "one.bin", "status": "queued", "route": "tor"}]}
+
+    def aria2_links_tasks(self, worker):
+        self.aria2_links_calls.append(("tasks", worker))
+        return {"items": []}
+
+    def aria2_link_task_control(self, worker, gid, action, payload):
+        self.aria2_links_calls.append((action, worker, gid, dict(payload)))
+        return {"gid": gid, "route": payload.get("route", "tor"), "status": "paused"}
 
     def aria2_ui_asset(self, worker, asset_path):
         self.aria2_asset_calls.append((worker, asset_path))
@@ -3037,7 +3054,48 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("X-CSRF-Token", setup.text)
         self.assertIn("allow-overwrite", setup.text)
         self.assertIn("/workspace/aria2", setup.text)
+        self.assertIn('form[name="newTaskForm"]', setup.text)
+        self.assertIn("selections[String(source.source_index)] = [];", setup.text)
+        self.assertIn("RESOLUTION_OR_ENQUEUE_FAILED", setup.text)
+        self.assertIn("task.status === 'paused' || task.status === 'held'", setup.text)
         self.assertNotIn("token:", setup.text)
+
+    def test_aria2_links_proxy_is_authenticated_worker_scoped_and_returns_no_signed_urls(self):
+        denied = self.client.post(
+            "/api/v1/workers/local/aria2/links/preview",
+            json={"sources": ["https://bunkr.cr/a/album"]},
+        )
+        self.assertEqual(denied.status_code, 401)
+        headers = self.login()
+        preview_body = {"sources": ["https://bunkr.cr/a/album"]}
+        preview = self.client.post(
+            "/api/v1/workers/local/aria2/links/preview", headers=headers, json=preview_body
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["items"][0]["files"][0]["file_name"], "one.bin")
+        self.assertNotIn("signed", preview.text.lower())
+        enqueue_body = {
+            "sources": ["https://bunkr.cr/a/album"], "selections": {"0": ["one"]},
+            "directory": "/workspace/aria2", "route": "tor",
+        }
+        queued = self.client.post(
+            "/api/v1/workers/local/aria2/links/enqueue", headers=headers, json=enqueue_body
+        )
+        self.assertEqual(queued.status_code, 200, queued.text)
+        self.assertEqual(queued.json()["items"][0]["route"], "tor")
+        tasks = self.client.get("/api/v1/workers/local/aria2/links/tasks", headers=headers)
+        self.assertEqual(tasks.status_code, 200)
+        changed = self.client.post(
+            "/api/v1/workers/local/aria2/links/tasks/0000000000000001/route",
+            headers=headers, json={"route": "non"},
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        self.assertEqual(changed.json()["route"], "non")
+        self.assertEqual([call[0] for call in self.dispatcher.aria2_links_calls], ["preview", "enqueue", "tasks", "route"])
+        invalid_gid = self.client.post(
+            "/api/v1/workers/local/aria2/links/tasks/not-a-gid/pause", headers=headers, json={}
+        )
+        self.assertEqual(invalid_gid.status_code, 422)
 
     def test_aria2_rpc_recovers_browser_session_without_access_cookie_or_page_reload(self):
         headers = self.browser_login()

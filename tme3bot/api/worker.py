@@ -603,6 +603,52 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
             return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Aria2 bridge is unavailable."}}
         return call(body)
 
+    @app.post("/internal/v1/aria2/links/preview", dependencies=[Depends(authorize)])
+    def aria2_links_preview(body: dict[str, Any]):
+        call = getattr(context.executor, "aria2_bunkr_links_preview", None)
+        if not callable(call):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung resolusi link Aria2.", status_code=404)
+        try:
+            return call(body)
+        except ValueError as exc:
+            raise DomainError("ARIA2_LINK_REQUEST_INVALID", str(exc)[:240], status_code=422) from exc
+        except Exception:
+            raise DomainError("ARIA2_LINK_PREVIEW_FAILED", "Link tidak dapat diperiksa pada worker.", status_code=502) from None
+
+    @app.post("/internal/v1/aria2/links/enqueue", dependencies=[Depends(authorize)])
+    def aria2_links_enqueue(body: dict[str, Any]):
+        call = getattr(context.executor, "aria2_bunkr_links_enqueue", None)
+        if not callable(call):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung pengiriman link Aria2.", status_code=404)
+        try:
+            return call(body)
+        except ValueError as exc:
+            raise DomainError("ARIA2_LINK_REQUEST_INVALID", str(exc)[:240], status_code=422) from exc
+        except Exception:
+            raise DomainError("ARIA2_LINK_ENQUEUE_FAILED", "Task Aria2 tidak dapat dibuat.", status_code=502) from None
+
+    @app.get("/internal/v1/aria2/links/tasks", dependencies=[Depends(authorize)])
+    def aria2_links_tasks():
+        call = getattr(context.executor, "aria2_bunkr_links_tasks", None)
+        if not callable(call):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung daftar task Links.", status_code=404)
+        return call()
+
+    @app.post("/internal/v1/aria2/links/tasks/{gid}/{action}", dependencies=[Depends(authorize)])
+    def aria2_link_task_control(gid: str, action: str, body: dict[str, Any] | None = None):
+        if action not in {"pause", "route", "resume"}:
+            raise DomainError("ARIA2_TASK_ACTION_INVALID", "Aksi task Aria2 tidak dikenal.", status_code=404)
+        call = getattr(context.executor, "aria2_bunkr_link_task_control", None)
+        if not callable(call):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung kontrol task Links.", status_code=404)
+        try:
+            return call(gid, action, body or {})
+        except ValueError as exc:
+            code = "ARIA2_TOR_UNAVAILABLE" if "ARIA2_TOR_UNAVAILABLE" in str(exc) else "ARIA2_TASK_ACTION_INVALID"
+            raise DomainError(code, str(exc)[:240], status_code=409 if code == "ARIA2_TOR_UNAVAILABLE" else 422) from exc
+        except Exception:
+            raise DomainError("ARIA2_TASK_ACTION_FAILED", "Aksi task Aria2 gagal.", status_code=502) from None
+
     @app.get("/internal/v1/aria2/ui/{asset_path:path}", dependencies=[Depends(authorize)])
     def aria2_ui_asset(asset_path: str):
         lookup = getattr(context.executor, "aria2_ui_asset_path", None)

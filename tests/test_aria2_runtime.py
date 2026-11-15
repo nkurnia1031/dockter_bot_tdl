@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import signal
+import subprocess
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -87,6 +90,7 @@ class Aria2RuntimeTests(unittest.TestCase):
     def test_bootstrap_persists_private_state_and_reports_hooked_rpc_health(self):
         self.runtime.ensure()
         first_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        first_proxy_token = self.runtime.tor_proxy_token_file.read_text(encoding="utf-8").strip()
         self.server.rpc_secret = first_secret
         self.runtime.ensure()
         health = self.runtime.health()
@@ -94,12 +98,17 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertTrue(first_secret)
         self.assertEqual(first_secret, self.runtime.secret_file.read_text(encoding="utf-8").strip())
         self.assertEqual(self.runtime.secret_file.stat().st_mode & 0o777, 0o600)
+        self.assertTrue(first_proxy_token)
+        self.assertEqual(first_proxy_token, self.runtime.tor_proxy_token_file.read_text(encoding="utf-8").strip())
+        self.assertEqual(self.runtime.tor_proxy_token_file.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.runtime.tor_proxy_token_file.parent.stat().st_mode & 0o777, 0o700)
         self.assertTrue(self.destination.is_dir())
         self.assertTrue(health["ready"])
         self.assertTrue(health["engine"]["ready"])
         self.assertTrue(health["hook"]["ready"])
         self.assertEqual(health["engine"]["version"], "1.36.0")
         self.assertNotIn(first_secret, json.dumps(health))
+        self.assertNotIn(first_proxy_token, json.dumps(health))
 
     def test_health_is_not_ready_when_the_custom_hook_is_missing(self):
         self.hook.unlink()
@@ -342,6 +351,7 @@ class Aria2RuntimeTests(unittest.TestCase):
             def __init__(self):
                 self.returncode = None
                 self.signalled = False
+                self.stdout = io.StringIO("")
 
             def poll(self):
                 return self.returncode
@@ -382,6 +392,54 @@ class Aria2RuntimeTests(unittest.TestCase):
             self.runtime.run()
 
         self.assertEqual(process.returncode, -signal.SIGTERM)
+
+    def test_aria2_process_output_redacts_signed_urls_before_docker_logs(self):
+        handlers = {}
+
+        class FakeProcess:
+            def __init__(self):
+                self.returncode = None
+                self.stdout = io.StringIO(
+                    "download error https://cdn.invalid/file.zip?token=signed-secret\n"
+                    "proxy failure http://aria2:proxy-secret@tts-1:8118\n"
+                )
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -signal.SIGTERM
+
+            def wait(self, timeout=None):
+                del timeout
+                self.returncode = 0
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -signal.SIGKILL
+
+        def install_handler(number, handler):
+            previous = handlers.get(number)
+            handlers[number] = handler
+            return previous
+
+        process = FakeProcess()
+        captured = io.StringIO()
+        with (
+            patch("tme3bot.worker.aria2_runtime.subprocess.Popen", return_value=process) as popen,
+            patch("tme3bot.worker.aria2_runtime.Aria2RecoveryCoordinator") as coordinator,
+            patch("tme3bot.worker.aria2_runtime.signal.signal", side_effect=install_handler),
+            redirect_stdout(captured),
+        ):
+            coordinator.return_value.interval_seconds = 1
+            self.runtime.run()
+
+        popen.assert_called_once()
+        self.assertIs(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertIs(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+        self.assertNotIn("signed-secret", captured.getvalue())
+        self.assertNotIn("proxy-secret", captured.getvalue())
+        self.assertIn("[query disembunyikan]", captured.getvalue())
 
 
 if __name__ == "__main__":

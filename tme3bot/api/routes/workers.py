@@ -251,6 +251,232 @@ def _aria2_rpc_setup_script(worker: str) -> str:
 }})();"""
 
 
+def _aria2_links_setup_script(worker: str) -> str:
+    worker_json = json.dumps(worker)
+    return r"""(() => {
+  const worker = __TME3_WORKER__;
+  const root = `/api/v1/workers/${encodeURIComponent(worker)}/aria2/links`;
+  const csrf = () => document.cookie.split('; ').find((part) => part.startsWith('tme3_csrf='))?.split('=').slice(1).join('') || '';
+  const request = async (path, method = 'GET', body) => {
+    const headers = { 'X-CSRF-Token': csrf() };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const response = await fetch(path, {
+      method, headers, credentials: 'same-origin',
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    let data = {};
+    try { data = await response.json(); } catch {}
+    if (!response.ok) {
+      const detail = data?.detail;
+      throw new Error(typeof detail === 'string' ? detail : detail?.message || 'Permintaan AriaNg Links gagal.');
+    }
+    return data;
+  };
+  const setText = (node, value) => { node.textContent = String(value ?? ''); };
+  const element = (tag, text, className) => {
+    const node = document.createElement(tag);
+    if (text !== undefined) setText(node, text);
+    if (className) node.className = className;
+    return node;
+  };
+  const callTask = (gid, action, body) => request(`${root}/tasks/${encodeURIComponent(gid)}/${action}`, 'POST', body || {});
+  const install = (form) => {
+    if (form.dataset.tme3LinksInstalled === '1') return;
+    const textarea = form.querySelector('textarea[name="urls"], textarea');
+    if (!textarea) return;
+    form.dataset.tme3LinksInstalled = '1';
+    const panel = element('section', undefined);
+    panel.style.cssText = 'margin:10px 0;padding:12px;border:1px solid #d1d5db;border-radius:8px;background:#f8fafc;color:#172033;font:13px/1.45 Arial,sans-serif';
+    panel.setAttribute('data-tme3-links-panel', '1');
+    const header = element('div', undefined);
+    header.style.cssText = 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px';
+    const title = element('strong', 'TME3Bot Links');
+    const modeLabel = element('label', 'Rute unduh: ');
+    const mode = element('select');
+    mode.setAttribute('aria-label', 'Rute unduh');
+    mode.style.cssText = 'margin-left:5px;padding:5px;border:1px solid #94a3b8;border-radius:5px;background:white;color:#172033';
+    for (const [value, label] of [['non', 'Non'], ['tor', 'Tor']]) {
+      const option = element('option', label);
+      option.value = value;
+      mode.append(option);
+    }
+    modeLabel.append(mode);
+    const refresh = element('button', 'Muat task');
+    refresh.type = 'button';
+    refresh.style.cssText = 'padding:5px 9px;border:1px solid #94a3b8;border-radius:5px;background:white;color:#172033;cursor:pointer';
+    header.append(title, modeLabel, refresh);
+    const message = element('div', 'Masukkan URL langsung atau link Bunkr; mode ini berlaku untuk seluruh batch.');
+    message.style.cssText = 'margin:5px 0;color:#334155;white-space:pre-wrap';
+    const taskList = element('div');
+    taskList.style.cssText = 'margin-top:8px';
+    panel.append(header, message, taskList);
+    textarea.insertAdjacentElement('afterend', panel);
+
+    const loadTasks = async () => {
+      refresh.disabled = true;
+      try {
+        const result = await request(`${root}/tasks`);
+        taskList.replaceChildren();
+        const items = Array.isArray(result.items) ? result.items : [];
+        if (!items.length) {
+          taskList.append(element('div', 'Belum ada task yang dikirim melalui Links.'));
+          return;
+        }
+        for (const task of items.slice(0, 50)) {
+          const row = element('div');
+          row.style.cssText = 'display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-top:1px solid #e2e8f0';
+          const info = element('span', `${task.file_name} · ${task.status} · ${task.route.toUpperCase()} · ${task.completed_bytes}/${task.total_bytes} B`);
+          info.style.cssText = 'flex:1 1 260px;overflow-wrap:anywhere';
+          row.append(info);
+          if (task.status === 'active' || task.status === 'waiting') {
+            const pause = element('button', 'Jeda');
+            pause.type = 'button'; pause.style.cssText = refresh.style.cssText;
+            pause.onclick = async () => { try { await callTask(task.gid, 'pause'); await loadTasks(); } catch (error) { showError(error); } };
+            row.append(pause);
+          }
+          if (task.status === 'paused' || task.status === 'held') {
+            const route = element('select');
+            route.setAttribute('aria-label', `Rute task ${task.file_name}`);
+            route.style.cssText = mode.style.cssText;
+            for (const [value, label] of [['non', 'Non'], ['tor', 'Tor']]) {
+              const option = element('option', label); option.value = value; option.selected = value === task.route; route.append(option);
+            }
+            const apply = element('button', 'Ubah rute');
+            apply.type = 'button'; apply.style.cssText = refresh.style.cssText;
+            apply.onclick = async () => { try { await callTask(task.gid, 'route', { route: route.value }); setText(message, `Rute task ${task.file_name} diperbarui. Lanjutkan task saat siap.`); await loadTasks(); } catch (error) { showError(error); } };
+            const resume = element('button', 'Lanjutkan');
+            resume.type = 'button'; resume.style.cssText = refresh.style.cssText;
+            resume.onclick = async () => { try { await callTask(task.gid, 'resume'); await loadTasks(); } catch (error) { showError(error); } };
+            row.append(route, apply, resume);
+          }
+          if (task.reason_code) row.append(element('span', task.reason_code));
+          taskList.append(row);
+        }
+      } catch (error) {
+        taskList.replaceChildren(element('div', error?.message || 'Task Links gagal dimuat.'));
+      } finally { refresh.disabled = false; }
+    };
+    const showError = (error) => setText(message, error?.message || 'Operasi Links gagal.');
+    refresh.onclick = () => { void loadTasks(); };
+
+    const dialog = element('dialog');
+    dialog.style.cssText = 'width:min(900px,94vw);max-height:85vh;padding:0;border:1px solid #94a3b8;border-radius:12px;color:#172033;background:#fff;box-shadow:0 20px 70px #0006';
+    dialog.setAttribute('aria-label', 'Pilih file Bunkr');
+    const dialogBody = element('div'); dialogBody.style.cssText = 'padding:18px;overflow:auto;max-height:85vh';
+    const dialogTitle = element('h2', 'Tinjau file untuk antrean'); dialogTitle.style.cssText = 'margin:0 0 8px;font-size:19px';
+    const dialogMessage = element('p', 'Pilih file yang akan dimasukkan ke Aria2.');
+    const fileList = element('div'); fileList.style.cssText = 'display:grid;gap:8px;margin:14px 0';
+    const footer = element('div'); footer.style.cssText = 'display:flex;justify-content:flex-end;gap:8px';
+    const cancel = element('button', 'Batal'); cancel.type = 'button'; cancel.style.cssText = refresh.style.cssText;
+    const submit = element('button', 'Tambahkan ke Aria2'); submit.type = 'button'; submit.style.cssText = 'padding:6px 10px;border:0;border-radius:5px;background:#0e7490;color:white;cursor:pointer';
+    footer.append(cancel, submit); dialogBody.append(dialogTitle, dialogMessage, fileList, footer); dialog.append(dialogBody);
+    document.body.append(dialog);
+    cancel.onclick = () => dialog.close();
+
+    const renderPreview = async (preview) => {
+      fileList.replaceChildren();
+      let hasFiles = false;
+      for (const source of preview.items || []) {
+        const sourceLabel = element('h3', source.title || `URL ${Number(source.source_index) + 1}`);
+        sourceLabel.style.cssText = 'margin:12px 0 4px;font-size:14px';
+        fileList.append(sourceLabel);
+        if (source.error) {
+          const error = element('p', `${source.error} · item dilewati`); error.style.color = '#b91c1c'; fileList.append(error); continue;
+        }
+        for (const file of source.files || []) {
+          hasFiles = true;
+          const label = element('label');
+          label.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px;border:1px solid #e2e8f0;border-radius:7px;cursor:pointer';
+          const checkbox = element('input'); checkbox.type = 'checkbox'; checkbox.checked = true;
+          checkbox.dataset.sourceIndex = String(source.source_index);
+          checkbox.dataset.itemId = String(file.item_id || '');
+          label.append(checkbox);
+          if (file.thumbnail_url) {
+            const image = element('img'); image.src = file.thumbnail_url; image.alt = ''; image.loading = 'lazy';
+            image.referrerPolicy = 'no-referrer'; image.style.cssText = 'width:64px;height:48px;object-fit:cover;border-radius:5px;background:#e2e8f0';
+            label.append(image);
+          }
+          label.append(element('span', file.file_name || 'download'));
+          fileList.append(label);
+        }
+      }
+      if (!hasFiles) throw new Error('Tidak ada file yang dapat dimasukkan ke antrean.');
+      dialog.showModal();
+      return new Promise((resolve) => {
+        let settled = false;
+        const done = (value) => {
+          if (settled) return;
+          settled = true;
+          submit.removeEventListener('click', onSubmit);
+          cancel.removeEventListener('click', onCancel);
+          dialog.removeEventListener('close', onClosed);
+          dialog.removeEventListener('cancel', onNativeCancel);
+          resolve(value);
+        };
+        const onCancel = () => done(null);
+        const onClosed = () => done(null);
+        const onNativeCancel = (event) => { event.preventDefault(); dialog.close(); done(null); };
+        const onSubmit = () => {
+          const selections = {};
+          for (const source of preview.items || []) {
+            selections[String(source.source_index)] = [];
+          }
+          for (const checkbox of fileList.querySelectorAll('input[type="checkbox"]:checked')) {
+            const index = checkbox.dataset.sourceIndex;
+            selections[index].push(checkbox.dataset.itemId);
+          }
+          done(selections); dialog.close();
+        };
+        cancel.addEventListener('click', onCancel, { once: true });
+        submit.addEventListener('click', onSubmit, { once: true });
+        dialog.addEventListener('close', onClosed, { once: true });
+        dialog.addEventListener('cancel', onNativeCancel, { once: true });
+      });
+    };
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault(); event.stopImmediatePropagation();
+      const sources = String(textarea.value || '').split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      if (!sources.length) { showError(new Error('Masukkan minimal satu URL.')); return; }
+      const nativeSubmit = form.querySelector('button[type="submit"],input[type="submit"]');
+      if (nativeSubmit) nativeSubmit.disabled = true;
+      setText(message, 'Memeriksa link…');
+      try {
+        const preview = await request(`${root}/preview`, 'POST', { sources });
+        const selections = await renderPreview(preview);
+        if (!selections) { setText(message, 'Pengiriman dibatalkan.'); return; }
+        setText(message, 'Menambahkan task ke Aria2…');
+        const result = await request(`${root}/enqueue`, 'POST', {
+          sources, selections, directory: localStorage.getItem(`tme3-aria2-folder:${worker}`) || '/workspace/aria2', route: mode.value
+        });
+        const successes = (result.items || []).filter((item) => item.status === 'queued').length;
+        const failures = (result.items || []).filter((item) => item.status === 'failed');
+        const skipped = (result.items || []).filter((item) => item.status === 'skipped');
+        const summary = `${successes} task masuk antrean${failures.length ? `; ${failures.length} gagal/bentrok` : ''}${skipped.length ? `; ${skipped.length} dilewati` : ''}.`;
+        const failureDetails = failures.map((item) => {
+          const name = item.file_name || `URL ${Number(item.source_index) + 1}`;
+          return `${name}: ${item.reason_code || 'RESOLUTION_OR_ENQUEUE_FAILED'}`;
+        });
+        setText(message, [summary, ...failureDetails, 'URL signed tidak ditampilkan.'].join('\n'));
+        textarea.value = ''; textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        await loadTasks();
+      } catch (error) { showError(error); }
+      finally { if (nativeSubmit) nativeSubmit.disabled = false; }
+    }, true);
+    void loadTasks();
+  };
+  const start = () => {
+    if (!document.body) return;
+    const observer = new MutationObserver(() => {
+      for (const form of document.querySelectorAll('form[name="newTaskForm"]')) install(form);
+    });
+    observer.observe(document.body, { childList: true, subtree: true });
+    for (const form of document.querySelectorAll('form[name="newTaskForm"]')) install(form);
+  };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true }); else start();
+})();""".replace("__TME3_WORKER__", worker_json)
+
+
 def _read_profile_inventory(context, worker: str, *, start_upload_prep: bool) -> dict:
     method_name = "scan_local_profiles" if start_upload_prep else "profile_local_inventory"
     scan = getattr(context.worker_dispatcher, method_name, None)
@@ -2494,6 +2720,70 @@ def register_workers(app, context, *, current_actor):
         except Exception:
             return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Worker Aria2 tidak dapat dihubungi."}}
 
+    def aria2_links_dispatch(name: str, method_name: str, *args):
+        record = context.worker_registry.get(name)
+        if record is None:
+            raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
+        if not bool(record.get("enabled", True)):
+            raise DomainError("WORKER_DISABLED", "Worker sedang nonaktif.", status_code=409)
+        call = getattr(context.worker_dispatcher, method_name, None)
+        if not callable(call):
+            raise DomainError("WORKER_UPDATE_REQUIRED", "Worker belum mendukung AriaNg Links.", status_code=409)
+        try:
+            result = call(name, *args)
+        except JsonHttpError as exc:
+            if exc.status in {400, 409, 422}:
+                detail = exc.payload.get("detail") if isinstance(exc.payload, dict) else None
+                message = detail.get("message") if isinstance(detail, dict) else None
+                code = detail.get("code") if isinstance(detail, dict) else None
+                raise DomainError(
+                    str(code or "ARIA2_LINK_REQUEST_INVALID"),
+                    str(message or "Worker menolak permintaan Links.")[:240],
+                    status_code=exc.status,
+                ) from None
+            raise DomainError("ARIA2_WORKER_UNAVAILABLE", "Worker Aria2 Links tidak dapat dihubungi.", status_code=503) from None
+        except Exception:
+            raise DomainError("ARIA2_WORKER_UNAVAILABLE", "Worker Aria2 Links tidak dapat dihubungi.", status_code=503) from None
+        if not isinstance(result, dict):
+            raise DomainError("ARIA2_LINK_RESPONSE_INVALID", "Worker memberikan respons Links yang tidak valid.", status_code=502)
+        return result
+
+    @app.post("/api/v1/workers/{name}/aria2/links/preview")
+    def aria2_links_preview(name: str, body: dict, actor=Depends(current_actor)):
+        del actor
+        if not isinstance(body, dict) or set(body) != {"sources"}:
+            raise DomainError("ARIA2_LINK_REQUEST_INVALID", "Daftar URL tidak valid.", status_code=422)
+        try:
+            if len(json.dumps(body, separators=(",", ":")).encode("utf-8")) > 256 * 1024:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise DomainError("ARIA2_LINK_REQUEST_INVALID", "Daftar URL terlalu besar.", status_code=422) from None
+        return aria2_links_dispatch(name, "aria2_links_preview", body)
+
+    @app.post("/api/v1/workers/{name}/aria2/links/enqueue")
+    def aria2_links_enqueue(name: str, body: dict, actor=Depends(current_actor)):
+        del actor
+        if not isinstance(body, dict) or len(json.dumps(body, separators=(",", ":")).encode("utf-8")) > 256 * 1024:
+            raise DomainError("ARIA2_LINK_REQUEST_INVALID", "Permintaan Links tidak valid atau terlalu besar.", status_code=422)
+        return aria2_links_dispatch(name, "aria2_links_enqueue", body)
+
+    @app.get("/api/v1/workers/{name}/aria2/links/tasks")
+    def aria2_links_tasks(name: str, actor=Depends(current_actor)):
+        del actor
+        return aria2_links_dispatch(name, "aria2_links_tasks")
+
+    @app.post("/api/v1/workers/{name}/aria2/links/tasks/{gid}/{action}")
+    def aria2_link_task_control(name: str, gid: str, action: str, body: dict | None = None, actor=Depends(current_actor)):
+        del actor
+        if not re.fullmatch(r"[0-9a-fA-F]{16}", str(gid or "")):
+            raise DomainError("ARIA2_TASK_ID_INVALID", "ID task Aria2 tidak valid.", status_code=422)
+        if action not in {"pause", "route", "resume"}:
+            raise DomainError("ARIA2_TASK_ACTION_INVALID", "Aksi task Aria2 tidak dikenal.", status_code=404)
+        payload = body or {}
+        if action == "route" and (set(payload) != {"route"} or payload.get("route") not in {"non", "tor"}):
+            raise DomainError("ARIA2_TASK_ROUTE_INVALID", "Mode jaringan tidak valid.", status_code=422)
+        return aria2_links_dispatch(name, "aria2_link_task_control", gid, action, payload)
+
     @app.get("/api/v1/aria2-ui/{name}/{asset_path:path}")
     def aria2_ui_asset(name: str, asset_path: str, actor=Depends(current_actor)):
         del actor
@@ -2504,7 +2794,7 @@ def register_workers(app, context, *, current_actor):
             raise DomainError("WORKER_DISABLED", "Worker sedang nonaktif.", status_code=409)
         if asset_path == "rpc-setup.js":
             return Response(
-                _aria2_rpc_setup_script(name),
+                _aria2_rpc_setup_script(name) + "\n" + _aria2_links_setup_script(name),
                 media_type="application/javascript",
                 headers={"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"},
             )

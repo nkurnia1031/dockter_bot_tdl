@@ -13,6 +13,7 @@ from pathlib import Path
 from flask import Flask, Response, jsonify, request
 from gtts import gTTS
 
+from tme3bot.worker.tor_http_proxy import TorHttpProxyServer
 from tme3bot.worker.tts_pipeline import TTS_PART_CHARS
 
 app = Flask(__name__)
@@ -24,6 +25,7 @@ _ACTIVE_SYNTHESIS = 0
 _RECOVERY_RUNNING = False
 _RECOVERY_COOLDOWN_SECONDS = 60
 _RECOVERY_LAST_STARTED = 0.0
+_ARIA2_TOR_PROXY: TorHttpProxyServer | None = None
 
 
 def _bootstrap_percent(status: bytes) -> int | None:
@@ -145,6 +147,13 @@ def readyz():
     return (jsonify({"ok": True}), 200) if _tor_ready() else (jsonify({"ok": False}), 503)
 
 
+@app.get("/aria2-proxy-readyz")
+def aria2_proxy_readyz():
+    proxy = _ARIA2_TOR_PROXY
+    ready = bool(proxy and proxy.ready() and _tor_ready())
+    return (jsonify({"ok": True}), 200) if ready else (jsonify({"ok": False}), 503)
+
+
 @app.get("/diagnostics")
 def diagnostics():
     with _HELPER_LOCK:
@@ -242,6 +251,10 @@ if __name__ == "__main__":
     from waitress import serve
 
     _start_tor()
+    _ARIA2_TOR_PROXY = TorHttpProxyServer(
+        token_file=os.environ.get("ARIA2_TOR_PROXY_TOKEN_FILE", "/aria2-proxy/token")
+    )
+    _ARIA2_TOR_PROXY.start()
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline and _TOR_PROCESS.poll() is None:
         if _tor_ready():

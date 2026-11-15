@@ -117,9 +117,11 @@ services:
       ARIA2_STATE_ROOT: /state
       ARIA2_RPC_URL: http://127.0.0.1:6800/jsonrpc
       ARIA2_HOOK_PATH: /usr/local/bin/aria2-retry-on-low-speed.py
+      ARIA2_TOR_PROXY_TOKEN_FILE: /aria2-proxy/token
       UTILITY_WORKSPACE_ROOT: ${UTILITY_WORKSPACE_ROOT:-/workspace}
     volumes:
       - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2:/state
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2-proxy:/aria2-proxy
       - ${UTILITY_WORKSPACE_HOST:-/www/wwwroot/downloads}:${UTILITY_WORKSPACE_ROOT:-/workspace}
     healthcheck:
       test: ["CMD", "python3", "-m", "tme3bot.worker.aria2_runtime", "healthcheck"]
@@ -132,9 +134,12 @@ services:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
-    expose: ["8090"]
+    expose: ["8090", "8118"]
+    volumes:
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2-proxy:/aria2-proxy:ro
     environment:
       TTS_TOR_DATA_DIR: /tmp/tor-data
+      ARIA2_TOR_PROXY_TOKEN_FILE: /aria2-proxy/token
       HTTP_PROXY: socks5h://127.0.0.1:9050
       HTTPS_PROXY: socks5h://127.0.0.1:9050
       http_proxy: socks5h://127.0.0.1:9050
@@ -151,9 +156,12 @@ services:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
-    expose: ["8090"]
+    expose: ["8090", "8118"]
+    volumes:
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2-proxy:/aria2-proxy:ro
     environment:
       TTS_TOR_DATA_DIR: /tmp/tor-data
+      ARIA2_TOR_PROXY_TOKEN_FILE: /aria2-proxy/token
       HTTP_PROXY: socks5h://127.0.0.1:9050
       HTTPS_PROXY: socks5h://127.0.0.1:9050
       http_proxy: socks5h://127.0.0.1:9050
@@ -170,9 +178,12 @@ services:
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
-    expose: ["8090"]
+    expose: ["8090", "8118"]
+    volumes:
+      - ${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2-proxy:/aria2-proxy:ro
     environment:
       TTS_TOR_DATA_DIR: /tmp/tor-data
+      ARIA2_TOR_PROXY_TOKEN_FILE: /aria2-proxy/token
       HTTP_PROXY: socks5h://127.0.0.1:9050
       HTTPS_PROXY: socks5h://127.0.0.1:9050
       http_proxy: socks5h://127.0.0.1:9050

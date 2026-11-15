@@ -40,6 +40,7 @@ class FakeExecutor:
         }
         self.aria2_recovery_settings_value = {"speed_threshold_bytes_per_second": 100000}
         self.aria2_rpc_calls = []
+        self.aria2_link_calls = []
         self.aria2_ui_root = None
         self.profile_readiness_canary_requests = []
         self.profile_readiness_canary_status = {
@@ -215,6 +216,22 @@ class FakeExecutor:
             return target if target.is_file() else None
         except (OSError, ValueError):
             return None
+
+    def aria2_bunkr_links_preview(self, payload):
+        self.aria2_link_calls.append(("preview", payload))
+        return {"items": [{"source_index": 0, "kind": "album", "title": "Album", "files": [], "error": ""}]}
+
+    def aria2_bunkr_links_enqueue(self, payload):
+        self.aria2_link_calls.append(("enqueue", payload))
+        return {"items": [{"gid": "0000000000000001", "file_name": "a.bin", "status": "queued", "route": "tor"}]}
+
+    def aria2_bunkr_links_tasks(self):
+        self.aria2_link_calls.append(("tasks", None))
+        return {"items": []}
+
+    def aria2_bunkr_link_task_control(self, gid, action, payload):
+        self.aria2_link_calls.append((action, gid, payload))
+        return {"gid": gid, "route": payload.get("route", "non"), "status": "paused"}
 
     def diagnose_profile_export(self, profile):
         return {
@@ -905,6 +922,36 @@ class WorkerApiTests(unittest.TestCase):
             json={"speed_threshold_bytes_per_second": 100000, "max-tries": 0},
         )
         self.assertEqual(invalid_extra.status_code, 422)
+
+    def test_aria2_links_preview_enqueue_and_task_route_require_worker_auth(self):
+        preview_body = {"sources": ["https://bunkr.cr/a/album"]}
+        denied = self.client.post("/internal/v1/aria2/links/preview", json=preview_body)
+        self.assertEqual(denied.status_code, 401)
+        headers = {"Authorization": "Bearer worker-secret"}
+        preview = self.client.post(
+            "/internal/v1/aria2/links/preview", headers=headers, json=preview_body
+        )
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["items"][0]["kind"], "album")
+        enqueue_body = {
+            "sources": ["https://bunkr.cr/a/album"],
+            "selections": {"0": ["a"]},
+            "directory": "/workspace", "route": "tor",
+        }
+        queued = self.client.post(
+            "/internal/v1/aria2/links/enqueue", headers=headers, json=enqueue_body
+        )
+        self.assertEqual(queued.status_code, 200, queued.text)
+        self.assertEqual(queued.json()["items"][0]["route"], "tor")
+        tasks = self.client.get("/internal/v1/aria2/links/tasks", headers=headers)
+        self.assertEqual(tasks.status_code, 200)
+        changed = self.client.post(
+            "/internal/v1/aria2/links/tasks/0000000000000001/route",
+            headers=headers, json={"route": "non"},
+        )
+        self.assertEqual(changed.status_code, 200)
+        self.assertEqual(changed.json()["route"], "non")
+        self.assertEqual([call[0] for call in self.executor.aria2_link_calls], ["preview", "enqueue", "tasks", "route"])
 
     def test_aria2_rpc_and_assets_require_worker_auth(self):
         payload = {"jsonrpc": "2.0", "id": "one", "method": "aria2.getVersion", "params": []}
