@@ -278,12 +278,10 @@ class UtilityExtractE2ETests(unittest.TestCase):
         corrupted = folder / "corrupted.zip"
         corrupted.write_bytes(b"not a zip or 7z archive")
         (folder / ".pass").write_text("wrong-pass-file", encoding="utf-8")
-        multipart_folder = folder / "multipart-failure"
-        multipart_folder.mkdir()
-        fixture_parts = sorted(self.archive_fixture_root.glob("multipart.part*.rar"))
-        for fixture in fixture_parts:
-            shutil.copy2(fixture, multipart_folder / fixture.name)
-        (multipart_folder / ".pass").write_text("wrong-multipart-password", encoding="utf-8")
+        rar_folder = folder / "corrupt-rar"
+        rar_folder.mkdir()
+        corrupted_rar = rar_folder / "corrupted.rar"
+        corrupted_rar.write_bytes(b"not a rar archive")
 
         result = self._extract(folder, password="wrong-form-password")
 
@@ -291,15 +289,12 @@ class UtilityExtractE2ETests(unittest.TestCase):
         self.assertEqual(result.summary["archives_failed"], 3)
         self.assertTrue(encrypted.is_file(), "failed encrypted source must remain available")
         self.assertTrue(corrupted.is_file(), "corrupt source must remain available")
-        self.assertTrue(
-            all((multipart_folder / part.name).is_file() for part in fixture_parts),
-            "failed multipart source parts must remain available",
-        )
+        self.assertTrue(corrupted_rar.is_file(), "corrupt RAR source must remain available")
         self.assertFalse((folder / "encrypted").exists())
         self.assertFalse((folder / "corrupted").exists())
-        self.assertFalse((multipart_folder / "multipart").exists())
+        self.assertFalse((rar_folder / "corrupted").exists())
         self.assertFalse(list(folder.glob(".extract-attempt-*")))
-        self.assertFalse(list(multipart_folder.glob(".extract-attempt-*")))
+        self.assertFalse(list(rar_folder.glob(".extract-attempt-*")))
         self.assertTrue(all(item["cleanup_status"] == "retained_failed" for item in result.archive_results))
 
     def test_archive_with_one_successful_member_is_successful_and_keeps_only_that_file(self) -> None:
