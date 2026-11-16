@@ -8,10 +8,60 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tme3bot.utility import UtilityFlattenPreviewStaleError, UtilityRunner
-from utility.extract.extract import _copy_partial_member_no_follow, _discard_partial_output
+from utility.extract.extract import _discard_partial_output
 
 
 class UtilityFeatureTests(unittest.TestCase):
+    def test_extract_only_treats_numbered_volumes_with_a_next_part_as_archives(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "numbered-volumes"
+            folder.mkdir()
+            orphan = folder / "orphan.001"
+            orphan.write_bytes(b"ordinary numbered file")
+            first_part = folder / "split.001"
+            first_part.write_bytes(b"archive volume 1")
+            (folder / "split.002").write_bytes(b"archive volume 2")
+
+            bin_root = root / "bin"
+            bin_root.mkdir()
+            called = root / "7z-called"
+            executable = bin_root / "7z"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "archive = next(arg for arg in args if arg.endswith('.001'))\n"
+                "output = Path(next(arg[2:] for arg in args if arg.startswith('-o')))\n"
+                "output.mkdir(parents=True, exist_ok=True)\n"
+                "(output / 'payload.bin').write_bytes(b'extracted')\n"
+                "Path(os.environ['UTILITY_TEST_7Z_CALLED']).write_text(archive)\n"
+                "print('- payload.bin')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": f"{bin_root}{os.pathsep}/usr/bin{os.pathsep}/bin",
+                    "UTILITY_TEST_7Z_CALLED": str(called),
+                },
+            ):
+                result = runner.run("extract", [str(folder)])
+
+            self.assertEqual(result.outcome, "succeeded", result.archive_results)
+            self.assertEqual([item["name"] for item in result.archive_results], ["split.001"])
+            self.assertEqual(Path(called.read_text(encoding="utf-8")).name, "split.001")
+            self.assertTrue(orphan.is_file())
+            self.assertFalse(first_part.exists())
+            self.assertFalse((folder / "split.002").exists())
+
     def _fake_7z_rar_with_exclusions(self, root: Path) -> tuple[Path, dict[str, str]]:
         bin_root = root / "bin"
         bin_root.mkdir(parents=True)
@@ -357,35 +407,6 @@ class UtilityFeatureTests(unittest.TestCase):
             self.assertTrue((output / "dirB" / "item.txt").is_file())
             self.assertTrue((output / "dirC" / "other.txt").is_file())
             self.assertTrue(first_archive.is_file())
-
-    def test_partial_member_copy_failure_never_publishes_truncated_output(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            source_root = root / "source"
-            destination_root = root / "destination"
-            (source_root / "nested").mkdir(parents=True)
-            destination_root.mkdir()
-            (source_root / "nested" / "payload.bin").write_bytes(b"complete payload")
-            real_write = os.write
-            write_calls = 0
-
-            def fail_after_partial_write(descriptor, data):
-                nonlocal write_calls
-                write_calls += 1
-                if write_calls == 1:
-                    real_write(descriptor, data[:4])
-                raise OSError("simulated disk write failure")
-
-            with patch("utility.extract.extract.os.write", side_effect=fail_after_partial_write):
-                copied = _copy_partial_member_no_follow(
-                    source_root,
-                    destination_root,
-                    Path("nested") / "payload.bin",
-                )
-
-            self.assertFalse(copied)
-            self.assertFalse((destination_root / "nested" / "payload.bin").exists())
-            self.assertEqual(list((destination_root / "nested").iterdir()), [])
 
     def test_partial_cleanup_rejects_workspace_parent_replaced_by_symlink(self):
         with tempfile.TemporaryDirectory() as temp_dir:

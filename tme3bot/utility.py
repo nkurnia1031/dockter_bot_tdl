@@ -877,6 +877,25 @@ class UtilityRunner:
     @staticmethod
     def _snapshot(folder: Path) -> dict[str, int]:
         files = [path for path in folder.rglob("*") if path.is_file()]
+        archive_suffixes = (
+            ".7z", ".zip", ".zipx", ".rar", ".tar", ".tar.gz",
+            ".tar.gzip", ".tar.bz2", ".tar.bzip2", ".tar.xz", ".tar.lzma",
+            ".tar.zst", ".tar.zstd", ".tgz", ".tpz", ".tbz", ".tbz2",
+            ".txz", ".tzst", ".taz", ".gz", ".gzip", ".bz2", ".bzip2",
+            ".xz", ".zst", ".zstd", ".lzma", ".z", ".arj", ".cab",
+            ".chm", ".cpio", ".dmg", ".iso", ".lha", ".lzh", ".rpm",
+            ".squashfs", ".udf", ".xar", ".pkg", ".xip", ".wim", ".swm",
+            ".esd", ".ppkg", ".qcow", ".qcow2", ".vdi", ".vhd", ".vhdx",
+            ".vmdk", ".deb", ".udeb", ".ova", ".jar", ".xpi", ".odt",
+            ".ods", ".docx", ".xlsx", ".pptx", ".epub", ".ipa", ".appx",
+            ".msi", ".msp", ".msm", ".apk", ".doc", ".xls", ".ppt", ".aaf",
+            ".apfs", ".b64", ".obj", ".elf", ".ext", ".ext2", ".ext3",
+            ".ext4", ".fat", ".flv", ".gpt", ".hfs", ".hfsx", ".hxs",
+            ".hxi", ".hxr", ".hxq", ".hxw", ".lit", ".img", ".lpimg",
+            ".mbr", ".macho", ".mslz", ".mub", ".ntfs", ".exe", ".dll",
+            ".sys", ".pmd", ".swf", ".simg", ".te", ".scap", ".uefif",
+            ".ihex",
+        )
         return {
             "files": len(files),
             "bytes": sum(path.stat().st_size for path in files),
@@ -884,7 +903,14 @@ class UtilityRunner:
             "archives": sum(
                 1
                 for path in files
-                if path.suffix.lower() in {".7z", ".zip", ".rar", ".001"}
+                if (
+                    path.name.lower().endswith(archive_suffixes)
+                    or path.name.lower().endswith(".7z.001")
+                    or (
+                        path.name.lower().endswith(".001")
+                        and path.with_name(f"{path.name[:-4]}.002").is_file()
+                    )
+                )
             ),
         }
 

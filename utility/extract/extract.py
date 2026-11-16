@@ -14,6 +14,63 @@ from pathlib import Path
 from typing import Any
 
 
+# Archive and container suffixes supported by the worker's 7z runtime. Compound
+# suffixes come first so ``bundle.tar.gz`` gets the output name ``bundle``.
+_ARCHIVE_SUFFIXES = (
+    ".tar.bzip2", ".tar.bz2", ".tar.gzip", ".tar.gz", ".tar.lzma",
+    ".tar.zstd", ".tar.zst", ".tar.xz", ".tar.z", ".tar",
+    ".7z", ".zipx", ".zip", ".rar", ".arj", ".cab", ".chm",
+    ".chi", ".chq", ".chw", ".cpio", ".cramfs", ".dmg", ".iso",
+    ".lha", ".lzh", ".nsis", ".rpm", ".squashfs", ".udf", ".xar",
+    ".pkg", ".xip", ".wim", ".swm", ".esd", ".ppkg", ".qcow2c",
+    ".qcow2", ".qcow", ".vdi", ".avhdx", ".vhdx", ".vhd", ".vmdk",
+    ".deb", ".udeb", ".ova", ".tgz", ".tpz", ".tbz2", ".tbz",
+    ".txz", ".tzst", ".taz", ".gzip", ".bzip2", ".lzma86", ".lzma",
+    ".bz2", ".zstd", ".zst", ".xz", ".gz", ".z", ".ar", ".lib",
+    ".jar", ".xpi", ".odt", ".ods", ".docx", ".xlsx", ".pptx",
+    ".epub", ".ipa", ".appx", ".msi", ".msp", ".msm", ".apk",
+    ".doc", ".xls", ".ppt", ".aaf", ".apfs", ".b64", ".obj",
+    ".elf", ".ext", ".ext2", ".ext3", ".ext4", ".fat", ".flv",
+    ".gpt", ".hfs", ".hfsx", ".hxs", ".hxi", ".hxr", ".hxq",
+    ".hxw", ".lit", ".img", ".lpimg", ".mbr", ".macho", ".mslz",
+    ".mub", ".ntfs", ".exe", ".dll", ".sys", ".pmd", ".swf",
+    ".simg", ".te", ".scap", ".uefif", ".ihex",
+)
+_PASSWORD_ARCHIVE_SUFFIXES = (".7z", ".zip", ".zipx", ".rar", ".arj")
+_TAR_STREAM_SUFFIXES = {
+    ".tar.gz": "GZip",
+    ".tar.gzip": "GZip",
+    ".tgz": "GZip",
+    ".tpz": "GZip",
+    ".tar.lzma": "Lzma",
+    ".tar.bz2": "BZip2",
+    ".tar.bzip2": "BZip2",
+    ".tbz": "BZip2",
+    ".tbz2": "BZip2",
+    ".tar.xz": "Xz",
+    ".txz": "Xz",
+    ".tar.zst": "Zstd",
+    ".tar.zstd": "Zstd",
+    ".tzst": "Zstd",
+    ".tar.z": "Z",
+    ".taz": "Z",
+}
+
+
+def archive_suffix(filename: str) -> str | None:
+    lower = filename.lower()
+    return next((suffix for suffix in _ARCHIVE_SUFFIXES if lower.endswith(suffix)), None)
+
+
+def _tar_stream_type(filename: str) -> str | None:
+    lower = filename.lower()
+    suffix = next(
+        (candidate for candidate in _TAR_STREAM_SUFFIXES if lower.endswith(candidate)),
+        None,
+    )
+    return _TAR_STREAM_SUFFIXES.get(suffix) if suffix else None
+
+
 def emit_progress(**values: Any) -> None:
     print("TME3_PROGRESS " + json.dumps(values, ensure_ascii=True), flush=True)
 
@@ -29,9 +86,9 @@ def get_multipart_group(filepath: Path) -> list[Path]:
         pattern = re.compile(rf"^{base}(?:\.part\d+\.rar|\.r\d+)$", re.IGNORECASE)
         return sorted(path for path in folder.iterdir() if pattern.match(path.name))
 
-    split_7z = re.match(r"(.+\.7z)\.\d+$", filename, re.IGNORECASE)
-    if split_7z:
-        base = re.escape(split_7z.group(1))
+    split_numbered = re.match(r"(.+)\.001$", filename, re.IGNORECASE)
+    if split_numbered:
+        base = re.escape(split_numbered.group(1))
         pattern = re.compile(rf"^{base}\.\d+$", re.IGNORECASE)
         return sorted(path for path in folder.iterdir() if pattern.match(path.name))
 
@@ -54,22 +111,35 @@ def is_main_part(filename: str) -> bool:
     lower = filename.lower()
     if re.match(r".+\.part\d+\.rar$", lower):
         return bool(re.match(r".+\.part0*1\.rar$", lower))
-    return lower.endswith((".7z", ".zip", ".rar", ".7z.001"))
+    return lower.endswith(".7z.001") or archive_suffix(filename) is not None
+
+
+def is_main_archive(filepath: Path) -> bool:
+    lower = filepath.name.lower()
+    if lower.endswith(".001") and not lower.endswith(".7z.001"):
+        next_volume = filepath.with_name(f"{filepath.name[:-4]}.002")
+        return next_volume.is_file() and not next_volume.is_symlink()
+    return is_main_part(filepath.name)
 
 
 def get_extract_folder_name(filename: str) -> str:
     for pattern in (
         r"(.+)\.part\d+\.rar$",
-        r"(.+\.7z)\.\d+$",
+        r"(.+)\.001$",
     ):
         match = re.match(pattern, filename, re.IGNORECASE)
         if match:
             return Path(match.group(1)).name
+    suffix = archive_suffix(filename)
+    if suffix:
+        return Path(filename[: -len(suffix)]).name or Path(filename).stem
     return Path(filename).stem
 
 
 def archive_password_candidates(filepath: Path, supplied_password: str | None) -> list[str]:
     """Return the first-pass candidates without logging or exposing their values."""
+    if not filepath.name.lower().endswith(_PASSWORD_ARCHIVE_SUFFIXES):
+        return []
     primary = supplied_password if supplied_password else filepath.parent.name
     candidates: list[str] = []
     if primary:
@@ -88,45 +158,67 @@ def archive_password_candidates(filepath: Path, supplied_password: str | None) -
     return candidates
 
 
-def _unique_output_directory(filepath: Path) -> Path:
+def _create_unique_output_directory(filepath: Path) -> Path:
     base = filepath.parent / get_extract_folder_name(filepath.name)
-    if not base.exists() and not base.is_symlink():
-        return base
+    candidate = base
     suffix = 2
     while True:
-        candidate = base.with_name(f"{base.name}_{suffix}")
-        if not candidate.exists() and not candidate.is_symlink():
+        try:
+            candidate.mkdir(mode=0o700)
             return candidate
-        suffix += 1
+        except FileExistsError:
+            candidate = base.with_name(f"{base.name}_{suffix}")
+            suffix += 1
 
 
 def _command_for(
-    filepath: Path, password: str | None, output: Path
-) -> list[str]:
-    lower = filepath.name.lower()
-    if lower.endswith((".7z", ".7z.001", ".zip", ".rar")):
-        # Per-member output is needed to distinguish a genuine partial extract
-        # from zero-byte files left behind after a password prompt/error.
-        # Exclude text and URL files before writing archive members. Linux 7z
-        # matches case-sensitively by default, so opt into case-insensitive
-        # matching to cover names such as README.TXT and Link.URL too.
-        command = [
+    filepath: Path,
+    password: str | None,
+    output: Path,
+    *,
+    skip_existing: bool = False,
+) -> tuple[list[str], ...]:
+    if _tar_stream_type(filepath.name):
+        # Stream compressed tar data directly into the extractor so no
+        # intermediate .tar file or staging copy is written to disk.
+        decompress = ["7z", "x", "-so", "-bso0", "-bsp0", str(filepath)]
+        extract = [
             "7z",
             "x",
+            "-si",
+            "-ttar",
             "-bb1",
             "-ssc-",
             "-xr!*.txt",
             "-xr!*.url",
         ]
-        if password is not None:
-            command.append(f"-p{password}")
-        command.extend(["-y", str(filepath), f"-o{output}", "-bsp0"])
-        return command
-    raise ValueError("Format arsip tidak didukung.")
+        if skip_existing:
+            extract.append("-aos")
+        extract.extend(["-y", f"-o{output}", "-bsp0"])
+        return (decompress, extract)
+
+    if archive_suffix(filepath.name) is None and not filepath.name.lower().endswith(".001"):
+        raise ValueError("Format arsip tidak didukung.")
+    # Per-member output distinguishes real extracted files from placeholders
+    # left after a password or corruption error. Write into the final directory.
+    command = [
+        "7z",
+        "x",
+        "-bb1",
+        "-ssc-",
+        "-xr!*.txt",
+        "-xr!*.url",
+    ]
+    if skip_existing:
+        command.append("-aos")
+    if password is not None:
+        command.append(f"-p{password}")
+    command.extend(["-y", str(filepath), f"-o{output}", "-bsp0"])
+    return (command,)
 
 
 def run_extract(
-    command: list[str],
+    commands: tuple[list[str], ...],
     *,
     filepath: Path,
     output: Path,
@@ -135,22 +227,55 @@ def run_extract(
     total: int,
     attempt: int,
 ) -> "ExtractorRun":
-    """Run one isolated extraction attempt and keep the job heartbeat alive."""
+    """Run one extractor or a decompressor→extractor streaming pipeline."""
     started = time.monotonic()
     with tempfile.TemporaryFile() as tool_log:
+        processes: list[subprocess.Popen[bytes]] = []
         try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(filepath.parent),
-                stdin=subprocess.DEVNULL,
-                stdout=tool_log,
-                stderr=subprocess.STDOUT,
-                start_new_session=False,
-            )
+            if len(commands) == 1:
+                processes.append(
+                    subprocess.Popen(
+                        commands[0],
+                        cwd=str(filepath.parent),
+                        stdin=subprocess.DEVNULL,
+                        stdout=tool_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=False,
+                    )
+                )
+            elif len(commands) == 2:
+                decompressor = subprocess.Popen(
+                    commands[0],
+                    cwd=str(filepath.parent),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=tool_log,
+                    start_new_session=False,
+                )
+                processes.append(decompressor)
+                assert decompressor.stdout is not None
+                try:
+                    extractor = subprocess.Popen(
+                        commands[1],
+                        cwd=str(filepath.parent),
+                        stdin=decompressor.stdout,
+                        stdout=tool_log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=False,
+                    )
+                except OSError:
+                    decompressor.stdout.close()
+                    decompressor.terminate()
+                    decompressor.wait()
+                    raise
+                processes.append(extractor)
+                decompressor.stdout.close()
+            else:
+                raise ValueError("Pipeline extractor tidak valid.")
         except OSError:
             return ExtractorRun(returncode=None, output="")
 
-        while process.poll() is None:
+        while any(process.poll() is None for process in processes):
             time.sleep(2)
             elapsed = time.monotonic() - started
             emit_progress(
@@ -165,7 +290,11 @@ def run_extract(
             )
         tool_log.seek(0)
         tool_output = tool_log.read().decode("utf-8", errors="replace")
-    return ExtractorRun(returncode=process.returncode, output=tool_output)
+    returncode = next(
+        (process.returncode for process in processes if process.returncode != 0),
+        0,
+    )
+    return ExtractorRun(returncode=returncode, output=tool_output)
 
 
 @dataclass(frozen=True)
@@ -252,8 +381,8 @@ def _member_files(
     return matched
 
 
-def _staged_file_results(
-    command: list[str],
+def _extracted_file_results(
+    commands: tuple[list[str], ...],
     tool_output: str,
     output: Path,
     returncode: int | None,
@@ -262,7 +391,7 @@ def _staged_file_results(
     successful_members: list[str] = []
     failed_members: list[str] = []
     has_unclassified_error = False
-    tool = Path(command[0]).name.lower()
+    tool = Path(commands[-1][0]).name.lower()
     for line in tool_output.replace("\x08", "").splitlines():
         if tool in {"7z", "7zz"}:
             failed_match = _SEVEN_Z_MEMBER_ERROR.match(line)
@@ -276,7 +405,7 @@ def _staged_file_results(
     failed_member_matches = [_member_files([member], output, files) for member in failed_members]
     failed_files = set().union(*failed_member_matches) if failed_member_matches else set()
     # Partial success must be explicit in the extractor's per-member output.
-    # Inferring success from files merely present in staging misclassifies
+    # Inferring success from files merely present in output misclassifies
     # zero-byte placeholders left by bad passwords or corrupt archives.
     successful_files = _member_files(successful_members, output, files)
     successful_files.difference_update(failed_files)
@@ -303,7 +432,7 @@ def _staged_file_results(
     return sorted(successful_files), tuple(sorted(normalized_failures)), has_unclassified_error
 
 
-def _retain_only_staged_files(output: Path, keep: list[Path]) -> bool:
+def _retain_only_verified_files(output: Path, keep: list[Path]) -> bool:
     kept_files = set(keep)
     entries = sorted(output.rglob("*"), key=lambda path: len(path.parts), reverse=True)
     try:
@@ -320,12 +449,6 @@ def _retain_only_staged_files(output: Path, keep: list[Path]) -> bool:
     return True
 
 
-def _publish_staging(staging: Path, destination: Path) -> None:
-    if destination.exists() or destination.is_symlink():
-        raise FileExistsError(f"Folder output sudah ada: {destination.name}")
-    staging.rename(destination)
-
-
 def _open_directory_no_follow(path: Path) -> int:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     current_fd = os.open(os.path.sep, flags)
@@ -338,149 +461,6 @@ def _open_directory_no_follow(path: Path) -> int:
     except OSError:
         os.close(current_fd)
         raise
-
-
-def _open_relative_directory(root_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    current_fd = os.dup(root_fd)
-    try:
-        for component in parts:
-            if component in {"", ".", ".."}:
-                raise ValueError("Arsip berisi path anggota yang tidak valid.")
-            if create:
-                try:
-                    os.mkdir(component, mode=0o755, dir_fd=current_fd)
-                except FileExistsError:
-                    pass
-            next_fd = os.open(component, flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
-        return current_fd
-    except (OSError, ValueError):
-        os.close(current_fd)
-        raise
-
-
-def _copy_partial_member_no_follow(
-    source_root: Path, destination_root: Path, relative: Path
-) -> bool:
-    parts = relative.parts
-    if not parts or any(part in {"", ".", ".."} for part in parts):
-        return False
-    source_root_fd = destination_root_fd = source_parent_fd = None
-    destination_parent_fd = source_fd = temporary_fd = None
-    temporary_name: str | None = None
-    temporary_identity: tuple[int, int] | None = None
-    try:
-        source_root_fd = _open_directory_no_follow(source_root)
-        destination_root_fd = _open_directory_no_follow(destination_root)
-        source_parent_fd = _open_relative_directory(
-            source_root_fd, parts[:-1], create=False
-        )
-        destination_parent_fd = _open_relative_directory(
-            destination_root_fd, parts[:-1], create=True
-        )
-        source_name = parts[-1]
-        source_fd = os.open(
-            source_name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=source_parent_fd,
-        )
-        source_stat = os.fstat(source_fd)
-        if not stat.S_ISREG(source_stat.st_mode):
-            return False
-        try:
-            os.stat(source_name, dir_fd=destination_parent_fd, follow_symlinks=False)
-            return False
-        except FileNotFoundError:
-            pass
-
-        temporary_name = f".extract-merge-{os.urandom(12).hex()}.tmp"
-        temporary_fd = os.open(
-            temporary_name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-            dir_fd=destination_parent_fd,
-        )
-        temporary_stat = os.fstat(temporary_fd)
-        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
-            if not chunk:
-                break
-            view = memoryview(chunk)
-            while view:
-                written = os.write(temporary_fd, view)
-                if written <= 0:
-                    raise OSError("Gagal menulis hasil merge sementara.")
-                view = view[written:]
-        final_source_stat = os.fstat(source_fd)
-        if (
-            final_source_stat.st_dev != source_stat.st_dev
-            or final_source_stat.st_ino != source_stat.st_ino
-            or final_source_stat.st_size != source_stat.st_size
-            or final_source_stat.st_mtime_ns != source_stat.st_mtime_ns
-        ):
-            raise OSError("File hasil percobaan berubah saat merge.")
-        os.fchmod(temporary_fd, stat.S_IMODE(source_stat.st_mode))
-        os.fsync(temporary_fd)
-        temporary_entry = os.stat(
-            temporary_name,
-            dir_fd=destination_parent_fd,
-            follow_symlinks=False,
-        )
-        if (temporary_entry.st_dev, temporary_entry.st_ino) != temporary_identity:
-            raise OSError("File merge sementara berubah sebelum publikasi.")
-        os.link(
-            temporary_name,
-            source_name,
-            src_dir_fd=destination_parent_fd,
-            dst_dir_fd=destination_parent_fd,
-            follow_symlinks=False,
-        )
-        published_stat = os.stat(
-            source_name,
-            dir_fd=destination_parent_fd,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(published_stat.st_mode)
-            or (published_stat.st_dev, published_stat.st_ino) != temporary_identity
-        ):
-            raise OSError("File merge yang dipublikasikan tidak cocok.")
-        return True
-    except (OSError, ValueError):
-        return False
-    finally:
-        if temporary_fd is not None:
-            os.close(temporary_fd)
-        if temporary_name is not None and destination_parent_fd is not None:
-            try:
-                temporary_entry = os.stat(
-                    temporary_name,
-                    dir_fd=destination_parent_fd,
-                    follow_symlinks=False,
-                )
-                if (
-                    temporary_identity is not None
-                    and (temporary_entry.st_dev, temporary_entry.st_ino)
-                    == temporary_identity
-                ):
-                    os.unlink(temporary_name, dir_fd=destination_parent_fd)
-            except (FileNotFoundError, OSError):
-                pass
-        for descriptor in (
-            source_fd,
-            source_parent_fd,
-            destination_parent_fd,
-            source_root_fd,
-            destination_root_fd,
-        ):
-            if descriptor is not None:
-                os.close(descriptor)
 
 
 def _discard_partial_output(
@@ -557,72 +537,6 @@ def _remove_tree_at(
     return True
 
 
-def _merge_partial_attempts(
-    filepath: Path,
-    current: ArchiveAttempt | None,
-    candidate: ArchiveAttempt,
-    workspace_root: Path,
-) -> ArchiveAttempt:
-    if current is None:
-        return candidate
-    if current.output is None or candidate.output is None:
-        _discard_partial_output(filepath, candidate.output, workspace_root)
-        return current
-    try:
-        source_parent = filepath.parent.resolve(strict=True)
-        source_parent.relative_to(workspace_root)
-        output_root = current.output.resolve(strict=True)
-        candidate_root = candidate.output.resolve(strict=True)
-        if (
-            current.output.is_symlink()
-            or candidate.output.is_symlink()
-            or output_root.parent != source_parent
-            or candidate_root.parent != source_parent
-        ):
-            _discard_partial_output(filepath, candidate.output, workspace_root)
-            return current
-        for source in _regular_output_files(candidate_root):
-            relative = source.relative_to(candidate_root)
-            destination = output_root / relative
-            if destination.exists() or destination.is_symlink():
-                continue
-            _copy_partial_member_no_follow(candidate_root, output_root, relative)
-    except (OSError, ValueError):
-        _discard_partial_output(filepath, candidate.output, workspace_root)
-        return current
-
-    files = _regular_output_files(output_root)
-    observed_members = set(current.successful_members)
-    observed_members.update(candidate.successful_members)
-    observed_members.update(current.failed_members)
-    observed_members.update(candidate.failed_members)
-    unresolved_members = {
-        member
-        for member in observed_members
-        if not _member_files(
-            [member], output_root, files, allow_basename_fallback=False
-        )
-    }
-    unclassified_failure = (
-        current.unclassified_failure or candidate.unclassified_failure
-    )
-    partial = bool(unresolved_members) or unclassified_failure
-    merged = ArchiveAttempt(
-        succeeded=True,
-        output=current.output,
-        partial=partial,
-        files_extracted=len(files),
-        failed_files=max(len(unresolved_members), int(unclassified_failure)),
-        successful_members=tuple(
-            sorted(path.relative_to(output_root).as_posix() for path in files)
-        ),
-        failed_members=tuple(sorted(unresolved_members)),
-        unclassified_failure=unclassified_failure,
-    )
-    _discard_partial_output(filepath, candidate.output, workspace_root)
-    return merged
-
-
 def _remove_archive_parts(filepath: Path) -> str:
     cleanup_status = "deleted"
     for part in get_multipart_group(filepath):
@@ -643,87 +557,144 @@ def _attempt_archive(
     total: int,
     pass_name: str,
     attempt: int,
+    workspace_root: Path,
+    previous: ArchiveAttempt | None = None,
 ) -> ArchiveAttempt:
-    with tempfile.TemporaryDirectory(
-        prefix=".extract-attempt-", dir=str(filepath.parent)
-    ) as temporary:
-        staging = Path(temporary) / "output"
+    if previous and previous.output:
+        output = previous.output
         try:
-            command = _command_for(filepath, password, staging)
-        except ValueError:
+            resolved_parent = filepath.parent.resolve(strict=True)
+            resolved_parent.relative_to(workspace_root)
+            resolved_output = output.resolve(strict=True)
+            expected_prefix = get_extract_folder_name(filepath.name)
+            if (
+                output.is_symlink()
+                or resolved_output.parent != resolved_parent
+                or not re.fullmatch(
+                    rf"{re.escape(expected_prefix)}(?:_[2-9]|_[1-9]\d+)?",
+                    resolved_output.name,
+                )
+            ):
+                return previous
+            output.chmod(0o700)
+        except (OSError, ValueError):
+            return previous
+    else:
+        try:
+            filepath.parent.resolve(strict=True).relative_to(workspace_root)
+            output = _create_unique_output_directory(filepath)
+        except (OSError, ValueError):
             return ArchiveAttempt(succeeded=False)
-        emit_progress(
-            phase="archive_attempt",
-            pass_name=pass_name,
-            index=index,
-            total=total,
-            name=filepath.name,
-            attempt=attempt,
-            indeterminate=True,
+
+    try:
+        commands = _command_for(
+            filepath,
+            password,
+            output,
+            skip_existing=bool(previous and previous.successful_members),
         )
-        run = run_extract(
-            command,
-            filepath=filepath,
-            output=staging,
-            pass_name=pass_name,
-            index=index,
-            total=total,
-            attempt=attempt,
+    except ValueError:
+        if previous is None:
+            _discard_partial_output(filepath, output, workspace_root)
+        return previous or ArchiveAttempt(succeeded=False)
+
+    emit_progress(
+        phase="archive_attempt",
+        pass_name=pass_name,
+        index=index,
+        total=total,
+        name=filepath.name,
+        attempt=attempt,
+        indeterminate=True,
+    )
+    run = run_extract(
+        commands,
+        filepath=filepath,
+        output=output,
+        pass_name=pass_name,
+        index=index,
+        total=total,
+        attempt=attempt,
+    )
+    current_successes, current_failures, current_unclassified = _extracted_file_results(
+        commands, run.output, output, run.returncode
+    )
+    existing_files = _regular_output_files(output)
+    retained_files = (
+        _member_files(
+            list(previous.successful_members),
+            output,
+            existing_files,
+            allow_basename_fallback=False,
         )
-        successful_files, failed_members, unclassified_failure = _staged_file_results(
-            command, run.output, staging, run.returncode
-        )
-        failed_file_count = len(failed_members)
-        if (
-            Path(command[0]).name.lower() in {"7z", "7zz"}
-            and run.returncode != 0
-            and not failed_members
-        ):
-            failed_file_count = 1
-        complete = (
-            run.returncode == 0
-            and staging.is_dir()
-            and failed_file_count == 0
-            and not unclassified_failure
-        )
-        partial = not complete and bool(successful_files)
-        if not complete and not partial:
-            return ArchiveAttempt(
-                succeeded=False,
-                failed_files=failed_file_count,
-                failed_members=failed_members,
-                unclassified_failure=unclassified_failure,
-            )
-        if partial and not _retain_only_staged_files(staging, successful_files):
-            return ArchiveAttempt(
-                succeeded=False,
-                failed_files=failed_file_count,
-                failed_members=failed_members,
-                unclassified_failure=unclassified_failure,
-            )
-        destination = _unique_output_directory(filepath)
-        try:
-            _publish_staging(staging, destination)
-        except OSError:
-            return ArchiveAttempt(
-                succeeded=False,
-                failed_files=failed_file_count,
-                failed_members=failed_members,
-                unclassified_failure=unclassified_failure,
-            )
-        successful_members = tuple(
-            sorted(path.relative_to(staging).as_posix() for path in successful_files)
-        )
+        if previous is not None
+        else set()
+    )
+    verified_files = retained_files.union(current_successes)
+    if run.returncode == 0 and not current_failures and not current_unclassified:
+        verified_files.update(existing_files)
+    if not _retain_only_verified_files(output, sorted(verified_files)):
+        if previous is None:
+            _discard_partial_output(filepath, output, workspace_root)
+            return ArchiveAttempt(succeeded=False)
+        return previous
+
+    files = _regular_output_files(output)
+    current_member_names = {
+        path.relative_to(output).as_posix() for path in current_successes
+    }
+    observed_members = set(previous.successful_members if previous else ())
+    observed_members.update(previous.failed_members if previous else ())
+    observed_members.update(current_member_names)
+    observed_members.update(current_failures)
+    found_members = {
+        path.relative_to(output).as_posix() for path in files
+    }
+    unresolved_members = {
+        member for member in observed_members if member not in found_members
+    }
+    unclassified_failure = bool(
+        (previous and previous.unclassified_failure)
+        or current_unclassified
+    )
+    failed_file_count = max(
+        len(unresolved_members),
+        int(unclassified_failure),
+    )
+    complete = (
+        run.returncode == 0
+        and not failed_file_count
+        and not unresolved_members
+        and not unclassified_failure
+    )
+    if complete:
+        output.chmod(0o755)
         return ArchiveAttempt(
             succeeded=True,
-            output=destination,
-            partial=partial,
-            files_extracted=(len(successful_files) if partial else len(_regular_output_files(destination))),
+            output=output,
+            partial=False,
+            files_extracted=len(files),
+            successful_members=tuple(sorted(found_members)),
+        )
+    if not files:
+        _discard_partial_output(filepath, output, workspace_root)
+        return ArchiveAttempt(
+            succeeded=False,
             failed_files=failed_file_count,
-            successful_members=successful_members,
-            failed_members=failed_members,
+            failed_members=tuple(sorted(unresolved_members)),
             unclassified_failure=unclassified_failure,
         )
+    output.chmod(0o755)
+    return ArchiveAttempt(
+        succeeded=True,
+        output=output,
+        partial=True,
+        files_extracted=len(files),
+        failed_files=failed_file_count,
+        successful_members=tuple(sorted(found_members)),
+        failed_members=tuple(sorted(unresolved_members)),
+        unclassified_failure=unclassified_failure,
+    )
 
 
 def _finalize_result(
@@ -772,7 +743,7 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
         (
             path
             for path in base_dir.rglob("*")
-            if path.is_file() and not path.is_symlink() and is_main_part(path.name)
+            if path.is_file() and not path.is_symlink() and is_main_archive(path)
         ),
         key=lambda path: str(path).casefold(),
     )
@@ -803,21 +774,14 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
                 total=total,
                 pass_name="first_pass",
                 attempt=attempt,
+                workspace_root=base_dir,
+                previous=partial_attempt,
             )
             failed_file_count = max(failed_file_count, attempt_result.failed_files)
             if attempt_result.succeeded and attempt_result.partial:
-                partial_attempt = _merge_partial_attempts(
-                    filepath, partial_attempt, attempt_result, base_dir
-                )
-                if partial_attempt.partial:
-                    continue
-                attempt_result = partial_attempt
+                partial_attempt = attempt_result
+                continue
             if attempt_result.succeeded:
-                if (
-                    partial_attempt is not None
-                    and attempt_result.output != partial_attempt.output
-                ):
-                    _discard_partial_output(filepath, partial_attempt.output, base_dir)
                 record = _finalize_result(
                     filepath,
                     status="succeeded",
@@ -889,24 +853,17 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
                 total=total,
                 pass_name="retry",
                 attempt=int(item["attempt_count"]),
+                workspace_root=base_dir,
+                previous=partial_attempt,
             )
             item["failed_files"] = max(
                 int(item.get("failed_files", 0)), attempt_result.failed_files
             )
             if attempt_result.succeeded and attempt_result.partial:
-                partial_attempt = _merge_partial_attempts(
-                    filepath, partial_attempt, attempt_result, base_dir
-                )
+                partial_attempt = attempt_result
                 partial_pass_name = "retry"
-                if partial_attempt.partial:
-                    continue
-                attempt_result = partial_attempt
+                continue
             if attempt_result.succeeded:
-                if (
-                    partial_attempt is not None
-                    and attempt_result.output != partial_attempt.output
-                ):
-                    _discard_partial_output(filepath, partial_attempt.output, base_dir)
                 record = _finalize_result(
                     filepath,
                     status="succeeded",

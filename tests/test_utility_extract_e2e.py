@@ -4,6 +4,7 @@ import os
 import random
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 import zipfile
@@ -169,6 +170,68 @@ class UtilityExtractE2ETests(unittest.TestCase):
             ["nested/payload.bin"],
         )
 
+    def test_tgz_extracts_tar_members_without_intermediate_tar_file(self) -> None:
+        folder = self._selected_folder("tgz")
+        source = self._payload(folder, "payload.bin", 43)
+        excluded_text = self._payload(folder, "readme.txt", 17)
+        excluded_url = self._payload(folder, "link.url", 19)
+        archive = folder / "bundle.tgz"
+        with tarfile.open(archive, "w:gz") as compressed_tar:
+            compressed_tar.add(source, arcname="nested/payload.bin")
+            compressed_tar.add(excluded_text, arcname="nested/readme.txt")
+            compressed_tar.add(excluded_url, arcname="nested/link.url")
+
+        result = self._extract(folder)
+
+        item = self._assert_success(result, archive.name, folder)
+        output = Path(str(item["output"]))
+        self.assertEqual(output.name, "bundle")
+        self.assertEqual((output / "nested" / "payload.bin").read_bytes(), source.read_bytes())
+        self.assertFalse((output / "nested" / "readme.txt").exists())
+        self.assertFalse((output / "nested" / "link.url").exists())
+        self.assertFalse((output / "bundle.tar").exists())
+        self.assertFalse(archive.exists())
+
+    def test_extractor_writes_directly_to_final_output_directory(self) -> None:
+        folder = self._selected_folder("direct-output")
+        archive = folder / "direct.zip"
+        archive.write_bytes(b"fake archive handled by fake 7z")
+        fake_bin = self.temp_root / "fake-bin"
+        fake_bin.mkdir()
+        output_record = self.temp_root / "7z-output-path.txt"
+        fake_7z = fake_bin / "7z"
+        fake_7z.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, sys\n"
+            "output = pathlib.Path(next(arg[2:] for arg in sys.argv if arg.startswith('-o')))\n"
+            "output.mkdir(parents=True, exist_ok=True)\n"
+            "(output / 'payload.bin').write_bytes(b'direct output')\n"
+            "pathlib.Path(os.environ['TME3_TEST_7Z_OUTPUT']).write_text(str(output))\n"
+            "print('- payload.bin')\n",
+            encoding="utf-8",
+        )
+        fake_7z.chmod(0o755)
+        old_path = os.environ.get("PATH", "")
+        old_record = os.environ.get("TME3_TEST_7Z_OUTPUT")
+        os.environ["PATH"] = f"{fake_bin}{os.pathsep}{old_path}"
+        os.environ["TME3_TEST_7Z_OUTPUT"] = str(output_record)
+        try:
+            result = self._extract(folder)
+        finally:
+            os.environ["PATH"] = old_path
+            if old_record is None:
+                os.environ.pop("TME3_TEST_7Z_OUTPUT", None)
+            else:
+                os.environ["TME3_TEST_7Z_OUTPUT"] = old_record
+
+        item = self._assert_success(result, archive.name, folder)
+        final_output = Path(str(item["output"])).resolve()
+        extractor_output = Path(output_record.read_text(encoding="utf-8")).resolve()
+        self.assertEqual(extractor_output, final_output)
+        self.assertEqual(extractor_output.parent, folder.resolve())
+        self.assertFalse(list(folder.glob(".extract-attempt-*")))
+        self.assertFalse(list(folder.glob(".extract-merge-*.tmp")))
+
     def test_password_from_utility_form_unlocks_encrypted_7z(self) -> None:
         folder = self._selected_folder("form-password")
         source = self._payload(folder)
@@ -268,7 +331,7 @@ class UtilityExtractE2ETests(unittest.TestCase):
         self.assertFalse(seed_archive.exists())
         self.assertFalse(later_archive.exists())
 
-    def test_failed_encrypted_and_corrupt_archives_are_retained_and_staging_is_removed(self) -> None:
+    def test_failed_encrypted_and_corrupt_archives_are_retained_without_temp_outputs(self) -> None:
         folder = self._selected_folder("failed-archives")
         source = self._payload(folder, "private.bin")
         encrypted = folder / "encrypted.zip"
@@ -295,6 +358,8 @@ class UtilityExtractE2ETests(unittest.TestCase):
         self.assertFalse((rar_folder / "corrupted").exists())
         self.assertFalse(list(folder.glob(".extract-attempt-*")))
         self.assertFalse(list(rar_folder.glob(".extract-attempt-*")))
+        self.assertFalse(list(folder.glob(".extract-merge-*.tmp")))
+        self.assertFalse(list(rar_folder.glob(".extract-merge-*.tmp")))
         self.assertTrue(all(item["cleanup_status"] == "retained_failed" for item in result.archive_results))
 
     def test_archive_with_one_successful_member_is_successful_and_keeps_only_that_file(self) -> None:
