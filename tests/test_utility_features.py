@@ -62,6 +62,56 @@ class UtilityFeatureTests(unittest.TestCase):
             self.assertFalse(first_part.exists())
             self.assertFalse((folder / "split.002").exists())
 
+    def test_split_7z_uses_supplied_password(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            folder = root / "split-password"
+            folder.mkdir()
+            archive = folder / "encrypted.7z.001"
+            archive.write_bytes(b"archive volume 1")
+            (folder / "encrypted.7z.002").write_bytes(b"archive volume 2")
+
+            bin_root = root / "bin"
+            bin_root.mkdir()
+            command_record = root / "7z-arguments.json"
+            executable = bin_root / "7z"
+            executable.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "archive = next(arg for arg in args if arg.endswith('.7z.001'))\n"
+                "output = Path(next(arg[2:] for arg in args if arg.startswith('-o')))\n"
+                "output.mkdir(parents=True, exist_ok=True)\n"
+                "(output / 'payload.bin').write_bytes(b'extracted')\n"
+                "Path(os.environ['UTILITY_TEST_7Z_ARGS']).write_text(json.dumps(args))\n"
+                "print('- payload.bin')\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=root,
+            )
+
+            with patch.dict(
+                os.environ,
+                {
+                    "PATH": f"{bin_root}{os.pathsep}/usr/bin{os.pathsep}/bin",
+                    "UTILITY_TEST_7Z_ARGS": str(command_record),
+                },
+            ):
+                result = runner.run(
+                    "extract", [str(folder)], password="split-secret-password"
+                )
+
+            self.assertEqual(result.outcome, "succeeded", result.archive_results)
+            self.assertEqual(result.archive_results[0]["name"], archive.name)
+            args = json.loads(command_record.read_text(encoding="utf-8"))
+            self.assertIn("-psplit-secret-password", args)
+            self.assertFalse(archive.exists())
+            self.assertFalse((folder / "encrypted.7z.002").exists())
+
     def _fake_7z_rar_with_exclusions(self, root: Path) -> tuple[Path, dict[str, str]]:
         bin_root = root / "bin"
         bin_root.mkdir(parents=True)

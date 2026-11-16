@@ -13,63 +13,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+APP_ROOT = Path(__file__).resolve().parents[2]
+if str(APP_ROOT) not in sys.path:
+    sys.path.insert(0, str(APP_ROOT))
 
-# Archive and container suffixes supported by the worker's 7z runtime. Compound
-# suffixes come first so ``bundle.tar.gz`` gets the output name ``bundle``.
-_ARCHIVE_SUFFIXES = (
-    ".tar.bzip2", ".tar.bz2", ".tar.gzip", ".tar.gz", ".tar.lzma",
-    ".tar.zstd", ".tar.zst", ".tar.xz", ".tar.z", ".tar",
-    ".7z", ".zipx", ".zip", ".rar", ".arj", ".cab", ".chm",
-    ".chi", ".chq", ".chw", ".cpio", ".cramfs", ".dmg", ".iso",
-    ".lha", ".lzh", ".nsis", ".rpm", ".squashfs", ".udf", ".xar",
-    ".pkg", ".xip", ".wim", ".swm", ".esd", ".ppkg", ".qcow2c",
-    ".qcow2", ".qcow", ".vdi", ".avhdx", ".vhdx", ".vhd", ".vmdk",
-    ".deb", ".udeb", ".ova", ".tgz", ".tpz", ".tbz2", ".tbz",
-    ".txz", ".tzst", ".taz", ".gzip", ".bzip2", ".lzma86", ".lzma",
-    ".bz2", ".zstd", ".zst", ".xz", ".gz", ".z", ".ar", ".lib",
-    ".jar", ".xpi", ".odt", ".ods", ".docx", ".xlsx", ".pptx",
-    ".epub", ".ipa", ".appx", ".msi", ".msp", ".msm", ".apk",
-    ".doc", ".xls", ".ppt", ".aaf", ".apfs", ".b64", ".obj",
-    ".elf", ".ext", ".ext2", ".ext3", ".ext4", ".fat", ".flv",
-    ".gpt", ".hfs", ".hfsx", ".hxs", ".hxi", ".hxr", ".hxq",
-    ".hxw", ".lit", ".img", ".lpimg", ".mbr", ".macho", ".mslz",
-    ".mub", ".ntfs", ".exe", ".dll", ".sys", ".pmd", ".swf",
-    ".simg", ".te", ".scap", ".uefif", ".ihex",
+from tme3bot.archive_formats import (
+    archive_suffix,
+    is_main_archive_path,
+    tar_stream_type,
 )
+
 _PASSWORD_ARCHIVE_SUFFIXES = (".7z", ".zip", ".zipx", ".rar", ".arj")
-_TAR_STREAM_SUFFIXES = {
-    ".tar.gz": "GZip",
-    ".tar.gzip": "GZip",
-    ".tgz": "GZip",
-    ".tpz": "GZip",
-    ".tar.lzma": "Lzma",
-    ".tar.bz2": "BZip2",
-    ".tar.bzip2": "BZip2",
-    ".tbz": "BZip2",
-    ".tbz2": "BZip2",
-    ".tar.xz": "Xz",
-    ".txz": "Xz",
-    ".tar.zst": "Zstd",
-    ".tar.zstd": "Zstd",
-    ".tzst": "Zstd",
-    ".tar.z": "Z",
-    ".taz": "Z",
-}
-
-
-def archive_suffix(filename: str) -> str | None:
-    lower = filename.lower()
-    return next((suffix for suffix in _ARCHIVE_SUFFIXES if lower.endswith(suffix)), None)
-
-
-def _tar_stream_type(filename: str) -> str | None:
-    lower = filename.lower()
-    suffix = next(
-        (candidate for candidate in _TAR_STREAM_SUFFIXES if lower.endswith(candidate)),
-        None,
-    )
-    return _TAR_STREAM_SUFFIXES.get(suffix) if suffix else None
-
 
 def emit_progress(**values: Any) -> None:
     print("TME3_PROGRESS " + json.dumps(values, ensure_ascii=True), flush=True)
@@ -107,21 +61,6 @@ def get_multipart_group(filepath: Path) -> list[Path]:
     return [filepath]
 
 
-def is_main_part(filename: str) -> bool:
-    lower = filename.lower()
-    if re.match(r".+\.part\d+\.rar$", lower):
-        return bool(re.match(r".+\.part0*1\.rar$", lower))
-    return lower.endswith(".7z.001") or archive_suffix(filename) is not None
-
-
-def is_main_archive(filepath: Path) -> bool:
-    lower = filepath.name.lower()
-    if lower.endswith(".001") and not lower.endswith(".7z.001"):
-        next_volume = filepath.with_name(f"{filepath.name[:-4]}.002")
-        return next_volume.is_file() and not next_volume.is_symlink()
-    return is_main_part(filepath.name)
-
-
 def get_extract_folder_name(filename: str) -> str:
     for pattern in (
         r"(.+)\.part\d+\.rar$",
@@ -138,7 +77,8 @@ def get_extract_folder_name(filename: str) -> str:
 
 def archive_password_candidates(filepath: Path, supplied_password: str | None) -> list[str]:
     """Return the first-pass candidates without logging or exposing their values."""
-    if not filepath.name.lower().endswith(_PASSWORD_ARCHIVE_SUFFIXES):
+    lower = filepath.name.lower()
+    if not lower.endswith(_PASSWORD_ARCHIVE_SUFFIXES) and not lower.endswith(".7z.001"):
         return []
     primary = supplied_password if supplied_password else filepath.parent.name
     candidates: list[str] = []
@@ -178,7 +118,7 @@ def _command_for(
     *,
     skip_existing: bool = False,
 ) -> tuple[list[str], ...]:
-    if _tar_stream_type(filepath.name):
+    if tar_stream_type(filepath.name):
         # Stream compressed tar data directly into the extractor so no
         # intermediate .tar file or staging copy is written to disk.
         decompress = ["7z", "x", "-so", "-bso0", "-bsp0", str(filepath)]
@@ -743,7 +683,7 @@ def scan_directory(base_dir: Path, supplied_password: str | None) -> dict[str, A
         (
             path
             for path in base_dir.rglob("*")
-            if path.is_file() and not path.is_symlink() and is_main_archive(path)
+            if path.is_file() and not path.is_symlink() and is_main_archive_path(path)
         ),
         key=lambda path: str(path).casefold(),
     )
