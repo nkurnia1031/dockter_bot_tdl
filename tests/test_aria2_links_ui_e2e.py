@@ -187,6 +187,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                     f"browser errors: {page_errors}"
                 )
             expect(page.locator("#bunkr-panel img")).to_have_count(1)
+            page.get_by_role("button", name="Pilih semua").click()
             page.get_by_label("Pilih two.zip").uncheck()
             page.get_by_label("Rute unduh").select_option("tor")
             page.get_by_role("button", name="Masukkan pilihan ke Aria2").click()
