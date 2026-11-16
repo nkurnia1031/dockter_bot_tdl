@@ -536,6 +536,41 @@ class Aria2BunkrLinksTests(unittest.TestCase):
         self.assertEqual(task["retry_after_seconds"], 12)
         self.assertEqual(task["reason_code"], "BUNKR_URL_REFRESH_RETRYING")
 
+    def test_task_list_surfaces_bunkr_expiry_error_as_pending_refresh_without_raw_error(self):
+        result = self.links.enqueue({
+            "sources": ["https://bunkr.cr/f/single"],
+            "selections": {"0": ["single"]},
+            "directory": str(self.workspace), "route": "non",
+        })["items"][0]
+        gid = result["gid"]
+        self.rpc.status[gid].update({
+            "status": "error",
+            "errorCode": "24",
+            "errorMessage": "HTTP 403 Forbidden https://cdn.invalid/file?token=signed-secret",
+        })
+
+        task = self.links.tasks()["items"][0]
+
+        self.assertEqual(task["status"], "refreshing")
+        self.assertEqual(task["reason_code"], "BUNKR_URL_REFRESH_PENDING")
+        self.assertNotIn("signed-secret", repr(task))
+
+        direct = self.links.enqueue({
+            "sources": ["https://example.invalid/direct.zip"],
+            "selections": {"0": [""]},
+            "directory": str(self.workspace), "route": "non",
+        })["items"][0]
+        self.rpc.status[direct["gid"]].update({
+            "status": "error",
+            "errorCode": "29",
+            "errorMessage": "Disk I/O error",
+        })
+        direct_task = next(
+            item for item in self.links.tasks()["items"] if item["gid"] == direct["gid"]
+        )
+        self.assertEqual(direct_task["status"], "error")
+        self.assertNotIn("errorMessage", direct_task)
+
     def test_refresh_retry_survives_manager_restart_without_adding_another_gid(self):
         result = self.links.enqueue({
             "sources": ["https://bunkr.cr/f/single"],

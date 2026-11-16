@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { CircleAlert, Download, Link2, Pause, Play, RefreshCw } from '@lucide/svelte';
   import { api } from '$lib/api';
 
@@ -66,9 +66,9 @@
 
   function schedulePoll(name = worker) {
     stopPolling();
-    if (!active || name !== worker || !activeTasks()) return;
+    if (!untrack(() => active && name === worker && activeTasks())) return;
     pollTimer = setTimeout(async () => {
-      await loadTasks(name);
+      await untrack(() => loadTasks(name));
       schedulePoll(name);
     }, 2500);
   }
@@ -107,7 +107,7 @@
       stopPolling();
       return;
     }
-    void loadTasks(name);
+    untrack(() => { void loadTasks(name); });
     return stopPolling;
   });
 
@@ -238,6 +238,7 @@
 
   function statusLabel(task: LinkTask) {
     if (task.status === 'refreshing') {
+      if (task.refresh_attempts <= 0) return 'Memperbarui URL otomatis…';
       if (task.retry_after_seconds > 0) return `Memperbarui URL otomatis · percobaan ${task.refresh_attempts} · coba lagi dalam ${task.retry_after_seconds} dtk`;
       return `Memperbarui URL otomatis · percobaan ${task.refresh_attempts}`;
     }

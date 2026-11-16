@@ -872,30 +872,46 @@ class Aria2BunkrLinks:
         for row in self.store.tasks():
             gid = str(row.get("gid") or "")
             stored_status = str(row.get("status") or "")
+            kind = str(row.get("kind") or "")
             status: dict[str, Any] = {}
             if gid:
                 try:
                     value = self.rpc("tellStatus", gid, [
-                        "gid", "status", "completedLength", "totalLength", "downloadSpeed", "errorCode",
+                        "gid", "status", "completedLength", "totalLength", "downloadSpeed",
+                        "errorCode", "errorMessage",
                     ])
                     if isinstance(value, dict):
                         status = value
                 except Exception:
                     pass
+            refresh_pending = (
+                kind == "bunkr"
+                and str(status.get("status") or "") == "error"
+                and (
+                    bool(_HTTP_ERROR.search(str(status.get("errorMessage") or "")))
+                    or str(status.get("errorCode") or "").strip() == "24"
+                )
+            )
+            reported_status = (
+                stored_status
+                if stored_status in {"held", "refreshing"}
+                else "refreshing" if refresh_pending
+                else str(status.get("status") or row["status"])
+            )
             result.append({
                 "gid": gid,
-                "kind": str(row.get("kind") or ""),
+                "kind": kind,
                 "file_name": row["file_name"],
-                "status": (
-                    stored_status
-                    if stored_status in {"held", "refreshing"}
-                    else str(status.get("status") or row["status"])
-                ),
+                "status": reported_status,
                 "completed_bytes": _as_nonnegative_int(status.get("completedLength")),
                 "total_bytes": _as_nonnegative_int(status.get("totalLength")),
                 "speed_bytes_per_second": _as_nonnegative_int(status.get("downloadSpeed")),
                 "error_code": str(status.get("errorCode") or ""),
-                "reason_code": str(row.get("reason_code") or ""),
+                "reason_code": (
+                    "BUNKR_URL_REFRESH_PENDING"
+                    if refresh_pending and stored_status not in {"held", "refreshing"}
+                    else str(row.get("reason_code") or "")
+                ),
                 "refresh_attempts": _as_nonnegative_int(row.get("refresh_attempts")),
                 "retry_after_seconds": max(
                     0,

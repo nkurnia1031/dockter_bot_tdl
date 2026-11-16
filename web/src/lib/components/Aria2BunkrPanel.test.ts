@@ -80,6 +80,21 @@ describe('Aria2 Bunkr panel', () => {
     expect(screen.queryByRole('button', { name: /Perbarui link sekarang|Retry manual/i })).toBeNull();
   });
 
+  it('shows a detected expired Bunkr URL as pending automatic refresh without a fake attempt count', async () => {
+    apiMock.mockImplementation(async (path: string) => {
+      if (path.endsWith('/aria2/links/tasks')) return { items: [{
+        gid: '3333333333333333', kind: 'bunkr', file_name: 'episode-01.mp4', status: 'refreshing',
+        completed_bytes: 0, total_bytes: 100, speed_bytes_per_second: 0, route: 'non',
+        refresh_attempts: 0, retry_after_seconds: 0, reason_code: 'BUNKR_URL_REFRESH_PENDING'
+      }] };
+      throw new Error(`Unexpected request ${path}`);
+    });
+    render(Aria2BunkrPanel, { worker: 'remote-1', directory: '/workspace/aria2', active: true });
+
+    await screen.findByText('Memperbarui URL otomatis…');
+    expect(screen.queryByText(/percobaan 0/)).toBeNull();
+  });
+
   it('invalidates album selection when the source links change after preview', async () => {
     render(Aria2BunkrPanel, { worker: 'remote-1', directory: '/workspace/aria2', active: true });
 
