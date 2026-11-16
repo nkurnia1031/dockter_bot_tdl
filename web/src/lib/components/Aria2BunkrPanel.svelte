@@ -4,7 +4,7 @@
   import { api } from '$lib/api';
 
   type Props = { worker: string; directory: string; active: boolean; route?: 'non' | 'tor' };
-  type PreviewFile = { item_id: string; file_name: string; thumbnail_url: string };
+  type PreviewFile = { item_id: string; source_url?: string; file_name: string; thumbnail_url: string };
   type PreviewItem = {
     source_index: number;
     kind: string;
@@ -31,11 +31,17 @@
   type TaskResult = { items: LinkTask[] };
   type EnqueueResult = { items: Array<{ status: string; file_name?: string; reason_code?: string }> };
 
+  const FILES_PER_PAGE = 6;
+
   let { worker, directory, active, route = $bindable('non') }: Props = $props();
   let sources = $state('');
   let preview = $state<Preview | null>(null);
   let previewSources = $state<string[]>([]);
   let selectedFiles = $state<Record<string, boolean>>({});
+  let pageBySource = $state<Record<number, number>>({});
+  let thumbnailAttempts = $state<Record<string, boolean>>({});
+  let thumbnailLoading = $state<Record<string, boolean>>({});
+  let previewGeneration = 0;
   let tasks = $state<LinkTask[]>([]);
   let checking = $state(false);
   let enqueueing = $state(false);
@@ -94,10 +100,14 @@
     const name = worker;
     const visible = active;
     if (lastWorker && lastWorker !== name) {
+      previewGeneration += 1;
       tasks = [];
       preview = null;
       previewSources = [];
       selectedFiles = {};
+      pageBySource = {};
+      thumbnailAttempts = {};
+      thumbnailLoading = {};
       message = '';
       error = '';
     }
@@ -118,11 +128,117 @@
 
   function handleSourcesInput(event: Event) {
     sources = (event.currentTarget as HTMLTextAreaElement).value;
+    if (checking) previewGeneration += 1;
     if (preview && JSON.stringify(collectSources()) !== JSON.stringify(previewSources)) {
+      previewGeneration += 1;
       preview = null;
       previewSources = [];
       selectedFiles = {};
+      pageBySource = {};
+      thumbnailAttempts = {};
+      thumbnailLoading = {};
       message = 'Link berubah; periksa ulang sebelum memasukkan file ke antrean.';
+    }
+  }
+
+  function currentPage(source: PreviewItem) {
+    const page = pageBySource[source.source_index] || 0;
+    return Math.min(page, Math.max(0, Math.ceil(source.files.length / FILES_PER_PAGE) - 1));
+  }
+
+  function pageCount(source: PreviewItem) {
+    return Math.max(1, Math.ceil(source.files.length / FILES_PER_PAGE));
+  }
+
+  function visibleFiles(source: PreviewItem) {
+    const start = currentPage(source) * FILES_PER_PAGE;
+    return (source.files || []).slice(start, start + FILES_PER_PAGE);
+  }
+
+  function allAlbumFilesSelected(current = preview) {
+    const albums = (current?.items || []).filter((source) => source.kind === 'album');
+    return albums.length > 0
+      && albums.every((source) => (source.files || []).every((file) =>
+        selectedFiles[fileKey(source.source_index, file.item_id)]
+      ));
+  }
+
+  function toggleSelectAll() {
+    if (!preview) return;
+    const select = !allAlbumFilesSelected(preview);
+    const next = { ...selectedFiles };
+    for (const source of preview.items || []) {
+      if (source.kind !== 'album') continue;
+      for (const file of source.files || []) next[fileKey(source.source_index, file.item_id)] = select;
+    }
+    selectedFiles = next;
+  }
+
+  function changePage(source: PreviewItem, page: number) {
+    pageBySource = { ...pageBySource, [source.source_index]: page };
+    void loadPageThumbnails(source);
+  }
+
+  async function loadPageThumbnails(source: PreviewItem) {
+    if (source.kind !== 'album' || !worker) return;
+    const missing = visibleFiles(source).filter((file) =>
+      Boolean(file.source_url)
+      && !file.thumbnail_url
+      && !thumbnailAttempts[fileKey(source.source_index, file.item_id)]
+    );
+    if (!missing.length) return;
+
+    const generation = previewGeneration;
+    const workerName = worker;
+    const keys = missing.map((file) => fileKey(source.source_index, file.item_id));
+    thumbnailAttempts = { ...thumbnailAttempts, ...Object.fromEntries(keys.map((key) => [key, true])) };
+    thumbnailLoading = { ...thumbnailLoading, ...Object.fromEntries(keys.map((key) => [key, true])) };
+    try {
+      const result = await api<Preview>(`${linksPath(workerName)}/preview`, {
+        method: 'POST',
+        body: JSON.stringify({ sources: missing.map((file) => file.source_url) })
+      });
+      if (generation !== previewGeneration || workerName !== worker || !preview) return;
+      const thumbnails = new Map<string, string>();
+      missing.forEach((file, index) => {
+        const thumbnail = result.items?.[index]?.files?.[0]?.thumbnail_url;
+        if (thumbnail) thumbnails.set(fileKey(source.source_index, file.item_id), thumbnail);
+      });
+      if (thumbnails.size) {
+        preview = {
+          ...preview,
+          items: preview.items.map((item) => item.source_index === source.source_index
+            ? {
+                ...item,
+                files: item.files.map((file) => {
+                  const thumbnail = thumbnails.get(fileKey(item.source_index, file.item_id));
+                  return thumbnail ? { ...file, thumbnail_url: thumbnail } : file;
+                })
+              }
+            : item)
+        };
+      }
+      const failedKeys = missing
+        .filter((file) => !thumbnails.has(fileKey(source.source_index, file.item_id)))
+        .map((file) => fileKey(source.source_index, file.item_id));
+      if (failedKeys.length) {
+        const next = { ...thumbnailAttempts };
+        for (const key of failedKeys) delete next[key];
+        thumbnailAttempts = next;
+      }
+    } catch {
+      // The album listing remains usable when a thumbnail page cannot be fetched.
+      if (generation === previewGeneration && workerName === worker) {
+        const next = { ...thumbnailAttempts };
+        for (const key of keys) delete next[key];
+        thumbnailAttempts = next;
+      }
+    } finally {
+      if (generation === previewGeneration && workerName === worker) {
+        const next = { ...thumbnailLoading };
+        for (const key of keys) delete next[key];
+        thumbnailLoading = next;
+      }
     }
   }
 
@@ -133,6 +249,7 @@
       return;
     }
     checking = true;
+    const generation = ++previewGeneration;
     error = '';
     message = '';
     preview = null;
@@ -142,19 +259,30 @@
       const result = await api<Preview>(`${linksPath()}/preview`, {
         method: 'POST', body: JSON.stringify({ sources: values })
       });
+      if (generation !== previewGeneration) return;
       previewSources = values;
       preview = result;
+      pageBySource = {};
+      thumbnailAttempts = {};
+      thumbnailLoading = {};
       const next: Record<string, boolean> = {};
       for (const source of result.items || []) {
         for (const file of source.files || []) {
-          next[fileKey(source.source_index, file.item_id)] = true;
+          next[fileKey(source.source_index, file.item_id)] = source.kind !== 'album';
         }
       }
       selectedFiles = next;
       const fileCount = Object.values(next).filter(Boolean).length;
-      message = fileCount ? `${fileCount} file dapat dipilih.` : 'Tidak ada file yang dapat dimasukkan ke antrean.';
+      const albumCount = (result.items || []).filter((source) => source.kind === 'album')
+        .reduce((count, source) => count + (source.files || []).length, 0);
+      for (const source of result.items || []) void loadPageThumbnails(source);
+      message = albumCount
+        ? `${albumCount} file album ditemukan. Pilih file atau gunakan Pilih semua.`
+        : fileCount ? `${fileCount} file dapat dipilih.` : 'Tidak ada file yang dapat dimasukkan ke antrean.';
     } catch (cause) {
-      error = cause instanceof Error ? cause.message : 'Preview link gagal dimuat.';
+      if (generation === previewGeneration) {
+        error = cause instanceof Error ? cause.message : 'Preview link gagal dimuat.';
+      }
     } finally {
       checking = false;
     }
@@ -314,35 +442,47 @@
         <div><p class="eyebrow">PREVIEW ALBUM</p><h2 id="bunkr-preview-title" class="mt-1 text-lg font-extrabold">Pilih file untuk antrean</h2></div>
         <div class="flex flex-wrap items-center gap-2">
           <span class="badge">{selectedCount()} dipilih</span>
+          {#if (preview.items || []).some((source) => source.kind === 'album' && source.files.length > 0)}
+            <button class="button secondary" type="button" onclick={toggleSelectAll} aria-pressed={allAlbumFilesSelected()}>
+              {allAlbumFilesSelected() ? 'Batalkan semua pilihan' : 'Pilih semua'}
+            </button>
+          {/if}
           <button class="button primary" type="button" onclick={enqueueSelected} disabled={enqueueing || selectedCount() === 0}>
             <Download size={15}/>{enqueueing ? 'Menambahkan…' : 'Masukkan pilihan ke Aria2'}
           </button>
         </div>
       </header>
-      <div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      <div class="space-y-4">
         {#each preview.items || [] as source (source.source_index)}
+          {@const page = currentPage(source)}
+          {@const totalPages = pageCount(source)}
+          {@const pageFiles = visibleFiles(source)}
           <article class="min-w-0 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-3">
             <h3 class="truncate font-bold" title={source.title || `Link ${source.source_index + 1}`}>{source.title || `Link ${source.source_index + 1}`}</h3>
             {#if source.error}
               <p class="mt-2 flex items-start gap-2 text-sm text-rose-600"><CircleAlert size={16} class="mt-0.5 shrink-0"/>{source.error}</p>
             {:else}
-              <div class="mt-3 grid gap-3">
-                {#each source.files || [] as file (file.item_id)}
+              <div class="mt-3 grid grid-cols-2 gap-3" aria-label={`Daftar file album ${source.title || source.source_index + 1}`}>
+                {#each pageFiles as file (file.item_id)}
+                  {@const key = fileKey(source.source_index, file.item_id)}
                   <label class="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--panel)]">
                     {#if file.thumbnail_url}
-                      <img class="h-48 w-full bg-[var(--surface)] object-cover" src={file.thumbnail_url} alt={file.file_name} loading="lazy" referrerpolicy="no-referrer" />
+                      <img class="h-40 w-full bg-[var(--surface)] object-cover sm:h-56" src={file.thumbnail_url} alt={file.file_name} loading="lazy" referrerpolicy="no-referrer" />
                     {:else}
-                      <div class="grid h-48 place-items-center bg-[var(--surface)]"><Download class="muted" size={28}/></div>
+                      <div class="grid h-40 place-items-center bg-[var(--surface)] sm:h-56">
+                        {#if thumbnailLoading[key]}<span class="muted px-2 text-center text-xs">Memuat thumbnail…</span>
+                        {:else}<Download class="muted" size={28}/>{/if}
+                      </div>
                     {/if}
                     <span class="flex min-h-12 items-start gap-3 p-3">
                       <input
                         type="checkbox"
                         class="mt-1"
                         aria-label={`Pilih ${file.file_name}`}
-                        checked={source.kind === 'direct' || Boolean(selectedFiles[fileKey(source.source_index, file.item_id)])}
+                        checked={source.kind === 'direct' || Boolean(selectedFiles[key])}
                         disabled={source.kind === 'direct'}
                         onchange={(event) => {
-                          selectedFiles = { ...selectedFiles, [fileKey(source.source_index, file.item_id)]: (event.currentTarget as HTMLInputElement).checked };
+                          selectedFiles = { ...selectedFiles, [key]: (event.currentTarget as HTMLInputElement).checked };
                         }}
                       />
                       <span class="min-w-0 break-all text-sm font-semibold">{file.file_name}</span>
@@ -350,6 +490,18 @@
                   </label>
                 {/each}
               </div>
+              {#if source.kind === 'album' && totalPages > 1}
+                <footer class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] pt-3">
+                  <span class="muted text-xs" aria-live="polite">
+                    Menampilkan {page * FILES_PER_PAGE + 1}–{Math.min((page + 1) * FILES_PER_PAGE, source.files.length)} dari {source.files.length} file
+                  </span>
+                  <div class="flex items-center gap-2">
+                    <button class="button secondary !px-3 !py-1.5" type="button" aria-label={`Halaman sebelumnya ${source.title}`} disabled={page === 0} onclick={() => changePage(source, page - 1)}>Sebelumnya</button>
+                    <span class="muted min-w-24 text-center text-xs">Halaman {page + 1} dari {totalPages}</span>
+                    <button class="button secondary !px-3 !py-1.5" type="button" aria-label={`Halaman berikutnya ${source.title}`} disabled={page + 1 >= totalPages} onclick={() => changePage(source, page + 1)}>Berikutnya</button>
+                  </div>
+                </footer>
+              {/if}
             {/if}
           </article>
         {/each}

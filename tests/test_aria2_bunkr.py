@@ -649,6 +649,65 @@ class Aria2BunkrLinksTests(unittest.TestCase):
 
 
 class BunkrResolverTests(unittest.TestCase):
+    def test_album_preview_uses_card_filename_and_does_not_return_generic_icon_as_thumbnail(self):
+        def handler(request):
+            if request.url.path == "/a/m1nKS0iN":
+                return httpx.Response(
+                    200,
+                    text=(
+                        '<html><body><h1>uflash</h1>'
+                        '<div class="relative group/item theItem" title="up0lfwutfu~0BLbAqY1Gm.mp4">'
+                        '<a href="/f/QI9OXVHxU4ORt"></a>'
+                        '<img src="/images/video.svg" alt="Video icon"></div>'
+                        '</body></html>'
+                    ),
+                )
+            self.fail(f"unexpected request URL: {request.url}")
+
+        resolver = BunkrResolver(
+            client_factory=lambda **kwargs: httpx.Client(
+                transport=httpx.MockTransport(handler), **kwargs
+            )
+        )
+
+        preview = resolver.preview("https://bunkr.cr/a/m1nKS0iN")
+
+        self.assertEqual(preview["files"][0]["file_name"], "up0lfwutfu~0BLbAqY1Gm.mp4")
+        self.assertEqual(preview["files"][0]["thumbnail_url"], "")
+
+    def test_preview_prefers_the_file_thumbnail_over_the_video_icon(self):
+        thumbnail = (
+            "https://static.scdn.st/1d5a9f3c-8b7e-4c46-b2a6-4e0d7c9f1a3b/"
+            "thumbs/up0lfwutfu-0BLbAqY1Gm-Ss6hSlbV.png"
+        )
+
+        def handler(request):
+            if request.url.host == "bunkr.cr":
+                self.assertEqual(str(request.url), "https://bunkr.cr/f/QI9OXVHxU4ORt")
+                return httpx.Response(
+                    200,
+                    text=(
+                        '<html><head><meta property="og:image" content="' + thumbnail + '"></head>'
+                        '<body><h1>up0lfwutfu~0BLbAqY1Gm.mp4</h1>'
+                        '<img src="/images/video.svg" alt="video">'
+                        '<script>var jsCDN = "https:\\/\\/cdn.bunkr.cr\\/storage\\/video.mp4";</script>'
+                        '</body></html>'
+                    ),
+                )
+            if request.url.host == "glb-apisign.cdn.cr":
+                return httpx.Response(200, json={"token": "signed-test", "ex": "123"})
+            self.fail(f"unexpected request host: {request.url.host}")
+
+        resolver = BunkrResolver(
+            client_factory=lambda **kwargs: httpx.Client(
+                transport=httpx.MockTransport(handler), **kwargs
+            )
+        )
+
+        preview = resolver.preview("https://bunkr.cr/f/QI9OXVHxU4ORt")
+
+        self.assertEqual(preview["files"][0]["thumbnail_url"], thumbnail)
+
     def test_probe_does_not_expose_signed_url_in_httpx_logs(self):
         def handler(request):
             self.assertEqual(request.url.params.get("token"), "signed-secret")
@@ -720,7 +779,9 @@ class BunkrResolverTests(unittest.TestCase):
             resolved.direct_url,
             "https://cdn.bunkr.cr/storage/archive.zip?token=signed-secret&ex=123",
         )
-        self.assertEqual([request.method for request in requests], ["GET", "GET", "GET", "GET"])
+        self.assertEqual([request.url.host for request in requests], [
+            "bunkr.cr", "bunkr.cr", "glb-apisign.cdn.cr",
+        ])
 
     def test_fallback_download_api_uses_gzip_and_deflate_before_signing(self):
         requests = []

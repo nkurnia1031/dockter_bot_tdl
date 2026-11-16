@@ -143,7 +143,7 @@ class BunkrResolver:
                 "title": album_name,
                 "files": [self._public_file(item) for item in files],
             }
-        item = self._file_page(clean, item_id)
+        item = self._file_page(clean, item_id, sign=False)
         return {"kind": "file", "title": item.file_name, "files": [self._public_file(item)]}
 
     def resolve_file(self, source: object, item_id: str | None = None) -> BunkrFile:
@@ -259,7 +259,11 @@ class BunkrResolver:
                             thumbnail = urljoin(normalized, thumbnail)
                         if not thumbnail.startswith("https://"):
                             thumbnail = ""
-                    label = anchor.get_text(" ", strip=True)
+                        thumbnail_path = urlsplit(thumbnail).path.lower()
+                        if thumbnail_path.startswith("/images/") and thumbnail_path.endswith(".svg"):
+                            thumbnail = ""
+                    label = str(card.get("title") or "").strip() if hasattr(card, "get") else ""
+                    label = label or anchor.get_text(" ", strip=True)
                     if not label and image:
                         label = str(image.get("alt") or "")
                     file_name = self._safe_name(label, item_id)
@@ -282,7 +286,7 @@ class BunkrResolver:
             value = heading.get_text(" ", strip=True)
         return cls._safe_name(value, fallback)
 
-    def _file_page(self, source: str, item_id: str) -> BunkrFile:
+    def _file_page(self, source: str, item_id: str, *, sign: bool = True) -> BunkrFile:
         with self._client() as client:
             final_url, soup = self._get_page(client, source)
             heading = soup.find("h1")
@@ -294,6 +298,8 @@ class BunkrResolver:
             thumbnail = str(thumbnail_tag.get("content") or "") if thumbnail_tag else ""
             if thumbnail and not thumbnail.startswith("https://"):
                 thumbnail = urljoin(final_url, thumbnail)
+            if not sign:
+                return BunkrFile(item_id, self.normalize_source(final_url), file_name, thumbnail)
             page_vars: dict[str, str] = {}
             file_identifier = ""
             for script in soup.find_all("script"):

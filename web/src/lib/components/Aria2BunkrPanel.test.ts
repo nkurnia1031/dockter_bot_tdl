@@ -42,11 +42,12 @@ describe('Aria2 Bunkr panel', () => {
     await screen.findByText('episode-01.mp4');
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
     const thumbnail = screen.getByAltText('episode-01.mp4') as HTMLImageElement;
-    expect(thumbnail.className).toContain('h-48');
+    expect(thumbnail.className).toContain('h-40');
     expect(thumbnail.className).toContain('w-full');
 
     await fireEvent.click(screen.getByLabelText('Rute unduh'));
     await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'tor' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Pilih semua' }));
     await fireEvent.click(screen.getByRole('checkbox', { name: /episode-02\.mp4/ }));
     await fireEvent.click(screen.getByRole('button', { name: 'Masukkan pilihan ke Aria2' }));
 
@@ -61,6 +62,138 @@ describe('Aria2 Bunkr panel', () => {
       directory: '/workspace/aria2',
       route: 'tor'
     });
+  });
+
+  it('loads thumbnails for visible album items, shows six files in two columns, and selects all pages', async () => {
+    const albumUrl = 'https://bunkr.cr/a/iWOMARht';
+    const files = Array.from({ length: 8 }, (_, index) => ({
+      item_id: `file-${index + 1}`,
+      source_url: `https://bunkr.cr/f/file-${index + 1}`,
+      file_name: `episode-${String(index + 1).padStart(2, '0')}.mp4`,
+      thumbnail_url: ''
+    }));
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.endsWith('/aria2/links/tasks')) return { items: [] };
+      if (path.endsWith('/aria2/links/preview')) {
+        const sources = JSON.parse(String(init?.body)).sources as string[];
+        if (sources.length === 1 && sources[0] === albumUrl) {
+          return { items: [{ source_index: 0, kind: 'album', title: 'uflash', error: '', files }] };
+        }
+        return { items: sources.map((source, source_index) => {
+          const file = files.find((item) => item.source_url === source)!;
+          return {
+            source_index,
+            kind: 'file',
+            title: file.file_name,
+            error: '',
+            files: [{ ...file, thumbnail_url: `https://img.test/${file.item_id}.jpg` }]
+          };
+        }) };
+      }
+      if (path.endsWith('/aria2/links/enqueue')) return { items: [] };
+      throw new Error(`Unexpected request ${path}`);
+    });
+    render(Aria2BunkrPanel, { worker: 'remote-1', directory: '/workspace/aria2', active: true });
+
+    await fireEvent.input(screen.getByLabelText('Link Bunkr atau URL langsung'), {
+      target: { value: albumUrl }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Periksa link' }));
+
+    await screen.findByAltText('episode-06.mp4');
+    expect(screen.queryByAltText('episode-07.mp4')).toBeNull();
+    expect(screen.getAllByRole('checkbox')).toHaveLength(6);
+    expect(screen.getByLabelText('Daftar file album uflash').className).toContain('grid-cols-2');
+    expect(screen.getByText('Menampilkan 1–6 dari 8 file')).toBeTruthy();
+
+    const previewCalls = () => apiMock.mock.calls.filter(([path]) => String(path).endsWith('/aria2/links/preview'));
+    expect(JSON.parse(String(previewCalls()[1][1]?.body)).sources).toEqual(files.slice(0, 6).map((file) => file.source_url));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Halaman berikutnya uflash' }));
+    await screen.findByAltText('episode-08.mp4');
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2);
+    expect(screen.getByText('Menampilkan 7–8 dari 8 file')).toBeTruthy();
+    expect(JSON.parse(String(previewCalls()[2][1]?.body)).sources).toEqual(files.slice(6).map((file) => file.source_url));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Pilih semua' }));
+    expect(screen.getByText('8 dipilih')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Batalkan semua pilihan' })).toBeTruthy();
+  });
+
+  it('retries a failed thumbnail request when its page is visited again', async () => {
+    const albumUrl = 'https://bunkr.cr/a/iWOMARht';
+    const files = Array.from({ length: 7 }, (_, index) => ({
+      item_id: `file-${index + 1}`,
+      source_url: `https://bunkr.cr/f/file-${index + 1}`,
+      file_name: `episode-${String(index + 1).padStart(2, '0')}.mp4`,
+      thumbnail_url: ''
+    }));
+    let firstPageAttempts = 0;
+    apiMock.mockImplementation(async (path: string, init?: RequestInit) => {
+      if (path.endsWith('/aria2/links/tasks')) return { items: [] };
+      if (path.endsWith('/aria2/links/preview')) {
+        const sources = JSON.parse(String(init?.body)).sources as string[];
+        if (sources.length === 1 && sources[0] === albumUrl) {
+          return { items: [{ source_index: 0, kind: 'album', title: 'uflash', error: '', files }] };
+        }
+        if (sources.includes(files[0].source_url) && firstPageAttempts++ === 0) {
+          throw new Error('temporary thumbnail failure');
+        }
+        return { items: sources.map((source, source_index) => {
+          const file = files.find((item) => item.source_url === source)!;
+          return {
+            source_index,
+            kind: 'file',
+            title: file.file_name,
+            error: '',
+            files: [{ ...file, thumbnail_url: `https://img.test/${file.item_id}.jpg` }]
+          };
+        }) };
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    render(Aria2BunkrPanel, { worker: 'remote-1', directory: '/workspace/aria2', active: true });
+
+    await fireEvent.input(screen.getByLabelText('Link Bunkr atau URL langsung'), {
+      target: { value: albumUrl }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Periksa link' }));
+    await screen.findByText('episode-01.mp4');
+    await waitFor(() => expect(screen.queryByText('Memuat thumbnail…')).toBeNull());
+    expect(screen.queryByAltText('episode-01.mp4')).toBeNull();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Halaman berikutnya uflash' }));
+    await screen.findByAltText('episode-07.mp4');
+    await fireEvent.click(screen.getByRole('button', { name: 'Halaman sebelumnya uflash' }));
+
+    await screen.findByAltText('episode-01.mp4');
+    const thumbnailRequests = apiMock.mock.calls.filter(([path]) => String(path).endsWith('/aria2/links/preview'));
+    expect(thumbnailRequests).toHaveLength(4);
+    expect(JSON.parse(String(thumbnailRequests[3][1]?.body)).sources).toEqual(
+      files.slice(0, 6).map((file) => file.source_url)
+    );
+  });
+
+  it('does not show an error from a preview request after the source input changed', async () => {
+    let rejectPreview: ((reason: Error) => void) | undefined;
+    apiMock.mockImplementation((path: string) => {
+      if (path.endsWith('/aria2/links/tasks')) return Promise.resolve({ items: [] });
+      if (path.endsWith('/aria2/links/preview')) {
+        return new Promise((_, reject) => { rejectPreview = reject; });
+      }
+      throw new Error(`Unexpected request ${path}`);
+    });
+    render(Aria2BunkrPanel, { worker: 'remote-1', directory: '/workspace/aria2', active: true });
+
+    const input = screen.getByLabelText('Link Bunkr atau URL langsung');
+    await fireEvent.input(input, { target: { value: 'https://bunkr.cr/a/old-album' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Periksa link' }));
+    expect(rejectPreview).toBeDefined();
+    await fireEvent.input(input, { target: { value: 'https://bunkr.cr/a/new-album' } });
+    rejectPreview?.(new Error('obsolete preview failure'));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Periksa link' })).toBeTruthy());
+    expect(screen.queryByText('obsolete preview failure')).toBeNull();
   });
 
   it('shows automatic URL refresh retry state without manual refresh controls', async () => {
