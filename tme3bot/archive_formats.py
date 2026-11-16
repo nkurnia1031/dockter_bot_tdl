@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 
@@ -49,17 +50,19 @@ TAR_STREAM_TYPES = {
 }
 
 
-def archive_suffix(filename: str) -> str | None:
+def _matching_suffix(
+    filename: str, suffixes: Iterable[str]
+) -> str | None:
     lower = filename.lower()
-    return next((suffix for suffix in ARCHIVE_SUFFIXES if lower.endswith(suffix)), None)
+    return next((suffix for suffix in suffixes if lower.endswith(suffix)), None)
+
+
+def archive_suffix(filename: str) -> str | None:
+    return _matching_suffix(filename, ARCHIVE_SUFFIXES)
 
 
 def tar_stream_type(filename: str) -> str | None:
-    lower = filename.lower()
-    suffix = next(
-        (candidate for candidate in TAR_STREAM_TYPES if lower.endswith(candidate)),
-        None,
-    )
+    suffix = _matching_suffix(filename, TAR_STREAM_TYPES)
     return TAR_STREAM_TYPES.get(suffix) if suffix else None
 
 
