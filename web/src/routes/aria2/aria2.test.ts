@@ -20,6 +20,7 @@ describe('AriaNg worker readiness', () => {
         path: '/workspace',
         items: [{ name: 'aria2', path: '/workspace/aria2', kind: 'directory', directories: 0, files: 0 }]
       };
+      if (path.endsWith('/aria2/links/tasks')) return { items: [] };
       if (path.startsWith('/aria2-rpc-') && init?.method === 'POST') {
         const request = JSON.parse(String(init.body));
         if (request.method === 'aria2.getGlobalOption') return { result: {
@@ -57,6 +58,18 @@ describe('AriaNg worker readiness', () => {
     expect(iframeConfig.get('interface')).toBe('api/v1/aria2-rpc-remote-1');
     expect(frame.getAttribute('src')).not.toContain('secret');
     expect(apiMock).toHaveBeenCalledWith('/workers/remote-1/aria2/health');
+  });
+
+  it('opens a standalone Bunkr panel outside the AriaNg iframe', async () => {
+    render(Aria2Page);
+    await screen.findByTitle('aria2 remote-1');
+
+    const bunkrTab = await screen.findByRole('tab', { name: 'Bunkr' });
+    await fireEvent.click(bunkrTab);
+
+    expect(screen.getByRole('tabpanel', { name: 'Bunkr' })).toBeTruthy();
+    expect(screen.getByLabelText('Link Bunkr atau URL langsung')).toBeTruthy();
+    expect(screen.getByTitle('aria2 remote-1').closest('[role="tabpanel"]')?.hasAttribute('hidden')).toBe(true);
   });
 
   it('loads and saves only safe transfer settings through the authenticated bridge', async () => {

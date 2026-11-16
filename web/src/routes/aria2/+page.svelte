@@ -4,6 +4,7 @@
   import { fade, fly } from 'svelte/transition';
   import { api } from '$lib/api';
   import WorkspaceExplorer from '$lib/components/WorkspaceExplorer.svelte';
+  import Aria2BunkrPanel from '$lib/components/Aria2BunkrPanel.svelte';
 
   type Worker = { name: string; enabled: boolean };
   type Health = {
@@ -61,6 +62,7 @@
 
   let workers: Worker[] = $state([]);
   let selectedWorker = $state('');
+  let activeTab = $state<'ariang' | 'bunkr'>('ariang');
   let ariaNgZoom = $state(100);
   let selectedFolders = $state<string[]>([]);
   let health = $state<Health | null>(null);
@@ -402,21 +404,30 @@
     </div>
 
     {#if health?.ready}
-      <div class="card min-w-0 overflow-auto p-0">
-        {#if iframeSrc}
-          <div class="flex items-center justify-end gap-1 border-b border-[var(--line)] bg-[var(--panel)] px-3 py-2" role="group" aria-label="Zoom AriaNg">
-            <span class="muted mr-2 text-xs">Zoom</span>
-            <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(-10)} disabled={ariaNgZoom <= 80} aria-label="Perkecil tampilan AriaNg" title="Perkecil tampilan">−</button>
-            <output class="min-w-12 text-center text-sm font-semibold tabular-nums" aria-live="polite">{ariaNgZoom}%</output>
-            <button class="button secondary !px-2 !py-1" onclick={resetZoom} aria-label="Reset zoom AriaNg" title="Reset zoom">Reset</button>
-            <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(10)} disabled={ariaNgZoom >= 150} aria-label="Perbesar tampilan AriaNg" title="Perbesar tampilan">+</button>
-          </div>
-          <iframe class="h-[calc(100vh-18rem)] min-h-[460px] w-full border-0 bg-white sm:min-h-[500px]" style={`zoom: ${ariaNgZoom / 100};`} src={iframeSrc} title={`aria2 ${selectedWorker}`} referrerpolicy="no-referrer"></iframe>
-        {:else}
-          <div class="grid min-h-[480px] place-items-center p-8 text-center">
-            <div><Activity class="mx-auto mb-3 text-violet-500" size={28}/><h2 class="font-extrabold">Aria2 belum siap</h2><p class="muted mt-1 text-sm">Perbaiki status engine dan hook worker, lalu periksa layanan kembali.</p></div>
-          </div>
-        {/if}
+      <div class="card min-w-0 overflow-hidden p-0">
+        <div class="flex gap-1 border-b border-[var(--line)] bg-[var(--panel)] p-2" role="tablist" aria-label="Aria2 dan Bunkr">
+          <button id="aria2-tab" role="tab" aria-selected={activeTab === 'ariang'} aria-controls="aria2-panel" class={`rounded-lg px-4 py-2 text-sm font-bold ${activeTab === 'ariang' ? 'bg-[var(--brand-soft)] text-[var(--brand)]' : 'muted'}`} onclick={() => activeTab = 'ariang'}>AriaNg</button>
+          <button id="bunkr-tab" role="tab" aria-selected={activeTab === 'bunkr'} aria-controls="bunkr-panel" class={`rounded-lg px-4 py-2 text-sm font-bold ${activeTab === 'bunkr' ? 'bg-[var(--brand-soft)] text-[var(--brand)]' : 'muted'}`} onclick={() => activeTab = 'bunkr'}>Bunkr</button>
+        </div>
+        <div id="aria2-panel" role="tabpanel" aria-labelledby="aria2-tab" hidden={activeTab !== 'ariang'}>
+          {#if iframeSrc}
+            <div class="flex items-center justify-end gap-1 border-b border-[var(--line)] bg-[var(--panel)] px-3 py-2" role="group" aria-label="Zoom AriaNg">
+              <span class="muted mr-2 text-xs">Zoom</span>
+              <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(-10)} disabled={ariaNgZoom <= 80} aria-label="Perkecil tampilan AriaNg" title="Perkecil tampilan">−</button>
+              <output class="min-w-12 text-center text-sm font-semibold tabular-nums" aria-live="polite">{ariaNgZoom}%</output>
+              <button class="button secondary !px-2 !py-1" onclick={resetZoom} aria-label="Reset zoom AriaNg" title="Reset zoom">Reset</button>
+              <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(10)} disabled={ariaNgZoom >= 150} aria-label="Perbesar tampilan AriaNg" title="Perbesar tampilan">+</button>
+            </div>
+            <iframe class="h-[calc(100vh-18rem)] min-h-[460px] w-full border-0 bg-white sm:min-h-[500px]" style={`zoom: ${ariaNgZoom / 100};`} src={iframeSrc} title={`aria2 ${selectedWorker}`} referrerpolicy="no-referrer"></iframe>
+          {:else}
+            <div class="grid min-h-[480px] place-items-center p-8 text-center">
+              <div><Activity class="mx-auto mb-3 text-violet-500" size={28}/><h2 class="font-extrabold">Aria2 belum siap</h2><p class="muted mt-1 text-sm">Perbaiki status engine dan hook worker, lalu periksa layanan kembali.</p></div>
+            </div>
+          {/if}
+        </div>
+        <div id="bunkr-panel" role="tabpanel" aria-labelledby="bunkr-tab" aria-label="Bunkr" hidden={activeTab !== 'bunkr'}>
+          <Aria2BunkrPanel worker={selectedWorker} directory={selectedFolder()} active={activeTab === 'bunkr'} />
+        </div>
       </div>
     {:else if !health && !inspecting}
       <div class="card grid min-h-[480px] place-items-center p-6 text-center"><p class="muted">Periksa layanan worker untuk membuka AriaNg.</p></div>

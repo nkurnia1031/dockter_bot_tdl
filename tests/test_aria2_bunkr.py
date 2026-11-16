@@ -513,6 +513,29 @@ class Aria2BunkrLinksTests(unittest.TestCase):
         self.assertGreater(row["retry_at"], 1000.0)
         self.assertNotIn("token=secret", repr(row))
 
+    def test_task_list_exposes_persisted_refresh_retry_status(self):
+        result = self.links.enqueue({
+            "sources": ["https://bunkr.cr/f/single"],
+            "selections": {"0": ["single"]},
+            "directory": str(self.workspace), "route": "non",
+        })["items"][0]
+        gid = result["gid"]
+        self.links.store.update(
+            gid,
+            status="refreshing",
+            reason_code="BUNKR_URL_REFRESH_RETRYING",
+            refresh_attempts=2,
+            retry_at=1012.0,
+        )
+
+        task = self.links.tasks()["items"][0]
+
+        self.assertEqual(task["status"], "refreshing")
+        self.assertEqual(task["kind"], "bunkr")
+        self.assertEqual(task["refresh_attempts"], 2)
+        self.assertEqual(task["retry_after_seconds"], 12)
+        self.assertEqual(task["reason_code"], "BUNKR_URL_REFRESH_RETRYING")
+
     def test_refresh_retry_survives_manager_restart_without_adding_another_gid(self):
         result = self.links.enqueue({
             "sources": ["https://bunkr.cr/f/single"],

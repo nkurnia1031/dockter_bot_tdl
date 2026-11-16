@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -867,8 +868,10 @@ class Aria2BunkrLinks:
 
     def tasks(self) -> dict[str, Any]:
         result: list[dict[str, Any]] = []
+        now = self.clock()
         for row in self.store.tasks():
             gid = str(row.get("gid") or "")
+            stored_status = str(row.get("status") or "")
             status: dict[str, Any] = {}
             if gid:
                 try:
@@ -881,10 +884,11 @@ class Aria2BunkrLinks:
                     pass
             result.append({
                 "gid": gid,
+                "kind": str(row.get("kind") or ""),
                 "file_name": row["file_name"],
                 "status": (
-                    "held"
-                    if row.get("status") == "held"
+                    stored_status
+                    if stored_status in {"held", "refreshing"}
                     else str(status.get("status") or row["status"])
                 ),
                 "completed_bytes": _as_nonnegative_int(status.get("completedLength")),
@@ -892,6 +896,11 @@ class Aria2BunkrLinks:
                 "speed_bytes_per_second": _as_nonnegative_int(status.get("downloadSpeed")),
                 "error_code": str(status.get("errorCode") or ""),
                 "reason_code": str(row.get("reason_code") or ""),
+                "refresh_attempts": _as_nonnegative_int(row.get("refresh_attempts")),
+                "retry_after_seconds": max(
+                    0,
+                    math.ceil(float(row.get("retry_at") or 0) - now),
+                ) if stored_status == "refreshing" else 0,
                 "route": str(row["route"]),
                 "route_change_allowed": str(status.get("status") or "") == "paused",
             })

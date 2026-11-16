@@ -3054,10 +3054,8 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("X-CSRF-Token", setup.text)
         self.assertIn("allow-overwrite", setup.text)
         self.assertIn("/workspace/aria2", setup.text)
-        self.assertIn('form[name="newTaskForm"]', setup.text)
-        self.assertIn("selections[String(source.source_index)] = [];", setup.text)
-        self.assertIn("RESOLUTION_OR_ENQUEUE_FAILED", setup.text)
-        self.assertIn("task.status === 'paused' || task.status === 'held'", setup.text)
+        self.assertNotIn('form[name="newTaskForm"]', setup.text)
+        self.assertNotIn("data-tme3-links-panel", setup.text)
         self.assertNotIn("token:", setup.text)
 
     def test_aria2_links_proxy_is_authenticated_worker_scoped_and_returns_no_signed_urls(self):
