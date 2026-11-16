@@ -60,16 +60,45 @@ describe('AriaNg worker readiness', () => {
     expect(apiMock).toHaveBeenCalledWith('/workers/remote-1/aria2/health');
   });
 
+  it('selects and remembers the Tor route for native AriaNg downloads per worker', async () => {
+    window.localStorage.setItem('tme3-aria2-route:remote-1', 'tor');
+    render(Aria2Page);
+    await screen.findByTitle('aria2 remote-1');
+
+    const route = await screen.findByRole('combobox', { name: 'Rute unduhan' });
+    expect((route as HTMLSelectElement).value).toBe('tor');
+    expect(screen.getByText(/resume task dijeda/)).toBeTruthy();
+
+    const workerPicker = screen.getByRole('combobox', { name: 'Worker' });
+    await fireEvent.change(workerPicker, { target: { value: 'remote-2' } });
+    await screen.findByTitle('aria2 remote-2');
+    expect((screen.getByRole('combobox', { name: 'Rute unduhan' }) as HTMLSelectElement).value).toBe('non');
+
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Rute unduhan' }), { target: { value: 'tor' } });
+    expect(window.localStorage.getItem('tme3-aria2-route:remote-2')).toBe('tor');
+    await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
+    await screen.findByTitle('aria2 remote-1');
+    expect((screen.getByRole('combobox', { name: 'Rute unduhan' }) as HTMLSelectElement).value).toBe('tor');
+  });
+
   it('opens a standalone Bunkr panel outside the AriaNg iframe', async () => {
     render(Aria2Page);
     await screen.findByTitle('aria2 remote-1');
+
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Rute unduhan' }), { target: { value: 'tor' } });
 
     const bunkrTab = await screen.findByRole('tab', { name: 'Bunkr' });
     await fireEvent.click(bunkrTab);
 
     expect(screen.getByRole('tabpanel', { name: 'Bunkr' })).toBeTruthy();
     expect(screen.getByLabelText('Link Bunkr atau URL langsung')).toBeTruthy();
+    expect((screen.getByLabelText('Rute unduh') as HTMLSelectElement).value).toBe('tor');
     expect(screen.getByTitle('aria2 remote-1').closest('[role="tabpanel"]')?.hasAttribute('hidden')).toBe(true);
+
+    await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'non' } });
+    await fireEvent.click(screen.getByRole('tab', { name: 'AriaNg' }));
+    expect((screen.getByRole('combobox', { name: 'Rute unduhan' }) as HTMLSelectElement).value).toBe('non');
+    expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBe('non');
   });
 
   it('loads and saves only safe transfer settings through the authenticated bridge', async () => {

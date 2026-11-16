@@ -28,6 +28,18 @@ class _Aria2RpcHandler(BaseHTTPRequestHandler):
             method = request.get("method")
             if method in {"aria2.addUri", "aria2.addTorrent", "aria2.addMetalink"}:
                 result = "new-gid"
+            elif method == "aria2.tellStatus":
+                result = {"gid": request.get("params", [None, ""])[1], "status": "paused"}
+            elif method == "aria2.changeOption":
+                result = "OK"
+            elif method == "aria2.unpause":
+                result = "active"
+            elif method == "aria2.getOption":
+                result = {
+                    "all-proxy": "http://aria2:proxy-secret@tts-1:8118",
+                    "all-proxy-user": "aria2",
+                    "all-proxy-passwd": "proxy-secret",
+                }
             elif method == "aria2.getGlobalOption":
                 result = {
                     "max-concurrent-downloads": "3",
@@ -162,6 +174,97 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertEqual(options["lowest-speed-limit"], "0")
         self.assertEqual(options["max-tries"], "0")
         self.assertNotIn(self.server.rpc_secret, json.dumps(result))
+
+    def test_rpc_routes_plain_ariang_download_through_tor_without_exposing_proxy_secret(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        proxy_url = "http://aria2:proxy-secret@tts-1:8118"
+        self.runtime.bunkr_links.tor_ready = lambda: True
+        self.runtime.bunkr_links.tor_proxy_url = lambda: proxy_url
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "tor-add", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {}], "tme3_route": "tor",
+        }, requested_directory=str(self.destination))
+
+        self.assertEqual(result["result"], "new-gid")
+        added = self.server.calls[-1]
+        options = added["params"][2]
+        self.assertEqual(options["all-proxy"], proxy_url)
+        self.assertEqual(options["proxy-method"], "tunnel")
+        self.assertNotIn("proxy-secret", json.dumps(result))
+        self.assertNotIn(self.server.rpc_secret, json.dumps(result))
+
+        status = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "tor-options", "method": "aria2.getOption",
+            "params": ["new-gid"],
+        })
+        self.assertNotIn("proxy-secret", json.dumps(status))
+        self.assertNotIn("all-proxy", json.dumps(status))
+
+    def test_rpc_non_route_clears_proxy_for_new_ariang_download(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "direct-add", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {}], "tme3_route": "non",
+        }, requested_directory=str(self.destination))
+
+        self.assertEqual(result["result"], "new-gid")
+        options = self.server.calls[-1]["params"][2]
+        self.assertEqual(options["all-proxy"], "")
+        self.assertEqual(options["proxy-method"], "get")
+
+    def test_rpc_tor_route_fails_visibly_without_falling_back_when_tor_is_unavailable(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        self.runtime.bunkr_links.tor_ready = lambda: False
+        before = len(self.server.calls)
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "tor-unavailable", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {}], "tme3_route": "tor",
+        }, requested_directory=str(self.destination))
+
+        self.assertIn("error", result)
+        self.assertIn("ARIA2_TOR_UNAVAILABLE", result["error"]["message"])
+        self.assertEqual(len(self.server.calls), before)
+
+    def test_rpc_applies_selected_route_when_resuming_an_unmanaged_paused_task(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        proxy_url = "http://aria2:proxy-secret@tts-1:8118"
+        self.runtime.bunkr_links.tor_ready = lambda: True
+        self.runtime.bunkr_links.tor_proxy_url = lambda: proxy_url
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "resume-tor", "method": "aria2.unpause",
+            "params": ["1234567890abcdef"], "tme3_route": "tor",
+        })
+
+        self.assertEqual(result["result"], "active")
+        methods = [call["method"] for call in self.server.calls[-3:]]
+        self.assertEqual(methods, ["aria2.tellStatus", "aria2.changeOption", "aria2.unpause"])
+        self.assertEqual(self.server.calls[-2]["params"][2]["all-proxy"], proxy_url)
+
+    def test_rpc_does_not_change_managed_links_route_when_resumed_through_ariang(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        task_key = self.runtime.bunkr_links.store.reserve({
+            "kind": "direct", "source_url": "", "item_id": "", "album_name": "",
+            "file_name": "managed.bin", "destination": str(self.destination / "managed.bin"),
+            "route": "tor",
+        }, destination_exists=False)
+        self.runtime.bunkr_links.store.set_gid(task_key, "1234567890abcdef", status="queued")
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "resume-managed", "method": "aria2.unpause",
+            "params": ["1234567890abcdef"], "tme3_route": "non",
+        })
+
+        self.assertEqual(result["result"], "active")
+        self.assertEqual([call["method"] for call in self.server.calls[-1:]], ["aria2.unpause"])
 
     def test_rpc_rejects_paths_outside_workspace_and_managed_methods(self):
         self.runtime.ensure()

@@ -3,7 +3,7 @@
   import { CircleAlert, Download, Link2, Pause, Play, RefreshCw } from '@lucide/svelte';
   import { api } from '$lib/api';
 
-  type Props = { worker: string; directory: string; active: boolean };
+  type Props = { worker: string; directory: string; active: boolean; route?: 'non' | 'tor' };
   type PreviewFile = { item_id: string; file_name: string; thumbnail_url: string };
   type PreviewItem = {
     source_index: number;
@@ -31,12 +31,11 @@
   type TaskResult = { items: LinkTask[] };
   type EnqueueResult = { items: Array<{ status: string; file_name?: string; reason_code?: string }> };
 
-  let { worker, directory, active }: Props = $props();
+  let { worker, directory, active, route = $bindable('non') }: Props = $props();
   let sources = $state('');
   let preview = $state<Preview | null>(null);
   let previewSources = $state<string[]>([]);
   let selectedFiles = $state<Record<string, boolean>>({});
-  let route = $state<'non' | 'tor'>('non');
   let tasks = $state<LinkTask[]>([]);
   let checking = $state(false);
   let enqueueing = $state(false);

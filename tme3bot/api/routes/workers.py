@@ -206,10 +206,13 @@ def _tts_runtime_evidence(payload) -> tuple[bool, str, str]:
 def _aria2_rpc_setup_script(worker: str) -> str:
     endpoint = json.dumps(f"/api/v1/aria2-rpc-{worker}")
     folder_key = json.dumps(f"tme3-aria2-folder:{worker}")
+    route_key = json.dumps(f"tme3-aria2-route:{worker}")
     return f"""(() => {{
   const endpoint = {endpoint};
   const folderKey = {folder_key};
+  const routeKey = {route_key};
   const csrf = () => document.cookie.split('; ').find((part) => part.startsWith('tme3_csrf='))?.split('=').slice(1).join('') || '';
+  const selectedRoute = () => localStorage.getItem(routeKey) === 'tor' ? 'tor' : 'non';
   const isRpc = (url) => {{ try {{ return new URL(url, location.href).pathname === endpoint; }} catch {{ return false; }} }};
   const withDirectory = (body) => {{
     if (typeof body !== 'string') return body;
@@ -217,13 +220,19 @@ def _aria2_rpc_setup_script(worker: str) -> str:
       const call = JSON.parse(body);
       if (!call || typeof call !== 'object' || !Array.isArray(call.params)) return body;
       const index = {{ 'aria2.addUri': 1, 'aria2.addTorrent': 2, 'aria2.addMetalink': 1 }}[call.method];
-      if (index === undefined) return body;
-      while (call.params.length <= index) call.params.push(null);
-      const options = call.params[index] && typeof call.params[index] === 'object' ? call.params[index] : {{}};
-      options.dir = localStorage.getItem(folderKey) || '/workspace/aria2';
-      options['allow-overwrite'] = 'false';
-      options['auto-file-renaming'] = 'false';
-      call.params[index] = options;
+      if (index !== undefined) {{
+        while (call.params.length <= index) call.params.push(null);
+        const options = call.params[index] && typeof call.params[index] === 'object' ? call.params[index] : {{}};
+        options.dir = localStorage.getItem(folderKey) || '/workspace/aria2';
+        options['allow-overwrite'] = 'false';
+        options['auto-file-renaming'] = 'false';
+        call.params[index] = options;
+        call.tme3_route = selectedRoute();
+      }} else if (call.method === 'aria2.unpause') {{
+        call.tme3_route = selectedRoute();
+      }} else {{
+        return body;
+      }}
       return JSON.stringify(call);
     }} catch {{ return body; }}
   }};

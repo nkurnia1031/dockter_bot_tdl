@@ -3054,6 +3054,8 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("X-CSRF-Token", setup.text)
         self.assertIn("allow-overwrite", setup.text)
         self.assertIn("/workspace/aria2", setup.text)
+        self.assertIn("tme3-aria2-route:local", setup.text)
+        self.assertIn("tme3_route", setup.text)
         self.assertNotIn('form[name="newTaskForm"]', setup.text)
         self.assertNotIn("data-tme3-links-panel", setup.text)
         self.assertNotIn("token:", setup.text)

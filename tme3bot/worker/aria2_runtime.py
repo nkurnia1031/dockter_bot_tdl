@@ -23,6 +23,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from tme3bot.database_paths import ensure_private_directory
 from tme3bot.worker.aria2_bunkr import (
     Aria2BunkrLinks,
+    BunkrLinkError,
     redact_aria2_response,
     redact_sensitive_urls_in_text,
 )
@@ -278,6 +279,17 @@ class Aria2Runtime:
             return _rpc_error(request_id, -32602, "Client-supplied RPC credentials are not accepted.")
 
         method = request_payload["method"]
+        route_requested = "tme3_route" in request_payload
+        requested_route = request_payload.get("tme3_route")
+        route_methods = {
+            "aria2.addUri", "aria2.addTorrent", "aria2.addMetalink", "aria2.unpause",
+        }
+        if route_requested and (
+            method not in route_methods
+            or not isinstance(requested_route, str)
+            or requested_route not in {"non", "tor"}
+        ):
+            return _rpc_error(request_id, -32602, "Aria2 download route is invalid.")
         params = list(params)
         if method in {"aria2.addUri", "aria2.addTorrent", "aria2.addMetalink"}:
             options_index = {
@@ -304,6 +316,11 @@ class Aria2Runtime:
             )
             if error:
                 return _rpc_error(request_id, -32602, error)
+            if route_requested:
+                try:
+                    safe_options.update(self.bunkr_links.route_options_for(requested_route))
+                except BunkrLinkError as exc:
+                    return _rpc_error(request_id, -32000, str(exc))
             while len(params) <= options_index:
                 params.append(None)
             params[options_index] = safe_options
@@ -328,6 +345,21 @@ class Aria2Runtime:
                 secret = self.secret_file.read_text(encoding="utf-8").strip()
                 if not secret:
                     return _rpc_error(request_id, -32000, "Aria2 RPC is not configured.")
+                if (
+                    route_requested
+                    and method == "aria2.unpause"
+                    and params
+                    and isinstance(params[0], str)
+                    and re.fullmatch(r"[0-9a-fA-F]{16}", params[0])
+                    and not self.bunkr_links.store.contains(params[0])
+                ):
+                    status = self._internal_rpc(secret, "tellStatus", params[0], ["status"])
+                    if isinstance(status, dict) and status.get("status") == "paused":
+                        try:
+                            route_options = self.bunkr_links.route_options_for(requested_route)
+                        except BunkrLinkError as exc:
+                            return _rpc_error(request_id, -32000, str(exc))
+                        self._internal_rpc(secret, "changeOption", params[0], route_options)
                 body = json.dumps({
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -360,6 +392,7 @@ class Aria2Runtime:
         if not isinstance(result, dict):
             return _rpc_error(request_id, -32000, "Aria2 returned an invalid response.")
         result = self._redact_managed_result(method, params, result)
+        result = _redact_aria2_proxy_options(result)
         result["jsonrpc"] = "2.0"
         result["id"] = request_id
         if method == "aria2.getGlobalOption" and isinstance(result.get("result"), dict):
@@ -716,6 +749,20 @@ def _safe_global_options(raw_options: dict[str, Any]) -> tuple[dict[str, str] | 
 
 def _rpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+
+
+def _redact_aria2_proxy_options(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_redact_aria2_proxy_options(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _redact_aria2_proxy_options(item)
+            for key, item in value.items()
+            if key not in {"all-proxy", "all-proxy-user", "all-proxy-passwd"}
+        }
+    if isinstance(value, str):
+        return redact_sensitive_urls_in_text(value)
+    return value
 
 
 def main() -> int:

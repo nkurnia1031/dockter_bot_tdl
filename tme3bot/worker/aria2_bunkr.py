@@ -730,7 +730,6 @@ class Aria2BunkrLinks:
             source_port = parsed_url.port or {"http": 80, "https": 443, "ftp": 21, "sftp": 22}.get(source_scheme, 0)
         except ValueError as exc:
             raise BunkrLinkError("URL unduhan tidak valid.") from exc
-        tor_proxy = self.tor_proxy_url() if route == "tor" else ""
         held_for_tor = route == "tor" and not tor_available
         task_key = self.store.reserve({
             "kind": kind,
@@ -754,13 +753,11 @@ class Aria2BunkrLinks:
             "auto-file-renaming": "false",
             "max-tries": "0",
         }
-        if route == "tor":
-            options["all-proxy"] = tor_proxy
-            options["proxy-method"] = "tunnel"
-            if held_for_tor:
-                # Keep the task visible and persistent in aria2 without starting
-                # a transfer until the operator confirms Tor has recovered.
-                options["pause"] = "true"
+        options.update(self.route_options_for(route, require_ready=False))
+        if held_for_tor:
+            # Keep the task visible and persistent in aria2 without starting
+            # a transfer until the operator confirms Tor has recovered.
+            options["pause"] = "true"
         try:
             gid = self.rpc("addUri", [direct_url], options)
             if not isinstance(gid, str) or not _GID.fullmatch(gid):
@@ -796,6 +793,16 @@ class Aria2BunkrLinks:
         if not token:
             raise BunkrLinkError("ARIA2_TOR_UNAVAILABLE: kredensial proxy internal belum siap.")
         return f"http://aria2:{quote(token, safe='')}@tts-1:8118"
+
+    def route_options_for(self, route: object, *, require_ready: bool = True) -> dict[str, str]:
+        mode = str(route or "").lower()
+        if mode == "non":
+            return {"all-proxy": "", "proxy-method": "get"}
+        if mode != "tor":
+            raise BunkrLinkError("Mode jaringan tidak valid.")
+        if require_ready and not self._tor_available(force=True):
+            raise BunkrLinkError("ARIA2_TOR_UNAVAILABLE: layanan Tor worker belum siap.")
+        return {"all-proxy": self.tor_proxy_url(), "proxy-method": "tunnel"}
 
     def _workspace_directory(self, value: object, *, create: bool) -> Path:
         root = self.workspace_root.resolve(strict=True)
@@ -935,13 +942,11 @@ class Aria2BunkrLinks:
         status = self.rpc("tellStatus", gid, ["gid", "status"])
         if not isinstance(status, dict) or status.get("status") != "paused":
             raise BunkrLinkError("Jeda task sebelum mengganti mode jaringan.")
-        if mode == "tor" and not self._tor_available(force=True):
+        try:
+            options = self.route_options_for(mode)
+        except BunkrLinkError:
             self.store.update(gid, route="tor", status="held", reason_code="ARIA2_TOR_UNAVAILABLE")
-            raise BunkrLinkError("ARIA2_TOR_UNAVAILABLE: layanan Tor worker belum siap.")
-        options = {
-            "all-proxy": self.tor_proxy_url() if mode == "tor" else "",
-            "proxy-method": "tunnel" if mode == "tor" else "get",
-        }
+            raise
         self.rpc("changeOption", gid, options)
         self.store.update(gid, route=mode, status="paused", reason_code="")
         return {"gid": gid, "route": mode, "status": "paused"}
@@ -953,13 +958,12 @@ class Aria2BunkrLinks:
             raise BunkrLinkError("Task tidak sedang dijeda.")
         row = self.store.get(gid) or {}
         route = str(row.get("route") or "non")
-        if route == "tor" and not self._tor_available(force=True):
+        try:
+            options = self.route_options_for(route)
+        except BunkrLinkError:
             self.store.update(gid, status="held", reason_code="ARIA2_TOR_UNAVAILABLE")
-            raise BunkrLinkError("ARIA2_TOR_UNAVAILABLE: layanan Tor worker belum siap.")
-        self.rpc("changeOption", gid, {
-            "all-proxy": self.tor_proxy_url() if route == "tor" else "",
-            "proxy-method": "tunnel" if route == "tor" else "get",
-        })
+            raise
+        self.rpc("changeOption", gid, options)
         result = self.rpc("unpause", gid)
         self.store.update(gid, status="active", reason_code="")
         return {"gid": gid, "status": str(result or "active")}

@@ -64,6 +64,7 @@
   let selectedWorker = $state('');
   let activeTab = $state<'ariang' | 'bunkr'>('ariang');
   let ariaNgZoom = $state(100);
+  let selectedRoute = $state<'non' | 'tor'>('non');
   let selectedFolders = $state<string[]>([]);
   let health = $state<Health | null>(null);
   let iframeSrc = $state('');
@@ -105,7 +106,12 @@
   }
 
   function folderStorageKey(worker: string) { return `tme3-aria2-folder:${worker}`; }
+  function routeStorageKey(worker: string) { return `tme3-aria2-route:${worker}`; }
   function zoomStorageKey(worker: string) { return `tme3-aria2-zoom:${worker}`; }
+  function readRoute(worker: string): 'non' | 'tor' {
+    if (typeof window === 'undefined') return 'non';
+    return localStorage.getItem(routeStorageKey(worker)) === 'tor' ? 'tor' : 'non';
+  }
   function readZoom(worker: string) {
     if (typeof window === 'undefined') return 100;
     const stored = Number(localStorage.getItem(zoomStorageKey(worker)));
@@ -119,6 +125,12 @@
   }
   function changeZoom(amount: number) { setZoom(ariaNgZoom + amount); }
   function resetZoom() { setZoom(100); }
+  function changeRoute(event: Event) {
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    if (value !== 'non' && value !== 'tor') return;
+    selectedRoute = value;
+    if (selectedWorker) localStorage.setItem(routeStorageKey(selectedWorker), value);
+  }
   function selectedFolder(worker = selectedWorker) {
     return selectedFolders[0] || (typeof window !== 'undefined' ? localStorage.getItem(folderStorageKey(worker)) : '') || '/workspace/aria2';
   }
@@ -281,6 +293,7 @@
       }
       if (selectedWorker) {
         ariaNgZoom = readZoom(selectedWorker);
+        selectedRoute = readRoute(selectedWorker);
         await inspect(selectedWorker);
       }
     } catch (cause) {
@@ -317,6 +330,7 @@
   function changeWorker(event: Event) {
     selectedWorker = (event.currentTarget as HTMLSelectElement).value;
     ariaNgZoom = readZoom(selectedWorker);
+    selectedRoute = readRoute(selectedWorker);
     selectedFolders = selectedWorker
       ? [localStorage.getItem(folderStorageKey(selectedWorker)) || '/workspace/aria2']
       : [];
@@ -339,6 +353,12 @@
   $effect(() => {
     if (typeof window !== 'undefined' && selectedWorker && selectedFolders[0]) {
       localStorage.setItem(folderStorageKey(selectedWorker), selectedFolders[0]);
+    }
+  });
+
+  $effect(() => {
+    if (typeof window !== 'undefined' && selectedWorker) {
+      localStorage.setItem(routeStorageKey(selectedWorker), selectedRoute);
     }
   });
 
@@ -411,12 +431,22 @@
         </div>
         <div id="aria2-panel" role="tabpanel" aria-labelledby="aria2-tab" hidden={activeTab !== 'ariang'}>
           {#if iframeSrc}
-            <div class="flex items-center justify-end gap-1 border-b border-[var(--line)] bg-[var(--panel)] px-3 py-2" role="group" aria-label="Zoom AriaNg">
+            <div class="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] bg-[var(--panel)] px-3 py-2">
+              <label class="flex items-center gap-2 text-xs font-bold" aria-label="Rute unduhan">
+                <span>Rute unduhan</span>
+                <select class="field !w-auto !py-1 text-sm" aria-label="Rute unduhan" value={selectedRoute} onchange={changeRoute}>
+                  <option value="non">Non · langsung</option>
+                  <option value="tor">Tor</option>
+                </select>
+                <span class="muted text-xs font-normal">Task baru dan resume task dijeda memakai rute ini. Jika Tor gagal, tidak ada fallback langsung.</span>
+              </label>
+              <div class="flex items-center justify-end gap-1" role="group" aria-label="Zoom AriaNg">
               <span class="muted mr-2 text-xs">Zoom</span>
               <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(-10)} disabled={ariaNgZoom <= 80} aria-label="Perkecil tampilan AriaNg" title="Perkecil tampilan">−</button>
               <output class="min-w-12 text-center text-sm font-semibold tabular-nums" aria-live="polite">{ariaNgZoom}%</output>
               <button class="button secondary !px-2 !py-1" onclick={resetZoom} aria-label="Reset zoom AriaNg" title="Reset zoom">Reset</button>
               <button class="button secondary !px-2 !py-1" onclick={() => changeZoom(10)} disabled={ariaNgZoom >= 150} aria-label="Perbesar tampilan AriaNg" title="Perbesar tampilan">+</button>
+              </div>
             </div>
             <iframe class="h-[calc(100vh-18rem)] min-h-[460px] w-full border-0 bg-white sm:min-h-[500px]" style={`zoom: ${ariaNgZoom / 100};`} src={iframeSrc} title={`aria2 ${selectedWorker}`} referrerpolicy="no-referrer"></iframe>
           {:else}
@@ -426,7 +456,7 @@
           {/if}
         </div>
         <div id="bunkr-panel" role="tabpanel" aria-labelledby="bunkr-tab" aria-label="Bunkr" hidden={activeTab !== 'bunkr'}>
-          <Aria2BunkrPanel worker={selectedWorker} directory={selectedFolder()} active={activeTab === 'bunkr'} />
+          <Aria2BunkrPanel bind:route={selectedRoute} worker={selectedWorker} directory={selectedFolder()} active={activeTab === 'bunkr'} />
         </div>
       </div>
     {:else if !health && !inspecting}
