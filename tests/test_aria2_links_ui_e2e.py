@@ -186,6 +186,8 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                     f"API calls: {calls[-20:]}; alerts: {page.locator('[role=alert]').all_inner_texts()}; "
                     f"browser errors: {page_errors}"
                 )
+            expect(page.get_by_text("PRATINJAU LINK · 3 FILE")).to_be_visible()
+            expect(page.locator("#bunkr-panel label:has(input[type=checkbox])")).to_have_count(3)
             expect(page.locator("#bunkr-panel img")).to_have_count(1)
             page.get_by_role("button", name="Pilih semua").click()
             page.get_by_label("Pilih two.zip").uncheck()
@@ -208,6 +210,111 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             self.assertTrue(all(call["csrf"] == "local-e2e-csrf" for call in calls if call["method"] == "POST"))
             self.assertNotIn("signed-secret", page.locator("body").inner_text())
             self.assertEqual(page_errors, [], "Browser runtime errors: " + " | ".join(page_errors))
+        finally:
+            context.close()
+
+    def test_native_ariang_route_picker_is_inside_iframe_and_applies_to_new_tasks(self) -> None:
+        from playwright.sync_api import expect
+        from tme3bot.api.routes.workers import _aria2_rpc_setup_script
+
+        context = self.browser.new_context(viewport={"width": 1365, "height": 900})
+        context.add_cookies([{
+            "name": "tme3_csrf",
+            "value": "local-e2e-csrf",
+            "url": self.origin,
+            "sameSite": "Lax",
+        }])
+        rpc_calls: list[dict[str, object]] = []
+        setup_script = _aria2_rpc_setup_script("local")
+
+        def mock_api(route) -> None:
+            request = route.request
+            parsed = urlsplit(request.url)
+            path = parsed.path.removeprefix("/api/v1")
+            if path == "/auth/browser/session":
+                payload = {
+                    "authenticated": True,
+                    "actor": {"telegram_user_id": 42, "profile": "default", "worker_route": "local"},
+                    "profiles": ["default"],
+                }
+            elif path == "/workers":
+                payload = {"items": [{"name": "local", "enabled": True, "selected": True}]}
+            elif path == "/workers/local/aria2/health":
+                payload = {
+                    "worker": "local", "ready": True, "reason_code": "",
+                    "engine": {"ready": True, "version": "1.37.0"},
+                    "hook": {"ready": True, "script_present": True, "configured": True},
+                    "recovery": {"speed_threshold_bytes_per_second": 100000},
+                }
+            elif path == "/aria2-rpc-local":
+                body = request.post_data_json
+                rpc_calls.append({
+                    "body": body,
+                    "csrf": request.headers.get("x-csrf-token", ""),
+                })
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                    "jsonrpc": "2.0", "id": body.get("id"), "result": "new-gid",
+                }))
+                return
+            elif path == "/aria2-ui/local/index.html":
+                body = f"""<!doctype html>
+<html><head><meta charset="utf-8"><script>{setup_script}</script></head>
+<body class="hold-transition skin-aria-ng sidebar-mini fixed">
+  <header class="main-header"><nav class="navbar"><div class="navbar-toolbar">
+    <ul class="nav navbar-nav"><li><a class="toolbar" href="#!/new">New</a></li></ul>
+  </div></nav></header>
+  <main><form id="new-task"><label for="task-uri">URI</label>
+    <input id="task-uri" value="https://example.test/file.bin">
+    <button type="submit">Add task</button>
+  </form></main>
+  <script>
+    document.getElementById('new-task').addEventListener('submit', (event) => {{
+      event.preventDefault();
+      const request = new XMLHttpRequest();
+      request.open('POST', '/api/v1/aria2-rpc-local');
+      request.setRequestHeader('Content-Type', 'application/json');
+      request.send(JSON.stringify({{jsonrpc:'2.0', id:'add-task', method:'aria2.addUri',
+        params:[[document.getElementById('task-uri').value], {{}}]}}));
+    }});
+  </script>
+</body></html>"""
+                route.fulfill(status=200, content_type="text/html", body=body)
+                return
+            else:
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({}))
+                return
+            route.fulfill(status=200, content_type="application/json", body=json.dumps(payload))
+
+        context.route("**/api/v1/**", mock_api)
+        page = context.new_page()
+        try:
+            page.goto(f"{self.origin}/aria2/", wait_until="domcontentloaded")
+            frame = page.frame_locator('iframe[title="aria2 local"]')
+            route_picker = frame.get_by_role("combobox", name="Rute unduhan")
+            expect(route_picker).to_be_visible(timeout=10000)
+            route_picker.select_option("tor")
+            page.get_by_role("tab", name="Bunkr").click()
+            expect(page.get_by_label("Rute unduh", exact=True)).to_have_value("tor")
+            page.get_by_role("tab", name="AriaNg").click()
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+            ):
+                frame.get_by_role("button", name="Add task").click()
+            upload_call = next(call for call in rpc_calls if call["body"].get("method") == "aria2.addUri")
+            self.assertEqual(upload_call["csrf"], "local-e2e-csrf")
+            self.assertEqual(upload_call["body"], {
+                "jsonrpc": "2.0",
+                "id": "add-task",
+                "method": "aria2.addUri",
+                "params":[["https://example.test/file.bin"], {
+                    "dir": "/workspace/aria2",
+                    "allow-overwrite": "false",
+                    "auto-file-renaming": "false",
+                }],
+                "tme3_route": "tor",
+            })
+            self.assertEqual(page.get_by_label("Rute unduhan").count(), 0)
         finally:
             context.close()
 

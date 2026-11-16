@@ -207,13 +207,80 @@ def _aria2_rpc_setup_script(worker: str) -> str:
     endpoint = json.dumps(f"/api/v1/aria2-rpc-{worker}")
     folder_key = json.dumps(f"tme3-aria2-folder:{worker}")
     route_key = json.dumps(f"tme3-aria2-route:{worker}")
+    route_control_id = json.dumps(f"tme3-aria2-route-control-{worker}")
+    route_select_id = json.dumps(f"tme3-aria2-route-select-{worker}")
     return f"""(() => {{
   const endpoint = {endpoint};
   const folderKey = {folder_key};
   const routeKey = {route_key};
+  const routeControlId = {route_control_id};
+  const routeSelectId = {route_select_id};
   const csrf = () => document.cookie.split('; ').find((part) => part.startsWith('tme3_csrf='))?.split('=').slice(1).join('') || '';
   const selectedRoute = () => localStorage.getItem(routeKey) === 'tor' ? 'tor' : 'non';
   const isRpc = (url) => {{ try {{ return new URL(url, location.href).pathname === endpoint; }} catch {{ return false; }} }};
+  const installRouteControl = () => {{
+    const toolbar = document.querySelector('.main-header .navbar-toolbar .navbar-nav');
+    if (!toolbar) return false;
+    if (document.getElementById(routeControlId)) return true;
+
+    const item = document.createElement('li');
+    item.id = routeControlId;
+    item.className = 'tme3-route-control';
+    item.setAttribute('role', 'group');
+    item.setAttribute('aria-label', 'Kontrol rute unduhan');
+    item.style.display = 'flex';
+    item.style.alignItems = 'center';
+    item.style.gap = '6px';
+    item.style.height = '50px';
+    item.style.padding = '0 10px';
+
+    const label = document.createElement('label');
+    label.className = 'toolbar';
+    label.style.margin = '0';
+    label.style.fontWeight = 'normal';
+    label.appendChild(document.createTextNode('Rute'));
+
+    const select = document.createElement('select');
+    select.id = routeSelectId;
+    select.className = 'form-control input-sm';
+    select.setAttribute('aria-label', 'Rute unduhan');
+    select.title = 'Rute untuk task baru di AriaNg';
+    select.style.width = '104px';
+    select.style.height = '30px';
+    for (const [value, text] of [['non', 'Non'], ['tor', 'Tor']]) {{
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      select.appendChild(option);
+    }}
+    select.value = selectedRoute();
+    select.addEventListener('change', () => {{
+      localStorage.setItem(routeKey, select.value === 'tor' ? 'tor' : 'non');
+    }});
+    window.addEventListener('storage', (event) => {{
+      if (event.key === routeKey) select.value = selectedRoute();
+    }});
+    label.appendChild(select);
+    item.appendChild(label);
+
+    const newTaskLink = toolbar.querySelector('a[href="#!/new"]');
+    const newTaskItem = newTaskLink?.closest('li');
+    if (newTaskItem) newTaskItem.insertAdjacentElement('afterend', item);
+    else toolbar.appendChild(item);
+    return true;
+  }};
+  const watchForToolbar = () => {{
+    if (installRouteControl()) return;
+    const observer = new MutationObserver(() => {{
+      if (installRouteControl()) observer.disconnect();
+    }});
+    observer.observe(document.documentElement, {{ childList: true, subtree: true }});
+  }};
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', watchForToolbar, {{ once: true }});
+  }} else {{
+    watchForToolbar();
+  }}
   const withDirectory = (body) => {{
     if (typeof body !== 'string') return body;
     try {{

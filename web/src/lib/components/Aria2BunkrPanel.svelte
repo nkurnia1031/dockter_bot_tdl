@@ -305,6 +305,16 @@
     ).length, 0);
   }
 
+  function sourceSelectedCount(source: PreviewItem) {
+    return (source.files || []).filter((file) =>
+      source.kind === 'direct' || selectedFiles[fileKey(source.source_index, file.item_id)]
+    ).length;
+  }
+
+  function previewFileCount(current = preview) {
+    return (current?.items || []).reduce((count, source) => count + (source.files || []).length, 0);
+  }
+
   async function enqueueSelected() {
     if (!preview || selectedCount() === 0) return;
     if (JSON.stringify(collectSources()) !== JSON.stringify(previewSources)) {
@@ -437,11 +447,18 @@
   {#if message}<div class="alert success" role="status">{message}</div>{/if}
 
   {#if preview}
-    <section class="card p-4" aria-labelledby="bunkr-preview-title">
-      <header class="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div><p class="eyebrow">PREVIEW ALBUM</p><h2 id="bunkr-preview-title" class="mt-1 text-lg font-extrabold">Pilih file untuk antrean</h2></div>
+    <section class="card overflow-hidden p-0" aria-labelledby="bunkr-preview-title">
+      <header class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--panel-soft)] p-4 sm:p-5">
+        <div class="flex min-w-0 items-center gap-3">
+          <span class="page-icon shrink-0"><Download size={18}/></span>
+          <div class="min-w-0">
+            <p class="eyebrow">PRATINJAU LINK · {previewFileCount()} FILE</p>
+            <h2 id="bunkr-preview-title" class="mt-1 text-lg font-extrabold">Pilih file untuk antrean</h2>
+            <p class="muted mt-1 text-sm">Periksa isi album, lalu pilih file yang akan ditambahkan.</p>
+          </div>
+        </div>
         <div class="flex flex-wrap items-center gap-2">
-          <span class="badge">{selectedCount()} dipilih</span>
+          <span class="badge border border-[var(--line)] bg-[var(--panel)]">{selectedCount()} dipilih</span>
           {#if (preview.items || []).some((source) => source.kind === 'album' && source.files.length > 0)}
             <button class="button secondary" type="button" onclick={toggleSelectAll} aria-pressed={allAlbumFilesSelected()}>
               {allAlbumFilesSelected() ? 'Batalkan semua pilihan' : 'Pilih semua'}
@@ -452,47 +469,69 @@
           </button>
         </div>
       </header>
-      <div class="space-y-4">
+      <div class="space-y-3 p-3 sm:p-4">
         {#each preview.items || [] as source (source.source_index)}
           {@const page = currentPage(source)}
           {@const totalPages = pageCount(source)}
           {@const pageFiles = visibleFiles(source)}
-          <article class="min-w-0 rounded-xl border border-[var(--line)] bg-[var(--surface)] p-3">
-            <h3 class="truncate font-bold" title={source.title || `Link ${source.source_index + 1}`}>{source.title || `Link ${source.source_index + 1}`}</h3>
+          <article class="min-w-0 overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--panel)]">
+            <header class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-3 py-3 sm:px-4">
+              <div class="flex min-w-0 items-center gap-3">
+                <span class="grid h-9 w-9 shrink-0 place-items-center rounded-lg border border-[var(--line)] bg-[var(--panel-soft)] text-[var(--brand)]"><Link2 size={16}/></span>
+                <div class="min-w-0">
+                  <div class="mb-1 flex flex-wrap items-center gap-2">
+                    <span class="eyebrow">{source.kind === 'album' ? 'ALBUM' : 'LINK LANGSUNG'}</span>
+                    <span class="muted text-xs">{source.files.length} file · {sourceSelectedCount(source)} dipilih</span>
+                  </div>
+                  <h3 class="truncate font-bold" title={source.title || `Link ${source.source_index + 1}`}>{source.title || `Link ${source.source_index + 1}`}</h3>
+                </div>
+              </div>
+              {#if source.kind === 'album' && source.files.length > 0}
+                <span class="badge">Halaman {page + 1}/{totalPages}</span>
+              {/if}
+            </header>
             {#if source.error}
-              <p class="mt-2 flex items-start gap-2 text-sm text-rose-600"><CircleAlert size={16} class="mt-0.5 shrink-0"/>{source.error}</p>
+              <p class="m-3 flex items-start gap-2 rounded-lg border border-rose-500/25 bg-rose-500/10 p-3 text-sm text-rose-600 sm:m-4"><CircleAlert size={16} class="mt-0.5 shrink-0"/>{source.error}</p>
             {:else}
-              <div class="mt-3 grid grid-cols-2 gap-3" aria-label={`Daftar file album ${source.title || source.source_index + 1}`}>
+              <div class="grid grid-cols-1 gap-3 p-3 sm:grid-cols-2 sm:p-4 xl:grid-cols-3" aria-label={`Daftar file album ${source.title || source.source_index + 1}`}>
                 {#each pageFiles as file (file.item_id)}
                   {@const key = fileKey(source.source_index, file.item_id)}
-                  <label class="overflow-hidden rounded-lg border border-[var(--line)] bg-[var(--panel)]">
-                    {#if file.thumbnail_url}
-                      <img class="h-40 w-full bg-[var(--surface)] object-cover sm:h-56" src={file.thumbnail_url} alt={file.file_name} loading="lazy" referrerpolicy="no-referrer" />
-                    {:else}
-                      <div class="grid h-40 place-items-center bg-[var(--surface)] sm:h-56">
-                        {#if thumbnailLoading[key]}<span class="muted px-2 text-center text-xs">Memuat thumbnail…</span>
-                        {:else}<Download class="muted" size={28}/>{/if}
-                      </div>
-                    {/if}
-                    <span class="flex min-h-12 items-start gap-3 p-3">
+                  {@const isSelected = source.kind === 'direct' || Boolean(selectedFiles[key])}
+                  <label class={`group min-w-0 overflow-hidden rounded-xl border bg-[var(--panel-soft)] transition duration-200 ${isSelected ? 'border-[var(--brand)] shadow-[0_0_0_1px_var(--brand-soft)]' : 'border-[var(--line)] hover:border-[var(--line-bright)]'}`}>
+                    <span class="relative block aspect-video overflow-hidden bg-[var(--surface)]">
+                      {#if file.thumbnail_url}
+                        <img class="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]" src={file.thumbnail_url} alt={file.file_name} loading="lazy" referrerpolicy="no-referrer" />
+                      {:else}
+                        <span class="grid h-full place-items-center bg-[radial-gradient(ellipse_at_top,var(--brand-soft),transparent_65%)]">
+                          {#if thumbnailLoading[key]}<span class="muted px-2 text-center text-xs">Memuat thumbnail…</span>
+                          {:else}<Download class="text-[var(--muted-dim)]" size={25}/>{/if}
+                        </span>
+                      {/if}
                       <input
                         type="checkbox"
-                        class="mt-1"
+                        class="absolute left-2.5 top-2.5 z-10 h-5 w-5 cursor-pointer accent-[var(--brand)]"
                         aria-label={`Pilih ${file.file_name}`}
-                        checked={source.kind === 'direct' || Boolean(selectedFiles[key])}
+                        checked={isSelected}
                         disabled={source.kind === 'direct'}
                         onchange={(event) => {
                           selectedFiles = { ...selectedFiles, [key]: (event.currentTarget as HTMLInputElement).checked };
                         }}
                       />
-                      <span class="min-w-0 break-all text-sm font-semibold">{file.file_name}</span>
+                      {#if isSelected}<span class="absolute right-2 top-2 rounded-full border border-[var(--brand)] bg-[var(--canvas)]/90 px-2 py-1 text-[10px] font-bold text-[var(--brand)]">Dipilih</span>{/if}
+                    </span>
+                    <span class="flex min-h-[68px] items-center justify-between gap-3 p-3">
+                      <span class="min-w-0">
+                        <span class="block line-clamp-2 break-all text-sm font-semibold">{file.file_name}</span>
+                        <span class="muted mt-1 block text-[11px]">{source.kind === 'direct' ? 'URL langsung' : 'File album'}</span>
+                      </span>
+                      <span class={`grid h-7 w-7 shrink-0 place-items-center rounded-full border text-xs ${isSelected ? 'border-[var(--brand)] bg-[var(--brand-soft)] text-[var(--brand)]' : 'border-[var(--line-bright)] text-[var(--muted)]'}`} aria-hidden="true">{isSelected ? '✓' : '+'}</span>
                     </span>
                   </label>
                 {/each}
               </div>
               {#if source.kind === 'album' && totalPages > 1}
-                <footer class="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] pt-3">
-                  <span class="muted text-xs" aria-live="polite">
+                <footer class="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] bg-[var(--panel-soft)] px-3 py-3 sm:px-4">
+                  <span class="muted text-xs tabular-nums" aria-live="polite">
                     Menampilkan {page * FILES_PER_PAGE + 1}–{Math.min((page + 1) * FILES_PER_PAGE, source.files.length)} dari {source.files.length} file
                   </span>
                   <div class="flex items-center gap-2">

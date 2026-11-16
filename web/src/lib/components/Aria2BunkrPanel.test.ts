@@ -31,7 +31,7 @@ describe('Aria2 Bunkr panel', () => {
     });
   });
 
-  it('previews Bunkr albums with large thumbnails and submits selected files through the authenticated API client', async () => {
+  it('previews Bunkr albums with responsive cards and submits selected files through the authenticated API client', async () => {
     render(Aria2BunkrPanel, { worker: 'remote-1', directory: '/workspace/aria2', active: true });
 
     await fireEvent.input(screen.getByLabelText('Link Bunkr atau URL langsung'), {
@@ -42,7 +42,8 @@ describe('Aria2 Bunkr panel', () => {
     await screen.findByText('episode-01.mp4');
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
     const thumbnail = screen.getByAltText('episode-01.mp4') as HTMLImageElement;
-    expect(thumbnail.className).toContain('h-40');
+    expect(thumbnail.parentElement?.className).toContain('aspect-video');
+    expect(screen.getByText('PRATINJAU LINK · 2 FILE')).toBeTruthy();
     expect(thumbnail.className).toContain('w-full');
 
     await fireEvent.click(screen.getByLabelText('Rute unduh'));
