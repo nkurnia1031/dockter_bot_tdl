@@ -189,7 +189,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             expect(page.locator("#bunkr-panel img")).to_have_count(1)
             page.get_by_role("button", name="Pilih semua").click()
             page.get_by_label("Pilih two.zip").uncheck()
-            page.get_by_label("Rute unduh").select_option("tor")
+            page.locator("#bunkr-panel").get_by_label("Rute unduh", exact=True).select_option("tor")
             page.get_by_role("button", name="Masukkan pilihan ke Aria2").click()
             expect(page.get_by_role("status").filter(has_text="2 task masuk antrean")).to_be_visible()
             expect(page.get_by_text("one.zip", exact=True)).to_be_visible()
