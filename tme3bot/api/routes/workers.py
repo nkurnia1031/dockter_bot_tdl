@@ -257,22 +257,35 @@ def _aria2_rpc_setup_script(worker: str) -> str:
   const installNewTaskRouteControl = () => {
     const form = document.querySelector('form[name="newTaskForm"]');
     if (!form || form.querySelector(`[data-tme3-route="${newRouteControl}"]`)) return;
-    const hasOptionsTab = Array.from(form.querySelectorAll('.nav-tabs a')).some((anchor) =>
-      (anchor.getAttribute('ng-click') || '').includes("changeTab('options')")
+    const hasLinksTab = Array.from(form.querySelectorAll('.nav-tabs a')).some((anchor) =>
+      (anchor.getAttribute('ng-click') || '').includes("changeTab('links')")
     );
-    const optionsPane = Array.from(form.querySelectorAll('.tab-content .tab-pane')).find((pane) =>
-      (pane.getAttribute('ng-class') || '').includes("context.currentTab === 'options'")
+    const linksPane = Array.from(form.querySelectorAll('.tab-content .tab-pane')).find((pane) =>
+      (pane.getAttribute('ng-class') || '').includes("context.currentTab === 'links'")
     );
-    const settings = optionsPane?.querySelector('.settings-table');
-    if (!hasOptionsTab || !settings) return;
+    if (!hasLinksTab || !linksPane) return;
     const select = makeSelect('tme3-new-task-route', 'Rute unduhan');
-    const row = makeSettingsRow('Rute unduh task baru', select);
+    const row = document.createElement('div');
+    row.className = 'form-group tme3-aria-route-row';
     row.dataset.tme3Route = newRouteControl;
+    const label = document.createElement('label');
+    label.className = 'control-label';
+    label.textContent = 'Rute unduh task baru';
+    label.appendChild(select);
+    row.appendChild(label);
     const hint = document.createElement('small');
     hint.className = 'muted';
     hint.textContent = 'Pilihan ini hanya berlaku untuk task yang ditambahkan dari form ini.';
-    row.querySelector('.setting-value').appendChild(hint);
-    insertAtTopOfSettings(settings, row);
+    row.appendChild(hint);
+    const uriInput = linksPane.querySelector(
+      'textarea, input[type="url"], input[name*="uri"], input[id*="uri"], input[ng-model*="uri"]'
+    );
+    const insertionPoint = uriInput?.closest('.form-group, .row')
+      || uriInput?.previousElementSibling
+      || uriInput
+      || linksPane.firstElementChild;
+    if (insertionPoint) insertionPoint.insertAdjacentElement('beforebegin', row);
+    else linksPane.prepend(row);
   };
   const taskDetailGid = () => {
     const match = location.hash.match(/^#!\/task\/detail\/([0-9a-f]{16})(?:[/?]|$)/i);
@@ -325,7 +338,7 @@ def _aria2_rpc_setup_script(worker: str) -> str:
     row.dataset.gid = gid;
     const hint = document.createElement('small');
     hint.className = 'muted';
-    hint.textContent = 'Task aktif dijeda sementara dan dilanjutkan setelah rute diterapkan.';
+    hint.textContent = 'Task aktif dijeda sementara. Jika rute gagal diterapkan, task tetap dijeda.';
     row.querySelector('.setting-value').append(hint, status);
     apply.disabled = true;
     select.addEventListener('change', () => { apply.disabled = !select.value; });
@@ -343,14 +356,8 @@ def _aria2_rpc_setup_script(worker: str) -> str:
           throw new Error('Task harus aktif atau dijeda untuk mengubah rute.');
         }
         if (wasRunning) await sendRpc('aria2.pause', [currentGid]);
-        let changeError;
-        try {
-          await sendRpc('aria2.changeOption', [currentGid, {}], route);
-        } catch (error) {
-          changeError = error;
-        }
+        await sendRpc('aria2.changeOption', [currentGid, {}], route);
         if (wasRunning) await sendRpc('aria2.unpause', [currentGid]);
-        if (changeError) throw changeError;
         status.textContent = `Rute ${route === 'tor' ? 'Tor' : 'Non'} diterapkan pada task ini.`;
         select.value = '';
       } catch (error) {

@@ -213,7 +213,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
         finally:
             context.close()
 
-    def test_native_ariang_route_picker_is_per_task_in_the_new_options_tab(self) -> None:
+    def test_native_ariang_route_picker_is_per_task_in_the_new_links_tab(self) -> None:
         from playwright.sync_api import expect
         from tme3bot.api.routes.workers import _aria2_rpc_setup_script
 
@@ -225,6 +225,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             "sameSite": "Lax",
         }])
         rpc_calls: list[dict[str, object]] = []
+        reject_tor_route_change = [False]
         setup_script = _aria2_rpc_setup_script("local")
 
         def mock_api(route) -> None:
@@ -256,6 +257,13 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                 if method == "aria2.tellStatus":
                     result = {"gid": body["params"][0], "status": "active"}
                 elif method in {"aria2.pause", "aria2.changeOption"}:
+                    if method == "aria2.changeOption" and reject_tor_route_change[0]:
+                        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                            "jsonrpc": "2.0",
+                            "id": body.get("id"),
+                            "error": {"code": -32000, "message": "ARIA2_TOR_UNAVAILABLE: Tor worker belum siap."},
+                        }))
+                        return
                     result = "OK"
                 elif method == "aria2.unpause":
                     result = "active"
@@ -315,13 +323,16 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
         try:
             page.goto(f"{self.origin}/aria2/", wait_until="domcontentloaded")
             frame = page.frame_locator('iframe[title="aria2 local"]')
+            links_panel = frame.locator("form[name='newTaskForm'] .tab-pane[data-panel='links']")
+            expect(links_panel).to_be_visible()
+            route_picker = links_panel.get_by_role("combobox", name="Rute unduhan")
+            expect(route_picker).to_be_visible(timeout=10000)
             frame.get_by_role("tab", name="Options").click()
             options_panel = frame.locator("form[name='newTaskForm'] .tab-pane[data-panel='options']")
             expect(options_panel).to_be_visible()
-            route_picker = frame.locator("form[name='newTaskForm']").get_by_role("combobox", name="Rute unduhan")
-            expect(route_picker).to_be_visible(timeout=10000)
-            route_picker.select_option("tor")
+            self.assertEqual(options_panel.get_by_role("combobox", name="Rute unduhan").count(), 0)
             frame.get_by_role("tab", name="Links").click()
+            route_picker.select_option("tor")
             with page.expect_response(
                 lambda response: response.url.endswith("/aria2-rpc-local")
                 and response.request.method == "POST"
@@ -343,9 +354,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             self.assertEqual(frame.locator(".navbar-toolbar").get_by_label("Rute unduhan").count(), 0)
             self.assertIsNone(frame.locator("body").evaluate("() => localStorage.getItem('tme3-aria2-route:local')"))
 
-            frame.get_by_role("tab", name="Options").click()
             route_picker.select_option("non")
-            frame.get_by_role("tab", name="Links").click()
             with page.expect_response(
                 lambda response: response.url.endswith("/aria2-rpc-local")
                 and response.request.method == "POST"
@@ -379,6 +388,18 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             self.assertEqual(edited_calls[2]["body"]["params"], ["0123456789abcdef", {}])
             self.assertNotIn("tme3_route", edited_calls[-1]["body"])
             self.assertTrue(all(call["csrf"] == "local-e2e-csrf" for call in edited_calls))
+
+            reject_tor_route_change[0] = True
+            frame.get_by_label("Rute task").select_option("tor")
+            frame.get_by_role("button", name="Terapkan rute").click()
+            expect(edit_control.get_by_role("status")).to_have_text(
+                "ARIA2_TOR_UNAVAILABLE: Tor worker belum siap.", timeout=10000
+            )
+            failed_edit_calls = rpc_calls[-3:]
+            self.assertEqual(
+                [call["body"]["method"] for call in failed_edit_calls],
+                ["aria2.tellStatus", "aria2.pause", "aria2.changeOption"],
+            )
         finally:
             context.close()
 

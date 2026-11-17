@@ -3055,7 +3055,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("allow-overwrite", setup.text)
         self.assertIn("/workspace/aria2", setup.text)
         self.assertIn('form[name="newTaskForm"]', setup.text)
-        self.assertIn("changeTab('options')", setup.text)
+        self.assertIn("changeTab('links')", setup.text)
         self.assertIn("tme3-new-task-route-control", setup.text)
         self.assertIn("tme3-edit-task-route-control", setup.text)
         self.assertIn("aria2.changeOption", setup.text)

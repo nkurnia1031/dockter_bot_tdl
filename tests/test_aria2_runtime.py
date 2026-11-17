@@ -252,6 +252,24 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertEqual(self.server.calls[-1]["params"][2]["all-proxy"], proxy_url)
         self.assertEqual(self.server.calls[-1]["params"][1], "1234567890abcdef")
 
+    def test_rpc_holds_paused_task_when_tor_route_change_cannot_be_applied(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        self.runtime.bunkr_links.tor_ready = lambda: False
+        before = len(self.server.calls)
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "edit-tor-unavailable", "method": "aria2.changeOption",
+            "params": ["1234567890abcdef", {}], "tme3_route": "tor",
+        })
+
+        self.assertIn("error", result)
+        self.assertIn("ARIA2_TOR_UNAVAILABLE", result["error"]["message"])
+        self.assertEqual(
+            [call["method"] for call in self.server.calls[before:]],
+            ["aria2.tellStatus"],
+        )
+
     def test_rpc_rejects_editing_route_while_task_is_not_paused(self):
         self.runtime.ensure()
         self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
