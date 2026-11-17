@@ -206,125 +206,254 @@ def _tts_runtime_evidence(payload) -> tuple[bool, str, str]:
 def _aria2_rpc_setup_script(worker: str) -> str:
     endpoint = json.dumps(f"/api/v1/aria2-rpc-{worker}")
     folder_key = json.dumps(f"tme3-aria2-folder:{worker}")
-    route_key = json.dumps(f"tme3-aria2-route:{worker}")
-    route_control_id = json.dumps(f"tme3-aria2-route-control-{worker}")
-    route_select_id = json.dumps(f"tme3-aria2-route-select-{worker}")
-    return f"""(() => {{
-  const endpoint = {endpoint};
-  const folderKey = {folder_key};
-  const routeKey = {route_key};
-  const routeControlId = {route_control_id};
-  const routeSelectId = {route_select_id};
+    template = r"""(() => {
+  const endpoint = __ENDPOINT__;
+  const folderKey = __FOLDER_KEY__;
+  const newRouteControl = 'tme3-new-task-route-control';
+  const taskRouteControl = 'tme3-edit-task-route-control';
   const csrf = () => document.cookie.split('; ').find((part) => part.startsWith('tme3_csrf='))?.split('=').slice(1).join('') || '';
-  const selectedRoute = () => localStorage.getItem(routeKey) === 'tor' ? 'tor' : 'non';
-  const isRpc = (url) => {{ try {{ return new URL(url, location.href).pathname === endpoint; }} catch {{ return false; }} }};
-  const installRouteControl = () => {{
-    const toolbar = document.querySelector('.main-header .navbar-toolbar .navbar-nav');
-    if (!toolbar) return false;
-    if (document.getElementById(routeControlId)) return true;
-
-    const item = document.createElement('li');
-    item.id = routeControlId;
-    item.className = 'tme3-route-control';
-    item.setAttribute('role', 'group');
-    item.setAttribute('aria-label', 'Kontrol rute unduhan');
-    item.style.display = 'flex';
-    item.style.alignItems = 'center';
-    item.style.gap = '6px';
-    item.style.height = '50px';
-    item.style.padding = '0 10px';
-
-    const label = document.createElement('label');
-    label.className = 'toolbar';
-    label.style.margin = '0';
-    label.style.fontWeight = 'normal';
-    label.appendChild(document.createTextNode('Rute'));
-
+  const isRpc = (url) => { try { return new URL(url, location.href).pathname === endpoint; } catch { return false; } };
+  const makeSelect = (id, label, placeholder = '') => {
     const select = document.createElement('select');
-    select.id = routeSelectId;
-    select.className = 'form-control input-sm';
-    select.setAttribute('aria-label', 'Rute unduhan');
-    select.title = 'Rute untuk task baru di AriaNg';
-    select.style.width = '104px';
-    select.style.height = '30px';
-    for (const [value, text] of [['non', 'Non'], ['tor', 'Tor']]) {{
+    select.id = id;
+    select.className = 'form-control';
+    select.setAttribute('aria-label', label);
+    select.style.maxWidth = '260px';
+    if (placeholder) {
+      const option = document.createElement('option');
+      option.value = '';
+      option.textContent = placeholder;
+      option.disabled = true;
+      option.selected = true;
+      select.appendChild(option);
+    }
+    for (const [value, text] of [['non', 'Non (langsung)'], ['tor', 'Tor']]) {
       const option = document.createElement('option');
       option.value = value;
       option.textContent = text;
       select.appendChild(option);
-    }}
-    select.value = selectedRoute();
-    select.addEventListener('change', () => {{
-      localStorage.setItem(routeKey, select.value === 'tor' ? 'tor' : 'non');
-    }});
-    window.addEventListener('storage', (event) => {{
-      if (event.key === routeKey) select.value = selectedRoute();
-    }});
-    label.appendChild(select);
-    item.appendChild(label);
+    }
+    return select;
+  };
+  const makeSettingsRow = (label, control) => {
+    const row = document.createElement('div');
+    row.className = 'row tme3-aria-route-row';
+    const key = document.createElement('div');
+    key.className = 'setting-key setting-key-without-desc col-sm-4';
+    const title = document.createElement('span');
+    title.textContent = label;
+    key.appendChild(title);
+    const value = document.createElement('div');
+    value.className = 'setting-value col-sm-8';
+    value.appendChild(control);
+    row.append(key, value);
+    return row;
+  };
+  const insertAtTopOfSettings = (settings, row) => {
+    const title = settings.querySelector('.settings-table-title');
+    if (title) title.insertAdjacentElement('afterend', row);
+    else settings.prepend(row);
+  };
+  const installNewTaskRouteControl = () => {
+    const form = document.querySelector('form[name="newTaskForm"]');
+    if (!form || form.querySelector(`[data-tme3-route="${newRouteControl}"]`)) return;
+    const hasOptionsTab = Array.from(form.querySelectorAll('.nav-tabs a')).some((anchor) =>
+      (anchor.getAttribute('ng-click') || '').includes("changeTab('options')")
+    );
+    const optionsPane = Array.from(form.querySelectorAll('.tab-content .tab-pane')).find((pane) =>
+      (pane.getAttribute('ng-class') || '').includes("context.currentTab === 'options'")
+    );
+    const settings = optionsPane?.querySelector('.settings-table');
+    if (!hasOptionsTab || !settings) return;
+    const select = makeSelect('tme3-new-task-route', 'Rute unduhan');
+    const row = makeSettingsRow('Rute unduh task baru', select);
+    row.dataset.tme3Route = newRouteControl;
+    const hint = document.createElement('small');
+    hint.className = 'muted';
+    hint.textContent = 'Pilihan ini hanya berlaku untuk task yang ditambahkan dari form ini.';
+    row.querySelector('.setting-value').appendChild(hint);
+    insertAtTopOfSettings(settings, row);
+  };
+  const taskDetailGid = () => {
+    const match = location.hash.match(/^#!\/task\/detail\/([0-9a-f]{16})(?:[/?]|$)/i);
+    return match ? match[1] : '';
+  };
+  let routeRequestId = 0;
+  const sendRpc = async (method, params, route) => {
+    const call = { jsonrpc: '2.0', id: `tme3-route-${++routeRequestId}`, method, params };
+    if (route) call.tme3_route = route;
+    const response = await originalFetch(endpoint, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrf() },
+      body: JSON.stringify(call)
+    });
+    const payload = await response.json();
+    if (!response.ok || payload?.error) {
+      throw new Error(payload?.error?.message || payload?.detail || 'Perubahan rute task gagal.');
+    }
+    return payload?.result;
+  };
+  const installTaskRouteControl = () => {
+    const gid = taskDetailGid();
+    if (!gid) return;
+    const existingControl = document.querySelector(`[data-tme3-route="${taskRouteControl}"]`);
+    if (existingControl?.dataset.gid === gid) return;
+    existingControl?.remove();
+    const settingsPane = Array.from(document.querySelectorAll('.tab-content .tab-pane')).find((pane) =>
+      (pane.getAttribute('ng-class') || '').includes("context.currentTab === 'settings'")
+    );
+    const settings = settingsPane?.querySelector('.settings-table');
+    if (!settings) return;
 
-    const newTaskLink = toolbar.querySelector('a[href="#!/new"]');
-    const newTaskItem = newTaskLink?.closest('li');
-    if (newTaskItem) newTaskItem.insertAdjacentElement('afterend', item);
-    else toolbar.appendChild(item);
+    const select = makeSelect('tme3-edit-task-route', 'Rute task', 'Pilih rute baru…');
+    const apply = document.createElement('button');
+    apply.type = 'button';
+    apply.className = 'btn btn-default btn-sm';
+    apply.textContent = 'Terapkan rute';
+    const status = document.createElement('span');
+    status.className = 'muted';
+    status.setAttribute('role', 'status');
+    status.style.display = 'block';
+    const controls = document.createElement('div');
+    controls.append(select, apply);
+    controls.style.display = 'flex';
+    controls.style.alignItems = 'center';
+    controls.style.gap = '8px';
+    const row = makeSettingsRow('Ubah rute task ini', controls);
+    row.dataset.tme3Route = taskRouteControl;
+    row.dataset.gid = gid;
+    const hint = document.createElement('small');
+    hint.className = 'muted';
+    hint.textContent = 'Task aktif dijeda sementara dan dilanjutkan setelah rute diterapkan.';
+    row.querySelector('.setting-value').append(hint, status);
+    apply.disabled = true;
+    select.addEventListener('change', () => { apply.disabled = !select.value; });
+    apply.addEventListener('click', async () => {
+      const route = select.value;
+      const currentGid = taskDetailGid();
+      if (!route || !currentGid) return;
+      apply.disabled = true;
+      select.disabled = true;
+      status.textContent = 'Memperbarui rute task…';
+      try {
+        const task = await sendRpc('aria2.tellStatus', [currentGid, ['status']]);
+        const wasRunning = task?.status === 'active' || task?.status === 'waiting';
+        if (!wasRunning && task?.status !== 'paused') {
+          throw new Error('Task harus aktif atau dijeda untuk mengubah rute.');
+        }
+        if (wasRunning) await sendRpc('aria2.pause', [currentGid]);
+        let changeError;
+        try {
+          await sendRpc('aria2.changeOption', [currentGid, {}], route);
+        } catch (error) {
+          changeError = error;
+        }
+        if (wasRunning) await sendRpc('aria2.unpause', [currentGid]);
+        if (changeError) throw changeError;
+        status.textContent = `Rute ${route === 'tor' ? 'Tor' : 'Non'} diterapkan pada task ini.`;
+        select.value = '';
+      } catch (error) {
+        status.textContent = error instanceof Error ? error.message : 'Perubahan rute task gagal.';
+      } finally {
+        select.disabled = false;
+        apply.disabled = !select.value;
+      }
+    });
+    insertAtTopOfSettings(settings, row);
+  };
+  const installTaskRouteControls = () => {
+    installNewTaskRouteControl();
+    installTaskRouteControl();
+  };
+  let routeControlObserver;
+  let routeControlTimeout;
+  const stopRouteControlObserver = () => {
+    if (routeControlObserver) routeControlObserver.disconnect();
+    routeControlObserver = undefined;
+    if (routeControlTimeout) window.clearTimeout(routeControlTimeout);
+    routeControlTimeout = undefined;
+  };
+  const routeControlInstalled = () => {
+    const gid = taskDetailGid();
+    if (gid) {
+      const control = document.querySelector(`[data-tme3-route="${taskRouteControl}"]`);
+      return control?.dataset.gid === gid;
+    }
+    const form = document.querySelector('form[name="newTaskForm"]');
+    if (form) return Boolean(form.querySelector(`[data-tme3-route="${newRouteControl}"]`));
     return true;
-  }};
-  const watchForToolbar = () => {{
-    if (installRouteControl()) return;
-    const observer = new MutationObserver(() => {{
-      if (installRouteControl()) observer.disconnect();
-    }});
-    observer.observe(document.documentElement, {{ childList: true, subtree: true }});
-  }};
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', watchForToolbar, {{ once: true }});
-  }} else {{
-    watchForToolbar();
-  }}
-  const withDirectory = (body) => {{
+  };
+  const watchTaskRouteControls = () => {
+    installTaskRouteControls();
+    if (routeControlInstalled()) {
+      stopRouteControlObserver();
+      return;
+    }
+    if (!routeControlObserver) {
+      routeControlObserver = new MutationObserver(() => {
+        installTaskRouteControls();
+        if (routeControlInstalled()) stopRouteControlObserver();
+      });
+      routeControlObserver.observe(document.documentElement, { childList: true, subtree: true });
+      routeControlTimeout = window.setTimeout(stopRouteControlObserver, 5000);
+    }
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', watchTaskRouteControls, { once: true });
+  } else {
+    watchTaskRouteControls();
+  }
+  window.addEventListener('hashchange', () => {
+    stopRouteControlObserver();
+    window.setTimeout(watchTaskRouteControls, 0);
+  });
+  document.addEventListener('click', (event) => {
+    if (event.target instanceof Element && event.target.closest('a[ng-click*="changeTab("]')) {
+      window.setTimeout(watchTaskRouteControls, 0);
+    }
+  });
+  const withDirectory = (body) => {
     if (typeof body !== 'string') return body;
-    try {{
+    try {
       const call = JSON.parse(body);
       if (!call || typeof call !== 'object' || !Array.isArray(call.params)) return body;
-      const index = {{ 'aria2.addUri': 1, 'aria2.addTorrent': 2, 'aria2.addMetalink': 1 }}[call.method];
-      if (index !== undefined) {{
-        while (call.params.length <= index) call.params.push(null);
-        const options = call.params[index] && typeof call.params[index] === 'object' ? call.params[index] : {{}};
-        options.dir = localStorage.getItem(folderKey) || '/workspace/aria2';
-        options['allow-overwrite'] = 'false';
-        options['auto-file-renaming'] = 'false';
-        call.params[index] = options;
-        call.tme3_route = selectedRoute();
-      }} else if (call.method === 'aria2.unpause') {{
-        call.tme3_route = selectedRoute();
-      }} else {{
-        return body;
-      }}
+      const index = { 'aria2.addUri': 1, 'aria2.addTorrent': 2, 'aria2.addMetalink': 1 }[call.method];
+      if (index === undefined) return body;
+      while (call.params.length <= index) call.params.push(null);
+      const options = call.params[index] && typeof call.params[index] === 'object' ? call.params[index] : {};
+      options.dir = localStorage.getItem(folderKey) || '/workspace/aria2';
+      options['allow-overwrite'] = 'false';
+      options['auto-file-renaming'] = 'false';
+      call.params[index] = options;
+      const routeSelect = document.querySelector('form[name="newTaskForm"] #tme3-new-task-route');
+      call.tme3_route = routeSelect?.value === 'tor' ? 'tor' : 'non';
       return JSON.stringify(call);
-    }} catch {{ return body; }}
-  }};
+    } catch { return body; }
+  };
   const originalOpen = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url, ...rest) {{
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     this.__tme3Aria2Rpc = isRpc(url);
     return originalOpen.call(this, method, url, ...rest);
-  }};
+  };
   const originalSend = XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send = function(body) {{
-    if (this.__tme3Aria2Rpc) {{
+  XMLHttpRequest.prototype.send = function(body) {
+    if (this.__tme3Aria2Rpc) {
       this.setRequestHeader('X-CSRF-Token', csrf());
       body = withDirectory(body);
-    }}
+    }
     return originalSend.call(this, body);
-  }};
+  };
   const originalFetch = window.fetch.bind(window);
-  window.fetch = (input, init = {{}}) => {{
+  window.fetch = (input, init = {}) => {
     const url = input instanceof Request ? input.url : input;
     if (!isRpc(url)) return originalFetch(input, init);
     const headers = new Headers(init.headers || (input instanceof Request ? input.headers : undefined));
     headers.set('X-CSRF-Token', csrf());
-    return originalFetch(input, {{ ...init, headers, body: withDirectory(init.body) }});
-  }};
-}})();"""
+    return originalFetch(input, { ...init, headers, body: withDirectory(init.body) });
+  };
+})()"""
+    return template.replace("__ENDPOINT__", endpoint).replace("__FOLDER_KEY__", folder_key)
 
 
 def _read_profile_inventory(context, worker: str, *, start_upload_prep: bool) -> dict:

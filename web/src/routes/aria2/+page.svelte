@@ -64,7 +64,7 @@
   let selectedWorker = $state('');
   let activeTab = $state<'ariang' | 'bunkr'>('ariang');
   let ariaNgZoom = $state(100);
-  let selectedRoute = $state<'non' | 'tor'>('non');
+  let bunkrRoute = $state<'non' | 'tor'>('non');
   let selectedFolders = $state<string[]>([]);
   let health = $state<Health | null>(null);
   let iframeSrc = $state('');
@@ -106,12 +106,7 @@
   }
 
   function folderStorageKey(worker: string) { return `tme3-aria2-folder:${worker}`; }
-  function routeStorageKey(worker: string) { return `tme3-aria2-route:${worker}`; }
   function zoomStorageKey(worker: string) { return `tme3-aria2-zoom:${worker}`; }
-  function readRoute(worker: string): 'non' | 'tor' {
-    if (typeof window === 'undefined') return 'non';
-    return localStorage.getItem(routeStorageKey(worker)) === 'tor' ? 'tor' : 'non';
-  }
   function readZoom(worker: string) {
     if (typeof window === 'undefined') return 100;
     const stored = Number(localStorage.getItem(zoomStorageKey(worker)));
@@ -125,10 +120,6 @@
   }
   function changeZoom(amount: number) { setZoom(ariaNgZoom + amount); }
   function resetZoom() { setZoom(100); }
-  function syncRouteFromStorage(event: StorageEvent) {
-    if (!selectedWorker || event.key !== routeStorageKey(selectedWorker)) return;
-    selectedRoute = event.newValue === 'tor' ? 'tor' : 'non';
-  }
   function selectedFolder(worker = selectedWorker) {
     return selectedFolders[0] || (typeof window !== 'undefined' ? localStorage.getItem(folderStorageKey(worker)) : '') || '/workspace/aria2';
   }
@@ -291,7 +282,6 @@
       }
       if (selectedWorker) {
         ariaNgZoom = readZoom(selectedWorker);
-        selectedRoute = readRoute(selectedWorker);
         await inspect(selectedWorker);
       }
     } catch (cause) {
@@ -328,7 +318,7 @@
   function changeWorker(event: Event) {
     selectedWorker = (event.currentTarget as HTMLSelectElement).value;
     ariaNgZoom = readZoom(selectedWorker);
-    selectedRoute = readRoute(selectedWorker);
+    bunkrRoute = 'non';
     selectedFolders = selectedWorker
       ? [localStorage.getItem(folderStorageKey(selectedWorker)) || '/workspace/aria2']
       : [];
@@ -354,16 +344,8 @@
     }
   });
 
-  $effect(() => {
-    if (typeof window !== 'undefined' && selectedWorker) {
-      localStorage.setItem(routeStorageKey(selectedWorker), selectedRoute);
-    }
-  });
-
   onMount(() => {
-    window.addEventListener('storage', syncRouteFromStorage);
     void loadWorkers();
-    return () => window.removeEventListener('storage', syncRouteFromStorage);
   });
 </script>
 
@@ -450,7 +432,7 @@
           {/if}
         </div>
         <div id="bunkr-panel" role="tabpanel" aria-labelledby="bunkr-tab" aria-label="Bunkr" hidden={activeTab !== 'bunkr'}>
-          <Aria2BunkrPanel bind:route={selectedRoute} worker={selectedWorker} directory={selectedFolder()} active={activeTab === 'bunkr'} />
+          <Aria2BunkrPanel bind:route={bunkrRoute} worker={selectedWorker} directory={selectedFolder()} active={activeTab === 'bunkr'} />
         </div>
       </div>
     {:else if !health && !inspecting}

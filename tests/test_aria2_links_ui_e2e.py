@@ -213,7 +213,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
         finally:
             context.close()
 
-    def test_native_ariang_route_picker_is_inside_iframe_and_applies_to_new_tasks(self) -> None:
+    def test_native_ariang_route_picker_is_per_task_in_the_new_options_tab(self) -> None:
         from playwright.sync_api import expect
         from tme3bot.api.routes.workers import _aria2_rpc_setup_script
 
@@ -252,22 +252,47 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                     "body": body,
                     "csrf": request.headers.get("x-csrf-token", ""),
                 })
+                method = body.get("method")
+                if method == "aria2.tellStatus":
+                    result = {"gid": body["params"][0], "status": "active"}
+                elif method in {"aria2.pause", "aria2.changeOption"}:
+                    result = "OK"
+                elif method == "aria2.unpause":
+                    result = "active"
+                else:
+                    result = "new-gid"
                 route.fulfill(status=200, content_type="application/json", body=json.dumps({
-                    "jsonrpc": "2.0", "id": body.get("id"), "result": "new-gid",
+                    "jsonrpc": "2.0", "id": body.get("id"), "result": result,
                 }))
                 return
             elif path == "/aria2-ui/local/index.html":
                 body = f"""<!doctype html>
-<html><head><meta charset="utf-8"><script>{setup_script}</script></head>
+<html><head><meta charset="utf-8"><style>.tab-pane {{ display: none; }} .tab-pane.active {{ display: block; }}</style><script>{setup_script}</script></head>
 <body class="hold-transition skin-aria-ng sidebar-mini fixed">
   <header class="main-header"><nav class="navbar"><div class="navbar-toolbar">
     <ul class="nav navbar-nav"><li><a class="toolbar" href="#!/new">New</a></li></ul>
   </div></nav></header>
-  <main><form id="new-task"><label for="task-uri">URI</label>
-    <input id="task-uri" value="https://example.test/file.bin">
+  <main><form id="new-task" name="newTaskForm">
+    <div class="nav-tabs-custom">
+      <ul class="nav nav-tabs" role="tablist">
+        <li class="active"><a role="tab" aria-selected="true" data-tab="links" ng-click="changeTab('links')">Links</a></li>
+        <li><a role="tab" aria-selected="false" data-tab="options" ng-click="changeTab('options')">Options</a></li>
+      </ul>
+      <div class="tab-content">
+        <div class="tab-pane active" data-panel="links" ng-class="{{'active': context.currentTab === 'links'}}"><label for="task-uri">URI</label>
+          <input id="task-uri" value="https://example.test/file.bin"></div>
+        <div class="tab-pane" data-panel="options" ng-class="{{'active': context.currentTab === 'options'}}"><div class="settings-table"></div></div>
+      </div>
+    </div>
     <button type="submit">Add task</button>
   </form></main>
   <script>
+    document.querySelectorAll('[data-tab]').forEach((tab) => tab.addEventListener('click', () => {{
+      document.querySelectorAll('[data-tab]').forEach((item) => item.setAttribute('aria-selected', String(item === tab)));
+      document.querySelectorAll('[data-panel]').forEach((panel) => {{
+        panel.classList.toggle('active', panel.dataset.panel === tab.dataset.tab);
+      }});
+    }}));
     document.getElementById('new-task').addEventListener('submit', (event) => {{
       event.preventDefault();
       const request = new XMLHttpRequest();
@@ -290,12 +315,13 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
         try:
             page.goto(f"{self.origin}/aria2/", wait_until="domcontentloaded")
             frame = page.frame_locator('iframe[title="aria2 local"]')
-            route_picker = frame.get_by_role("combobox", name="Rute unduhan")
+            frame.get_by_role("tab", name="Options").click()
+            options_panel = frame.locator("form[name='newTaskForm'] .tab-pane[data-panel='options']")
+            expect(options_panel).to_be_visible()
+            route_picker = frame.locator("form[name='newTaskForm']").get_by_role("combobox", name="Rute unduhan")
             expect(route_picker).to_be_visible(timeout=10000)
             route_picker.select_option("tor")
-            page.get_by_role("tab", name="Bunkr").click()
-            expect(page.get_by_label("Rute unduh", exact=True)).to_have_value("tor")
-            page.get_by_role("tab", name="AriaNg").click()
+            frame.get_by_role("tab", name="Links").click()
             with page.expect_response(
                 lambda response: response.url.endswith("/aria2-rpc-local")
                 and response.request.method == "POST"
@@ -314,7 +340,45 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                 }],
                 "tme3_route": "tor",
             })
-            self.assertEqual(page.get_by_label("Rute unduhan").count(), 0)
+            self.assertEqual(frame.locator(".navbar-toolbar").get_by_label("Rute unduhan").count(), 0)
+            self.assertIsNone(frame.locator("body").evaluate("() => localStorage.getItem('tme3-aria2-route:local')"))
+
+            frame.get_by_role("tab", name="Options").click()
+            route_picker.select_option("non")
+            frame.get_by_role("tab", name="Links").click()
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+            ):
+                frame.get_by_role("button", name="Add task").click()
+            direct_call = [call for call in rpc_calls if call["body"].get("method") == "aria2.addUri"][-1]
+            self.assertEqual(direct_call["body"].get("tme3_route"), "non")
+
+            frame.locator("main").evaluate("""(main) => {
+              main.innerHTML = `<section class="content"><div class="nav-tabs-custom">
+                <ul class="nav nav-tabs"><li class="active"><a ng-click="changeTab('settings')">Settings</a></li></ul>
+                <div class="tab-content"><div class="tab-pane active" ng-class="{'active': context.currentTab === 'settings'}">
+                  <div class="settings-table"></div>
+                </div></div>
+              </div></section>`;
+              location.hash = '#!/task/detail/0123456789abcdef';
+            }""")
+            edit_control = frame.locator('[data-tme3-route="tme3-edit-task-route-control"]')
+            expect(edit_control).to_be_visible(timeout=10000)
+            frame.get_by_label("Rute task").select_option("tor")
+            frame.get_by_role("button", name="Terapkan rute").click()
+            expect(edit_control.get_by_role("status")).to_have_text(
+                "Rute Tor diterapkan pada task ini.", timeout=10000
+            )
+            edited_calls = rpc_calls[-4:]
+            self.assertEqual(
+                [call["body"]["method"] for call in edited_calls],
+                ["aria2.tellStatus", "aria2.pause", "aria2.changeOption", "aria2.unpause"],
+            )
+            self.assertEqual(edited_calls[2]["body"].get("tme3_route"), "tor")
+            self.assertEqual(edited_calls[2]["body"]["params"], ["0123456789abcdef", {}])
+            self.assertNotIn("tme3_route", edited_calls[-1]["body"])
+            self.assertTrue(all(call["csrf"] == "local-e2e-csrf" for call in edited_calls))
         finally:
             context.close()
 

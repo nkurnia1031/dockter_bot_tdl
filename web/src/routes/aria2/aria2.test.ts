@@ -60,7 +60,7 @@ describe('AriaNg worker readiness', () => {
     expect(apiMock).toHaveBeenCalledWith('/workers/remote-1/aria2/health');
   });
 
-  it('keeps the native route selector inside AriaNg and syncs its route with Bunkr per worker', async () => {
+  it('keeps the native route choice per task and does not persist it globally', async () => {
     window.localStorage.setItem('tme3-aria2-route:remote-1', 'tor');
     render(Aria2Page);
     await screen.findByTitle('aria2 remote-1');
@@ -69,18 +69,20 @@ describe('AriaNg worker readiness', () => {
     expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBe('tor');
 
     await fireEvent.click(await screen.findByRole('tab', { name: 'Bunkr' }));
-    expect((screen.getByLabelText('Rute unduh') as HTMLSelectElement).value).toBe('tor');
+    expect((screen.getByLabelText('Rute unduh') as HTMLSelectElement).value).toBe('non');
+    await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'tor' } });
+    expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBe('tor');
+    await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'non' } });
+    expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBe('tor');
 
     const workerPicker = screen.getByRole('combobox', { name: 'Worker' });
     await fireEvent.change(workerPicker, { target: { value: 'remote-2' } });
     await screen.findByTitle('aria2 remote-2');
     expect((screen.getByLabelText('Rute unduh') as HTMLSelectElement).value).toBe('non');
-
-    await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'tor' } });
-    expect(window.localStorage.getItem('tme3-aria2-route:remote-2')).toBe('tor');
     await fireEvent.change(workerPicker, { target: { value: 'remote-1' } });
     await screen.findByTitle('aria2 remote-1');
-    expect((screen.getByLabelText('Rute unduh') as HTMLSelectElement).value).toBe('tor');
+    expect((screen.getByLabelText('Rute unduh') as HTMLSelectElement).value).toBe('non');
+    expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBe('tor');
   });
 
   it('opens a standalone Bunkr panel outside the AriaNg iframe', async () => {
@@ -88,10 +90,10 @@ describe('AriaNg worker readiness', () => {
     await screen.findByTitle('aria2 remote-1');
 
     expect(screen.queryByRole('combobox', { name: 'Rute unduhan' })).toBeNull();
-    await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'tor' } });
 
     const bunkrTab = await screen.findByRole('tab', { name: 'Bunkr' });
     await fireEvent.click(bunkrTab);
+    await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'tor' } });
 
     expect(screen.getByRole('tabpanel', { name: 'Bunkr' })).toBeTruthy();
     expect(screen.getByLabelText('Link Bunkr atau URL langsung')).toBeTruthy();
@@ -99,7 +101,7 @@ describe('AriaNg worker readiness', () => {
     expect(screen.getByTitle('aria2 remote-1').closest('[role="tabpanel"]')?.hasAttribute('hidden')).toBe(true);
 
     await fireEvent.change(screen.getByLabelText('Rute unduh'), { target: { value: 'non' } });
-    expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBe('non');
+    expect(window.localStorage.getItem('tme3-aria2-route:remote-1')).toBeNull();
   });
 
   it('loads and saves only safe transfer settings through the authenticated bridge', async () => {

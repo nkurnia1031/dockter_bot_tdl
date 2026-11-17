@@ -282,7 +282,7 @@ class Aria2Runtime:
         route_requested = "tme3_route" in request_payload
         requested_route = request_payload.get("tme3_route")
         route_methods = {
-            "aria2.addUri", "aria2.addTorrent", "aria2.addMetalink", "aria2.unpause",
+            "aria2.addUri", "aria2.addTorrent", "aria2.addMetalink", "aria2.changeOption",
         }
         if route_requested and (
             method not in route_methods
@@ -327,6 +327,17 @@ class Aria2Runtime:
         elif method == "aria2.changeOption":
             if len(params) < 2:
                 return _rpc_error(request_id, -32602, "Download options are required.")
+            if route_requested and (
+                not isinstance(params[0], str)
+                or not re.fullmatch(r"[0-9a-fA-F]{16}", params[0])
+            ):
+                return _rpc_error(request_id, -32602, "Aria2 task id is invalid.")
+            if route_requested and self.bunkr_links.store.contains(params[0]):
+                return _rpc_error(
+                    request_id,
+                    -32602,
+                    "Task ini dikelola dari tab Bunkr; ubah rute melalui daftar task Bunkr.",
+                )
             safe_options, error = self._safe_download_options(params[1], create=False)
             if error:
                 return _rpc_error(request_id, -32602, error)
@@ -345,21 +356,22 @@ class Aria2Runtime:
                 secret = self.secret_file.read_text(encoding="utf-8").strip()
                 if not secret:
                     return _rpc_error(request_id, -32000, "Aria2 RPC is not configured.")
-                if (
-                    route_requested
-                    and method == "aria2.unpause"
-                    and params
-                    and isinstance(params[0], str)
-                    and re.fullmatch(r"[0-9a-fA-F]{16}", params[0])
-                    and not self.bunkr_links.store.contains(params[0])
-                ):
-                    status = self._internal_rpc(secret, "tellStatus", params[0], ["status"])
-                    if isinstance(status, dict) and status.get("status") == "paused":
-                        try:
-                            route_options = self.bunkr_links.route_options_for(requested_route)
-                        except BunkrLinkError as exc:
-                            return _rpc_error(request_id, -32000, str(exc))
-                        self._internal_rpc(secret, "changeOption", params[0], route_options)
+                if route_requested and method == "aria2.changeOption":
+                    try:
+                        status = self._internal_rpc(secret, "tellStatus", params[0], ["status"])
+                    except Exception:
+                        return _rpc_error(request_id, -32000, "Status task tidak dapat diperiksa.")
+                    if not isinstance(status, dict) or status.get("status") != "paused":
+                        return _rpc_error(
+                            request_id,
+                            -32000,
+                            "Jeda task sebelum mengganti rute unduhan.",
+                        )
+                    try:
+                        route_options = self.bunkr_links.route_options_for(requested_route)
+                    except BunkrLinkError as exc:
+                        return _rpc_error(request_id, -32000, str(exc))
+                    params[1].update(route_options)
                 body = json.dumps({
                     "jsonrpc": "2.0",
                     "id": request_id,

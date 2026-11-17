@@ -29,7 +29,10 @@ class _Aria2RpcHandler(BaseHTTPRequestHandler):
             if method in {"aria2.addUri", "aria2.addTorrent", "aria2.addMetalink"}:
                 result = "new-gid"
             elif method == "aria2.tellStatus":
-                result = {"gid": request.get("params", [None, ""])[1], "status": "paused"}
+                result = {
+                    "gid": request.get("params", [None, ""])[1],
+                    "status": getattr(self.server, "task_status", "paused"),
+                }
             elif method == "aria2.changeOption":
                 result = "OK"
             elif method == "aria2.unpause":
@@ -231,7 +234,7 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertIn("ARIA2_TOR_UNAVAILABLE", result["error"]["message"])
         self.assertEqual(len(self.server.calls), before)
 
-    def test_rpc_applies_selected_route_when_resuming_an_unmanaged_paused_task(self):
+    def test_rpc_applies_selected_route_only_to_the_paused_task_being_edited(self):
         self.runtime.ensure()
         self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
         proxy_url = "http://aria2:proxy-secret@tts-1:8118"
@@ -239,16 +242,46 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.runtime.bunkr_links.tor_proxy_url = lambda: proxy_url
 
         result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "edit-tor", "method": "aria2.changeOption",
+            "params": ["1234567890abcdef", {}], "tme3_route": "tor",
+        })
+
+        self.assertEqual(result["result"], "OK")
+        methods = [call["method"] for call in self.server.calls[-2:]]
+        self.assertEqual(methods, ["aria2.tellStatus", "aria2.changeOption"])
+        self.assertEqual(self.server.calls[-1]["params"][2]["all-proxy"], proxy_url)
+        self.assertEqual(self.server.calls[-1]["params"][1], "1234567890abcdef")
+
+    def test_rpc_rejects_editing_route_while_task_is_not_paused(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        self.server.task_status = "active"
+        before = len(self.server.calls)
+
+        result = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "edit-active", "method": "aria2.changeOption",
+            "params": ["1234567890abcdef", {}], "tme3_route": "tor",
+        })
+
+        self.assertIn("error", result)
+        self.assertIn("jeda", result["error"]["message"].lower())
+        calls = self.server.calls[before:]
+        self.assertEqual([call["method"] for call in calls], ["aria2.tellStatus"])
+
+    def test_rpc_rejects_route_metadata_on_unpause(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        before = len(self.server.calls)
+
+        result = self.runtime.rpc({
             "jsonrpc": "2.0", "id": "resume-tor", "method": "aria2.unpause",
             "params": ["1234567890abcdef"], "tme3_route": "tor",
         })
 
-        self.assertEqual(result["result"], "active")
-        methods = [call["method"] for call in self.server.calls[-3:]]
-        self.assertEqual(methods, ["aria2.tellStatus", "aria2.changeOption", "aria2.unpause"])
-        self.assertEqual(self.server.calls[-2]["params"][2]["all-proxy"], proxy_url)
+        self.assertIn("error", result)
+        self.assertEqual(self.server.calls[before:], [])
 
-    def test_rpc_does_not_change_managed_links_route_when_resumed_through_ariang(self):
+    def test_rpc_rejects_route_edit_for_tasks_owned_by_bunkr_links(self):
         self.runtime.ensure()
         self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
         task_key = self.runtime.bunkr_links.store.reserve({
@@ -259,12 +292,12 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.runtime.bunkr_links.store.set_gid(task_key, "1234567890abcdef", status="queued")
 
         result = self.runtime.rpc({
-            "jsonrpc": "2.0", "id": "resume-managed", "method": "aria2.unpause",
-            "params": ["1234567890abcdef"], "tme3_route": "non",
+            "jsonrpc": "2.0", "id": "edit-managed", "method": "aria2.changeOption",
+            "params": ["1234567890abcdef", {}], "tme3_route": "non",
         })
 
-        self.assertEqual(result["result"], "active")
-        self.assertEqual([call["method"] for call in self.server.calls[-1:]], ["aria2.unpause"])
+        self.assertIn("error", result)
+        self.assertEqual(self.server.calls, [])
 
     def test_rpc_rejects_paths_outside_workspace_and_managed_methods(self):
         self.runtime.ensure()
