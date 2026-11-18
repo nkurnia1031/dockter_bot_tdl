@@ -347,7 +347,11 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
     unrelated.addEventListener('click', () => submitTask('https://unrelated.example.test/other.bin'));
     document.getElementById('new-task').addEventListener('submit', (event) => {{
       event.preventDefault();
-      window.setTimeout(() => submitTask(document.getElementById('task-uri').value), 750);
+      if (window.dropNextTaskSubmission) {{
+        window.dropNextTaskSubmission = false;
+        return;
+      }}
+      submitTask(document.getElementById('task-uri').value);
     }});
   </script>
 </body></html>"""
@@ -404,33 +408,45 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             direct_call = [call for call in rpc_calls if call["body"].get("method") == "aria2.addUri"][-1]
             self.assertEqual(direct_call["body"].get("tme3_route"), "non")
 
+            # A cookie form submit whose AriaNg handler never creates an RPC
+            # must not leave a cookie waiting for a later task with the same URL.
             cookie_bytes = (
                 b"# Netscape HTTP Cookie File\n"
                 b".example.test\tTRUE\t/\tTRUE\t2000000000\tsid\tui-cookie-secret\n"
             )
+            stale_url = "https://example.test/same-url.bin"
+            rpc_count_before_stale = len(rpc_calls)
+            frame.locator("#task-uri").fill(stale_url)
+            frame.locator("#tme3-cookie-file").set_input_files({
+                "name": "cookies.txt", "mimeType": "text/plain", "buffer": cookie_bytes,
+            })
+            frame.locator("form[name='newTaskForm']").evaluate(
+                "form => { form.ownerDocument.defaultView.dropNextTaskSubmission = true; }"
+            )
+            frame.get_by_role("button", name="Add task").click()
+            self.assertEqual(len(rpc_calls), rpc_count_before_stale)
+            self.assertEqual(frame.locator("#tme3-cookie-file").input_value(), "")
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+                and stale_url in (response.request.post_data or "")
+            ):
+                frame.get_by_role("button", name="Add task").click()
+            stale_followup = rpc_calls[-1]
+            self.assertEqual(stale_followup["path"], "/aria2-rpc-local")
+            self.assertNotIn("cookie_bytes", stale_followup)
+
+            cookie_url = "https://example.test/cookie-url.bin"
+            frame.locator("#task-uri").fill(cookie_url)
             route_picker.select_option("tor")
             frame.locator("#tme3-cookie-file").set_input_files({
                 "name": "cookies.txt", "mimeType": "text/plain", "buffer": cookie_bytes,
             })
-            frame.get_by_role("button", name="Add task").click()
-            route_picker.select_option("non")
-            with page.expect_response(
-                lambda response: response.url.endswith("/aria2-rpc-local")
-                and response.request.method == "POST"
-                and "unrelated.example.test/other.bin" in (response.request.post_data or "")
-            ):
-                frame.locator("#unrelated-task").click()
             with page.expect_response(
                 lambda response: response.url.endswith("/aria2-cookie-rpc-local")
                 and response.request.method == "POST"
             ):
-                page.wait_for_timeout(800)
-            unrelated_call = next(
-                call for call in rpc_calls
-                if call["path"] == "/aria2-rpc-local"
-                and "unrelated.example.test/other.bin" in json.dumps(call["body"])
-            )
-            self.assertNotIn("cookie_bytes", unrelated_call)
+                frame.get_by_role("button", name="Add task").click()
             cookie_call = rpc_calls[-1]
             self.assertEqual(cookie_call["cookie_bytes"], cookie_bytes)
             self.assertTrue(str(cookie_call["content_type"]).startswith("multipart/form-data; boundary="))
@@ -438,6 +454,47 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             self.assertEqual(cookie_call["body"].get("tme3_route"), "tor")
             self.assertEqual(cookie_call["body"]["method"], "aria2.addUri")
             self.assertEqual(frame.locator("#tme3-cookie-file").input_value(), "")
+
+            second_cookie_bytes = (
+                b"# Netscape HTTP Cookie File\n"
+                b".example.test\tTRUE\t/\tTRUE\t2000000000\tsid\tsecond-cookie-fixture\n"
+            )
+            route_picker.select_option("non")
+            frame.locator("#tme3-cookie-file").set_input_files({
+                "name": "cookies.txt", "mimeType": "text/plain", "buffer": second_cookie_bytes,
+            })
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-cookie-rpc-local")
+                and response.request.method == "POST"
+            ):
+                frame.get_by_role("button", name="Add task").click()
+            second_cookie_call = rpc_calls[-1]
+            self.assertEqual(second_cookie_call["cookie_bytes"], second_cookie_bytes)
+            self.assertEqual(second_cookie_call["body"].get("tme3_route"), "non")
+
+            route_picker.select_option("non")
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+                and cookie_url in (response.request.post_data or "")
+            ):
+                frame.get_by_role("button", name="Add task").click()
+            repeated_call = rpc_calls[-1]
+            self.assertEqual(repeated_call["path"], "/aria2-rpc-local")
+            self.assertNotIn("cookie_bytes", repeated_call)
+
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+                and "unrelated.example.test/other.bin" in (response.request.post_data or "")
+            ):
+                frame.locator("#unrelated-task").click()
+            unrelated_call = next(
+                call for call in rpc_calls
+                if call["path"] == "/aria2-rpc-local"
+                and "unrelated.example.test/other.bin" in json.dumps(call["body"])
+            )
+            self.assertNotIn("cookie_bytes", unrelated_call)
             self.assertNotIn("ui-cookie-secret", page.locator("body").inner_text())
 
             route_picker.select_option("non")

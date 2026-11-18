@@ -9,6 +9,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -17,6 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from tme3bot.api.backend import BackendContext, create_backend_app, job_dict
+from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService, PreparedOperation
@@ -28,6 +30,7 @@ from tme3bot.infrastructure.activity_journal import ActivityJournalStore
 from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistoryStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
+from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
 from tme3bot.infrastructure.local_profile_catalog import LocalProfileCatalog
 from tme3bot.infrastructure.profile_scan_store import ProfileScanOperationStore
 from tme3bot.infrastructure.operation_store import SqliteOperationStore
@@ -40,6 +43,8 @@ from tme3bot.profile_registry import ProfileRegistry
 from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_links import sign_storage_item
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
+from tme3bot.worker.aria2_cookie_relay import Aria2CookieRelayServer
+from tme3bot.worker.aria2_runtime import Aria2Runtime
 
 
 class FakeProfiles:
@@ -3102,6 +3107,158 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("tme3_route", setup.text)
         self.assertNotIn("data-tme3-links-panel", setup.text)
         self.assertNotIn("token:", setup.text)
+
+    def test_aria2_cookie_submission_crosses_backend_dispatcher_worker_runtime_and_relay(self):
+        worker_token = "integration-worker-token"
+        rpc_secret = "integration-aria2-secret"
+        root = Path(self.temp.name)
+        state_root = root / "cookie-worker-db" / "aria2"
+        workspace = root / "workspace"
+        runtime = Aria2Runtime(
+            state_root=state_root,
+            workspace_root=workspace,
+            rpc_url="http://127.0.0.1:1/jsonrpc",
+            cookie_relay_url="http://127.0.0.1:1",
+        )
+        runtime.ensure()
+        runtime.secret_file.write_text(rpc_secret + "\n", encoding="utf-8")
+
+        class FakeAria2:
+            def __init__(self):
+                self.calls = []
+                self.gid = "0123456789abcdef"
+                self.uris = []
+                self.options = {}
+
+            def __call__(self, method, *params):
+                self.calls.append((method, params))
+                if method == "addUri":
+                    self.uris, self.options = params
+                    return self.gid
+                if method == "tellActive":
+                    return [{"gid": self.gid, "status": "active", "files": []}]
+                if method in {"tellWaiting", "tellStopped"}:
+                    return []
+                return "OK"
+
+        aria2 = FakeAria2()
+        relay = Aria2CookieRelayServer(
+            state_root=state_root,
+            rpc=aria2,
+            rpc_secret=lambda: rpc_secret,
+            tor_proxy_url=lambda: "",
+            listen_host="127.0.0.1",
+            listen_port=0,
+        )
+        relay.start()
+        runtime.cookie_relay_url = relay.base_url
+
+        class RuntimeExecutor:
+            def aria2_rpc_with_cookie(self, request_payload, cookie_file):
+                return runtime.rpc(request_payload, cookie_file=cookie_file)
+
+        class OriginHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.cookies.append(self.headers.get("Cookie", ""))
+                body = b"archive bytes"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        origin = ThreadingHTTPServer(("127.0.0.1", 0), OriginHandler)
+        origin.cookies = []
+        origin_thread = threading.Thread(target=origin.serve_forever, daemon=True)
+        origin_thread.start()
+        worker_app = create_worker_app(
+            WorkerContext(
+                type("Config", (), {"worker_api_token": worker_token})(),
+                RuntimeExecutor(),
+            )
+        )
+
+        try:
+            with TestClient(worker_app) as worker_client:
+                class WorkerForwarder(BaseHTTPRequestHandler):
+                    def do_POST(self):
+                        length = int(self.headers.get("Content-Length", "0"))
+                        body = self.rfile.read(length)
+                        response = worker_client.post(
+                            self.path,
+                            content=body,
+                            headers={
+                                "Authorization": self.headers.get("Authorization", ""),
+                                "Content-Type": self.headers.get("Content-Type", "application/json"),
+                            },
+                        )
+                        content = response.content
+                        self.send_response(response.status_code)
+                        self.send_header(
+                            "Content-Type", response.headers.get("content-type", "application/json")
+                        )
+                        self.send_header("Content-Length", str(len(content)))
+                        self.end_headers()
+                        self.wfile.write(content)
+
+                    def log_message(self, _format, *_args):
+                        pass
+
+                worker_http = ThreadingHTTPServer(("127.0.0.1", 0), WorkerForwarder)
+                worker_thread = threading.Thread(target=worker_http.serve_forever, daemon=True)
+                worker_thread.start()
+                try:
+                    self.workers.values["local"] = {
+                        "url": f"http://127.0.0.1:{worker_http.server_port}",
+                        "token": worker_token,
+                        "enabled": True,
+                    }
+                    self.context.worker_dispatcher = WorkerHttpDispatcher(self.workers)
+                    source_url = f"http://127.0.0.1:{origin.server_port}/archive.zip"
+                    cookie_bytes = (
+                        b"# Netscape HTTP Cookie File\n"
+                        b"127.0.0.1\tFALSE\t/\tFALSE\t2000000000\tsid\tprivate-cookie-fixture\n"
+                    )
+                    request_payload = {
+                        "jsonrpc": "2.0",
+                        "id": "cross-layer-cookie",
+                        "method": "aria2.addUri",
+                        "params": [[source_url], {"out": "archive.zip"}],
+                        "tme3_route": "non",
+                    }
+                    response = self.client.post(
+                        "/api/v1/aria2-cookie-rpc-local",
+                        headers=self.login(),
+                        data={"request": json.dumps(request_payload)},
+                        files={"cookies": ("cookies.txt", cookie_bytes, "text/plain")},
+                    )
+
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertEqual(response.json(), {
+                        "jsonrpc": "2.0", "id": "cross-layer-cookie", "result": aria2.gid,
+                    })
+                    self.assertEqual([call[0] for call in aria2.calls], ["addUri"])
+                    self.assertNotIn(source_url, aria2.uris)
+                    self.assertEqual(len(aria2.uris), 1)
+                    self.assertNotIn("private-cookie-fixture", response.text)
+                    self.assertNotIn("private-cookie-fixture", json.dumps(aria2.uris))
+
+                    from urllib.request import urlopen
+
+                    with urlopen(aria2.uris[0], timeout=5) as download:
+                        self.assertEqual(download.read(), b"archive bytes")
+                    self.assertEqual(origin.cookies, ["sid=private-cookie-fixture"])
+                finally:
+                    worker_http.shutdown()
+                    worker_http.server_close()
+                    worker_thread.join(timeout=2)
+        finally:
+            relay.close()
+            origin.shutdown()
+            origin.server_close()
+            origin_thread.join(timeout=2)
 
     def test_aria2_links_proxy_is_authenticated_worker_scoped_and_returns_no_signed_urls(self):
         denied = self.client.post(

@@ -465,18 +465,11 @@ def _aria2_rpc_setup_script(worker: str) -> str:
       return JSON.stringify(call);
     } catch { return body; }
   };
-  const cookieSubmissions = [];
-  const cookieSubmissionTtlMs = 5 * 60 * 1000;
-  const maxCookieSubmissions = 8;
-  const pruneCookieSubmissions = () => {
-    const now = Date.now();
-    for (let index = cookieSubmissions.length - 1; index >= 0; index -= 1) {
-      if (cookieSubmissions[index].expiresAt <= now) cookieSubmissions.splice(index, 1);
-    }
-  };
+  let activeCookieSubmission = null;
   document.addEventListener('submit', (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || form.getAttribute('name') !== 'newTaskForm') return;
+    activeCookieSubmission = null;
     const input = form.querySelector('#tme3-cookie-file');
     const file = input?.files?.[0] || null;
     if (input) input.value = '';
@@ -493,15 +486,14 @@ def _aria2_rpc_setup_script(worker: str) -> str:
       file,
       remaining,
       route: routeSelect?.value === 'tor' ? 'tor' : 'non',
-      expiresAt: Date.now() + cookieSubmissionTtlMs,
     };
-    pruneCookieSubmissions();
-    cookieSubmissions.push(submission);
-    while (cookieSubmissions.length > maxCookieSubmissions) cookieSubmissions.shift();
+    activeCookieSubmission = submission;
+    // AriaNg creates its addUri requests while handling this form submission.
+    // Expire the association after the event turn so a dropped/failed submit
+    // cannot lend its cookie to a later task that happens to reuse the URL.
     window.setTimeout(() => {
-      const index = cookieSubmissions.indexOf(submission);
-      if (index >= 0) cookieSubmissions.splice(index, 1);
-    }, cookieSubmissionTtlMs);
+      if (activeCookieSubmission === submission) activeCookieSubmission = null;
+    }, 0);
   }, true);
   const cookieMultipart = (body) => {
     if (typeof body !== 'string') return null;
@@ -511,18 +503,13 @@ def _aria2_rpc_setup_script(worker: str) -> str:
         ? call.params[0].filter((uri) => typeof uri === 'string')
         : [];
       if (!requestUris.length) return null;
-      pruneCookieSubmissions();
-      const submissionIndex = cookieSubmissions.findIndex((submission) =>
-        requestUris.every((uri) => (submission.remaining.get(uri) || 0) > 0)
-      );
-      if (submissionIndex < 0) return null;
-      const submission = cookieSubmissions[submissionIndex];
+      const submission = activeCookieSubmission;
+      if (!submission || !requestUris.every((uri) => (submission.remaining.get(uri) || 0) > 0)) return null;
       for (const uri of requestUris) {
         const count = submission.remaining.get(uri) || 0;
         if (count === 1) submission.remaining.delete(uri);
         else submission.remaining.set(uri, count - 1);
       }
-      if (submission.remaining.size === 0) cookieSubmissions.splice(submissionIndex, 1);
       call.tme3_route = submission.route;
       const form = new FormData();
       form.append('request', JSON.stringify(call));
