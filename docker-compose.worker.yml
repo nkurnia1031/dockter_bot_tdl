@@ -14,6 +14,7 @@ services:
       DATABASE_ROOT: /database
       TTS_DATA_ROOT: /data/tts
       ARIA2_RPC_URL: http://aria2:6800/jsonrpc
+      ARIA2_TOR_PROXY_TOKEN_FILE: /database/aria2-proxy/token
       STORAGE_DB_FILE: /database/storage.db
       TDL_EXPORT_STORAGE: ""
       TDL_DOWNLOAD_STORAGE: ""

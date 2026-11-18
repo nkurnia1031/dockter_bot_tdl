@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import signal
 import subprocess
 import tempfile
@@ -11,6 +12,8 @@ from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 from tme3bot.worker.aria2_runtime import Aria2Runtime
 
@@ -28,6 +31,16 @@ class _Aria2RpcHandler(BaseHTTPRequestHandler):
             method = request.get("method")
             if method in {"aria2.addUri", "aria2.addTorrent", "aria2.addMetalink"}:
                 result = "new-gid"
+                self.server.tasks[result] = {
+                    "gid": result,
+                    "status": "active",
+                    "totalLength": "1",
+                    "completedLength": "0",
+                }
+            elif method == "aria2.tellActive":
+                result = list(self.server.tasks.values())
+            elif method in {"aria2.tellWaiting", "aria2.tellStopped"}:
+                result = []
             elif method == "aria2.tellStatus":
                 result = {
                     "gid": request.get("params", [None, ""])[1],
@@ -87,6 +100,7 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Aria2RpcHandler)
         self.server.rpc_secret = ""
         self.server.calls = []
+        self.server.tasks = {}
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.runtime = Aria2Runtime(
@@ -205,6 +219,63 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertNotIn("proxy-secret", json.dumps(status))
         self.assertNotIn("all-proxy", json.dumps(status))
 
+    def test_tor_task_is_listed_for_ariang_and_uses_the_shared_proxy_token(self):
+        compose = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "docker-compose.worker.yml").read_text(
+                encoding="utf-8"
+            )
+        )
+        configured_token_path = compose["services"]["worker"]["environment"].get(
+            "ARIA2_TOR_PROXY_TOKEN_FILE"
+        )
+        self.assertEqual(configured_token_path, "/database/aria2-proxy/token")
+
+        shared_token_file = self.root / "database" / "aria2-proxy" / "token"
+        shared_token_file.parent.mkdir(parents=True)
+        shared_token_file.write_text("shared-tor-token\n", encoding="utf-8")
+        with patch.dict(os.environ, {"ARIA2_TOR_PROXY_TOKEN_FILE": str(shared_token_file)}):
+            runtime = Aria2Runtime(
+                state_root=self.state,
+                workspace_root=self.workspace,
+                hook_script_path=self.hook,
+                rpc_url=f"http://127.0.0.1:{self.server.server_port}/jsonrpc",
+            )
+        runtime.ensure()
+        self.server.rpc_secret = runtime.secret_file.read_text(encoding="utf-8").strip()
+        runtime.bunkr_links.tor_ready = lambda: True
+
+        submitted = runtime.rpc({
+            "jsonrpc": "2.0",
+            "id": "tor-visible-task",
+            "method": "aria2.addUri",
+            "params": [["https://check.torproject.org/api/ip"], {}],
+            "tme3_route": "tor",
+        }, requested_directory=str(self.destination))
+        listed = runtime.rpc({
+            "jsonrpc": "2.0",
+            "id": "aria-ng-active-list",
+            "method": "aria2.tellActive",
+            "params": [],
+        })
+
+        self.assertEqual(submitted.get("result"), "new-gid")
+        self.assertIn(
+            "new-gid",
+            {item["gid"] for item in listed.get("result", [])},
+            "AriaNg's active-task query must contain the submitted GID",
+        )
+        forwarded_add = next(
+            call for call in self.server.calls if call.get("method") == "aria2.addUri"
+        )
+        options = forwarded_add["params"][2]
+        self.assertEqual(
+            options["all-proxy"],
+            "http://aria2:shared-tor-token@tts-1:8118",
+        )
+        self.assertEqual(options["proxy-method"], "tunnel")
+        self.assertEqual(shared_token_file.read_text(encoding="utf-8"), "shared-tor-token\n")
+        self.assertFalse((self.state / "tor-proxy.token").exists())
+
     def test_rpc_non_route_clears_proxy_for_new_ariang_download(self):
         self.runtime.ensure()
         self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
@@ -233,6 +304,28 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertIn("error", result)
         self.assertIn("ARIA2_TOR_UNAVAILABLE", result["error"]["message"])
         self.assertEqual(len(self.server.calls), before)
+
+    def test_tor_route_returns_a_sanitized_rpc_error_when_shared_token_is_missing(self):
+        missing_token_file = self.root / "database" / "aria2-proxy" / "token"
+        with patch.dict(os.environ, {"ARIA2_TOR_PROXY_TOKEN_FILE": str(missing_token_file)}):
+            runtime = Aria2Runtime(
+                state_root=self.state,
+                workspace_root=self.workspace,
+                hook_script_path=self.hook,
+                rpc_url=f"http://127.0.0.1:{self.server.server_port}/jsonrpc",
+            )
+        self.destination.mkdir(parents=True, exist_ok=True)
+        runtime.bunkr_links.tor_ready = lambda: True
+
+        result = runtime.rpc({
+            "jsonrpc": "2.0", "id": "missing-tor-token", "method": "aria2.addUri",
+            "params": [["https://example.test/file.bin"], {}], "tme3_route": "tor",
+        }, requested_directory=str(self.destination))
+
+        self.assertIn("error", result)
+        self.assertIn("ARIA2_TOR_UNAVAILABLE", result["error"]["message"])
+        self.assertNotIn(str(missing_token_file), json.dumps(result))
+        self.assertEqual(self.server.calls, [])
 
     def test_rpc_applies_selected_route_only_to_the_paused_task_being_edited(self):
         self.runtime.ensure()

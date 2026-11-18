@@ -67,6 +67,31 @@ jobs:
           TME3_RUN_UTILITY_EXTRACT_E2E: "1"
         run: python -m unittest tests.test_utility_extract_e2e -v
 
+  aria2-tor-e2e:
+    name: Aria2 Tor route and task listing E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install aria2, Tor, and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends aria2 tor
+          python -m pip install --upgrade pip
+          python -m pip install "httpx==0.28.1" "beautifulsoup4==4.15.0" "PyYAML>=6,<7"
+
+      - name: Run real Aria2 task through Tor
+        env:
+          TME3_RUN_ARIA2_TOR_E2E: "1"
+        run: python -m unittest tests.test_aria2_tor_e2e -v
+
   web:
     name: Web checks, tests, and build
     runs-on: ubuntu-24.04

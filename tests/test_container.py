@@ -155,6 +155,45 @@ class ContainerBuildTests(unittest.TestCase):
                     any("/aria2:/aria2-state" in volume for volume in helper["volumes"])
                 )
 
+    def test_worker_aria2_bridge_reads_the_shared_tor_proxy_token(self) -> None:
+        for filename, service_name, expected_path, proxy_subpath in (
+            (
+                "docker-compose.gateway.yml",
+                "worker-local",
+                "/database/worker-local/aria2-proxy/token",
+                "worker-local/aria2-proxy",
+            ),
+            (
+                "docker-compose.worker.yml",
+                "worker",
+                "/database/aria2-proxy/token",
+                "aria2-proxy",
+            ),
+        ):
+            with self.subTest(filename=filename, service=service_name):
+                compose = yaml.safe_load(
+                    (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+                )
+                worker = compose["services"][service_name]
+                worker_database_volume = next(
+                    volume for volume in worker["volumes"]
+                    if volume.endswith(":/database")
+                )
+                worker_database_root = worker_database_volume.removesuffix(":/database")
+                aria2_proxy_volume = next(
+                    volume for volume in compose["services"]["aria2"]["volumes"]
+                    if volume.endswith(":/aria2-proxy")
+                )
+                self.assertEqual(
+                    worker["environment"].get("ARIA2_TOR_PROXY_TOKEN_FILE"),
+                    expected_path,
+                )
+                self.assertTrue(
+                    aria2_proxy_volume.startswith(
+                        f"{worker_database_root}/{proxy_subpath}:/aria2-proxy"
+                    )
+                )
+
     def test_gateway_queue_uses_private_persistent_redis_without_worker_mounts(self) -> None:
         for filename in ("docker-compose.gateway.yml", "docker-compose.yml"):
             payload = yaml.safe_load((PROJECT_ROOT / filename).read_text(encoding="utf-8"))

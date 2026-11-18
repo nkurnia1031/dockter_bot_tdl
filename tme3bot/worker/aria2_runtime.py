@@ -568,9 +568,16 @@ class Aria2Runtime:
         return token
 
     def _tor_proxy_url(self) -> str:
-        token = self.tor_proxy_token_file.read_text(encoding="utf-8").strip()
+        try:
+            token = self.tor_proxy_token_file.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise BunkrLinkError(
+                "ARIA2_TOR_UNAVAILABLE: kredensial proxy internal belum siap."
+            ) from exc
         if not token:
-            raise RuntimeError("Aria2 Tor proxy token is not configured.")
+            raise BunkrLinkError(
+                "ARIA2_TOR_UNAVAILABLE: kredensial proxy internal belum siap."
+            )
         return f"http://aria2:{quote(token, safe='')}@tts-1:8118"
 
     def _read_config(self) -> dict[str, str]:
