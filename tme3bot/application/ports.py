@@ -173,6 +173,10 @@ class WorkerDispatcher(Protocol):
         self, worker: str, payload: dict[str, Any]
     ) -> dict[str, Any]: ...
 
+    def aria2_rpc_with_cookie(
+        self, worker: str, request_payload: dict[str, Any], cookie_file: bytes
+    ) -> dict[str, Any]: ...
+
     def revoke_public_download_link(self, worker: str, link_id: str) -> dict[str, Any]: ...
 
     def storage_move_cleanup(

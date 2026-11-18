@@ -3058,6 +3058,44 @@ class BackendApiTests(unittest.TestCase):
         self.assertIn("changeTab('links')", setup.text)
         self.assertIn("tme3-new-task-route-control", setup.text)
         self.assertIn("tme3-edit-task-route-control", setup.text)
+
+    def test_aria2_cookie_upload_is_task_scoped_and_returns_only_rpc_result(self):
+        headers = self.login()
+        uploaded = []
+        self.dispatcher.aria2_rpc_with_cookie = lambda worker, payload, cookie_bytes: (
+            uploaded.append((worker, payload, cookie_bytes))
+            or {"jsonrpc": "2.0", "id": payload.get("id"), "result": "cookie-gid"}
+        )
+        request = {
+            "jsonrpc": "2.0",
+            "id": "cookie-add",
+            "method": "aria2.addUri",
+            "params": [["https://files.example.test/archive.zip"], {}],
+            "tme3_route": "non",
+        }
+        cookie_bytes = (
+            b"# Netscape HTTP Cookie File\n"
+            b".example.test\tTRUE\t/\tTRUE\t2000000000\tsid\tsuper-secret-cookie\n"
+        )
+
+        response = self.client.post(
+            "/api/v1/aria2-cookie-rpc-local",
+            headers=headers,
+            data={"request": json.dumps(request)},
+            files={"cookies": ("cookies.txt", cookie_bytes, "text/plain")},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {
+            "jsonrpc": "2.0", "id": "cookie-add", "result": "cookie-gid"
+        })
+        self.assertEqual(uploaded, [("local", request, cookie_bytes)])
+        self.assertNotIn("super-secret-cookie", response.text)
+
+        setup = self.client.get("/api/v1/aria2-ui/local/rpc-setup.js", headers=headers)
+        self.assertEqual(setup.status_code, 200)
+        self.assertIn("tme3-cookie-file", setup.text)
+        self.assertIn("aria2-cookie-rpc-local", setup.text)
         self.assertIn("aria2.changeOption", setup.text)
         self.assertNotIn("tme3-aria2-route:local", setup.text)
         self.assertNotIn(".main-header .navbar-toolbar .navbar-nav", setup.text)

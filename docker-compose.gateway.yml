@@ -105,6 +105,7 @@ services:
       DATABASE_ROOT: /database/worker-local
       TTS_DATA_ROOT: /data/tts
       ARIA2_RPC_URL: http://aria2:6800/jsonrpc
+      ARIA2_COOKIE_RELAY_URL: http://aria2:6801
       ARIA2_TOR_PROXY_TOKEN_FILE: /database/worker-local/aria2-proxy/token
       STORAGE_DB_FILE: /database/worker-local/storage.db
       TDL_EXPORT_STORAGE: ""
@@ -117,6 +118,7 @@ services:
     environment:
       ARIA2_STATE_ROOT: /state
       ARIA2_RPC_URL: http://127.0.0.1:6800/jsonrpc
+      ARIA2_COOKIE_RELAY_URL: http://127.0.0.1:6801
       ARIA2_HOOK_PATH: /usr/local/bin/aria2-retry-on-low-speed.py
       ARIA2_TOR_PROXY_TOKEN_FILE: /aria2-proxy/token
       UTILITY_WORKSPACE_ROOT: ${UTILITY_WORKSPACE_ROOT:-/workspace}

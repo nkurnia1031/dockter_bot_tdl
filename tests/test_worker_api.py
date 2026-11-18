@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import unittest
 from pathlib import Path
@@ -970,6 +971,53 @@ class WorkerApiTests(unittest.TestCase):
         asset = self.client.get("/internal/v1/aria2/ui/index.html", headers=headers)
         self.assertEqual(asset.status_code, 200)
         self.assertEqual(asset.text, "<html></html>")
+
+    def test_aria2_cookie_rpc_requires_worker_auth_and_dispatches_cookie_bytes(self):
+        calls = []
+        cookie_bytes = (
+            b"# Netscape HTTP Cookie File\n"
+            b".example.test\tTRUE\t/\tTRUE\t2000000000\tsid\tprivate-cookie-value\n"
+        )
+        request = {
+            "jsonrpc": "2.0",
+            "id": "cookie-add",
+            "method": "aria2.addUri",
+            "params": [["https://files.example.test/archive.zip"], {}],
+        }
+        self.executor.aria2_rpc_with_cookie = lambda payload, uploaded: (
+            calls.append((payload, uploaded))
+            or {"jsonrpc": "2.0", "id": payload.get("id"), "result": "cookie-gid"}
+        )
+        body = {
+            "request": request,
+            "cookies_b64": base64.b64encode(cookie_bytes).decode("ascii"),
+        }
+
+        denied = self.client.post("/internal/v1/aria2/jsonrpc-cookie", json=body)
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(calls, [])
+
+        accepted = self.client.post(
+            "/internal/v1/aria2/jsonrpc-cookie",
+            headers={"Authorization": "Bearer worker-secret"},
+            json=body,
+        )
+
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        self.assertEqual(accepted.json(), {
+            "jsonrpc": "2.0", "id": "cookie-add", "result": "cookie-gid"
+        })
+        self.assertEqual(calls, [(request, cookie_bytes)])
+        self.assertNotIn("private-cookie-value", accepted.text)
+
+        rejected = self.client.post(
+            "/internal/v1/aria2/jsonrpc-cookie",
+            headers={"Authorization": "Bearer worker-secret"},
+            json={**body, "request": {**request, "method": "aria2.remove"}},
+        )
+        self.assertEqual(rejected.status_code, 200)
+        self.assertIn("error", rejected.json())
+        self.assertEqual(len(calls), 1)
 
     def test_worker_runtime_settings_are_internal_and_validate_storage_profile(self):
         headers = {"Authorization": "Bearer worker-secret"}

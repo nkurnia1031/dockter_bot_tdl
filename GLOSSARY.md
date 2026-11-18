@@ -188,6 +188,10 @@ _Avoid_: membuat unduhan duplikat, menghapus parsial tanpa pemeriksaan.
 Pilihan per task untuk mengirim koneksi unduh melalui Tor atau jaringan langsung. Mode default adalah jaringan langsung; perubahan pada task aktif dilakukan setelah task dijeda.
 _Avoid_: pengaturan proxy global, fallback Tor diam-diam.
 
+**Relay cookie task Aria2**:
+Relay worker untuk menerapkan cookie Netscape hanya pada task Aria2 yang URL-nya dikirim bersama form Links. Cookie disimpan privat per task untuk resume, tidak dikembalikan ke UI/API, dan dibersihkan ketika task selesai atau operator menghapus hasilnya.
+_Avoid_: header Cookie global, cookie lintas task.
+
 ## Storage
 
 **Unduhan Storage**:

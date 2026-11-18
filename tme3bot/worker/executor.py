@@ -307,6 +307,13 @@ class WorkerJobExecutor(
             request_payload, requested_directory=requested_directory
         )
 
+    def aria2_rpc_with_cookie(
+        self, request_payload: dict[str, Any], cookie_file: bytes
+    ) -> dict[str, Any]:
+        return self.aria2_runtime.rpc(
+            request_payload, cookie_file=cookie_file
+        )
+
     def aria2_ui_asset_path(self, asset_path: str) -> Path | None:
         return self.aria2_runtime.ui_asset_path(asset_path)
 

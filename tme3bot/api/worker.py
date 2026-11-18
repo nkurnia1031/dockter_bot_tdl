@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import base64
+import binascii
 import json
 import re
 import uuid
@@ -602,6 +604,29 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         if not callable(call):
             return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Aria2 bridge is unavailable."}}
         return call(body)
+
+    @app.post("/internal/v1/aria2/jsonrpc-cookie", dependencies=[Depends(authorize)])
+    def aria2_jsonrpc_cookie(body: dict[str, Any]):
+        request_payload = body.get("request") if isinstance(body, dict) else None
+        request_id = request_payload.get("id") if isinstance(request_payload, dict) else None
+        encoded = body.get("cookies_b64") if isinstance(body, dict) else None
+        if (
+            not isinstance(request_payload, dict)
+            or request_payload.get("method") != "aria2.addUri"
+            or not isinstance(encoded, str)
+            or len(encoded) > 3 * 1024 * 1024
+        ):
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": "Cookie task request is invalid."}}
+        try:
+            cookie_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Cookie file encoding is invalid."}}
+        if not cookie_bytes or len(cookie_bytes) > 2 * 1024 * 1024:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "Cookie file is empty or too large."}}
+        call = getattr(context.executor, "aria2_rpc_with_cookie", None)
+        if not callable(call):
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Cookie task support is unavailable."}}
+        return call(request_payload, cookie_bytes)
 
     @app.post("/internal/v1/aria2/links/preview", dependencies=[Depends(authorize)])
     def aria2_links_preview(body: dict[str, Any]):

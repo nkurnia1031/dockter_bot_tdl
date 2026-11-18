@@ -4,6 +4,8 @@ import json
 import os
 import threading
 import unittest
+from email.parser import BytesParser
+from email.policy import default as email_policy
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -228,10 +230,39 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
         reject_tor_route_change = [False]
         setup_script = _aria2_rpc_setup_script("local")
 
+        def multipart_fields(request):
+            content_type = request.headers.get("content-type", "")
+            raw = request.post_data_buffer or b""
+            message = BytesParser(policy=email_policy).parsebytes(
+                b"MIME-Version: 1.0\r\nContent-Type: "
+                + content_type.encode("ascii")
+                + b"\r\n\r\n"
+                + raw
+            )
+            return {
+                part.get_param("name", header="content-disposition"):
+                    part.get_payload(decode=True) or b""
+                for part in message.iter_parts()
+            }
+
         def mock_api(route) -> None:
             request = route.request
             parsed = urlsplit(request.url)
             path = parsed.path.removeprefix("/api/v1")
+            if path == "/aria2-cookie-rpc-local":
+                fields = multipart_fields(request)
+                cookie_request = json.loads(fields["request"].decode("utf-8"))
+                rpc_calls.append({
+                    "path": path,
+                    "body": cookie_request,
+                    "csrf": request.headers.get("x-csrf-token", ""),
+                    "cookie_bytes": fields["cookies"],
+                    "content_type": request.headers.get("content-type", ""),
+                })
+                route.fulfill(status=200, content_type="application/json", body=json.dumps({
+                    "jsonrpc": "2.0", "id": cookie_request.get("id"), "result": "cookie-gid",
+                }))
+                return
             if path == "/auth/browser/session":
                 payload = {
                     "authenticated": True,
@@ -250,6 +281,7 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
             elif path == "/aria2-rpc-local":
                 body = request.post_data_json
                 rpc_calls.append({
+                    "path": path,
                     "body": body,
                     "csrf": request.headers.get("x-csrf-token", ""),
                 })
@@ -301,13 +333,21 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
         panel.classList.toggle('active', panel.dataset.panel === tab.dataset.tab);
       }});
     }}));
-    document.getElementById('new-task').addEventListener('submit', (event) => {{
-      event.preventDefault();
+    const submitTask = (uri) => {{
       const request = new XMLHttpRequest();
       request.open('POST', '/api/v1/aria2-rpc-local');
       request.setRequestHeader('Content-Type', 'application/json');
-      request.send(JSON.stringify({{jsonrpc:'2.0', id:'add-task', method:'aria2.addUri',
-        params:[[document.getElementById('task-uri').value], {{}}]}}));
+      request.send(JSON.stringify({{jsonrpc:'2.0', id:'add-task', method:'aria2.addUri', params:[[uri], {{}}]}}));
+    }};
+    const unrelated = document.createElement('button');
+    unrelated.type = 'button';
+    unrelated.id = 'unrelated-task';
+    unrelated.textContent = 'Add unrelated task';
+    document.body.appendChild(unrelated);
+    unrelated.addEventListener('click', () => submitTask('https://unrelated.example.test/other.bin'));
+    document.getElementById('new-task').addEventListener('submit', (event) => {{
+      event.preventDefault();
+      window.setTimeout(() => submitTask(document.getElementById('task-uri').value), 750);
     }});
   </script>
 </body></html>"""
@@ -363,6 +403,51 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                 frame.get_by_role("button", name="Add task").click()
             direct_call = [call for call in rpc_calls if call["body"].get("method") == "aria2.addUri"][-1]
             self.assertEqual(direct_call["body"].get("tme3_route"), "non")
+
+            cookie_bytes = (
+                b"# Netscape HTTP Cookie File\n"
+                b".example.test\tTRUE\t/\tTRUE\t2000000000\tsid\tui-cookie-secret\n"
+            )
+            route_picker.select_option("tor")
+            frame.locator("#tme3-cookie-file").set_input_files({
+                "name": "cookies.txt", "mimeType": "text/plain", "buffer": cookie_bytes,
+            })
+            frame.get_by_role("button", name="Add task").click()
+            route_picker.select_option("non")
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+                and "unrelated.example.test/other.bin" in (response.request.post_data or "")
+            ):
+                frame.locator("#unrelated-task").click()
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-cookie-rpc-local")
+                and response.request.method == "POST"
+            ):
+                page.wait_for_timeout(800)
+            unrelated_call = next(
+                call for call in rpc_calls
+                if call["path"] == "/aria2-rpc-local"
+                and "unrelated.example.test/other.bin" in json.dumps(call["body"])
+            )
+            self.assertNotIn("cookie_bytes", unrelated_call)
+            cookie_call = rpc_calls[-1]
+            self.assertEqual(cookie_call["cookie_bytes"], cookie_bytes)
+            self.assertTrue(str(cookie_call["content_type"]).startswith("multipart/form-data; boundary="))
+            self.assertEqual(cookie_call["csrf"], "local-e2e-csrf")
+            self.assertEqual(cookie_call["body"].get("tme3_route"), "tor")
+            self.assertEqual(cookie_call["body"]["method"], "aria2.addUri")
+            self.assertEqual(frame.locator("#tme3-cookie-file").input_value(), "")
+            self.assertNotIn("ui-cookie-secret", page.locator("body").inner_text())
+
+            route_picker.select_option("non")
+            with page.expect_response(
+                lambda response: response.url.endswith("/aria2-rpc-local")
+                and response.request.method == "POST"
+            ):
+                frame.get_by_role("button", name="Add task").click()
+            self.assertEqual(rpc_calls[-1]["body"].get("method"), "aria2.addUri")
+            self.assertNotIn("cookie_bytes", rpc_calls[-1])
 
             frame.locator("main").evaluate("""(main) => {
               main.innerHTML = `<section class="content"><div class="nav-tabs-custom">

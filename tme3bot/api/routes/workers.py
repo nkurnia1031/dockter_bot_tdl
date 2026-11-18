@@ -8,7 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
-from fastapi import Depends, Response
+from fastapi import Depends, File, Form, Response, UploadFile
 from tme3bot.api.schemas import (
     ObjectResponse,
     WorkerEnabledRequest,
@@ -43,6 +43,7 @@ _WORKER_RUNTIME_SCAN_TARGETS = {
     "rclone_storage",
 }
 _PROFILE_RUNTIME_SCAN_TARGETS = {"export", "download", "storage", "tts", "quick_mode"}
+_ARIA2_COOKIE_FILE_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _safe_local_profile_inventory(payload, *, worker: str) -> dict:
@@ -205,9 +206,11 @@ def _tts_runtime_evidence(payload) -> tuple[bool, str, str]:
 
 def _aria2_rpc_setup_script(worker: str) -> str:
     endpoint = json.dumps(f"/api/v1/aria2-rpc-{worker}")
+    cookie_endpoint = json.dumps(f"/api/v1/aria2-cookie-rpc-{worker}")
     folder_key = json.dumps(f"tme3-aria2-folder:{worker}")
     template = r"""(() => {
   const endpoint = __ENDPOINT__;
+  const cookieEndpoint = __COOKIE_ENDPOINT__;
   const folderKey = __FOLDER_KEY__;
   const newRouteControl = 'tme3-new-task-route-control';
   const taskRouteControl = 'tme3-edit-task-route-control';
@@ -284,8 +287,32 @@ def _aria2_rpc_setup_script(worker: str) -> str:
       || uriInput?.previousElementSibling
       || uriInput
       || linksPane.firstElementChild;
-    if (insertionPoint) insertionPoint.insertAdjacentElement('beforebegin', row);
-    else linksPane.prepend(row);
+    const cookieRow = document.createElement('div');
+    cookieRow.className = 'form-group tme3-aria-cookie-row';
+    cookieRow.dataset.tme3Cookie = 'new-task-cookie-control';
+    const cookieLabel = document.createElement('label');
+    cookieLabel.className = 'control-label';
+    cookieLabel.htmlFor = 'tme3-cookie-file';
+    cookieLabel.textContent = 'Cookie Netscape (opsional)';
+    const cookieInput = document.createElement('input');
+    cookieInput.id = 'tme3-cookie-file';
+    cookieInput.type = 'file';
+    cookieInput.accept = '.txt,text/plain';
+    cookieInput.className = 'form-control';
+    cookieInput.setAttribute('aria-label', 'Cookie Netscape');
+    cookieLabel.appendChild(cookieInput);
+    cookieRow.appendChild(cookieLabel);
+    const cookieHint = document.createElement('small');
+    cookieHint.className = 'muted';
+    cookieHint.textContent = 'Berlaku hanya untuk URL yang dikirim dari form ini.';
+    cookieRow.appendChild(cookieHint);
+    if (insertionPoint) {
+      insertionPoint.insertAdjacentElement('beforebegin', row);
+      row.insertAdjacentElement('afterend', cookieRow);
+    } else {
+      linksPane.prepend(cookieRow);
+      linksPane.prepend(row);
+    }
   };
   const taskDetailGid = () => {
     const match = location.hash.match(/^#!\/task\/detail\/([0-9a-f]{16})(?:[/?]|$)/i);
@@ -438,16 +465,88 @@ def _aria2_rpc_setup_script(worker: str) -> str:
       return JSON.stringify(call);
     } catch { return body; }
   };
+  const cookieSubmissions = [];
+  const cookieSubmissionTtlMs = 5 * 60 * 1000;
+  const maxCookieSubmissions = 8;
+  const pruneCookieSubmissions = () => {
+    const now = Date.now();
+    for (let index = cookieSubmissions.length - 1; index >= 0; index -= 1) {
+      if (cookieSubmissions[index].expiresAt <= now) cookieSubmissions.splice(index, 1);
+    }
+  };
+  document.addEventListener('submit', (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || form.getAttribute('name') !== 'newTaskForm') return;
+    const input = form.querySelector('#tme3-cookie-file');
+    const file = input?.files?.[0] || null;
+    if (input) input.value = '';
+    if (!file) return;
+    const uriInput = form.querySelector(
+      '.tab-content .tab-pane textarea, .tab-content .tab-pane input[type="url"], .tab-content .tab-pane input[name*="uri"], .tab-content .tab-pane input[id*="uri"], .tab-content .tab-pane input[ng-model*="uri"]'
+    );
+    const uris = String(uriInput?.value || '').split(/\r?\n/).map((uri) => uri.trim()).filter(Boolean);
+    if (!uris.length) return;
+    const remaining = new Map();
+    for (const uri of uris) remaining.set(uri, (remaining.get(uri) || 0) + 1);
+    const routeSelect = form.querySelector('#tme3-new-task-route');
+    const submission = {
+      file,
+      remaining,
+      route: routeSelect?.value === 'tor' ? 'tor' : 'non',
+      expiresAt: Date.now() + cookieSubmissionTtlMs,
+    };
+    pruneCookieSubmissions();
+    cookieSubmissions.push(submission);
+    while (cookieSubmissions.length > maxCookieSubmissions) cookieSubmissions.shift();
+    window.setTimeout(() => {
+      const index = cookieSubmissions.indexOf(submission);
+      if (index >= 0) cookieSubmissions.splice(index, 1);
+    }, cookieSubmissionTtlMs);
+  }, true);
+  const cookieMultipart = (body) => {
+    if (typeof body !== 'string') return null;
+    try {
+      const call = JSON.parse(body);
+      const requestUris = call?.method === 'aria2.addUri' && Array.isArray(call.params?.[0])
+        ? call.params[0].filter((uri) => typeof uri === 'string')
+        : [];
+      if (!requestUris.length) return null;
+      pruneCookieSubmissions();
+      const submissionIndex = cookieSubmissions.findIndex((submission) =>
+        requestUris.every((uri) => (submission.remaining.get(uri) || 0) > 0)
+      );
+      if (submissionIndex < 0) return null;
+      const submission = cookieSubmissions[submissionIndex];
+      for (const uri of requestUris) {
+        const count = submission.remaining.get(uri) || 0;
+        if (count === 1) submission.remaining.delete(uri);
+        else submission.remaining.set(uri, count - 1);
+      }
+      if (submission.remaining.size === 0) cookieSubmissions.splice(submissionIndex, 1);
+      call.tme3_route = submission.route;
+      const form = new FormData();
+      form.append('request', JSON.stringify(call));
+      form.append('cookies', submission.file, 'cookies.txt');
+      return form;
+    } catch { return null; }
+  };
   const originalOpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url, ...rest) {
     this.__tme3Aria2Rpc = isRpc(url);
+    this.__tme3Aria2Method = method;
+    this.__tme3Aria2Rest = rest;
     return originalOpen.call(this, method, url, ...rest);
   };
   const originalSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.send = function(body) {
     if (this.__tme3Aria2Rpc) {
-      this.setRequestHeader('X-CSRF-Token', csrf());
       body = withDirectory(body);
+      const multipart = cookieMultipart(body);
+      if (multipart) {
+        originalOpen.call(this, this.__tme3Aria2Method, cookieEndpoint, ...this.__tme3Aria2Rest);
+        body = multipart;
+      }
+      this.setRequestHeader('X-CSRF-Token', csrf());
     }
     return originalSend.call(this, body);
   };
@@ -460,7 +559,11 @@ def _aria2_rpc_setup_script(worker: str) -> str:
     return originalFetch(input, { ...init, headers, body: withDirectory(init.body) });
   };
 })()"""
-    return template.replace("__ENDPOINT__", endpoint).replace("__FOLDER_KEY__", folder_key)
+    return (
+        template.replace("__ENDPOINT__", endpoint)
+        .replace("__COOKIE_ENDPOINT__", cookie_endpoint)
+        .replace("__FOLDER_KEY__", folder_key)
+    )
 
 
 def _read_profile_inventory(context, worker: str, *, start_upload_prep: bool) -> dict:
@@ -2705,6 +2808,47 @@ def register_workers(app, context, *, current_actor):
             return dispatcher(name, body)
         except Exception:
             return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Worker Aria2 tidak dapat dihubungi."}}
+
+    @app.post("/api/v1/aria2-cookie-rpc-{name}")
+    async def aria2_cookie_rpc_proxy(
+        name: str,
+        request_payload: str = Form(alias="request"),
+        cookies: UploadFile = File(),
+        actor=Depends(current_actor),
+    ):
+        del actor
+        try:
+            body = json.loads(request_payload)
+        except (TypeError, ValueError):
+            body = {}
+        request_id = body.get("id") if isinstance(body, dict) else None
+        if (
+            not isinstance(body, dict)
+            or body.get("jsonrpc") != "2.0"
+            or body.get("method") != "aria2.addUri"
+            or not isinstance(body.get("params"), list)
+        ):
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": "Cookie hanya didukung untuk task Links Aria2."}}
+        if len(request_payload.encode("utf-8")) > 16 * 1024 * 1024:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32600, "message": "Request terlalu besar."}}
+        try:
+            cookie_bytes = await cookies.read(_ARIA2_COOKIE_FILE_MAX_BYTES + 1)
+        finally:
+            await cookies.close()
+        if not cookie_bytes or len(cookie_bytes) > _ARIA2_COOKIE_FILE_MAX_BYTES:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "File cookies.txt kosong atau melebihi batas 2 MiB."}}
+        record = context.worker_registry.get(name)
+        if record is None:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Worker tidak ditemukan."}}
+        if not bool(record.get("enabled", True)):
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Worker sedang nonaktif."}}
+        dispatcher = getattr(context.worker_dispatcher, "aria2_rpc_with_cookie", None)
+        if not callable(dispatcher):
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Worker belum mendukung task cookie Aria2."}}
+        try:
+            return dispatcher(name, body, cookie_bytes)
+        except Exception:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Worker Aria2 tidak dapat dihubungi."}}
 
     def aria2_links_dispatch(name: str, method_name: str, *args):
         record = context.worker_registry.get(name)

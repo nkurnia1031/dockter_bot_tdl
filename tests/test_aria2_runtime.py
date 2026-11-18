@@ -591,6 +591,47 @@ class Aria2RuntimeTests(unittest.TestCase):
         self.assertEqual(partial.read_bytes(), b"partial payload")
         self.assertEqual(control.read_bytes(), b"control state")
 
+    def test_explicit_aria2_removal_cleans_task_cookie_state(self):
+        self.runtime.ensure()
+        self.server.rpc_secret = self.runtime.secret_file.read_text(encoding="utf-8").strip()
+        cookie_bytes = (
+            b"# Netscape HTTP Cookie File\n"
+            b".example.test\tTRUE\t/\tTRUE\t2000000000\tsid\tprivate-cookie\n"
+        )
+
+        for method, gid in (
+            ("aria2.remove", "1111111111111111"),
+            ("aria2.forceRemove", "2222222222222222"),
+            ("aria2.removeDownloadResult", "3333333333333333"),
+        ):
+            task = self.runtime.cookie_task_store.create_pending(
+                ["https://example.test/file.bin"], cookie_bytes, "non"
+            )
+            cookie_path = task["cookie_path"]
+            self.runtime.cookie_task_store.set_gid(task["token"], gid)
+
+            response = self.runtime.rpc({
+                "jsonrpc": "2.0", "id": method, "method": method, "params": [gid],
+            })
+
+            self.assertNotIn("error", response)
+            self.assertFalse(cookie_path.exists(), method)
+
+        tasks = [
+            self.runtime.cookie_task_store.create_pending(
+                [f"https://example.test/{index}.bin"], cookie_bytes, "non"
+            )
+            for index in range(2)
+        ]
+        cookie_paths = [task["cookie_path"] for task in tasks]
+
+        response = self.runtime.rpc({
+            "jsonrpc": "2.0", "id": "purge", "method": "aria2.purgeDownloadResult", "params": [],
+        })
+
+        self.assertNotIn("error", response)
+        self.assertTrue(all(not path.exists() for path in cookie_paths))
+
     def test_intentional_signal_shutdown_does_not_report_aria2_as_failed(self):
         handlers = {}
 

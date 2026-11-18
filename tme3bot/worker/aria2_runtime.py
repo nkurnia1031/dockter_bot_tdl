@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -26,6 +27,12 @@ from tme3bot.worker.aria2_bunkr import (
     BunkrLinkError,
     redact_aria2_response,
     redact_sensitive_urls_in_text,
+)
+from tme3bot.worker.aria2_cookie_relay import (
+    MAX_COOKIE_FILE_BYTES,
+    Aria2CookieRelayServer,
+    Aria2CookieTaskStore,
+    redact_cookie_task_urls,
 )
 from tme3bot.worker.aria2_recovery import (
     Aria2RecoveryCoordinator,
@@ -78,12 +85,17 @@ class Aria2Runtime:
         workspace_root: Path | str,
         hook_script_path: Path | str = DEFAULT_HOOK_PATH,
         rpc_url: str = DEFAULT_RPC_URL,
+        cookie_relay_url: str | None = None,
     ) -> None:
         self.state_root = Path(state_root)
         self.workspace_root = Path(workspace_root)
         self.download_root = self.workspace_root / "aria2"
         self.hook_script_path = Path(hook_script_path)
         self.rpc_url = str(rpc_url or DEFAULT_RPC_URL)
+        self.cookie_relay_url = str(
+            cookie_relay_url
+            or os.environ.get("ARIA2_COOKIE_RELAY_URL", "http://aria2:6801")
+        ).rstrip("/")
         self.config_file = self.state_root / "aria2.conf"
         self.secret_file = self.state_root / "rpc.secret"
         self.tor_proxy_token_file = Path(
@@ -97,6 +109,7 @@ class Aria2Runtime:
         self.recovery_store = Aria2RecoveryStateStore(
             self.state_root / "aria2-recovery.json"
         )
+        self.cookie_task_store = Aria2CookieTaskStore(self.state_root)
         self.bunkr_links = Aria2BunkrLinks(
             workspace_root=self.workspace_root,
             state_root=self.state_root,
@@ -164,15 +177,31 @@ class Aria2Runtime:
 
     def run(self) -> None:
         self.ensure()
-        process = subprocess.Popen(
-            ["aria2c", f"--conf-path={self.config_file}", "--daemon=false"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
+        secret = self.secret_file.read_text(encoding="utf-8").strip()
+
+        def call(method: str, *params):
+            return self._internal_rpc(secret, method, *params)
+
+        cookie_relay = Aria2CookieRelayServer(
+            state_root=self.state_root,
+            rpc=call,
+            rpc_secret=lambda: secret,
+            tor_proxy_url=self._tor_proxy_url,
         )
+        cookie_relay.start()
+        try:
+            process = subprocess.Popen(
+                ["aria2c", f"--conf-path={self.config_file}", "--daemon=false"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except Exception:
+            cookie_relay.close()
+            raise
         output_thread = threading.Thread(
             target=self._forward_aria2_output,
             args=(process.stdout,),
@@ -180,10 +209,6 @@ class Aria2Runtime:
             name="aria2-log-forwarder",
         )
         output_thread.start()
-        secret = self.secret_file.read_text(encoding="utf-8").strip()
-
-        def call(method: str, *params):
-            return self._internal_rpc(secret, method, *params)
 
         coordinator = Aria2RecoveryCoordinator(
             call,
@@ -207,6 +232,7 @@ class Aria2Runtime:
                 try:
                     self.bunkr_links.tick(self.recovery_store)
                     coordinator.tick()
+                    cookie_relay.reconcile()
                 except Exception:
                     # RPC failures can contain transfer URLs or credentials.
                     LOGGER.warning("Aria2 recovery coordinator tick failed")
@@ -232,6 +258,7 @@ class Aria2Runtime:
                 process.stdout.close()
             for signal_number, handler in previous_handlers.items():
                 signal.signal(signal_number, handler)
+            cookie_relay.close()
 
     @staticmethod
     def _forward_aria2_output(stream) -> None:
@@ -239,7 +266,8 @@ class Aria2Runtime:
             return
         try:
             for line in stream:
-                sys.stdout.write(redact_sensitive_urls_in_text(line))
+                safe_line = redact_sensitive_urls_in_text(line)
+                sys.stdout.write(redact_cookie_task_urls(safe_line))
                 sys.stdout.flush()
         except (OSError, ValueError):
             LOGGER.warning("Aria2 output stream closed before it was fully read")
@@ -258,7 +286,11 @@ class Aria2Runtime:
         return {"speed_threshold_bytes_per_second": threshold}
 
     def rpc(
-        self, request_payload: dict[str, Any], *, requested_directory: str = ""
+        self,
+        request_payload: dict[str, Any],
+        *,
+        requested_directory: str = "",
+        cookie_file: bytes | None = None,
     ) -> dict[str, Any]:
         request_id = request_payload.get("id") if isinstance(request_payload, dict) else None
         if (
@@ -279,6 +311,13 @@ class Aria2Runtime:
             return _rpc_error(request_id, -32602, "Client-supplied RPC credentials are not accepted.")
 
         method = request_payload["method"]
+        if cookie_file is not None and (
+            method != "aria2.addUri"
+            or not isinstance(cookie_file, bytes)
+            or not cookie_file
+            or len(cookie_file) > MAX_COOKIE_FILE_BYTES
+        ):
+            return _rpc_error(request_id, -32602, "Cookie hanya didukung untuk task Links Aria2.")
         route_requested = "tme3_route" in request_payload
         requested_route = request_payload.get("tme3_route")
         route_methods = {
@@ -291,6 +330,7 @@ class Aria2Runtime:
         ):
             return _rpc_error(request_id, -32602, "Aria2 download route is invalid.")
         params = list(params)
+        cookie_route_task = None
         if method in {"aria2.addUri", "aria2.addTorrent", "aria2.addMetalink"}:
             options_index = {
                 "aria2.addUri": 1,
@@ -318,7 +358,9 @@ class Aria2Runtime:
                 return _rpc_error(request_id, -32602, error)
             if route_requested:
                 try:
-                    safe_options.update(self.bunkr_links.route_options_for(requested_route))
+                    route_options = self.bunkr_links.route_options_for(requested_route)
+                    if cookie_file is None:
+                        safe_options.update(route_options)
                 except BunkrLinkError as exc:
                     return _rpc_error(request_id, -32000, str(exc))
             while len(params) <= options_index:
@@ -338,6 +380,8 @@ class Aria2Runtime:
                     -32602,
                     "Task ini dikelola dari tab Bunkr; ubah rute melalui daftar task Bunkr.",
                 )
+            if route_requested:
+                cookie_route_task = self.cookie_task_store.task_for_gid(params[0])
             safe_options, error = self._safe_download_options(params[1], create=False)
             if error:
                 return _rpc_error(request_id, -32602, error)
@@ -371,21 +415,29 @@ class Aria2Runtime:
                         route_options = self.bunkr_links.route_options_for(requested_route)
                     except BunkrLinkError as exc:
                         return _rpc_error(request_id, -32000, str(exc))
-                    params[1].update(route_options)
+                    if not cookie_route_task:
+                        params[1].update(route_options)
                 body = json.dumps({
                     "jsonrpc": "2.0",
                     "id": request_id,
                     "method": method,
                     "params": [f"token:{secret}", *params],
                 }).encode("utf-8")
-                rpc_request = Request(
-                    self.rpc_url,
-                    data=body,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with RPC_OPENER.open(rpc_request, timeout=30) as response:
-                    result = json.loads(response.read().decode("utf-8"))
+                if cookie_file is not None:
+                    result = self._cookie_relay_add(
+                        request_id, method, params,
+                        requested_route if route_requested else "non",
+                        cookie_file,
+                    )
+                else:
+                    rpc_request = Request(
+                        self.rpc_url,
+                        data=body,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with RPC_OPENER.open(rpc_request, timeout=30) as response:
+                        result = json.loads(response.read().decode("utf-8"))
             except Exception:
                 return _rpc_error(request_id, -32000, "Aria2 worker is unavailable.")
             if (
@@ -403,6 +455,21 @@ class Aria2Runtime:
                     )
         if not isinstance(result, dict):
             return _rpc_error(request_id, -32000, "Aria2 returned an invalid response.")
+        if "error" not in result:
+            if method in {"aria2.remove", "aria2.forceRemove", "aria2.removeDownloadResult"}:
+                if params and isinstance(params[0], str):
+                    self.cookie_task_store.remove_gid(params[0])
+            elif method == "aria2.purgeDownloadResult":
+                for task in self.cookie_task_store.tasks():
+                    self.cookie_task_store.remove_token(str(task["token"]))
+        if (
+            method == "aria2.changeOption"
+            and cookie_route_task
+            and route_requested
+            and "error" not in result
+        ):
+            self.cookie_task_store.update_route(params[0], requested_route)
+        result = self._restore_cookie_task_uris(method, params, result)
         result = self._redact_managed_result(method, params, result)
         result = _redact_aria2_proxy_options(result)
         result["jsonrpc"] = "2.0"
@@ -413,6 +480,80 @@ class Aria2Runtime:
                 if key in SAFE_GLOBAL_OPTIONS
             }
         return result
+
+    def _cookie_relay_add(
+        self,
+        request_id: Any,
+        method: str,
+        params: list[Any],
+        route: str,
+        cookie_file: bytes,
+    ) -> dict[str, Any]:
+        try:
+            secret = self.secret_file.read_text(encoding="utf-8").strip()
+            if not secret:
+                return _rpc_error(request_id, -32000, "Aria2 RPC is not configured.")
+            payload = {
+                "request": {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                },
+                "route": route,
+                "cookies_b64": base64.b64encode(cookie_file).decode("ascii"),
+            }
+            request = Request(
+                self.cookie_relay_url + "/internal/add",
+                data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {secret}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            with RPC_OPENER.open(request, timeout=35) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return _rpc_error(request_id, -32000, "Cookie relay worker is unavailable.")
+        if not isinstance(result, dict):
+            return _rpc_error(request_id, -32000, "Cookie relay returned an invalid response.")
+        result["jsonrpc"] = "2.0"
+        result["id"] = request_id
+        return result
+
+    def _restore_cookie_task_uris(
+        self, method: str, params: list[Any], response: dict[str, Any]
+    ) -> dict[str, Any]:
+        uri_methods = {
+            "aria2.getUris", "aria2.getFiles", "aria2.tellStatus",
+            "aria2.getStatus", "aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped",
+        }
+
+        def restore(value: Any) -> Any:
+            if isinstance(value, list):
+                return [restore(item) for item in value]
+            if isinstance(value, dict):
+                updated = dict(value)
+                for key, item in updated.items():
+                    if key == "uri" and isinstance(item, str):
+                        updated[key] = (
+                            self.cookie_task_store.source_for_relay_uri(item)
+                            or redact_cookie_task_urls(item)
+                        )
+                    else:
+                        updated[key] = restore(item)
+                return updated
+            if isinstance(value, str):
+                return redact_cookie_task_urls(value)
+            return value
+
+        if method in uri_methods:
+            response["result"] = restore(response.get("result"))
+        if "error" in response:
+            response["error"] = restore(response["error"])
+        return response
 
     def bunkr_links_preview(self, payload: object) -> dict[str, Any]:
         return self.bunkr_links.preview(payload)

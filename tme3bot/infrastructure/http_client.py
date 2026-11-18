@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import socket
@@ -863,6 +864,21 @@ class WorkerHttpDispatcher:
         return request_json(
             str(record["url"]), str(record["token"]), "POST",
             "/internal/v1/aria2/jsonrpc", request_payload, timeout=35,
+        )
+
+    def aria2_rpc_with_cookie(
+        self, worker: str, request_payload: dict[str, Any], cookie_file: bytes
+    ) -> dict[str, Any]:
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        payload = {
+            "request": request_payload,
+            "cookies_b64": base64.b64encode(cookie_file).decode("ascii"),
+        }
+        return request_json(
+            str(record["url"]), str(record["token"]), "POST",
+            "/internal/v1/aria2/jsonrpc-cookie", payload, timeout=35,
         )
 
     def aria2_links_preview(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]:
