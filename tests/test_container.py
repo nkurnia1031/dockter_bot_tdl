@@ -155,6 +155,31 @@ class ContainerBuildTests(unittest.TestCase):
                     any("/aria2:/aria2-state" in volume for volume in helper["volumes"])
                 )
 
+    def test_aria2_state_mount_matches_its_validated_database_path(self) -> None:
+        for filename, state_root, expected_volume in (
+            (
+                "docker-compose.gateway.yml",
+                "/database/worker-local/aria2",
+                "${DATABASE_ROOT:-/srv/tme3bot/db/gateway}/worker-local/aria2:"
+                "/database/worker-local/aria2",
+            ),
+            (
+                "docker-compose.worker.yml",
+                "/database/aria2",
+                "${DATABASE_ROOT:-/srv/tme3bot/db/worker}/aria2:"
+                "/database/aria2",
+            ),
+        ):
+            with self.subTest(filename=filename):
+                services = yaml.safe_load(
+                    (PROJECT_ROOT / filename).read_text(encoding="utf-8")
+                )["services"]
+                aria2 = services["aria2"]
+                self.assertEqual(
+                    aria2["environment"]["ARIA2_STATE_ROOT"], state_root
+                )
+                self.assertIn(expected_volume, aria2["volumes"])
+
     def test_worker_aria2_bridge_reads_the_shared_tor_proxy_token(self) -> None:
         for filename, service_name, expected_path, proxy_subpath in (
             (
