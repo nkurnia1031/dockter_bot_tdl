@@ -353,6 +353,7 @@ class UtilityJobRequest(BaseModel):
     password: str | None = None
     flatten_action: str | None = None
     flatten_fingerprints: dict[str, str] | None = None
+    video_options: dict[str, Any] | None = None
     worker: str | None = None
 
 

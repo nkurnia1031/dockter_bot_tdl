@@ -85,6 +85,62 @@ describe('UtilityPage access controls', () => {
     expect(requests.some((url) => url.endsWith('/utility/jobs'))).toBe(true);
   });
 
+  it('submits per-job video settings and uses the selected codec defaults', async () => {
+    const submissions: any[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method || 'GET').toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'local', url: 'http://worker-local', enabled: true }
+      ] }), { status: 200 });
+      if (url.endsWith('/profiles/local')) return readinessResponse();
+      if (url.endsWith('/utility/folders')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/utility/tree')) return new Response(JSON.stringify({ path: '/workspace', items: [
+        { name: 'video', path: '/workspace/video', kind: 'directory', files: 1, directories: 0, has_children: false }
+      ] }), { status: 200 });
+      if (url.endsWith('/utility/jobs') && method === 'POST') {
+        submissions.push(body);
+        return new Response(JSON.stringify({ id: 'video-job', kind: 'utility', status: 'queued' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    await session.restore();
+    render(UtilityPage);
+    await fireEvent.click(await screen.findByRole('checkbox', { name: 'Pilih video' }));
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Jenis operasi' }), {
+      target: { value: 'video_convert' }
+    });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Pilih' }));
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Codec video' }), {
+      target: { value: 'h264' }
+    });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Resolusi video' }), {
+      target: { value: 'original' }
+    });
+    await fireEvent.change(screen.getByRole('combobox', { name: 'Kecepatan encode' }), {
+      target: { value: 'slow' }
+    });
+    await fireEvent.change(screen.getByRole('slider', { name: 'Kualitas video' }), {
+      target: { value: '33' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Jalankan utility' }));
+
+    await waitFor(() => expect(submissions).toHaveLength(1));
+    expect(submissions[0]).toEqual({
+      utility: 'video_convert',
+      folders: ['/workspace/video'],
+      worker: 'local',
+      video_options: { codec: 'h264', resolution: 'original', crf: 18, speed: 'slow' }
+    });
+  });
+
   it('previews Flatten completely and submits a separate confirmed apply job', async () => {
     const requests: { url: string; method: string; body?: any }[] = [];
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);

@@ -40,6 +40,10 @@
   let pending = $state(false);
   let message = $state('');
   let worker = $state('');
+  let videoCodec = $state<'h265' | 'h264'>('h265');
+  let videoResolution = $state<'720p' | '1080p' | 'original'>('720p');
+  let videoQuality = $state(21);
+  let videoSpeed = $state('veryfast');
   let flattenPreview = $state<FlattenPreviewState | null>(null);
   let pageDisposed = false;
 
@@ -162,7 +166,21 @@
     }
     pending = true;
     try {
-      await post('/utility/jobs', { utility, folders: selected, worker, ...(password ? { password } : {}) });
+      const includesVideo = utility === 'video_convert' || utility === 'media_pipeline';
+      await post('/utility/jobs', {
+        utility,
+        folders: selected,
+        worker,
+        ...(password ? { password } : {}),
+        ...(includesVideo ? {
+          video_options: {
+            codec: videoCodec,
+            resolution: videoResolution,
+            crf: 51 - videoQuality,
+            speed: videoSpeed
+          }
+        } : {})
+      });
       message = `${selected.length} folder masuk antrean utility.`;
     } catch (cause) { message = cause instanceof Error ? cause.message : 'Utility gagal dibuat.'; }
     finally { pending = false; }
@@ -173,6 +191,18 @@
     flattenPreview = null;
     if (utility !== 'extract') password = '';
     message = '';
+  }
+
+  function changeVideoCodec(event: Event) {
+    videoCodec = (event.currentTarget as HTMLSelectElement).value as 'h265' | 'h264';
+    if (videoCodec === 'h265') {
+      videoResolution = '720p';
+      videoQuality = 21; // CRF 30 from convert.py
+    } else {
+      videoResolution = '1080p';
+      videoQuality = 33; // CRF 18 from convert3.py
+    }
+    videoSpeed = 'veryfast';
   }
 
   onDestroy(() => { pageDisposed = true; });
@@ -188,8 +218,35 @@
     <div class="mt-4"><WorkspaceExplorer bind:selected {worker} /></div>
   </section>
   <section class="card p-5 sm:p-6">
-    <label class="block text-sm font-bold">Jenis operasi<select class="field mt-2" value={utility} onchange={changeUtility}><option value="pindah">Pindah / group</option><option value="compress">Compress 7z</option><option value="extract">Extract</option><option value="export">Organizer export</option><option value="flatten">Flatten folder</option></select></label>
+    <label class="block text-sm font-bold">Jenis operasi<select class="field mt-2" value={utility} onchange={changeUtility}><option value="pindah">Pindah / group</option><option value="compress">Compress 7z</option><option value="extract">Extract</option><option value="export">Organizer export</option><option value="flatten">Flatten folder</option><option value="video_convert">Konversi video</option><option value="image_compress">Kompres gambar</option><option value="media_pipeline">Video + gambar</option></select></label>
     {#if utility === 'extract'}<label class="mt-4 block text-sm font-bold">Password arsip<input class="field mt-2" type="password" bind:value={password} autocomplete="new-password" placeholder="Kosongkan untuk default"/></label>{/if}
+    {#if utility === 'video_convert' || utility === 'media_pipeline'}
+      <section class="mt-4 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-4" aria-label="Pengaturan konversi video">
+        <h3 class="font-bold">Pengaturan video untuk job ini</h3>
+        <div class="mt-3 grid gap-3 sm:grid-cols-2">
+          <label class="block text-sm font-semibold">Codec
+            <select class="field mt-1" aria-label="Codec video" value={videoCodec} onchange={changeVideoCodec}>
+              <option value="h265">H.265 (HEVC)</option><option value="h264">H.264 (AVC)</option>
+            </select>
+          </label>
+          <label class="block text-sm font-semibold">Resolusi maksimum
+            <select class="field mt-1" aria-label="Resolusi video" bind:value={videoResolution}>
+              <option value="720p">720p</option><option value="1080p">1080p</option><option value="original">Asli</option>
+            </select>
+          </label>
+          <label class="block text-sm font-semibold sm:col-span-2">Kualitas · Terburuk → Terbaik
+            <input class="mt-3 w-full accent-[var(--accent)]" aria-label="Kualitas video" type="range" min="0" max="51" step="1" bind:value={videoQuality} />
+            <span class="muted mt-1 flex justify-between text-xs"><span>Terburuk</span><span>CRF {51 - videoQuality}</span><span>Terbaik</span></span>
+          </label>
+          <label class="block text-sm font-semibold">Kecepatan encode
+            <select class="field mt-1" aria-label="Kecepatan encode" bind:value={videoSpeed}>
+              <option value="ultrafast">ultrafast</option><option value="superfast">superfast</option><option value="veryfast">veryfast</option><option value="faster">faster</option><option value="fast">fast</option><option value="medium">medium</option><option value="slow">slow</option><option value="slower">slower</option><option value="veryslow">veryslow</option>
+            </select>
+          </label>
+        </div>
+        <p class="muted mt-3 text-xs">Default H.265 mengikuti convert.py dan H.264 mengikuti convert3.py. Resolusi mempertahankan rasio aspek dan tidak memperbesar video sumber.</p>
+      </section>
+    {/if}
     <div class="mt-5 flex flex-wrap gap-2"><button class="button" onclick={run} disabled={!selected.length || pending}><Play size={16}/>{pending ? 'Memproses...' : utility === 'flatten' ? 'Preview Flatten' : 'Jalankan utility'}</button><button class="button secondary" onclick={saveFolders} disabled={!selected.length || pending}><Plus size={16}/>Simpan pilihan</button></div>
     {#if message}<p class="mt-4 rounded-xl bg-[var(--brand-soft)] p-3 text-sm" role="status">{message}</p>{/if}
 

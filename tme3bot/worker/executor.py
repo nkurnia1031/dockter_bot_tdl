@@ -2799,14 +2799,42 @@ class WorkerJobExecutor(
                     command_terminal_status = "failed"
                 elif utility_outcome in {"partial_failure", "failed"}:
                     summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
-                    archive_total = int(summary.get("archives_processed") or 0)
-                    archive_succeeded = int(summary.get("archives_succeeded") or 0)
-                    archive_failed = int(summary.get("archives_failed") or 0)
-                    error_message = (
-                        f"{archive_failed} arsip gagal setelah semua kandidat password dicoba."
-                        if archive_failed
-                        else "Extract gagal pada folder pilihan."
-                    )
+                    utility_payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+                    utility_name = str(utility_payload.get("utility") or "")
+                    media_mode = utility_name in {"video_convert", "image_compress", "media_pipeline"}
+                    if media_mode:
+                        files_total = int(summary.get("files_total") or 0)
+                        files_succeeded = int(summary.get("files_succeeded") or 0)
+                        files_failed = int(summary.get("files_failed") or 0)
+                        error_message = (
+                            f"Konversi media selesai sebagian: {files_succeeded} berhasil, "
+                            f"{files_failed} gagal dari {files_total} file."
+                            if files_succeeded
+                            else f"Konversi media gagal untuk {files_failed} dari {files_total} file."
+                        )
+                        error_code = "UTILITY_MEDIA_PARTIAL" if files_succeeded else "UTILITY_MEDIA_FAILED"
+                        overall = {
+                            "current": files_succeeded + files_failed,
+                            "total": files_total,
+                            "unit": "files",
+                        }
+                        counters = {"succeeded": files_succeeded, "failed": files_failed}
+                    else:
+                        archive_total = int(summary.get("archives_processed") or 0)
+                        archive_succeeded = int(summary.get("archives_succeeded") or 0)
+                        archive_failed = int(summary.get("archives_failed") or 0)
+                        error_message = (
+                            f"{archive_failed} arsip gagal setelah semua kandidat password dicoba."
+                            if archive_failed
+                            else "Extract gagal pada folder pilihan."
+                        )
+                        error_code = "UTILITY_EXTRACT_FAILED"
+                        overall = {
+                            "current": archive_succeeded + archive_failed,
+                            "total": archive_total,
+                            "unit": "archives",
+                        }
+                        counters = {"succeeded": archive_succeeded, "failed": archive_failed}
                     self.publisher.emit(
                         job_id,
                         "failed",
@@ -2815,18 +2843,11 @@ class WorkerJobExecutor(
                             "phase": utility_outcome,
                             "message": error_message,
                             "finished_at": utc_now().isoformat(),
-                            "overall": {
-                                "current": archive_succeeded + archive_failed,
-                                "total": archive_total,
-                                "unit": "archives",
-                            },
-                            "counters": {
-                                "succeeded": archive_succeeded,
-                                "failed": archive_failed,
-                            },
+                            "overall": overall,
+                            "counters": counters,
                         },
                         result={"value": json_value(result)},
-                        error={"code": "UTILITY_EXTRACT_FAILED", "message": error_message},
+                        error={"code": error_code, "message": error_message},
                     )
                     command_terminal_status = "failed"
                 else:

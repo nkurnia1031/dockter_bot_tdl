@@ -4510,6 +4510,51 @@ class BackendApiTests(unittest.TestCase):
         self.assertIsNone(self.runtime_readiness_store.cell("local", None, "utility"))
         self.assertEqual(checker_calls, [])
 
+    def test_utility_video_options_are_normalized_and_persisted_per_job(self):
+        self.control.runtime_readiness_gate = RuntimeReadinessGate(
+            self.runtime_readiness_store
+        )
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-10-23T10:00:00Z",
+            workers=[{"worker": "local", "status": "success"}],
+            profiles={"local": []},
+        )
+        headers = self.login()
+        accepted = self.client.post(
+            "/api/v1/utility/jobs",
+            headers=headers,
+            json={
+                "utility": "media_pipeline",
+                "folders": ["/workspace/video"],
+                "worker": "local",
+                "video_options": {
+                    "codec": "h264",
+                    "resolution": "720p",
+                    "crf": 24,
+                    "speed": "slow",
+                },
+            },
+        )
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        worker_payload = self.dispatcher.commands[-1][1]["payload"]
+        self.assertEqual(
+            worker_payload["video_options"],
+            {"codec": "h264", "resolution": "720p", "crf": 24, "speed": "slow"},
+        )
+
+        invalid = self.client.post(
+            "/api/v1/utility/jobs",
+            headers=headers,
+            json={
+                "utility": "video_convert",
+                "folders": ["/workspace/video"],
+                "worker": "local",
+                "video_options": {"codec": "h265", "crf": 52},
+            },
+        )
+        self.assertEqual(invalid.status_code, 422, invalid.text)
+        self.assertEqual(invalid.json()["error"]["code"], "UTILITY_VIDEO_OPTIONS_INVALID")
+
     def test_context_checker_does_not_use_catalog_as_a_profile_worker_gate(self):
         headers = self.login()
         self.workers.values["remote-1"] = {"url": "http://remote", "token": "secret"}

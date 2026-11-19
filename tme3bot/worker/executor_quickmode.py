@@ -1114,6 +1114,7 @@ class QuickModeExecutorMixin:
                     stall_timeout_seconds=getattr(
                         self.config, "job_stall_timeout_seconds", 600
                     ),
+                    owner_job_id=job_id,
                     progress_callback=lambda value: reporter.report(
                         phase="compressing",
                         message="Mengompres hasil download",

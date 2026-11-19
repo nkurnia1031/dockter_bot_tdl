@@ -33,9 +33,19 @@ from tme3bot.utility_flatten import (
     plan_flatten,
     validate_flatten_roots,
 )
+from tme3bot.utility_media import (
+    MEDIA_UTILITIES,
+    VIDEO_CONVERT,
+    UtilityMediaProcessor,
+    default_video_options,
+    normalize_video_options,
+)
 
 LOGGER = logging.getLogger(__name__)
-UTILITY_NAMES = ("extract", "compress", "export", "pindah", "flatten")
+UTILITY_NAMES = (
+    "extract", "compress", "export", "pindah", "flatten",
+    "video_convert", "image_compress", "media_pipeline",
+)
 DEFAULT_UTILITY_FOLDERS = ("/workspace/biasa", "/workspace/pilihan", "/workspace/downloads")
 DEFAULT_UTILITY_SETTINGS = {
     "move_size": "4g",
@@ -54,7 +64,9 @@ UTILITY_RUNTIME_SCRIPTS = (
     "pindah/pindah.py",
     "pindah/pindah2.py",
 )
-UTILITY_RUNTIME_COMMANDS = ("python3", "bash", "7z", "du", "cut")
+UTILITY_RUNTIME_COMMANDS = (
+    "python3", "bash", "7z", "du", "cut", "ffmpeg", "ffprobe", "mogrify", "identify",
+)
 UTILITY_SETTING_SPECS = {
     "move_size": {
         "label": "Batas ukuran grup pindah",
@@ -97,6 +109,13 @@ class UtilityRuntimeError(RuntimeError):
         super().__init__(f"{code}: {message}")
 
 
+class UtilityCancelledError(RuntimeError):
+    """Raised when the active Utility job was cancelled by its operator."""
+
+    def __init__(self) -> None:
+        super().__init__("Job Utility dibatalkan.")
+
+
 def probe_utility_runtime(utility_root: Path, workspace_root: Path) -> dict[str, object]:
     """Inspect Utility dependencies without creating or changing workspace files."""
     utility_root = Path(utility_root)
@@ -121,6 +140,13 @@ def probe_utility_runtime(utility_root: Path, workspace_root: Path) -> dict[str,
             (
                 "tme3bot/utility_flatten.py",
                 hashlib.sha256(flatten_module.read_bytes()).hexdigest(),
+            )
+        )
+        media_module = Path(__file__).with_name("utility_media.py")
+        script_hashes.append(
+            (
+                "tme3bot/utility_media.py",
+                hashlib.sha256(media_module.read_bytes()).hexdigest(),
             )
         )
     except OSError:
@@ -439,6 +465,7 @@ class UtilityRunner:
         stall_timeout_seconds: int = 0,
         command_callback: CommandCallback | None = None,
         workspace_root: Path = Path("/workspace"),
+        owner_job_id: str | None = None,
     ) -> None:
         self.root = utility_root
         self.workspace = Path(workspace_root).resolve()
@@ -446,6 +473,7 @@ class UtilityRunner:
         self.progress_callback = progress_callback
         self.stall_timeout_seconds = max(0, int(stall_timeout_seconds))
         self.command_callback = command_callback
+        self.owner_job_id = str(owner_job_id) if owner_job_id is not None else None
         self._process_lock = threading.RLock()
         self._pause_condition = threading.Condition(self._process_lock)
         self._pause_requested = False
@@ -454,6 +482,11 @@ class UtilityRunner:
         self._current_owner: str | None = None
         self._folder_index: int | None = None
         self._folder_total: int | None = None
+        self._running = False
+        self._run_owner: str | None = None
+        self._cancel_before_run = False
+        self._cancel_requested = threading.Event()
+        self._current_owner = self.owner_job_id
 
     def pause_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
@@ -480,21 +513,39 @@ class UtilityRunner:
     def _wait_until_resumed(self) -> None:
         with self._pause_condition:
             while self._pause_requested:
+                self._check_cancelled()
                 self._pause_condition.wait(timeout=1.0)
+            self._check_cancelled()
 
     def cancel_current(self, owner_job_id: str | None = None) -> bool:
-        with self._process_lock:
+        with self._pause_condition:
             process = self._current_process
             current_owner = self._current_owner
-        if owner_job_id is not None and current_owner != str(owner_job_id):
-            return False
+            process_active = process is not None and process.poll() is None
+            if not self._running and not process_active:
+                if (
+                    owner_job_id is None
+                    or current_owner is None
+                    or current_owner != str(owner_job_id)
+                ):
+                    return False
+                self._cancel_requested.set()
+                self._cancel_before_run = True
+                self._pause_condition.notify_all()
+                return True
+            if owner_job_id is not None and current_owner != str(owner_job_id):
+                return False
+            self._cancel_requested.set()
+            self._pause_condition.notify_all()
+            process = self._current_process
         if process is None or process.poll() is not None:
-            return False
+            return True
         if os.name != "nt":
             try:
+                os.killpg(os.getpgid(process.pid), signal.SIGCONT)
                 os.killpg(os.getpgid(process.pid), signal.SIGINT)
             except ProcessLookupError:
-                return False
+                return True
         else:  # pragma: no cover - production workers run on Linux
             process.send_signal(signal.CTRL_BREAK_EVENT)
         try:
@@ -512,7 +563,53 @@ class UtilityRunner:
         *,
         flatten_action: str | None = None,
         flatten_fingerprints: dict[str, str] | None = None,
+        video_options: dict[str, object] | None = None,
     ) -> UtilityResult:
+        with self._process_lock:
+            if self._running:
+                raise RuntimeError("UtilityRunner tidak dapat menjalankan dua job bersamaan.")
+            self._running = True
+            self._run_owner = self.owner_job_id or (
+                str(getattr(self.command_callback, "job_id", "") or "") or None
+            )
+            self._current_owner = self._run_owner
+            if not self._cancel_before_run:
+                self._cancel_requested.clear()
+        try:
+            return self._run(
+                utility,
+                folders,
+                password,
+                settings,
+                flatten_action=flatten_action,
+                flatten_fingerprints=flatten_fingerprints,
+                video_options=video_options,
+            )
+        finally:
+            with self._pause_condition:
+                self._running = False
+                self._current_owner = None
+                self._run_owner = None
+                self._cancel_before_run = False
+                self._cancel_requested.clear()
+                self._paused = False
+                self._pause_requested = False
+                self._pause_condition.notify_all()
+
+    def _run(
+        self,
+        utility: str,
+        folders: list[str],
+        password: str | None = None,
+        settings: dict[str, str] | None = None,
+        *,
+        flatten_action: str | None = None,
+        flatten_fingerprints: dict[str, str] | None = None,
+        video_options: dict[str, object] | None = None,
+    ) -> UtilityResult:
+        self._check_cancelled()
+        if utility in MEDIA_UTILITIES:
+            return self._run_media(utility, folders, video_options)
         if utility == "flatten":
             return self._run_flatten(
                 folders, flatten_action, flatten_fingerprints or {}
@@ -633,6 +730,8 @@ class UtilityRunner:
                 LOGGER.exception("Utility %s failed for %s", utility, folder)
                 if isinstance(exc, UtilityRuntimeError):
                     raise
+                if isinstance(exc, UtilityCancelledError):
+                    raise
                 if isinstance(exc, ProcessStalledError):
                     raise UtilityRuntimeError(
                         "UTILITY_PROCESS_STALLED",
@@ -695,6 +794,50 @@ class UtilityRunner:
                 archive_results=archive_results,
             )
         return UtilityResult(utility, succeeded, failed, details, summary)
+
+    def _check_cancelled(self) -> None:
+        if self._cancel_requested.is_set():
+            raise UtilityCancelledError()
+
+    def _run_media(
+        self,
+        utility: str,
+        folders: list[str],
+        video_options: dict[str, object] | None,
+    ) -> UtilityResult:
+        resolved_folders = [self._resolve_workspace_folder(folder) for folder in folders]
+        required = set()
+        if utility in {"video_convert", "media_pipeline"}:
+            required.update({"ffmpeg", "ffprobe"})
+        if utility in {"image_compress", "media_pipeline"}:
+            required.update({"mogrify", "identify"})
+        missing = sorted(command for command in required if not shutil.which(command))
+        if missing:
+            raise UtilityRuntimeError(
+                "UTILITY_MEDIA_RUNTIME_UNAVAILABLE",
+                "Worker tidak memiliki runtime konversi media yang diperlukan.",
+            )
+        try:
+            media_result = UtilityMediaProcessor(
+                self.workspace,
+                self._command,
+                self._progress,
+                self._check_cancelled,
+            ).run(utility, resolved_folders, video_options)
+        except ValueError as exc:
+            raise UtilityRuntimeError(
+                "UTILITY_VIDEO_OPTIONS_INVALID",
+                "Pengaturan konversi video tidak valid.",
+            ) from exc
+        return UtilityResult(
+            utility,
+            list(media_result["succeeded"]),
+            dict(media_result["failed"]),
+            list(media_result["details"]),
+            dict(media_result["summary"]),
+            outcome=str(media_result["outcome"]),
+            archive_results=list(media_result.get("summary", {}).get("archives", [])),
+        )
 
     def _run_flatten(
         self,
@@ -927,9 +1070,21 @@ class UtilityRunner:
         settings: dict[str, str] | None = None,
         *,
         allow_result_on_failure: bool = False,
+        capture_output: bool = False,
+        capture_log: bool = True,
+        line_progress: Callable[[str], dict[str, object] | None] | None = None,
+        cpu_quota_percent: int | None = None,
+        cpu_threads: int = 1,
+        lower_priority: bool = False,
     ) -> dict[str, object] | None:
+        with self._process_lock:
+            # Preserve the private single-command seam used by lightweight
+            # callers and tests; normal Utility jobs reset this once in run().
+            if not self._running and not self._cancel_before_run:
+                self._cancel_requested.clear()
         LOGGER.info("%s start folder=%s", prefix, cwd)
         self._wait_until_resumed()
+        self._check_cancelled()
         started_at = time.monotonic()
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
@@ -942,6 +1097,7 @@ class UtilityRunner:
             # final preflight with Popen and owner registration so a cancel
             # cannot be accepted while the subprocess is invisible to it.
             with self._process_lock:
+                self._check_cancelled()
                 preflight_command(self.command_callback)
                 process = subprocess.Popen(
                     command,
@@ -952,9 +1108,16 @@ class UtilityRunner:
                     env=env,
                     start_new_session=os.name != "nt",
                 )
-                owner_job_id = str(getattr(self.command_callback, "job_id", "") or "") or None
+                owner_job_id = self._run_owner or (
+                    str(getattr(self.command_callback, "job_id", "") or "") or None
+                )
                 self._current_process = process
                 self._current_owner = owner_job_id
+                if lower_priority and os.name != "nt" and hasattr(os, "setpriority"):
+                    try:
+                        os.setpriority(os.PRIO_PROCESS, process.pid, 15)
+                    except OSError:
+                        LOGGER.debug("Could not lower priority for %s", prefix, exc_info=True)
         except OSError as exc:
             if self.command_callback is not None:
                 notify_command_completed(
@@ -1006,6 +1169,45 @@ class UtilityRunner:
         )
         watchdog_thread.start()
 
+        cpu_limiter_stop = threading.Event()
+        cpu_limiter_thread: threading.Thread | None = None
+        if os.name != "nt" and cpu_quota_percent is not None:
+            quota = max(1, min(100, int(cpu_quota_percent)))
+            thread_count = max(1, int(cpu_threads))
+            duty = min(1.0, quota / (100.0 * thread_count))
+            if duty < 1.0:
+                slice_seconds = 0.5
+
+                def limit_cpu() -> None:
+                    while not cpu_limiter_stop.wait(slice_seconds * duty):
+                        if process.poll() is not None or self._cancel_requested.is_set():
+                            return
+                        with self._process_lock:
+                            if self._paused:
+                                continue
+                        try:
+                            os.killpg(os.getpgid(process.pid), signal.SIGSTOP)
+                        except ProcessLookupError:
+                            return
+                        if cpu_limiter_stop.wait(slice_seconds * (1.0 - duty)):
+                            return
+                        if process.poll() is not None or self._cancel_requested.is_set():
+                            return
+                        with self._process_lock:
+                            paused = self._paused
+                        if not paused:
+                            try:
+                                os.killpg(os.getpgid(process.pid), signal.SIGCONT)
+                            except ProcessLookupError:
+                                return
+
+                cpu_limiter_thread = threading.Thread(
+                    target=limit_cpu,
+                    daemon=True,
+                    name=f"utility-cpu-limit-{prefix}",
+                )
+                cpu_limiter_thread.start()
+
         def consume_line(raw_line: str) -> None:
             nonlocal marker, result_marker, last_progress_at, last_progress_signature
             clean = raw_line.strip()
@@ -1019,10 +1221,22 @@ class UtilityRunner:
                 except json.JSONDecodeError:
                     LOGGER.warning("Invalid utility result marker for %s", prefix)
                 return
-            lines.append(clean)
-            LOGGER.info("%s | %s", prefix, clean)
-            if self.log_callback:
-                self.log_callback(clean)
+            if capture_output:
+                lines.append(clean)
+            if capture_log:
+                if not capture_output:
+                    lines.append(clean)
+                LOGGER.info("%s | %s", prefix, clean)
+                if self.log_callback:
+                    self.log_callback(clean)
+            if line_progress is not None:
+                progress = line_progress(clean)
+                if isinstance(progress, dict):
+                    signature = json.dumps(progress, sort_keys=True, default=str)
+                    if signature != last_progress_signature:
+                        last_progress_signature = signature
+                        last_progress_at = time.monotonic()
+                    self._progress({"command": prefix, **progress})
             if clean.startswith("TME3_PROGRESS "):
                 try:
                     decoded = json.loads(clean.removeprefix("TME3_PROGRESS "))
@@ -1081,12 +1295,15 @@ class UtilityRunner:
             code = process.wait()
         finally:
             watchdog_stop.set()
+            cpu_limiter_stop.set()
             watchdog_thread.join(timeout=2)
+            if cpu_limiter_thread is not None:
+                cpu_limiter_thread.join(timeout=2)
             process.stdout.close()
             with self._process_lock:
                 if self._current_process is process:
                     self._current_process = None
-                    self._current_owner = None
+                    self._current_owner = self._run_owner
                     self._paused = False
                     self._pause_requested = False
                     self._pause_condition.notify_all()
@@ -1105,10 +1322,18 @@ class UtilityRunner:
                 f"{prefix} stalled for {self.stall_timeout_seconds}s",
                 self.stall_timeout_seconds,
             )
+        if self._running and self._cancel_requested.is_set():
+            raise UtilityCancelledError()
         if code != 0:
             if allow_result_on_failure and result_marker is not None:
                 return result_marker
-            raise RuntimeError(f"{prefix} exit code {code}: {' | '.join(lines[-5:])}")
+            detail = lines[-5:] if capture_output or capture_log else []
+            raise RuntimeError(
+                f"{prefix} exit code {code}"
+                + (f": {' | '.join(detail)}" if detail else "")
+            )
+        if capture_output:
+            return {"stdout": "\n".join(lines), "returncode": int(code)}
         return result_marker
 
     @staticmethod

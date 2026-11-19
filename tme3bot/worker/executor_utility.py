@@ -7,6 +7,7 @@ from tme3bot.progress_reporter import (
     ProgressReporter,
 )
 from tme3bot.utility import (
+    MEDIA_UTILITIES,
     UtilityRunner,
 )
 from typing import (
@@ -33,6 +34,7 @@ class UtilityExecutorMixin:
         if missing:
             raise ValueError(f"Folder utility tidak ditemukan: {', '.join(missing)}")
         utility_name = str(payload["utility"])
+        media_mode = utility_name in MEDIA_UTILITIES
         counters = {"succeeded": 0, "failed": 0, "skipped": 0}
 
         def utility_progress(value: dict[str, object]) -> None:
@@ -57,7 +59,18 @@ class UtilityExecutorMixin:
             folder_index = int(value.get("folder_index") or 1)
             folder_total = int(value.get("folder_total") or len(folders))
             percent = value.get("percent")
-            if archive_phase:
+            media_overall = value.get("overall") if media_mode else None
+            if media_mode and isinstance(media_overall, dict):
+                overall = dict(media_overall)
+            elif media_mode:
+                overall = {
+                    "current": value.get("files_discovered", 0),
+                    "total": None,
+                    "percent": None,
+                    "unit": "files",
+                    "files_current": value.get("files_discovered", 0),
+                }
+            elif archive_phase:
                 archive_fraction = (
                     index / total
                     if total and phase in {"archive_completed", "archive_failed"}
@@ -104,6 +117,10 @@ class UtilityExecutorMixin:
                     "size_bytes": value.get("size_bytes"),
                     "percent": percent,
                     "pass_name": value.get("pass_name"),
+                    "stage": value.get("stage"),
+                    "codec": value.get("codec"),
+                    "resolution": value.get("resolution"),
+                    "files_discovered": value.get("files_discovered"),
                 },
                 transfer=reporter.transfer_metrics(
                     speed_bps=value.get("speed_bps"),
@@ -117,6 +134,7 @@ class UtilityExecutorMixin:
                 indeterminate=bool(value.get("indeterminate", percent is None)),
                 force=phase.endswith("_starting") or phase in {
                     "item_completed", "item_failed", "archive_completed", "archive_failed",
+                    "media_archive_completed", "media_archive_failed",
                     "extract_folder_completed", "extract_folder_failed",
                     "flatten_preview_completed", "flatten_folder_completed",
                 },
@@ -137,6 +155,7 @@ class UtilityExecutorMixin:
                     ),
                 )
 
+        job_id = str(command["job_id"])
         runner = UtilityRunner(
             Path("/app/utility") if Path("/app/utility").exists() else Path("utility"),
             log_callback=self._append_job_log,
@@ -144,9 +163,9 @@ class UtilityExecutorMixin:
             stall_timeout_seconds=getattr(
                 self.config, "job_stall_timeout_seconds", 600
             ),
+            owner_job_id=job_id,
             progress_callback=utility_progress,
         )
-        job_id = str(command["job_id"])
         with self._lock:
             self._utility_runners[job_id] = runner
         try:
@@ -158,16 +177,41 @@ class UtilityExecutorMixin:
                     payload.get("settings") or {},
                     flatten_action=payload.get("flatten_action"),
                     flatten_fingerprints=payload.get("flatten_fingerprints"),
+                    video_options=payload.get("video_options"),
                 )
             )
             archive_mode = utility_name == "extract"
+            media_summary = result.get("summary", {})
+            media_failed = int(media_summary.get("files_failed", 0)) if media_mode else 0
+            media_succeeded = int(media_summary.get("files_succeeded", 0)) if media_mode else 0
+            media_total = int(media_summary.get("files_total", 0)) if media_mode else 0
             archive_succeeded = int(result.get("summary", {}).get("archives_succeeded", 0))
             archive_partial = int(result.get("summary", {}).get("archives_partial", 0))
             archive_failed = int(result.get("summary", {}).get("archives_failed", 0))
             failed_outcome = result.get("outcome") in {"failed", "partial_failure"}
-            reporter.report(
-                phase="extract_failed" if archive_mode and failed_outcome else "completed",
-                message=(
+            final_phase = (
+                "utility_failed"
+                if media_mode and failed_outcome
+                else "completed"
+            )
+            if archive_mode and failed_outcome:
+                final_phase = "extract_failed"
+            if media_mode:
+                final_message = (
+                    f"Konversi media selesai: {media_succeeded} file berhasil, "
+                    f"{media_failed} gagal dari {media_total}."
+                )
+                final_overall = {
+                    "current": media_succeeded + media_failed,
+                    "total": media_total,
+                    "percent": 100,
+                    "unit": "files",
+                    "files_current": media_succeeded + media_failed,
+                    "files_total": media_total,
+                }
+                final_counters = {"succeeded": media_succeeded, "failed": media_failed}
+            else:
+                final_message = (
                     (
                         f"Extract selesai: {archive_succeeded} arsip berhasil"
                         + (f" ({archive_partial} parsial)" if archive_partial else "")
@@ -179,17 +223,22 @@ class UtilityExecutorMixin:
                         f"Utility selesai: {len(result.get('succeeded', []))} folder berhasil, "
                         f"{len(result.get('failed', {}))} gagal"
                     )
-                ),
-                overall={
+                )
+                final_overall = {
                     "current": archive_succeeded + archive_failed if archive_mode else len(folders),
                     "total": result.get("summary", {}).get("archives_processed", 0) if archive_mode else len(folders),
                     "percent": 100,
                     "unit": "archives" if archive_mode else "folders",
-                },
-                counters={
+                }
+                final_counters = {
                     "succeeded": archive_succeeded if archive_mode else len(result.get("succeeded", [])),
                     "failed": archive_failed if archive_mode else len(result.get("failed", {})),
-                },
+                }
+            reporter.report(
+                phase=final_phase,
+                message=final_message,
+                overall=final_overall,
+                counters=final_counters,
                 force=True,
             )
             return result

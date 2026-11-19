@@ -36,7 +36,11 @@ from tme3bot.tdl_access_fingerprint import (
     normalize_session_fingerprints,
 )
 from tme3bot.url_parser import parse_tme3_url
-from tme3bot.utility import DEFAULT_UTILITY_SETTINGS, validate_rclone_destination
+from tme3bot.utility import (
+    DEFAULT_UTILITY_SETTINGS,
+    normalize_video_options,
+    validate_rclone_destination,
+)
 from tme3bot.safelink import normalize_shortlink_url
 
 _DURABLE_JOB_KINDS = frozenset({
@@ -502,7 +506,7 @@ class ControlPlane:
                     key: internal_payload.get(key)
                     for key in (
                         "utility", "folders", "password", "flatten_action",
-                        "flatten_fingerprints",
+                        "flatten_fingerprints", "video_options",
                     )
                     if key in internal_payload
                 },
@@ -1061,7 +1065,7 @@ class ControlPlane:
             "download": {"artifact_ids", "priority"},
             "utility": {
                 "utility", "folders", "password", "flatten_action",
-                "flatten_fingerprints",
+                "flatten_fingerprints", "video_options",
             },
             "storage_upload": {
                 "folder_path", "folder", "destination_folder_id",
@@ -1353,7 +1357,10 @@ class ControlPlane:
         if kind == "utility":
             utility = str(payload.get("utility") or "").strip().lower()
             folders = payload.get("folders")
-            if utility not in {"extract", "compress", "export", "pindah", "flatten"}:
+            if utility not in {
+                "extract", "compress", "export", "pindah", "flatten",
+                "video_convert", "image_compress", "media_pipeline",
+            }:
                 raise DomainError("UTILITY_INVALID", "Jenis utility tidak dikenal.", status_code=422)
             if not isinstance(folders, list) or not folders or len(folders) > 500:
                 raise DomainError("JOB_PAYLOAD_INVALID", "Daftar folder utility tidak valid.", status_code=422)
@@ -1366,6 +1373,24 @@ class ControlPlane:
             password = payload.get("password")
             if password is not None and (not isinstance(password, str) or len(password) > 512):
                 raise DomainError("JOB_PAYLOAD_INVALID", "Password utility tidak valid.", status_code=422)
+            submitted_video_options = payload.get("video_options")
+            if utility in {"video_convert", "media_pipeline"}:
+                try:
+                    video_options = normalize_video_options(submitted_video_options)
+                except ValueError as exc:
+                    raise DomainError(
+                        "UTILITY_VIDEO_OPTIONS_INVALID",
+                        "Pengaturan konversi video tidak valid.",
+                        status_code=422,
+                    ) from exc
+            else:
+                if submitted_video_options is not None:
+                    raise DomainError(
+                        "UTILITY_VIDEO_OPTIONS_INVALID",
+                        "Pengaturan video hanya berlaku untuk konversi video.",
+                        status_code=422,
+                    )
+                video_options = None
             flatten_action = payload.get("flatten_action")
             flatten_fingerprints = payload.get("flatten_fingerprints")
             if utility == "flatten":
@@ -1423,6 +1448,8 @@ class ControlPlane:
                 normalized["flatten_action"] = flatten_action
                 if flatten_fingerprints is not None:
                     normalized["flatten_fingerprints"] = flatten_fingerprints
+            if video_options is not None:
+                normalized["video_options"] = video_options
             return normalized
 
         if kind == "storage_upload":
