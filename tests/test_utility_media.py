@@ -39,6 +39,9 @@ class UtilityMediaJobTests(unittest.TestCase):
             "    while True:\n"
             "        time.sleep(0.05)\n"
             "output = Path(args[-1])\n"
+            "if '-t' in args:\n"
+            "    output.write_bytes(b'x' * int(os.environ.get('UTILITY_TEST_FFMPEG_SAMPLE_BYTES', '1')))\n"
+            "    raise SystemExit(0)\n"
             "output.write_bytes(b'x' * 200000)\n"
             "for line in ['out_time_us=5000000', 'total_size=100000', 'progress=continue',\n"
             "             'out_time_us=10000000', 'total_size=200000', 'progress=end']:\n"
@@ -51,10 +54,10 @@ class UtilityMediaJobTests(unittest.TestCase):
         ffprobe = bin_root / "ffprobe"
         ffprobe.write_text(
             "#!/usr/bin/env python3\n"
-            "import sys\n"
+            "import os, sys\n"
             "args = sys.argv[1:]\n"
             "if any('format=duration' in arg for arg in args):\n"
-            "    print('10.0')\n"
+            "    print(os.environ.get('UTILITY_TEST_VIDEO_DURATION', '10.0'))\n"
             "elif any('stream=codec_type' in arg for arg in args):\n"
             "    print('video')\n"
             "else:\n"
@@ -138,6 +141,117 @@ class UtilityMediaJobTests(unittest.TestCase):
             self.assertNotIn("-vf", encode)
             self.assertTrue(any(item.get("phase") == "item_progress" for item in progress))
 
+    def test_video_preflight_skips_when_estimated_savings_do_not_exceed_40_percent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            source = folder / "clip.mkv"
+            source.write_bytes(b"x" * 100_000)
+            calls = root / "ffmpeg-calls.jsonl"
+            bin_root = self._fake_video_tools(root)
+            progress: list[dict[str, object]] = []
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+            runner.progress_callback = progress.append
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(calls),
+                "UTILITY_TEST_FFMPEG_SAMPLE_BYTES": "16250",
+            }):
+                result = runner.run("video_convert", [str(folder)])
+
+            commands = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(result.succeeded, [])
+            self.assertEqual(result.summary["files_skipped"], 1)
+            self.assertEqual(result.details[0]["status"], "skipped")
+            self.assertEqual(result.details[0]["estimated_savings_percent"], 35.0)
+            self.assertTrue(source.is_file())
+            self.assertFalse((folder / "clip_recode.mp4").exists())
+            self.assertTrue(commands)
+            self.assertTrue(all("-t" in command for command in commands))
+            self.assertTrue(any(item.get("phase") == "item_skipped" for item in progress))
+
+    def test_video_preflight_skips_at_the_exact_40_percent_threshold(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            source = folder / "clip.mkv"
+            source.write_bytes(b"x" * 100_000)
+            calls = root / "ffmpeg-calls.jsonl"
+            bin_root = self._fake_video_tools(root)
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(calls),
+                "UTILITY_TEST_FFMPEG_SAMPLE_BYTES": "15000",
+            }):
+                result = runner.run("video_convert", [str(folder)])
+
+            self.assertEqual(result.details[0]["estimated_savings_percent"], 40.0)
+            self.assertEqual(result.summary["files_skipped"], 1)
+            self.assertTrue(source.is_file())
+            self.assertFalse((folder / "clip_recode.mp4").exists())
+
+    def test_skipped_video_advances_overall_progress_before_the_next_preflight(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            (folder / "a.mkv").write_bytes(b"x" * 100_000)
+            (folder / "b.mkv").write_bytes(b"x" * 100_000)
+            bin_root = self._fake_video_tools(root)
+            progress: list[dict[str, object]] = []
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+            runner.progress_callback = progress.append
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(root / "ffmpeg-calls.jsonl"),
+                "UTILITY_TEST_FFMPEG_SAMPLE_BYTES": "16250",
+            }):
+                result = runner.run("video_convert", [str(folder)])
+
+            self.assertEqual(result.summary["files_skipped"], 2)
+            second_preflight = next(
+                item for item in progress
+                if item.get("phase") == "media_preflight_started" and item.get("index") == 2
+            )
+            self.assertEqual(second_preflight["overall"]["current"], 1)
+
+    def test_long_video_preflight_samples_start_middle_and_end_before_full_encode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            source = folder / "clip.mkv"
+            source.write_bytes(b"x" * 100_000)
+            calls = root / "ffmpeg-calls.jsonl"
+            bin_root = self._fake_video_tools(root)
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(calls),
+                "UTILITY_TEST_VIDEO_DURATION": "120.0",
+            }):
+                result = runner.run("video_convert", [str(folder)])
+
+            commands = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
+            sample_commands = [command for command in commands if "-t" in command]
+            encode_commands = [command for command in commands if "-t" not in command]
+            sample_starts = {command[command.index("-ss") + 1] for command in sample_commands}
+            self.assertEqual(result.outcome, "succeeded")
+            self.assertEqual(len(sample_commands), 3)
+            self.assertEqual(len(sample_starts), 3)
+            self.assertEqual(len(encode_commands), 1)
+
     def test_video_resolution_filters_escape_expression_commas(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -171,6 +285,7 @@ class UtilityMediaJobTests(unittest.TestCase):
             encode_commands = [
                 json.loads(line)
                 for line in calls.read_text(encoding="utf-8").splitlines()
+                if "-t" not in json.loads(line)
             ]
             self.assertEqual(len(encode_commands), len(resolutions))
             for command, (resolution, expected_height) in zip(encode_commands, resolutions):
@@ -256,6 +371,88 @@ class UtilityMediaJobTests(unittest.TestCase):
                 isinstance(item, dict)
                 and item.get("overall", {}).get("files_total") == 1
                 and item.get("item", {}).get("name") == str(source)
+                for item in progress
+            ))
+
+    def test_worker_utility_job_reports_preflight_skips_in_counters_and_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            source = folder / "clip.mkv"
+            source.write_bytes(b"x" * 100_000)
+            bin_root = self._fake_video_tools(root)
+
+            class CapturingPublisher:
+                def __init__(self):
+                    self.events = []
+
+                def emit(self, *args, **kwargs):
+                    self.events.append((args, kwargs))
+
+            class Executor(UtilityExecutorMixin):
+                def __init__(self):
+                    self.config = SimpleNamespace(
+                        utility_workspace_root=str(workspace),
+                        job_stall_timeout_seconds=0,
+                    )
+                    self.publisher = CapturingPublisher()
+                    self._lock = threading.RLock()
+                    self._utility_runners = {}
+
+                def _workspace_path(self, raw, *, require_absolute=False):
+                    path = Path(raw)
+                    if require_absolute and not path.is_absolute():
+                        raise ValueError("workspace path must be absolute")
+                    resolved = path.resolve()
+                    resolved.relative_to(workspace.resolve())
+                    return resolved
+
+                def _append_job_log(self, _line):
+                    pass
+
+                def _command_callback(self):
+                    return None
+
+            executor = Executor()
+            def build_runner(*args, **kwargs):
+                return UtilityRunner(*args, workspace_root=workspace, **kwargs)
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(root / "ffmpeg-calls.jsonl"),
+                "UTILITY_TEST_FFMPEG_SAMPLE_BYTES": "16250",
+            }), patch(
+                "tme3bot.worker.executor_utility.UtilityRunner",
+                side_effect=build_runner,
+            ):
+                result = executor._utility({
+                    "job_id": "media-skip-job",
+                    "payload": {
+                        "utility": "video_convert",
+                        "folders": [str(folder)],
+                        "settings": {},
+                        "video_options": {},
+                    },
+                })
+
+            self.assertEqual(result["summary"]["files_skipped"], 1)
+            self.assertEqual(result["summary"]["files_succeeded"], 0)
+            self.assertTrue(source.is_file())
+            progress = [kwargs.get("progress") for _, kwargs in executor.publisher.events]
+            self.assertTrue(any(
+                isinstance(item, dict)
+                and item.get("phase") == "item_skipped"
+                and item.get("counters", {}).get("skipped") == 1
+                and item.get("item", {}).get("estimated_savings_percent") == 35.0
+                for item in progress
+            ))
+            self.assertTrue(any(
+                isinstance(item, dict)
+                and item.get("phase") == "completed"
+                and item.get("counters", {}).get("skipped") == 1
+                and item.get("overall", {}).get("files_current") == 1
                 for item in progress
             ))
 

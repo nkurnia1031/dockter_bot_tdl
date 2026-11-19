@@ -228,6 +228,46 @@ describe('JobTable', () => {
     expect(screen.queryByText(/^items$/)).toBeNull();
   });
 
+  it('shows media files skipped by the savings preflight in the job report', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const job = {
+      id: 'media-preflight-1', kind: 'utility', status: 'succeeded', profile: 'default', worker: 'local',
+      payload: { utility: 'video_convert' },
+      result: { value: {
+        outcome: 'succeeded',
+        summary: { files_total: 1, files_succeeded: 0, files_failed: 0, files_skipped: 1 },
+        details: [{
+          file: '/workspace/videos/clip.mkv', status: 'skipped',
+          estimated_savings_percent: 35, minimum_estimated_savings_percent: 40,
+          reason: 'Perkiraan penghematan 35.0% tidak melewati ambang 40%.',
+        }],
+      } },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [job] }), { status: 200 });
+      if (url.endsWith('/jobs/media-preflight-1')) return new Response(JSON.stringify(job), { status: 200 });
+      if (url.includes('/events') || url.includes('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'utility', view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+
+    expect(await screen.findByRole('region', { name: 'Hasil konversi media per file' })).toBeTruthy();
+    expect(screen.getByText('clip.mkv')).toBeTruthy();
+    expect(screen.getByText('Perkiraan hemat 35.0% · ambang 40%')).toBeTruthy();
+    expect(screen.getByText('Perkiraan penghematan 35.0% tidak melewati ambang 40%.')).toBeTruthy();
+    expect(screen.getByText('0 berhasil · 0 gagal · 1 dilewati')).toBeTruthy();
+  });
+
   it('lists and reopens safe Storage reconciliation results without exposing caption or path', async () => {
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
       configurable: true,

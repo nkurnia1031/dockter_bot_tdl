@@ -121,6 +121,8 @@ export function phaseLabel(value: string): string {
     downloading: 'Mendownload media',
     thumbnailing: 'Membuat thumbnail',
     processing_json: 'Memproses JSON',
+    media_preflight_started: 'Memperkirakan penghematan',
+    item_skipped: 'File dilewati',
     cleanup: 'Membersihkan staging',
     completed: 'Selesai',
     starting: 'Memulai',

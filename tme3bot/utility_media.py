@@ -56,6 +56,7 @@ VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".mov", ".wmv", ".mkv", ".ts", ".m
 MAX_IMAGE_WIDTH = 1200
 IMAGE_QUALITY = "80%"
 IMAGE_RECODE_MARKER = "_recode"
+MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT = 40.0
 
 FORMAT_ROW_RE = re.compile(r"^\s*([A-Z0-9]+)\*?\s+([A-Z0-9]+)\s+([r-][w-][+-])(?:\s|$)")
 NON_RASTER_CODERS = {
@@ -184,6 +185,7 @@ class UtilityMediaProcessor:
         total = self._overall_total
         succeeded_count = len(succeeded)
         failed_count = len(failed)
+        skipped_count = sum(item.get("status") == "skipped" for item in details)
         outcome = "partial_failure" if failed_count and succeeded_count else "failed" if failed_count else "succeeded"
         return {
             "utility": utility,
@@ -194,7 +196,7 @@ class UtilityMediaProcessor:
                 "files_total": total,
                 "files_succeeded": succeeded_count,
                 "files_failed": failed_count,
-                "files_skipped": 0,
+                "files_skipped": skipped_count,
                 "archives_created": sum(item.get("status") == "succeeded" for item in archives),
                 "archives_failed": sum(item.get("status") == "failed" for item in archives),
                 "archives": archives,
@@ -276,28 +278,59 @@ class UtilityMediaProcessor:
             raise FileExistsError(f"Hasil sudah ada, sumber dipertahankan: {final_path.name}")
         source_identity = self._identity(source)
         codec = options.codec
-        encoder = "libx265" if codec == "h265" else "libx264"
+        resolution = options.resolution
         duration = self._video_duration(source)
+        estimated_savings_percent = self._estimate_video_savings(
+            source,
+            duration,
+            source_identity[2],
+            index,
+            options,
+        )
+        if self._identity(source) != source_identity:
+            raise RuntimeError("Sumber berubah saat estimasi; sumber dipertahankan.")
+        if estimated_savings_percent <= MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT:
+            reason = (
+                f"Perkiraan penghematan {estimated_savings_percent:.1f}% tidak melewati "
+                f"ambang {MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT:.0f}%."
+            )
+            detail = {
+                "file": str(source),
+                "status": "skipped",
+                "reason_code": "VIDEO_ESTIMATED_SAVINGS_BELOW_THRESHOLD",
+                "reason": reason,
+                "estimated_savings_percent": estimated_savings_percent,
+                "minimum_estimated_savings_percent": MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT,
+            }
+            self._item_progress(
+                "item_skipped",
+                source,
+                index,
+                percent=100,
+                reason=reason,
+                reason_code=detail["reason_code"],
+                estimated_savings_percent=estimated_savings_percent,
+                minimum_estimated_savings_percent=MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT,
+            )
+            return detail
+
         stage_path = self._temporary_path(source.parent, ".tme3-media-video-", ".mp4")
         try:
             command = [
                 "ffmpeg", "-hide_banner", "-nostdin", "-y",
                 "-progress", "pipe:1", "-nostats", "-fflags", "+genpts",
                 "-threads", "1", "-i", str(source),
-                "-c:v", encoder, "-preset", options.speed,
             ]
-            resolution = options.resolution
-            if resolution != "original":
-                maximum_height = 720 if resolution == "720p" else 1080
-                command.extend(["-vf", f"scale=-2:min({maximum_height}\\,ih)"])
-            command.extend(["-crf", str(options.crf)])
-            if codec == "h265":
-                command.extend(["-x265-params", "pools=1:frame-threads=1:log-level=error", "-c:a", "aac"])
-            else:
-                command.extend(["-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart"])
+            command.extend(self._video_encoder_args(options))
             command.append(str(stage_path))
 
-            self._item_progress("item_started", source, index, stage="encode")
+            self._item_progress(
+                "item_started",
+                source,
+                index,
+                stage="encode",
+                estimated_savings_percent=estimated_savings_percent,
+            )
             progress_parser = self._ffmpeg_progress(source, index, duration)
             self.command_runner(
                 command,
@@ -338,6 +371,7 @@ class UtilityMediaProcessor:
                 "resolution": resolution,
                 "crf": options.crf,
                 "speed": options.speed,
+                "estimated_savings_percent": estimated_savings_percent,
             }
             self._item_progress("item_completed", source, index, percent=100, stage="complete")
             return detail
@@ -346,6 +380,95 @@ class UtilityMediaProcessor:
                 stage_path.unlink()
             except FileNotFoundError:
                 pass
+
+    def _estimate_video_savings(
+        self,
+        source: Path,
+        duration: float,
+        source_size: int,
+        index: int,
+        options: VideoOptions,
+    ) -> float:
+        if source_size <= 0:
+            raise RuntimeError("Ukuran sumber video tidak valid untuk estimasi.")
+
+        windows = self._video_sample_windows(duration)
+        sampled_bytes = 0
+        sampled_seconds = 0.0
+        self._item_progress(
+            "media_preflight_started",
+            source,
+            index,
+            stage="estimate",
+            minimum_estimated_savings_percent=MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT,
+        )
+        with tempfile.TemporaryDirectory(prefix="tme3-media-video-sample-") as temporary:
+            sample_root = Path(temporary)
+            for sample_index, (start, sample_duration) in enumerate(windows, start=1):
+                self.cancel_check()
+                sample_path = sample_root / f"sample-{sample_index}.mp4"
+                command = [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                    "-fflags", "+genpts",
+                    "-threads", "1", "-ss", self._format_seconds(start),
+                    "-i", str(source), "-t", self._format_seconds(sample_duration),
+                ]
+                command.extend(self._video_encoder_args(options))
+                command.append(str(sample_path))
+                self.command_runner(
+                    command,
+                    source.parent,
+                    "utility-video-preflight",
+                    cpu_quota_percent=80,
+                    cpu_threads=1,
+                    lower_priority=True,
+                )
+                self.cancel_check()
+                if not sample_path.is_file() or sample_path.stat().st_size <= 0:
+                    raise RuntimeError("FFmpeg tidak menghasilkan sampel estimasi video.")
+                sampled_bytes += sample_path.stat().st_size
+                sampled_seconds += sample_duration
+
+        estimated_output_size = sampled_bytes / sampled_seconds * duration
+        estimated_savings_percent = (source_size - estimated_output_size) * 100 / source_size
+        return round(estimated_savings_percent, 1)
+
+    @staticmethod
+    def _video_sample_windows(duration: float) -> list[tuple[float, float]]:
+        if duration >= 36.0:
+            sample_duration = min(5.0, duration / 12.0)
+            centers = (0.1, 0.5, 0.9)
+        else:
+            sample_duration = min(5.0, duration / 4.0)
+            centers = (0.5,)
+        return [
+            (
+                max(0.0, min(duration - sample_duration, center * duration - sample_duration / 2)),
+                sample_duration,
+            )
+            for center in centers
+        ]
+
+    @staticmethod
+    def _format_seconds(value: float) -> str:
+        return f"{value:.3f}".rstrip("0").rstrip(".") or "0"
+
+    @staticmethod
+    def _video_encoder_args(options: VideoOptions) -> list[str]:
+        encoder = "libx265" if options.codec == "h265" else "libx264"
+        command = ["-c:v", encoder, "-preset", options.speed]
+        if options.resolution != "original":
+            maximum_height = 720 if options.resolution == "720p" else 1080
+            command.extend(["-vf", f"scale=-2:min({maximum_height}\\,ih)"])
+        command.extend(["-crf", str(options.crf)])
+        if options.codec == "h265":
+            command.extend([
+                "-x265-params", "pools=1:frame-threads=1:log-level=error",
+                "-c:a", "aac",
+            ])
+        else:
+            command.extend(["-pix_fmt", "yuv420p", "-c:a", "copy", "-movflags", "+faststart"])
+        return command
 
     def _video_duration(self, source: Path) -> float:
         result = self.command_runner(
@@ -668,7 +791,7 @@ class UtilityMediaProcessor:
         if error:
             payload["error"] = error
         self._progress(payload)
-        if phase in {"item_completed", "item_failed"}:
+        if phase in {"item_completed", "item_failed", "item_skipped"}:
             self._overall_done += 1
 
     def _progress_value(

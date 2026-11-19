@@ -232,6 +232,10 @@ _Avoid_: password bersama lintas folder, password yang ditampilkan di laporan.
 Simulasi lengkap perubahan susunan folder pilihan sampai tidak ada tindakan lanjutan. Preview menjadi dasar konfirmasi; perubahan pada salah satu folder membatalkan seluruh batch apply.
 _Avoid_: daftar tindakan parsial, apply atas preview yang sudah stale.
 
+**Pra-estimasi penghematan video**:
+Perkiraan apakah konversi video berpotensi memenuhi target penghematan ukuran sebelum konversi penuh; hasilnya bukan jaminan ukuran akhir.
+_Avoid_: jaminan kompresi, pengukuran ukuran hasil.
+
 **Flatten folder**:
 Perapian isi direktori dengan menghapus subfolder kosong dan menaikkan isi subfolder yang hanya memiliki satu item. Subfolder dengan lebih dari satu item tetap utuh; benturan nama mendapat nama unik tanpa menimpa data.
 _Avoid_: flatten rekursif tanpa batas, overwrite saat benturan.

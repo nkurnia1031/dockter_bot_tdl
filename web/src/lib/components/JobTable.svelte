@@ -518,6 +518,25 @@
             {/each}
           </section>
         {/if}
+        {#if selected.kind === 'utility' && ['video_convert', 'image_compress', 'media_pipeline'].includes(String(selected.payload?.utility || '')) && Array.isArray(utilityResult.details)}
+          <section class="record-card mb-4" aria-label="Hasil konversi media per file">
+            <h3 class="font-bold">Hasil konversi media per file</h3>
+            <p class="muted mt-1 text-sm">{utilityResult.summary?.files_succeeded || 0} berhasil · {utilityResult.summary?.files_failed || 0} gagal · {utilityResult.summary?.files_skipped || 0} dilewati</p>
+            <div class="mt-2 space-y-2">
+              {#each utilityResult.details as item, index (`${item.file || 'file'}:${index}`)}
+                <article class="rounded-lg border border-[var(--line)] p-3">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <b class="break-all text-sm">{String(item.file || `File ${index + 1}`).split('/').pop()}</b>
+                    <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'skipped' ? 'skipped' : 'failed'}`}>{item.status === 'succeeded' ? 'Berhasil' : item.status === 'skipped' ? 'Dilewati' : 'Gagal'}</span>
+                    {#if typeof item.estimated_savings_percent === 'number'}<span class="muted text-xs">Perkiraan hemat {item.estimated_savings_percent.toFixed(1)}% · ambang {item.minimum_estimated_savings_percent ?? 40}%</span>{/if}
+                  </div>
+                  {#if item.reason}<p class="muted mt-1 break-words text-sm">{item.reason}</p>{/if}
+                  {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
+                </article>
+              {/each}
+            </div>
+          </section>
+        {/if}
         {#if selected.kind === 'chat_send' && Array.isArray(utilityResult.items)}
           <section class="record-card mb-4" aria-label="Hasil kirim ke chat per file">
             <h3 class="font-bold">Hasil Kirim ke Chat per file</h3>

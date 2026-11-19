@@ -54,6 +54,8 @@ class UtilityExecutorMixin:
                 "item_failed", f"{utility_name}_folder_failed"
             }:
                 counters["failed"] += 1
+            elif not archive_phase and phase == "item_skipped":
+                counters["skipped"] += 1
             index = int(value.get("index") or value.get("folder_index") or 0)
             total = int(value.get("total") or value.get("folder_total") or len(folders))
             folder_index = int(value.get("folder_index") or 1)
@@ -120,6 +122,10 @@ class UtilityExecutorMixin:
                     "stage": value.get("stage"),
                     "codec": value.get("codec"),
                     "resolution": value.get("resolution"),
+                    "estimated_savings_percent": value.get("estimated_savings_percent"),
+                    "minimum_estimated_savings_percent": value.get("minimum_estimated_savings_percent"),
+                    "reason": value.get("reason"),
+                    "reason_code": value.get("reason_code"),
                     "files_discovered": value.get("files_discovered"),
                 },
                 transfer=reporter.transfer_metrics(
@@ -133,14 +139,14 @@ class UtilityExecutorMixin:
                 counters=counters,
                 indeterminate=bool(value.get("indeterminate", percent is None)),
                 force=phase.endswith("_starting") or phase in {
-                    "item_completed", "item_failed", "archive_completed", "archive_failed",
+                    "item_completed", "item_failed", "item_skipped", "archive_completed", "archive_failed",
                     "media_archive_completed", "media_archive_failed",
                     "extract_folder_completed", "extract_folder_failed",
                     "flatten_preview_completed", "flatten_folder_completed",
                 },
             )
             if phase in {
-                "item_completed", "item_failed", "archive_completed", "archive_failed"
+                "item_completed", "item_failed", "item_skipped", "archive_completed", "archive_failed"
             }:
                 reporter.milestone(
                     phase,
@@ -184,6 +190,7 @@ class UtilityExecutorMixin:
             media_summary = result.get("summary", {})
             media_failed = int(media_summary.get("files_failed", 0)) if media_mode else 0
             media_succeeded = int(media_summary.get("files_succeeded", 0)) if media_mode else 0
+            media_skipped = int(media_summary.get("files_skipped", 0)) if media_mode else 0
             media_total = int(media_summary.get("files_total", 0)) if media_mode else 0
             archive_succeeded = int(result.get("summary", {}).get("archives_succeeded", 0))
             archive_partial = int(result.get("summary", {}).get("archives_partial", 0))
@@ -199,17 +206,21 @@ class UtilityExecutorMixin:
             if media_mode:
                 final_message = (
                     f"Konversi media selesai: {media_succeeded} file berhasil, "
-                    f"{media_failed} gagal dari {media_total}."
+                    f"{media_failed} gagal, {media_skipped} dilewati dari {media_total}."
                 )
                 final_overall = {
-                    "current": media_succeeded + media_failed,
+                    "current": media_succeeded + media_failed + media_skipped,
                     "total": media_total,
                     "percent": 100,
                     "unit": "files",
-                    "files_current": media_succeeded + media_failed,
+                    "files_current": media_succeeded + media_failed + media_skipped,
                     "files_total": media_total,
                 }
-                final_counters = {"succeeded": media_succeeded, "failed": media_failed}
+                final_counters = {
+                    "succeeded": media_succeeded,
+                    "failed": media_failed,
+                    "skipped": media_skipped,
+                }
             else:
                 final_message = (
                     (
