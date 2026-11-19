@@ -117,7 +117,6 @@ describe('UtilityPage access controls', () => {
     await fireEvent.change(screen.getByRole('combobox', { name: 'Jenis operasi' }), {
       target: { value: 'video_convert' }
     });
-    await fireEvent.click(await screen.findByRole('button', { name: 'Pilih' }));
     await fireEvent.change(screen.getByRole('combobox', { name: 'Codec video' }), {
       target: { value: 'h264' }
     });

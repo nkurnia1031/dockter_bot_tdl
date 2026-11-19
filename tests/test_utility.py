@@ -191,8 +191,17 @@ class UtilitySummaryTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("# probe fixture\n", encoding="utf-8")
 
+            bin_root = root / "bin"
+            bin_root.mkdir()
+            command_paths = {}
+            for name in UTILITY_RUNTIME_COMMANDS:
+                command_path = bin_root / name
+                command_path.write_text("#!/bin/sh\n", encoding="utf-8")
+                command_path.chmod(0o755)
+                command_paths[name] = str(command_path)
+
             def which(name):
-                return None if name == "unrar" else f"/usr/bin/{name}"
+                return None if name == "unrar" else command_paths.get(name)
 
             with patch("tme3bot.utility.shutil.which", side_effect=which):
                 result = probe_utility_runtime(utility_root, workspace)
