@@ -1449,7 +1449,7 @@ class ControlPlane:
                 if flatten_fingerprints is not None:
                     normalized["flatten_fingerprints"] = flatten_fingerprints
             if video_options is not None:
-                normalized["video_options"] = video_options
+                normalized["video_options"] = video_options.to_payload()
             return normalized
 
         if kind == "storage_upload":

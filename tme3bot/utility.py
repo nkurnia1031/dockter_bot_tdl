@@ -1072,6 +1072,7 @@ class UtilityRunner:
         allow_result_on_failure: bool = False,
         capture_output: bool = False,
         capture_log: bool = True,
+        capture_job_log: bool = True,
         line_progress: Callable[[str], dict[str, object] | None] | None = None,
         cpu_quota_percent: int | None = None,
         cpu_threads: int = 1,
@@ -1227,7 +1228,7 @@ class UtilityRunner:
                 if not capture_output:
                     lines.append(clean)
                 LOGGER.info("%s | %s", prefix, clean)
-                if self.log_callback:
+                if self.log_callback and capture_job_log:
                     self.log_callback(clean)
             if line_progress is not None:
                 progress = line_progress(clean)

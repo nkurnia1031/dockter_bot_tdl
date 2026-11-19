@@ -8,6 +8,7 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,6 +19,22 @@ MEDIA_PIPELINE = "media_pipeline"
 MEDIA_UTILITIES = frozenset({VIDEO_CONVERT, IMAGE_COMPRESS, MEDIA_PIPELINE})
 VIDEO_UTILITIES = frozenset({VIDEO_CONVERT, MEDIA_PIPELINE})
 IMAGE_UTILITIES = frozenset({IMAGE_COMPRESS, MEDIA_PIPELINE})
+
+
+@dataclass(frozen=True)
+class VideoOptions:
+    codec: str
+    resolution: str
+    crf: int
+    speed: str
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "codec": self.codec,
+            "resolution": self.resolution,
+            "crf": self.crf,
+            "speed": self.speed,
+        }
 
 VIDEO_PRESETS = (
     "ultrafast",
@@ -31,9 +48,9 @@ VIDEO_PRESETS = (
     "veryslow",
 )
 VIDEO_RESOLUTIONS = frozenset({"720p", "1080p", "original"})
-VIDEO_CODEC_DEFAULTS: dict[str, dict[str, object]] = {
-    "h265": {"codec": "h265", "resolution": "720p", "crf": 30, "speed": "veryfast"},
-    "h264": {"codec": "h264", "resolution": "1080p", "crf": 18, "speed": "veryfast"},
+VIDEO_CODEC_DEFAULTS: dict[str, VideoOptions] = {
+    "h265": VideoOptions("h265", "720p", 30, "veryfast"),
+    "h264": VideoOptions("h264", "1080p", 18, "veryfast"),
 }
 VIDEO_EXTENSIONS = frozenset({".mp4", ".avi", ".mov", ".wmv", ".mkv", ".ts", ".m4v"})
 MAX_IMAGE_WIDTH = 1200
@@ -56,17 +73,25 @@ ProgressCallback = Callable[[dict[str, object]], None]
 CancelCheck = Callable[[], None]
 
 
-def default_video_options(codec: str = "h265") -> dict[str, object]:
+def _is_utility_control_error(error: Exception) -> bool:
+    from tme3bot.utility import ProcessStalledError, UtilityCancelledError, UtilityRuntimeError
+
+    return isinstance(error, (ProcessStalledError, UtilityCancelledError, UtilityRuntimeError))
+
+
+def default_video_options(codec: str = "h265") -> VideoOptions:
     selected = str(codec or "h265").strip().lower()
     selected = {"x265": "h265", "x264": "h264"}.get(selected, selected)
     try:
         defaults = VIDEO_CODEC_DEFAULTS[selected]
     except KeyError as exc:
         raise ValueError("Codec video harus H.265 atau H.264.") from exc
-    return dict(defaults)
+    return defaults
 
 
-def normalize_video_options(value: object | None) -> dict[str, object]:
+def normalize_video_options(value: object | None) -> VideoOptions:
+    if isinstance(value, VideoOptions):
+        value = value.to_payload()
     if value is None:
         value = {}
     if not isinstance(value, dict):
@@ -77,23 +102,18 @@ def normalize_video_options(value: object | None) -> dict[str, object]:
     selected = str(value.get("codec") or "h265").strip().lower()
     selected = {"x265": "h265", "x264": "h264"}.get(selected, selected)
     options = default_video_options(selected)
-    resolution = value.get("resolution") or options["resolution"]
+    resolution = value.get("resolution") or options.resolution
     if not isinstance(resolution, str) or resolution not in VIDEO_RESOLUTIONS:
         raise ValueError("Resolusi video harus 720p, 1080p, atau original.")
     crf = value.get("crf")
     if crf is None:
-        crf = options["crf"]
+        crf = options.crf
     if type(crf) is not int or not 0 <= crf <= 51:
         raise ValueError("Kualitas video harus berada pada rentang CRF 0 sampai 51.")
-    speed = value.get("speed", value.get("preset")) or options["speed"]
+    speed = value.get("speed") or value.get("preset") or options.speed
     if not isinstance(speed, str) or speed not in VIDEO_PRESETS:
         raise ValueError("Kecepatan encoder video tidak valid.")
-    return {
-        "codec": selected,
-        "resolution": resolution,
-        "crf": crf,
-        "speed": speed,
-    }
+    return VideoOptions(selected, resolution, crf, speed)
 
 
 class UtilityMediaProcessor:
@@ -142,9 +162,7 @@ class UtilityMediaProcessor:
                 try:
                     detail = self._convert_video(source, index, options)
                 except Exception as exc:
-                    from tme3bot.utility import ProcessStalledError, UtilityCancelledError, UtilityRuntimeError
-
-                    if isinstance(exc, (ProcessStalledError, UtilityCancelledError, UtilityRuntimeError)):
+                    if _is_utility_control_error(exc):
                         raise
                     failed[str(source)] = str(exc)[:500]
                     detail = {"file": str(source), "status": "failed", "error": failed[str(source)]}
@@ -229,7 +247,8 @@ class UtilityMediaProcessor:
             self.workspace,
             "utility-image-formats",
             capture_output=True,
-            capture_log=False,
+            capture_log=True,
+            capture_job_log=False,
         )
         if not isinstance(result, dict):
             raise RuntimeError("ImageMagick tidak dapat membaca format gambar.")
@@ -250,13 +269,13 @@ class UtilityMediaProcessor:
         self,
         source: Path,
         index: int,
-        options: dict[str, object],
+        options: VideoOptions,
     ) -> dict[str, object]:
         final_path = source.with_name(f"{source.stem}{IMAGE_RECODE_MARKER}.mp4")
         if final_path.exists():
             raise FileExistsError(f"Hasil sudah ada, sumber dipertahankan: {final_path.name}")
         source_identity = self._identity(source)
-        codec = str(options["codec"])
+        codec = options.codec
         encoder = "libx265" if codec == "h265" else "libx264"
         duration = self._video_duration(source)
         stage_path = self._temporary_path(source.parent, ".tme3-media-video-", ".mp4")
@@ -265,13 +284,13 @@ class UtilityMediaProcessor:
                 "ffmpeg", "-hide_banner", "-nostdin", "-y",
                 "-progress", "pipe:1", "-nostats", "-fflags", "+genpts",
                 "-threads", "1", "-i", str(source),
-                "-c:v", encoder, "-preset", str(options["speed"]),
+                "-c:v", encoder, "-preset", options.speed,
             ]
-            resolution = str(options["resolution"])
+            resolution = options.resolution
             if resolution != "original":
                 maximum_height = 720 if resolution == "720p" else 1080
                 command.extend(["-vf", f"scale=-2:min({maximum_height}\\,ih)"])
-            command.extend(["-crf", str(options["crf"])])
+            command.extend(["-crf", str(options.crf)])
             if codec == "h265":
                 command.extend(["-x265-params", "pools=1:frame-threads=1:log-level=error", "-c:a", "aac"])
             else:
@@ -317,8 +336,8 @@ class UtilityMediaProcessor:
                 "output": str(final_path),
                 "codec": codec,
                 "resolution": resolution,
-                "crf": options["crf"],
-                "speed": options["speed"],
+                "crf": options.crf,
+                "speed": options.speed,
             }
             self._item_progress("item_completed", source, index, percent=100, stage="complete")
             return detail
@@ -337,7 +356,8 @@ class UtilityMediaProcessor:
             source.parent,
             "utility-video-probe",
             capture_output=True,
-            capture_log=False,
+            capture_log=True,
+            capture_job_log=False,
             lower_priority=True,
         )
         if not isinstance(result, dict):
@@ -359,7 +379,8 @@ class UtilityMediaProcessor:
             cwd,
             "utility-video-verify-probe",
             capture_output=True,
-            capture_log=False,
+            capture_log=True,
+            capture_job_log=False,
             lower_priority=True,
         )
         if not isinstance(probe, dict) or "video" not in str(probe.get("stdout") or "").splitlines():
@@ -465,9 +486,7 @@ class UtilityMediaProcessor:
                     staged_by_folder[source.parent].append((source, temp_path, source_identity))
                     temp_path = None
                 except Exception as exc:
-                    from tme3bot.utility import ProcessStalledError, UtilityCancelledError, UtilityRuntimeError
-
-                    if isinstance(exc, (ProcessStalledError, UtilityCancelledError, UtilityRuntimeError)):
+                    if _is_utility_control_error(exc):
                         raise
                     failed[str(source)] = str(exc)[:500]
                     details.append({"file": str(source), "status": "failed", "error": failed[str(source)]})
@@ -550,9 +569,7 @@ class UtilityMediaProcessor:
             self._progress_value("media_archive_completed", folder, 0, stage="archive", output=str(final_path))
             return {"folder": str(folder), "path": str(final_path), "count": len(expected), "status": "succeeded"}
         except Exception as exc:
-            from tme3bot.utility import ProcessStalledError, UtilityCancelledError, UtilityRuntimeError
-
-            if isinstance(exc, (ProcessStalledError, UtilityCancelledError, UtilityRuntimeError)):
+            if _is_utility_control_error(exc):
                 raise
             self._progress_value("media_archive_failed", folder, 0, stage="archive", error=str(exc)[:500])
             return {"folder": str(folder), "count": len(staged), "status": "failed", "error": str(exc)[:500]}
@@ -580,7 +597,8 @@ class UtilityMediaProcessor:
             path.parent,
             "utility-image-verify",
             capture_output=True,
-            capture_log=False,
+            capture_log=True,
+            capture_job_log=False,
         )
         if not isinstance(result, dict) or int(result.get("returncode", 0)) != 0:
             raise RuntimeError("Verifikasi dimensi gambar gagal.")

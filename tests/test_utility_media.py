@@ -11,7 +11,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tme3bot.utility import UtilityCancelledError, UtilityRunner, default_video_options
+from tme3bot.utility import (
+    UtilityCancelledError,
+    UtilityRunner,
+    default_video_options,
+    normalize_video_options,
+)
 from tme3bot.worker.executor_utility import UtilityExecutorMixin
 
 
@@ -100,21 +105,25 @@ class UtilityMediaJobTests(unittest.TestCase):
             progress: list[dict[str, object]] = []
             runner.progress_callback = progress.append
 
-            with patch.dict(os.environ, {
-                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
-                "UTILITY_TEST_FFMPEG_CALLS": str(calls),
-            }):
-                result = runner.run(
-                    "video_convert",
-                    [str(folder)],
-                    video_options={
-                        "codec": "h264",
-                        "resolution": "original",
-                        "crf": 24,
-                        "speed": "slow",
-                    },
-                )
+            with self.assertLogs("tme3bot.utility", level="INFO") as command_logs:
+                with patch.dict(os.environ, {
+                    "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "UTILITY_TEST_FFMPEG_CALLS": str(calls),
+                }):
+                    result = runner.run(
+                        "video_convert",
+                        [str(folder)],
+                        video_options={
+                            "codec": "h264",
+                            "resolution": "original",
+                            "crf": 24,
+                            "speed": "slow",
+                        },
+                    )
 
+            output_log = "\n".join(command_logs.output)
+            self.assertIn("utility-video-probe | 10.0", output_log)
+            self.assertIn("utility-video-verify-probe | video", output_log)
             commands = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
             encode = commands[0]
             output = folder / "clip_recode.mp4"
@@ -275,13 +284,21 @@ class UtilityMediaJobTests(unittest.TestCase):
 
     def test_codec_defaults_match_the_existing_conversion_profiles(self):
         self.assertEqual(
-            default_video_options("h265"),
+            default_video_options("h265").to_payload(),
             {"codec": "h265", "resolution": "720p", "crf": 30, "speed": "veryfast"},
         )
         self.assertEqual(
-            default_video_options("h264"),
+            default_video_options("h264").to_payload(),
             {"codec": "h264", "resolution": "1080p", "crf": 18, "speed": "veryfast"},
         )
+        normalized_preset = normalize_video_options({
+            "codec": None,
+            "resolution": None,
+            "crf": None,
+            "speed": None,
+            "preset": "slow",
+        })
+        self.assertEqual(normalized_preset.speed, "slow")
 
     def test_image_job_archives_verified_outputs_before_removing_sources(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -295,13 +312,21 @@ class UtilityMediaJobTests(unittest.TestCase):
             ignored.write_text("keep", encoding="utf-8")
             bin_root = self._fake_video_tools(root)
             self._fake_image_tools(bin_root)
-            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+            job_logs: list[str] = []
+            runner = UtilityRunner(
+                Path("utility"), workspace_root=workspace, log_callback=job_logs.append
+            )
 
-            with patch.dict(os.environ, {
-                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
-            }):
-                result = runner.run("image_compress", [str(folder)])
+            with self.assertLogs("tme3bot.utility", level="INFO") as command_logs:
+                with patch.dict(os.environ, {
+                    "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                }):
+                    result = runner.run("image_compress", [str(folder)])
 
+            output_log = "\n".join(command_logs.output)
+            self.assertIn("utility-image-formats | PNG* PNG rw+", output_log)
+            self.assertIn("utility-image-verify | 100 50", output_log)
+            self.assertFalse(any("PNG* PNG rw+" in line or "100 50" in line for line in job_logs))
             archive = folder / "images.zip"
             self.assertEqual(result.summary["files_succeeded"], 1)
             self.assertFalse(source.exists())

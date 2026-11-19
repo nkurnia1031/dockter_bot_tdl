@@ -347,13 +347,23 @@ class SourceUpdateRequest(BaseModel):
     label: str | None = None
 
 
+class UtilityVideoOptionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    codec: str | None = Field(default=None, strict=True)
+    resolution: str | None = Field(default=None, strict=True)
+    crf: int | None = Field(default=None, strict=True)
+    speed: str | None = Field(default=None, strict=True)
+    preset: str | None = Field(default=None, strict=True)
+
+
 class UtilityJobRequest(BaseModel):
     utility: str
     folders: list[str]
     password: str | None = None
     flatten_action: str | None = None
     flatten_fingerprints: dict[str, str] | None = None
-    video_options: dict[str, Any] | None = None
+    video_options: UtilityVideoOptionsRequest | None = None
     worker: str | None = None
 
 
