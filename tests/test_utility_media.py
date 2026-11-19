@@ -129,6 +129,46 @@ class UtilityMediaJobTests(unittest.TestCase):
             self.assertNotIn("-vf", encode)
             self.assertTrue(any(item.get("phase") == "item_progress" for item in progress))
 
+    def test_video_resolution_filters_escape_expression_commas(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            bin_root = self._fake_video_tools(root)
+            calls = root / "ffmpeg-calls.jsonl"
+            resolutions = (("720p", 720), ("1080p", 1080))
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(calls),
+            }):
+                for resolution, expected_height in resolutions:
+                    with self.subTest(resolution=resolution):
+                        folder = workspace / resolution
+                        folder.mkdir(parents=True)
+                        (folder / "clip.mkv").write_bytes(b"video source")
+                        runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+                        result = runner.run(
+                            "video_convert",
+                            [str(folder)],
+                            video_options={
+                                "codec": "h264",
+                                "resolution": resolution,
+                                "crf": 24,
+                                "speed": "slow",
+                            },
+                        )
+                        self.assertEqual(result.outcome, "succeeded")
+
+            encode_commands = [
+                json.loads(line)
+                for line in calls.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(encode_commands), len(resolutions))
+            for command, (resolution, expected_height) in zip(encode_commands, resolutions):
+                with self.subTest(resolution=resolution):
+                    filter_value = command[command.index("-vf") + 1]
+                    self.assertEqual(filter_value, f"scale=-2:min({expected_height}\\,ih)")
+
     def test_worker_utility_job_publishes_file_count_and_carries_cancel_owner(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

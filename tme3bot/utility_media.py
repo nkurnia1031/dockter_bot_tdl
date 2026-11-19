@@ -270,7 +270,7 @@ class UtilityMediaProcessor:
             resolution = str(options["resolution"])
             if resolution != "original":
                 maximum_height = 720 if resolution == "720p" else 1080
-                command.extend(["-vf", f"scale=-2:min({maximum_height},ih)"])
+                command.extend(["-vf", f"scale=-2:min({maximum_height}\\,ih)"])
             command.extend(["-crf", str(options["crf"])])
             if codec == "h265":
                 command.extend(["-x265-params", "pools=1:frame-threads=1:log-level=error", "-c:a", "aac"])
