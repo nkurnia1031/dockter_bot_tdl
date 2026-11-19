@@ -235,3 +235,7 @@ _Avoid_: daftar tindakan parsial, apply atas preview yang sudah stale.
 **Flatten folder**:
 Perapian isi direktori dengan menghapus subfolder kosong dan menaikkan isi subfolder yang hanya memiliki satu item. Subfolder dengan lebih dari satu item tetap utuh; benturan nama mendapat nama unik tanpa menimpa data.
 _Avoid_: flatten rekursif tanpa batas, overwrite saat benturan.
+
+**Job konversi media**:
+Job Utility untuk memproses video dan gambar dari folder Workspace terpilih, dengan hasil yang dapat dilihat per file. Sumber dihapus setelah hasil terverifikasi; pembatalan mempertahankan sumber untuk file aktif dan belum diproses.
+_Avoid_: proses konversi shell yang tidak tercatat sebagai job aplikasi.
