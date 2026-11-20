@@ -584,13 +584,15 @@ class UtilityMediaJobTests(unittest.TestCase):
             output = folder / "clip_recode.mp4"
             source.write_bytes(b"source video")
             output.write_bytes(b"existing output")
+            bin_root = self._fake_video_tools(root)
             progress_events: list[dict[str, object]] = []
             runner = UtilityRunner(
                 Path("utility"), workspace_root=workspace,
                 progress_callback=progress_events.append,
             )
 
-            result = runner.run("video_convert", [str(folder)])
+            with patch.dict(os.environ, {"PATH": str(bin_root)}):
+                result = runner.run("video_convert", [str(folder)])
 
             self.assertEqual(result.summary["files_skipped"], 1)
             self.assertEqual(result.summary["files_failed"], 0)
