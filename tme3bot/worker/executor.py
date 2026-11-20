@@ -237,6 +237,10 @@ class WorkerJobExecutor(
         self._cancel_confirmed: set[str] = set()
         self._finalizing: set[str] = set()
         self._rclone_storage_lock = threading.RLock()
+        # Pause/resume process callbacks must complete in the same order as
+        # their state changes. Cancellation deliberately does not acquire this
+        # lock, so a slow process callback cannot delay Stop.
+        self._process_control_lock = threading.RLock()
         self._pause_events: dict[str, threading.Event] = {}
         self._paused_pending_ids: set[str] = set()
         self._known: set[str] = set()
@@ -1397,8 +1401,7 @@ class WorkerJobExecutor(
         with getattr(self, "_durable_admission_lock", threading.RLock()):
             # Serialize cancellation against the finalization boundary. Keep
             # lock order durable-admission -> executor lock, matching command
-            # admission, so a late cancel cannot mutate durable state after the
-            # handler has completed its external effects.
+            # admission; whichever reaches this boundary first owns the outcome.
             with self._lock:
                 if job_id in getattr(self, "_finalizing", set()):
                     return False
@@ -1555,6 +1558,26 @@ class WorkerJobExecutor(
             # between two interrupt calls; the worker must still terminate
             # instead of entering the next Quick Mode phase.
             self._cancel_requested.add(job_id)
+        # Persist and publish the stop intent before waiting on process
+        # interrupt callbacks. The event outbox promotes this control event
+        # ahead of ordinary worker telemetry.
+        try:
+            self.publisher.emit(
+                job_id,
+                "running",
+                "cancel.requested",
+                progress={
+                    "cancel_request": {
+                        "status": "accepted",
+                        "requested_at": utc_now().isoformat(),
+                        "message": "Permintaan diterima; menunggu proses worker berhenti.",
+                    }
+                },
+            )
+        except Exception:
+            LOGGER.warning(
+                "Could not publish accepted cancellation for job %s", job_id, exc_info=True
+            )
         self._write_quick_log_line(
             job_id,
             f"[cancel] request received kind={kind} quick_mode={quick_active}",
@@ -1839,25 +1862,6 @@ class WorkerJobExecutor(
                     confirmed = set()
                     self._cancel_confirmed = confirmed
                 confirmed.add(job_id)
-        # An active Quick Mode job is cancellable even when its current phase
-        # has no subprocess (for example while resolving a Telegram result).
-        try:
-            self.publisher.emit(
-                job_id,
-                "running",
-                "cancel.requested",
-                progress={
-                    "cancel_request": {
-                        "status": "accepted",
-                        "requested_at": utc_now().isoformat(),
-                        "message": "Permintaan diterima; menunggu proses worker berhenti.",
-                    }
-                },
-            )
-        except Exception:
-            LOGGER.warning(
-                "Could not publish accepted cancellation for job %s", job_id, exc_info=True
-            )
         return bool(
             cancelled
             or quick_active
@@ -1866,94 +1870,163 @@ class WorkerJobExecutor(
 
     def pause(self, job_id: str) -> bool:
         target = str(job_id)
-        if self._jobs.pause_pending(target):
-            try:
-                self.publisher.emit(
-                    target,
-                    "paused",
-                    "paused",
-                    progress={"phase": "queued", "paused_phase": "queued", "pause_kind": "worker"},
-                )
-                with self._lock:
-                    self._paused_pending_ids.add(target)
-                return True
-            except Exception:
-                LOGGER.warning("Could not publish pause for queued job %s", target, exc_info=True)
-                self._jobs.resume_pending(target)
-                return False
-        if self._jobs.is_active(target):
-            deadline = time.monotonic() + 1.0
-            while time.monotonic() < deadline:
-                with self._lock:
-                    if target in self._active_commands:
-                        break
-                time.sleep(0.01)
-        with self._lock:
-            if target in getattr(self, "_finalizing", set()):
-                return False
-            active = self._active.get(target)
-            command = self._active_commands.get(target)
-            if active is None or command is None:
-                return False
-            pause_event = self._pause_events.setdefault(target, threading.Event())
-            if pause_event.is_set():
-                return True
-            pause_event.set()
-            tts_active = active[1] == "tts"
-        if tts_active:
-            # TTS acknowledges pause after its current three-request batch.
-            return True
-        self._set_job_process_paused(target, True)
-        phase = self._quick_terminal_phase(command, "running")
-        try:
-            self.publisher.emit(
-                target,
-                "paused",
-                "paused",
-                progress={
-                    "phase": phase,
-                    "paused_phase": phase,
-                    "pause_kind": "worker",
-                    "message": "Quick Mode dijeda",
-                },
-            )
-            return True
-        except Exception:
-            LOGGER.warning("Could not publish pause for job %s", target, exc_info=True)
+        admission_lock = getattr(self, "_durable_admission_lock", None)
+        if admission_lock is None:
+            admission_lock = threading.RLock()
+        with admission_lock:
             with self._lock:
-                pause_event.clear()
-            self._set_job_process_paused(target, False)
+                if target in getattr(self, "_cancel_requested", set()):
+                    return False
+            if self._jobs.pause_pending(target):
+                try:
+                    self.publisher.emit(
+                        target,
+                        "paused",
+                        "paused",
+                        progress={"phase": "queued", "paused_phase": "queued", "pause_kind": "worker"},
+                    )
+                    with self._lock:
+                        self._paused_pending_ids.add(target)
+                    return True
+                except Exception:
+                    LOGGER.warning("Could not publish pause for queued job %s", target, exc_info=True)
+                    self._jobs.resume_pending(target)
+                    return False
+        process_control_lock = getattr(self, "_process_control_lock", None)
+        if process_control_lock is None:
+            process_control_lock = threading.RLock()
+            self._process_control_lock = process_control_lock
+        with process_control_lock:
+            if self._jobs.is_active(target):
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    with self._lock:
+                        if target in self._active_commands:
+                            break
+                    time.sleep(0.01)
+            with admission_lock:
+                with self._lock:
+                    if (
+                        target in getattr(self, "_cancel_requested", set())
+                        or target in getattr(self, "_finalizing", set())
+                    ):
+                        return False
+                    active = self._active.get(target)
+                    command = self._active_commands.get(target)
+                    if active is None or command is None:
+                        return False
+                    pause_event = self._pause_events.setdefault(target, threading.Event())
+                    if pause_event.is_set():
+                        return True
+                    pause_event.set()
+                    tts_active = active[1] == "tts"
+            if tts_active:
+                # TTS acknowledges pause after its current three-request batch.
+                with admission_lock:
+                    with self._lock:
+                        if (
+                            target in getattr(self, "_cancel_requested", set())
+                            or target in getattr(self, "_finalizing", set())
+                        ):
+                            pause_event.clear()
+                            return False
+                return True
+
+            # Process signaling stays outside the global admission lock so a
+            # stop request can set its token and signal the process immediately.
+            self._set_job_process_paused(target, True)
+            cancelled = False
+            undo_pause = False
+            with admission_lock:
+                with self._lock:
+                    cancelled = target in getattr(self, "_cancel_requested", set())
+                    invalidated = (
+                        target in getattr(self, "_finalizing", set())
+                        or self._active.get(target) != active
+                        or self._active_commands.get(target) is not command
+                    )
+                    if cancelled or invalidated:
+                        pause_event.clear()
+                        undo_pause = not cancelled
+                if not cancelled and not invalidated:
+                    phase = self._quick_terminal_phase(command, "running")
+                    try:
+                        self.publisher.emit(
+                            target,
+                            "paused",
+                            "paused",
+                            progress={
+                                "phase": phase,
+                                "paused_phase": phase,
+                                "pause_kind": "worker",
+                                "message": "Quick Mode dijeda",
+                            },
+                        )
+                        return True
+                    except Exception:
+                        LOGGER.warning("Could not publish pause for job %s", target, exc_info=True)
+                        with self._lock:
+                            pause_event.clear()
+                        undo_pause = True
+            if undo_pause:
+                # Do not issue a late resume after Stop won. The cancelling
+                # runner owns unpausing/interrupting that process.
+                self._set_job_process_paused(target, False)
             return False
 
     def resume(self, job_id: str, event_sequence_start: int | None = None) -> bool:
         target = str(job_id)
-        self.publisher.begin(target, event_sequence_start)
-        if self._jobs.resume_pending(target, event_sequence_start=event_sequence_start):
-            with self._lock:
-                self._paused_pending_ids.discard(target)
-            return True
-        with self._lock:
-            pause_event = self._pause_events.get(target)
-            active = self._active.get(target)
-            if pause_event is None or not pause_event.is_set() or active is None:
-                return False
-            pause_event.clear()
-        self._set_job_process_paused(target, False)
-        try:
-            self.publisher.emit(
-                target,
-                "running",
-                "resumed",
-                progress={
-                    "phase": "resuming",
-                    "message": "Quick Mode dilanjutkan",
-                    "resumed_at": utc_now().isoformat(),
-                },
-            )
-            return True
-        except Exception:
-            LOGGER.warning("Could not publish resume for job %s", target, exc_info=True)
-            return False
+        admission_lock = getattr(self, "_durable_admission_lock", None)
+        if admission_lock is None:
+            admission_lock = threading.RLock()
+        process_control_lock = getattr(self, "_process_control_lock", None)
+        if process_control_lock is None:
+            process_control_lock = threading.RLock()
+            self._process_control_lock = process_control_lock
+        with process_control_lock:
+            with admission_lock:
+                with self._lock:
+                    if target in getattr(self, "_cancel_requested", set()):
+                        pause_event = self._pause_events.get(target)
+                        if pause_event is not None:
+                            pause_event.clear()
+                        return False
+                    if target in getattr(self, "_finalizing", set()):
+                        return False
+                self.publisher.begin(target, event_sequence_start)
+                if self._jobs.resume_pending(target, event_sequence_start=event_sequence_start):
+                    with self._lock:
+                        self._paused_pending_ids.discard(target)
+                    return True
+                with self._lock:
+                    pause_event = self._pause_events.get(target)
+                    active = self._active.get(target)
+                    if pause_event is None or not pause_event.is_set() or active is None:
+                        return False
+                    pause_event.clear()
+            self._set_job_process_paused(target, False)
+            with admission_lock:
+                with self._lock:
+                    if (
+                        target in getattr(self, "_cancel_requested", set())
+                        or target in getattr(self, "_finalizing", set())
+                    ):
+                        return False
+                try:
+                    self.publisher.emit(
+                        target,
+                        "running",
+                        "resumed",
+                        progress={
+                            "phase": "resuming",
+                            "message": "Quick Mode dilanjutkan",
+                            "resumed_at": utc_now().isoformat(),
+                        },
+                    )
+                    return True
+                except Exception:
+                    LOGGER.warning("Could not publish resume for job %s", target, exc_info=True)
+                    return False
 
     def _set_job_process_paused(self, job_id: str, paused: bool) -> None:
         with self._lock:
@@ -3054,14 +3127,17 @@ class WorkerJobExecutor(
     def _cancellation_was_effective(
         self, job_id: str, *, cancelled_before_execute: bool = False
     ) -> bool:
-        """Only report cancellation observed by work or confirmed by an interrupt.
+        """Honor any accepted stop request that won before finalization.
 
-        A request that races with a handler's normal return must not turn an
-        already completed external effect into a false ``cancelled`` result.
+        ``cancel()`` and this finalization check serialize on ``_lock``. Once
+        finalization begins, later stop requests are rejected; a request that
+        already set the cancellation token must therefore win even if the
+        handler returned between its last cooperative checkpoint and here.
         """
         with self._lock:
             return bool(
                 cancelled_before_execute
+                or job_id in getattr(self, "_cancel_requested", set())
                 or job_id in getattr(self, "_cancel_observed", set())
                 or job_id in getattr(self, "_cancel_confirmed", set())
             )

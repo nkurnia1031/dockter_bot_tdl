@@ -21,6 +21,17 @@ TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "needs_reconc
 _ALLOWED_COMMAND_STATUSES = frozenset(
     {"accepted", "claimed", "queued", "running", "cancelling", *TERMINAL_STATUSES}
 )
+_TELEMETRY_EVENT_TYPES = ("command.started", "command.completed", "log.snapshot")
+_TELEMETRY_EVENT_TYPES_SQL = ",".join(f"'{event_type}'" for event_type in _TELEMETRY_EVENT_TYPES)
+
+
+def _event_telemetry_predicate(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    event_type = f"json_extract({prefix}event_json,'$.event_type')"
+    return (
+        f"({prefix}transient=1 OR {event_type} IN ({_TELEMETRY_EVENT_TYPES_SQL}) "
+        f"OR {event_type} LIKE '%.snapshot')"
+    )
 
 
 def _now() -> str:
@@ -915,44 +926,55 @@ class WorkerCommandStore:
         with self._write_transaction() as db:
             row = db.execute("SELECT last_sequence FROM worker_event_sequences WHERE job_id=?", (str(job_id),)).fetchone()
             sequence = int(row["last_sequence"]) + 1 if row else 2
-            if str(payload.get("status") or "").lower() == "cancelled":
-                # A cancellation makes queued progress/command events for this
-                # job obsolete. Keep the newest progress and log snapshots so
-                # the cancellation cannot sit behind a backlog after its
-                # process has already stopped.
+            event_type = str(payload.get("event_type") or "").strip().lower()
+            cancellation_priority = (
+                event_type == "cancel.requested"
+                or str(payload.get("status") or "").lower() == "cancelled"
+            )
+            if cancellation_priority:
+                # Drop telemetry backlog so stop control can advance, while
+                # retaining non-telemetry events that carry catalog or other
+                # durable side effects.
                 keep_ids: set[int] = set()
-                latest_progress = db.execute(
-                    "SELECT id FROM worker_event_outbox "
-                    "WHERE job_id=? AND sequence<? AND transient=1 "
-                    "AND status IN ('pending','sending') ORDER BY sequence DESC LIMIT 1",
-                    (str(job_id), sequence),
-                ).fetchone()
-                if latest_progress is not None:
-                    keep_ids.add(int(latest_progress["id"]))
-                latest_log = db.execute(
-                    "SELECT id FROM worker_event_outbox "
-                    "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
-                    "AND json_extract(event_json,'$.event_type')='log.snapshot' "
-                    "ORDER BY sequence DESC LIMIT 1",
-                    (str(job_id), sequence),
-                ).fetchone()
-                if latest_log is not None:
-                    keep_ids.add(int(latest_log["id"]))
+                if event_type != "cancel.requested":
+                    latest_progress = db.execute(
+                        "SELECT id FROM worker_event_outbox "
+                        "WHERE job_id=? AND sequence<? AND transient=1 "
+                        "AND status IN ('pending','sending') ORDER BY sequence DESC LIMIT 1",
+                        (str(job_id), sequence),
+                    ).fetchone()
+                    if latest_progress is not None:
+                        keep_ids.add(int(latest_progress["id"]))
+                    latest_log = db.execute(
+                        "SELECT id FROM worker_event_outbox "
+                        "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                        "AND json_extract(event_json,'$.event_type')='log.snapshot' "
+                        "ORDER BY sequence DESC LIMIT 1",
+                        (str(job_id), sequence),
+                    ).fetchone()
+                    if latest_log is not None:
+                        keep_ids.add(int(latest_log["id"]))
+                reason = (
+                    "cancel_request_superseded"
+                    if event_type == "cancel.requested"
+                    else "terminal_event_superseded"
+                )
+                telemetry = _event_telemetry_predicate()
                 if keep_ids:
                     placeholders = ",".join("?" for _ in keep_ids)
                     db.execute(
                         "UPDATE worker_event_outbox SET status='superseded',"
-                        "lease_token=NULL,lease_until=NULL,last_error='terminal_event_superseded' "
-                        "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                        "lease_token=NULL,lease_until=NULL,last_error=? "
+                        f"WHERE job_id=? AND sequence<? AND status IN ('pending','sending') AND {telemetry} "
                         f"AND id NOT IN ({placeholders})",
-                        (str(job_id), sequence, *sorted(keep_ids)),
+                        (reason, str(job_id), sequence, *sorted(keep_ids)),
                     )
                 else:
                     db.execute(
                         "UPDATE worker_event_outbox SET status='superseded',"
-                        "lease_token=NULL,lease_until=NULL,last_error='terminal_event_superseded' "
-                        "WHERE job_id=? AND sequence<? AND status IN ('pending','sending')",
-                        (str(job_id), sequence),
+                        f"lease_token=NULL,lease_until=NULL,last_error=? "
+                        f"WHERE job_id=? AND sequence<? AND status IN ('pending','sending') AND {telemetry}",
+                        (reason, str(job_id), sequence),
                     )
             db.execute(
                 "INSERT INTO worker_event_sequences(job_id,last_sequence) VALUES (?,?) ON CONFLICT(job_id) DO UPDATE SET last_sequence=excluded.last_sequence",
@@ -1030,13 +1052,34 @@ class WorkerCommandStore:
                     WHERE p.job_id=e.job_id AND p.sequence<e.sequence
                       AND p.status IN ('pending','sending')
                 )"""
-            # Deliver at most one event for a job while another job has a
-            # ready head. Per-job sequence ordering and leases remain intact.
+            cancellation_event = """(
+                json_extract(e.event_json,'$.event_type')='cancel.requested'
+                OR json_extract(e.event_json,'$.status')='cancelled'
+            )"""
+            semantic_cancel_predecessor = (
+                "EXISTS (SELECT 1 FROM worker_event_outbox c "
+                "WHERE c.job_id=e.job_id AND c.sequence>e.sequence "
+                "AND c.status IN ('pending','sending') "
+                "AND (json_extract(c.event_json,'$.event_type')='cancel.requested' "
+                "OR json_extract(c.event_json,'$.status')='cancelled') "
+                f"AND NOT {_event_telemetry_predicate('e')})"
+            )
+            cancellation_priority = f"({cancellation_event} OR {semantic_cancel_predecessor})"
+            # Stop control traffic outranks other jobs. Required side-effect
+            # events ahead of it are promoted too and remain sequence-ordered.
             row = db.execute(
                 f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "
-                f"WHERE {eligible} AND e.job_id<>? AND e.id>? ORDER BY e.id LIMIT 1",
-                (now, now, last_job_id, last_event_id),
+                f"WHERE {eligible} AND {cancellation_priority} ORDER BY e.id LIMIT 1",
+                (now, now),
             ).fetchone()
+            # Deliver at most one event for a job while another job has a
+            # ready head. Per-job sequence ordering and leases remain intact.
+            if row is None:
+                row = db.execute(
+                    f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "
+                    f"WHERE {eligible} AND e.job_id<>? AND e.id>? ORDER BY e.id LIMIT 1",
+                    (now, now, last_job_id, last_event_id),
+                ).fetchone()
             if row is None:
                 row = db.execute(
                     f"SELECT e.id,e.job_id,e.sequence,e.event_json FROM worker_event_outbox e "

@@ -326,6 +326,7 @@ class SubprocessRunner:
         self._current_process: subprocess.Popen[bytes] | None = None
         self._current_command: list[str] | None = None
         self._current_owner: str | None = None
+        self._cancelled_owner: str | None = None
         self._last_output_at: float | None = None
         self._last_progress_signature: tuple[Any, ...] | None = None
         self._last_transfer_progress_at: float | None = None
@@ -393,6 +394,13 @@ class SubprocessRunner:
             # cannot slip into the Popen-to-registration gap.
             with self._lock:
                 preflight_command(command_callback)
+                if self._pause_requested and self._pause_owner not in {None, command_owner}:
+                    # A late pause for a previously cancelled job must not
+                    # leave this shared lane carrying stale pause state.
+                    self._pause_requested = False
+                    self._paused = False
+                    self._pause_owner = None
+                    self._pause_condition.notify_all()
                 process = subprocess.Popen(
                     process_command,
                     stdout=subprocess.PIPE,
@@ -402,6 +410,8 @@ class SubprocessRunner:
                     env=env,
                     start_new_session=os.name != "nt",
                 )
+                if self._cancelled_owner != command_owner:
+                    self._cancelled_owner = None
                 self._current_process = process
                 self._current_command = command
                 self._current_owner = command_owner
@@ -574,6 +584,9 @@ class SubprocessRunner:
         with self._pause_condition:
             owner = str(owner_job_id) if owner_job_id is not None else None
             process = self._current_process
+            effective_owner = owner or self._current_owner
+            if effective_owner is not None and effective_owner == self._cancelled_owner:
+                return False
             if process is not None and owner is not None and self._current_owner != owner:
                 return False
             self._pause_requested = True
@@ -593,6 +606,9 @@ class SubprocessRunner:
         with self._pause_condition:
             process = self._current_process
             owner = str(owner_job_id) if owner_job_id is not None else None
+            effective_owner = owner or self._current_owner
+            if effective_owner is not None and effective_owner == self._cancelled_owner:
+                return False
             if owner is not None and self._pause_owner not in {None, owner}:
                 return False
             if process is not None and owner is not None and self._current_owner != owner:
@@ -616,12 +632,25 @@ class SubprocessRunner:
             return resumed
 
     def interrupt_current(self, owner_job_id: str | None = None) -> bool:
-        with self._lock:
+        with self._pause_condition:
             process = self._current_process
             command = self._current_command
             current_owner = self._current_owner
-        if owner_job_id is not None and current_owner != str(owner_job_id):
-            return False
+            requested_owner = str(owner_job_id) if owner_job_id is not None else None
+            if (
+                requested_owner is not None
+                and current_owner is not None
+                and current_owner != requested_owner
+            ):
+                return False
+            owner = requested_owner or current_owner
+            if owner is not None:
+                self._cancelled_owner = owner
+                if self._pause_owner in {None, owner}:
+                    self._pause_requested = False
+                    self._paused = False
+                    self._pause_owner = None
+                    self._pause_condition.notify_all()
         if process is None or process.poll() is not None:
             return False
 
@@ -635,6 +664,9 @@ class SubprocessRunner:
             return
         if os.name != "nt":
             try:
+                # SIGINT remains pending for a SIGSTOPped process. Resume it
+                # first so the graceful interrupt can be handled immediately.
+                os.killpg(os.getpgid(process.pid), signal.SIGCONT)
                 os.killpg(os.getpgid(process.pid), signal.SIGINT)
             except ProcessLookupError:
                 return

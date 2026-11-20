@@ -55,6 +55,7 @@ class WorkerJobLifecycleContractTests(unittest.TestCase):
             )
         )
         executor._lock = threading.RLock()
+        executor._process_control_lock = threading.RLock()
         executor._active = {"job-1": ("default", kind)}
         executor._active_commands = {
             "job-1": {"kind": kind, "profile": "default", "payload": payload}
@@ -71,7 +72,8 @@ class WorkerJobLifecycleContractTests(unittest.TestCase):
         executor._finalizing = set()
         executor._jobs = SimpleNamespace(cancel_pending=lambda _job_id: False)
         executor.publisher = SimpleNamespace(
-            emit=lambda *args, **kwargs: emitted.append((args, kwargs))
+            emit=lambda *args, **kwargs: emitted.append((args, kwargs)),
+            begin=lambda *args, **kwargs: None,
         )
         executor.profile_manager = SimpleNamespace(
             runtime=lambda profile: runtimes[profile],
@@ -305,7 +307,167 @@ class WorkerJobLifecycleContractTests(unittest.TestCase):
         self.assertEqual(cancel_calls, [])
         self.assertNotIn("job-1", executor._cancel_requested)
 
-    def test_unobserved_cancel_racing_with_handler_return_does_not_override_success(self):
+    def test_cancel_request_precedes_interrupt_and_blocks_pause_or_resume(self):
+        emitted = []
+        interrupt_observations = []
+        executor, _cancel_calls, _ = self._active_cancel_executor(
+            "utility", {}, ["default"], {"default": SimpleNamespace()}
+        )
+        executor.publisher.emit = lambda *args, **kwargs: emitted.append((args, kwargs))
+        executor.publisher.begin = lambda *args, **kwargs: emitted.append(("begin", args, kwargs))
+        executor._jobs.pause_pending = lambda _job_id: False
+        executor._jobs.is_active = lambda _job_id: True
+        executor._jobs.resume_pending = lambda *_args, **_kwargs: False
+        executor._quick_terminal_phase = lambda _command, fallback: fallback
+        executor._set_job_process_paused = lambda *_args: None
+        executor._utility_runners["job-1"] = SimpleNamespace(
+            cancel_current=lambda *_args: (
+                interrupt_observations.append(
+                    any(event[0][2] == "cancel.requested" for event in emitted if event[0] != "begin")
+                )
+                or True
+            )
+        )
+
+        self.assertTrue(executor.cancel("job-1"))
+        self.assertEqual(interrupt_observations, [True])
+        self.assertFalse(executor.pause("job-1"))
+        self.assertFalse(any(event[0][2] == "paused" for event in emitted if event[0] != "begin"))
+
+        late_pause = threading.Event()
+        late_pause.set()
+        executor._pause_events["job-1"] = late_pause
+        emitted_before_resume = len(emitted)
+        self.assertFalse(executor.resume("job-1", event_sequence_start=99))
+        self.assertFalse(late_pause.is_set())
+        self.assertEqual(len(emitted), emitted_before_resume)
+        self.assertFalse(any(event[0] == "begin" for event in emitted))
+
+    def test_cancel_can_win_while_pause_process_callback_is_slow(self):
+        pause_entered = threading.Event()
+        release_pause = threading.Event()
+        cancel_finished = threading.Event()
+        process_control_calls = []
+        cancel_results = []
+
+        class UtilityRunner:
+            def cancel_current(self, owner_job_id=None):
+                return owner_job_id == "job-1"
+
+        executor, _, emitted = self._active_cancel_executor(
+            "utility", {}, ["default"], {"default": SimpleNamespace()}
+        )
+        executor._utility_runners = {"job-1": UtilityRunner()}
+        executor._jobs = SimpleNamespace(
+            pause_pending=lambda _job_id: False,
+            resume_pending=lambda _job_id, **_kwargs: False,
+            cancel_pending=lambda _job_id: False,
+            is_active=lambda _job_id: True,
+        )
+
+        def set_process_paused(_job_id, paused):
+            process_control_calls.append(paused)
+            if paused:
+                pause_entered.set()
+                release_pause.wait(timeout=2)
+
+        executor._set_job_process_paused = set_process_paused
+        pause_results = []
+        pause_thread = threading.Thread(
+            target=lambda: pause_results.append(executor.pause("job-1"))
+        )
+        cancel_thread = threading.Thread(
+            target=lambda: (
+                cancel_results.append(executor.cancel("job-1")),
+                cancel_finished.set(),
+            )
+        )
+        pause_thread.start()
+        try:
+            self.assertTrue(pause_entered.wait(timeout=1))
+            cancel_thread.start()
+            self.assertTrue(cancel_finished.wait(timeout=1))
+        finally:
+            release_pause.set()
+            pause_thread.join(timeout=2)
+            if cancel_thread.ident is not None:
+                cancel_thread.join(timeout=2)
+
+        self.assertEqual(cancel_results, [True])
+        self.assertEqual(pause_results, [False])
+        # Cancel itself may unpause before interrupting a stopped child, but
+        # the stale Pause callback must not issue a second unpause afterward.
+        self.assertEqual(process_control_calls, [True, False])
+        self.assertFalse(any(event[0][1] == "paused" for event in emitted))
+
+    def test_pause_and_resume_callbacks_are_serialized(self):
+        pause_entered = threading.Event()
+        release_pause = threading.Event()
+        resume_attempted = threading.Event()
+        process_control_calls = []
+
+        class ObservedControlLock:
+            def __init__(self):
+                self.lock = threading.RLock()
+
+            def __enter__(self):
+                if threading.current_thread().name == "resume-control-test":
+                    resume_attempted.set()
+                self.lock.acquire()
+                return self
+
+            def __exit__(self, *_args):
+                self.lock.release()
+
+        executor, _, emitted = self._active_cancel_executor(
+            "utility", {}, ["default"], {"default": SimpleNamespace()}
+        )
+        executor._process_control_lock = ObservedControlLock()
+        executor._jobs = SimpleNamespace(
+            pause_pending=lambda _job_id: False,
+            resume_pending=lambda _job_id, **_kwargs: False,
+            is_active=lambda _job_id: True,
+        )
+        executor._quick_terminal_phase = lambda _command, fallback: fallback
+
+        def set_process_paused(_job_id, paused):
+            process_control_calls.append(paused)
+            if paused:
+                pause_entered.set()
+                release_pause.wait(timeout=2)
+
+        executor._set_job_process_paused = set_process_paused
+        pause_results = []
+        resume_results = []
+        pause_thread = threading.Thread(
+            target=lambda: pause_results.append(executor.pause("job-1"))
+        )
+
+        def resume_job():
+            resume_results.append(executor.resume("job-1"))
+
+        resume_thread = threading.Thread(
+            target=resume_job, name="resume-control-test"
+        )
+        pause_thread.start()
+        try:
+            self.assertTrue(pause_entered.wait(timeout=1))
+            resume_thread.start()
+            self.assertTrue(resume_attempted.wait(timeout=1))
+            self.assertEqual(process_control_calls, [True])
+        finally:
+            release_pause.set()
+            pause_thread.join(timeout=2)
+            if resume_thread.ident is not None:
+                resume_thread.join(timeout=2)
+
+        self.assertEqual(pause_results, [True])
+        self.assertEqual(resume_results, [True])
+        self.assertEqual(process_control_calls, [True, False])
+        self.assertTrue(any(event[0][1] == "paused" for event in emitted))
+        self.assertTrue(any(event[0][2] == "resumed" for event in emitted))
+
+    def test_accepted_cancel_wins_when_handler_returns_after_last_checkpoint(self):
         executor = object.__new__(WorkerJobExecutor)
         executor._lock = threading.RLock()
         executor._cancel_requested = {"job-1"}
@@ -313,9 +475,9 @@ class WorkerJobLifecycleContractTests(unittest.TestCase):
         executor._cancel_confirmed = set()
         executor._finalizing = set()
 
-        self.assertFalse(executor._cancellation_was_effective("job-1"))
+        self.assertTrue(executor._cancellation_was_effective("job-1"))
         executor._finalizing.add("job-1")
-        self.assertFalse(executor._cancellation_was_effective("job-1"))
+        self.assertTrue(executor._cancellation_was_effective("job-1"))
 
     def test_worker_checkpoint_makes_cancel_effective_for_terminal_status(self):
         executor = object.__new__(WorkerJobExecutor)

@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tme3bot.tdl import (
     SubprocessRunner,
@@ -483,6 +485,58 @@ class TDLClientTests(unittest.TestCase):
         self.assertTrue(finished.wait(timeout=4))
         thread.join(timeout=3)
         self.assertFalse(errors)
+
+    def test_subprocess_runner_rejects_pause_and_resume_after_interrupt_wins(self):
+        class ActiveProcess:
+            pid = 12345
+            returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.returncode = 0
+                return 0
+
+        runner = SubprocessRunner()
+        runner._current_process = ActiveProcess()
+        runner._current_command = ["tdl", "upload"]
+        runner._current_owner = "job-stop"
+
+        with patch("tme3bot.tdl.os.getpgid", return_value=12345):
+            with patch("tme3bot.tdl.os.killpg") as killpg:
+                self.assertTrue(runner.interrupt_current("job-stop"))
+        self.assertEqual(
+            [call.args[1] for call in killpg.call_args_list],
+            [signal.SIGCONT, signal.SIGINT],
+        )
+
+        with patch("tme3bot.tdl.os.getpgid", return_value=12345):
+            with patch("tme3bot.tdl.os.killpg") as killpg:
+                self.assertFalse(runner.pause_current("job-stop"))
+                self.assertFalse(runner.resume_current("job-stop"))
+        killpg.assert_not_called()
+
+    def test_stale_interrupt_for_another_owner_does_not_poison_current_lane(self):
+        class ActiveProcess:
+            pid = 23456
+
+            def poll(self):
+                return None
+
+        runner = SubprocessRunner()
+        runner._current_process = ActiveProcess()
+        runner._current_command = ["tdl", "download"]
+        runner._current_owner = "current-job"
+
+        with patch.object(SubprocessRunner, "_interrupt_process") as interrupt:
+            self.assertFalse(runner.interrupt_current("stale-job"))
+        interrupt.assert_not_called()
+
+        with patch("tme3bot.tdl.os.getpgid", return_value=23456):
+            with patch("tme3bot.tdl.os.killpg") as killpg:
+                self.assertTrue(runner.pause_current("current-job"))
+        killpg.assert_called_once()
 
     def test_decodes_invalid_utf8_without_losing_surrounding_output(self) -> None:
         self.assertEqual(

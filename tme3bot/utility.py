@@ -491,6 +491,8 @@ class UtilityRunner:
     def pause_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
         with self._pause_condition:
+            if self._cancel_requested.is_set():
+                return False
             self._pause_requested = True
             process = self._current_process
             if process is None or process.poll() is not None:
@@ -501,6 +503,8 @@ class UtilityRunner:
     def resume_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
         with self._pause_condition:
+            if self._cancel_requested.is_set():
+                return False
             process = self._current_process
             resumed = process is None or process.poll() is not None
             if process is not None and process.poll() is None and self._paused:

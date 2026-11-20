@@ -1,4 +1,5 @@
 import shutil
+import signal
 import tempfile
 import threading
 import time
@@ -55,6 +56,22 @@ class WorkerExecutorTestCase(unittest.TestCase):
 
 
 class QuickThumbnailTests(WorkerExecutorTestCase):
+
+    def test_stop_unpauses_then_interrupts_thumbnail_and_rejects_late_controls(self) -> None:
+        builder = QuickThumbnailBuilder()
+        process = SimpleNamespace(pid=1234, poll=lambda: None, wait=lambda timeout=None: 0)
+        builder._current_process = process
+
+        with patch("tme3bot.worker.quick_export.os.getpgid", return_value=1234):
+            with patch("tme3bot.worker.quick_export.os.killpg") as killpg:
+                self.assertTrue(builder.cancel_current())
+                self.assertFalse(builder.pause_current())
+                self.assertFalse(builder.resume_current())
+
+        self.assertEqual(
+            [call.args[1] for call in killpg.call_args_list],
+            [signal.SIGCONT, signal.SIGINT],
+        )
 
     def test_job_log_keeps_newest_tail_and_returns_newest_first(self) -> None:
         snapshot = JobLogSnapshot()

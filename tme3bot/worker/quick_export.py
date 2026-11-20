@@ -543,6 +543,8 @@ class QuickThumbnailBuilder:
     def pause_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
         with self._pause_condition:
+            if self._cancel_requested:
+                return False
             self._pause_requested = True
             process = self._current_process
             if process is None or process.poll() is not None:
@@ -553,6 +555,8 @@ class QuickThumbnailBuilder:
     def resume_current(self, owner_job_id: str | None = None) -> bool:
         del owner_job_id
         with self._pause_condition:
+            if self._cancel_requested:
+                return False
             process = self._current_process
             resumed = process is None or process.poll() is not None
             if process is not None and process.poll() is None and self._paused:
@@ -565,6 +569,9 @@ class QuickThumbnailBuilder:
     def cancel_current(self) -> bool:
         with self._process_lock:
             self._cancel_requested = True
+            self._pause_requested = False
+            self._paused = False
+            self._pause_condition.notify_all()
             process = self._current_process
             if process is None or process.poll() is not None:
                 # Remember cancellation even if ffmpeg has not spawned yet.
@@ -573,6 +580,7 @@ class QuickThumbnailBuilder:
                 return True
         try:
             if os.name != "nt":
+                os.killpg(os.getpgid(process.pid), signal.SIGCONT)
                 os.killpg(os.getpgid(process.pid), signal.SIGINT)
             else:  # pragma: no cover - production workers run on Linux
                 process.send_signal(signal.CTRL_BREAK_EVENT)

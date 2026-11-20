@@ -822,6 +822,8 @@ class UtilityMediaJobTests(unittest.TestCase):
             )
 
             self.assertTrue(runner.cancel_current("media-job"))
+            self.assertFalse(runner.pause_current("media-job"))
+            self.assertFalse(runner.resume_current("media-job"))
             with self.assertRaises(UtilityCancelledError):
                 runner.run("video_convert", [str(folder)])
             self.assertTrue(source.exists())

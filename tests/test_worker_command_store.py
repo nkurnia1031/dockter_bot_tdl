@@ -506,6 +506,15 @@ class WorkerCommandStoreTests(unittest.TestCase):
                 },
                 transient=False,
             )
+        side_effect_sequence = self.store.append_event(
+            job_id,
+            {
+                "event_type": "storage.item_uploaded",
+                "status": "running",
+                "result": {"item": {"original_name": "already-uploaded.bin"}},
+            },
+            transient=False,
+        )
         progress_sequence = self.store.append_event(
             job_id,
             {"event_type": "progress.snapshot", "status": "running", "progress": {"current": 7}},
@@ -532,6 +541,7 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertEqual(
             delivered,
             [
+                (side_effect_sequence, "storage.item_uploaded"),
                 (progress_sequence, "progress.snapshot"),
                 (log_sequence, "log.snapshot"),
                 (terminal_sequence, "cancelled"),
@@ -543,6 +553,84 @@ class WorkerCommandStoreTests(unittest.TestCase):
                 (job_id,),
             ).fetchone()[0]
         self.assertEqual(superseded, 80)
+
+    def test_cancel_request_supersedes_telemetry_but_preserves_side_effects(self):
+        job_id = "cancel-request-with-event-backlog"
+        for index in range(80):
+            self.store.append_event(
+                job_id,
+                {
+                    "event_type": "command.completed",
+                    "status": "running",
+                    "command_index": index,
+                },
+                transient=False,
+            )
+        side_effect_sequence = self.store.append_event(
+            job_id,
+            {
+                "event_type": "storage.item_uploaded",
+                "status": "running",
+                "result": {"item": {"original_name": "already-uploaded.bin"}},
+            },
+            transient=False,
+        )
+        in_flight = self.store.claim_event()
+        self.assertEqual(in_flight[1], job_id)
+        self.assertEqual(in_flight[3]["event_type"], "command.completed")
+        other_job_sequence = self.store.append_event(
+            "unrelated-job",
+            {"event_type": "progress", "status": "running"},
+            transient=False,
+        )
+        progress_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "progress.snapshot", "status": "running", "progress": {"current": 7}},
+            transient=True,
+        )
+        log_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "log.snapshot", "status": "running", "progress": {"log_tail": "last output"}},
+            transient=False,
+        )
+        cancel_sequence = self.store.append_event(
+            job_id,
+            {
+                "event_type": "cancel.requested",
+                "status": "running",
+                "progress": {"cancel_request": {"status": "accepted"}},
+            },
+            transient=False,
+        )
+
+        delivered = []
+        while (claimed := self.store.claim_event()) is not None:
+            delivered.append((claimed[1], claimed[2], claimed[3]["event_type"]))
+            self.assertTrue(
+                self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+            )
+
+        self.assertEqual(
+            delivered,
+            [
+                (job_id, side_effect_sequence, "storage.item_uploaded"),
+                (job_id, cancel_sequence, "cancel.requested"),
+                ("unrelated-job", other_job_sequence, "progress"),
+            ],
+        )
+        with sqlite3.connect(self.path) as db:
+            superseded = db.execute(
+                "SELECT COUNT(*) FROM worker_event_outbox WHERE job_id=? AND status='superseded'",
+                (job_id,),
+            ).fetchone()[0]
+        self.assertEqual(superseded, 82)
+        self.assertLess(progress_sequence, cancel_sequence)
+        self.assertLess(log_sequence, cancel_sequence)
+        self.assertFalse(
+            self.store.acknowledge_event(
+                in_flight[0], in_flight[4], accepted=True
+            )
+        )
 
     def test_active_event_predecessor_lookup_uses_a_dedicated_index(self):
         with sqlite3.connect(self.path) as db:
