@@ -880,6 +880,8 @@ class UtilityRunner:
                         "folder_total": len(roots),
                         "moves": plan["moves"],
                         "deleted": plan["deleted"],
+                        "replaced": plan["replaced"],
+                        "suffixed": plan["suffixed"],
                         "skipped": plan["skipped"],
                         "percent": 100,
                         "indeterminate": False,
@@ -889,6 +891,8 @@ class UtilityRunner:
                 "folders_processed": len(roots),
                 "moves": sum(int(item["flatten_preview"]["moves"]) for item in details),
                 "deleted": sum(int(item["flatten_preview"]["deleted"]) for item in details),
+                "replaced": sum(int(item["flatten_preview"]["replaced"]) for item in details),
+                "suffixed": sum(int(item["flatten_preview"]["suffixed"]) for item in details),
                 "skipped": sum(int(item["flatten_preview"]["skipped"]) for item in details),
                 "action_count": sum(
                     int(item["flatten_preview"]["action_count"]) for item in details
@@ -942,6 +946,8 @@ class UtilityRunner:
             "folders_processed": len(details),
             "moves": sum(int(item["moves"]) for item in details),
             "deleted": sum(int(item["deleted"]) for item in details),
+            "replaced": sum(int(item["replaced"]) for item in details),
+            "suffixed": sum(int(item["suffixed"]) for item in details),
             "skipped": sum(int(item["skipped"]) for item in details),
         }
         return UtilityResult("flatten", [str(root) for root in roots], [], details, summary)

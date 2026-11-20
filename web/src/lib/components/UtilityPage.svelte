@@ -8,11 +8,13 @@
 
   type Job = Record<string, any>;
   type FlattenAction = {
-    type: 'delete_empty' | 'move' | 'skip_multiple';
+    type: 'delete_empty' | 'move' | 'merge' | 'replace' | 'skip_multiple';
     folder: string;
     source?: string;
     destination?: string;
     collision?: boolean;
+    collision_reason?: 'different_size' | 'different_type';
+    merge_summary?: { added: number; replaced: number; suffixed: number; merged_folders: number };
     item_count?: number;
   };
   type FlattenDetail = {
@@ -253,7 +255,7 @@
     {#if currentFlattenPreview}
       <section class="mt-5 rounded-xl border border-[var(--line)] p-4" aria-label="Preview Flatten">
         <div class="flex flex-wrap items-start justify-between gap-3">
-          <div><h3 class="font-bold">Preview Flatten</h3><p class="muted mt-1 text-sm">{currentFlattenPreview.summary.moves || 0} pindah · {currentFlattenPreview.summary.deleted || 0} hapus · {currentFlattenPreview.summary.skipped || 0} dilewati</p></div>
+          <div><h3 class="font-bold">Preview Flatten</h3><p class="muted mt-1 text-sm">{currentFlattenPreview.summary.moves || 0} operasi · {currentFlattenPreview.summary.replaced || 0} file diganti · {currentFlattenPreview.summary.suffixed || 0} file diberi suffix · {currentFlattenPreview.summary.deleted || 0} folder kosong dihapus · {currentFlattenPreview.summary.skipped || 0} dilewati</p></div>
           {#if currentFlattenPreview.summary.action_count}<button class="button danger" onclick={applyFlatten} disabled={pending}>Terapkan Flatten</button>{/if}
         </div>
         <div class="mt-4 space-y-4">
@@ -267,7 +269,9 @@
                     {#each pass.actions as action, index (`${pass.index}:${index}`)}
                       <li>
                         {#if action.type === 'delete_empty'}Hapus folder kosong: <code>{action.folder}</code>
-                        {:else if action.type === 'move'}Pindah <code>{action.source}</code> → <code>{action.destination}</code> (hapus <code>{action.folder}</code>){#if action.collision} · nama bentrok, diberi prefix{/if}
+                        {:else if action.type === 'move'}Pindah <code>{action.source}</code> → <code>{action.destination}</code> (hapus <code>{action.folder}</code>){#if action.collision_reason === 'different_size'} · ukuran berbeda, file disimpan dengan suffix{:else if action.collision} · nama bentrok, path diberi suffix{/if}
+                        {:else if action.type === 'replace'}Ganti <code>{action.destination}</code> dengan <code>{action.source}</code> (ukuran sama)
+                        {:else if action.type === 'merge'}Gabungkan <code>{action.source}</code> ke <code>{action.destination}</code>{#if action.merge_summary} · {action.merge_summary.added} ditambahkan, {action.merge_summary.replaced} diganti, {action.merge_summary.suffixed} diberi suffix{/if}
                         {:else}Lewati <code>{action.folder}</code> ({action.item_count} item){/if}
                       </li>
                     {/each}

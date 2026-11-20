@@ -171,11 +171,14 @@ describe('UtilityPage access controls', () => {
         id: 'preview-1', kind: 'utility', status: 'succeeded',
         payload: { utility: 'flatten', flatten_action: 'preview' },
         result: { value: {
-          summary: { moves: 1, deleted: 0, skipped: 1, action_count: 1 },
+          summary: { moves: 3, deleted: 1, replaced: 1, suffixed: 2, skipped: 1, action_count: 5 },
           details: [{ folder: '/workspace/demo', flatten_preview: {
-            fingerprint: 'a'.repeat(64), action_count: 1, moves: 1, deleted: 0, skipped: 1,
+            fingerprint: 'a'.repeat(64), action_count: 5, moves: 3, deleted: 1, replaced: 1, suffixed: 2, skipped: 1,
             passes: [{ index: 1, actions: [
               { type: 'move', folder: 'single', source: 'single/file.txt', destination: 'file.txt', collision: false },
+              { type: 'move', folder: 'different', source: 'different/file.txt', destination: 'file_2.txt', collision: true, collision_reason: 'different_size' },
+              { type: 'replace', folder: 'same-size', source: 'same-size/file.txt', destination: 'file.txt', size: 10 },
+              { type: 'merge', folder: 'wrapper', source: 'wrapper/demo', destination: 'demo', merge_summary: { added: 1, replaced: 0, suffixed: 1, merged_folders: 0 } },
               { type: 'skip_multiple', folder: 'many', item_count: 2 }
             ] }]
           } }]
@@ -197,6 +200,9 @@ describe('UtilityPage access controls', () => {
 
     expect(await screen.findByRole('region', { name: 'Preview Flatten' })).toBeTruthy();
     expect(screen.getByText(/single\/file\.txt/)).toBeTruthy();
+    expect(screen.getByText(/ukuran berbeda, file disimpan dengan suffix/)).toBeTruthy();
+    expect(screen.getByText(/ukuran sama/)).toBeTruthy();
+    expect(screen.getByText(/Gabungkan/)).toBeTruthy();
     expect(screen.getByText(/many/)).toBeTruthy();
     await fireEvent.click(screen.getByRole('button', { name: 'Terapkan Flatten' }));
     await waitFor(() => expect(requests.some((item) =>

@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import stat
 import uuid
 from pathlib import Path, PurePosixPath
@@ -20,6 +19,9 @@ class UtilityFlattenPreviewStaleError(ValueError):
             + ", ".join(folders)
             + ". Buat preview baru sebelum menerapkan perubahan."
         )
+
+
+Entry = tuple[str, int]
 
 
 def _walk(root: Path) -> list[tuple[str, int, int, int, int, int, int, str]]:
@@ -75,22 +77,24 @@ def tree_fingerprint(root: Path) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _inventory(root: Path) -> dict[str, str]:
-    entries: dict[str, str] = {}
-    for relative, mode, *_ in _walk(root):
-        if stat.S_ISLNK(mode):
-            kind = "symlink"
-        elif stat.S_ISDIR(mode):
-            kind = "directory"
-        elif stat.S_ISREG(mode):
-            kind = "file"
-        else:
-            kind = "other"
-        entries[relative] = kind
-    return entries
+def _entry_kind(mode: int) -> str:
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "other"
 
 
-def _children(entries: dict[str, str], parent: str) -> list[str]:
+def _inventory(root: Path) -> dict[str, Entry]:
+    return {
+        relative: (_entry_kind(mode), size)
+        for relative, mode, _dev, _ino, size, _mtime, _ctime, _link in _walk(root)
+    }
+
+
+def _children(entries: dict[str, Entry], parent: str) -> list[str]:
     return sorted(
         path
         for path in entries
@@ -98,38 +102,220 @@ def _children(entries: dict[str, str], parent: str) -> list[str]:
     )
 
 
-def _subtree(entries: dict[str, str], source: str) -> dict[str, str]:
+def _subtree(entries: dict[str, Entry], source: str) -> dict[str, Entry]:
     prefix = source + "/"
     return {
-        path: kind
-        for path, kind in entries.items()
+        path: entry
+        for path, entry in entries.items()
         if path == source or path.startswith(prefix)
     }
 
 
-def _destination_name(entries: dict[str, str], folder_name: str, item_name: str) -> tuple[str, bool]:
-    if item_name == folder_name:
-        return item_name, False
-    if item_name not in entries:
-        return item_name, False
-    base = f"dup_{folder_name}_{item_name}"
-    candidate = base
+def _remove_subtree(entries: dict[str, Entry], path: str) -> None:
+    prefix = path + "/"
+    for candidate in list(entries):
+        if candidate == path or candidate.startswith(prefix):
+            del entries[candidate]
+
+
+def _move_virtual(entries: dict[str, Entry], source: str, destination: str) -> None:
+    moving = _subtree(entries, source)
+    _remove_subtree(entries, source)
+    for path, entry in moving.items():
+        entries[destination + path[len(source):]] = entry
+
+
+def _suffixed_path(entries: dict[str, Entry], path: str, kind: str) -> str:
+    candidate_path = PurePosixPath(path)
+    name = candidate_path.name
+    if kind == "file" and candidate_path.suffix:
+        stem, extension = candidate_path.stem, candidate_path.suffix
+    else:
+        stem, extension = name, ""
     suffix = 2
-    while candidate in entries:
-        candidate = f"{base}_{suffix}"
+    while True:
+        candidate_name = f"{stem}_{suffix}{extension}"
+        candidate = (candidate_path.parent / candidate_name).as_posix()
+        if candidate not in entries:
+            return candidate
         suffix += 1
-    return candidate, True
 
 
-def _move_virtual(entries: dict[str, str], folder: str, item: str, destination: str) -> None:
-    moving = _subtree(entries, item)
-    prefix = folder + "/"
-    for path in list(entries):
-        if path == folder or path.startswith(prefix):
-            del entries[path]
-    for path, kind in moving.items():
-        relative_suffix = path[len(item):]
-        entries[destination + relative_suffix] = kind
+def _plan_merge(entries: dict[str, Entry], source: str, destination: str) -> list[dict[str, Any]]:
+    """Plan and simulate a directory merge without replacing different-size files."""
+    operations: list[dict[str, Any]] = []
+    for source_child in _children(entries, source):
+        destination_child = (PurePosixPath(destination) / PurePosixPath(source_child).name).as_posix()
+        source_kind, source_size = entries[source_child]
+        destination_entry = entries.get(destination_child)
+
+        if source_kind == "directory" and not _children(entries, source_child):
+            operations.append({"type": "delete_empty", "folder": source_child})
+            entries.pop(source_child, None)
+            continue
+
+        if destination_entry is None:
+            operations.append(
+                {"type": "move", "source": source_child, "destination": destination_child}
+            )
+            _move_virtual(entries, source_child, destination_child)
+            continue
+
+        destination_kind, destination_size = destination_entry
+        if source_kind == destination_kind == "directory":
+            nested = _plan_merge(entries, source_child, destination_child)
+            operations.append(
+                {
+                    "type": "merge",
+                    "source": source_child,
+                    "destination": destination_child,
+                    "items": nested,
+                    "merge_summary": _merge_summary(nested),
+                }
+            )
+            entries.pop(source_child, None)
+            continue
+
+        if source_kind == destination_kind == "file" and source_size == destination_size:
+            operations.append(
+                {
+                    "type": "replace",
+                    "source": source_child,
+                    "destination": destination_child,
+                    "size": source_size,
+                }
+            )
+            _remove_subtree(entries, source_child)
+            entries[destination_child] = (source_kind, source_size)
+            continue
+
+        collision = (
+            "different_size"
+            if source_kind == destination_kind == "file"
+            else "different_type"
+        )
+        renamed = _suffixed_path(entries, destination_child, source_kind)
+        operations.append(
+            {
+                "type": "move",
+                "source": source_child,
+                "destination": renamed,
+                "collision": True,
+                "collision_reason": collision,
+            }
+        )
+        _move_virtual(entries, source_child, renamed)
+
+    entries.pop(source, None)
+    return operations
+
+
+def _merge_summary(operations: list[dict[str, Any]]) -> dict[str, int]:
+    summary = {"added": 0, "replaced": 0, "suffixed": 0, "merged_folders": 0, "deleted": 0}
+    for operation in operations:
+        kind = operation.get("type")
+        if kind == "move":
+            reason = operation.get("collision_reason")
+            if reason in {"different_size", "different_type"}:
+                summary["suffixed"] += 1
+            elif reason is None:
+                summary["added"] += 1
+        elif kind == "replace":
+            summary["replaced"] += 1
+        elif kind == "delete_empty":
+            summary["deleted"] += 1
+        elif kind == "merge":
+            summary["merged_folders"] += 1
+            nested = operation.get("merge_summary") or _merge_summary(operation.get("items", []))
+            for key in ("added", "replaced", "suffixed", "deleted"):
+                summary[key] += int(nested.get(key, 0))
+            summary["merged_folders"] += int(nested.get("merged_folders", 0))
+    return summary
+
+
+def _count_actions(actions: list[dict[str, Any]], kind: str) -> int:
+    total = 0
+    for action in actions:
+        if action.get("type") == kind:
+            total += 1
+        if action.get("type") == "merge":
+            total += _count_actions(action.get("items", []), kind)
+    return total
+
+
+def _top_level_move(
+    entries: dict[str, Entry], folder: str, source: str, destination: str
+) -> dict[str, Any]:
+    source_kind, source_size = entries[source]
+    destination_entry = entries.get(destination)
+
+    if destination == folder and source_kind == "directory":
+        items = _plan_merge(entries, source, destination)
+        action: dict[str, Any] = {
+            "type": "merge",
+            "folder": folder,
+            "source": source,
+            "destination": destination,
+            "items": items,
+            "merge_summary": _merge_summary(items),
+            "keep_folder": True,
+        }
+        return action
+
+    if destination_entry is None:
+        _move_virtual(entries, source, destination)
+        entries.pop(folder, None)
+        return {
+            "type": "move",
+            "folder": folder,
+            "source": source,
+            "destination": destination,
+            "collision": False,
+        }
+
+    destination_kind, destination_size = destination_entry
+    if source_kind == destination_kind == "directory":
+        items = _plan_merge(entries, source, destination)
+        if destination != folder:
+            entries.pop(folder, None)
+        return {
+            "type": "merge",
+            "folder": folder,
+            "source": source,
+            "destination": destination,
+            "items": items,
+            "merge_summary": _merge_summary(items),
+            "keep_folder": destination == folder,
+        }
+
+    if source_kind == destination_kind == "file" and source_size == destination_size:
+        _remove_subtree(entries, source)
+        entries[destination] = (source_kind, source_size)
+        entries.pop(folder, None)
+        return {
+            "type": "replace",
+            "folder": folder,
+            "source": source,
+            "destination": destination,
+            "size": source_size,
+        }
+
+    collision_reason = (
+        "different_size"
+        if source_kind == destination_kind == "file"
+        else "different_type"
+    )
+    renamed = _suffixed_path(entries, destination, source_kind)
+    _move_virtual(entries, source, renamed)
+    entries.pop(folder, None)
+    return {
+        "type": "move",
+        "folder": folder,
+        "source": source,
+        "destination": renamed,
+        "collision": True,
+        "collision_reason": collision_reason,
+    }
 
 
 def plan_flatten(root: Path) -> dict[str, Any]:
@@ -142,15 +328,26 @@ def plan_flatten(root: Path) -> dict[str, Any]:
     passes: list[dict[str, Any]] = []
 
     while True:
-        folder_candidates = [
-            path
-            for path in _children(entries, "")
-            if entries.get(path) == "directory"
-        ]
         actions: list[dict[str, Any]] = []
-        changed = False
+        empty_folders = sorted(
+            (
+                path
+                for path, (kind, _size) in entries.items()
+                if kind == "directory" and not _children(entries, path)
+            ),
+            key=lambda path: (-path.count("/"), path.casefold(), path),
+        )
+        for folder in empty_folders:
+            if entries.get(folder, ("", 0))[0] == "directory" and not _children(entries, folder):
+                actions.append({"type": "delete_empty", "folder": folder})
+                entries.pop(folder, None)
+
+        folder_candidates = [
+            path for path in _children(entries, "") if entries.get(path, ("", 0))[0] == "directory"
+        ]
+        changed = bool(empty_folders)
         for folder in folder_candidates:
-            if entries.get(folder) != "directory":
+            if entries.get(folder, ("", 0))[0] != "directory":
                 continue
             items = _children(entries, folder)
             folder_name = PurePosixPath(folder).name
@@ -167,20 +364,8 @@ def plan_flatten(root: Path) -> dict[str, Any]:
 
             item = items[0]
             item_name = PurePosixPath(item).name
-            destination_name, collision = _destination_name(
-                entries, folder_name, item_name
-            )
-            destination = destination_name
-            actions.append(
-                {
-                    "type": "move",
-                    "folder": folder,
-                    "source": item,
-                    "destination": destination,
-                    "collision": collision,
-                }
-            )
-            _move_virtual(entries, folder, item, destination)
+            action = _top_level_move(entries, folder, item, item_name)
+            actions.append(action)
             changed = True
 
         if actions:
@@ -188,19 +373,35 @@ def plan_flatten(root: Path) -> dict[str, Any]:
         if not changed:
             break
 
+    actionable_types = {"move", "merge", "replace", "delete_empty"}
     actionable = [
         action
         for pass_item in passes
         for action in pass_item["actions"]
-        if action["type"] in {"move", "delete_empty"}
+        if action["type"] in actionable_types
     ]
     return {
         "folder": str(root),
         "fingerprint": fingerprint,
         "passes": passes,
-        "action_count": len(actionable),
-        "moves": sum(action["type"] == "move" for action in actionable),
-        "deleted": sum(action["type"] == "delete_empty" for action in actionable),
+        "action_count": sum(
+            _count_actions(pass_item["actions"], kind)
+            for pass_item in passes
+            for kind in actionable_types
+        ),
+        "moves": sum(action["type"] in {"move", "merge", "replace"} for action in actionable),
+        "deleted": sum(
+            _count_actions(pass_item["actions"], "delete_empty") for pass_item in passes
+        ),
+        "replaced": sum(
+            1 if action["type"] == "replace" else int(action.get("merge_summary", {}).get("replaced", 0))
+            for action in actionable
+        ),
+        "suffixed": sum(
+            1 if action.get("collision_reason") == "different_size"
+            else int(action.get("merge_summary", {}).get("suffixed", 0))
+            for action in actionable
+        ),
         "skipped": sum(
             action["type"] == "skip_multiple"
             for pass_item in passes
@@ -209,51 +410,112 @@ def plan_flatten(root: Path) -> dict[str, Any]:
     }
 
 
+def _safe_move(source: Path, destination: Path) -> None:
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(f"Tujuan Flatten sudah ada: {destination}")
+    source.rename(destination)
+
+
+def _apply_merge(
+    root: Path, source_relative: str, destination_relative: str, operations: list[dict[str, Any]]
+) -> None:
+    source = root / source_relative
+    destination = root / destination_relative
+    if not source.is_dir() or source.is_symlink() or not destination.is_dir() or destination.is_symlink():
+        raise ValueError("Struktur folder Flatten berubah saat merge diterapkan.")
+
+    for operation in operations:
+        kind = operation.get("type")
+        item_source = root / str(operation["source"])
+        item_destination = root / str(operation["destination"])
+        if kind == "move":
+            _safe_move(item_source, item_destination)
+        elif kind == "replace":
+            metadata_source = item_source.stat(follow_symlinks=False)
+            metadata_destination = item_destination.stat(follow_symlinks=False)
+            expected_size = int(operation["size"])
+            if (
+                not stat.S_ISREG(metadata_source.st_mode)
+                or not stat.S_ISREG(metadata_destination.st_mode)
+                or metadata_source.st_size != expected_size
+                or metadata_destination.st_size != expected_size
+            ):
+                raise ValueError("Ukuran file Flatten berubah setelah preview.")
+            os.replace(item_source, item_destination)
+        elif kind == "delete_empty":
+            (root / str(operation["folder"])).rmdir()
+        elif kind == "merge":
+            _apply_merge(root, str(operation["source"]), str(operation["destination"]), operation["items"])
+        else:
+            raise ValueError(f"Aksi merge Flatten tidak dikenal: {kind}")
+
+    source.rmdir()
+
+
 def apply_flatten_plan(
     root: Path,
     plan: dict[str, Any],
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
-    """Apply a previously checked plan without overwriting existing paths."""
+    """Apply a previously checked plan, merging folders and resolving file conflicts by size."""
     root = Path(root).resolve()
     results: list[dict[str, Any]] = []
     for pass_item in plan.get("passes", []):
         for action in pass_item.get("actions", []):
             kind = action.get("type")
             if kind == "skip_multiple":
-                results.append({**action, "status": "skipped"})
-                if progress_callback is not None:
-                    progress_callback({**action, "status": "skipped"})
-                continue
-            if kind == "delete_empty":
-                folder = root / str(action["folder"])
-                folder.rmdir()
-                results.append({**action, "status": "deleted"})
+                status = "skipped"
+            elif kind == "delete_empty":
+                (root / str(action["folder"])).rmdir()
+                status = "deleted"
             elif kind == "move":
                 source = root / str(action["source"])
                 folder = root / str(action["folder"])
                 destination = root / str(action["destination"])
                 temporary = root / f".tmp-flatten-{uuid.uuid4().hex}"
-                if destination.exists() or destination.is_symlink():
-                    raise FileExistsError(f"Tujuan Flatten sudah ada: {destination}")
-                source.rename(temporary)
+                _safe_move(source, temporary)
                 try:
                     folder.rmdir()
                 except Exception:
                     temporary.rename(source)
                     raise
                 try:
-                    if destination.exists() or destination.is_symlink():
-                        raise FileExistsError(f"Tujuan Flatten sudah ada: {destination}")
-                    temporary.rename(destination)
+                    _safe_move(temporary, destination)
                 except Exception:
                     if not folder.exists():
                         folder.mkdir()
                     temporary.rename(source)
                     raise
-                results.append({**action, "status": "moved"})
+                status = "moved"
+            elif kind == "replace":
+                source = root / str(action["source"])
+                destination = root / str(action["destination"])
+                source_stat = source.stat(follow_symlinks=False)
+                destination_stat = destination.stat(follow_symlinks=False)
+                expected_size = int(action["size"])
+                if (
+                    not stat.S_ISREG(source_stat.st_mode)
+                    or not stat.S_ISREG(destination_stat.st_mode)
+                    or source_stat.st_size != expected_size
+                    or destination_stat.st_size != expected_size
+                ):
+                    raise ValueError("Ukuran file Flatten berubah setelah preview.")
+                os.replace(source, destination)
+                (root / str(action["folder"])).rmdir()
+                status = "replaced"
+            elif kind == "merge":
+                source = root / str(action["source"])
+                _apply_merge(root, str(action["source"]), str(action["destination"]), action["items"])
+                if not action.get("keep_folder"):
+                    (root / str(action["folder"])).rmdir()
+                status = "merged"
+            else:
+                raise ValueError(f"Aksi Flatten tidak dikenal: {kind}")
+
+            result = {**action, "status": status}
+            results.append(result)
             if progress_callback is not None:
-                progress_callback({**action, "status": results[-1]["status"]})
+                progress_callback(result)
     return results
 
 
@@ -304,11 +566,21 @@ def apply_flatten_batch(
         results.append(
             {
                 "folder": str(root),
-                "fingerprint": plan["fingerprint"],
-                "actions": actions,
-                "moves": sum(item["status"] == "moved" for item in actions),
-                "deleted": sum(item["status"] == "deleted" for item in actions),
+                "moves": sum(item["status"] in {"moved", "merged", "replaced"} for item in actions),
+                "deleted": sum(
+                    1 if item["status"] == "deleted" else int(item.get("merge_summary", {}).get("deleted", 0))
+                    for item in actions
+                ),
                 "skipped": sum(item["status"] == "skipped" for item in actions),
+                "replaced": sum(
+                    1 if item["type"] == "replace" else int(item.get("merge_summary", {}).get("replaced", 0))
+                    for item in actions
+                ),
+                "suffixed": sum(
+                    1 if item.get("collision_reason") == "different_size"
+                    else int(item.get("merge_summary", {}).get("suffixed", 0))
+                    for item in actions
+                ),
             }
         )
     return results

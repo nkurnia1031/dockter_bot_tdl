@@ -636,7 +636,8 @@ class UtilityFeatureTests(unittest.TestCase):
             actions = [action for batch in plan["passes"] for action in batch["actions"]]
             action_types = {action["type"] for action in actions}
             self.assertTrue({"delete_empty", "move", "skip_multiple"}.issubset(action_types))
-            self.assertTrue(any(action.get("destination") == "dup_wrapper_asset.txt" for action in actions))
+            self.assertTrue(any(action.get("destination") == "asset_2.txt" for action in actions))
+            self.assertEqual(plan["suffixed"], 1)
             self.assertEqual(preview.summary["moves"], 3)
 
             applied = runner.run(
@@ -649,9 +650,96 @@ class UtilityFeatureTests(unittest.TestCase):
             self.assertEqual(applied.succeeded, [str(root)])
             self.assertFalse((root / "empty").exists())
             self.assertTrue((root / "archive.txt").is_file())
-            self.assertTrue((root / "dup_wrapper_asset.txt").is_file())
+            self.assertTrue((root / "asset_2.txt").is_file())
             self.assertEqual((root / "asset.txt").read_text(encoding="utf-8"), "existing")
             self.assertTrue((root / "multi").is_dir())
+
+    def test_flatten_merges_existing_destination_and_resolves_collisions_by_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "tickzoo"
+            destination = root / "Knottyjess"
+            incoming = root / "wrapper" / "Knottyjess"
+            destination.mkdir(parents=True)
+            incoming.mkdir(parents=True)
+            (destination / "same-size.txt").write_bytes(b"old-data")
+            (incoming / "same-size.txt").write_bytes(b"new-data")
+            (destination / "different-size.txt").write_bytes(b"old")
+            (incoming / "different-size.txt").write_bytes(b"new-payload")
+            (destination / "destination-only.txt").write_text("keep", encoding="utf-8")
+            (incoming / "incoming-only.txt").write_text("add", encoding="utf-8")
+            (destination / "nested").mkdir()
+            (incoming / "nested").mkdir()
+            (destination / "nested" / "same-size.bin").write_bytes(b"old!")
+            (incoming / "nested" / "same-size.bin").write_bytes(b"new!")
+            (incoming / "nested" / "nested-only.bin").write_bytes(b"nested")
+            (incoming / "nested" / "empty").mkdir()
+            (root / "empty").mkdir()
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=Path(temp_dir),
+            )
+
+            preview = runner.run("flatten", [str(root)], flatten_action="preview")
+            plan = preview.details[0]["flatten_preview"]
+            merge_actions = [
+                action
+                for batch in plan["passes"]
+                for action in batch["actions"]
+                if action["type"] == "merge"
+            ]
+            self.assertEqual(len(merge_actions), 1)
+            self.assertEqual(
+                merge_actions[0]["merge_summary"],
+                {"added": 2, "replaced": 2, "suffixed": 1, "merged_folders": 1, "deleted": 0},
+            )
+            self.assertEqual(plan["deleted"], 2)
+            self.assertEqual(plan["replaced"], 2)
+            self.assertEqual(plan["suffixed"], 1)
+            applied = runner.run(
+                "flatten",
+                [str(root)],
+                flatten_action="apply",
+                flatten_fingerprints={str(root): plan["fingerprint"]},
+            )
+
+            self.assertEqual(applied.succeeded, [str(root)])
+            self.assertEqual((destination / "same-size.txt").read_bytes(), b"new-data")
+            self.assertEqual((destination / "different-size.txt").read_bytes(), b"old")
+            self.assertEqual((destination / "different-size_2.txt").read_bytes(), b"new-payload")
+            self.assertEqual((destination / "destination-only.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual((destination / "incoming-only.txt").read_text(encoding="utf-8"), "add")
+            self.assertEqual((destination / "nested" / "same-size.bin").read_bytes(), b"new!")
+            self.assertEqual((destination / "nested" / "nested-only.bin").read_bytes(), b"nested")
+            self.assertFalse((destination / "nested" / "empty").exists())
+            self.assertFalse((root / "wrapper").exists())
+            self.assertFalse((root / "empty").exists())
+
+    def test_flatten_collapses_same_named_nested_folder_without_existing_destination_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "tickzoo"
+            source = root / "Knottyjess" / "Knottyjess"
+            source.mkdir(parents=True)
+            (source / "episode.txt").write_text("episode", encoding="utf-8")
+            (root / "empty").mkdir()
+            runner = UtilityRunner(
+                Path(__file__).resolve().parents[1] / "utility",
+                workspace_root=Path(temp_dir),
+            )
+
+            preview = runner.run("flatten", [str(root)], flatten_action="preview")
+            plan = preview.details[0]["flatten_preview"]
+            applied = runner.run(
+                "flatten",
+                [str(root)],
+                flatten_action="apply",
+                flatten_fingerprints={str(root): plan["fingerprint"]},
+            )
+
+            self.assertEqual(applied.succeeded, [str(root)])
+            self.assertTrue((root / "episode.txt").is_file())
+            self.assertFalse((root / "Knottyjess").exists())
+            self.assertFalse(source.exists())
+            self.assertFalse((root / "empty").exists())
 
     def test_flatten_apply_rejects_entire_batch_when_any_selected_root_is_stale(self):
         with tempfile.TemporaryDirectory() as temp_dir:

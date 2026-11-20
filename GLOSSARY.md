@@ -237,8 +237,8 @@ Perkiraan apakah konversi video berpotensi memenuhi target penghematan ukuran se
 _Avoid_: jaminan kompresi, pengukuran ukuran hasil.
 
 **Flatten folder**:
-Perapian isi direktori dengan menghapus subfolder kosong dan menaikkan isi subfolder yang hanya memiliki satu item. Subfolder dengan lebih dari satu item tetap utuh; benturan nama mendapat nama unik tanpa menimpa data.
-_Avoid_: flatten rekursif tanpa batas, overwrite saat benturan.
+Perapian isi direktori dengan menghapus folder kosong dan menaikkan isi folder yang hanya memiliki satu item sampai rencana stabil. Jika nama folder tujuan sudah ada, isinya digabung. File bernama sama dan berukuran sama diganti oleh file masuk; jika ukurannya berbeda, file masuk mendapat suffix unik.
+_Avoid_: keluar dari root pilihan, menimpa file berbeda ukuran.
 
 **Job konversi media**:
 Job Utility untuk memproses video dan gambar dari folder Workspace terpilih. Activity merangkum jumlah video dan gambar yang berjalan, berhasil, atau gagal serta alasan file dilewati. Sumber dipertahankan jika estimasi penghematan video tidak melewati ambang atau hasil `_recode` sudah tersedia; selain itu sumber dihapus setelah hasil terverifikasi. Pembatalan mempertahankan sumber untuk file aktif dan belum diproses.

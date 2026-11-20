@@ -507,7 +507,7 @@
         {#if selected.kind === 'utility' && selected.payload?.utility === 'flatten' && selected.payload?.flatten_action === 'preview' && Array.isArray(utilityResult.details)}
           <section class="record-card mb-4">
             <h3 class="font-bold">Preview Flatten tersimpan</h3>
-            <p class="muted mt-1 text-sm">{utilityResult.summary?.moves || 0} pindah · {utilityResult.summary?.deleted || 0} hapus · {utilityResult.summary?.skipped || 0} dilewati</p>
+            <p class="muted mt-1 text-sm">{utilityResult.summary?.moves || 0} operasi · {utilityResult.summary?.replaced || 0} file diganti · {utilityResult.summary?.suffixed || 0} file diberi suffix · {utilityResult.summary?.deleted || 0} folder kosong dihapus · {utilityResult.summary?.skipped || 0} dilewati</p>
             {#each utilityResult.details as detail}
               <article class="mt-3 rounded-lg border border-[var(--line)] p-3">
                 <h4 class="break-all font-mono text-xs font-bold">{detail.folder}</h4>
@@ -515,7 +515,7 @@
                   <p class="muted mt-2 text-xs font-semibold">Putaran {pass.index}</p>
                   <ul class="mt-1 space-y-1 text-sm">
                     {#each pass.actions || [] as action, index (`${pass.index}:${index}`)}
-                      <li>{action.type === 'delete_empty' ? `Hapus folder kosong: ${action.folder}` : action.type === 'move' ? `Pindah ${action.source} → ${action.destination}${action.collision ? ' · nama bentrok, diberi prefix' : ''}` : `Lewati ${action.folder} (${action.item_count} item)`}</li>
+                      <li>{action.type === 'delete_empty' ? `Hapus folder kosong: ${action.folder}` : action.type === 'move' ? `Pindah ${action.source} → ${action.destination}${action.collision_reason === 'different_size' ? ' · ukuran berbeda, file disimpan dengan suffix' : action.collision ? ' · nama bentrok, path diberi suffix' : ''}` : action.type === 'replace' ? `Ganti ${action.destination} dengan ${action.source} (ukuran sama)` : action.type === 'merge' ? `Gabungkan ${action.source} ke ${action.destination}${action.merge_summary ? ` · ${action.merge_summary.added} ditambahkan, ${action.merge_summary.replaced} diganti, ${action.merge_summary.suffixed} diberi suffix` : ''}` : `Lewati ${action.folder} (${action.item_count} item)`}</li>
                     {/each}
                   </ul>
                 {/each}
