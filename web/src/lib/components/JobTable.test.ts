@@ -268,6 +268,34 @@ describe('JobTable', () => {
     expect(screen.getByText('0 berhasil · 0 gagal · 1 dilewati')).toBeTruthy();
   });
 
+  it('keeps the media category summary visible after a job enters Activity history', async () => {
+    const job = {
+      id: 'media-history-1', kind: 'utility', status: 'succeeded', profile: 'default', worker: 'local',
+      payload: { utility: 'media_pipeline' },
+      result: { value: { summary: {
+        media: {
+          scan_complete: true,
+          video: { total: 3, running: 0, succeeded: 2, failed: 0, skipped: 1 },
+          image: { total: 2, running: 0, succeeded: 2, failed: 0, skipped: 0 },
+          skipped: { estimated_savings_below_threshold: 1, recode_output_exists: 0 },
+        },
+      } } },
+      progress: { phase: 'completed', counters: { succeeded: 4, failed: 0, skipped: 1 } },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [job] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'utility', view: 'history' });
+
+    expect(await screen.findByText('Video: 3 total · 0 berjalan · 2 berhasil · 0 gagal')).toBeTruthy();
+    expect(screen.getByText('Gambar: 2 total · 0 berjalan · 2 berhasil · 0 gagal')).toBeTruthy();
+    expect(screen.getByText('Estimasi hemat ≤40%: 1')).toBeTruthy();
+    expect(screen.queryByRole('list', { name: 'Daftar hasil konversi media' })).toBeNull();
+  });
+
   it('lists and reopens safe Storage reconciliation results without exposing caption or path', async () => {
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
       configurable: true,

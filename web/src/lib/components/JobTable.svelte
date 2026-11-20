@@ -5,9 +5,10 @@
   import { AlertTriangle, ClipboardList, Copy, Download, FileText, RefreshCw, SquareTerminal, XCircle } from '@lucide/svelte';
   import { api, post } from '$lib/api';
   import { formatBytes, formatDate, jobMessage, resultEntries, textValue } from '$lib/presentation';
-  import { formatDuration, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
+  import { formatDuration, isMediaUtilityJob, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
   import { operatorTdlLogText } from '$lib/tdl-lanes';
   import JobProgressCard from './JobProgressCard.svelte';
+  import MediaProgressSummary from './MediaProgressSummary.svelte';
 
   type Job = Record<string, any>;
   type JobEvent = Record<string, any>;
@@ -427,6 +428,7 @@
   <div class="divide-y divide-[var(--line)] px-4 sm:px-5">
     {#each (view === 'active' ? [] : historyJobs) as job (job.id)}
       {@const stageId = job.payload?.quick_retry?.stage_job_id || (job.payload?.quick_mode ? job.id : null)}
+      {@const mediaSummary = isMediaUtilityJob(job) ? normalizeJobProgress(job).media : undefined}
       <article class="grid gap-3 py-4 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
         <div class="min-w-0">
           {#if job.kind === 'tts'}
@@ -445,6 +447,9 @@
             <span class="muted text-xs">{job.worker || '-'}</span>
           </div>
           <p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p>
+          {#if mediaSummary?.scanComplete}
+            <MediaProgressSummary media={mediaSummary}/>
+          {/if}
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small>

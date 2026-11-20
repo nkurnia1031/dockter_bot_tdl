@@ -241,5 +241,5 @@ Perapian isi direktori dengan menghapus subfolder kosong dan menaikkan isi subfo
 _Avoid_: flatten rekursif tanpa batas, overwrite saat benturan.
 
 **Job konversi media**:
-Job Utility untuk memproses video dan gambar dari folder Workspace terpilih, dengan hasil yang dapat dilihat per file. Sumber dihapus setelah hasil terverifikasi; pembatalan mempertahankan sumber untuk file aktif dan belum diproses.
+Job Utility untuk memproses video dan gambar dari folder Workspace terpilih. Activity merangkum jumlah video dan gambar yang berjalan, berhasil, atau gagal serta alasan file dilewati. Sumber dipertahankan jika estimasi penghematan video tidak melewati ambang atau hasil `_recode` sudah tersedia; selain itu sumber dihapus setelah hasil terverifikasi. Pembatalan mempertahankan sumber untuk file aktif dan belum diproses.
 _Avoid_: proses konversi shell yang tidak tercatat sebagai job aplikasi.

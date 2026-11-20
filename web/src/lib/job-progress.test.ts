@@ -34,4 +34,30 @@ describe('job progress normalization', () => {
     expect(value.item.percent).toBe(75);
     expect(formatDuration(403)).toBe('6m 43d');
   });
+
+  it('reads terminal media summaries from the job result', () => {
+    const value = normalizeJobProgress({
+      kind: 'utility',
+      status: 'completed',
+      payload: { utility: 'media_pipeline' },
+      result: {
+        summary: {
+          media: {
+            scan_complete: true,
+            video: { total: 3, running: 0, succeeded: 2, failed: 0, skipped: 1 },
+            image: { total: 2, running: 0, succeeded: 1, failed: 1, skipped: 0 },
+            skipped: { estimated_savings_below_threshold: 1, recode_output_exists: 0 },
+          },
+        },
+      },
+      progress: { phase: 'completed', counters: { succeeded: 3, failed: 1, skipped: 1 } },
+    });
+
+    expect(value.media).toEqual({
+      scanComplete: true,
+      video: { total: 3, running: 0, succeeded: 2, failed: 0, skipped: 1 },
+      image: { total: 2, running: 0, succeeded: 1, failed: 1, skipped: 0 },
+      skipped: { estimatedSavingsBelowThreshold: 1, recodeOutputExists: 0 },
+    });
+  });
 });

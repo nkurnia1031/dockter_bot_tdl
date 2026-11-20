@@ -36,9 +36,81 @@ class UtilityExecutorMixin:
         utility_name = str(payload["utility"])
         media_mode = utility_name in MEDIA_UTILITIES
         counters = {"succeeded": 0, "failed": 0, "skipped": 0}
+        media_counters: dict[str, Any] | None = None
+        active_media_items: dict[str, set[str]] = {"video": set(), "image": set()}
+        completed_media_items: set[tuple[str, str]] = set()
+
+        def media_snapshot() -> dict[str, Any] | None:
+            if media_counters is None:
+                return None
+            return {
+                "scan_complete": bool(media_counters["scan_complete"]),
+                "video": dict(media_counters["video"]),
+                "image": dict(media_counters["image"]),
+                "skipped": dict(media_counters["skipped"]),
+            }
+
+        def update_media_counters(value: dict[str, object], phase: str) -> None:
+            nonlocal media_counters
+            if phase == "media_scan_completed":
+                totals = value.get("media_totals")
+                totals = totals if isinstance(totals, dict) else {}
+                media_counters = {
+                    "scan_complete": True,
+                    "video": {
+                        "total": max(0, int(totals.get("video") or 0)),
+                        "running": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                    },
+                    "image": {
+                        "total": max(0, int(totals.get("image") or 0)),
+                        "running": 0,
+                        "succeeded": 0,
+                        "failed": 0,
+                        "skipped": 0,
+                    },
+                    "skipped": {
+                        "estimated_savings_below_threshold": 0,
+                        "recode_output_exists": 0,
+                    },
+                }
+                return
+
+            if media_counters is None:
+                return
+            media_type = str(value.get("media_type") or "")
+            if media_type not in {"video", "image"}:
+                return
+            name = str(value.get("name") or "")
+            if not name:
+                return
+            terminal_phases = {
+                "item_completed": "succeeded",
+                "item_failed": "failed",
+                "item_skipped": "skipped",
+            }
+            if phase in {"media_preflight_started", "item_started"}:
+                if (media_type, name) not in completed_media_items:
+                    active_media_items[media_type].add(name)
+            elif phase in terminal_phases and (media_type, name) not in completed_media_items:
+                completed_media_items.add((media_type, name))
+                active_media_items[media_type].discard(name)
+                outcome = terminal_phases[phase]
+                media_counters[media_type][outcome] += 1
+                if outcome == "skipped":
+                    reason_code = str(value.get("reason_code") or "")
+                    if reason_code == "VIDEO_ESTIMATED_SAVINGS_BELOW_THRESHOLD":
+                        media_counters["skipped"]["estimated_savings_below_threshold"] += 1
+                    elif reason_code in {"VIDEO_RECODE_OUTPUT_EXISTS", "IMAGE_RECODE_OUTPUT_EXISTS"}:
+                        media_counters["skipped"]["recode_output_exists"] += 1
+            media_counters[media_type]["running"] = len(active_media_items[media_type])
 
         def utility_progress(value: dict[str, object]) -> None:
             phase = str(value.get("phase") or utility_name)
+            if media_mode:
+                update_media_counters(value, phase)
             archive_phase = utility_name == "extract" and phase in {
                 "archive_completed", "archive_failed"
             }
@@ -108,6 +180,10 @@ class UtilityExecutorMixin:
                 or value.get("folder")
                 or (folders[min(max(index - 1, 0), len(folders) - 1)] if folders else "")
             )
+            progress_counters = dict(counters)
+            media_snapshot_value = media_snapshot() if media_mode else None
+            if media_snapshot_value is not None:
+                progress_counters["media"] = media_snapshot_value
             progress_payload = reporter.report(
                 phase=phase,
                 message=_utility_progress_message(utility_name, phase, item_name),
@@ -126,6 +202,7 @@ class UtilityExecutorMixin:
                     "minimum_estimated_savings_percent": value.get("minimum_estimated_savings_percent"),
                     "reason": value.get("reason"),
                     "reason_code": value.get("reason_code"),
+                    "media_type": value.get("media_type"),
                     "files_discovered": value.get("files_discovered"),
                 },
                 transfer=reporter.transfer_metrics(
@@ -136,11 +213,12 @@ class UtilityExecutorMixin:
                     elapsed_seconds=value.get("elapsed_seconds"),
                     percent=float(percent) if isinstance(percent, (int, float)) else None,
                 ),
-                counters=counters,
+                counters=progress_counters,
                 indeterminate=bool(value.get("indeterminate", percent is None)),
                 force=phase.endswith("_starting") or phase in {
                     "item_completed", "item_failed", "item_skipped", "archive_completed", "archive_failed",
                     "media_archive_completed", "media_archive_failed",
+                    "media_scan_completed", "media_preflight_started", "item_started",
                     "extract_folder_completed", "extract_folder_failed",
                     "flatten_preview_completed", "flatten_folder_completed",
                 },
@@ -221,6 +299,8 @@ class UtilityExecutorMixin:
                     "failed": media_failed,
                     "skipped": media_skipped,
                 }
+                if isinstance(media_summary.get("media"), dict):
+                    final_counters["media"] = media_summary["media"]
             else:
                 final_message = (
                     (

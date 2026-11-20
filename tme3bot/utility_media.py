@@ -151,7 +151,22 @@ class UtilityMediaProcessor:
         media_files = self._find_files(folders, wanted_extensions)
         video_files = [path for path in media_files if path.suffix.casefold() in VIDEO_EXTENSIONS]
         image_files = [path for path in media_files if path.suffix.casefold() in image_extensions]
+        video_files.sort(key=self._workspace_path_sort_key)
+        image_files.sort(key=self._workspace_path_sort_key)
         self._overall_total = len(video_files) + len(image_files)
+        self._progress({
+            "phase": "media_scan_completed",
+            "files_discovered": self._overall_total,
+            "media_totals": {"video": len(video_files), "image": len(image_files)},
+            "overall": {
+                "current": 0,
+                "total": self._overall_total,
+                "percent": 0 if self._overall_total else 100,
+                "unit": "files",
+                "files_current": 0,
+                "files_total": self._overall_total,
+            },
+        })
 
         succeeded: list[str] = []
         failed: dict[str, str] = {}
@@ -166,7 +181,12 @@ class UtilityMediaProcessor:
                     if _is_utility_control_error(exc):
                         raise
                     failed[str(source)] = str(exc)[:500]
-                    detail = {"file": str(source), "status": "failed", "error": failed[str(source)]}
+                    detail = {
+                        "file": str(source),
+                        "media_type": "video",
+                        "status": "failed",
+                        "error": failed[str(source)],
+                    }
                     self._item_progress("item_failed", source, index, detail.get("error"))
                 details.append(detail)
                 if detail.get("status") == "succeeded":
@@ -197,12 +217,87 @@ class UtilityMediaProcessor:
                 "files_succeeded": succeeded_count,
                 "files_failed": failed_count,
                 "files_skipped": skipped_count,
+                "media": self._media_summary(video_files, image_files, details),
                 "archives_created": sum(item.get("status") == "succeeded" for item in archives),
                 "archives_failed": sum(item.get("status") == "failed" for item in archives),
                 "archives": archives,
             },
             "outcome": outcome,
         }
+
+    def _workspace_path_sort_key(self, path: Path) -> tuple[str, str]:
+        relative = path.relative_to(self.workspace).as_posix()
+        return relative.casefold(), relative
+
+    @staticmethod
+    def _media_summary(
+        video_files: list[Path],
+        image_files: list[Path],
+        details: list[dict[str, object]],
+    ) -> dict[str, object]:
+        by_type: dict[str, list[dict[str, object]]] = {
+            "video": [item for item in details if item.get("media_type") == "video"],
+            "image": [item for item in details if item.get("media_type") == "image"],
+        }
+        result: dict[str, object] = {"scan_complete": True}
+        for media_type, files in (("video", video_files), ("image", image_files)):
+            outcomes = by_type[media_type]
+            result[media_type] = {
+                "total": len(files),
+                "running": 0,
+                "succeeded": sum(item.get("status") == "succeeded" for item in outcomes),
+                "failed": sum(item.get("status") == "failed" for item in outcomes),
+                "skipped": sum(item.get("status") == "skipped" for item in outcomes),
+            }
+        result["skipped"] = {
+            "estimated_savings_below_threshold": sum(
+                item.get("reason_code") == "VIDEO_ESTIMATED_SAVINGS_BELOW_THRESHOLD"
+                for item in details
+            ),
+            "recode_output_exists": sum(
+                item.get("reason_code") in {
+                    "VIDEO_RECODE_OUTPUT_EXISTS",
+                    "IMAGE_RECODE_OUTPUT_EXISTS",
+                }
+                for item in details
+            ),
+        }
+        return result
+
+    @staticmethod
+    def _media_type(source: Path) -> str:
+        return "video" if source.suffix.casefold() in VIDEO_EXTENSIONS else "image"
+
+    @staticmethod
+    def _image_recode_path(source: Path) -> Path:
+        return source.with_name(f"{source.stem}{IMAGE_RECODE_MARKER}{source.suffix}")
+
+    def _skip_existing_recode_output(
+        self,
+        source: Path,
+        index: int,
+        output: Path,
+        media_type: str,
+        reason_code: str,
+    ) -> dict[str, object]:
+        reason = f"Hasil _recode sudah ada; sumber dipertahankan: {output.name}"
+        detail = {
+            "file": str(source),
+            "media_type": media_type,
+            "status": "skipped",
+            "output": str(output),
+            "reason_code": reason_code,
+            "reason": reason,
+        }
+        self._item_progress(
+            "item_skipped",
+            source,
+            index,
+            percent=100,
+            reason=reason,
+            reason_code=reason_code,
+        )
+        return detail
 
     def _find_files(self, folders: list[Path], extensions: set[str] | frozenset[str]) -> list[Path]:
         selected: list[Path] = []
@@ -274,11 +369,24 @@ class UtilityMediaProcessor:
         options: VideoOptions,
     ) -> dict[str, object]:
         final_path = source.with_name(f"{source.stem}{IMAGE_RECODE_MARKER}.mp4")
-        if final_path.exists():
-            raise FileExistsError(f"Hasil sudah ada, sumber dipertahankan: {final_path.name}")
         source_identity = self._identity(source)
+        if final_path.is_file():
+            return self._skip_existing_recode_output(
+                source,
+                index,
+                final_path,
+                "video",
+                "VIDEO_RECODE_OUTPUT_EXISTS",
+            )
         codec = options.codec
         resolution = options.resolution
+        self._item_progress(
+            "media_preflight_started",
+            source,
+            index,
+            stage="probe",
+            minimum_estimated_savings_percent=MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT,
+        )
         duration = self._video_duration(source)
         estimated_savings_percent = self._estimate_video_savings(
             source,
@@ -296,6 +404,7 @@ class UtilityMediaProcessor:
             )
             detail = {
                 "file": str(source),
+                "media_type": "video",
                 "status": "skipped",
                 "reason_code": "VIDEO_ESTIMATED_SAVINGS_BELOW_THRESHOLD",
                 "reason": reason,
@@ -352,6 +461,14 @@ class UtilityMediaProcessor:
             try:
                 os.link(stage_path, final_path)
             except FileExistsError as exc:
+                if final_path.is_file():
+                    return self._skip_existing_recode_output(
+                        source,
+                        index,
+                        final_path,
+                        "video",
+                        "VIDEO_RECODE_OUTPUT_EXISTS",
+                    )
                 raise FileExistsError(f"Hasil muncul saat proses; sumber dipertahankan: {final_path.name}") from exc
             final_identity = self._identity(final_path)
             stage_path.unlink()
@@ -365,6 +482,7 @@ class UtilityMediaProcessor:
                 raise
             detail = {
                 "file": str(source),
+                "media_type": "video",
                 "status": "succeeded",
                 "output": str(final_path),
                 "codec": codec,
@@ -395,13 +513,6 @@ class UtilityMediaProcessor:
         windows = self._video_sample_windows(duration)
         sampled_bytes = 0
         sampled_seconds = 0.0
-        self._item_progress(
-            "media_preflight_started",
-            source,
-            index,
-            stage="estimate",
-            minimum_estimated_savings_percent=MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT,
-        )
         with tempfile.TemporaryDirectory(prefix="tme3-media-video-sample-") as temporary:
             sample_root = Path(temporary)
             for sample_index, (start, sample_duration) in enumerate(windows, start=1):
@@ -580,17 +691,19 @@ class UtilityMediaProcessor:
             for source in image_files:
                 index = index_by_source[source]
                 self.cancel_check()
-                recoded_name = f"{source.stem}{IMAGE_RECODE_MARKER}{source.suffix}"
-                recoded_existing = source.with_name(recoded_name)
-                if recoded_existing.exists():
-                    error = f"Hasil gambar sudah ada: {recoded_existing.name}"
-                    failed[str(source)] = error
-                    details.append({"file": str(source), "status": "failed", "error": error})
-                    self._item_progress("item_failed", source, index, error)
-                    continue
                 temp_path: Path | None = None
                 try:
                     source_identity = self._identity(source)
+                    recoded_existing = self._image_recode_path(source)
+                    if recoded_existing.is_file():
+                        details.append(self._skip_existing_recode_output(
+                            source,
+                            index,
+                            recoded_existing,
+                            "image",
+                            "IMAGE_RECODE_OUTPUT_EXISTS",
+                        ))
+                        continue
                     temp_path = self._temporary_path(
                         source.parent, ".tme3-media-image-", source.suffix
                     )
@@ -612,7 +725,7 @@ class UtilityMediaProcessor:
                     if _is_utility_control_error(exc):
                         raise
                     failed[str(source)] = str(exc)[:500]
-                    details.append({"file": str(source), "status": "failed", "error": failed[str(source)]})
+                    details.append({"file": str(source), "media_type": "image", "status": "failed", "error": failed[str(source)]})
                     self._item_progress("item_failed", source, index, failed[str(source)])
                 finally:
                     if temp_path is not None:
@@ -620,23 +733,59 @@ class UtilityMediaProcessor:
 
             for folder, staged in staged_by_folder.items():
                 self.cancel_check()
-                archive = self._archive_images(folder, staged)
+                publishable: list[tuple[Path, Path, tuple[int, int, int, int]]] = []
+                for source, temp_path, identity in staged:
+                    recoded_existing = self._image_recode_path(source)
+                    if recoded_existing.is_file():
+                        details.append(self._skip_existing_recode_output(
+                            source,
+                            index_by_source[source],
+                            recoded_existing,
+                            "image",
+                            "IMAGE_RECODE_OUTPUT_EXISTS",
+                        ))
+                    else:
+                        publishable.append((source, temp_path, identity))
+
+                if not publishable:
+                    continue
+                archive = self._archive_images(folder, publishable)
                 archives.append(archive)
                 if archive["status"] != "succeeded":
                     message = str(archive.get("error") or "Arsip gambar gagal diverifikasi.")
-                    for source, _, _ in staged:
+                    for source, _, _ in publishable:
+                        recoded_existing = self._image_recode_path(source)
+                        if recoded_existing.is_file():
+                            details.append(self._skip_existing_recode_output(
+                                source,
+                                index_by_source[source],
+                                recoded_existing,
+                                "image",
+                                "IMAGE_RECODE_OUTPUT_EXISTS",
+                            ))
+                            continue
                         failed[str(source)] = message
-                        details.append({"file": str(source), "status": "failed", "error": message})
+                        details.append({"file": str(source), "media_type": "image", "status": "failed", "error": message})
                         self._item_progress("item_failed", source, index_by_source[source], message)
                     continue
 
-                for source, _, identity in staged:
+                for source, _, identity in publishable:
                     self.cancel_check()
                     index = index_by_source[source]
+                    recoded_existing = self._image_recode_path(source)
+                    if recoded_existing.is_file():
+                        details.append(self._skip_existing_recode_output(
+                            source,
+                            index,
+                            recoded_existing,
+                            "image",
+                            "IMAGE_RECODE_OUTPUT_EXISTS",
+                        ))
+                        continue
                     if self._identity(source) != identity:
                         error = "Sumber berubah sebelum dihapus; hasil ZIP tersimpan dan sumber dipertahankan."
                         failed[str(source)] = error
-                        details.append({"file": str(source), "status": "failed", "output": archive["path"], "error": error})
+                        details.append({"file": str(source), "media_type": "image", "status": "failed", "output": archive["path"], "error": error})
                         self._item_progress("item_failed", source, index, error)
                     else:
                         try:
@@ -644,12 +793,13 @@ class UtilityMediaProcessor:
                         except OSError as exc:
                             error = f"Hasil ZIP tersimpan, tetapi sumber gagal dihapus: {exc}"
                             failed[str(source)] = error
-                            details.append({"file": str(source), "status": "failed", "output": archive["path"], "error": error})
+                            details.append({"file": str(source), "media_type": "image", "status": "failed", "output": archive["path"], "error": error})
                             self._item_progress("item_failed", source, index, error)
                         else:
                             succeeded.append(str(source))
                             details.append({
                                 "file": str(source),
+                                "media_type": "image",
                                 "status": "succeeded",
                                 "output": archive["path"],
                             })
@@ -787,7 +937,14 @@ class UtilityMediaProcessor:
         **extra: object,
     ) -> None:
         percent = extra.pop("percent", None)
-        payload = self._progress_value(phase, source, index, percent=percent, **extra)
+        payload = self._progress_value(
+            phase,
+            source,
+            index,
+            percent=percent,
+            media_type=self._media_type(source),
+            **extra,
+        )
         if error:
             payload["error"] = error
         self._progress(payload)

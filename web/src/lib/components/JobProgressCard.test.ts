@@ -37,6 +37,51 @@ describe('JobProgressCard', () => {
     expect(screen.getByText('1')).toBeTruthy();
   });
 
+  it('shows per-type media totals and distinct skip reasons without file lists', () => {
+    render(JobProgressCard, {
+      job: {
+        id: 'media-summary-job',
+        kind: 'utility',
+        status: 'running',
+        profile: 'default',
+        worker: 'local',
+        created_at: new Date().toISOString(),
+        payload: { utility: 'media_pipeline' },
+        progress: {
+          phase: 'item_progress',
+          message: 'Processing media',
+          overall: { current: 2, total: 8, percent: 25, unit: 'files' },
+          item: { name: 'private/clip.mkv', index: 2, total: 8, percent: 50 },
+          counters: {
+            succeeded: 2,
+            failed: 0,
+            skipped: 4,
+            media: {
+              scan_complete: true,
+              video: { total: 5, running: 1, succeeded: 2, failed: 0, skipped: 2 },
+              image: { total: 3, running: 0, succeeded: 0, failed: 0, skipped: 3 },
+              skipped: {
+                estimated_savings_below_threshold: 2,
+                recode_output_exists: 3,
+              },
+            },
+          },
+        },
+      },
+      onReport: vi.fn(),
+      onLog: vi.fn(),
+      onTerminate: vi.fn(),
+    });
+
+    const summary = screen.getByRole('region', { name: 'Ringkasan konversi media' });
+    expect(summary).toBeTruthy();
+    expect(screen.getByText('Video: 5 total · 1 berjalan · 2 berhasil · 0 gagal')).toBeTruthy();
+    expect(screen.getByText('Gambar: 3 total · 0 berjalan · 0 berhasil · 0 gagal')).toBeTruthy();
+    expect(screen.getByText('Estimasi hemat ≤40%: 2')).toBeTruthy();
+    expect(screen.getByText('Output _recode sudah ada: 3')).toBeTruthy();
+    expect(summary.querySelector('ul, li')).toBeNull();
+  });
+
   it('shows the relative Workspace path during direct chat delivery', () => {
     render(JobProgressCard, {
       job: {

@@ -1,5 +1,29 @@
 export type JobLike = Record<string, any>;
 
+const MEDIA_UTILITIES = new Set(['video_convert', 'image_compress', 'media_pipeline']);
+
+export function isMediaUtilityJob(job: JobLike): boolean {
+  return job.kind === 'utility' && MEDIA_UTILITIES.has(String(job.payload?.utility || ''));
+}
+
+export type MediaTypeProgress = {
+  total: number;
+  running: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+};
+
+export type MediaProgress = {
+  scanComplete: boolean;
+  video: MediaTypeProgress;
+  image: MediaTypeProgress;
+  skipped: {
+    estimatedSavingsBelowThreshold: number;
+    recodeOutputExists: number;
+  };
+};
+
 export type NormalizedProgress = {
   phase: string;
   message: string;
@@ -9,6 +33,7 @@ export type NormalizedProgress = {
   activeItems: Record<string, any>[];
   transfer: Record<string, any>;
   counters: { succeeded: number; failed: number; skipped: number; ambiguous: number };
+  media?: MediaProgress;
   indeterminate: boolean;
   elapsedSeconds?: number;
 };
@@ -17,6 +42,38 @@ const number = (value: unknown): number | undefined => {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 };
+
+const count = (value: unknown): number => Math.max(0, Math.trunc(number(value) || 0));
+
+function normalizeMediaProgress(job: JobLike, raw: Record<string, any>): MediaProgress | undefined {
+  const result = job.result?.value || job.result || {};
+  const media = raw.counters?.media || result.summary?.media;
+  if (!media || typeof media !== 'object' || Array.isArray(media)) return undefined;
+  const typeCounts = (value: unknown): MediaTypeProgress => {
+    const counts = value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+    return {
+      total: count(counts.total),
+      running: count(counts.running),
+      succeeded: count(counts.succeeded),
+      failed: count(counts.failed),
+      skipped: count(counts.skipped),
+    };
+  };
+  const skipped = media.skipped && typeof media.skipped === 'object' && !Array.isArray(media.skipped)
+    ? media.skipped as Record<string, unknown>
+    : {};
+  return {
+    scanComplete: media.scan_complete !== false,
+    video: typeCounts(media.video),
+    image: typeCounts(media.image),
+    skipped: {
+      estimatedSavingsBelowThreshold: count(skipped.estimated_savings_below_threshold),
+      recodeOutputExists: count(skipped.recode_output_exists),
+    },
+  };
+}
 
 export function clampPercent(value: unknown): number | undefined {
   const parsed = number(value);
@@ -44,6 +101,7 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
         skipped: number(raw.counters?.skipped) || 0,
         ambiguous: number(raw.counters?.ambiguous) || 0
       },
+      media: normalizeMediaProgress(job, raw),
       indeterminate: Boolean(raw.indeterminate),
       elapsedSeconds: number(raw.elapsed_seconds)
     };
@@ -81,6 +139,7 @@ export function normalizeJobProgress(job: JobLike): NormalizedProgress {
       skipped: number(raw.skipped) || 0,
       ambiguous: number(raw.ambiguous) || 0
     },
+    media: normalizeMediaProgress(job, raw),
     indeterminate: percent === undefined,
     elapsedSeconds: number(raw.elapsed_seconds)
   };
@@ -122,6 +181,9 @@ export function phaseLabel(value: string): string {
     thumbnailing: 'Membuat thumbnail',
     processing_json: 'Memproses JSON',
     media_preflight_started: 'Memperkirakan penghematan',
+    media_scan_completed: 'Pemindaian media selesai',
+    media_archive_started: 'Menyusun arsip gambar',
+    media_archive_completed: 'Arsip gambar selesai',
     item_skipped: 'File dilewati',
     cleanup: 'Membersihkan staging',
     completed: 'Selesai',

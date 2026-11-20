@@ -17,6 +17,7 @@ from tme3bot.utility import (
     default_video_options,
     normalize_video_options,
 )
+from tme3bot.utility_media import UtilityMediaProcessor
 from tme3bot.worker.executor_utility import UtilityExecutorMixin
 
 
@@ -337,10 +338,19 @@ class UtilityMediaJobTests(unittest.TestCase):
             executor = Executor()
             runner_type = UtilityRunner
             owners = []
+            duration_probe_progress: list[object] = []
 
             def build_runner(*args, **kwargs):
                 owners.append(kwargs.get("owner_job_id"))
                 return runner_type(*args, workspace_root=workspace, **kwargs)
+
+            original_video_duration = UtilityMediaProcessor._video_duration
+
+            def capture_duration_progress(processor, video_source):
+                duration_probe_progress.extend(
+                    kwargs.get("progress") for _, kwargs in executor.publisher.events
+                )
+                return original_video_duration(processor, video_source)
 
             with patch.dict(os.environ, {
                 "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -348,6 +358,10 @@ class UtilityMediaJobTests(unittest.TestCase):
             }), patch(
                 "tme3bot.worker.executor_utility.UtilityRunner",
                 side_effect=build_runner,
+            ), patch.object(
+                UtilityMediaProcessor,
+                "_video_duration",
+                new=capture_duration_progress,
             ):
                 result = executor._utility({
                     "job_id": "media-job-17",
@@ -369,10 +383,32 @@ class UtilityMediaJobTests(unittest.TestCase):
             progress = [kwargs.get("progress") for _, kwargs in executor.publisher.events]
             self.assertTrue(any(
                 isinstance(item, dict)
+                and item.get("phase") == "item_started"
+                and item.get("item", {}).get("media_type") == "video"
+                and item.get("counters", {}).get("media", {}).get("video", {}).get("total") == 1
+                and item.get("counters", {}).get("media", {}).get("video", {}).get("running") == 1
+                for item in progress
+            ))
+            self.assertTrue(any(
+                isinstance(item, dict)
+                and item.get("phase") == "media_preflight_started"
+                and item.get("counters", {}).get("media", {}).get("video", {}).get("running") == 1
+                for item in duration_probe_progress
+            ))
+            self.assertTrue(any(
+                isinstance(item, dict)
                 and item.get("overall", {}).get("files_total") == 1
                 and item.get("item", {}).get("name") == str(source)
                 for item in progress
             ))
+            completed = next(item for item in reversed(progress) if isinstance(item, dict) and item.get("phase") == "completed")
+            self.assertEqual(completed["counters"]["media"]["video"], {
+                "total": 1,
+                "running": 0,
+                "succeeded": 1,
+                "failed": 0,
+                "skipped": 0,
+            })
 
     def test_worker_utility_job_reports_preflight_skips_in_counters_and_summary(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -445,6 +481,9 @@ class UtilityMediaJobTests(unittest.TestCase):
                 isinstance(item, dict)
                 and item.get("phase") == "item_skipped"
                 and item.get("counters", {}).get("skipped") == 1
+                and item.get("item", {}).get("media_type") == "video"
+                and item.get("counters", {}).get("media", {}).get("video", {}).get("total") == 1
+                and item.get("counters", {}).get("media", {}).get("skipped", {}).get("estimated_savings_below_threshold") == 1
                 and item.get("item", {}).get("estimated_savings_percent") == 35.0
                 for item in progress
             ))
@@ -452,9 +491,12 @@ class UtilityMediaJobTests(unittest.TestCase):
                 isinstance(item, dict)
                 and item.get("phase") == "completed"
                 and item.get("counters", {}).get("skipped") == 1
+                and item.get("counters", {}).get("media", {}).get("video", {}).get("skipped") == 1
+                and item.get("counters", {}).get("media", {}).get("scan_complete") is True
                 and item.get("overall", {}).get("files_current") == 1
                 for item in progress
             ))
+            self.assertEqual(result["summary"]["media"]["skipped"]["estimated_savings_below_threshold"], 1)
 
     def test_ffmpeg_progress_keeps_active_encode_from_triggering_stall_watchdog(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -531,6 +573,167 @@ class UtilityMediaJobTests(unittest.TestCase):
             with zipfile.ZipFile(archive) as zipped:
                 self.assertEqual(zipped.namelist(), ["cover_recode.png"])
                 self.assertIsNone(zipped.testzip())
+
+    def test_existing_video_recode_output_is_reported_as_skip_and_preserves_both_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            source = folder / "clip.mkv"
+            output = folder / "clip_recode.mp4"
+            source.write_bytes(b"source video")
+            output.write_bytes(b"existing output")
+            progress_events: list[dict[str, object]] = []
+            runner = UtilityRunner(
+                Path("utility"), workspace_root=workspace,
+                progress_callback=progress_events.append,
+            )
+
+            result = runner.run("video_convert", [str(folder)])
+
+            self.assertEqual(result.summary["files_skipped"], 1)
+            self.assertEqual(result.summary["files_failed"], 0)
+            self.assertTrue(source.is_file())
+            self.assertTrue(output.is_file())
+            detail = result.details[0]
+            self.assertEqual(detail["status"], "skipped")
+            self.assertEqual(detail["media_type"], "video")
+            self.assertEqual(detail["reason_code"], "VIDEO_RECODE_OUTPUT_EXISTS")
+            skipped = next(item for item in progress_events if item["phase"] == "item_skipped")
+            self.assertEqual(skipped["media_type"], "video")
+            self.assertEqual(skipped["reason_code"], "VIDEO_RECODE_OUTPUT_EXISTS")
+
+    def test_video_recode_output_race_is_reported_as_skip_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "videos"
+            folder.mkdir(parents=True)
+            source = folder / "clip.mkv"
+            output = folder / "clip_recode.mp4"
+            source.write_bytes(b"x" * 100_000)
+            bin_root = self._fake_video_tools(root)
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+
+            def create_racing_output(_stage_path, final_path):
+                Path(final_path).write_bytes(b"output created by another operation")
+                raise FileExistsError(final_path)
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_FFMPEG_CALLS": str(root / "ffmpeg-calls.jsonl"),
+                "UTILITY_TEST_FFMPEG_SAMPLE_BYTES": "1000",
+            }), patch("tme3bot.utility_media.os.link", side_effect=create_racing_output):
+                result = runner.run("video_convert", [str(folder)])
+
+            self.assertEqual(result.summary["files_skipped"], 1)
+            self.assertEqual(result.summary["files_failed"], 0)
+            self.assertTrue(source.is_file())
+            self.assertEqual(output.read_bytes(), b"output created by another operation")
+            self.assertEqual(result.details[0]["reason_code"], "VIDEO_RECODE_OUTPUT_EXISTS")
+
+    def test_existing_image_recode_output_is_reported_as_skip_and_preserves_both_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "images"
+            folder.mkdir(parents=True)
+            source = folder / "cover.png"
+            output = folder / "cover_recode.png"
+            source.write_bytes(b"source image")
+            output.write_bytes(b"existing output")
+            bin_root = self._fake_video_tools(root)
+            self._fake_image_tools(bin_root)
+            progress_events: list[dict[str, object]] = []
+            runner = UtilityRunner(
+                Path("utility"), workspace_root=workspace,
+                progress_callback=progress_events.append,
+            )
+
+            with patch.dict(os.environ, {"PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                result = runner.run("image_compress", [str(folder)])
+
+            self.assertEqual(result.summary["files_skipped"], 1)
+            self.assertEqual(result.summary["files_failed"], 0)
+            self.assertTrue(source.is_file())
+            self.assertTrue(output.is_file())
+            detail = result.details[0]
+            self.assertEqual(detail["status"], "skipped")
+            self.assertEqual(detail["media_type"], "image")
+            self.assertEqual(detail["reason_code"], "IMAGE_RECODE_OUTPUT_EXISTS")
+            skipped = next(item for item in progress_events if item["phase"] == "item_skipped")
+            self.assertEqual(skipped["media_type"], "image")
+            self.assertEqual(skipped["reason_code"], "IMAGE_RECODE_OUTPUT_EXISTS")
+
+    def test_image_recode_output_race_is_reported_as_skip_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = workspace / "images"
+            folder.mkdir(parents=True)
+            source = folder / "cover.png"
+            output = folder / "cover_recode.png"
+            source.write_bytes(b"source image")
+            bin_root = root / "bin"
+            bin_root.mkdir()
+            self._fake_image_tools(bin_root)
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+            original_link = os.link
+            output_created = False
+
+            def create_racing_output(source_path, destination_path):
+                nonlocal output_created
+                if Path(destination_path).name == "images.zip" and not output_created:
+                    output.write_bytes(b"output created by another operation")
+                    output_created = True
+                return original_link(source_path, destination_path)
+
+            with patch.dict(os.environ, {"PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}"}), \
+                 patch("tme3bot.utility_media.os.link", side_effect=create_racing_output):
+                result = runner.run("image_compress", [str(folder)])
+
+            self.assertEqual(result.summary["files_skipped"], 1)
+            self.assertEqual(result.summary["files_failed"], 0)
+            self.assertTrue(source.is_file())
+            self.assertEqual(output.read_bytes(), b"output created by another operation")
+            self.assertEqual(result.details[0]["status"], "skipped")
+            self.assertEqual(result.details[0]["reason_code"], "IMAGE_RECODE_OUTPUT_EXISTS")
+
+    def test_media_pipeline_orders_videos_then_images_by_workspace_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            selected_folders = [workspace / "zeta", workspace / "Alpha"]
+            for folder in selected_folders:
+                folder.mkdir(parents=True)
+                for name, suffix in (("b", ".mkv"), ("a", ".mkv"), ("b", ".png"), ("a", ".png")):
+                    source = folder / f"{name}{suffix}"
+                    source.write_bytes(b"source")
+                    output_suffix = ".mp4" if suffix == ".mkv" else suffix
+                    (folder / f"{name}_recode{output_suffix}").write_bytes(b"output")
+            bin_root = self._fake_video_tools(root)
+            self._fake_image_tools(bin_root)
+            progress_events: list[dict[str, object]] = []
+            runner = UtilityRunner(
+                Path("utility"), workspace_root=workspace,
+                progress_callback=progress_events.append,
+            )
+
+            with patch.dict(os.environ, {"PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}"}):
+                result = runner.run("media_pipeline", [str(path) for path in selected_folders])
+
+            skipped = [item for item in progress_events if item["phase"] == "item_skipped"]
+            relative_paths = [Path(str(item["name"])).relative_to(workspace).as_posix() for item in skipped]
+            self.assertEqual(relative_paths, [
+                "Alpha/a.mkv", "Alpha/b.mkv", "zeta/a.mkv", "zeta/b.mkv",
+                "Alpha/a.png", "Alpha/b.png", "zeta/a.png", "zeta/b.png",
+            ])
+            self.assertEqual([item["media_type"] for item in skipped], [
+                "video", "video", "video", "video", "image", "image", "image", "image",
+            ])
+            self.assertEqual(result.summary["media"]["video"]["total"], 4)
+            self.assertEqual(result.summary["media"]["image"]["total"], 4)
 
     def test_media_pipeline_converts_video_and_archives_images_in_one_job(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { formatBytes } from '$lib/presentation';
-  import { formatDuration, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
+  import { formatDuration, isMediaUtilityJob, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
   import { ChevronDown, Clock3, FileText, Gauge, Pause, Play, SquareTerminal, Timer, XCircle } from '@lucide/svelte';
+  import MediaProgressSummary from './MediaProgressSummary.svelte';
 
   let { job, onReport, onLog, onTerminate, onPauseToggle, actionPending = false }: {
     job: Record<string, any>;
@@ -14,6 +15,7 @@
 
   let expanded = $state(false);
   const progress = $derived(normalizeJobProgress(job));
+  const mediaSummary = $derived(isMediaUtilityJob(job) && progress.media?.scanComplete ? progress.media : null);
   const overallPercent = $derived(progress.overall.percent);
   const itemPercent = $derived(progress.item.percent);
   const activePercent = $derived(overallPercent ?? itemPercent);
@@ -123,6 +125,9 @@
             </div>
           </div>
         </div>
+        {#if mediaSummary}
+          <MediaProgressSummary media={mediaSummary}/>
+        {/if}
         {#if progress.overall.files_total !== undefined || progress.overall.bytes_total !== undefined}
           <div class="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] font-semibold text-[var(--muted)]">
             {#if progress.overall.files_total !== undefined}
