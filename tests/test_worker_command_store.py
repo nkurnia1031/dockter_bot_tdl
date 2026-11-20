@@ -494,6 +494,69 @@ class WorkerCommandStoreTests(unittest.TestCase):
         remaining = self.store.claim_event()
         self.assertEqual(remaining[1], "large-recovery-job")
 
+    def test_terminal_event_supersedes_backlog_and_keeps_latest_snapshots(self):
+        job_id = "cancelled-job-with-event-backlog"
+        for index in range(80):
+            self.store.append_event(
+                job_id,
+                {
+                    "event_type": "command.completed",
+                    "status": "running",
+                    "command_index": index,
+                },
+                transient=False,
+            )
+        progress_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "progress.snapshot", "status": "running", "progress": {"current": 7}},
+            transient=True,
+        )
+        log_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "log.snapshot", "status": "running", "progress": {"log_tail": "last output"}},
+            transient=False,
+        )
+        terminal_sequence = self.store.append_event(
+            job_id,
+            {"event_type": "cancelled", "status": "cancelled", "progress": {"phase": "cancelled"}},
+            transient=False,
+        )
+
+        delivered = []
+        while (claimed := self.store.claim_event()) is not None:
+            delivered.append((claimed[2], claimed[3]["event_type"]))
+            self.assertTrue(
+                self.store.acknowledge_event(claimed[0], claimed[4], accepted=True)
+            )
+
+        self.assertEqual(
+            delivered,
+            [
+                (progress_sequence, "progress.snapshot"),
+                (log_sequence, "log.snapshot"),
+                (terminal_sequence, "cancelled"),
+            ],
+        )
+        with sqlite3.connect(self.path) as db:
+            superseded = db.execute(
+                "SELECT COUNT(*) FROM worker_event_outbox WHERE job_id=? AND status='superseded'",
+                (job_id,),
+            ).fetchone()[0]
+        self.assertEqual(superseded, 80)
+
+    def test_active_event_predecessor_lookup_uses_a_dedicated_index(self):
+        with sqlite3.connect(self.path) as db:
+            plan = db.execute(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM worker_event_outbox p "
+                "WHERE p.job_id=? AND p.sequence<? AND p.status IN ('pending','sending')",
+                ("job-with-history", 100),
+            ).fetchall()
+
+        self.assertTrue(
+            any("idx_worker_event_outbox_active_job_sequence" in row[3] for row in plan),
+            plan,
+        )
+
     def test_event_outbox_schema_migrates_legacy_sending_rows(self):
         legacy_path = Path(self.temp.name) / "legacy-worker-journal.sqlite3"
         db = sqlite3.connect(legacy_path)

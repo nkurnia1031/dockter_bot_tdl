@@ -185,6 +185,11 @@ class WorkerCommandStore:
                 "CREATE INDEX IF NOT EXISTS idx_worker_event_outbox_lease "
                 "ON worker_event_outbox(status,available_at,lease_until,id)"
             )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_worker_event_outbox_active_job_sequence "
+                "ON worker_event_outbox(job_id,sequence) "
+                "WHERE status IN ('pending','sending')"
+            )
             upload_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(worker_storage_upload_items)").fetchall()
@@ -910,6 +915,45 @@ class WorkerCommandStore:
         with self._write_transaction() as db:
             row = db.execute("SELECT last_sequence FROM worker_event_sequences WHERE job_id=?", (str(job_id),)).fetchone()
             sequence = int(row["last_sequence"]) + 1 if row else 2
+            if str(payload.get("status") or "").lower() == "cancelled":
+                # A cancellation makes queued progress/command events for this
+                # job obsolete. Keep the newest progress and log snapshots so
+                # the cancellation cannot sit behind a backlog after its
+                # process has already stopped.
+                keep_ids: set[int] = set()
+                latest_progress = db.execute(
+                    "SELECT id FROM worker_event_outbox "
+                    "WHERE job_id=? AND sequence<? AND transient=1 "
+                    "AND status IN ('pending','sending') ORDER BY sequence DESC LIMIT 1",
+                    (str(job_id), sequence),
+                ).fetchone()
+                if latest_progress is not None:
+                    keep_ids.add(int(latest_progress["id"]))
+                latest_log = db.execute(
+                    "SELECT id FROM worker_event_outbox "
+                    "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                    "AND json_extract(event_json,'$.event_type')='log.snapshot' "
+                    "ORDER BY sequence DESC LIMIT 1",
+                    (str(job_id), sequence),
+                ).fetchone()
+                if latest_log is not None:
+                    keep_ids.add(int(latest_log["id"]))
+                if keep_ids:
+                    placeholders = ",".join("?" for _ in keep_ids)
+                    db.execute(
+                        "UPDATE worker_event_outbox SET status='superseded',"
+                        "lease_token=NULL,lease_until=NULL,last_error='terminal_event_superseded' "
+                        "WHERE job_id=? AND sequence<? AND status IN ('pending','sending') "
+                        f"AND id NOT IN ({placeholders})",
+                        (str(job_id), sequence, *sorted(keep_ids)),
+                    )
+                else:
+                    db.execute(
+                        "UPDATE worker_event_outbox SET status='superseded',"
+                        "lease_token=NULL,lease_until=NULL,last_error='terminal_event_superseded' "
+                        "WHERE job_id=? AND sequence<? AND status IN ('pending','sending')",
+                        (str(job_id), sequence),
+                    )
             db.execute(
                 "INSERT INTO worker_event_sequences(job_id,last_sequence) VALUES (?,?) ON CONFLICT(job_id) DO UPDATE SET last_sequence=excluded.last_sequence",
                 (str(job_id), sequence),
