@@ -61,7 +61,7 @@ MIN_ESTIMATED_VIDEO_SAVINGS_PERCENT = 40.0
 FORMAT_ROW_RE = re.compile(r"^\s*([A-Z0-9]+)\*?\s+([A-Z0-9]+)\s+([r-][w-][+-])(?:\s|$)")
 NON_RASTER_CODERS = {
     "AI", "CGM", "DOT", "DXF", "EPDF", "EPS", "EPS2", "EPS3", "EPT",
-    "FIG", "HPGL", "HTML", "MVG", "MSVG", "PCL", "PDF", "PLT", "POV",
+    "FIG", "HPGL", "HTML", "MVG", "MSVG", "PCL", "PDF", "PLT", "POV", "TXT",
     "PS", "PS2", "PS3", "SVG", "SVGZ", "VIDEO", "WMF", "WPG", "XPS",
 }
 PSEUDO_FORMATS = {

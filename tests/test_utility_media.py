@@ -574,6 +574,69 @@ class UtilityMediaJobTests(unittest.TestCase):
                 self.assertEqual(zipped.namelist(), ["cover_recode.png"])
                 self.assertIsNone(zipped.testzip())
 
+    def test_image_job_ignores_txt_in_nested_album_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace = root / "workspace"
+            folder = (
+                workspace
+                / "dummy"
+                / "group_1"
+                / "4321"
+                / "A Star is Born 15yo"
+                / "A Star is Born 15yo"
+            )
+            folder.mkdir(parents=True)
+            source = folder / "cover.png"
+            source.write_bytes(b"original image")
+            info = folder / "info.txt"
+            info.write_text("album metadata", encoding="utf-8")
+            identify_calls = root / "identify-calls.txt"
+            bin_root = self._fake_video_tools(root)
+            self._fake_image_tools(bin_root)
+            mogrify = bin_root / "mogrify"
+            mogrify_source = mogrify.read_text(encoding="utf-8")
+            mogrify_source = mogrify_source.replace(
+                "print('JPEG* JPEG rw+ Joint Photographic Experts Group')",
+                "print('JPEG* JPEG rw+ Joint Photographic Experts Group')\n"
+                "    print('TXT* TXT rw+ Text')",
+            )
+            mogrify.write_text(mogrify_source, encoding="utf-8")
+            mogrify.chmod(0o755)
+            identify = bin_root / "identify"
+            identify.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                "target = next((Path(arg) for arg in reversed(sys.argv[1:])\n"
+                "               if Path(arg).is_file()), Path(sys.argv[-1]))\n"
+                "with open(os.environ['UTILITY_TEST_IDENTIFY_CALLS'], 'a', encoding='utf-8') as f:\n"
+                "    f.write(str(target) + '\\n')\n"
+                "if target.suffix.lower() not in {'.jpg', '.jpeg', '.png'}:\n"
+                "    print(f\"identify-im6.q16: improper image header '{target}'\", file=sys.stderr)\n"
+                "    raise SystemExit(1)\n"
+                "print('100 50')\n",
+                encoding="utf-8",
+            )
+            identify.chmod(0o755)
+            runner = UtilityRunner(Path("utility"), workspace_root=workspace)
+
+            with patch.dict(os.environ, {
+                "PATH": f"{bin_root}{os.pathsep}{os.environ.get('PATH', '')}",
+                "UTILITY_TEST_IDENTIFY_CALLS": str(identify_calls),
+            }):
+                result = runner.run("image_compress", [str(folder)])
+
+            self.assertEqual(result.summary["files_total"], 1, msg=str(result.summary))
+            self.assertEqual(result.summary["files_succeeded"], 1, msg=str(result.details))
+            self.assertEqual(result.summary["files_failed"], 0, msg=str(result.details))
+            self.assertEqual(result.outcome, "succeeded")
+            self.assertTrue(info.exists())
+            self.assertTrue(identify_calls.exists())
+            self.assertNotIn("info.txt", identify_calls.read_text(encoding="utf-8"))
+            with zipfile.ZipFile(folder / "images.zip") as archive:
+                self.assertEqual(archive.namelist(), ["cover_recode.png"])
+
     def test_existing_video_recode_output_is_reported_as_skip_and_preserves_both_files(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
