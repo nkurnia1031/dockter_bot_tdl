@@ -92,6 +92,65 @@
     return typeof title === 'string' && title.trim() ? title.trim() : 'Judul tidak tersedia';
   }
 
+  function utilityOperationLabel(job: Job): string {
+    const labels: Record<string, string> = {
+      pindah: 'Pindah / group',
+      compress: 'Compress 7z',
+      extract: 'Extract',
+      export: 'Organizer export',
+      flatten: 'Flatten',
+      video_convert: 'Konversi video',
+      image_compress: 'Kompres gambar',
+      media_pipeline: 'Video + gambar',
+    };
+    return labels[String(job.payload?.utility || '')] || 'Utility';
+  }
+
+  function utilityFolders(job: Job): string[] {
+    return Array.isArray(job.payload?.folders)
+      ? job.payload.folders.filter((folder: unknown): folder is string => typeof folder === 'string' && folder.trim().length > 0)
+      : [];
+  }
+
+  function utilityHistorySummary(job: Job): string {
+    const result = job.result?.value || job.result || {};
+    const summary = result?.summary && typeof result.summary === 'object' ? result.summary : {};
+    const utility = String(job.payload?.utility || '');
+    const count = (value: unknown) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? Math.max(0, Math.trunc(number)) : 0;
+    };
+    const has = (key: string) => Object.prototype.hasOwnProperty.call(summary, key);
+
+    if (utility === 'extract' && (has('archives_succeeded') || has('archives_failed'))) {
+      const partial = count(summary.archives_partial);
+      return `${count(summary.archives_succeeded)} arsip berhasil · ${count(summary.archives_failed)} gagal${partial ? ` · ${partial} parsial` : ''}`;
+    }
+    if (utility === 'flatten' && (has('moves') || has('replaced') || has('deleted') || has('skipped'))) {
+      return `${count(summary.moves)} operasi · ${count(summary.replaced)} diganti · ${count(summary.suffixed)} suffix · ${count(summary.deleted)} folder kosong dihapus · ${count(summary.skipped)} dilewati`;
+    }
+    if (['video_convert', 'image_compress', 'media_pipeline'].includes(utility) && has('files_total')) {
+      return `${count(summary.files_succeeded)} file berhasil · ${count(summary.files_failed)} gagal · ${count(summary.files_skipped)} dilewati`;
+    }
+    if (utility === 'export' && (has('groups_created') || has('items_moved') || has('unresolved_groups'))) {
+      return `${count(summary.groups_created)} grup dibuat · ${count(summary.items_moved)} item dipindah · ${count(summary.unresolved_groups)} belum terkelompok`;
+    }
+    if (utility === 'pindah' && (has('folders_processed') || has('folders_failed'))) {
+      return `${count(summary.folders_processed)} folder diproses · ${count(summary.folders_failed)} gagal · ${count(summary.temporary_json_removed)} JSON sementara dibersihkan`;
+    }
+    if (utility === 'compress' && (has('files_before') || has('files_after'))) {
+      return `${count(summary.files_before)} → ${count(summary.files_after)} file · ${formatBytes(count(summary.bytes_before))} → ${formatBytes(count(summary.bytes_after))}`;
+    }
+    if (has('folders_processed') || has('folders_failed')) {
+      return `${count(summary.folders_processed)} folder diproses · ${count(summary.folders_failed)} gagal`;
+    }
+    return jobMessage(job);
+  }
+
+  function utilityFolderTitle(job: Job): string {
+    return utilityFolders(job).join('\n');
+  }
+
   function workerStatusLabel(status: string): string {
     return ({ busy: 'sibuk', stale: 'heartbeat terlambat', paused: 'dijeda', queued: 'antre', idle: 'idle', disabled: 'nonaktif' } as Record<string, string>)[status] || status;
   }
@@ -438,7 +497,7 @@
             {#if job.id}
               <span class="font-mono text-xs font-semibold text-slate-500" title="Job ID: {job.id}">#{job.id.slice(0, 8)}</span>
             {/if}
-            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind === 'storage_reconcile' ? 'Storage reconcile' : job.kind === 'storage_rclone_manage' ? `Rclone ${job.payload?.action || 'manage'}` : job.kind.replaceAll('_',' ')}</b>
+            <b class="capitalize">{job.kind === 'tts' ? 'TTS' : job.kind === 'utility' ? utilityOperationLabel(job) : job.kind === 'storage_reconcile' ? 'Storage reconcile' : job.kind === 'storage_rclone_manage' ? `Rclone ${job.payload?.action || 'manage'}` : job.kind.replaceAll('_',' ')}</b>
             {#if job.payload?.quick_mode}<span class="badge running">Quick Mode</span>{/if}
             {#if stageId}
               <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {String(stageId).slice(0, 8)}</span>
@@ -446,7 +505,18 @@
             <span class={`badge ${job.status}`}>{job.status}</span>
             <span class="muted text-xs">{job.worker || '-'}</span>
           </div>
-          <p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p>
+          {#if job.kind === 'utility'}
+            {@const folders = utilityFolders(job)}
+            {#if folders.length}
+              <p class="muted mt-1 flex min-w-0 items-center gap-2 truncate text-xs" title={utilityFolderTitle(job)}>
+                <span class="truncate font-mono">{folders[0]}</span>
+                {#if folders.length > 1}<span class="badge shrink-0">+{folders.length - 1} folder</span>{/if}
+              </p>
+            {/if}
+            <p class="muted mt-1 truncate text-sm">{utilityHistorySummary(job)}</p>
+          {:else}
+            <p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p>
+          {/if}
           {#if mediaSummary?.scanComplete}
             <MediaProgressSummary media={mediaSummary}/>
           {/if}
@@ -485,6 +555,21 @@
       </div>
       {#if detailTab === 'summary'}
         {@const utilityResult = selected.result?.value || selected.result || {}}
+        {#if selected.kind === 'utility'}
+          {@const folders = utilityFolders(selected)}
+          <section class="record-card mb-4" aria-label="Ringkasan Utility">
+            <h3 class="font-bold">{utilityOperationLabel(selected)}</h3>
+            <p class="muted mt-1 text-sm">{utilityHistorySummary(selected)}</p>
+            {#if folders.length}
+              <div class="mt-3">
+                <h4 class="muted text-xs font-bold uppercase tracking-wide">Folder yang dipilih</h4>
+                <ul class="mt-1 space-y-1">
+                  {#each folders as folder}<li class="break-all font-mono text-xs">{folder}</li>{/each}
+                </ul>
+              </div>
+            {/if}
+          </section>
+        {/if}
         {#if selected.kind === 'utility' && selected.payload?.utility === 'extract' && Array.isArray(utilityResult.archive_results)}
           <section class="record-card mb-4">
             <h3 class="font-bold">Hasil Extract per arsip</h3>

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import JobTable from './JobTable.svelte';
 
 describe('JobTable', () => {
@@ -294,6 +294,60 @@ describe('JobTable', () => {
     expect(screen.getByText('Gambar: 2 total · 0 berjalan · 2 berhasil · 0 gagal')).toBeTruthy();
     expect(screen.getByText('Estimasi hemat ≤40%: 1')).toBeTruthy();
     expect(screen.queryByRole('list', { name: 'Daftar hasil konversi media' })).toBeNull();
+  });
+
+  it('identifies Utility history by operation, selected folder, and result while keeping the full report', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const extract = {
+      id: 'utility-extract-history', kind: 'utility', status: 'partial_failure', worker: 'remote-1',
+      payload: { utility: 'extract', folders: ['/workspace/Series/Season 2'] },
+      result: { value: { summary: { archives_succeeded: 4, archives_partial: 1, archives_failed: 1 } } },
+      updated_at: '2026-11-20T09:00:00Z',
+    };
+    const flatten = {
+      id: 'utility-flatten-history', kind: 'utility', status: 'succeeded', worker: 'local',
+      payload: {
+        utility: 'flatten', flatten_action: 'preview',
+        folders: ['/workspace/Alpha', '/workspace/Beta', '/workspace/Gamma'],
+      },
+      result: { value: {
+        summary: { moves: 7, replaced: 1, suffixed: 2, deleted: 3, skipped: 4 },
+        details: [{ folder: '/workspace/Alpha', flatten_preview: { passes: [] } }],
+      } },
+      updated_at: '2026-11-20T09:01:00Z',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) return new Response(JSON.stringify({ items: [extract, flatten] }), { status: 200 });
+      if (url.endsWith('/jobs/utility-flatten-history')) return new Response(JSON.stringify(flatten), { status: 200 });
+      if (url.includes('/events') || url.includes('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({}), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'utility', view: 'history' });
+
+    expect(await screen.findByText('Extract')).toBeTruthy();
+    expect(screen.getByText('/workspace/Series/Season 2')).toBeTruthy();
+    expect(screen.getByText('4 arsip berhasil · 1 gagal · 1 parsial')).toBeTruthy();
+    expect(screen.getByText('Flatten')).toBeTruthy();
+    expect(screen.getByText('/workspace/Alpha')).toBeTruthy();
+    expect(screen.getByText('+2 folder')).toBeTruthy();
+    expect(screen.getByText('7 operasi · 1 diganti · 2 suffix · 3 folder kosong dihapus · 4 dilewati')).toBeTruthy();
+
+    const flattenRow = screen.getByText('Flatten').closest('article');
+    expect(flattenRow).toBeTruthy();
+    await fireEvent.click(within(flattenRow!).getByRole('button', { name: 'Report' }));
+    expect(await screen.findByText('Preview Flatten tersimpan')).toBeTruthy();
+    expect(screen.getByText('/workspace/Alpha', { selector: 'h4' })).toBeTruthy();
+    expect(screen.getByText('/workspace/Beta')).toBeTruthy();
+    expect(screen.getByText('/workspace/Gamma')).toBeTruthy();
   });
 
   it('lists and reopens safe Storage reconciliation results without exposing caption or path', async () => {
