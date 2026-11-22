@@ -29,7 +29,9 @@
   let toastOpen = $state(false);
   let toastMessage = $state('');
   let retrying = $state<Record<string, boolean>>({});
+  let retryingStorageItems = $state<Record<string, boolean>>({});
   let reconciling = $state<Record<string, boolean>>({});
+  let reconcilingStorageItems = $state<Record<string, boolean>>({});
   let jobActionPending = $state<Record<string, boolean>>({});
   let lastRefreshed = $state<Date | null>(null);
   let mounted = false;
@@ -158,6 +160,7 @@
   function storageStatusLabel(status: string): string {
     return ({
       succeeded: 'Berhasil', failed: 'Gagal', pending: 'Menunggu', sending: 'Mengirim',
+      retrying: 'Retry berjalan',
       skipped: 'Dilewati · target sudah ada', retained_existing_target: 'Sumber disimpan · target sudah ada',
       partial: 'Selesai sebagian', cancelled: 'Dibatalkan', deleted: 'Dihapus',
       needs_reconciliation: 'Perlu verifikasi',
@@ -166,6 +169,17 @@
       skipped_source_changed: 'Dilewati · sumber berubah', cleanup_failed: 'Gagal menghapus',
       retained_unsafe_path: 'Disimpan · path tidak aman'
     } as Record<string, string>)[status] || status;
+  }
+
+  function storageItemConfirmedMissing(item: Job): boolean {
+    return item?.reconciliation?.status === 'failed'
+      && Number(item.reconciliation.match_count) === 0;
+  }
+
+  function storageItemRetryInProgress(job: Job): boolean {
+    const result = job.result?.value || job.result;
+    return Array.isArray(result?.items)
+      && result.items.some((item: Job) => item?.status === 'retrying');
   }
 
   function reportResultEntries(job: Job): Array<[string, string]> {
@@ -185,9 +199,14 @@
 
   function schedulePolling() {
     stopPolling();
-    if (!mounted || view === 'history') return;
+    const reportHasActiveStorageAction = reportOpen
+      && selected?.kind === 'storage_upload'
+      && Boolean(activeStorageReconciliation(selected) || storageItemRetryInProgress(selected));
+    if (!mounted || (view === 'history' && !reportHasActiveStorageAction)) return;
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-    const delay = pollingMode === 'activity'
+    const delay = reportHasActiveStorageAction
+      ? 2500
+      : pollingMode === 'activity'
       ? activeJobs.length ? 2500 : 10_000
       : activeJobs.length ? 2500 : undefined;
     if (delay === undefined) return;
@@ -213,27 +232,43 @@
       const kinds = kind === 'storage_upload' ? ['storage_upload', 'storage_reconcile'] : kind ? [kind] : [''];
       const jobRequests = kinds.map((selectedKind) => {
         const selectedParams = new URLSearchParams(params);
+        if (view === 'history' && selectedKind === 'storage_reconcile') {
+          // Keep active per-file verification visible while a historical
+          // upload report is open, even though the source list is terminal.
+          selectedParams.delete('status');
+        }
         if (selectedKind) selectedParams.set('kind', selectedKind);
         return api<{items:Job[]}>(`/jobs?${selectedParams.toString()}`);
       });
+      const selectedReportId = reportOpen && selected?.kind === 'storage_upload'
+        ? String(selected.id)
+        : '';
+      const selectedReportRequest = selectedReportId
+        ? api<Job>(`/jobs/${encodeURIComponent(selectedReportId)}`).catch(() => null)
+        : Promise.resolve(null);
       const metricsParams = new URLSearchParams({ scope });
       if (profile) metricsParams.set('profile', profile);
       if (worker) metricsParams.set('worker', worker);
       const shouldRefreshMetrics = view !== 'history' && (!scheduled || pollingMode === 'activity');
-      const [jobResponses, nextMetrics] = await Promise.all([
+      const [jobResponses, nextMetrics, selectedReport] = await Promise.all([
         Promise.all(jobRequests),
         !shouldRefreshMetrics
           ? Promise.resolve(undefined)
-          : api<Record<string, any>>(`/jobs/metrics?${metricsParams.toString()}`).catch(() => null)
+          : api<Record<string, any>>(`/jobs/metrics?${metricsParams.toString()}`).catch(() => null),
+        selectedReportRequest,
       ]);
-      const next = jobResponses.flatMap((response) => response.items || [])
+      let next = jobResponses.flatMap((response) => response.items || [])
         .sort((left, right) => Date.parse(String(right.created_at || '')) - Date.parse(String(left.created_at || '')))
         .slice(0, 30);
       if (request !== loadGeneration) return;
+      if (selectedReport && selected?.id === selectedReportId) {
+        next = next.map((job) => job.id === selectedReport.id ? selectedReport : job);
+      }
       jobs = next;
       if (nextMetrics !== undefined) monitorMetrics = nextMetrics;
       lastRefreshed = new Date();
-      if (selected) selected = next.find((job) => job.id === selected?.id) || selected;
+      if (selectedReport && selected?.id === selectedReportId) selected = selectedReport;
+      else if (selected) selected = next.find((job) => job.id === selected?.id) || selected;
       if (view === 'active' && hasLoaded) {
         const currentActiveIds = new Set(next.filter(active).map((job) => String(job.id)));
         const finished = [...previousActiveIds].filter((id) => !currentActiveIds.has(id));
@@ -268,7 +303,15 @@
     catch (cause) { error = cause instanceof Error ? cause.message : 'Tidak dapat memuat event.'; }
     finally { loadingEvents = false; }
   }
-  async function openReport(job: Job) { selected = job; events = []; liveLog = null; detailTab = 'summary'; reportOpen = true; await loadEvents(); }
+  async function openReport(job: Job) {
+    selected = job;
+    events = [];
+    liveLog = null;
+    detailTab = 'summary';
+    reportOpen = true;
+    await loadEvents();
+    schedulePolling();
+  }
   async function openLog(job: Job) { selected = job; events = []; liveLog = null; logOpen = true; await loadEvents(); }
   function requestTerminate(target: 'one'|'all', job?: Job) { if (job) selected = job; confirmTarget = target; confirmOpen = true; }
   function hasAmbiguousStorageFiles(job: Job): boolean {
@@ -327,6 +370,23 @@
       retrying = next;
     }
   }
+  async function retryStorageItem(job: Job, itemIndex: number) {
+    const key = `${job.id}:${itemIndex}`;
+    if (!window.confirm('Rekonsiliasi lengkap memastikan file ini belum ada di tujuan. Kirim ulang file ini saja?')) return;
+    retryingStorageItems = { ...retryingStorageItems, [key]: true };
+    try {
+      await post(`/jobs/${encodeURIComponent(job.id)}/retry?item_index=${itemIndex}`);
+      toastMessage = 'Retry file Storage masuk antrean.';
+      toastOpen = true;
+      await load();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Retry file Storage gagal dibuat.';
+    } finally {
+      const next = { ...retryingStorageItems };
+      delete next[key];
+      retryingStorageItems = next;
+    }
+  }
   async function reconcile(job: Job) {
     reconciling = { ...reconciling, [job.id]: true };
     try {
@@ -341,6 +401,35 @@
       delete next[job.id];
       reconciling = next;
     }
+  }
+  async function reconcileStorageItem(job: Job, itemIndex: number) {
+    const key = `${job.id}:${itemIndex}`;
+    reconcilingStorageItems = { ...reconcilingStorageItems, [key]: true };
+    try {
+      await post(`/jobs/${encodeURIComponent(job.id)}/reconcile?item_index=${itemIndex}`);
+      toastMessage = 'Verifikasi file Storage masuk antrean.';
+      toastOpen = true;
+      await load();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Verifikasi file Storage gagal dibuat.';
+    } finally {
+      const next = { ...reconcilingStorageItems };
+      delete next[key];
+      reconcilingStorageItems = next;
+    }
+  }
+  function activeStorageReconciliation(job: Job): Job | undefined {
+    return jobs.find((candidate) => candidate.kind === 'storage_reconcile'
+      && active(candidate)
+      && candidate.payload?.source_job_id === job.id);
+  }
+  function storageItemReconciliation(job: Job, itemIndex: number): Job | undefined {
+    const candidate = activeStorageReconciliation(job);
+    if (!candidate) return undefined;
+    const activeIndex = candidate.payload?.item_index;
+    return activeIndex === undefined || activeIndex === null || Number(activeIndex) === itemIndex
+      ? candidate
+      : undefined;
   }
   async function togglePause(job: Job) {
     jobActionPending = { ...jobActionPending, [job.id]: true };
@@ -412,7 +501,10 @@
         stopPolling();
         return;
       }
-      if (pollingMode === 'activity' || activeJobs.length) void load();
+      const reportActionActive = reportOpen
+        && selected?.kind === 'storage_upload'
+        && Boolean(activeStorageReconciliation(selected) || storageItemRetryInProgress(selected));
+      if (pollingMode === 'activity' || activeJobs.length || reportActionActive) void load();
     };
     window.addEventListener('tme3:data-mutated', refresh);
     window.addEventListener('tme3:context-changed', contextRefresh);
@@ -526,7 +618,8 @@
           <button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button>
           <button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>
           {#if job.kind === 'storage_upload' && ['failed','cancelled'].includes(job.status) && hasAmbiguousStorageFiles(job)}
-            <button class="button secondary" onclick={() => reconcile(job)} disabled={reconciling[job.id]}><RefreshCw size={15} class={reconciling[job.id] ? 'animate-spin' : ''}/>Rekonsiliasi</button>
+            {@const activeReconcile = activeStorageReconciliation(job)}
+            <button class="button secondary" onclick={() => reconcile(job)} disabled={reconciling[job.id] || Boolean(activeReconcile)}><RefreshCw size={15} class={reconciling[job.id] || activeReconcile ? 'animate-spin' : ''}/>{activeReconcile ? 'Verifikasi berjalan' : 'Rekonsiliasi'}</button>
           {/if}
           {#if retryable && ['export','tts'].includes(job.kind) && ['failed','cancelled','succeeded'].includes(job.status)}
             <button class="button secondary" onclick={() => retry(job)} disabled={retrying[job.id]}><RefreshCw size={15} class={retrying[job.id] ? 'animate-spin' : ''}/>{job.status === 'succeeded' ? 'Jalankan lagi' : 'Retry'}</button>
@@ -657,6 +750,9 @@
             <h3 class="font-bold">Hasil per file</h3>
             <div class="mt-2 space-y-2">
               {#each storageItems as item, index (item.path || index)}
+                {@const itemKey = `${selected.id}:${index}`}
+                {@const activeReconcile = activeStorageReconciliation(selected)}
+                {@const itemReconcile = storageItemReconciliation(selected, index)}
                 <article class="rounded-lg border border-[var(--line)] p-3">
                   <div class="flex flex-wrap items-center gap-2">
                     <b class="break-all text-sm">{item.name || item.path || `File ${index + 1}`}</b>
@@ -677,6 +773,27 @@
                         {/each}
                       </ul>
                     </details>
+                  {/if}
+                  {#if item.status === 'retrying'}
+                    <div class="mt-3">
+                      <button class="button secondary" disabled>
+                        <RefreshCw size={15} class="animate-spin"/>Retry berjalan
+                      </button>
+                    </div>
+                  {:else if item.status === 'needs_reconciliation' && selected.payload?.provider !== 'rclone' && ['failed','cancelled'].includes(selected.status)}
+                    <div class="mt-3">
+                      <button class="button secondary" onclick={() => reconcileStorageItem(selected!, index)} disabled={Boolean(reconcilingStorageItems[itemKey] || activeReconcile)}>
+                        <RefreshCw size={15} class={reconcilingStorageItems[itemKey] || itemReconcile ? 'animate-spin' : ''}/>
+                        {#if reconcilingStorageItems[itemKey] || itemReconcile}Memverifikasi…{:else if activeReconcile}Verifikasi lain berjalan{:else}Verifikasi file{/if}
+                      </button>
+                    </div>
+                  {:else if item.status === 'failed' && item.retryable === true && storageItemConfirmedMissing(item) && selected.payload?.provider !== 'rclone' && ['failed','cancelled'].includes(selected.status)}
+                    <div class="mt-3">
+                      <button class="button secondary" onclick={() => retryStorageItem(selected!, index)} disabled={Boolean(retryingStorageItems[itemKey])}>
+                        <RefreshCw size={15} class={retryingStorageItems[itemKey] ? 'animate-spin' : ''}/>
+                        {retryingStorageItems[itemKey] ? 'Mengirim ulang…' : 'Retry file'}
+                      </button>
+                    </div>
                   {/if}
                 </article>
               {/each}

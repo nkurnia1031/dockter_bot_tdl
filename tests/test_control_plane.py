@@ -1833,8 +1833,33 @@ class ControlPlaneTests(unittest.TestCase):
         retry_payload = self.dispatcher.commands[-1]["payload"]
         self.assertEqual(retry_payload["_storage_retry_paths"], ["subdir/safe.txt"])
         self.assertEqual(retry_payload["_storage_file_attempts"], {"subdir/safe.txt": 1})
+        self.assertEqual(retry_payload["_storage_retry_item_indexes"], {"0": "subdir/safe.txt"})
         self.assertNotIn("ambiguous.txt", retry_payload["_storage_retry_paths"])
         self.assertEqual(self.jobs.get(original.id).status, JobStatus.FAILED)
+        self.assertEqual(self.jobs.get(original.id).result["value"]["items"][0]["status"], "retrying")
+
+        # A per-file action for a path already covered by the active batch
+        # returns that child job instead of queuing a duplicate send.
+        command_count = len(self.dispatcher.commands)
+        duplicate = self.control.retry_job(self.actor, original.id, storage_item_index=0)
+        self.assertEqual(duplicate.id, retry.id)
+        self.assertEqual(len(self.dispatcher.commands), command_count)
+
+        next_sequence = max(event.sequence for event in self.jobs.events(retry.id)) + 1
+        self.control.append_worker_event(JobEvent(
+            retry.id, next_sequence, JobStatus.RUNNING, "started"
+        ))
+        self.control.append_worker_event(JobEvent(
+            retry.id,
+            next_sequence + 1,
+            JobStatus.SUCCEEDED,
+            "storage.batch_completed",
+            result={"value": {"items": [{
+                "path": "subdir/safe.txt", "status": "succeeded",
+                "upload_status": "succeeded", "attempt": 2,
+            }]}},
+        ))
+        self.assertEqual(self.jobs.get(original.id).result["value"]["items"][0]["status"], "succeeded")
 
     def test_storage_permission_denial_invalidates_only_the_rejected_readiness_cell(self):
         registry = WorkerRegistry(
@@ -3090,6 +3115,44 @@ class ControlPlaneTests(unittest.TestCase):
         )
         return source
 
+    def _attach_confirmed_missing_storage_item(
+        self, source, item_index, *, verifier_status=JobStatus.SUCCEEDED, extra_items=None
+    ):
+        items = source.result["value"]["items"]
+        item = items[item_index]
+        verifier_id = f"storage-reconcile-proof-{source.id}-{item_index}"
+        verifier_result = {
+            "value": {
+                "source_job_id": source.id,
+                "items": [{
+                    "index": item_index,
+                    "name": item["name"],
+                    "status": "failed",
+                    "match_count": 0,
+                    "retryable": True,
+                }] + list(extra_items or []),
+            }
+        }
+        self.jobs.create(Job(
+            id=verifier_id,
+            kind="storage_reconcile",
+            profile=source.profile,
+            actor_user_id=source.actor_user_id,
+            worker=source.worker,
+            status=verifier_status,
+            payload={"source_job_id": source.id, "item_index": item_index},
+            result=verifier_result,
+        ))
+        item["reconciliation"] = {
+            "job_id": verifier_id,
+            "status": "failed",
+            "match_count": 0,
+        }
+        item["status"] = "failed"
+        item["retryable"] = True
+        source.result["value"]["items"][item_index] = item
+        return self.jobs.update_result(source.id, source.result)
+
     def test_storage_reconciliation_uses_private_original_snapshot_and_deduplicates_active_jobs(self):
         source = self._create_ambiguous_storage_upload()
 
@@ -3109,6 +3172,208 @@ class ControlPlaneTests(unittest.TestCase):
         duplicate = self.control.reconcile_storage_upload(self.actor, source.id)
         self.assertEqual(duplicate.id, reconciliation.id)
         self.assertEqual(len(self.dispatcher.commands), count)
+
+    def test_storage_reconciliation_targets_one_file_and_serializes_other_item_scans(self):
+        source = self._create_ambiguous_storage_upload()
+
+        reconciliation = self.control.reconcile_storage_upload(
+            self.actor, source.id, item_index=1
+        )
+
+        self.assertEqual(reconciliation.payload, {
+            "source_job_id": source.id,
+            "item_index": 1,
+        })
+        worker_payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(
+            worker_payload["_storage_reconcile_items"],
+            [{"index": 1, "path": "safe.txt", "name": "safe.txt", "profile": "archive"}],
+        )
+        count = len(self.dispatcher.commands)
+        duplicate = self.control.reconcile_storage_upload(
+            self.actor, source.id, item_index=1
+        )
+        self.assertEqual(duplicate.id, reconciliation.id)
+        self.assertEqual(len(self.dispatcher.commands), count)
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.reconcile_storage_upload(self.actor, source.id, item_index=0)
+        self.assertEqual(raised.exception.code, "STORAGE_RECONCILIATION_IN_PROGRESS")
+
+        next_sequence = max(
+            event.sequence for event in self.jobs.events(reconciliation.id)
+        ) + 1
+        self.control.append_worker_event(JobEvent(
+            reconciliation.id,
+            next_sequence,
+            JobStatus.RUNNING,
+            "started",
+        ))
+        self.control.append_worker_event(JobEvent(
+            reconciliation.id,
+            next_sequence + 1,
+            JobStatus.SUCCEEDED,
+            "storage.reconciliation_completed",
+            result={"value": {
+                "source_job_id": source.id,
+                "items": [
+                    {"index": 0, "name": "matched.txt", "status": "succeeded", "match_count": 1},
+                    {"index": 1, "name": "safe.txt", "status": "failed", "match_count": 0, "retryable": True},
+                ],
+            }},
+        ))
+        updated_items = self.jobs.get(source.id).result["value"]["items"]
+        self.assertEqual(updated_items[0]["status"], "needs_reconciliation")
+        self.assertFalse(updated_items[0]["retryable"])
+        self.assertEqual(updated_items[1]["status"], "failed")
+        self.assertTrue(updated_items[1]["retryable"])
+
+    def test_storage_item_retry_submits_only_selected_confirmed_missing_file(self):
+        self.authorize_quick_mode_storage()
+        self.attach_storage_readiness()
+        source = Job(
+            id="storage-item-retry-source",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"folder_path": "/workspace/storage"},
+            result={"value": {"items": [
+                {"path": "already-there.txt", "name": "already-there.txt", "status": "succeeded", "retryable": False},
+                {"path": "safe.txt", "name": "safe.txt", "status": "failed", "retryable": True, "attempt": 2},
+                {"path": "still-ambiguous.txt", "name": "still-ambiguous.txt", "status": "needs_reconciliation", "retryable": False},
+            ]}},
+        )
+        self.jobs.create_with_private_values(
+            source, {"tdl_storage_chat_ref": b"-100123"}
+        )
+        source = self._attach_confirmed_missing_storage_item(source, 1)
+
+        retry = self.control.retry_job(self.actor, source.id, storage_item_index=1)
+
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(retry.kind, "storage_upload")
+        self.assertEqual(payload["_storage_retry_paths"], ["safe.txt"])
+        self.assertEqual(payload["_storage_file_attempts"], {"safe.txt": 2})
+        retried_item = self.jobs.get(source.id).result["value"]["items"][1]
+        self.assertEqual(retried_item["status"], "retrying")
+        self.assertEqual(retried_item["retry_job_id"], retry.id)
+
+        command_count = len(self.dispatcher.commands)
+        duplicate = self.control.retry_job(self.actor, source.id, storage_item_index=1)
+        self.assertEqual(duplicate.id, retry.id)
+        self.assertEqual(len(self.dispatcher.commands), command_count)
+
+        next_sequence = max(event.sequence for event in self.jobs.events(retry.id)) + 1
+        self.control.append_worker_event(JobEvent(
+            retry.id, next_sequence, JobStatus.RUNNING, "started"
+        ))
+        self.control.append_worker_event(JobEvent(
+            retry.id,
+            next_sequence + 1,
+            JobStatus.SUCCEEDED,
+            "storage.batch_completed",
+            result={"value": {"items": [{
+                "path": "safe.txt", "name": "safe.txt", "status": "succeeded",
+                "upload_status": "succeeded", "attempt": 3,
+            }]}},
+        ))
+        retried_item = self.jobs.get(source.id).result["value"]["items"][1]
+        self.assertEqual(retried_item["status"], "succeeded")
+        self.assertNotIn("retry_job_id", retried_item)
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.retry_job(self.actor, source.id, storage_item_index=1)
+        self.assertEqual(raised.exception.code, "STORAGE_RETRY_UNAVAILABLE")
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.retry_job(self.actor, source.id, storage_item_index=2)
+        self.assertEqual(raised.exception.code, "STORAGE_RETRY_UNAVAILABLE")
+
+    def test_storage_item_retry_rejects_pre_send_failure_without_complete_negative_proof(self):
+        self.authorize_quick_mode_storage()
+        self.attach_storage_readiness()
+        source = Job(
+            id="storage-item-retry-without-proof",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"folder_path": "/workspace/storage"},
+            result={"value": {"items": [{
+                "path": "safe.txt", "name": "safe.txt", "status": "failed",
+                "retryable": True, "attempt": 1,
+            }]}},
+        )
+        self.jobs.create_with_private_values(
+            source, {"tdl_storage_chat_ref": b"-100123"}
+        )
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.retry_job(self.actor, source.id, storage_item_index=0)
+
+        self.assertEqual(raised.exception.code, "STORAGE_RETRY_REQUIRES_RECONCILIATION")
+        self.assertEqual(self.dispatcher.commands, [])
+
+        # Batch Retry keeps its existing behavior for files known to have failed
+        # before the send was attempted; only the per-item action needs proof.
+        retry = self.control.retry_job(self.actor, source.id)
+        self.assertEqual(
+            self.dispatcher.commands[-1]["payload"]["_storage_retry_paths"],
+            ["safe.txt"],
+        )
+        self.assertEqual(retry.kind, "storage_upload")
+
+    def test_storage_item_retry_accepts_confirmed_missing_file_from_failed_mixed_reconciliation(self):
+        source = self._create_ambiguous_storage_upload()
+        source = self._attach_confirmed_missing_storage_item(
+            source,
+            1,
+            verifier_status=JobStatus.FAILED,
+            extra_items=[{
+                "index": 0,
+                "name": "matched.txt",
+                "status": "needs_reconciliation",
+                "match_count": 0,
+                "retryable": False,
+            }],
+        )
+
+        retry = self.control.retry_job(self.actor, source.id, storage_item_index=1)
+
+        self.assertEqual(retry.kind, "storage_upload")
+        self.assertEqual(
+            self.dispatcher.commands[-1]["payload"]["_storage_retry_paths"],
+            ["safe.txt"],
+        )
+
+    def test_storage_item_reconciliation_rejects_rclone_provider(self):
+        source = Job(
+            id="rclone-item-reconcile-source",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"provider": "rclone", "folder_path": "/workspace/storage"},
+            result={"value": {"items": [{
+                "path": "file.bin", "name": "file.bin",
+                "status": "needs_reconciliation", "retryable": False,
+                "target_path": "archive/file.bin",
+            }]}},
+        )
+        self.jobs.create(source)
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.reconcile_storage_upload(self.actor, source.id, item_index=0)
+
+        self.assertEqual(
+            raised.exception.code,
+            "STORAGE_RECONCILIATION_ITEM_UNAVAILABLE",
+        )
+        self.assertEqual(self.dispatcher.commands, [])
 
     def test_reconciled_success_is_not_retried_and_only_zero_match_file_uses_original_destination(self):
         source = self._create_ambiguous_storage_upload()

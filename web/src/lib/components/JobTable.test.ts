@@ -187,6 +187,134 @@ describe('JobTable', () => {
     expect(screen.getByText('Sumber: Sumber disimpan · target sudah ada')).toBeTruthy();
   });
 
+  it('verifies one Storage file, keeps incomplete results ambiguous, and retries only a confirmed missing file', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const source: Record<string, any> = {
+      id: 'storage-item-actions', kind: 'storage_upload', status: 'failed', profile: 'default', worker: 'local',
+      created_at: '2026-10-14T00:00:00Z', updated_at: '2026-10-14T00:00:01Z',
+      result: { value: { items: [
+        { path: 'confirmed-missing.zip', name: 'confirmed-missing.zip', status: 'needs_reconciliation', retryable: false },
+        { path: 'still-ambiguous.zip', name: 'still-ambiguous.zip', status: 'needs_reconciliation', retryable: false },
+      ] } }
+    };
+    const calls: { url: string; method?: string }[] = [];
+    let activeReconciliation: Record<string, any> | null = null;
+    let verifiedIndex: number | null = null;
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method });
+      if (url.includes('/jobs?')) {
+        const query = new URL(url, 'http://localhost').searchParams;
+        const items = query.get('kind') === 'storage_upload'
+          ? [source]
+          : query.get('kind') === 'storage_reconcile' && activeReconciliation
+            ? [activeReconciliation]
+            : [];
+        return new Response(JSON.stringify({ items }), { status: 200 });
+      }
+      if (url.endsWith('/jobs/storage-item-actions')) return new Response(JSON.stringify(source), { status: 200 });
+      if (url.endsWith('/events?after_sequence=0') || url.endsWith('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.includes('/jobs/storage-item-actions/reconcile?item_index=')) {
+        verifiedIndex = Number(new URL(url, 'http://localhost').searchParams.get('item_index'));
+        activeReconciliation = {
+          id: `storage-reconcile-${verifiedIndex}`, kind: 'storage_reconcile', status: 'running',
+          payload: { source_job_id: source.id, item_index: verifiedIndex },
+        };
+        return new Response(JSON.stringify(activeReconciliation), { status: 200 });
+      }
+      if (url.includes('/jobs/storage-item-actions/retry?item_index=')) {
+        source.result.value.items[0] = {
+          ...source.result.value.items[0],
+          status: 'retrying',
+          retryable: false,
+          retry_job_id: 'storage-item-retry',
+        };
+        return new Response(JSON.stringify({ id: 'storage-item-retry', status: 'queued' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'storage_upload', retryable: true, view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+    const ambiguousRow = screen.getByText('still-ambiguous.zip').closest('article')!;
+    await fireEvent.click(within(ambiguousRow).getByRole('button', { name: 'Verifikasi file' }));
+
+    expect(calls.some((call) => call.url.endsWith('/jobs/storage-item-actions/reconcile?item_index=1') && call.method === 'POST')).toBe(true);
+    expect(verifiedIndex).toBe(1);
+    expect(await within(ambiguousRow).findByRole('button', { name: 'Memverifikasi…' })).toBeTruthy();
+    expect(within(ambiguousRow).getByRole('button', { name: 'Memverifikasi…' })).toHaveProperty('disabled', true);
+
+    activeReconciliation = null;
+    window.dispatchEvent(new CustomEvent('tme3:job-finished'));
+    await waitFor(() => expect(within(ambiguousRow).getByRole('button', { name: 'Verifikasi file' })).toBeTruthy());
+    expect(within(ambiguousRow).queryByRole('button', { name: 'Retry file' })).toBeNull();
+
+    const missingRow = screen.getByText('confirmed-missing.zip').closest('article')!;
+    await fireEvent.click(within(missingRow).getByRole('button', { name: 'Verifikasi file' }));
+    expect(calls.some((call) => call.url.endsWith('/jobs/storage-item-actions/reconcile?item_index=0') && call.method === 'POST')).toBe(true);
+    activeReconciliation = null;
+    source.result.value.items[0] = {
+      ...source.result.value.items[0],
+      status: 'failed',
+      retryable: true,
+      error: 'Ekspor lengkap tidak menemukan file.',
+      reconciliation: { job_id: 'storage-reconcile-0', status: 'failed', match_count: 0 },
+    };
+    window.dispatchEvent(new CustomEvent('tme3:job-finished'));
+
+    const retryButton = await within(missingRow).findByRole('button', { name: 'Retry file' });
+    await fireEvent.click(retryButton);
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining('file ini saja'));
+    expect(calls.some((call) => call.url.endsWith('/jobs/storage-item-actions/retry?item_index=0') && call.method === 'POST')).toBe(true);
+    const retryingButton = await within(missingRow).findByRole('button', { name: 'Retry berjalan' });
+    expect(retryingButton).toHaveProperty('disabled', true);
+    expect(within(ambiguousRow).queryByRole('button', { name: 'Retry file' })).toBeNull();
+  });
+
+  it('does not expose per-file reconcile or retry actions for Rclone uploads', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    const source = {
+      id: 'rclone-item-actions', kind: 'storage_upload', status: 'failed',
+      profile: 'default', worker: 'local', payload: { provider: 'rclone' },
+      created_at: '2026-10-14T00:00:00Z', updated_at: '2026-10-14T00:00:01Z',
+      result: { value: { items: [
+        { path: 'archive/file.bin', name: 'file.bin', status: 'needs_reconciliation', retryable: false },
+        { path: 'archive/other.bin', name: 'other.bin', status: 'failed', retryable: true,
+          reconciliation: { job_id: 'old-reconcile', status: 'failed', match_count: 0 } },
+      ] } },
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) {
+        return new Response(JSON.stringify({ items: url.includes('kind=storage_upload') ? [source] : [] }), { status: 200 });
+      }
+      if (url.endsWith('/jobs/rclone-item-actions')) return new Response(JSON.stringify(source), { status: 200 });
+      if (url.endsWith('/events?after_sequence=0') || url.endsWith('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'storage_upload', retryable: true, view: 'history' });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
+
+    expect(screen.queryByRole('button', { name: 'Verifikasi file' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry file' })).toBeNull();
+  });
+
   it('shows completed Storage download results per file in the report', async () => {
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
       configurable: true,

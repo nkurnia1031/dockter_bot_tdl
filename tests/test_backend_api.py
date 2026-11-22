@@ -5523,15 +5523,24 @@ class BackendApiTests(unittest.TestCase):
         self.jobs.create_with_private_values(source, private_values)
 
         response = self.client.post(
-            f"/api/v1/jobs/{source.id}/reconcile",
+            f"/api/v1/jobs/{source.id}/reconcile?item_index=0",
             headers=headers,
         )
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["kind"], "storage_reconcile")
-        self.assertEqual(response.json()["payload"], {"source_job_id": source.id})
+        self.assertEqual(response.json()["payload"], {
+            "source_job_id": source.id,
+            "item_index": 0,
+        })
         self.assertNotIn("-1009876543210", response.text)
         command = self.dispatcher.commands[-1][1]
+        self.assertEqual(command["payload"]["_storage_reconcile_items"], [{
+            "index": 0,
+            "path": "ambiguous.txt",
+            "name": "ambiguous.txt",
+            "profile": "default",
+        }])
         self.assertEqual(command["payload"]["tdl_access_target"], "-1009876543210")
         self.assertEqual(command["payload"]["start_timestamp"], int(created_at.timestamp()))
 

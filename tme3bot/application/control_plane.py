@@ -8,6 +8,7 @@ import secrets
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
@@ -100,10 +101,30 @@ class ControlPlane:
         self._scheduler_thread: threading.Thread | None = None
         self._stale_cancel_requested: dict[str, Any] = {}
         self._stale_job_lock = threading.RLock()
+        self._storage_source_action_guard = threading.Lock()
+        self._storage_source_action_locks: dict[str, dict[str, Any]] = {}
         self._tts_route_lock = threading.Lock()
         self._tts_round_robin = 0
         self._tts_sender_round_robin: dict[str, int] = {}
         self.add_event_observer(self._invalidate_runtime_readiness_from_event)
+
+    @contextmanager
+    def _storage_source_action_lock(self, source_job_id: str):
+        key = str(source_job_id)
+        with self._storage_source_action_guard:
+            entry = self._storage_source_action_locks.get(key)
+            if entry is None:
+                entry = {"lock": threading.RLock(), "users": 0}
+                self._storage_source_action_locks[key] = entry
+            entry["users"] += 1
+        try:
+            with entry["lock"]:
+                yield
+        finally:
+            with self._storage_source_action_guard:
+                entry["users"] -= 1
+                if entry["users"] == 0 and self._storage_source_action_locks.get(key) is entry:
+                    del self._storage_source_action_locks[key]
 
     def actor(self, telegram_user_id: int) -> Actor:
         profile = self.profile_manager.profile_for_user(telegram_user_id)
@@ -4003,6 +4024,517 @@ class ControlPlane:
             "not_confirmed": not_confirmed,
         }
 
+    def _storage_reconciliation_proves_missing(
+        self, source: Job, item_index: int, item: dict[str, Any]
+    ) -> bool:
+        proof = item.get("reconciliation")
+        if not isinstance(proof, dict):
+            return False
+        if type(proof.get("match_count")) is not int:
+            return False
+        if proof.get("status") != "failed" or proof.get("match_count") != 0:
+            return False
+        proof_job_id = str(proof.get("job_id") or "").strip()
+        verifier = self.jobs.get(proof_job_id) if proof_job_id else None
+        if (
+            verifier is None
+            or verifier.kind != "storage_reconcile"
+            # A batch reconciliation may finish as failed/needs-reconciliation
+            # because a sibling item is still ambiguous. The per-item evidence
+            # below is authoritative only when it explicitly says the export
+            # was complete and this exact item was absent.
+            or verifier.status not in {JobStatus.SUCCEEDED, JobStatus.FAILED}
+            or verifier.actor_user_id != source.actor_user_id
+            or verifier.profile != source.profile
+            or verifier.worker != source.worker
+            or str(verifier.payload.get("source_job_id") or "") != source.id
+        ):
+            return False
+        verifier_item_index = verifier.payload.get("item_index")
+        if verifier_item_index is not None and (
+            type(verifier_item_index) is not int or verifier_item_index != item_index
+        ):
+            return False
+        verifier_result = verifier.result if isinstance(verifier.result, dict) else {}
+        verifier_value = verifier_result.get("value", verifier_result)
+        if not isinstance(verifier_value, dict):
+            return False
+        if str(verifier_value.get("source_job_id") or "") != source.id:
+            return False
+        if str(verifier_value.get("provider") or "telegram").strip().lower() != "telegram":
+            return False
+        evidence_items = verifier_value.get("items")
+        if not isinstance(evidence_items, list):
+            return False
+        source_name = str(item.get("name") or "")
+        for evidence in evidence_items:
+            if not isinstance(evidence, dict):
+                continue
+            if (
+                type(evidence.get("index")) is not int
+                or type(evidence.get("match_count")) is not int
+            ):
+                continue
+            if (
+                evidence["index"] == item_index
+                and str(evidence.get("name") or "") == source_name
+                and evidence.get("status") == "failed"
+                and evidence["match_count"] == 0
+                and evidence.get("retryable") is True
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _storage_retry_item_paths(
+        payload: dict[str, Any], source_items: list[Any]
+    ) -> dict[int, str]:
+        raw_mapping = payload.get("_storage_retry_item_indexes")
+        mapped: dict[int, str] = {}
+        if isinstance(raw_mapping, dict):
+            for raw_index, raw_path in raw_mapping.items():
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(raw_index, bool) or index < 0 or not isinstance(raw_path, str):
+                    continue
+                mapped[index] = raw_path
+            if mapped:
+                return mapped
+
+        single_index = payload.get("_storage_retry_item_index")
+        if isinstance(single_index, int) and not isinstance(single_index, bool) and single_index >= 0:
+            path = ""
+            if single_index < len(source_items) and isinstance(source_items[single_index], dict):
+                path = str(source_items[single_index].get("path") or "")
+            if path:
+                return {single_index: path}
+
+        raw_paths = payload.get("_storage_retry_paths")
+        selected_paths = {
+            str(path)
+            for path in raw_paths
+            if isinstance(path, str) and path
+        } if isinstance(raw_paths, list) else set()
+        for index, item in enumerate(source_items):
+            if isinstance(item, dict):
+                path = str(item.get("path") or "")
+                if path in selected_paths:
+                    mapped[index] = path
+        return mapped
+
+    def _update_storage_upload_items(
+        self, source: Job, value: dict[str, Any], items: list[Any]
+    ) -> Job:
+        value["items"] = items
+        value["total"] = len(items)
+        value["succeeded"] = sum(
+            isinstance(item, dict) and item.get("status") == "succeeded"
+            for item in items
+        )
+        value["skipped"] = sum(
+            isinstance(item, dict) and item.get("status") == "skipped"
+            for item in items
+        )
+        unresolved = [
+            item for item in items
+            if not isinstance(item, dict)
+            or item.get("status") not in {"succeeded", "skipped"}
+        ]
+        value["failed"] = unresolved
+        value["retryable"] = any(
+            isinstance(item, dict) and item.get("retryable") is True
+            for item in unresolved
+        )
+        value["ambiguous"] = sum(
+            isinstance(item, dict) and item.get("status") == "needs_reconciliation"
+            for item in unresolved
+        )
+        value["skipped_items"] = [
+            item for item in items
+            if isinstance(item, dict) and item.get("status") == "skipped"
+        ]
+        if unresolved:
+            has_success = value["succeeded"] > 0 or value["skipped"] > 0
+            value["outcome"] = (
+                "partial_failure" if has_success
+                else "needs_reconciliation"
+                if any(
+                    isinstance(item, dict)
+                    and item.get("status") == "needs_reconciliation"
+                    for item in unresolved
+                )
+                else "failed"
+            )
+        else:
+            value["outcome"] = "succeeded"
+        source_result = source.result if isinstance(source.result, dict) else {}
+        if isinstance(source_result.get("value"), dict):
+            result = {**source_result, "value": value}
+        else:
+            result = value
+        return self.jobs.update_result(source.id, result)
+
+    def _mark_storage_items_retrying(
+        self,
+        source_job_id: str,
+        retry_job: Job,
+        item_paths: dict[int, str],
+        *,
+        require_reconciliation_proof: bool,
+    ) -> Job | None:
+        source = self.jobs.get(source_job_id)
+        if (
+            source is None
+            or source.kind != "storage_upload"
+            or source.status not in {JobStatus.FAILED, JobStatus.CANCELLED}
+            or source.actor_user_id != retry_job.actor_user_id
+            or source.profile != retry_job.profile
+            or source.worker != retry_job.worker
+        ):
+            return None
+        source_result = source.result if isinstance(source.result, dict) else {}
+        value = source_result.get("value", source_result)
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            return None
+        items = [dict(item) if isinstance(item, dict) else item for item in value["items"]]
+        changed = False
+        for item_index, expected_path in item_paths.items():
+            if item_index < 0 or item_index >= len(items):
+                continue
+            item = items[item_index]
+            if (
+                not isinstance(item, dict)
+                or item.get("status") not in {"failed", "pending"}
+                or item.get("retryable") is not True
+                or str(item.get("path") or "") != expected_path
+                or (
+                    require_reconciliation_proof
+                    and not self._storage_reconciliation_proves_missing(source, item_index, item)
+                )
+            ):
+                continue
+            item.update(status="retrying", retryable=False, retry_job_id=retry_job.id)
+            items[item_index] = item
+            changed = True
+        if not changed:
+            return None
+        return self._update_storage_upload_items(source, value, items)
+
+    def _retry_storage_upload_item(
+        self, actor: Actor, original: Job, item_index: int
+    ) -> Job:
+        if str(original.payload.get("provider") or "telegram").strip().lower() != "telegram":
+            raise DomainError(
+                "STORAGE_RETRY_UNAVAILABLE",
+                "Retry individual hanya tersedia untuk file Telegram yang sudah diverifikasi.",
+                status_code=409,
+            )
+        result_value = (
+            original.result.get("value", original.result)
+            if isinstance(original.result, dict)
+            else {}
+        )
+        file_items = result_value.get("items") if isinstance(result_value, dict) else []
+        file_items = file_items if isinstance(file_items, list) else []
+        if item_index < 0 or item_index >= len(file_items):
+            raise DomainError(
+                "STORAGE_RETRY_UNAVAILABLE",
+                "File ini tidak lagi tersedia untuk Retry.",
+                status_code=409,
+            )
+        current_item = file_items[item_index]
+        if isinstance(current_item, dict) and current_item.get("status") == "retrying":
+            retry_job_id = str(current_item.get("retry_job_id") or "").strip()
+            retry_job = self.jobs.get(retry_job_id) if retry_job_id else None
+            if retry_job is not None:
+                if retry_job.status.terminal:
+                    retry_result = retry_job.result if isinstance(retry_job.result, dict) else {}
+                    retry_value = retry_result.get("value", retry_result)
+                    if isinstance(retry_value, dict):
+                        self._apply_storage_retry_result(retry_job, retry_value)
+                return retry_job
+            raise DomainError(
+                "STORAGE_RETRY_IN_PROGRESS",
+                "Retry file ini masih berjalan.",
+                status_code=409,
+            )
+        for candidate in self.jobs.list(
+            actor_user_id=actor.telegram_user_id,
+            profile=original.profile,
+            kind="storage_upload",
+            worker=original.worker,
+            archived=False,
+            offset=0,
+            limit=1000,
+        ):
+            if candidate.status.terminal:
+                continue
+            command = self.jobs.command_payload(candidate.id)
+            nested_payload = command.get("payload") if isinstance(command, dict) else None
+            payload = nested_payload if isinstance(nested_payload, dict) else (
+                command if isinstance(command, dict) else {}
+            )
+            candidate_value = (
+                original.result.get("value", original.result)
+                if isinstance(original.result, dict)
+                else {}
+            )
+            candidate_items = candidate_value.get("items") if isinstance(candidate_value, dict) else []
+            candidate_items = candidate_items if isinstance(candidate_items, list) else []
+            indexed_paths = self._storage_retry_item_paths(payload, candidate_items)
+            if (
+                str(payload.get("_storage_retry_of") or "") == original.id
+                and indexed_paths.get(item_index) == str(current_item.get("path") or "")
+            ):
+                self._mark_storage_items_retrying(
+                    original.id,
+                    candidate,
+                    {item_index: str(current_item.get("path") or "")},
+                    require_reconciliation_proof=False,
+                )
+                return candidate
+
+        item = file_items[item_index]
+        if isinstance(item, dict) and item.get("status") == "retrying":
+            raise DomainError(
+                "STORAGE_RETRY_IN_PROGRESS",
+                "Retry file ini masih berjalan.",
+                status_code=409,
+            )
+        if (
+            not isinstance(item, dict)
+            or item.get("status") not in {"failed", "pending"}
+            or item.get("retryable") is not True
+        ):
+            raise DomainError(
+                "STORAGE_RETRY_UNAVAILABLE",
+                "File ini tidak dipastikan gagal sebelum terkirim.",
+                status_code=409,
+            )
+        if not self._storage_reconciliation_proves_missing(original, item_index, item):
+            raise DomainError(
+                "STORAGE_RETRY_REQUIRES_RECONCILIATION",
+                "Verifikasi lengkap harus memastikan file ini tidak ada sebelum Retry.",
+                status_code=409,
+            )
+        raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+        path = PurePosixPath(raw_path)
+        if (
+            not raw_path
+            or path.is_absolute()
+            or any(part in {"", ".", ".."} for part in path.parts)
+            or path.as_posix() != raw_path
+        ):
+            raise DomainError(
+                "STORAGE_RETRY_UNAVAILABLE",
+                "Path file untuk Retry tidak valid.",
+                status_code=409,
+            )
+        try:
+            attempts = max(0, int(item.get("attempt") or 0))
+        except (TypeError, ValueError):
+            attempts = 0
+        payload = deepcopy(original.payload)
+        payload["batch_id"] = str(uuid.uuid4())
+        payload["_storage_retry_paths"] = [raw_path]
+        payload["_storage_file_attempts"] = {raw_path: attempts}
+        payload["_storage_retry_of"] = original.id
+        payload["_storage_retry_item_index"] = item_index
+        payload["_storage_retry_item_indexes"] = {str(item_index): raw_path}
+        retry_job = self.submit_job(
+            actor,
+            "storage_upload",
+            payload,
+            profile=original.profile,
+            worker=original.worker,
+        )
+        self._mark_storage_items_retrying(
+            original.id,
+            retry_job,
+            {item_index: raw_path},
+            require_reconciliation_proof=True,
+        )
+        current_retry = self.jobs.get(retry_job.id) or retry_job
+        if current_retry.status.terminal:
+            child_result = current_retry.result if isinstance(current_retry.result, dict) else {}
+            value = child_result.get("value", child_result)
+            if isinstance(value, dict):
+                self._apply_storage_retry_result(current_retry, value)
+        return current_retry
+
+    def _retry_storage_upload_batch(self, actor: Actor, original: Job) -> Job:
+        result_value = (
+            original.result.get("value", original.result)
+            if isinstance(original.result, dict)
+            else {}
+        )
+        file_items = result_value.get("items") if isinstance(result_value, dict) else []
+        file_items = file_items if isinstance(file_items, list) else []
+        retry_paths: dict[str, int] = {}
+        retry_indexes: dict[str, str] = {}
+        item_paths: dict[int, str] = {}
+        for index, item in enumerate(file_items):
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") not in {"failed", "pending"} or item.get("retryable") is not True:
+                continue
+            raw_path = str(item.get("path") or "").replace("\\", "/").strip()
+            path = PurePosixPath(raw_path)
+            if (
+                not raw_path
+                or path.is_absolute()
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or path.as_posix() != raw_path
+            ):
+                continue
+            if raw_path in retry_paths:
+                continue
+            try:
+                attempt = max(0, int(item.get("attempt") or 0))
+            except (TypeError, ValueError):
+                attempt = 0
+            retry_paths[raw_path] = attempt
+            retry_indexes[str(index)] = raw_path
+            item_paths[index] = raw_path
+        if not retry_paths:
+            raise DomainError(
+                "STORAGE_RETRY_UNAVAILABLE",
+                "Tidak ada file yang dipastikan belum diterima Telegram. File ambigu harus direkonsiliasi sebelum Retry.",
+                status_code=409,
+            )
+
+        # Do not let a repeated batch action overlap an in-flight per-file or
+        # batch retry for this source job.
+        for candidate in self.jobs.list(
+            actor_user_id=actor.telegram_user_id,
+            profile=original.profile,
+            kind="storage_upload",
+            worker=original.worker,
+            archived=False,
+            offset=0,
+            limit=1000,
+        ):
+            if candidate.status.terminal:
+                continue
+            command = self.jobs.command_payload(candidate.id)
+            nested_payload = command.get("payload") if isinstance(command, dict) else None
+            child_payload = nested_payload if isinstance(nested_payload, dict) else (
+                command if isinstance(command, dict) else {}
+            )
+            if str(child_payload.get("_storage_retry_of") or "") == original.id:
+                raise DomainError(
+                    "STORAGE_RETRY_IN_PROGRESS",
+                    "Retry file dari upload ini masih berjalan.",
+                    status_code=409,
+                )
+
+        payload = deepcopy(original.payload)
+        payload["batch_id"] = str(uuid.uuid4())
+        payload["_storage_retry_paths"] = sorted(retry_paths)
+        payload["_storage_file_attempts"] = retry_paths
+        payload["_storage_retry_of"] = original.id
+        payload["_storage_retry_item_indexes"] = retry_indexes
+        retry_job = self.submit_job(
+            actor,
+            "storage_upload",
+            payload,
+            profile=original.profile,
+            worker=original.worker,
+        )
+        self._mark_storage_items_retrying(
+            original.id,
+            retry_job,
+            item_paths,
+            require_reconciliation_proof=False,
+        )
+        current_retry = self.jobs.get(retry_job.id) or retry_job
+        if current_retry.status.terminal:
+            child_result = current_retry.result if isinstance(current_retry.result, dict) else {}
+            value = child_result.get("value", child_result)
+            if isinstance(value, dict):
+                self._apply_storage_retry_result(current_retry, value)
+        return current_retry
+
+    def _apply_storage_retry_result(self, retry_job: Job, result: dict[str, Any]) -> None:
+        command = self.jobs.command_payload(retry_job.id)
+        nested_payload = command.get("payload") if isinstance(command, dict) else None
+        payload = nested_payload if isinstance(nested_payload, dict) else (
+            command if isinstance(command, dict) else {}
+        )
+        source_job_id = str(payload.get("_storage_retry_of") or "").strip()
+        if not source_job_id:
+            return
+        with self._storage_source_action_lock(source_job_id):
+            source = self.jobs.get(source_job_id)
+            if (
+                source is None
+                or source.kind != "storage_upload"
+                or source.actor_user_id != retry_job.actor_user_id
+                or source.profile != retry_job.profile
+                or source.worker != retry_job.worker
+                or not source.status.terminal
+            ):
+                return
+            source_result = source.result if isinstance(source.result, dict) else {}
+            value = source_result.get("value", source_result)
+            if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+                return
+            items = [dict(item) if isinstance(item, dict) else item for item in value["items"]]
+            item_paths = self._storage_retry_item_paths(payload, items)
+            if not item_paths:
+                return
+            evidence_items = result.get("items") if isinstance(result.get("items"), list) else []
+            changed = False
+            for item_index, expected_path in item_paths.items():
+                if item_index < 0 or item_index >= len(items):
+                    continue
+                original_item = items[item_index]
+                if (
+                    not isinstance(original_item, dict)
+                    or original_item.get("status") != "retrying"
+                    or str(original_item.get("retry_job_id") or "") != retry_job.id
+                    or str(original_item.get("path") or "") != expected_path
+                ):
+                    continue
+                evidence = next((
+                    item for item in evidence_items
+                    if isinstance(item, dict)
+                    and str(item.get("path") or "") == expected_path
+                ), None)
+                if evidence is None:
+                    original_item.update(
+                        status="needs_reconciliation",
+                        retryable=False,
+                        error="Hasil Retry belum terkonfirmasi; verifikasi ulang file.",
+                    )
+                    original_item.pop("reconciliation", None)
+                else:
+                    evidence_status = str(evidence.get("status") or "")
+                    if evidence_status in {"succeeded", "skipped"}:
+                        original_item["status"] = evidence_status
+                        original_item["retryable"] = False
+                        original_item.pop("reconciliation", None)
+                        original_item.pop("source_identity", None)
+                    else:
+                        original_item["status"] = "needs_reconciliation"
+                        original_item["retryable"] = False
+                        original_item.pop("reconciliation", None)
+                    for key in (
+                        "upload_status", "cleanup_status", "attempt", "profile",
+                        "error", "error_code", "reason", "reason_code", "attempts",
+                    ):
+                        if key in evidence:
+                            original_item[key] = deepcopy(evidence[key])
+                        elif key in {"error", "error_code", "reason", "reason_code", "attempts"}:
+                            original_item.pop(key, None)
+                original_item.pop("retry_job_id", None)
+                items[item_index] = original_item
+                changed = True
+            if changed:
+                self._update_storage_upload_items(source, value, items)
+
     def retry_job(
         self,
         actor: Actor,
@@ -4010,62 +4542,39 @@ class ControlPlane:
         *,
         resume_phase: str | None = None,
         single_phase: bool = False,
+        storage_item_index: int | None = None,
     ) -> Job:
         """Restart an export attempt while preserving its stable job ID."""
         original = self.jobs.get(job_id)
         if original is None:
             raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
         self.require_profile(actor, original.profile)
+        if storage_item_index is not None and original.kind != "storage_upload":
+            raise DomainError(
+                "STORAGE_RETRY_UNAVAILABLE",
+                "Retry per file hanya tersedia untuk upload Storage.",
+                status_code=409,
+            )
+        if original.kind == "storage_upload":
+            with self._storage_source_action_lock(original.id):
+                original = self.jobs.get(job_id)
+                if original is None:
+                    raise DomainError("JOB_NOT_FOUND", "Job tidak ditemukan.", status_code=404)
+                self.require_profile(actor, original.profile)
+                if not original.status.terminal:
+                    raise DomainError(
+                        "JOB_NOT_TERMINAL",
+                        "Job masih aktif dan belum dapat diulang.",
+                        status_code=409,
+                    )
+                if storage_item_index is not None:
+                    return self._retry_storage_upload_item(actor, original, storage_item_index)
+                return self._retry_storage_upload_batch(actor, original)
         if not original.status.terminal:
             raise DomainError(
                 "JOB_NOT_TERMINAL",
                 "Job masih aktif dan belum dapat diulang.",
                 status_code=409,
-            )
-        if original.kind == "storage_upload":
-            result_value = (
-                original.result.get("value", original.result)
-                if isinstance(original.result, dict)
-                else {}
-            )
-            file_items = result_value.get("items") if isinstance(result_value, dict) else []
-            file_items = file_items if isinstance(file_items, list) else []
-            retry_paths: dict[str, int] = {}
-            for item in file_items:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("status") not in {"failed", "pending"} or item.get("retryable") is not True:
-                    continue
-                raw_path = str(item.get("path") or "").replace("\\", "/").strip()
-                path = PurePosixPath(raw_path)
-                if (
-                    not raw_path
-                    or path.is_absolute()
-                    or any(part in {"", ".", ".."} for part in path.parts)
-                    or path.as_posix() != raw_path
-                ):
-                    continue
-                try:
-                    retry_paths[raw_path] = max(0, int(item.get("attempt") or 0))
-                except (TypeError, ValueError):
-                    retry_paths[raw_path] = 0
-            if not retry_paths:
-                raise DomainError(
-                    "STORAGE_RETRY_UNAVAILABLE",
-                    "Tidak ada file yang dipastikan belum diterima Telegram. File ambigu harus direkonsiliasi sebelum Retry.",
-                    status_code=409,
-                )
-            payload = deepcopy(original.payload)
-            payload["batch_id"] = str(uuid.uuid4())
-            payload["_storage_retry_paths"] = sorted(retry_paths)
-            payload["_storage_file_attempts"] = retry_paths
-            payload["_storage_retry_of"] = original.id
-            return self.submit_job(
-                actor,
-                "storage_upload",
-                payload,
-                profile=original.profile,
-                worker=original.worker,
             )
         if original.kind != "export":
             raise DomainError(
@@ -4372,7 +4881,17 @@ class ControlPlane:
         # running process.
         return self.jobs.get(job.id) or job
 
-    def reconcile_storage_upload(self, actor: Actor, job_id: str) -> Job:
+    def reconcile_storage_upload(
+        self, actor: Actor, job_id: str, *, item_index: int | None = None
+    ) -> Job:
+        with self._storage_source_action_lock(job_id):
+            return self._reconcile_storage_upload_locked(
+                actor, job_id, item_index=item_index
+            )
+
+    def _reconcile_storage_upload_locked(
+        self, actor: Actor, job_id: str, *, item_index: int | None = None
+    ) -> Job:
         """Queue a read-only filename scan for ambiguous files in one upload job."""
         original = self.jobs.get(job_id)
         if original is None:
@@ -4382,6 +4901,16 @@ class ControlPlane:
             raise DomainError(
                 "STORAGE_UPLOAD_REQUIRED",
                 "Rekonsiliasi hanya tersedia untuk upload Storage.",
+                status_code=409,
+            )
+        if item_index is not None and (
+            not isinstance(item_index, int)
+            or isinstance(item_index, bool)
+            or item_index < 0
+        ):
+            raise DomainError(
+                "STORAGE_RECONCILIATION_ITEM_UNAVAILABLE",
+                "Nomor file untuk verifikasi tidak valid.",
                 status_code=409,
             )
         if not original.status.terminal:
@@ -4400,6 +4929,12 @@ class ControlPlane:
             raise DomainError(
                 "STORAGE_RECONCILIATION_UNAVAILABLE",
                 "Provider upload tidak didukung untuk rekonsiliasi.",
+                status_code=409,
+            )
+        if item_index is not None and provider != "telegram":
+            raise DomainError(
+                "STORAGE_RECONCILIATION_ITEM_UNAVAILABLE",
+                "Verifikasi per file hanya tersedia untuk upload Telegram.",
                 status_code=409,
             )
         ambiguous: list[dict[str, Any]] = []
@@ -4451,6 +4986,17 @@ class ControlPlane:
                 "Tidak ada file ambigu yang menunggu rekonsiliasi.",
                 status_code=409,
             )
+        if item_index is not None:
+            selected_item = next(
+                (item for item in ambiguous if item["index"] == item_index), None
+            )
+            if selected_item is None:
+                raise DomainError(
+                    "STORAGE_RECONCILIATION_ITEM_UNAVAILABLE",
+                    "File ini tidak lagi menunggu verifikasi.",
+                    status_code=409,
+                )
+            ambiguous = [selected_item]
 
         for candidate in self.jobs.list(
             actor_user_id=actor.telegram_user_id,
@@ -4465,7 +5011,17 @@ class ControlPlane:
                 and candidate.worker == original.worker
                 and str(candidate.payload.get("source_job_id") or "") == original.id
             ):
-                return candidate
+                active_index = candidate.payload.get("item_index")
+                if item_index is None:
+                    if active_index is None:
+                        return candidate
+                elif active_index is None or active_index == item_index:
+                    return candidate
+                raise DomainError(
+                    "STORAGE_RECONCILIATION_IN_PROGRESS",
+                    "Verifikasi file lain pada upload ini masih berjalan.",
+                    status_code=409,
+                )
 
         created_at = original.created_at
         if created_at.tzinfo is None:
@@ -4481,6 +5037,8 @@ class ControlPlane:
             "end_timestamp": end_timestamp,
             "_storage_reconcile_items": ambiguous,
         }
+        if item_index is not None:
+            payload["item_index"] = item_index
         if provider == "rclone":
             destination = str(original.payload.get("rclone_destination") or "").strip()
             try:
@@ -4608,7 +5166,12 @@ class ControlPlane:
         if kind == "safelink_resolve":
             return {"submitted": True}
         if kind == "storage_reconcile":
-            return {"source_job_id": str(payload.get("source_job_id") or "")}
+            public_payload = {"source_job_id": str(payload.get("source_job_id") or "")}
+            if isinstance(payload.get("item_index"), int) and not isinstance(
+                payload.get("item_index"), bool
+            ):
+                public_payload["item_index"] = payload["item_index"]
+            return public_payload
         if kind == "tdl_access_verify":
             return {"purpose": str(payload.get("purpose") or "")}
         if kind == "backup_verify":
@@ -4679,6 +5242,14 @@ class ControlPlane:
             result = result["value"]
         if job.kind == "storage_reconcile" and event.status.terminal and isinstance(result, dict):
             self._apply_storage_reconciliation_result(job, result)
+        if job.kind == "storage_upload" and event.status.terminal and isinstance(result, dict):
+            command = self.jobs.command_payload(job.id)
+            nested_payload = command.get("payload") if isinstance(command, dict) else None
+            payload = nested_payload if isinstance(nested_payload, dict) else (
+                command if isinstance(command, dict) else {}
+            )
+            if payload.get("_storage_retry_of"):
+                self._apply_storage_retry_result(job, result)
         if job.kind == "tdl_access_verify" and event.status == JobStatus.SUCCEEDED:
             store = self.tdl_access_store
             command = self.jobs.command_payload(job.id)
@@ -4979,6 +5550,17 @@ class ControlPlane:
     def _apply_storage_reconciliation_result(
         self, reconciliation_job: Job, result: dict[str, Any]
     ) -> None:
+        source_job_id = str(reconciliation_job.payload.get("source_job_id") or "").strip()
+        if not source_job_id:
+            return
+        with self._storage_source_action_lock(source_job_id):
+            self._apply_storage_reconciliation_result_locked(
+                reconciliation_job, result
+            )
+
+    def _apply_storage_reconciliation_result_locked(
+        self, reconciliation_job: Job, result: dict[str, Any]
+    ) -> None:
         source_job_id = str(result.get("source_job_id") or "").strip()
         source = self.jobs.get(source_job_id) if source_job_id else None
         if (
@@ -5002,6 +5584,7 @@ class ControlPlane:
             return
         updated_items = [dict(item) if isinstance(item, dict) else item for item in value["items"]]
         seen: set[int] = set()
+        expected_item_index = reconciliation_job.payload.get("item_index")
         for evidence in result.get("items", []) if isinstance(result.get("items"), list) else []:
             if not isinstance(evidence, dict):
                 continue
@@ -5009,6 +5592,8 @@ class ControlPlane:
                 index = int(evidence.get("index"))
                 match_count = max(0, int(evidence.get("match_count") or 0))
             except (TypeError, ValueError):
+                continue
+            if expected_item_index is not None and index != expected_item_index:
                 continue
             if index in seen or index < 0 or index >= len(updated_items):
                 continue
