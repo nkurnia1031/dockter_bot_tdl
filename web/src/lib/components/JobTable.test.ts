@@ -279,7 +279,7 @@ describe('JobTable', () => {
     expect(within(ambiguousRow).queryByRole('button', { name: 'Retry file' })).toBeNull();
   });
 
-  it('does not expose per-file reconcile or retry actions for Rclone uploads', async () => {
+  it('exposes per-file verification and safe retry actions for Rclone uploads', async () => {
     Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
       configurable: true,
       value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
@@ -293,26 +293,39 @@ describe('JobTable', () => {
       profile: 'default', worker: 'local', payload: { provider: 'rclone' },
       created_at: '2026-10-14T00:00:00Z', updated_at: '2026-10-14T00:00:01Z',
       result: { value: { items: [
-        { path: 'archive/file.bin', name: 'file.bin', status: 'needs_reconciliation', retryable: false },
+        { path: 'archive/file.bin', name: 'file.bin', target_path: 'backup/archive/file.bin', status: 'needs_reconciliation', retryable: false },
         { path: 'archive/other.bin', name: 'other.bin', status: 'failed', retryable: true,
-          reconciliation: { job_id: 'old-reconcile', status: 'failed', match_count: 0 } },
+          target_path: 'backup/archive/other.bin', reconciliation: { job_id: 'old-reconcile', status: 'failed', match_count: 0 } },
       ] } },
     };
-    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+    const calls: { url: string; method?: string }[] = [];
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
       const url = String(input);
+      calls.push({ url, method: init?.method });
       if (url.includes('/jobs?')) {
         return new Response(JSON.stringify({ items: url.includes('kind=storage_upload') ? [source] : [] }), { status: 200 });
       }
       if (url.endsWith('/jobs/rclone-item-actions')) return new Response(JSON.stringify(source), { status: 200 });
       if (url.endsWith('/events?after_sequence=0') || url.endsWith('/log-snapshot')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      if (url.endsWith('/jobs/rclone-item-actions/reconcile?item_index=0')) return new Response(JSON.stringify({ id: 'rclone-reconcile', status: 'queued' }), { status: 200 });
+      if (url.endsWith('/jobs/rclone-item-actions/retry?item_index=1')) return new Response(JSON.stringify({ id: 'rclone-retry', status: 'queued' }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
     render(JobTable, { kind: 'storage_upload', retryable: true, view: 'history' });
+    const historyRow = (await screen.findByText('#rclone-i')).closest('article')!;
+    await fireEvent.click(within(historyRow).getByRole('button', { name: 'Rekonsiliasi' }));
+    expect(calls.some((call) => call.url.endsWith('/jobs/rclone-item-actions/reconcile') && call.method === 'POST')).toBe(true);
     await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
 
-    expect(screen.queryByRole('button', { name: 'Verifikasi file' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Retry file' })).toBeNull();
+    const ambiguousRow = screen.getByText('file.bin').closest('article')!;
+    await fireEvent.click(within(ambiguousRow).getByRole('button', { name: 'Verifikasi file' }));
+    expect(calls.some((call) => call.url.endsWith('/jobs/rclone-item-actions/reconcile?item_index=0') && call.method === 'POST')).toBe(true);
+
+    const missingRow = screen.getByText('other.bin').closest('article')!;
+    await fireEvent.click(within(missingRow).getByRole('button', { name: 'Retry file' }));
+    expect(calls.some((call) => call.url.endsWith('/jobs/rclone-item-actions/retry?item_index=1') && call.method === 'POST')).toBe(true);
   });
 
   it('shows completed Storage download results per file in the report', async () => {
@@ -509,7 +522,7 @@ describe('JobTable', () => {
     const { container } = render(JobTable, { kind: 'storage_upload', view: 'history' });
     expect(await screen.findByText('Storage reconcile')).toBeTruthy();
     await fireEvent.click(await screen.findByRole('button', { name: 'Report' }));
-    expect(await screen.findByText('Hasil rekonsiliasi caption')).toBeTruthy();
+    expect(await screen.findByText('Hasil verifikasi tujuan')).toBeTruthy();
     expect(screen.getByText('archive.zip')).toBeTruthy();
     expect(screen.getByText('Caption cocok: 1')).toBeTruthy();
     expect(container.textContent).not.toContain('/workspace/');

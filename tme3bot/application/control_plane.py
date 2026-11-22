@@ -4039,10 +4039,9 @@ class ControlPlane:
         if (
             verifier is None
             or verifier.kind != "storage_reconcile"
-            # A batch reconciliation may finish as failed/needs-reconciliation
-            # because a sibling item is still ambiguous. The per-item evidence
-            # below is authoritative only when it explicitly says the export
-            # was complete and this exact item was absent.
+            # A batch reconciliation may finish with an unresolved sibling.
+            # Per-item evidence is authoritative only when it proves this exact
+            # item absent through its provider-specific verification path.
             or verifier.status not in {JobStatus.SUCCEEDED, JobStatus.FAILED}
             or verifier.actor_user_id != source.actor_user_id
             or verifier.profile != source.profile
@@ -4061,7 +4060,8 @@ class ControlPlane:
             return False
         if str(verifier_value.get("source_job_id") or "") != source.id:
             return False
-        if str(verifier_value.get("provider") or "telegram").strip().lower() != "telegram":
+        provider = str(source.payload.get("provider") or "telegram").strip().lower()
+        if str(verifier_value.get("provider") or "telegram").strip().lower() != provider:
             return False
         evidence_items = verifier_value.get("items")
         if not isinstance(evidence_items, list):
@@ -4082,6 +4082,10 @@ class ControlPlane:
                 and evidence["match_count"] == 0
                 and evidence.get("retryable") is True
             ):
+                if provider == "rclone" and str(evidence.get("target_path") or "") != str(
+                    item.get("target_path") or ""
+                ):
+                    continue
                 return True
         return False
 
@@ -4225,12 +4229,6 @@ class ControlPlane:
     def _retry_storage_upload_item(
         self, actor: Actor, original: Job, item_index: int
     ) -> Job:
-        if str(original.payload.get("provider") or "telegram").strip().lower() != "telegram":
-            raise DomainError(
-                "STORAGE_RETRY_UNAVAILABLE",
-                "Retry individual hanya tersedia untuk file Telegram yang sudah diverifikasi.",
-                status_code=409,
-            )
         result_value = (
             original.result.get("value", original.result)
             if isinstance(original.result, dict)
@@ -4316,7 +4314,7 @@ class ControlPlane:
         if not self._storage_reconciliation_proves_missing(original, item_index, item):
             raise DomainError(
                 "STORAGE_RETRY_REQUIRES_RECONCILIATION",
-                "Verifikasi lengkap harus memastikan file ini tidak ada sebelum Retry.",
+                "Verifikasi lengkap harus memastikan file ini tidak ada di tujuan sebelum Retry.",
                 status_code=409,
             )
         raw_path = str(item.get("path") or "").replace("\\", "/").strip()
@@ -4929,12 +4927,6 @@ class ControlPlane:
             raise DomainError(
                 "STORAGE_RECONCILIATION_UNAVAILABLE",
                 "Provider upload tidak didukung untuk rekonsiliasi.",
-                status_code=409,
-            )
-        if item_index is not None and provider != "telegram":
-            raise DomainError(
-                "STORAGE_RECONCILIATION_ITEM_UNAVAILABLE",
-                "Verifikasi per file hanya tersedia untuk upload Telegram.",
                 status_code=409,
             )
         ambiguous: list[dict[str, Any]] = []

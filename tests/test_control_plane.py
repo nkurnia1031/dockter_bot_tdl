@@ -3349,7 +3349,7 @@ class ControlPlaneTests(unittest.TestCase):
             ["safe.txt"],
         )
 
-    def test_storage_item_reconciliation_rejects_rclone_provider(self):
+    def test_storage_item_reconciliation_supports_rclone_provider(self):
         source = Job(
             id="rclone-item-reconcile-source",
             kind="storage_upload",
@@ -3357,23 +3357,177 @@ class ControlPlaneTests(unittest.TestCase):
             actor_user_id=42,
             worker="local",
             status=JobStatus.FAILED,
-            payload={"provider": "rclone", "folder_path": "/workspace/storage"},
+            payload={
+                "provider": "rclone",
+                "folder_path": "/workspace/storage",
+                "rclone_path": "archive",
+                "rclone_destination": "googledrive:backup",
+            },
             result={"value": {"items": [{
                 "path": "file.bin", "name": "file.bin",
                 "status": "needs_reconciliation", "retryable": False,
                 "target_path": "archive/file.bin",
+                "source_identity": {"device": 1, "inode": 2, "size": 2048, "mtime_ns": 3},
             }]}},
         )
         self.jobs.create(source)
 
-        with self.assertRaises(DomainError) as raised:
-            self.control.reconcile_storage_upload(self.actor, source.id, item_index=0)
-
-        self.assertEqual(
-            raised.exception.code,
-            "STORAGE_RECONCILIATION_ITEM_UNAVAILABLE",
+        reconciliation = self.control.reconcile_storage_upload(
+            self.actor, source.id, item_index=0
         )
+
+        self.assertEqual(reconciliation.kind, "storage_reconcile")
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(payload["item_index"], 0)
+        self.assertEqual(payload["_storage_reconcile_provider"], "rclone")
+        self.assertEqual(payload["rclone_destination"], "googledrive:backup")
+        self.assertEqual(payload["_storage_reconcile_items"], [{
+            "index": 0,
+            "path": "file.bin",
+            "name": "file.bin",
+            "profile": "",
+            "target_path": "archive/file.bin",
+        }])
+
+        next_sequence = max(
+            event.sequence for event in self.jobs.events(reconciliation.id)
+        ) + 1
+        self.control.append_worker_event(
+            JobEvent(reconciliation.id, next_sequence, JobStatus.RUNNING, "started")
+        )
+        self.control.append_worker_event(
+            JobEvent(
+                reconciliation.id,
+                next_sequence + 1,
+                JobStatus.SUCCEEDED,
+                "storage.reconciliation_completed",
+                result={"value": {
+                    "source_job_id": source.id,
+                    "provider": "rclone",
+                    "items": [{
+                        "index": 0,
+                        "name": "file.bin",
+                        "target_path": "archive/file.bin",
+                        "status": "failed",
+                        "match_count": 0,
+                        "retryable": True,
+                    }],
+                }},
+            )
+        )
+
+        verified_source = self.jobs.get(source.id)
+        verified_item = verified_source.result["value"]["items"][0]
+        self.assertEqual(verified_item["status"], "failed")
+        self.assertTrue(verified_item["retryable"])
+
+        retry = self.control.retry_job(
+            self.actor, source.id, storage_item_index=0
+        )
+        retry_payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(retry.kind, "storage_upload")
+        self.assertEqual(retry_payload["provider"], "rclone")
+        self.assertEqual(retry_payload["_storage_retry_paths"], ["file.bin"])
+        self.assertEqual(retry_payload["_storage_retry_item_indexes"], {"0": "file.bin"})
+        self.assertEqual(retry_payload["rclone_destination"], "googledrive:backup")
+        self.assertEqual(retry_payload["rclone_path"], "archive")
+
+    def test_rclone_item_retry_rejects_missing_proof_for_a_different_target_path(self):
+        source = Job(
+            id="rclone-item-proof-source",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={
+                "provider": "rclone",
+                "folder_path": "/workspace/storage",
+                "rclone_destination": "googledrive:backup",
+            },
+            result={"value": {"items": [{
+                "path": "file.bin",
+                "name": "file.bin",
+                "target_path": "archive/file.bin",
+                "status": "failed",
+                "retryable": True,
+                "reconciliation": {
+                    "job_id": "rclone-item-proof-verifier",
+                    "status": "failed",
+                    "match_count": 0,
+                },
+            }]}},
+        )
+        self.jobs.create(source)
+        self.jobs.create(Job(
+            id="rclone-item-proof-verifier",
+            kind="storage_reconcile",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.SUCCEEDED,
+            payload={"source_job_id": source.id, "item_index": 0},
+            result={"value": {
+                "source_job_id": source.id,
+                "provider": "rclone",
+                "items": [{
+                    "index": 0,
+                    "name": "file.bin",
+                    "target_path": "different/file.bin",
+                    "status": "failed",
+                    "match_count": 0,
+                    "retryable": True,
+                }],
+            }},
+        ))
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.retry_job(self.actor, source.id, storage_item_index=0)
+
+        self.assertEqual(raised.exception.code, "STORAGE_RETRY_REQUIRES_RECONCILIATION")
         self.assertEqual(self.dispatcher.commands, [])
+
+    def test_rclone_item_retry_requires_evidence_for_the_exact_destination(self):
+        source = Job(
+            id="rclone-item-proof-exact-source",
+            kind="storage_upload",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.FAILED,
+            payload={"provider": "rclone", "folder_path": "/workspace/storage",
+                     "rclone_destination": "googledrive:backup"},
+            result={"value": {"items": [{
+                "path": "file.bin", "name": "file.bin",
+                "target_path": "archive/file.bin", "status": "failed", "retryable": True,
+                "reconciliation": {
+                    "job_id": "rclone-item-proof-exact-verifier",
+                    "status": "failed", "match_count": 0,
+                },
+            }]}},
+        )
+        self.jobs.create(source)
+        self.jobs.create(Job(
+            id="rclone-item-proof-exact-verifier",
+            kind="storage_reconcile",
+            profile="default",
+            actor_user_id=42,
+            worker="local",
+            status=JobStatus.SUCCEEDED,
+            payload={"source_job_id": source.id, "item_index": 0},
+            result={"value": {
+                "source_job_id": source.id, "provider": "rclone",
+                "items": [{
+                    "index": 0, "name": "file.bin", "target_path": "archive/file.bin",
+                    "status": "failed", "match_count": 0, "retryable": True,
+                }],
+            }},
+        ))
+
+        retry = self.control.retry_job(self.actor, source.id, storage_item_index=0)
+
+        self.assertEqual(retry.kind, "storage_upload")
+        self.assertEqual(self.dispatcher.commands[-1]["payload"]["_storage_retry_paths"], ["file.bin"])
 
     def test_reconciled_success_is_not_retried_and_only_zero_match_file_uses_original_destination(self):
         source = self._create_ambiguous_storage_upload()

@@ -315,7 +315,6 @@
   async function openLog(job: Job) { selected = job; events = []; liveLog = null; logOpen = true; await loadEvents(); }
   function requestTerminate(target: 'one'|'all', job?: Job) { if (job) selected = job; confirmTarget = target; confirmOpen = true; }
   function hasAmbiguousStorageFiles(job: Job): boolean {
-    if (job.payload?.provider === 'rclone') return false;
     const items = job.result?.value?.items || job.result?.items;
     return Array.isArray(items) && items.some((item) => item?.status === 'needs_reconciliation');
   }
@@ -372,7 +371,7 @@
   }
   async function retryStorageItem(job: Job, itemIndex: number) {
     const key = `${job.id}:${itemIndex}`;
-    if (!window.confirm('Rekonsiliasi lengkap memastikan file ini belum ada di tujuan. Kirim ulang file ini saja?')) return;
+    if (!window.confirm('Verifikasi lengkap memastikan file ini belum ada di tujuan. Kirim ulang file ini saja?')) return;
     retryingStorageItems = { ...retryingStorageItems, [key]: true };
     try {
       await post(`/jobs/${encodeURIComponent(job.id)}/retry?item_index=${itemIndex}`);
@@ -391,7 +390,7 @@
     reconciling = { ...reconciling, [job.id]: true };
     try {
       await post(`/jobs/${encodeURIComponent(job.id)}/reconcile`);
-      toastMessage = 'Rekonsiliasi caption Storage masuk antrean.';
+      toastMessage = 'Verifikasi tujuan Storage masuk antrean.';
       toastOpen = true;
       await load();
     } catch (cause) {
@@ -780,14 +779,14 @@
                         <RefreshCw size={15} class="animate-spin"/>Retry berjalan
                       </button>
                     </div>
-                  {:else if item.status === 'needs_reconciliation' && selected.payload?.provider !== 'rclone' && ['failed','cancelled'].includes(selected.status)}
+                  {:else if item.status === 'needs_reconciliation' && ['failed','cancelled'].includes(selected.status)}
                     <div class="mt-3">
                       <button class="button secondary" onclick={() => reconcileStorageItem(selected!, index)} disabled={Boolean(reconcilingStorageItems[itemKey] || activeReconcile)}>
                         <RefreshCw size={15} class={reconcilingStorageItems[itemKey] || itemReconcile ? 'animate-spin' : ''}/>
                         {#if reconcilingStorageItems[itemKey] || itemReconcile}Memverifikasi…{:else if activeReconcile}Verifikasi lain berjalan{:else}Verifikasi file{/if}
                       </button>
                     </div>
-                  {:else if item.status === 'failed' && item.retryable === true && storageItemConfirmedMissing(item) && selected.payload?.provider !== 'rclone' && ['failed','cancelled'].includes(selected.status)}
+                  {:else if item.status === 'failed' && item.retryable === true && storageItemConfirmedMissing(item) && ['failed','cancelled'].includes(selected.status)}
                     <div class="mt-3">
                       <button class="button secondary" onclick={() => retryStorageItem(selected!, index)} disabled={Boolean(retryingStorageItems[itemKey])}>
                         <RefreshCw size={15} class={retryingStorageItems[itemKey] ? 'animate-spin' : ''}/>
@@ -850,7 +849,7 @@
         {#if selected.kind === 'storage_reconcile' && Array.isArray(selected.result?.value?.items || selected.result?.items)}
           {@const reconciliationItems = selected.result?.value?.items || selected.result?.items || []}
           <section class="record-card mb-4">
-            <h3 class="font-bold">Hasil rekonsiliasi caption</h3>
+            <h3 class="font-bold">Hasil verifikasi tujuan</h3>
             <p class="muted mt-1 text-sm">Job sumber: #{String(selected.payload?.source_job_id || '').slice(0, 8)} · tidak menampilkan caption atau path lokal.</p>
             <div class="mt-2 space-y-2">
               {#each reconciliationItems as item, index (item.index ?? index)}
@@ -859,7 +858,7 @@
                     <b class="break-all text-sm">{item.name || `File ${index + 1}`}</b>
                     <span class={`badge ${item.status === 'succeeded' ? 'succeeded' : item.status === 'needs_reconciliation' ? 'failed' : 'queued'}`}>{item.status || 'unknown'}</span>
                     {#if item.profile}<span class="muted text-xs">Upload {item.profile}</span>{/if}
-                    <span class="muted text-xs">Caption cocok: {item.match_count || 0}</span>
+                    <span class="muted text-xs">{(selected.payload?.provider || selected.result?.value?.provider) === 'rclone' ? 'Path dan ukuran cocok' : 'Caption cocok'}: {item.match_count || 0}</span>
                     {#if item.retryable}<span class="text-xs font-semibold text-amber-700">Aman untuk Retry</span>{/if}
                   </div>
                   {#if item.error}<p class="mt-1 break-words text-sm text-rose-700">{item.error}</p>{/if}
