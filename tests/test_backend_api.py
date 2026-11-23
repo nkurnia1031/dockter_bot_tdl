@@ -146,6 +146,9 @@ class FakeDispatcher:
     def __init__(self):
         self.commands = []
         self.durable_commands = []
+        self.progress_snapshot_calls = []
+        self.progress_snapshots = {}
+        self.progress_snapshot_errors = {}
         self.storage_available = True
         self.tts_ready = False
         self.tts_health_result = {
@@ -219,6 +222,15 @@ class FakeDispatcher:
     def dispatch(self, worker, payload):
         self.commands.append((worker, payload))
         return {"position": 1}
+
+    def job_progress_snapshots(self, worker, job_ids):
+        selected = [str(job_id) for job_id in job_ids]
+        self.progress_snapshot_calls.append((worker, selected))
+        error = self.progress_snapshot_errors.get(worker)
+        if error is not None:
+            raise error
+        snapshots = self.progress_snapshots.get(worker, {})
+        return [dict(snapshots[job_id]) for job_id in selected if job_id in snapshots]
 
     def rclone_storage_browse(self, worker, destination, **kwargs):
         self.rclone_browse_calls.append((worker, destination, kwargs))
@@ -730,6 +742,75 @@ class BackendApiTests(unittest.TestCase):
         lite_response = self.client.get("/api/v1/runtime/mode")
 
         self.assertEqual(lite_response.json(), {"mode": "lite"})
+
+    def test_manual_active_refresh_updates_compact_progress_and_marks_unreachable_worker_stale(self):
+        headers = self.login(42)
+        now = datetime.now(timezone.utc)
+        fresh_job = self.jobs.create(Job(
+            id="refresh-fresh", kind="utility", profile="default", actor_user_id=42,
+            worker="remote-1", status=JobStatus.RUNNING,
+            payload={"utility": "extract"}, progress={"retained": "gateway-metadata"},
+        ))
+        stale_job = self.jobs.create(Job(
+            id="refresh-stale", kind="storage_upload", profile="default", actor_user_id=42,
+            worker="remote-2", status=JobStatus.RUNNING,
+            payload={"provider": "telegram"}, progress={"phase": "uploading"},
+        ))
+        queued_job = self.jobs.create(Job(
+            id="refresh-queued", kind="export", profile="default", actor_user_id=42,
+            worker="remote-2", status=JobStatus.QUEUED,
+            payload={}, progress={"phase": "queued"},
+        ))
+        terminal_job = self.jobs.create(Job(
+            id="refresh-terminal", kind="utility", profile="default", actor_user_id=42,
+            worker="remote-1", status=JobStatus.SUCCEEDED,
+            payload={}, progress={"phase": "completed"},
+        ))
+        self.dispatcher.progress_snapshots["remote-1"] = {
+            fresh_job.id: {
+                "job_id": fresh_job.id,
+                "status": "running",
+                "phase": "extracting",
+                "updated_at": now.isoformat(),
+                "progress": {
+                    "phase": "extracting",
+                    "item": {"name": "episode.rar", "index": 2, "total": 5, "percent": 40},
+                    "overall": {"current": 1, "total": 3, "percent": 33.3},
+                    "message": "private raw worker message must not be copied",
+                },
+            }
+        }
+        self.dispatcher.progress_snapshot_errors["remote-2"] = RuntimeError("worker offline")
+
+        response = self.client.post("/api/v1/jobs/refresh-active", headers=headers)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        items = {item["id"]: item for item in response.json()["items"]}
+        self.assertEqual(set(items), {fresh_job.id, stale_job.id, queued_job.id})
+        fresh = items[fresh_job.id]
+        self.assertEqual(fresh["status"], "running")
+        self.assertEqual(fresh["progress"]["retained"], "gateway-metadata")
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["state"], "fresh")
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["active_file"], "episode.rar")
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["stage"], "extracting")
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["completed"], 1)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["total"], 3)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["percent"], 33.3)
+        self.assertNotIn("private raw worker message", str(fresh["progress"]["lite_worker_refresh"]))
+
+        stale = items[stale_job.id]
+        self.assertEqual(stale["status"], "running")
+        self.assertTrue(stale["progress"]["lite_worker_refresh"]["stale"])
+        self.assertEqual(stale["progress"]["lite_worker_refresh"]["state"], "stale")
+        self.assertEqual(stale["progress"]["phase"], "uploading")
+        self.assertEqual(items[queued_job.id]["status"], "queued")
+        self.assertEqual(items[queued_job.id]["progress"]["lite_worker_refresh"]["state"], "waiting_worker")
+        calls_by_worker = dict(self.dispatcher.progress_snapshot_calls)
+        self.assertEqual(calls_by_worker, {
+            "remote-1": [fresh_job.id],
+            "remote-2": [stale_job.id],
+        })
+        self.assertEqual(self.jobs.get(terminal_job.id).status, JobStatus.SUCCEEDED)
 
     def test_lite_worker_options_hide_local_targets_but_keep_remote_workers(self):
         headers = self.login(42)
@@ -5105,6 +5186,36 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(metrics["workers"][0]["quickmode_slots"], 0)
         self.assertEqual(metrics["workers"][0]["quickmode_queued"], 0)
         self.assertIsNotNone(metrics["average_queue_wait_seconds"])
+
+    def test_unresponsive_worker_is_exposed_in_worker_and_job_metrics(self):
+        headers = self.login()
+
+        class Health:
+            def snapshot(self, worker):
+                return {
+                    "worker": worker,
+                    "status": "unresponsive",
+                    "healthy": False,
+                    "reason": "event_backlog_cancel_unconfirmed",
+                }
+
+        self.context.worker_health_monitor = Health()
+
+        worker_response = self.client.get("/api/v1/workers", headers=headers)
+        metrics_response = self.client.get("/api/v1/jobs/metrics", headers=headers)
+
+        self.assertEqual(worker_response.status_code, 200, worker_response.text)
+        self.assertEqual(metrics_response.status_code, 200, metrics_response.text)
+        local_worker = next(
+            item for item in worker_response.json()["items"]
+            if item["name"] == "local"
+        )
+        local_metrics = next(
+            item for item in metrics_response.json()["workers"]
+            if item["worker"] == "local"
+        )
+        self.assertEqual(local_worker["health_status"], "unresponsive")
+        self.assertEqual(local_metrics["status"], "unresponsive")
 
     def test_worker_event_latency_and_phase_timing_are_scoped_to_owner_job(self):
         headers = self.login()

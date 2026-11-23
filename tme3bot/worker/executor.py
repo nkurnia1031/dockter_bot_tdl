@@ -756,6 +756,15 @@ class WorkerJobExecutor(
     def durable_command_status(self, command_id: str) -> dict[str, Any] | None:
         return self.command_runner.status(command_id)
 
+    def durable_job_progress_snapshots(self, job_ids: list[str]) -> list[dict[str, Any]]:
+        if not self.durable_commands_ready():
+            raise DomainError(
+                "DURABLE_COMMANDS_NOT_READY",
+                "Jurnal command worker belum siap.",
+                status_code=503,
+            )
+        return self.command_store.progress_snapshots_for_jobs(job_ids)
+
     def _recover_legacy_quick_stages(self) -> None:
         """Make pre-manager Quick Mode staging visible after worker restart."""
         workspace = self._quick_workspace(self.config)

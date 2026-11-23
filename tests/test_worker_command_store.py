@@ -54,6 +54,55 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertNotIn("dispatch-secret", str(second))
         self.assertNotIn("payload-secret", str(second))
 
+    def test_job_progress_snapshots_return_latest_attempt_checkpoint_without_command_data(self):
+        first = job_envelope("snapshot-command-1", "snapshot-job", attempt=1)
+        self.store.accept(first)
+        self.store.set_status("snapshot-command-1", "running")
+        self.store.append_event(
+            "snapshot-job",
+            {
+                "status": "running",
+                "event_type": "progress.snapshot",
+                "command_id": "snapshot-command-1",
+                "attempt": 1,
+                "dispatch_token": first["dispatch_token"],
+                "progress": {"phase": "old-phase", "item": {"name": "old.bin"}},
+            },
+            transient=True,
+        )
+
+        latest = job_envelope("snapshot-command-2", "snapshot-job", attempt=2)
+        self.store.accept(latest)
+        self.store.set_status("snapshot-command-2", "running")
+        self.store.append_event(
+            "snapshot-job",
+            {
+                "status": "running",
+                "event_type": "progress.snapshot",
+                "command_id": "snapshot-command-2",
+                "attempt": 2,
+                "dispatch_token": latest["dispatch_token"],
+                "progress": {
+                    "phase": "uploading",
+                    "item": {"name": "new.bin", "index": 2, "total": 4, "percent": 40},
+                },
+            },
+            transient=True,
+        )
+
+        snapshots = self.store.progress_snapshots_for_jobs(
+            ["snapshot-job", "missing-job", "snapshot-job"]
+        )
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["job_id"], "snapshot-job")
+        self.assertEqual(snapshots[0]["attempt"], 2)
+        self.assertEqual(snapshots[0]["phase"], "uploading")
+        self.assertEqual(snapshots[0]["progress"]["item"]["name"], "new.bin")
+        self.assertNotIn("command_id", snapshots[0])
+        self.assertNotIn("checkpoint", snapshots[0])
+        self.assertNotIn("payload", snapshots[0])
+
     def _append_and_ack_terminal_command(
         self, envelope, *, status="succeeded", result=None, progress=None
     ):

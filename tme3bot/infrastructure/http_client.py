@@ -4,6 +4,7 @@ import base64
 import json
 import re
 import socket
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -505,16 +506,66 @@ class WorkerHttpDispatcher:
             )
         return {**receipt, "accepted": True}
 
+    def job_progress_snapshots(
+        self, worker: str, job_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Ask the assigned worker for the last durable checkpoint of each job."""
+        selected = list(dict.fromkeys(str(job_id or "").strip() for job_id in job_ids))
+        selected = [job_id for job_id in selected if job_id]
+        if not selected:
+            return []
+        record = self.worker_registry.get(worker)
+        if not record:
+            raise RuntimeError(f"Worker tidak ditemukan: {worker}.")
+        base_url = str(record["url"])
+        token = str(record["token"])
+        snapshots: list[dict[str, Any]] = []
+        for offset in range(0, len(selected), 200):
+            response = request_json(
+                base_url,
+                token,
+                "POST",
+                "/internal/v1/jobs/progress-snapshots",
+                {"job_ids": selected[offset : offset + 200]},
+                timeout=8,
+            )
+            items = response.get("items") if isinstance(response, dict) else None
+            if not isinstance(items, list):
+                raise JsonHttpError(
+                    502,
+                    "Worker mengembalikan snapshot progres yang tidak valid.",
+                    kind="protocol",
+                )
+            snapshots.extend(
+                dict(item)
+                for item in items
+                if isinstance(item, dict)
+                and str(item.get("job_id") or "") in selected[offset : offset + 200]
+            )
+        return snapshots
+
     def cancel(self, worker: str, job_id: str) -> bool:
+        return self.cancel_with_timeout(worker, job_id, timeout_seconds=30)
+
+    def cancel_with_timeout(
+        self, worker: str, job_id: str, *, timeout_seconds: float
+    ) -> bool:
         record = self.worker_registry.get(worker)
         if not record:
             return False
-        self._require_capabilities(worker, {CAP_JOB_CONTROL}, record=record)
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+        self._require_capabilities(
+            worker,
+            {CAP_JOB_CONTROL},
+            record=record,
+            timeout_seconds=self._remaining_timeout(deadline),
+        )
         result = request_json(
             str(record["url"]),
             str(record["token"]),
             "POST",
             f"/internal/v1/jobs/{job_id}/cancel",
+            timeout=self._remaining_timeout(deadline),
         )
         # ``accepted`` means the worker recorded the request. It does not
         # claim the child process has stopped; older workers only returned
@@ -523,13 +574,28 @@ class WorkerHttpDispatcher:
 
     def cancel_attempt(self, worker: str, job_id: str, attempt: int) -> bool:
         """Cancel one durable attempt without affecting a later retry."""
+        return self.cancel_attempt_with_timeout(
+            worker, job_id, attempt, timeout_seconds=30
+        )
+
+    def cancel_attempt_with_timeout(
+        self,
+        worker: str,
+        job_id: str,
+        attempt: int,
+        *,
+        timeout_seconds: float,
+    ) -> bool:
+        """Cancel one durable attempt with a caller-selected response bound."""
         record = self.worker_registry.get(worker)
         if not record:
             return False
+        deadline = time.monotonic() + max(0.1, float(timeout_seconds))
         self._require_capabilities(
             worker,
             {CAP_JOB_CONTROL, CAP_JOB_CANCEL_ATTEMPT},
             record=record,
+            timeout_seconds=self._remaining_timeout(deadline),
         )
         result = request_json(
             str(record["url"]),
@@ -537,8 +603,16 @@ class WorkerHttpDispatcher:
             "POST",
             f"/internal/v1/jobs/{job_id}/cancel",
             {"attempt": max(1, int(attempt))},
+            timeout=self._remaining_timeout(deadline),
         )
         return bool(result.get("accepted", result.get("cancelled", False)))
+
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Worker cancel response deadline elapsed.")
+        return max(0.05, remaining)
 
     def pause(self, worker: str, job_id: str) -> bool:
         record = self.worker_registry.get(worker)
@@ -1017,6 +1091,7 @@ class WorkerHttpDispatcher:
         required: set[str],
         *,
         record: dict[str, Any] | None = None,
+        timeout_seconds: float = 15,
     ) -> dict[str, Any]:
         if record is None:
             record = self.worker_registry.get(worker)
@@ -1027,7 +1102,7 @@ class WorkerHttpDispatcher:
             str(record["token"]),
             "GET",
             "/internal/v1/capabilities",
-            timeout=15,
+            timeout=max(0.05, float(timeout_seconds)),
         )
         return require_worker_contract(
             response, worker, required_capabilities=required

@@ -568,6 +568,11 @@ class TelegramStorageDeliveryRequest(BaseModel):
     telegram_user_id: int
 
 
+class WorkerProgressSnapshotsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    job_ids: list[str] = Field(min_length=1, max_length=200)
+
+
 class WorkerJobRequest(BaseModel):
     job_id: str
     kind: str

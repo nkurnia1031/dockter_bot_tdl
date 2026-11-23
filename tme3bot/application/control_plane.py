@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import secrets
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -51,6 +53,14 @@ _DURABLE_JOB_KINDS = frozenset({
     "safelink_resolve", "tdl_access_verify", "backup_verify", "chat_send",
 })
 _STORAGE_DURABLE_DISPATCH_KEY = "_storage_durable_dispatch"
+_WORKER_UNRESPONSIVE_EVENT_LATENCY_MS = 2_000.0
+_WORKER_UNRESPONSIVE_CANCEL_TIMEOUT_SECONDS = 2.5
+_ACTIVE_PROGRESS_REFRESH_STATUSES = (
+    JobStatus.QUEUED.value,
+    JobStatus.DISPATCHED.value,
+    JobStatus.RUNNING.value,
+    JobStatus.PAUSED.value,
+)
 
 
 class ControlPlane:
@@ -115,12 +125,358 @@ class ControlPlane:
         self._scheduler_thread: threading.Thread | None = None
         self._stale_cancel_requested: dict[str, Any] = {}
         self._stale_job_lock = threading.RLock()
+        self._high_latency_cancel_attempts: dict[str, dict[str, Any]] = {}
+        self._unresponsive_workers: dict[str, str] = {}
         self._storage_source_action_guard = threading.Lock()
         self._storage_source_action_locks: dict[str, dict[str, Any]] = {}
         self._tts_route_lock = threading.Lock()
         self._tts_round_robin = 0
         self._tts_sender_round_robin: dict[str, int] = {}
         self.add_event_observer(self._invalidate_runtime_readiness_from_event)
+        self._restore_unresponsive_workers()
+
+    @staticmethod
+    def _job_event_latency_ms(job: Job) -> float | None:
+        progress = job.progress if isinstance(job.progress, dict) else {}
+        observability = progress.get("observability")
+        observability = observability if isinstance(observability, dict) else {}
+        event_latency = observability.get("event_latency")
+        event_latency = event_latency if isinstance(event_latency, dict) else {}
+        value = event_latency.get("last_ms")
+        if not isinstance(value, (int, float)) or value < 0:
+            telemetry = progress.get("backend_telemetry")
+            telemetry = telemetry if isinstance(telemetry, dict) else {}
+            value = telemetry.get("event_latency_ms")
+        if not isinstance(value, (int, float)) or value < 0:
+            return None
+        return float(value)
+
+    @staticmethod
+    def _progress_number(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
+    @classmethod
+    def _compact_worker_progress(
+        cls,
+        stored_progress: dict[str, Any],
+        worker_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Keep only the compact fields Lite needs from a worker checkpoint."""
+        merged = dict(stored_progress) if isinstance(stored_progress, dict) else {}
+        snapshot = worker_snapshot if isinstance(worker_snapshot, dict) else {}
+        worker_progress = snapshot.get("progress")
+        if isinstance(worker_progress, dict):
+            merged.update(worker_progress)
+
+        item = merged.get("item") if isinstance(merged.get("item"), dict) else {}
+        overall = merged.get("overall") if isinstance(merged.get("overall"), dict) else {}
+        active_items = merged.get("active_items")
+        active_item = (
+            active_items[0]
+            if isinstance(active_items, list)
+            and active_items
+            and isinstance(active_items[0], dict)
+            else {}
+        )
+        name = (
+            active_item.get("name")
+            or item.get("name")
+            or merged.get("tdl_file_name")
+            or merged.get("current_json_name")
+        )
+        if isinstance(name, str):
+            name = name.replace("\x00", "").strip()[:255] or None
+        else:
+            name = None
+
+        completed_value = overall.get("files_current", overall.get("current"))
+        total_value = overall.get("files_total", overall.get("total"))
+        if completed_value is None:
+            completed_value = merged.get("current_json_index")
+        if total_value is None:
+            total_value = merged.get("total_json")
+
+        def count_value(value: Any) -> int | None:
+            parsed = cls._progress_number(value)
+            return max(0, int(parsed)) if parsed is not None else None
+
+        completed = count_value(completed_value)
+        total = count_value(total_value)
+        percent_value = cls._progress_number(
+            overall.get("percent", item.get("percent", merged.get("tdl_percent")))
+        )
+        if percent_value is None and completed is not None and total:
+            percent_value = completed * 100 / total
+        percent = (
+            round(min(100.0, max(0.0, percent_value)), 1)
+            if percent_value is not None
+            else None
+        )
+        stage = merged.get("phase") or snapshot.get("phase")
+        status = item.get("status") or active_item.get("status") or snapshot.get("status")
+        return {
+            "active_file": name,
+            "stage": str(stage)[:80] if stage else None,
+            "status": str(status)[:80] if status else None,
+            "completed": completed,
+            "total": total,
+            "percent": percent,
+        }
+
+    @classmethod
+    def _stale_worker_progress(
+        cls, job: Job, checked_at: str, reason_code: str
+    ) -> dict[str, Any]:
+        previous = job.progress.get("lite_worker_refresh")
+        if isinstance(previous, dict):
+            summary = {
+                key: previous.get(key)
+                for key in (
+                    "active_file", "stage", "status", "completed", "total", "percent"
+                )
+            }
+            refreshed_at = previous.get("refreshed_at")
+        else:
+            summary = cls._compact_worker_progress(job.progress)
+            refreshed_at = None
+        return {
+            **summary,
+            "state": "stale",
+            "stale": True,
+            "checked_at": checked_at,
+            "refreshed_at": refreshed_at,
+            "reason_code": reason_code,
+        }
+
+    @staticmethod
+    def _job_has_unconfirmed_worker_cancel(job: Job) -> bool:
+        progress = job.progress if isinstance(job.progress, dict) else {}
+        result = job.result if isinstance(job.result, dict) else {}
+        return bool(
+            job.status == JobStatus.CANCELLED
+            and progress.get("worker_unresponsive") is True
+            and progress.get("worker_confirmation") == "not_received"
+            and not result.get("late_worker_terminal")
+        )
+
+    @staticmethod
+    def _persisted_high_latency_cancel_request(job: Job) -> dict[str, Any] | None:
+        progress = job.progress if isinstance(job.progress, dict) else {}
+        request = progress.get("backend_cancel_request")
+        if not isinstance(request, dict):
+            return None
+        status = str(request.get("signal_status") or "")
+        if status not in {"pending", "accepted"}:
+            return None
+        try:
+            latency_ms = float(request.get("latency_ms"))
+        except (TypeError, ValueError):
+            latency_ms = _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+        return {
+            "requested_at": request.get("requested_at"),
+            "signal_status": status,
+            "latency_ms": max(0.0, latency_ms),
+            "in_flight": False,
+        }
+
+    @staticmethod
+    def _cancelled_after_stop_event(event: JobEvent) -> JobEvent:
+        """Keep the public lifecycle cancelled while retaining worker outcome."""
+        progress = dict(event.progress or {})
+        progress.update(
+            {
+                "phase": "cancelled",
+                "terminal_phase": "cancelled",
+                "finished_at": event.created_at.isoformat(),
+                "cancelled_after_stop": True,
+                "worker_terminal_status": event.status.value,
+                "worker_terminal_event_type": event.event_type,
+                "worker_terminal_error": _redact_secrets(event.error),
+            }
+        )
+        return replace(
+            event,
+            status=JobStatus.CANCELLED,
+            event_type="cancelled_after_stop",
+            progress=progress,
+            error={
+                "code": "JOB_TERMINATED",
+                "message": (
+                    "Permintaan Stop diterima; event terminal worker setelahnya "
+                    "tidak mengubah status pembatalan."
+                ),
+            },
+        )
+
+    @staticmethod
+    def _cancel_request_time(request: dict[str, Any]) -> datetime | None:
+        value = request.get("requested_at")
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        else:
+            return None
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+    def _cancel_request_grace_expired(
+        self, request: dict[str, Any], now: datetime
+    ) -> bool:
+        requested_at = self._cancel_request_time(request)
+        if requested_at is None:
+            return True
+        current_time = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now
+        return (
+            current_time - requested_at
+        ).total_seconds() >= self.job_cancel_grace_seconds
+
+    def _persist_high_latency_cancel_request(
+        self, job: Job, request: dict[str, Any]
+    ) -> Job:
+        current = self.jobs.get(job.id)
+        if current is None or current.status.terminal:
+            return current or job
+        requested_at = self._cancel_request_time(request)
+        cancel_metadata = {
+            "requested_at": (
+                requested_at.isoformat() if requested_at is not None else ""
+            ),
+            "signal_status": str(request.get("signal_status") or "pending"),
+            "latency_ms": round(float(request.get("latency_ms") or 0.0), 3),
+        }
+        updated, _ = self.jobs.update_progress_metadata(
+            current.id,
+            {"backend_cancel_request": cancel_metadata},
+            remove_keys=("backend_telemetry",),
+        )
+        return updated
+
+    def _clear_pending_cancel_request(self, job_id: str) -> None:
+        with self._stale_job_lock:
+            current = self.jobs.get(job_id)
+            if current is not None and not current.status.terminal:
+                self.jobs.update_progress_metadata(
+                    job_id, {}, remove_keys=("backend_cancel_request",)
+                )
+            self._high_latency_cancel_attempts.pop(job_id, None)
+
+    def _restore_unresponsive_workers(self) -> None:
+        reader = getattr(self.jobs, "unconfirmed_worker_cancellations", None)
+        lister = getattr(self.jobs, "list", None)
+        marker = getattr(self.worker_health_cache, "mark_unresponsive", None)
+        if not callable(reader) and not callable(lister):
+            return
+        try:
+            jobs = (
+                reader()
+                if callable(reader)
+                else lister(
+                    status=JobStatus.CANCELLED.value,
+                    archived=None,
+                    offset=0,
+                    limit=1_000,
+                )
+            )
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "Could not restore worker quarantine state"
+            )
+            return
+        for job in jobs:
+            if not self._job_has_unconfirmed_worker_cancel(job):
+                continue
+            worker = str(job.worker or "").strip().lower()
+            if not worker:
+                continue
+            reason = "event_backlog_cancel_unconfirmed"
+            self._unresponsive_workers[worker] = reason
+            if callable(marker):
+                marker(worker, reason=reason)
+
+    def _mark_worker_unresponsive(self, worker: str, *, reason: str) -> None:
+        name = str(worker or "").strip().lower()
+        if not name:
+            return
+        safe_reason = str(reason or "worker_unresponsive")[:96]
+        with self._stale_job_lock:
+            self._unresponsive_workers[name] = safe_reason
+        marker = getattr(self.worker_health_cache, "mark_unresponsive", None)
+        if callable(marker):
+            marker(name, reason=safe_reason)
+
+    def _clear_worker_unresponsive(self, worker: str) -> None:
+        name = str(worker or "").strip().lower()
+        with self._stale_job_lock:
+            self._unresponsive_workers.pop(name, None)
+        clearer = getattr(self.worker_health_cache, "clear_unresponsive", None)
+        if callable(clearer):
+            clearer(name)
+
+    def _worker_unresponsive_reason(self, worker: str) -> str | None:
+        name = str(worker or "").strip().lower()
+        with self._stale_job_lock:
+            reason = self._unresponsive_workers.get(name)
+        if reason:
+            return reason
+        snapshotter = getattr(self.worker_health_cache, "snapshot", None)
+        snapshot = snapshotter(name) if callable(snapshotter) else None
+        if isinstance(snapshot, dict) and snapshot.get("status") == "unresponsive":
+            return str(snapshot.get("reason") or "worker_unresponsive")
+        return None
+
+    def _require_worker_responsive(self, worker: str) -> None:
+        reason = self._worker_unresponsive_reason(worker)
+        if reason:
+            raise DomainError(
+                "WORKER_UNRESPONSIVE",
+                f"Worker {worker} tidak merespons; job baru ditahan sampai proses lama terkonfirmasi berhenti.",
+                status_code=503,
+                details={"worker": str(worker), "health": "unresponsive", "reason": reason},
+            )
+
+    def _refresh_worker_unresponsive_state(self, worker: str) -> None:
+        reader = getattr(self.jobs, "unconfirmed_worker_cancellations", None)
+        lister = getattr(self.jobs, "list", None)
+        if not callable(reader) and not callable(lister):
+            return
+        try:
+            jobs = (
+                reader(worker=str(worker or "").strip().lower())
+                if callable(reader)
+                else lister(
+                    status=JobStatus.CANCELLED.value,
+                    worker=str(worker or "").strip().lower(),
+                    archived=None,
+                    offset=0,
+                    limit=1_000,
+                )
+            )
+        except Exception:
+            # Keep the quarantine when its persisted evidence cannot be read.
+            return
+        normalized = str(worker or "").strip().lower()
+        remaining = next(
+            (
+                job for job in jobs
+                if self._job_has_unconfirmed_worker_cancel(job)
+            ),
+            None,
+        )
+        if remaining is None:
+            self._clear_worker_unresponsive(normalized)
+        else:
+            self._mark_worker_unresponsive(
+                normalized, reason="event_backlog_cancel_unconfirmed"
+            )
 
     @contextmanager
     def _storage_source_action_lock(self, source_job_id: str):
@@ -149,6 +505,124 @@ class ControlPlane:
                 status_code=403,
             )
         return Actor(int(telegram_user_id), profile)
+
+    def refresh_active_job_progress(self, actor: Actor) -> dict[str, Any]:
+        """Refresh compact worker checkpoints for this actor's active jobs."""
+        selected_profile = self.require_profile(actor, None)
+        total = self.jobs.count(
+            profile=selected_profile,
+            statuses=_ACTIVE_PROGRESS_REFRESH_STATUSES,
+            archived=False,
+        )
+        active_jobs: list[Job] = []
+        offset = 0
+        while offset < total:
+            page = self.jobs.list(
+                profile=selected_profile,
+                statuses=_ACTIVE_PROGRESS_REFRESH_STATUSES,
+                archived=False,
+                offset=offset,
+                limit=500,
+            )
+            if not page:
+                break
+            active_jobs.extend(page)
+            offset += len(page)
+
+        worker_jobs: dict[str, list[str]] = {}
+        waiting_jobs: set[str] = set()
+        for job in active_jobs:
+            pause_kind = str(job.progress.get("pause_kind") or "")
+            if job.status == JobStatus.QUEUED or (
+                job.status == JobStatus.PAUSED and pause_kind == "queued"
+            ):
+                waiting_jobs.add(job.id)
+                continue
+            worker_jobs.setdefault(str(job.worker or "").strip(), []).append(job.id)
+
+        snapshots_by_worker: dict[str, dict[str, dict[str, Any]]] = {}
+        failed_workers: set[str] = set()
+
+        def read_worker_snapshots(worker: str, job_ids: list[str]):
+            reader = getattr(self.dispatcher, "job_progress_snapshots", None)
+            if not callable(reader):
+                raise RuntimeError("worker progress snapshot is unavailable")
+            return reader(worker, job_ids)
+
+        selected_workers = [(worker, ids) for worker, ids in worker_jobs.items() if worker]
+        if selected_workers:
+            with ThreadPoolExecutor(max_workers=min(8, len(selected_workers))) as pool:
+                futures = {
+                    pool.submit(read_worker_snapshots, worker, ids): worker
+                    for worker, ids in selected_workers
+                }
+                for future in as_completed(futures):
+                    worker = futures[future]
+                    try:
+                        raw_items = future.result()
+                        items = (
+                            raw_items.get("items", [])
+                            if isinstance(raw_items, dict)
+                            else raw_items
+                        )
+                        if not isinstance(items, list):
+                            raise ValueError("worker progress response is invalid")
+                        allowed_ids = set(worker_jobs[worker])
+                        snapshots_by_worker[worker] = {
+                            str(item.get("job_id")): item
+                            for item in items
+                            if isinstance(item, dict)
+                            and str(item.get("job_id") or "") in allowed_ids
+                        }
+                    except Exception as exc:
+                        failed_workers.add(worker)
+                        logging.getLogger(__name__).info(
+                            "Manual job progress refresh failed for worker %s (%s)",
+                            worker,
+                            type(exc).__name__,
+                        )
+
+        checked_at = utc_now().isoformat()
+        updated_jobs: list[Job] = []
+        for job in active_jobs:
+            if job.id in waiting_jobs:
+                snapshot = {
+                    **self._compact_worker_progress(job.progress),
+                    "state": "waiting_worker",
+                    "stale": False,
+                    "checked_at": checked_at,
+                    "refreshed_at": None,
+                }
+            else:
+                worker = str(job.worker or "").strip()
+                worker_snapshot = snapshots_by_worker.get(worker, {}).get(job.id)
+                if worker in failed_workers or not worker:
+                    reason_code = "WORKER_UNAVAILABLE" if worker else "WORKER_UNASSIGNED"
+                    snapshot = self._stale_worker_progress(job, checked_at, reason_code)
+                elif worker_snapshot is None:
+                    snapshot = self._stale_worker_progress(
+                        job, checked_at, "SNAPSHOT_NOT_FOUND"
+                    )
+                else:
+                    snapshot = {
+                        **self._compact_worker_progress(job.progress, worker_snapshot),
+                        "state": "fresh",
+                        "stale": False,
+                        "checked_at": checked_at,
+                        "refreshed_at": checked_at,
+                    }
+                    source_updated_at = worker_snapshot.get("updated_at")
+                    if isinstance(source_updated_at, str) and source_updated_at:
+                        snapshot["worker_updated_at"] = source_updated_at[:64]
+            current, _ = self.jobs.update_progress_metadata(
+                job.id, {"lite_worker_refresh": snapshot}
+            )
+            updated_jobs.append(current)
+        return {
+            "items": updated_jobs,
+            "total": len(updated_jobs),
+            "checked_at": checked_at,
+        }
 
     def _worker_names_for_mode(self, selected=None) -> list[str]:
         registry = self.worker_registry
@@ -258,6 +732,7 @@ class ControlPlane:
             selected_worker = routed
         if not selected_worker:
             raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih.", status_code=422)
+        self._require_worker_responsive(selected_worker)
         if self.worker_registry is not None:
             names = self.worker_registry.names()
             if names and selected_worker not in names:
@@ -794,6 +1269,7 @@ class ControlPlane:
             self._require_lite_remote_worker(
                 selected_worker, requested_worker=worker
             )
+        self._require_worker_responsive(selected_worker)
         if kind == "utility":
             submitted_utility_settings = internal_payload.get("settings")
             internal_payload = self._prepare_durable_payload(
@@ -1053,6 +1529,7 @@ class ControlPlane:
                 selected_worker,
                 requested_worker=str(target.get("worker") or "").strip() or None,
             )
+        self._require_worker_responsive(selected_worker)
         payload = self._prepare_durable_payload(
             actor, kind, payload, owner_profile, selected_worker
         )
@@ -2397,6 +2874,8 @@ class ControlPlane:
             return {"status": "accepted", "reason": "already_dispatched"}
         if job.status != JobStatus.QUEUED:
             return {"status": "terminal", "reason": "job_not_queued"}
+        if self._worker_unresponsive_reason(job.worker):
+            return {"status": "wait", "reason": "worker_unresponsive"}
 
         if self.worker_registry is not None:
             record = self.worker_registry.get(job.worker)
@@ -2651,10 +3130,44 @@ class ControlPlane:
             return 1
 
     def _cancel_worker_attempt(self, job: Job, *, attempt: int | None = None) -> bool:
+        return self._cancel_worker_attempt_with_timeout(
+            job, attempt=attempt, timeout_seconds=None
+        )
+
+    def _cancel_worker_attempt_with_timeout(
+        self,
+        job: Job,
+        *,
+        attempt: int | None = None,
+        timeout_seconds: float | None,
+    ) -> bool:
         selected_attempt = (
             max(1, int(attempt)) if attempt is not None
             else self._durable_dispatch_attempt(job.id)
         )
+        if timeout_seconds is not None:
+            method_name = (
+                "cancel_attempt_with_timeout"
+                if selected_attempt is not None
+                else "cancel_with_timeout"
+            )
+            fast_cancel = getattr(self.dispatcher, method_name, None)
+            if not callable(fast_cancel):
+                return False
+            if selected_attempt is not None:
+                return bool(
+                    fast_cancel(
+                        job.worker,
+                        job.id,
+                        selected_attempt,
+                        timeout_seconds=timeout_seconds,
+                    )
+                )
+            return bool(
+                fast_cancel(
+                    job.worker, job.id, timeout_seconds=timeout_seconds
+                )
+            )
         cancel_attempt = getattr(self.dispatcher, "cancel_attempt", None)
         if selected_attempt is not None and callable(cancel_attempt):
             return bool(cancel_attempt(job.worker, job.id, selected_attempt))
@@ -3380,8 +3893,6 @@ class ControlPlane:
         execution lease remains held until a worker terminal event confirms it
         has stopped.
         """
-        if self.job_stall_timeout_seconds <= 0:
-            return
         current_time = now or utc_now()
         active_statuses = (JobStatus.DISPATCHED.value, JobStatus.RUNNING.value)
         active_ids: set[str] = set()
@@ -3394,6 +3905,86 @@ class ControlPlane:
                 limit=1000,
             ):
                 active_ids.add(job.id)
+                latest = self.jobs.get(job.id)
+                if latest is None or latest.status.terminal:
+                    continue
+                latency_ms = self._job_event_latency_ms(latest)
+                with self._stale_job_lock:
+                    high_latency_request = self._high_latency_cancel_attempts.get(
+                        latest.id
+                    )
+                if high_latency_request is None:
+                    high_latency_request = self._persisted_high_latency_cancel_request(
+                        latest
+                    )
+                    if high_latency_request is not None:
+                        with self._stale_job_lock:
+                            self._high_latency_cancel_attempts.setdefault(
+                                latest.id, high_latency_request
+                            )
+                            high_latency_request = self._high_latency_cancel_attempts[
+                                latest.id
+                            ]
+
+                if high_latency_request is not None:
+                    signal_status = str(
+                        high_latency_request.get("signal_status") or "pending"
+                    )
+                    if signal_status == "accepted":
+                        if self._cancel_request_grace_expired(
+                            high_latency_request, current_time
+                        ):
+                            latest = self._force_cancel_unresponsive_job(
+                                latest,
+                                latency_ms=float(
+                                    high_latency_request.get("latency_ms")
+                                    or latency_ms
+                                    or _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+                                ),
+                                signal_status="accepted_no_terminal_event",
+                            )
+                            forced = forced or latest.status == JobStatus.CANCELLED
+                    elif not high_latency_request.get("in_flight"):
+                        latest = self._cancel_high_latency_job(
+                            latest,
+                            float(
+                                high_latency_request.get("latency_ms")
+                                or latency_ms
+                                or _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+                            ),
+                        )
+                        forced = forced or latest.status == JobStatus.CANCELLED
+                        with self._stale_job_lock:
+                            refreshed_request = self._high_latency_cancel_attempts.get(
+                                latest.id
+                            )
+                        if (
+                            latest.status in {JobStatus.DISPATCHED, JobStatus.RUNNING}
+                            and refreshed_request is not None
+                            and refreshed_request.get("signal_status") == "accepted"
+                            and self._cancel_request_grace_expired(
+                                refreshed_request, current_time
+                            )
+                        ):
+                            latest = self._force_cancel_unresponsive_job(
+                                latest,
+                                latency_ms=float(
+                                    refreshed_request.get("latency_ms")
+                                    or _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+                                ),
+                                signal_status="accepted_no_terminal_event",
+                            )
+                            forced = forced or latest.status == JobStatus.CANCELLED
+                    continue
+                if (
+                    latency_ms is not None
+                    and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+                ):
+                    latest = self._cancel_high_latency_job(latest, latency_ms)
+                    forced = forced or latest.status == JobStatus.CANCELLED
+                    continue
+                if self.job_stall_timeout_seconds <= 0:
+                    continue
                 should_signal = False
                 should_fail = False
                 requested_at = None
@@ -3556,6 +4147,8 @@ class ControlPlane:
                 )
             )
             for queued in queued_jobs:
+                if self._worker_unresponsive_reason(queued.worker):
+                    continue
                 command_payload = self.jobs.command_payload(queued.id)
                 if (
                     isinstance(command_payload, dict)
@@ -3685,9 +4278,12 @@ class ControlPlane:
         if current.status.terminal:
             if (
                 current.error
-                and current.error.get("code") == "JOB_STALLED"
+                and current.error.get("code") in {
+                    "JOB_STALLED",
+                    "WORKER_UNRESPONSIVE",
+                }
             ):
-                # Keep the uncertain backend failure, but retain late physical
+                # Keep the uncertain backend terminal state, but retain late physical
                 # outcomes and replay their idempotent catalog effects. This
                 # handles worker outbox retries after an API outage/crash.
                 worker_event = event
@@ -3764,8 +4360,10 @@ class ControlPlane:
                         self.jobs.update_result(worker_event.job_id, latest_result)
                 if worker_event.status.terminal:
                     # A late terminal confirms the physical process stopped;
-                    # the backend's uncertain failure remains authoritative.
+                    # the backend's uncertain terminal record remains authoritative.
                     self.jobs.release_execution(event.job_id)
+                    if current.error.get("code") == "WORKER_UNRESPONSIVE":
+                        self._refresh_worker_unresponsive_state(current.worker)
                 return self.jobs.get(event.job_id) or current
             persisted = self._persisted_worker_event(current, event)
             if persisted is not None:
@@ -3786,6 +4384,7 @@ class ControlPlane:
         terminal_race = False
         stale_current: Job | None = None
         stale_persisted: JobEvent | None = None
+        worker_terminal_after_stop: JobEvent | None = None
         with self._stale_job_lock:
             current = self.jobs.get(event.job_id)
             if current is None:
@@ -3804,9 +4403,18 @@ class ControlPlane:
                     and event.event_type == "completed"
                 ):
                     event = self._apply_storage_sync_completion(current, event)
+                if (
+                    event.status.terminal
+                    and event.status != JobStatus.CANCELLED
+                    and self._persisted_high_latency_cancel_request(current) is not None
+                ):
+                    worker_terminal_after_stop = event
+                    event = self._cancelled_after_stop_event(event)
                 event = self._with_observability(current, event)
                 job, inserted = self.jobs.append_event(event)
                 self._stale_cancel_requested.pop(event.job_id, None)
+                if event.status.terminal or event.event_type == "retry_started":
+                    self._high_latency_cancel_attempts.pop(event.job_id, None)
         if terminal_race:
             # Re-enter the terminal path to preserve late-event reconciliation.
             return self.append_worker_event(event, dispatch_pending=dispatch_pending)
@@ -3818,7 +4426,9 @@ class ControlPlane:
             return stale_current
         # Side effects are idempotent and intentionally replayed when a worker
         # retries an already persisted event after a transient API failure.
-        self._apply_event_side_effects(job, event)
+        self._apply_event_side_effects(
+            job, worker_terminal_after_stop or event
+        )
         if inserted:
             self.wake_scheduler()
         if event.status.terminal and self.export_cursor_service is not None:
@@ -3838,7 +4448,11 @@ class ControlPlane:
                     job.id,
                     attempt=int(lease["lease_attempt"]),
                     worker_confirmed=worker_confirmed,
-                    require_applied_completion=event.status == JobStatus.SUCCEEDED,
+                    require_applied_completion=(
+                        worker_terminal_after_stop.status
+                        if worker_terminal_after_stop is not None
+                        else event.status
+                    ) == JobStatus.SUCCEEDED,
                 )
         if inserted:
             if (
@@ -3869,6 +4483,13 @@ class ControlPlane:
                 self._dispatch_pending_jobs()
             elif dispatch_pending and event.status == JobStatus.PAUSED:
                 self._dispatch_pending_jobs()
+            if job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING}:
+                latency_ms = self._job_event_latency_ms(job)
+                if (
+                    latency_ms is not None
+                    and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+                ):
+                    job = self._cancel_high_latency_job(job, latency_ms)
         return job
 
     def _persisted_worker_event(
@@ -3888,11 +4509,24 @@ class ControlPlane:
                 result_matches = _storage_sync_terminal_result_matches(
                     stored.result, event.result
                 )
+            stored_progress = stored.progress if isinstance(stored.progress, dict) else {}
+            cancelled_after_stop_matches = bool(
+                stored.status == JobStatus.CANCELLED
+                and stored.event_type == "cancelled_after_stop"
+                and stored_progress.get("cancelled_after_stop") is True
+                and stored_progress.get("worker_terminal_status") == event.status.value
+                and stored_progress.get("worker_terminal_event_type") == event.event_type
+                and stored_progress.get("worker_terminal_error")
+                == _redact_secrets(event.error)
+            )
             if (
-                stored.status == event.status
-                and stored.event_type == event.event_type
-                and result_matches
-                and stored.error == event.error
+                (
+                    stored.status == event.status
+                    and stored.event_type == event.event_type
+                    and result_matches
+                    and stored.error == event.error
+                )
+                or (cancelled_after_stop_matches and result_matches)
             ):
                 return stored
             return None
@@ -3900,14 +4534,33 @@ class ControlPlane:
 
     def _replay_persisted_worker_event(self, job: Job, event: JobEvent) -> None:
         """Repair idempotent post-commit effects for an exact worker retry."""
-        self._apply_event_side_effects(job, event)
+        worker_terminal = event
+        progress = event.progress if isinstance(event.progress, dict) else {}
+        if progress.get("cancelled_after_stop") is True:
+            try:
+                worker_status = JobStatus(str(progress.get("worker_terminal_status")))
+            except (TypeError, ValueError):
+                worker_status = JobStatus.CANCELLED
+            worker_event_type = str(progress.get("worker_terminal_event_type") or "")
+            if (
+                worker_status.terminal
+                and worker_status != JobStatus.CANCELLED
+                and worker_event_type
+            ):
+                worker_terminal = replace(
+                    event,
+                    status=worker_status,
+                    event_type=worker_event_type,
+                    error=progress.get("worker_terminal_error"),
+                )
+        self._apply_event_side_effects(job, worker_terminal)
         if event.status.terminal and self.export_cursor_service is not None:
             lease = self.export_cursor_service.lease_for_job(job.id)
             if lease is not None:
                 worker_confirmed = not (
-                    event.event_type.startswith("backend_")
-                    or event.event_type.startswith("force_cancelled")
-                    or event.event_type in {
+                    worker_terminal.event_type.startswith("backend_")
+                    or worker_terminal.event_type.startswith("force_cancelled")
+                    or worker_terminal.event_type in {
                         "dispatch_failed",
                         "cancelled_queued",
                         "cancelled_paused_queue",
@@ -3918,7 +4571,9 @@ class ControlPlane:
                     job.id,
                     attempt=int(lease["lease_attempt"]),
                     worker_confirmed=worker_confirmed,
-                    require_applied_completion=event.status == JobStatus.SUCCEEDED,
+                    require_applied_completion=(
+                        worker_terminal.status == JobStatus.SUCCEEDED
+                    ),
                 )
         if (
             event.event_type == "export.json_ready"
@@ -4218,7 +4873,16 @@ class ControlPlane:
                 # a fresh snapshot cannot land between the watchdog's final
                 # age check and its terminal event.
                 self._stale_cancel_requested.pop(event.job_id, None)
+        if not updated or job.status.terminal:
             return job, updated
+        latency_ms = self._job_event_latency_ms(job)
+        if (
+            job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING}
+            and latency_ms is not None
+            and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+        ):
+            job = self._cancel_high_latency_job(job, latency_ms)
+        return job, updated
 
     def _next_job_event_sequence(self, job_id: str, *, fallback: Job | None = None) -> int:
         current = self.jobs.get(job_id) or fallback
@@ -4234,6 +4898,20 @@ class ControlPlane:
         """Attach phase timing and event latency to this job's own event."""
         progress = dict(event.progress or {})
         current = job.progress if isinstance(job.progress, dict) else {}
+        cancel_request = current.get("backend_cancel_request")
+        incoming_cancel_request = progress.get("backend_cancel_request")
+        progress.pop("backend_cancel_request", None)
+        if (
+            event.event_type == "backend_cancel_requested_unresponsive"
+            and isinstance(incoming_cancel_request, dict)
+        ):
+            progress["backend_cancel_request"] = dict(incoming_cancel_request)
+        elif (
+            isinstance(cancel_request, dict)
+            and not event.status.terminal
+            and event.event_type != "retry_started"
+        ):
+            progress["backend_cancel_request"] = dict(cancel_request)
         previous_phase = str(current.get("phase") or "")
         phase = str(progress.get("phase") or previous_phase)
         previous_metrics = current.get("observability")
@@ -5174,6 +5852,130 @@ class ControlPlane:
         if end_id is not None:
             metadata["end_id"] = max(start_id or 1, end_id)
 
+    def _cancel_high_latency_job(self, job: Job, latency_ms: float) -> Job:
+        with self._stale_job_lock:
+            current = self.jobs.get(job.id)
+            if current is None or current.status.terminal:
+                return current or job
+            request_state = self._high_latency_cancel_attempts.get(job.id)
+            if request_state is None:
+                request_state = self._persisted_high_latency_cancel_request(current)
+            if request_state is not None and (
+                request_state.get("in_flight")
+                or request_state.get("signal_status") == "accepted"
+            ):
+                return current
+            if request_state is None:
+                request_state = {
+                    "requested_at": utc_now().isoformat(),
+                    "signal_status": "pending",
+                    "latency_ms": round(float(latency_ms), 3),
+                }
+            request_state["in_flight"] = True
+            current = self._persist_high_latency_cancel_request(
+                current, request_state
+            )
+            self._high_latency_cancel_attempts[job.id] = request_state
+        if current.status.terminal:
+            with self._stale_job_lock:
+                self._high_latency_cancel_attempts.pop(job.id, None)
+            return current
+
+        signal_status = "not_confirmed"
+        try:
+            accepted = self._cancel_worker_attempt_with_timeout(
+                current,
+                attempt=None,
+                timeout_seconds=_WORKER_UNRESPONSIVE_CANCEL_TIMEOUT_SECONDS,
+            )
+            if accepted:
+                signal_status = "accepted"
+                with self._stale_job_lock:
+                    latest = self.jobs.get(job.id)
+                    if latest is None or latest.status.terminal:
+                        self._high_latency_cancel_attempts.pop(job.id, None)
+                        return latest or current
+                    request_state["signal_status"] = "accepted"
+                    request_state["in_flight"] = False
+                    current = self._persist_high_latency_cancel_request(
+                        latest, request_state
+                    )
+                return self.jobs.get(job.id) or current
+        except Exception as exc:
+            signal_status = "unavailable"
+            with self._stale_job_lock:
+                request_state["signal_status"] = signal_status
+                request_state["in_flight"] = False
+            logging.getLogger(__name__).warning(
+                "High-latency worker cancel failed for %s (%s)",
+                job.id,
+                type(exc).__name__,
+            )
+            accepted = False
+
+        with self._stale_job_lock:
+            request_state["signal_status"] = signal_status
+            request_state["in_flight"] = False
+        return self._force_cancel_unresponsive_job(
+            current,
+            latency_ms=latency_ms,
+            signal_status=signal_status,
+        )
+
+    def _force_cancel_unresponsive_job(
+        self, job: Job, *, latency_ms: float, signal_status: str
+    ) -> Job:
+        with self._stale_job_lock:
+            current = self.jobs.get(job.id)
+            if current is None or current.status.terminal:
+                return current or job
+            self._mark_worker_unresponsive(
+                current.worker, reason="event_backlog_cancel_unconfirmed"
+            )
+            self._stale_cancel_requested.pop(current.id, None)
+            progress = (
+                dict(current.progress)
+                if isinstance(current.progress, dict)
+                else {}
+            )
+            progress.pop("backend_telemetry", None)
+            progress.update(
+                {
+                    "phase": "cancelled",
+                    "terminal_phase": "cancelled",
+                    "finished_at": utc_now().isoformat(),
+                    "worker_confirmation": "not_received",
+                    "worker_cancel_signal": signal_status,
+                    "worker_unresponsive": True,
+                    "event_latency_ms": round(float(latency_ms), 3),
+                    "outcome_uncertain": True,
+                    "reconciliation_required": True,
+                }
+            )
+            terminal = self.append_worker_event(
+                JobEvent(
+                    job_id=current.id,
+                    sequence=self._next_job_event_sequence(
+                        current.id, fallback=current
+                    ),
+                    status=JobStatus.CANCELLED,
+                    event_type="backend_cancelled_unresponsive",
+                    progress=progress,
+                    error={
+                        "code": "WORKER_UNRESPONSIVE",
+                        "message": (
+                            "Worker tidak mengonfirmasi pembatalan setelah latensi event "
+                            f"{round(float(latency_ms))} ms. Job ditandai cancelled di gateway; "
+                            "hasil proses fisik belum terkonfirmasi. Job baru pada worker ini ditahan."
+                        ),
+                    },
+                ),
+                dispatch_pending=False,
+            )
+            if current.kind == "tts":
+                self._cancel_tts_deliveries(current.id)
+            return terminal
+
     def cancel_job(self, actor: Actor, job_id: str) -> Job:
         job = self.jobs.get(job_id)
         if job is None:
@@ -5181,6 +5983,12 @@ class ControlPlane:
         self.require_profile(actor, job.profile)
         if job.status.terminal:
             return job
+        latency_ms = self._job_event_latency_ms(job)
+        if (
+            latency_ms is not None
+            and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
+        ):
+            return self._cancel_high_latency_job(job, latency_ms)
         if job.status == JobStatus.PAUSED and job.progress.get("pause_kind") == "queued":
             outcome, current = self._cancel_queued_before_dispatch(
                 job.id,
@@ -5205,14 +6013,38 @@ class ControlPlane:
                 self._dispatch_pending_jobs(job.profile)
                 return current or self.jobs.get(job.id) or job
             job = current or job
+        request_state = {
+            "requested_at": utc_now().isoformat(),
+            "signal_status": "pending",
+            "latency_ms": round(float(latency_ms or 0.0), 3),
+            "in_flight": True,
+        }
+        with self._stale_job_lock:
+            current = self.jobs.get(job.id)
+            if current is None or current.status.terminal:
+                return current or job
+            existing_request = self._persisted_high_latency_cancel_request(current)
+            if existing_request is not None:
+                return current
+            current = self._persist_high_latency_cancel_request(
+                current, request_state
+            )
+            if current.status.terminal:
+                return current
+            self._high_latency_cancel_attempts[job.id] = request_state
+            job = current
+
         try:
             cancelled = self._cancel_worker_attempt(job)
         except Exception as exc:
             current = self.jobs.get(job.id)
             if current is not None and current.status.terminal:
+                self._high_latency_cancel_attempts.pop(job.id, None)
                 return current
             if self._has_pending_dispatch_cancellation(job.id):
+                request_state["in_flight"] = False
                 return current or job
+            self._clear_pending_cancel_request(job.id)
             raise DomainError(
                 "WORKER_CANCEL_UNAVAILABLE",
                 f"Worker {job.worker} tidak dapat menerima permintaan terminate: {exc}",
@@ -5221,14 +6053,30 @@ class ControlPlane:
         if not cancelled:
             current = self.jobs.get(job.id)
             if current is not None and current.status.terminal:
+                self._high_latency_cancel_attempts.pop(job.id, None)
                 return current
             if self._has_pending_dispatch_cancellation(job.id):
+                request_state["in_flight"] = False
                 return current or job
+            self._clear_pending_cancel_request(job.id)
             raise DomainError(
                 "JOB_NOT_CANCELLABLE",
                 "Worker belum menerima permintaan pembatalan. Status job tidak diubah.",
                 status_code=409,
             )
+
+        with self._stale_job_lock:
+            current = self.jobs.get(job.id)
+            if current is None or current.status.terminal:
+                self._high_latency_cancel_attempts.pop(job.id, None)
+                return current or job
+            request_state["signal_status"] = "accepted"
+            request_state["in_flight"] = False
+            self._high_latency_cancel_attempts[job.id] = request_state
+            current = self._persist_high_latency_cancel_request(
+                current, request_state
+            )
+            job = current
         if job.kind == "tts":
             self._cancel_tts_deliveries(job.id)
         attempt = self._durable_dispatch_attempt(job.id)

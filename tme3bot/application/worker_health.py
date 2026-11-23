@@ -29,8 +29,24 @@ class WorkerHealthMonitor:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
         self._snapshots: dict[str, dict[str, Any]] = {}
+        self._unresponsive: dict[str, dict[str, str]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+
+    def mark_unresponsive(self, worker: str, *, reason: str) -> None:
+        name = str(worker or "").strip().lower()
+        if not name:
+            return
+        with self._lock:
+            self._unresponsive[name] = {
+                "reason": str(reason or "worker_unresponsive")[:96],
+                "marked_at": _aware(self.clock()).isoformat(),
+            }
+
+    def clear_unresponsive(self, worker: str) -> bool:
+        name = str(worker or "").strip().lower()
+        with self._lock:
+            return self._unresponsive.pop(name, None) is not None
 
     def refresh_once(self) -> None:
         workers = self.registry.list()
@@ -75,6 +91,15 @@ class WorkerHealthMonitor:
         name = str(worker or "").strip().lower()
         with self._lock:
             entry = dict(self._snapshots.get(name) or {})
+            unresponsive = dict(self._unresponsive.get(name) or {})
+        if unresponsive:
+            return {
+                "worker": name,
+                "status": "unresponsive",
+                "healthy": False,
+                "checked_at": unresponsive.get("marked_at"),
+                "reason": unresponsive.get("reason"),
+            }
         if not entry:
             return {"worker": name, "status": "unknown", "healthy": False}
         try:

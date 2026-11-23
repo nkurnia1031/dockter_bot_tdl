@@ -82,6 +82,14 @@ class JobRepository(Protocol):
 
     def update_progress_snapshot(self, event: JobEvent) -> tuple[Job, bool]: ...
 
+    def update_progress_metadata(
+        self,
+        job_id: str,
+        updates: dict[str, Any],
+        *,
+        remove_keys: tuple[str, ...] = (),
+    ) -> tuple[Job, bool]: ...
+
     def update_result(self, job_id: str, result: dict[str, Any]) -> Job: ...
 
     def complete_storage_upload_reconciliation(
@@ -137,6 +145,10 @@ class WorkerDispatcher(Protocol):
     def dispatch(self, worker: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     def dispatch_command(self, worker: str, envelope: dict[str, Any]) -> dict[str, Any]: ...
+
+    def job_progress_snapshots(
+        self, worker: str, job_ids: list[str]
+    ) -> list[dict[str, Any]]: ...
 
     def cancel(self, worker: str, job_id: str) -> bool: ...
 

@@ -64,10 +64,11 @@
 
   function workerReadinessLabel(worker: WorkerMetric): string {
     if (worker.enabled === false) return 'Nonaktif';
+    if (worker.status === 'unresponsive') return 'Tidak merespons';
     const snapshot = workerReadiness.find((item) => item.name === worker.worker);
     if (!snapshot) return 'Belum discan';
     if (isLite) {
-      return ({ ready: 'Siap', offline: 'Offline', stale: 'Status usang', unknown: 'Status belum diketahui', disabled: 'Nonaktif' } as Record<string, string>)[snapshot.health_status || 'unknown'] || 'Status belum diketahui';
+      return ({ ready: 'Siap', offline: 'Offline', stale: 'Status usang', unresponsive: 'Tidak merespons', unknown: 'Status belum diketahui', disabled: 'Nonaktif' } as Record<string, string>)[snapshot.health_status || 'unknown'] || 'Status belum diketahui';
     }
     if (snapshot.status === 'disabled') return 'Nonaktif';
     return snapshot.status === 'success' ? 'Siap' : 'Belum siap';
@@ -75,12 +76,12 @@
 
   function workerReadinessClass(worker: WorkerMetric): string {
     const label = workerReadinessLabel(worker);
-    return label === 'Siap' ? 'status-ready' : ['Belum siap', 'Offline'].includes(label) ? 'status-failed' : label === 'Status usang' ? 'status-warning' : 'status-neutral';
+    return label === 'Siap' ? 'status-ready' : ['Belum siap', 'Offline', 'Tidak merespons'].includes(label) ? 'status-failed' : label === 'Status usang' ? 'status-warning' : 'status-neutral';
   }
 
   function workerActivityLabel(worker: WorkerMetric): string {
     return ({
-      busy: 'Job berjalan', stale: 'Heartbeat terlambat', paused: 'Job dijeda',
+      busy: 'Job berjalan', stale: 'Heartbeat terlambat', unresponsive: 'Worker tidak merespons', paused: 'Job dijeda',
       queued: 'Job mengantre', idle: 'Antrean kosong', disabled: 'Admission nonaktif'
     } as Record<string, string>)[worker.status] || 'Aktivitas belum diketahui';
   }

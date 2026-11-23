@@ -2037,6 +2037,28 @@ class SqliteJobRepository:
             ).fetchall()
         return [job for row in rows if (job := self._job(row)) is not None]
 
+    def unconfirmed_worker_cancellations(
+        self, *, worker: str | None = None
+    ) -> list[Job]:
+        """Return the small set of backend-cancelled jobs still lacking a worker terminal."""
+        clauses = [
+            "status = 'cancelled'",
+            "json_extract(progress, '$.worker_unresponsive') = 1",
+            "json_extract(progress, '$.worker_confirmation') = 'not_received'",
+            "json_extract(result, '$.late_worker_terminal') IS NULL",
+        ]
+        values: list[object] = []
+        if worker:
+            clauses.append("worker = ?")
+            values.append(str(worker).strip().lower())
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT * FROM jobs WHERE " + " AND ".join(clauses)
+                + " ORDER BY updated_at DESC, id DESC",
+                values,
+            ).fetchall()
+        return [job for row in rows if (job := self._job(row)) is not None]
+
     def list_queued_for_scheduler(
         self, *, profile: str | None = None, limit: int = 1000
     ) -> list[Job]:
@@ -2505,6 +2527,39 @@ class SqliteJobRepository:
                 ),
                 True,
             )
+
+    def update_progress_metadata(
+        self,
+        job_id: str,
+        updates: dict[str, Any],
+        *,
+        remove_keys: tuple[str, ...] = (),
+    ) -> tuple[Job, bool]:
+        """Merge backend metadata without advancing the worker event cursor.
+
+        This is for control-plane bookkeeping that shares the progress JSON
+        document but is not a worker event. Advancing ``progress_sequence``
+        here could make the worker's next legitimate event look stale.
+        """
+        selected_id = str(job_id)
+        with self._db() as db:
+            row = db.execute(
+                "SELECT * FROM jobs WHERE id = ?", (selected_id,)
+            ).fetchone()
+            job = self._job(row)
+            if job is None:
+                raise KeyError(f"Unknown job: {selected_id}")
+            if job.status.terminal:
+                return job, False
+            progress = dict(job.progress)
+            for key in remove_keys:
+                progress.pop(str(key), None)
+            progress.update(updates)
+            db.execute(
+                "UPDATE jobs SET progress = ? WHERE id = ?",
+                (_dump(progress), selected_id),
+            )
+            return replace(job, progress=progress), True
 
     def update_result(self, job_id: str, result: dict[str, Any]) -> Job:
         """Update a terminal job's result without changing its lifecycle state."""

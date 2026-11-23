@@ -35,6 +35,7 @@
   let reconcilingStorageItems = $state<Record<string, boolean>>({});
   let jobActionPending = $state<Record<string, boolean>>({});
   let lastRefreshed = $state<Date | null>(null);
+  let refreshingLiteProgress = $state(false);
   let mounted = false;
   let loadGeneration = 0;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -57,6 +58,7 @@
     }
     return String(left.id || '').localeCompare(String(right.id || ''));
   }));
+  const canRefreshLiteProgress = $derived(isLite && pollingMode === 'activity' && view !== 'history' && activeJobs.length > 0);
   const historyJobs = $derived(visibleJobs.filter((job) => !active(job)));
   const liteStatusLabel = (status: string) => ({
     queued: 'Menunggu', dispatched: 'Berjalan', running: 'Berjalan', paused: 'Dijeda',
@@ -161,7 +163,7 @@
   }
 
   function workerStatusLabel(status: string): string {
-    return ({ busy: 'sibuk', stale: 'heartbeat terlambat', paused: 'dijeda', queued: 'antre', idle: 'idle', disabled: 'nonaktif' } as Record<string, string>)[status] || status;
+    return ({ busy: 'sibuk', stale: 'heartbeat terlambat', unresponsive: 'tidak merespons', paused: 'dijeda', queued: 'antre', idle: 'idle', disabled: 'nonaktif' } as Record<string, string>)[status] || status;
   }
 
   function storageStatusLabel(status: string): string {
@@ -302,6 +304,22 @@
       if (request !== loadGeneration) return;
       error = cause instanceof Error ? cause.message : 'Tidak dapat memuat job.';
       schedulePolling();
+    }
+  }
+  async function refreshActivity() {
+    if (!canRefreshLiteProgress) {
+      await load();
+      return;
+    }
+    refreshingLiteProgress = true;
+    error = '';
+    try {
+      await api('/jobs/refresh-active', { method: 'POST', body: JSON.stringify({}) });
+      await load();
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : 'Tidak dapat menyegarkan progres worker.';
+    } finally {
+      refreshingLiteProgress = false;
     }
   }
   async function loadEvents() {
@@ -570,7 +588,7 @@
         <span class="muted text-xs">Terakhir diperbarui: {formatClock(lastRefreshed)}</span>
       {/if}
       {#if view !== 'history'}<button class="button danger" onclick={() => requestTerminate('all')}><XCircle size={16}/>Terminate semua aktif</button>{/if}
-      <button class="button secondary" onclick={() => { void load(); }} aria-label={view === 'active' ? 'Refresh monitor' : 'Refresh daftar job'}><RefreshCw size={16}/>Refresh</button>
+      <button class="button secondary" onclick={() => { void refreshActivity(); }} disabled={refreshingLiteProgress} aria-label={canRefreshLiteProgress ? 'Refresh status worker' : view === 'active' ? 'Refresh monitor' : 'Refresh daftar job'}><RefreshCw size={16} class={refreshingLiteProgress ? 'animate-spin' : ''}/>{refreshingLiteProgress ? 'Menyegarkan…' : canRefreshLiteProgress ? 'Refresh status worker' : 'Refresh'}</button>
     </div>
   </div>
   {#if error}<p class="m-4 rounded-xl bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-950 dark:text-rose-200">{error}</p>{/if}
@@ -586,7 +604,7 @@
       {#if monitorMetrics.workers?.length}
         <div class="mt-2 flex flex-wrap gap-2" aria-label="Status worker">
           {#each monitorMetrics.workers as item (item.worker)}
-            <span class={`rounded-full border px-2.5 py-1 text-xs font-semibold ${item.status === 'stale' ? 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200' : item.status === 'disabled' ? 'border-slate-300 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300' : 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200'}`} title={item.last_seen_at ? `Event terakhir ${item.last_seen_age_seconds ?? '?'} detik lalu` : 'Belum ada event worker'}>
+            <span class={`rounded-full border px-2.5 py-1 text-xs font-semibold ${item.status === 'stale' ? 'border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200' : item.status === 'unresponsive' ? 'border-rose-300 bg-rose-50 text-rose-800 dark:border-rose-900 dark:bg-rose-950 dark:text-rose-200' : item.status === 'disabled' ? 'border-slate-300 bg-slate-100 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300' : 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200'}`} title={item.status === 'unresponsive' ? 'Worker dikarantina sampai proses lama terkonfirmasi berhenti' : item.last_seen_at ? `Event terakhir ${item.last_seen_age_seconds ?? '?'} detik lalu` : 'Belum ada event worker'}>
               {item.worker} · {workerStatusLabel(item.status)} · {item.active_jobs} aktif · {item.queued_jobs} antre
             </span>
           {/each}

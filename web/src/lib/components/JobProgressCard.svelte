@@ -50,6 +50,7 @@
       : []
   );
   const cancelRequest = $derived(job.progress?.cancel_request || null);
+  const liteWorkerRefresh = $derived(job.progress?.lite_worker_refresh || null);
   const liteStatus = $derived(({ queued: 'Menunggu', dispatched: 'Berjalan', running: 'Berjalan', paused: 'Dijeda' } as Record<string, string>)[job.status] || job.status);
   const liteTitle = $derived(job.kind === 'tts'
     ? job.payload?.title || 'TTS'
@@ -80,6 +81,22 @@
         <button class="button danger !py-1.5 !px-3 text-xs" onclick={onTerminate} aria-label="Hentikan job"><XCircle size={14}/><span>Stop</span></button>
       </div>
     </div>
+    {#if liteWorkerRefresh}
+      <div class="mt-3 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] px-3 py-2.5" aria-label="Ringkasan progres worker">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class={`badge ${liteWorkerRefresh.stale ? 'failed' : liteWorkerRefresh.state === 'fresh' ? 'succeeded' : 'paused'}`}>
+            {liteWorkerRefresh.stale ? 'Data worker stale' : liteWorkerRefresh.state === 'fresh' ? 'Snapshot worker' : 'Menunggu worker'}
+          </span>
+          {#if liteWorkerRefresh.stage}<span class="muted text-xs">Tahap: {phaseLabel(String(liteWorkerRefresh.stage))}</span>{/if}
+          {#if liteWorkerRefresh.status}<span class="muted text-xs">Status: {liteWorkerRefresh.status}</span>{/if}
+        </div>
+        {#if liteWorkerRefresh.active_file}<p class="mt-2 truncate text-sm font-semibold" title={liteWorkerRefresh.active_file}>File: {liteWorkerRefresh.active_file}</p>{/if}
+        <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs font-semibold text-[var(--muted)]">
+          {#if typeof liteWorkerRefresh.completed === 'number' && typeof liteWorkerRefresh.total === 'number'}<span>{liteWorkerRefresh.completed}/{liteWorkerRefresh.total} selesai</span>{/if}
+          {#if typeof liteWorkerRefresh.percent === 'number'}<span>{Math.round(liteWorkerRefresh.percent)}%</span>{/if}
+        </div>
+      </div>
+    {/if}
   {:else}
   <div class="p-3.5 sm:p-4">
     <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">

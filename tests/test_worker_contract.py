@@ -28,6 +28,8 @@ class ContractWorkerExecutor:
     def __init__(self):
         self.commands = []
         self.durable_ready = True
+        self.progress_snapshot_requests = []
+        self.progress_snapshot_items = []
 
     def capabilities(self):
         return {"profiles": ["default"], "workspace": True}
@@ -38,6 +40,15 @@ class ContractWorkerExecutor:
     def enqueue(self, command):
         self.commands.append(command)
         return 1
+
+    def durable_job_progress_snapshots(self, job_ids):
+        self.progress_snapshot_requests.append(list(job_ids))
+        requested = set(job_ids)
+        return [
+            dict(item)
+            for item in self.progress_snapshot_items
+            if item.get("job_id") in requested
+        ]
 
 
 class ContractWorkerRegistry:
@@ -56,6 +67,24 @@ class CapturingPublisher:
 
 
 class WorkerContractTests(unittest.TestCase):
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_progress_snapshot_dispatch_is_one_authenticated_worker_request(self, request):
+        response = {"items": [{"job_id": "job-1", "progress": {"phase": "extracting"}}]}
+        request.return_value = response
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        snapshots = dispatcher.job_progress_snapshots("remote", ["job-1"])
+
+        self.assertEqual(snapshots, response["items"])
+        request.assert_called_once_with(
+            "http://worker.test",
+            "worker-token",
+            "POST",
+            "/internal/v1/jobs/progress-snapshots",
+            {"job_ids": ["job-1"]},
+            timeout=8,
+        )
+
     @patch("tme3bot.infrastructure.http_client.request_json")
     def test_resolver_readiness_uses_authenticated_internal_probe(self, request):
         request.return_value = {"ready": True, "fingerprint": "a" * 64}
@@ -292,6 +321,33 @@ class WorkerContractTests(unittest.TestCase):
         self.assertIn(CAP_BACKUP_VERIFY, body["capabilities"])
         self.assertEqual(body["profiles"], ["default"])
 
+    def test_worker_progress_snapshot_endpoint_uses_authenticated_durable_executor(self):
+        executor = ContractWorkerExecutor()
+        executor.progress_snapshot_items = [{
+            "job_id": "active-job",
+            "attempt": 2,
+            "status": "running",
+            "phase": "uploading",
+            "updated_at": "2026-11-23T09:00:00+00:00",
+            "progress": {"item": {"name": "episode.zip"}},
+        }]
+        app = create_worker_app(
+            WorkerContext(
+                type("Config", (), {"worker_api_token": "worker-token"})(),
+                executor,
+            )
+        )
+
+        response = TestClient(app).post(
+            "/internal/v1/jobs/progress-snapshots",
+            headers={"Authorization": "Bearer worker-token"},
+            json={"job_ids": ["active-job", "missing-job"]},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(executor.progress_snapshot_requests, [["active-job", "missing-job"]])
+        self.assertEqual(response.json()["items"], executor.progress_snapshot_items)
+
     def test_durable_capability_is_hidden_until_journal_and_sender_are_ready(self):
         executor = ContractWorkerExecutor()
         executor.durable_ready = False
@@ -447,6 +503,42 @@ class WorkerContractTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, "WORKER_INCOMPATIBLE")
         self.assertEqual(request.call_count, 1)
+
+    @patch(
+        "tme3bot.infrastructure.http_client.time.monotonic",
+        side_effect=[0.0, 1.0, 2.0],
+    )
+    @patch("tme3bot.infrastructure.http_client.request_json")
+    def test_high_latency_cancel_shares_one_response_deadline(self, request, _clock):
+        request.side_effect = [worker_contract_metadata(), {"accepted": False}]
+        dispatcher = WorkerHttpDispatcher(ContractWorkerRegistry())
+
+        self.assertFalse(
+            dispatcher.cancel_attempt_with_timeout(
+                "remote", "job-1", 3, timeout_seconds=2.5
+            )
+        )
+
+        self.assertEqual(
+            request.call_args_list,
+            [
+                call(
+                    "http://worker.test",
+                    "worker-token",
+                    "GET",
+                    "/internal/v1/capabilities",
+                    timeout=1.5,
+                ),
+                call(
+                    "http://worker.test",
+                    "worker-token",
+                    "POST",
+                    "/internal/v1/jobs/job-1/cancel",
+                    {"attempt": 3},
+                    timeout=0.5,
+                ),
+            ],
+        )
 
     @patch("tme3bot.infrastructure.http_client.request_json")
     def test_shared_cursor_dispatch_requires_worker_capability(self, request):

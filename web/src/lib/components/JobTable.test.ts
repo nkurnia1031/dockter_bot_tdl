@@ -869,4 +869,90 @@ describe('JobTable', () => {
     expect(screen.queryByRole('button', { name: 'Raw JSON' })).toBeNull();
     expect(calls.some((url) => url.includes('/events') || url.includes('/log-snapshot'))).toBe(false);
   });
+
+  it('keeps manual worker refresh specific to the Lite Activity monitor', async () => {
+    setGatewayMode('lite');
+    let refreshCalls = 0;
+    let listCalls = 0;
+    const fetchMock = vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.endsWith('/jobs/refresh-active')) {
+        refreshCalls += 1;
+        return new Response(JSON.stringify({ items: [] }), { status: 200 });
+      }
+      if (url.includes('/jobs?')) {
+        listCalls += 1;
+        return new Response(JSON.stringify({ items: [{
+          id: 'lite-feature-job', kind: 'utility', status: 'running', profile: 'default', worker: 'remote-1',
+        }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { kind: 'utility', title: 'Riwayat utility' });
+    expect(await screen.findByText('Status Lite · 10 dtk saat aktif')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Refresh daftar job' })).toBeTruthy();
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh daftar job' }));
+    await flushPromises();
+
+    expect(refreshCalls).toBe(0);
+    expect(listCalls).toBe(2);
+  });
+
+  it('refreshes Lite worker progress only on click and shows a compact per-job snapshot', async () => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    setGatewayMode('lite');
+    let refreshed = false;
+    let refreshCalls = 0;
+    let listCalls = 0;
+    const activeJob = () => ({
+      id: 'lite-progress-refresh', kind: 'utility', status: 'running', profile: 'default', worker: 'remote-1',
+      created_at: '2026-11-23T09:00:00Z', updated_at: '2026-11-23T09:01:00Z', payload: { utility: 'extract' },
+      progress: refreshed ? {
+        phase: 'old-gateway-phase',
+        lite_worker_refresh: {
+          state: 'fresh', stale: false, active_file: 'episode.rar', stage: 'extracting', status: 'running',
+          completed: 2, total: 5, percent: 40, refreshed_at: '2026-11-23T09:02:00Z',
+        },
+      } : {},
+    });
+    const fetchMock = vi.fn(async (input: string, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/jobs/refresh-active')) {
+        refreshCalls += 1;
+        expect(init?.method).toBe('POST');
+        refreshed = true;
+        return new Response(JSON.stringify({ items: [activeJob()] }), { status: 200 });
+      }
+      if (url.includes('/jobs?')) {
+        listCalls += 1;
+        return new Response(JSON.stringify({ items: [activeJob()] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { title: 'Daftar aktivitas', pollingMode: 'activity' });
+    await flushPromises();
+    expect(listCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
+    expect(await screen.findByText('Status Lite · 10 dtk saat aktif')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Refresh status worker' })).toBeTruthy();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(refreshCalls).toBe(0);
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh status worker' }));
+    expect(await screen.findByText('File: episode.rar')).toBeTruthy();
+    expect(refreshCalls).toBe(1);
+    expect(listCalls).toBe(2);
+    expect(screen.getByText('Tahap: Mengekstrak')).toBeTruthy();
+    expect(screen.getByText('2/5 selesai')).toBeTruthy();
+    expect(screen.getByText('40%')).toBeTruthy();
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(refreshCalls).toBe(1);
+    expect(listCalls).toBe(2);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/events') || String(url).includes('/log-snapshot'))).toBe(false);
+  });
 });

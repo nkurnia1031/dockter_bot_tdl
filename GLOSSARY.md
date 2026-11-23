@@ -5,7 +5,7 @@ Istilah ini menjelaskan profil Telegram lokal dan vault yang dipakai aplikasi se
 ## Pemantauan
 
 **Pembaruan manual**:
-Memuat ulang data halaman saat pengguna membukanya, meminta refresh, atau menyelesaikan tindakan yang mengubah data. Data umum tidak diperbarui berulang kali tanpa tindakan pengguna.
+Memuat ulang data halaman saat pengguna membukanya, meminta refresh, atau menyelesaikan tindakan yang mengubah data. Di Activity Lite, refresh manual juga meminta snapshot progres ringkas dari worker asal untuk semua job aktif; worker yang tidak merespons hanya membuat snapshot ditandai stale dan tidak mengubah status job. Data umum tidak diperbarui berulang kali tanpa tindakan pengguna.
 _Avoid_: polling halaman.
 
 **Polling progres operasi**:

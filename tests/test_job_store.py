@@ -921,7 +921,12 @@ class JobStoreTests(unittest.TestCase):
             store = SqliteJobRepository(Path(temp_dir) / "app.db")
             store.create(self.make_job())
             store.append_event(
-                JobEvent("job-1", 1, JobStatus.DISPATCHED, "dispatched")
+                JobEvent(
+                    "job-1",
+                    1,
+                    JobStatus.DISPATCHED,
+                    "dispatched",
+                )
             )
             store.append_event(JobEvent("job-1", 2, JobStatus.RUNNING, "started"))
             current, updated = store.update_progress_snapshot(
@@ -983,6 +988,39 @@ class JobStoreTests(unittest.TestCase):
             )
             self.assertTrue(updated)
             self.assertEqual(current.progress["started_at"], "2026-09-17T01:00:00+00:00")
+
+    def test_progress_metadata_merge_does_not_advance_worker_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            store.create(self.make_job())
+            store.append_event(
+                JobEvent(
+                    "job-1",
+                    1,
+                    JobStatus.DISPATCHED,
+                    "dispatched",
+                    {"backend_telemetry": {"event_latency_ms": 335_611}},
+                )
+            )
+            store.append_event(JobEvent("job-1", 2, JobStatus.RUNNING, "started"))
+            before = store.get("job-1")
+            self.assertIsNotNone(before)
+
+            updated, changed = store.update_progress_metadata(
+                "job-1",
+                {"backend_cancel_request": {"signal_status": "pending"}},
+                remove_keys=("backend_telemetry",),
+            )
+
+            self.assertTrue(changed)
+            self.assertEqual(updated.progress_sequence, before.progress_sequence)
+            self.assertEqual(updated.updated_at, before.updated_at)
+            self.assertEqual(updated.status, before.status)
+            self.assertEqual(
+                updated.progress["backend_cancel_request"]["signal_status"],
+                "pending",
+            )
+            self.assertNotIn("backend_telemetry", updated.progress)
 
     def test_filters_archive_restore_and_purge_terminal_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import Depends, Query, Request
 from tme3bot.api.activity import track_activity_jobs
 from tme3bot.api.schemas import JobEventListResponse, JobListResponse, JobResponse, ObjectResponse, WorkerEventRequest
 from tme3bot.chat_refs import normalize_tdl_chat_ref
-from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus, utc_now
+from tme3bot.domain.models import DomainError, JobEvent, JobStatus, utc_now
 from tme3bot.worker_registry import worker_names_for_config
 
 
@@ -18,7 +19,7 @@ def _worker_names_for_context(context, selected=None):
         records = {name: item for name, item in records.items() if name in requested}
     mode = getattr(context.control_plane, "gateway_mode", "full")
     return worker_names_for_config(records, context.config, gateway_mode=mode)
-from typing import Any
+
 
 def register_jobs(app, context, *, _newest_first_log_response, _owned_job, current_actor, event_dict, job_dict, require_internal, require_service):
 
@@ -92,6 +93,14 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
             "next_offset": offset + len(items) if offset + len(items) < total else None,
         }
 
+    @app.post("/api/v1/jobs/refresh-active", response_model=ObjectResponse)
+    def refresh_active_job_progress(actor=Depends(current_actor)):
+        refreshed = context.control_plane.refresh_active_job_progress(actor)
+        return {
+            **refreshed,
+            "items": [job_dict(job) for job in refreshed["items"]],
+        }
+
     @app.get("/api/v1/jobs/metrics", response_model=ObjectResponse)
     def job_metrics(
         scope: str = Query("current", pattern="^(current|global)$"),
@@ -137,6 +146,12 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
             record = registry.get(name) if registry is not None else None
             record = record if isinstance(record, dict) else {}
             item["enabled"] = bool(record.get("enabled", True))
+            health_monitor = getattr(context, "worker_health_monitor", None)
+            health_snapshot = (
+                health_monitor.snapshot(name)
+                if health_monitor is not None
+                else {}
+            )
             active_count = int(item["dispatched_jobs"]) + int(item["running_jobs"])
             last_seen = item.get("last_seen_at")
             age_seconds = None
@@ -150,6 +165,8 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
                     age_seconds = None
             if not item["enabled"]:
                 item["status"] = "disabled"
+            elif health_snapshot.get("status") == "unresponsive":
+                item["status"] = "unresponsive"
             elif active_count:
                 item["status"] = "stale" if age_seconds is None or age_seconds > 45 else "busy"
             elif item["paused_jobs"]:

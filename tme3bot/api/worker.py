@@ -15,7 +15,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from tme3bot.api.schemas import WorkerJobRequest, WorkerRuntimeSettingsRequest
+from tme3bot.api.schemas import (
+    WorkerJobRequest,
+    WorkerProgressSnapshotsRequest,
+    WorkerRuntimeSettingsRequest,
+)
 from tme3bot.domain.models import DomainError
 from tme3bot.domain.worker_contract import (
     CAP_DURABLE_COMMANDS_V1,
@@ -1213,6 +1217,27 @@ def create_worker_app(context: WorkerContext) -> FastAPI:
         if payload.get("worker") is None:
             payload.pop("worker", None)
         return {"position": context.executor.enqueue(payload), "job_id": body.job_id}
+
+    @app.post(
+        "/internal/v1/jobs/progress-snapshots",
+        dependencies=[Depends(authorize)],
+    )
+    def job_progress_snapshots(body: WorkerProgressSnapshotsRequest):
+        job_ids = [str(job_id or "").strip() for job_id in body.job_ids]
+        if any(not job_id or len(job_id) > 160 for job_id in job_ids):
+            raise DomainError(
+                "JOB_PROGRESS_SNAPSHOT_REQUEST_INVALID",
+                "Daftar job untuk refresh tidak valid.",
+                status_code=422,
+            )
+        lookup = getattr(context.executor, "durable_job_progress_snapshots", None)
+        if not callable(lookup):
+            raise DomainError(
+                "WORKER_UPDATE_REQUIRED",
+                "Worker belum mendukung refresh progres job.",
+                status_code=404,
+            )
+        return {"items": lookup(job_ids)}
 
     @app.post(
         "/internal/v1/jobs/{job_id}/cancel", dependencies=[Depends(authorize)]

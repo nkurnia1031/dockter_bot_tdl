@@ -410,6 +410,48 @@ class WorkerCommandStore:
             return self._public(row)
         return self._public_tombstone(tombstone) if tombstone is not None else None
 
+    def progress_snapshots_for_jobs(self, job_ids: list[str]) -> list[dict[str, Any]]:
+        """Return the latest persisted progress checkpoint for each requested job."""
+        selected: list[str] = []
+        for raw_job_id in job_ids:
+            job_id = str(raw_job_id or "").strip()
+            if not job_id or len(job_id) > 160 or job_id in selected:
+                continue
+            selected.append(job_id)
+        if not selected:
+            return []
+        if len(selected) > 200:
+            raise ValueError("At most 200 job IDs may be refreshed at once.")
+
+        placeholders = ",".join("?" for _ in selected)
+        with self._db() as db:
+            rows = db.execute(
+                "SELECT job_id,attempt,status,phase,checkpoint,updated_at "
+                f"FROM worker_commands WHERE job_id IN ({placeholders}) "
+                "ORDER BY job_id,attempt DESC,updated_at DESC",
+                selected,
+            ).fetchall()
+
+        snapshots: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            job_id = str(row["job_id"] or "")
+            if not job_id or job_id in snapshots:
+                continue
+            try:
+                checkpoint = json.loads(row["checkpoint"]) if row["checkpoint"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                checkpoint = {}
+            progress = checkpoint.get("progress") if isinstance(checkpoint, dict) else {}
+            snapshots[job_id] = {
+                "job_id": job_id,
+                "attempt": int(row["attempt"]),
+                "status": str(row["status"] or ""),
+                "phase": str(row["phase"] or ""),
+                "updated_at": str(row["updated_at"] or ""),
+                "progress": progress if isinstance(progress, dict) else {},
+            }
+        return [snapshots[job_id] for job_id in selected if job_id in snapshots]
+
     def event_binding(self, command_id: str) -> dict[str, Any] | None:
         """Return worker-internal event fencing metadata for one command."""
         with self._db() as db:

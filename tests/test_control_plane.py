@@ -2,7 +2,7 @@ import hashlib
 import threading
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -75,6 +75,16 @@ class FakeDispatcher:
     def cancel(self, worker, job_id):
         self.cancelled_jobs.append((worker, job_id))
         return self.cancel_result
+
+    def cancel_with_timeout(self, worker, job_id, *, timeout_seconds):
+        del timeout_seconds
+        return self.cancel(worker, job_id)
+
+    def cancel_attempt_with_timeout(
+        self, worker, job_id, attempt, *, timeout_seconds
+    ):
+        del attempt, timeout_seconds
+        return self.cancel(worker, job_id)
 
     def resume(self, worker, job_id, event_sequence_start):
         del worker, job_id, event_sequence_start
@@ -2502,6 +2512,425 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(returned.status.value, "dispatched")
         self.assertTrue(self.jobs.has_active("default"))
         self.assertFalse(any(event.status.value == "cancelled" for event in self.jobs.events(job.id)))
+
+    def test_accepted_stop_wins_over_late_worker_success_event(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        running = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=job.progress_sequence + 1,
+                status=JobStatus.RUNNING,
+                event_type="started",
+            )
+        )
+
+        stopped = self.control.cancel_job(self.actor, job.id)
+        self.assertEqual(stopped.status, JobStatus.RUNNING)
+
+        completed = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=running.progress_sequence + 2,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+                result={"value": {"exported_count": 1}},
+            )
+        )
+
+        self.assertEqual(completed.status, JobStatus.CANCELLED)
+        self.assertEqual(completed.error["code"], "JOB_TERMINATED")
+        self.assertEqual(
+            self.jobs.events(job.id)[-1].event_type,
+            "cancelled_after_stop",
+        )
+
+        event_count = len(self.jobs.events(job.id))
+        replayed = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=completed.progress_sequence,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+                result={"value": {"exported_count": 1}},
+            )
+        )
+        self.assertEqual(replayed.status, JobStatus.CANCELLED)
+        self.assertEqual(len(self.jobs.events(job.id)), event_count)
+
+    def test_rejected_stop_does_not_override_later_worker_success(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        running = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=job.progress_sequence + 1,
+                status=JobStatus.RUNNING,
+                event_type="started",
+            )
+        )
+        self.dispatcher.cancel_result = False
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.cancel_job(self.actor, job.id)
+
+        self.assertEqual(raised.exception.code, "JOB_NOT_CANCELLABLE")
+        self.assertNotIn("backend_cancel_request", self.jobs.get(job.id).progress)
+        completed = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=running.progress_sequence + 1,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+                result={"value": {"exported_count": 1}},
+            )
+        )
+        self.assertEqual(completed.status, JobStatus.SUCCEEDED)
+
+    def test_high_latency_progress_cancels_job_when_worker_does_not_accept_signal(self):
+        class Health:
+            def __init__(self):
+                self.unresponsive = []
+
+            def mark_unresponsive(self, worker, *, reason):
+                self.unresponsive = [
+                    item for item in self.unresponsive if item[0] != worker
+                ]
+                self.unresponsive.append((worker, reason))
+
+            def clear_unresponsive(self, worker):
+                self.unresponsive = [
+                    item for item in self.unresponsive if item[0] != worker
+                ]
+
+            def snapshot(self, worker):
+                reason = next(
+                    (value for name, value in self.unresponsive if name == worker),
+                    None,
+                )
+                status = "unresponsive" if reason else "ready"
+                return {
+                    "worker": worker,
+                    "status": status,
+                    "healthy": status == "ready",
+                    "reason": reason,
+                }
+
+        self.control.worker_health_cache = Health()
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        received_at = utc_now()
+        sent_at = received_at - timedelta(milliseconds=335_611)
+        self.dispatcher.cancel_result = False
+        self.control.update_worker_progress(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="progress.snapshot",
+                progress={
+                    "phase": "downloading",
+                    "backend_telemetry": {
+                        "worker_sent_at": sent_at.isoformat(),
+                        "backend_received_at": received_at.isoformat(),
+                        "event_latency_ms": 335_611,
+                    },
+                },
+                created_at=received_at,
+            )
+        )
+        cancelled = self.jobs.get(job.id)
+
+        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
+        terminal = self.jobs.events(job.id)[-1]
+        self.assertEqual(terminal.event_type, "backend_cancelled_unresponsive")
+        self.assertTrue(terminal.progress["outcome_uncertain"])
+        self.assertEqual(self.dispatcher.cancelled_jobs, [("local", job.id)])
+        self.assertEqual(
+            self.control.worker_health_cache.unresponsive,
+            [("local", "event_backlog_cancel_unconfirmed")],
+        )
+        with self.assertRaises(DomainError) as raised:
+            self.control.resolve_target(self.actor, worker="local")
+        self.assertEqual(raised.exception.code, "WORKER_UNRESPONSIVE")
+
+        restored_health = Health()
+        restored = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            worker_health_cache=restored_health,
+        )
+        self.assertEqual(
+            restored._worker_unresponsive_reason("local"),
+            "event_backlog_cancel_unconfirmed",
+        )
+        late_terminal = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=3,
+                status=JobStatus.CANCELLED,
+                event_type="cancelled",
+            )
+        )
+        self.assertEqual(late_terminal.status, JobStatus.CANCELLED)
+        self.assertIsNone(self.control._worker_unresponsive_reason("local"))
+
+    def test_high_latency_below_threshold_does_not_force_cancel(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        received_at = utc_now()
+        sent_at = received_at - timedelta(milliseconds=1_999)
+        self.dispatcher.cancel_result = False
+
+        self.control.update_worker_progress(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="progress.snapshot",
+                progress={
+                    "backend_telemetry": {
+                        "worker_sent_at": sent_at.isoformat(),
+                        "backend_received_at": received_at.isoformat(),
+                        "event_latency_ms": 1_999,
+                    },
+                },
+                created_at=received_at,
+            )
+        )
+
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+
+    def test_high_latency_does_not_fall_back_to_unbounded_cancel(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+
+        class LegacyDispatcher:
+            def __init__(self):
+                self.calls = []
+
+            def cancel(self, worker, job_id):
+                self.calls.append((worker, job_id))
+                return True
+
+        legacy = LegacyDispatcher()
+        self.control.dispatcher = legacy
+
+        accepted = self.control._cancel_worker_attempt_with_timeout(
+            job, timeout_seconds=2.5
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(legacy.calls, [])
+
+    def test_accepted_high_latency_cancel_deadline_survives_low_latency_and_restart(self):
+        class Health:
+            def __init__(self):
+                self.unresponsive = []
+
+            def mark_unresponsive(self, worker, *, reason):
+                self.unresponsive = [
+                    item for item in self.unresponsive if item[0] != worker
+                ]
+                self.unresponsive.append((worker, reason))
+
+            def clear_unresponsive(self, worker):
+                self.unresponsive = [
+                    item for item in self.unresponsive if item[0] != worker
+                ]
+
+            def snapshot(self, worker):
+                reason = next(
+                    (value for name, value in self.unresponsive if name == worker),
+                    None,
+                )
+                status = "unresponsive" if reason else "ready"
+                return {
+                    "worker": worker,
+                    "status": status,
+                    "healthy": status == "ready",
+                    "reason": reason,
+                }
+
+        self.control.worker_health_cache = Health()
+        self.dispatcher.cancel_result = True
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+
+        accepted = self.control._cancel_high_latency_job(job, 335_611)
+        self.assertIn(accepted.status, {JobStatus.DISPATCHED, JobStatus.RUNNING})
+        request = accepted.progress["backend_cancel_request"]
+        self.assertEqual(request["signal_status"], "accepted")
+        requested_at = datetime.fromisoformat(request["requested_at"])
+
+        received_at = utc_now()
+        self.control.update_worker_progress(
+            JobEvent(
+                job_id=job.id,
+                sequence=self.control._next_job_event_sequence(job.id),
+                status=JobStatus.RUNNING,
+                event_type="progress.snapshot",
+                progress={
+                    "backend_telemetry": {
+                        "worker_sent_at": (
+                            received_at - timedelta(milliseconds=1_000)
+                        ).isoformat(),
+                        "backend_received_at": received_at.isoformat(),
+                        "event_latency_ms": 1_000,
+                    },
+                },
+                created_at=received_at,
+            )
+        )
+        self.assertEqual(
+            self.jobs.get(job.id).progress["backend_cancel_request"], request
+        )
+
+        restarted = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            job_cancel_grace_seconds=self.control.job_cancel_grace_seconds,
+        )
+        restarted._recover_stale_jobs(
+            now=requested_at
+            + timedelta(seconds=self.control.job_cancel_grace_seconds + 1)
+        )
+
+        cancelled = self.jobs.get(job.id)
+        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
+        self.assertEqual(cancelled.error["code"], "WORKER_UNRESPONSIVE")
+        self.assertEqual(
+            self.jobs.events(job.id)[-1].event_type,
+            "backend_cancelled_unresponsive",
+        )
+        self.assertEqual(self.dispatcher.cancelled_jobs, [("local", job.id)])
+
+    def test_accepted_high_latency_cancel_preserves_next_worker_event_sequence(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        self.jobs.append_event(
+            JobEvent(job.id, 2, JobStatus.RUNNING, "started")
+        )
+        current = self.jobs.get(job.id)
+        self.assertIsNotNone(current)
+        self.dispatcher.cancel_result = True
+
+        accepted = self.control._cancel_high_latency_job(current, 335_611)
+        self.assertEqual(accepted.status, JobStatus.RUNNING)
+        self.assertEqual(accepted.progress_sequence, 2)
+
+        terminal = self.control.append_worker_event(
+            JobEvent(
+                job.id,
+                3,
+                JobStatus.CANCELLED,
+                "cancelled",
+                {"phase": "cancelled"},
+            )
+        )
+
+        self.assertEqual(terminal.status, JobStatus.CANCELLED)
+        self.assertEqual(terminal.progress_sequence, 3)
+        self.assertEqual(self.jobs.events(job.id)[-1].event_type, "cancelled")
+
+    def test_accepted_high_latency_cancel_does_not_clear_concurrent_quarantine(self):
+        class Health:
+            def __init__(self):
+                self.unresponsive = []
+
+            def mark_unresponsive(self, worker, *, reason):
+                self.unresponsive = [
+                    item for item in self.unresponsive if item[0] != worker
+                ]
+                self.unresponsive.append((worker, reason))
+
+            def clear_unresponsive(self, worker):
+                self.unresponsive = [
+                    item for item in self.unresponsive if item[0] != worker
+                ]
+
+            def snapshot(self, worker):
+                reason = next(
+                    (value for name, value in self.unresponsive if name == worker),
+                    None,
+                )
+                status = "unresponsive" if reason else "ready"
+                return {
+                    "worker": worker,
+                    "status": status,
+                    "healthy": status == "ready",
+                    "reason": reason,
+                }
+
+        health = Health()
+        self.control.worker_health_cache = health
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+
+        class RacingDispatcher:
+            def cancel_with_timeout(self, worker, job_id, *, timeout_seconds):
+                del job_id, timeout_seconds
+                health.mark_unresponsive(
+                    worker, reason="event_backlog_cancel_unconfirmed"
+                )
+                return True
+
+        self.control.dispatcher = RacingDispatcher()
+        accepted = self.control._cancel_high_latency_job(job, 3_000)
+
+        self.assertIn(accepted.status, {JobStatus.DISPATCHED, JobStatus.RUNNING})
+        self.assertEqual(
+            self.control._worker_unresponsive_reason("local"),
+            "event_backlog_cancel_unconfirmed",
+        )
+
+    def test_recovery_loop_handles_already_stored_high_latency(self):
+        control = ControlPlane(
+            self.jobs,
+            self.dispatcher,
+            self.profiles,
+            job_stall_timeout_seconds=600,
+        )
+        job = control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        received_at = utc_now()
+        event = JobEvent(
+            job_id=job.id,
+            sequence=2,
+            status=JobStatus.RUNNING,
+            event_type="progress.snapshot",
+            progress={
+                "backend_telemetry": {
+                    "worker_sent_at": (
+                        received_at - timedelta(milliseconds=335_611)
+                    ).isoformat(),
+                    "backend_received_at": received_at.isoformat(),
+                    "event_latency_ms": 335_611,
+                },
+            },
+            created_at=received_at,
+        )
+        observed = control._with_observability(self.jobs.get(job.id), event)
+        self.jobs.update_progress_snapshot(observed)
+        self.dispatcher.cancel_result = False
+
+        control._recover_stale_jobs(now=received_at)
+
+        cancelled = self.jobs.get(job.id)
+        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
+        self.assertEqual(cancelled.error["code"], "WORKER_UNRESPONSIVE")
 
     def test_backend_force_cancels_stalled_job_after_worker_grace(self):
         control = ControlPlane(

@@ -57,6 +57,23 @@ class WorkerHealthMonitorTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "offline")
         self.assertEqual(snapshot["healthy"], False)
 
+    def test_unresponsive_override_survives_probe_until_cleared(self):
+        self.monitor.refresh_once()
+        self.monitor.mark_unresponsive(
+            "remote-1", reason="event_backlog_cancel_unconfirmed"
+        )
+
+        self.monitor.refresh_once()
+        snapshot = self.monitor.snapshot("remote-1")
+        self.assertEqual(snapshot["status"], "unresponsive")
+        self.assertEqual(
+            snapshot["reason"], "event_backlog_cancel_unconfirmed"
+        )
+        self.assertFalse(snapshot["healthy"])
+
+        self.monitor.clear_unresponsive("remote-1")
+        self.assertEqual(self.monitor.snapshot("remote-1")["status"], "ready")
+
 
 if __name__ == "__main__":
     unittest.main()
