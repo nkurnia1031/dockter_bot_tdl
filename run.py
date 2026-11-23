@@ -33,11 +33,7 @@ ENV_FILE = PROJECT_DIR / ".env"
 LEGACY_ENV_FILE = PROJECT_DIR / "env"
 FULL_ONLY_GATEWAY_SERVICES = (
     "telegram",
-    "worker-local",
     "aria2",
-    "tts-1",
-    "tts-2",
-    "tts-3",
 )
 USAGE = """Usage: python3 run.py <command>
 
@@ -1224,9 +1220,9 @@ def guard_lite_gateway_cutover(dotenv: dict[str, str]) -> None:
         # absent job database is not evidence that no local job needs draining.
         blockers = local_jobs_blocking_lite_cutover(database_file)
     else:
-        # First Lite deployment on a fresh project has no local worker or job
-        # database to cut over. Once either exists, an unverifiable database
-        # must block the transition rather than silently assume there is no work.
+        # A fresh Lite install has no previous Full services or job database
+        # to cut over. Once either exists, an unverifiable database must block
+        # the transition rather than silently assume there is no local work.
         return
 
     if not blockers:

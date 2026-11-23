@@ -76,8 +76,10 @@ class ContainerBuildTests(unittest.TestCase):
         self.assertNotIn("web:", gateway)
         self.assertIn("telegram:", gateway)
         self.assertEqual(gateway_services["telegram"]["profiles"], ["full"])
-        for name in ("worker-local", "aria2", "tts-1", "tts-2", "tts-3"):
-            self.assertEqual(gateway_services[name]["profiles"], ["full"])
+        self.assertEqual(gateway_services["worker-local"]["profiles"], ["full", "lite"])
+        self.assertEqual(gateway_services["aria2"]["profiles"], ["full"])
+        for name in ("tts-1", "tts-2", "tts-3"):
+            self.assertEqual(gateway_services[name]["profiles"], ["full", "lite"])
         login_bot = gateway_services["telegram-login"]
         self.assertEqual(login_bot["profiles"], ["lite"])
         self.assertEqual(login_bot["environment"]["APP_ROLE"], "telegram-login")
@@ -152,7 +154,7 @@ class ContainerBuildTests(unittest.TestCase):
             for name in ("tts-1", "tts-2", "tts-3"):
                 self.assertIn(name, services)
                 if filename == "docker-compose.gateway.yml":
-                    self.assertEqual(services[name].get("profiles"), ["full"])
+                    self.assertEqual(services[name].get("profiles"), ["full", "lite"])
                 else:
                     self.assertNotIn("profiles", services[name])
                 helper = services[name]

@@ -294,8 +294,8 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(final_ps.args[0][-3:], ["ps", "--all", "--services"])
             self.assertEqual(final_ps.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
             self.assertEqual(
-                stop_call.args[0][-7:],
-                ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
+                stop_call.args[0][-3:],
+                ["stop", "telegram", "aria2"],
             )
             self.assertEqual(stop_call.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
             self.assertEqual(up_call.args[0][-2:], ["up", "-d"])
@@ -408,7 +408,7 @@ class RunScriptTests(unittest.TestCase):
             ps_result = subprocess.CompletedProcess(
                 args=["docker", "compose", "ps"],
                 returncode=0,
-                stdout="worker-local\n",
+                stdout="telegram\n",
                 stderr="",
             )
             with (
@@ -474,7 +474,10 @@ class RunScriptTests(unittest.TestCase):
 
             self.assertEqual(subprocess_run.call_count, 3)
             self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
-            self.assertEqual(subprocess_run.call_args_list[1].args[0][-7], "stop")
+            self.assertEqual(
+                subprocess_run.call_args_list[1].args[0][-3:],
+                ["stop", "telegram", "aria2"],
+            )
             self.assertEqual(subprocess_run.call_args_list[2].args[0][-2:], ["up", "-d"])
             self.assertEqual(subprocess_run.call_args_list[2].kwargs["env"]["COMPOSE_PROFILES"], "lite")
 
@@ -529,8 +532,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(subprocess_run.call_count, 3)
         self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
         self.assertEqual(
-            subprocess_run.call_args_list[1].args[0][-7:],
-            ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
+            subprocess_run.call_args_list[1].args[0][-3:],
+            ["stop", "telegram", "aria2"],
         )
         restore = subprocess_run.call_args_list[2]
         self.assertEqual(restore.args[0][-2:], ["up", "-d"])

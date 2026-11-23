@@ -98,7 +98,7 @@ services:
         condition: service_healthy
 
   worker-local:
-    profiles: ["full"]
+    profiles: ["full", "lite"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     build:
       context: .
@@ -150,7 +150,7 @@ services:
       start_period: 10s
 
   tts-1:
-    profiles: ["full"]
+    profiles: ["full", "lite"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
@@ -173,7 +173,7 @@ services:
       start_period: 90s
 
   tts-2:
-    profiles: ["full"]
+    profiles: ["full", "lite"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
@@ -196,7 +196,7 @@ services:
       start_period: 90s
 
   tts-3:
-    profiles: ["full"]
+    profiles: ["full", "lite"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
