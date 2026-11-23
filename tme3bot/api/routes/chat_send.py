@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import Depends, Header, Request, Response
 
+from tme3bot.api.activity import track_activity_operation
 from tme3bot.api.schemas import ChatSendJobRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.chat_send import safe_chat_send_retry_paths
@@ -37,7 +38,7 @@ def register_chat_send(app, context, *, current_actor, job_dict) -> None:
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
-        request.state.activity_operation_id = operation.id
+        track_activity_operation(request, operation)
         job = context.control_plane.jobs.get(str(operation.job_id or ""))
         if job is None:
             raise DomainError("JOB_NOT_FOUND", "Job Kirim ke Chat tidak ditemukan setelah diterima.", status_code=500)
@@ -90,7 +91,7 @@ def register_chat_send(app, context, *, current_actor, job_dict) -> None:
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
-        request.state.activity_operation_id = operation.id
+        track_activity_operation(request, operation)
         retried_job = context.control_plane.jobs.get(str(operation.job_id or ""))
         if retried_job is None:
             raise DomainError("JOB_NOT_FOUND", "Job Retry Kirim ke Chat tidak ditemukan setelah diterima.", status_code=500)

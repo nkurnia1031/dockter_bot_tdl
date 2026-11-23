@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import sqlite3
 import shlex
 import shutil
 import subprocess
@@ -16,9 +17,11 @@ from getpass import getpass
 from pathlib import Path
 
 try:
+    from tme3bot.domain.models import JobStatus
     from tme3bot.infrastructure.http_client import request_json
     from tme3bot.names import normalize_profile_name
 except ModuleNotFoundError:  # First-run bootstrap before Python dependencies exist.
+    JobStatus = None  # type: ignore[assignment]
     request_json = None  # type: ignore[assignment]
     normalize_profile_name = None  # type: ignore[assignment]
 
@@ -28,6 +31,14 @@ from tme3bot.database_paths import DatabasePaths, filesystem_identity, validate_
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_DIR / ".env"
 LEGACY_ENV_FILE = PROJECT_DIR / "env"
+FULL_ONLY_GATEWAY_SERVICES = (
+    "telegram",
+    "worker-local",
+    "aria2",
+    "tts-1",
+    "tts-2",
+    "tts-3",
+)
 USAGE = """Usage: python3 run.py <command>
 
 Commands:
@@ -137,6 +148,11 @@ def main() -> int:
             return 0
         if action == "restart":
             require_env_file()
+            if gateway_mode_for_compose(env) is not None and not configured_service(env):
+                run_compose(
+                    ["up", "-d", "--remove-orphans", "--force-recreate"], env
+                )
+                return 0
             args = ["restart"]
             if service := configured_service(env):
                 args.append(service)
@@ -1040,13 +1056,262 @@ def find_host_tdl(env: dict[str, str]) -> Path | None:
     return candidate.resolve()
 
 
+def gateway_mode_for_compose(dotenv: dict[str, str]) -> str | None:
+    merged = dict(os.environ)
+    merged.update(dotenv)
+    compose_files = {
+        Path(path.replace("\\", "/")).name.lower()
+        for path in merged.get("COMPOSE_FILE", "").split(os.pathsep)
+        if path.strip()
+    }
+    if "docker-compose.gateway.yml" not in compose_files:
+        return None
+    gateway_mode = (merged.get("GATEWAY_MODE") or "full").strip().lower() or "full"
+    if gateway_mode not in {"full", "lite"}:
+        raise RuntimeError("GATEWAY_MODE harus full atau lite.")
+    return gateway_mode
+
+
 def compose_env(dotenv: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(dotenv)
+    if gateway_mode := gateway_mode_for_compose(dotenv):
+        merged["GATEWAY_MODE"] = gateway_mode
+        merged["COMPOSE_PROFILES"] = gateway_mode
     return merged
 
 
+def gateway_local_jobs_database(dotenv: dict[str, str]) -> Path:
+    merged = dict(os.environ)
+    merged.update(dotenv)
+    database_root = Path(database_root_value(merged, role="gateway")).expanduser()
+    return database_root / "gateway" / "storage.db"
+
+
+def _contains_reconciliation_marker(value: object) -> bool:
+    if isinstance(value, dict):
+        if any(
+            str(value.get(key, "")).strip().lower()
+            in {"needs_reconciliation", "reconciliation_required"}
+            for key in ("status", "state", "outcome")
+        ):
+            return True
+        if any(
+            value.get(key) is True
+            or str(value.get(key, "")).strip().lower() in {"true", "1"}
+            for key in ("reconciliation_required", "outcome_uncertain")
+        ):
+            return True
+        return any(_contains_reconciliation_marker(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_reconciliation_marker(item) for item in value)
+    return False
+
+
+def local_jobs_blocking_lite_cutover(database_file: Path) -> list[tuple[str, str]]:
+    """Read local jobs without creating or migrating the gateway database."""
+    if not database_file.is_file():
+        raise RuntimeError(
+            "Tidak dapat memeriksa job worker-local; database gateway tidak ditemukan. Deploy Lite dibatalkan."
+        )
+
+    uri = database_file.resolve().as_uri() + "?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=1) as database:
+            table = database.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+            ).fetchone()
+            if table is None:
+                raise RuntimeError(
+                    "Tidak dapat memeriksa job worker-local; tabel jobs tidak ditemukan. Deploy Lite dibatalkan."
+                )
+            columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(jobs)")
+            }
+            if not {"id", "worker", "status", "result", "progress"}.issubset(columns):
+                raise RuntimeError(
+                    "Tidak dapat memeriksa job worker-local; skema jobs tidak dapat diverifikasi. Deploy Lite dibatalkan."
+                )
+            rows = database.execute(
+                "SELECT id, status, result, progress FROM jobs WHERE worker='local' ORDER BY updated_at, id"
+                if "updated_at" in columns
+                else "SELECT id, status, result, progress FROM jobs WHERE worker='local' ORDER BY id"
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(
+            "Tidak dapat memeriksa job worker-local; deploy Lite dibatalkan agar layanan tidak menghentikan pekerjaan yang belum diketahui."
+        ) from exc
+
+    if JobStatus is None:
+        raise RuntimeError("Model status job tidak tersedia untuk preflight deploy Lite.")
+    terminal_statuses = {
+        status.value for status in JobStatus if status.terminal
+    }
+    blockers: list[tuple[str, str]] = []
+    for row in rows:
+        job_id, raw_status, raw_result = row[:3]
+        raw_progress = row[3]
+        status = str(raw_status or "unknown").strip().lower() or "unknown"
+        requires_reconciliation = False
+        for raw_metadata in (raw_result, raw_progress):
+            if not raw_metadata:
+                continue
+            try:
+                metadata = json.loads(str(raw_metadata))
+            except (TypeError, json.JSONDecodeError):
+                # Malformed job metadata cannot prove that an ambiguous upload
+                # was reconciled, so the operator must inspect it before cutover.
+                requires_reconciliation = True
+                break
+            requires_reconciliation = _contains_reconciliation_marker(metadata)
+            if requires_reconciliation:
+                break
+
+        if status not in terminal_statuses:
+            blockers.append((str(job_id), status))
+        elif requires_reconciliation:
+            blockers.append((str(job_id), "needs_reconciliation"))
+    return blockers
+
+
+def existing_full_gateway_services(dotenv: dict[str, str]) -> set[str]:
+    command = compose_base_command(dotenv) + ["ps", "--all", "--services"]
+    environment = compose_env(dotenv)
+    environment["COMPOSE_PROFILES"] = "full,lite"
+    print("$ " + shlex.join(command))
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_DIR,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    reported_services = set((completed.stdout or "").splitlines())
+    return reported_services.intersection(FULL_ONLY_GATEWAY_SERVICES)
+
+
+def active_gateway_mode(dotenv: dict[str, str]) -> str | None:
+    """Infer the currently running gateway profile before a mode transition."""
+    command = compose_base_command(dotenv) + ["ps", "--services", "--status", "running"]
+    environment = compose_env(dotenv)
+    environment["COMPOSE_PROFILES"] = "full,lite"
+    print("$ " + shlex.join(command))
+    completed = subprocess.run(
+        command,
+        cwd=PROJECT_DIR,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    services = set((completed.stdout or "").splitlines())
+    if services.intersection(FULL_ONLY_GATEWAY_SERVICES):
+        return "full"
+    if "telegram-login" in services:
+        return "lite"
+    return None
+
+
+def guard_lite_gateway_cutover(dotenv: dict[str, str]) -> None:
+    if gateway_mode_for_compose(dotenv) != "lite":
+        return
+    database_file = gateway_local_jobs_database(dotenv)
+    if database_file.is_file():
+        blockers = local_jobs_blocking_lite_cutover(database_file)
+    elif existing_full_gateway_services(dotenv):
+        # A prior Full container proves this is not a fresh Lite install. Its
+        # absent job database is not evidence that no local job needs draining.
+        blockers = local_jobs_blocking_lite_cutover(database_file)
+    else:
+        # First Lite deployment on a fresh project has no local worker or job
+        # database to cut over. Once either exists, an unverifiable database
+        # must block the transition rather than silently assume there is no work.
+        return
+
+    if not blockers:
+        return
+
+    def safe_identifier(value: str) -> str:
+        return "".join(char if char.isprintable() and char not in "\r\n" else "?" for char in value)[:80]
+
+    details = ", ".join(
+        f"{safe_identifier(job_id)} ({safe_identifier(status)})"
+        for job_id, status in blockers
+    )
+    raise RuntimeError(
+        "Deploy Full→Lite dibatalkan. Job worker-local belum terminal atau belum direkonsiliasi: "
+        f"{details}. Selesaikan job tersebut sebelum mengganti mode."
+    )
+
+
+def stop_inactive_gateway_services(dotenv: dict[str, str]) -> None:
+    gateway_mode = gateway_mode_for_compose(dotenv)
+    if gateway_mode is None:
+        return
+    inactive_services = (
+        ["telegram-login"]
+        if gateway_mode == "full"
+        else list(FULL_ONLY_GATEWAY_SERVICES)
+    )
+    command = compose_base_command(dotenv) + ["stop", *inactive_services]
+    environment = compose_env(dotenv)
+    # Include both profiles only for this stop command so Compose can see a
+    # previously running poller even though the active mode excludes it.
+    environment["COMPOSE_PROFILES"] = "full,lite"
+    print("$ " + shlex.join(command))
+    subprocess.run(command, cwd=PROJECT_DIR, env=environment, check=True)
+
+
+def stop_gateway_admission(dotenv: dict[str, str]) -> None:
+    """Stop API admission before the final local-job check for a Lite cutover."""
+    command = compose_base_command(dotenv) + ["stop", "backend"]
+    environment = compose_env(dotenv)
+    environment["COMPOSE_PROFILES"] = "full,lite"
+    print("$ " + shlex.join(command))
+    subprocess.run(command, cwd=PROJECT_DIR, env=environment, check=True)
+
+
+def restore_gateway_after_aborted_lite_cutover(
+    dotenv: dict[str, str], previous_mode: str
+) -> None:
+    restore_env = dict(dotenv)
+    restore_env["GATEWAY_MODE"] = previous_mode
+    restore_env["COMPOSE_PROFILES"] = previous_mode
+    stop_inactive_gateway_services(restore_env)
+    command = compose_base_command(dotenv) + ["up", "-d"]
+    environment = compose_env(restore_env)
+    print("$ " + shlex.join(command))
+    subprocess.run(command, cwd=PROJECT_DIR, env=environment, check=True)
+
+
 def run_compose(args: list[str], dotenv: dict[str, str]) -> None:
+    if args and args[0] == "up":
+        guard_lite_gateway_cutover(dotenv)
+        if gateway_mode_for_compose(dotenv) == "lite":
+            previous_mode = active_gateway_mode(dotenv) or "lite"
+            # Freeze public job admission before the authoritative second
+            # check; the first check alone races with requests already in flight.
+            try:
+                stop_gateway_admission(dotenv)
+                guard_lite_gateway_cutover(dotenv)
+                stop_inactive_gateway_services(dotenv)
+                command = compose_base_command(dotenv) + args
+                print("$ " + shlex.join(command))
+                subprocess.run(
+                    command, cwd=PROJECT_DIR, env=compose_env(dotenv), check=True
+                )
+            except Exception:
+                try:
+                    restore_gateway_after_aborted_lite_cutover(dotenv, previous_mode)
+                except Exception as restore_error:
+                    raise RuntimeError(
+                        "Cutover Lite gagal dan gateway Full tidak dapat dipulihkan otomatis. "
+                        "Periksa Docker Compose sebelum mengirim job baru."
+                    ) from restore_error
+                raise
+            return
+        stop_inactive_gateway_services(dotenv)
     command = compose_base_command(dotenv) + args
     print("$ " + shlex.join(command))
     subprocess.run(command, cwd=PROJECT_DIR, env=compose_env(dotenv), check=True)

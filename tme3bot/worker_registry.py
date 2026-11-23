@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -10,10 +11,54 @@ from tme3bot.persistence import write_json_atomic_private
 
 
 WORKER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+_GATEWAY_LOCAL_WORKER_NAMES = frozenset({"local", "worker-local"})
 
 
 def normalize_worker_name(value: str) -> str:
     return value.strip().lower()
+
+
+def worker_local_urls(config) -> frozenset[str]:
+    """Return configured endpoints that identify this gateway's local worker."""
+    urls: set[str] = set()
+    configured = str(getattr(config, "worker_local_url", "") or "").strip().rstrip("/")
+    if configured:
+        urls.add(configured.lower())
+    endpoints = getattr(config, "worker_endpoints", None)
+    if isinstance(endpoints, Mapping):
+        for name, url in endpoints.items():
+            if normalize_worker_name(str(name)) in _GATEWAY_LOCAL_WORKER_NAMES:
+                value = str(url or "").strip().rstrip("/")
+                if value:
+                    urls.add(value.lower())
+    return frozenset(urls)
+
+
+def worker_names_for_mode(workers, gateway_mode: str, *, local_urls=()) -> list[str]:
+    """Return worker targets usable in this mode, including endpoint aliases."""
+    normalized_mode = str(gateway_mode or "full").strip().lower()
+    records = workers if isinstance(workers, Mapping) else None
+    names = records.keys() if records is not None else workers
+    normalized_local_urls = {
+        str(url or "").strip().rstrip("/").lower()
+        for url in local_urls
+        if str(url or "").strip()
+    }
+    def targets_local_endpoint(name: object) -> bool:
+        if records is None:
+            return False
+        record = records[name]
+        endpoint = str(record.get("url") or "").strip().rstrip("/") if isinstance(record, Mapping) else ""
+        return endpoint.lower() in normalized_local_urls
+
+    return [
+        str(name)
+        for name in names
+        if normalized_mode != "lite" or (
+            normalize_worker_name(str(name)) not in _GATEWAY_LOCAL_WORKER_NAMES
+            and not targets_local_endpoint(name)
+        )
+    ]
 
 
 def _as_enabled(value: object) -> bool:

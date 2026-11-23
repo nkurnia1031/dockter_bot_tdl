@@ -10,12 +10,15 @@ from tme3bot.api.worker import WorkerContext, create_worker_app
 from tme3bot.application.control_plane import ControlPlane
 from tme3bot.application.operations import OperationsService
 from tme3bot.application.runtime_readiness import RuntimeReadinessGate
+from tme3bot.application.worker_health import WorkerHealthMonitor
+from tme3bot.background_schedule import GatewayBackgroundSchedule
 from tme3bot.backup_coordinator import BackupCoordinator, BackupScheduler
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.config import AppConfig
 from tme3bot.database_paths import ensure_private_directory
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
+from tme3bot.infrastructure.database_compaction import DatabaseCompactionService
 from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistoryStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService
 from tme3bot.infrastructure.http_client import WorkerHttpDispatcher
@@ -44,7 +47,7 @@ from tme3bot.storage_catalog import StorageCatalog
 from tme3bot.storage_maintenance import StorageMaintenanceService
 from tme3bot.utility import UtilityFolderStore, UtilitySettingsStore
 from tme3bot.worker.executor import WorkerEventPublisher, WorkerJobExecutor
-from tme3bot.worker_registry import WorkerRegistry
+from tme3bot.worker_registry import WorkerRegistry, worker_local_urls
 
 LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +55,11 @@ LOGGER = logging.getLogger(__name__)
 def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupScheduler]:
     from telegram import Bot
 
+    background_schedule = GatewayBackgroundSchedule.for_mode(
+        config.gateway_mode,
+        recovery_seconds=config.gateway_lite_recovery_interval_seconds,
+        trash_seconds=config.gateway_lite_trash_interval_seconds,
+    )
     ensure_private_directory(config.database_root)
     ensure_private_directory(config.storage_db_file.parent)
     runtime_settings = BackendRuntimeSettings(
@@ -151,6 +159,10 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
     catalog = StorageCatalog(config.storage_db_file)
     export_catalog = ExportArtifactCatalog(config.storage_db_file)
     jobs = SqliteJobRepository(config.storage_db_file)
+    database_compaction_service = DatabaseCompactionService(
+        jobs,
+        min_free_bytes=config.database_compaction_min_free_bytes,
+    )
     activity_journal = ActivityJournalStore(config.storage_db_file)
     tdl_access_store = SqliteTdlAccessStore(config.storage_db_file)
     operation_store = SqliteOperationStore(jobs)
@@ -172,16 +184,27 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
             operation_store,
             config.redis_url,
             operations=operation_service,
+            interval_seconds=background_schedule.queue_recovery_seconds,
+            reconcile_seconds=background_schedule.queue_reconcile_seconds,
         )
         if config.durable_dispatch_enabled
         else None
     )
+    if queue_publisher is not None:
+        operation_service.set_change_notifier(queue_publisher.wake)
     dispatcher = WorkerHttpDispatcher(registry)
+    worker_health_monitor = WorkerHealthMonitor(
+        registry, dispatcher.check_worker_fast
+    )
     profile_provisioner = ProfileProvisioningService(
         profile_vault,
         profiles,
         registry,
         dispatcher,
+        recovery_interval_seconds=background_schedule.profile_provisioning_seconds,
+        gateway_mode=config.gateway_mode,
+        local_worker_urls=worker_local_urls(config),
+        database_activity=database_compaction_service.database_activity,
     )
     folders = UtilityFolderStore(
         config.utility_folders_file, config.utility_workspace_root
@@ -220,6 +243,9 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         tdl_access_target_resolver=tdl_access_target,
         job_stall_timeout_seconds=config.job_stall_timeout_seconds,
         job_cancel_grace_seconds=config.job_cancel_grace_seconds,
+        gateway_mode=config.gateway_mode,
+        worker_health_cache=worker_health_monitor,
+        scheduler_recovery_seconds=background_schedule.job_recovery_seconds,
     )
     control_plane.add_event_observer(operation_service.on_job_event)
     control_plane.start_scheduler()
@@ -256,10 +282,25 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
                 "Backup channel username belum bisa di-resolve ke numeric chat ID."
             )
     storage_maintenance = StorageMaintenanceService(
-        catalog, bot, config.storage_trash_retention_days
+        catalog,
+        bot,
+        config.storage_trash_retention_days,
+        interval_seconds=int(background_schedule.storage_recovery_seconds),
+        database_activity=database_compaction_service.database_activity,
+        trash_interval_seconds=int(background_schedule.storage_trash_seconds),
     )
-    coordinator = BackupCoordinator(config, bot, catalog)
-    scheduler = BackupScheduler(config, coordinator)
+    catalog.set_caption_notifier(storage_maintenance.wake)
+    coordinator = BackupCoordinator(
+        config,
+        bot,
+        catalog,
+        database_activity=database_compaction_service.database_activity,
+    )
+    scheduler = BackupScheduler(
+        config,
+        coordinator,
+        scheduling_enabled=background_schedule.scheduled_backups_enabled,
+    )
 
     def backup_observer(event) -> None:
         job = control_plane.jobs.get(event.job_id)
@@ -288,6 +329,9 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         profile_vault,
         registry,
         dispatcher,
+        recovery_interval_seconds=background_schedule.profile_distribution_seconds,
+        gateway_mode=config.gateway_mode,
+        local_worker_urls=worker_local_urls(config),
     )
     context = BackendContext(
         config=config,
@@ -303,7 +347,9 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         backup_coordinator=coordinator,
         bot=bot,
         worker_dispatcher=dispatcher,
+        worker_health_monitor=worker_health_monitor,
         storage_maintenance=storage_maintenance,
+        database_compaction_service=database_compaction_service,
         runtime_settings=runtime_settings,
         runtime_settings_store=runtime_settings_store,
         backup_scheduler=scheduler,
@@ -326,15 +372,22 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
 
 def run_backend(config: AppConfig) -> None:
     context, scheduler = build_backend_context(config)
-    scheduler.start()
-    context.storage_maintenance.start()
-    if context.profile_provisioner is not None:
-        context.profile_provisioner.start()
-    if context.profile_distribution_service is not None:
-        context.profile_distribution_service.start()
-    if context.queue_publisher is not None:
-        context.queue_publisher.start()
     try:
+        scheduler.start()
+        if config.gateway_mode == "lite" and context.worker_health_monitor is not None:
+            context.worker_health_monitor.start()
+        context.storage_maintenance.start()
+        if context.profile_provisioner is not None:
+            context.profile_provisioner.start()
+        if context.profile_distribution_service is not None:
+            context.profile_distribution_service.start()
+        if context.queue_publisher is not None:
+            context.queue_publisher.start()
+        # Provisioning and distribution perform synchronous recovery writes
+        # against the gateway database during start(). Run VACUUM only after
+        # those recovery phases have completed.
+        if context.database_compaction_service is not None:
+            context.database_compaction_service.start()
         uvicorn.run(
             create_backend_app(context),
             host=config.backend_bind_host,
@@ -342,6 +395,10 @@ def run_backend(config: AppConfig) -> None:
             log_level=config.log_level.lower(),
         )
     finally:
+        if context.database_compaction_service is not None:
+            context.database_compaction_service.stop()
+        if context.worker_health_monitor is not None:
+            context.worker_health_monitor.stop()
         if context.profile_provisioner is not None:
             context.profile_provisioner.stop()
         if context.profile_distribution_service is not None:

@@ -1,6 +1,26 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import QuickModePage from './QuickModePage.svelte';
+import { setGatewayMode } from '$lib/gateway-mode.svelte';
+import { session } from '$lib/session.svelte';
+
+async function restoreFullSessionForPage() {
+  const pageFetch = window.fetch.bind(window);
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+      authenticated: true,
+      actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+      profiles: ['default']
+    }), { status: 200 });
+    if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'full' }), { status: 200 });
+    if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+      { name: 'local', url: 'http://worker-local', enabled: true }
+    ] }), { status: 200 });
+    return pageFetch(input, init);
+  }));
+  await session.restore();
+}
 
 const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles: [
   { name: 'default', workers: ['local'], exclusive_worker: 'local' }
@@ -14,10 +34,12 @@ const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles
 } }), { status: 200 });
 
 describe('QuickModePage', () => {
+  beforeEach(() => setGatewayMode('full'));
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    setGatewayMode(null);
   });
 
   async function flushPromises() {
@@ -38,6 +60,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({}), { status: 200 });
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await flushPromises();
     const statsQuery = '/jobs?limit=200&scope=global&kind=export&quick_mode=true&archived=false';
@@ -74,6 +97,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await screen.findByRole('button', { name: 'Tambah Quick Mode' });
     const profileFilter = await screen.findByLabelText('Profile') as HTMLSelectElement;
@@ -112,6 +136,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await screen.findByRole('button', { name: 'Tambah Quick Mode' });
     const profileFilter = await screen.findByLabelText('Profile') as HTMLSelectElement;
@@ -144,6 +169,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({}),{status:200});
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await screen.findByText(/Quick Mode siap/);
     await fireEvent.click(screen.getByRole('button',{name:'Pilih folder'}));
@@ -180,6 +206,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({}),{status:200});
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await screen.findByText(/Quick Mode siap/);
     await fireEvent.click(screen.getByRole('button',{name:'Pilih folder'}));
@@ -231,6 +258,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await fireEvent.click(await screen.findByRole('button', { name: 'Refresh scan' }));
     expect(await screen.findByText('Sedang processing (#active-s)')).toBeTruthy();
@@ -280,6 +308,7 @@ describe('QuickModePage', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
+    await restoreFullSessionForPage();
     render(QuickModePage);
     await fireEvent.click(await screen.findByRole('button', { name: 'Refresh scan' }));
     await fireEvent.click(await screen.findByRole('button', { name: 'Hapus staging' }));

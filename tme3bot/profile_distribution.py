@@ -9,6 +9,8 @@ import math
 import threading
 
 from tme3bot.profile_distribution_crypto import encrypt_distribution_bundle
+from tme3bot.background_schedule import run_event_driven_loop
+from tme3bot.worker_registry import worker_names_for_mode
 
 LOGGER = logging.getLogger(__name__)
 _TELEGRAM_PART_BYTES = 40 * 1024 * 1024
@@ -21,13 +23,22 @@ _PERMANENT_ARTIFACT_ERRORS = {
 
 
 class ProfileDistributionService:
-    def __init__(self, config, bot, store, vault_store, worker_registry, dispatcher) -> None:
+    def __init__(
+        self, config, bot, store, vault_store, worker_registry, dispatcher,
+        *, recovery_interval_seconds: float = 3,
+        gateway_mode: str | None = None, local_worker_urls=(),
+    ) -> None:
         self.config = config
         self.bot = bot
         self.store = store
         self.vault_store = vault_store
         self.worker_registry = worker_registry
         self.dispatcher = dispatcher
+        self.gateway_mode = str(
+            gateway_mode if gateway_mode is not None else getattr(config, "gateway_mode", "full")
+        ).strip().lower()
+        self.local_worker_urls = tuple(local_worker_urls)
+        self.recovery_interval_seconds = max(0.1, float(recovery_interval_seconds))
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
@@ -39,6 +50,9 @@ class ProfileDistributionService:
         recover = getattr(self.store, "recover_interrupted", None)
         if callable(recover):
             recover()
+        # Process queued/recovered work immediately on startup; the recovery
+        # interval is only a fallback for missed wakeups.
+        self._wake.set()
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="profile-distribution"
         )
@@ -54,12 +68,15 @@ class ProfileDistributionService:
         self._wake.set()
 
     def _loop(self) -> None:
-        while not self._stop.is_set():
-            self._wake.wait(3)
-            self._wake.clear()
-            if self._stop.is_set():
-                return
+        def process_waiting() -> None:
             self.process_pending()
+
+        run_event_driven_loop(
+            self._stop,
+            self._wake,
+            recovery_seconds=self.recovery_interval_seconds,
+            callback=process_waiting,
+        )
 
     def process_pending(self) -> int:
         if not self._lock.acquire(blocking=False):
@@ -69,6 +86,14 @@ class ProfileDistributionService:
             for target in self.store.pending_targets():
                 if self._stop.is_set():
                     break
+                worker = str(target.get("worker") or "")
+                record = self.worker_registry.get(worker)
+                if not worker_names_for_mode(
+                    {worker: record or {}},
+                    self.gateway_mode,
+                    local_urls=self.local_worker_urls,
+                ):
+                    continue
                 self._process_target(target)
                 processed += 1
         finally:

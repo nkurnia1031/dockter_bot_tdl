@@ -4,6 +4,8 @@ import sqlite3
 import tempfile
 import time
 import unittest
+import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -150,6 +152,181 @@ class JobStoreTests(unittest.TestCase):
             store.append_event(JobEvent(move.id, 2, JobStatus.RUNNING, "started"))
             store.append_event(JobEvent(move.id, 3, JobStatus.SUCCEEDED, "completed"))
             self.assertTrue(store.try_acquire_execution(later_copy.id)["admitted"])
+
+    def test_terminal_retention_keeps_latest_twenty_and_protects_active_and_reconciliation(self) -> None:
+        from tme3bot.infrastructure.activity_journal import ActivityJournalStore
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.db"
+            store = SqliteJobRepository(path)
+            journal = ActivityJournalStore(path)
+            base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+            job_ids = []
+            for index in range(23):
+                job_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"terminal-{index:02d}"))
+                job_ids.append(job_id)
+                store.create(replace(
+                    self.make_job(), id=job_id, status=JobStatus.SUCCEEDED,
+                    created_at=base + timedelta(minutes=index),
+                    updated_at=base + timedelta(minutes=index),
+                ))
+                with store._db() as db:
+                    db.execute(
+                        "UPDATE jobs SET terminal_at=? WHERE id=?",
+                        ((base + timedelta(minutes=index)).isoformat(), job_id),
+                    )
+                    db.execute(
+                        "INSERT INTO job_events(job_id,sequence,status,event_type,created_at) VALUES(?,?,?,?,?)",
+                        (job_id, 1, "succeeded", "completed", base.isoformat()),
+                    )
+                journal.record(
+                    occurred_at=(base + timedelta(minutes=index)).isoformat(),
+                    request_id=f"00000000-0000-0000-0000-{index + 1:012d}",
+                    method="GET", route="/api/v1/jobs/{job_id}", status_code=200,
+                    duration_ms=1, job_id=job_id,
+                )
+
+            store.create(replace(self.make_job(), id="active-job"))
+            store.create(replace(
+                self.make_job(), id="reconciliation-job", status=JobStatus.FAILED,
+                result={"error": "uncertain external effect"},
+                progress={"outcome_uncertain": True, "reconciliation_required": True},
+            ))
+            old_terminal_at = base - timedelta(days=1)
+            store.create(replace(
+                self.make_job(), id="outcome-uncertain-only-job", status=JobStatus.FAILED,
+                result={"outcome": "failed"},
+                progress={"outcome_uncertain": True},
+                created_at=old_terminal_at,
+                updated_at=old_terminal_at,
+            ))
+            with store._db() as db:
+                db.execute("CREATE TABLE operational_sentinel (value TEXT)")
+                db.execute("INSERT INTO operational_sentinel VALUES('keep')")
+
+            pruned = store.prune_terminal_history()
+
+            self.assertEqual(pruned, 3)
+            self.assertEqual(store.count(statuses=("succeeded",)), 20)
+            self.assertIsNone(store.get(job_ids[0]))
+            self.assertIsNotNone(store.get(job_ids[-1]))
+            self.assertIsNotNone(store.get("active-job"))
+            self.assertIsNotNone(store.get("reconciliation-job"))
+            self.assertIsNotNone(store.get("outcome-uncertain-only-job"))
+            with store._db() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM job_events WHERE job_id=?", (job_ids[0],)).fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM api_activity WHERE job_id=?", (job_ids[0],)).fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT value FROM operational_sentinel").fetchone()[0], "keep")
+
+    def test_terminal_retention_preserves_tts_delivery_reconciliation_evidence(self) -> None:
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            job_ids = []
+            for index in range(22):
+                job_id = f"tts-terminal-{index:02d}"
+                job_ids.append(job_id)
+                store.create(replace(
+                    self.make_job(), id=job_id, kind="tts",
+                    status=JobStatus.RUNNING if index == 0 else JobStatus.FAILED,
+                    created_at=base + timedelta(minutes=index),
+                    updated_at=base + timedelta(minutes=index),
+                    result={"error": "TTS_DELIVERY_NOT_VERIFIED"},
+                ))
+                with store._db() as db:
+                    db.execute(
+                        "UPDATE jobs SET terminal_at=? WHERE id=?",
+                        ((base + timedelta(minutes=index)).isoformat(), job_id),
+                    )
+
+            store.create_tts_deliveries(job_ids[0], "local", "Judul", [{
+                "artifact_ref": "a" * 48, "part_index": 1, "total_parts": 1,
+                "byte_size": 5,
+            }])
+            delivery = store.claim_tts_deliveries(
+                1, worker="local", job_id=job_ids[0]
+            )[0]
+            store.complete_tts_delivery(
+                delivery["id"], delivered=False, reconciliation_required=True,
+                uploaded_at=1_700_000_000, sender_profile="default",
+            )
+            with store._db() as db:
+                db.execute(
+                    "UPDATE jobs SET status='failed', terminal_at=?, result=? WHERE id=?",
+                    ((base.isoformat()), '{"error":"TTS_DELIVERY_NOT_VERIFIED"}', job_ids[0]),
+                )
+
+            pruned = store.prune_terminal_history()
+
+            self.assertEqual(pruned, 1)
+            self.assertIsNotNone(store.get(job_ids[0]))
+            self.assertEqual(
+                store.get_tts_delivery(delivery["id"])["status"],
+                "reconciliation_required",
+            )
+            self.assertIsNone(store.get(job_ids[1]))
+
+    def test_terminal_timestamp_migration_uses_terminal_event_not_archive_update_time(self) -> None:
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "app.db"
+            store = SqliteJobRepository(path)
+            job_ids = []
+            for index in range(21):
+                job_id = f"legacy-terminal-{index:02d}"
+                job_ids.append(job_id)
+                terminal_at = base + timedelta(minutes=index)
+                store.create(replace(
+                    self.make_job(), id=job_id, status=JobStatus.SUCCEEDED,
+                    created_at=terminal_at, updated_at=terminal_at,
+                ))
+                archived_updated_at = base + timedelta(days=100 + (20 - index))
+                with store._db() as db:
+                    db.execute(
+                        "UPDATE jobs SET terminal_at=NULL, updated_at=?, archived_at=? WHERE id=?",
+                        (archived_updated_at.isoformat(), archived_updated_at.isoformat(), job_id),
+                    )
+                    db.execute(
+                        "INSERT INTO job_events(job_id,sequence,status,event_type,created_at) VALUES(?,?,?,?,?)",
+                        (job_id, 1, "succeeded", "completed", terminal_at.isoformat()),
+                    )
+
+            SqliteJobRepository(path)
+
+            self.assertIsNone(store.get(job_ids[0]))
+            self.assertTrue(all(store.get(job_id) is not None for job_id in job_ids[1:]))
+
+    def test_retry_terminal_time_moves_job_into_latest_twenty(self) -> None:
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SqliteJobRepository(Path(temp_dir) / "app.db")
+            for index in range(21):
+                job_id = f"terminal-{index:02d}"
+                store.create(replace(
+                    self.make_job(), id=job_id, status=JobStatus.SUCCEEDED,
+                    created_at=base + timedelta(minutes=index),
+                    updated_at=base + timedelta(minutes=index),
+                ))
+                with store._db() as db:
+                    db.execute(
+                        "UPDATE jobs SET terminal_at=? WHERE id=?",
+                        ((base + timedelta(minutes=index)).isoformat(), job_id),
+                    )
+
+            retried = store.reset_for_retry("terminal-00", {"retry": True})
+            self.assertEqual(retried.status, JobStatus.QUEUED)
+            completed_at = base + timedelta(days=1)
+            store.append_event(JobEvent(
+                job_id="terminal-00", sequence=1, status=JobStatus.RUNNING,
+                event_type="started", created_at=completed_at - timedelta(seconds=1),
+            ))
+            store.append_event(JobEvent(
+                job_id="terminal-00", sequence=2, status=JobStatus.SUCCEEDED,
+                event_type="completed", created_at=completed_at,
+            ))
+
+            self.assertIsNotNone(store.get("terminal-00"))
+            self.assertIsNone(store.get("terminal-01"))
 
     def test_existing_resource_lease_table_migrates_to_allow_shared_holders(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

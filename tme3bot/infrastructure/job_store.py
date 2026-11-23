@@ -13,6 +13,16 @@ from typing import Any
 from tme3bot.domain.models import Job, JobEvent, JobStatus
 from tme3bot.resource_locks import first_resource_conflict
 
+TERMINAL_JOB_HISTORY_LIMIT = 20
+ACTIVE_OPERATION_TABLES = {
+    "operations": "'succeeded','failed','cancelled'",
+    "profile_scan_operations": "'succeeded','failed','cancelled'",
+    "profile_provisionings": "'succeeded','failed','cancelled','active','stored'",
+    "profile_distributions": "'ready','failed','removed_locally'",
+    "profile_distribution_operations": "'succeeded','failed','cancelled'",
+    "profile_distribution_targets": "'ready','failed'",
+}
+
 
 def _dump(value) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -81,6 +91,8 @@ class SqliteJobRepository:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._compaction_connection_lock = threading.Lock()
+        self._compaction_connection: sqlite3.Connection | None = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -126,7 +138,8 @@ class SqliteJobRepository:
                     archived_at TEXT,
                     settings_version INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    terminal_at TEXT
                 );
                 CREATE TABLE IF NOT EXISTS job_private_values (
                     job_id TEXT NOT NULL,
@@ -261,6 +274,19 @@ class SqliteJobRepository:
                 db.execute(
                     "ALTER TABLE jobs ADD COLUMN settings_version INTEGER NOT NULL DEFAULT 0"
                 )
+            if "terminal_at" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN terminal_at TEXT")
+            db.execute(
+                """UPDATE jobs
+                   SET terminal_at = COALESCE(
+                       (SELECT event.created_at FROM job_events AS event
+                        WHERE event.job_id = jobs.id AND event.status = jobs.status
+                        ORDER BY event.sequence DESC LIMIT 1),
+                       updated_at
+                   )
+                   WHERE terminal_at IS NULL
+                     AND status IN ('succeeded','failed','cancelled')"""
+            )
             tts_delivery_columns = {
                 str(row["name"])
                 for row in db.execute("PRAGMA table_info(job_tts_deliveries)").fetchall()
@@ -269,6 +295,7 @@ class SqliteJobRepository:
                 db.execute("ALTER TABLE job_tts_deliveries ADD COLUMN uploaded_at REAL")
             if "sender_profile" not in tts_delivery_columns:
                 db.execute("ALTER TABLE job_tts_deliveries ADD COLUMN sender_profile TEXT")
+            self._prune_terminal_history_in_transaction(db, TERMINAL_JOB_HISTORY_LIMIT)
             db.execute(
                 """
                 UPDATE jobs
@@ -385,8 +412,8 @@ class SqliteJobRepository:
                 INSERT INTO jobs(
                     id, kind, profile, actor_user_id, worker, status, payload,
                     progress, result, error, progress_sequence, archived_at,
-                    settings_version, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    settings_version, created_at, updated_at, terminal_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -404,6 +431,7 @@ class SqliteJobRepository:
                     max(0, int(job.settings_version)),
                     job.created_at.isoformat(),
                     job.updated_at.isoformat(),
+                    job.updated_at.isoformat() if job.status.terminal else None,
                 ),
             )
             self._insert_private_values(db, job.id, private_values)
@@ -440,8 +468,8 @@ class SqliteJobRepository:
             """INSERT INTO jobs(
                    id, kind, profile, actor_user_id, worker, status, payload,
                    progress, result, error, progress_sequence, archived_at,
-                   settings_version, created_at, updated_at
-               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   settings_version, created_at, updated_at, terminal_at
+               ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 job.id, job.kind, job.profile, job.actor_user_id, job.worker,
                 job.status.value, _dump(job.payload), _dump(job.progress),
@@ -451,6 +479,7 @@ class SqliteJobRepository:
                 job.archived_at.isoformat() if job.archived_at else None,
                 max(0, int(job.settings_version)),
                 job.created_at.isoformat(), job.updated_at.isoformat(),
+                job.updated_at.isoformat() if job.status.terminal else None,
             ),
         )
         SqliteJobRepository._insert_private_values(db, job.id, private_values)
@@ -522,7 +551,7 @@ class SqliteJobRepository:
                 UPDATE jobs
                 SET status = 'queued', payload = ?, progress = ?, result = NULL,
                     error = NULL, progress_sequence = ?, archived_at = NULL,
-                    settings_version = ?,
+                    settings_version = ?, terminal_at = NULL,
                     updated_at = ?
                 WHERE id = ?
                 """,
@@ -662,6 +691,44 @@ class SqliteJobRepository:
                 "UPDATE job_commands SET payload = ? WHERE job_id = ?",
                 (_dump(payload), job_id),
             )
+
+    def update_command_payload_fields(
+        self,
+        job_id: str,
+        *,
+        set_values: dict[str, Any] | None = None,
+        set_if_missing: dict[str, Any] | None = None,
+        remove: tuple[str, ...] | list[str] = (),
+    ) -> dict[str, Any] | None:
+        """Atomically update selected command fields without replacing peers."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT payload FROM job_commands WHERE job_id = ?",
+                (str(job_id),),
+            ).fetchone()
+            if row is None:
+                db.commit()
+                return None
+            payload = _load(row["payload"], {})
+            if not isinstance(payload, dict):
+                payload = {}
+            original = dict(payload)
+            for key in remove:
+                payload.pop(str(key), None)
+            for key, value in (set_values or {}).items():
+                payload[str(key)] = value
+            for key, value in (set_if_missing or {}).items():
+                payload.setdefault(str(key), value)
+            if payload == original:
+                db.commit()
+                return payload
+            db.execute(
+                "UPDATE job_commands SET payload = ? WHERE job_id = ?",
+                (_dump(payload), str(job_id)),
+            )
+            db.commit()
+            return payload
 
     def advance_durable_attempt(
         self, job_id: str, attempt: int, payload: dict[str, Any]
@@ -2050,6 +2117,247 @@ class SqliteJobRepository:
             db.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
         return True
 
+    @staticmethod
+    def _requires_reconciliation(value: Any) -> bool:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if str(key).lower() in {"status", "outcome", "phase"} and str(child).lower() in {
+                    "needs_reconciliation", "reconciliation_required"
+                }:
+                    return True
+                if str(key).lower() in {
+                    "needs_reconciliation", "reconciliation_required", "outcome_uncertain"
+                } and child is True:
+                    return True
+                if SqliteJobRepository._requires_reconciliation(child):
+                    return True
+        elif isinstance(value, list):
+            return any(SqliteJobRepository._requires_reconciliation(item) for item in value)
+        return False
+
+    @classmethod
+    def _prune_terminal_history_in_transaction(
+        cls, db: sqlite3.Connection, retain: int
+    ) -> int:
+        rows = db.execute(
+            """SELECT id, status, terminal_at, updated_at, progress, result
+               FROM jobs WHERE status IN ('succeeded','failed','cancelled')
+               ORDER BY COALESCE(terminal_at, updated_at) DESC, id DESC"""
+        ).fetchall()
+        unresolved_tts_jobs = {
+            str(row[0])
+            for row in db.execute(
+                """SELECT DISTINCT job_id FROM job_tts_deliveries
+                   WHERE status NOT IN ('delivered', 'cancelled')"""
+            ).fetchall()
+        }
+        retained = 0
+        expired: list[str] = []
+        for row in rows:
+            job_id = str(row["id"])
+            if (
+                job_id in unresolved_tts_jobs
+                or cls._requires_reconciliation(_load(row["result"], {}))
+                or cls._requires_reconciliation(_load(row["progress"], {}))
+            ):
+                continue
+            if retained < max(0, int(retain)):
+                retained += 1
+            else:
+                expired.append(job_id)
+        if not expired:
+            return 0
+        placeholders = ",".join("?" for _ in expired)
+        tables = {
+            str(row[0])
+            for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "api_activity" in tables:
+            db.execute(
+                f"DELETE FROM api_activity WHERE job_id IN ({placeholders})", expired
+            )
+        db.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", expired)
+        return len(expired)
+
+    def prune_terminal_history(self, retain: int = TERMINAL_JOB_HISTORY_LIMIT) -> int:
+        """Keep only the newest terminal job window; protect unfinished/uncertain work."""
+        with self._db() as db:
+            return self._prune_terminal_history_in_transaction(db, retain)
+
+    def compact_database_if_idle(
+        self,
+        min_free_bytes: int,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
+        """Best-effort VACUUM when history left meaningful free space and no job is active."""
+        threshold = max(0, int(min_free_bytes))
+        if not self._lock.acquire(blocking=False):
+            return {"outcome": "deferred_locked", "reason": "job_store_busy"}
+        db = None
+        try:
+            db = sqlite3.connect(str(self.path), timeout=0, isolation_level=None)
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA busy_timeout=0")
+            stats = self._database_space(db)
+            active_jobs = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status NOT IN ('succeeded','failed','cancelled')"
+                ).fetchone()[0]
+            )
+            active_operations = self._has_active_persisted_operation(db)
+            base = {
+                "threshold_bytes": threshold,
+                "free_bytes_before": stats["free_bytes"],
+                "database_bytes_before": self._database_file_size(),
+                "active_jobs": active_jobs,
+                "active_operations": active_operations,
+            }
+            if active_jobs or active_operations:
+                return {**base, "outcome": "deferred_active_jobs"}
+            if stats["free_bytes"] <= threshold:
+                return {**base, "outcome": "below_threshold"}
+            with self._compaction_connection_lock:
+                self._compaction_connection = db
+            if cancel_event is not None:
+                db.set_progress_handler(lambda: int(cancel_event.is_set()), 1000)
+            try:
+                db.execute("VACUUM")
+            except sqlite3.OperationalError as exc:
+                message = str(exc).lower()
+                if (
+                    cancel_event is not None
+                    and cancel_event.is_set()
+                    and "interrupt" in message
+                ):
+                    return {
+                        **base,
+                        "outcome": "deferred_activity",
+                        "reason": "database_activity",
+                    }
+                if "locked" in message or "busy" in message:
+                    return {**base, "outcome": "deferred_locked"}
+                return {
+                    **base,
+                    "outcome": "failed",
+                    "error_type": type(exc).__name__,
+                }
+            finally:
+                if cancel_event is not None:
+                    db.set_progress_handler(None, 0)
+            checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if checkpoint and int(checkpoint[0]):
+                return {
+                    **base,
+                    "outcome": "deferred_locked",
+                    "reason": "wal_checkpoint_busy",
+                    "vacuum_completed": True,
+                }
+            after = self._database_space(db)
+            database_bytes_after = self._database_file_size()
+            return {
+                **base,
+                "outcome": "compacted",
+                "free_bytes_after": after["free_bytes"],
+                "database_bytes_after": database_bytes_after,
+                "bytes_reclaimed": max(
+                    0, base["database_bytes_before"] - database_bytes_after
+                ),
+            }
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if (
+                cancel_event is not None
+                and cancel_event.is_set()
+                and "interrupt" in message
+            ):
+                return {
+                    "outcome": "deferred_activity",
+                    "reason": "database_activity",
+                    "threshold_bytes": threshold,
+                }
+            if "locked" in message or "busy" in message:
+                return {
+                    "outcome": "deferred_locked",
+                    "reason": "database_busy",
+                    "threshold_bytes": threshold,
+                }
+            return {"outcome": "failed", "error_type": type(exc).__name__}
+        except Exception as exc:
+            return {"outcome": "failed", "error_type": type(exc).__name__}
+        finally:
+            with self._compaction_connection_lock:
+                self._compaction_connection = None
+            if db is not None:
+                db.close()
+            self._lock.release()
+
+    def interrupt_database_compaction(self) -> bool:
+        """Interrupt an active maintenance statement so application work can proceed."""
+        with self._compaction_connection_lock:
+            connection = self._compaction_connection
+        if connection is None:
+            return False
+        try:
+            connection.interrupt()
+            return True
+        except sqlite3.Error:
+            return False
+
+    def _database_space(self, db: sqlite3.Connection) -> dict[str, int]:
+        page_size = int(db.execute("PRAGMA page_size").fetchone()[0])
+        page_count = int(db.execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(db.execute("PRAGMA freelist_count").fetchone()[0])
+        return {
+            "page_size": page_size,
+            "page_count": page_count,
+            "free_pages": free_pages,
+            "free_bytes": free_pages * page_size,
+        }
+
+    @staticmethod
+    def _has_active_persisted_operation(db: sqlite3.Connection) -> bool:
+        tables = {
+            str(row[0])
+            for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for table, terminal_statuses in ACTIVE_OPERATION_TABLES.items():
+            if table not in tables:
+                continue
+            query = (
+                f"SELECT 1 FROM {table} "
+                f"WHERE status NOT IN ({terminal_statuses}) LIMIT 1"
+            )
+            if db.execute(query).fetchone() is not None:
+                return True
+        # A local-only profile install is terminal in the operation history,
+        # but its encrypted staging bundle still needs startup cleanup. Keep
+        # idle compaction away until that recoverable residue is removed.
+        if {"profile_provisionings", "profile_sessions"}.issubset(tables):
+            pending_local_staging = db.execute(
+                "SELECT 1 FROM profile_provisionings p "
+                "JOIN profile_sessions s ON s.profile=p.profile "
+                "AND s.source=p.source "
+                "AND COALESCE(s.source_worker,'')=p.bootstrap_worker "
+                "AND s.updated_at=p.updated_at "
+                "WHERE p.source IN ('local_upload','local_login') "
+                "AND p.status='active' LIMIT 1"
+            ).fetchone()
+            if pending_local_staging is not None:
+                return True
+        return False
+
+    def _database_file_size(self) -> int:
+        total = 0
+        for candidate in (self.path, Path(f"{self.path}-wal")):
+            try:
+                total += int(candidate.stat().st_size)
+            except OSError:
+                continue
+        return total
+
     def append_event(self, event: JobEvent) -> tuple[Job, bool]:
         with self._db() as db:
             row = db.execute("SELECT * FROM jobs WHERE id = ?", (event.job_id,)).fetchone()
@@ -2091,7 +2399,8 @@ class SqliteJobRepository:
                 """
                 UPDATE jobs
                 SET status = ?, progress = ?, result = ?, error = ?,
-                    progress_sequence = MAX(progress_sequence, ?), updated_at = ?
+                    progress_sequence = MAX(progress_sequence, ?), updated_at = ?,
+                    terminal_at = CASE WHEN ? IN ('succeeded','failed','cancelled') THEN ? ELSE NULL END
                 WHERE id = ?
                 """,
                 (
@@ -2101,6 +2410,8 @@ class SqliteJobRepository:
                     _dump(error) if error is not None else None,
                     event.sequence,
                     event.created_at.isoformat(),
+                    event.status.value,
+                    event.created_at.isoformat() if event.status.terminal else None,
                     event.job_id,
                 ),
             )
@@ -2142,6 +2453,8 @@ class SqliteJobRepository:
                     "UPDATE job_execution_plans SET queued_at = ?, admitted_at = NULL, blocked_reason = NULL WHERE job_id = ?",
                     (queued_at.isoformat(), event.job_id),
                 )
+            if event.status.terminal:
+                self._prune_terminal_history_in_transaction(db, TERMINAL_JOB_HISTORY_LIMIT)
             return (
                 replace(
                     job,
@@ -2266,17 +2579,19 @@ class SqliteJobRepository:
             )
             db.execute(
                 """UPDATE jobs SET status = ?, progress = ?, result = ?, error = NULL,
-                    progress_sequence = ?, updated_at = ? WHERE id = ?""",
+                    progress_sequence = ?, updated_at = ?, terminal_at = ? WHERE id = ?""",
                 (
                     JobStatus.SUCCEEDED.value,
                     _dump(merged_progress),
                     _dump(result),
                     sequence,
                     now.isoformat(),
+                    now.isoformat(),
                     job_key,
                 ),
             )
             db.execute("DELETE FROM job_quickmode_slots WHERE job_id = ?", (job_key,))
+            self._prune_terminal_history_in_transaction(db, TERMINAL_JOB_HISTORY_LIMIT)
             updated = self._job(
                 db.execute("SELECT * FROM jobs WHERE id = ?", (job_key,)).fetchone()
             )

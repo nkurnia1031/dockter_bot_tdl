@@ -11,15 +11,18 @@ import threading
 import time
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
+
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from tme3bot.background_schedule import run_event_driven_loop
 
 from tme3bot.names import normalize_profile_name
+from tme3bot.worker_registry import worker_names_for_mode
 
 
 MAX_SESSION_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -1247,17 +1250,41 @@ class ProfileProvisioningStore:
 class ProfileProvisioningService:
     def __init__(
         self, store: ProfileProvisioningStore, profile_manager, worker_registry,
-        dispatcher,
+        dispatcher, *, recovery_interval_seconds: float = 10,
+        gateway_mode: str = "full", local_worker_urls=(), database_activity=None,
     ) -> None:
         self.store = store
         self.profile_manager = profile_manager
         self.worker_registry = worker_registry
         self.dispatcher = dispatcher
+        self.gateway_mode = str(gateway_mode or "full").strip().lower()
+        self.local_worker_urls = tuple(local_worker_urls)
+        self.database_activity = database_activity
+        self.recovery_interval_seconds = max(0.1, float(recovery_interval_seconds))
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._processing_lock = threading.Lock()
+
+    def _eligible_worker_names(self, selected=None) -> list[str]:
+        list_workers = getattr(self.worker_registry, "list", None)
+        records = list_workers() if callable(list_workers) else None
+        names = list(records) if isinstance(records, dict) else list(self.worker_registry.names())
+        if selected is not None:
+            selected_names = {str(name) for name in selected}
+            names = [name for name in names if name in selected_names]
+        if not isinstance(records, dict):
+            records = {}
+            for name in names:
+                record = self.worker_registry.get(name)
+                if isinstance(record, dict):
+                    records[name] = record
+        else:
+            records = {name: records[name] for name in names if name in records}
+        return worker_names_for_mode(
+            records, self.gateway_mode, local_urls=self.local_worker_urls
+        )
 
     def start(self) -> None:
         if self._thread is not None:
@@ -1272,17 +1299,23 @@ class ProfileProvisioningService:
         self._stop.set()
         self._wake.set()
 
+    def wake(self) -> None:
+        self._wake.set()
+
     def _loop(self) -> None:
-        while not self._stop.is_set():
-            self._wake.wait(10)
-            self._wake.clear()
-            if self._stop.is_set():
-                break
+        def process_waiting() -> None:
             try:
                 self.process_once()
             except Exception:
                 # The next pass retries durable waiting rows.
                 pass
+
+        run_event_driven_loop(
+            self._stop,
+            self._wake,
+            recovery_seconds=self.recovery_interval_seconds,
+            callback=process_waiting,
+        )
 
     def process_once(self) -> None:
         if not self._processing_lock.acquire(blocking=False):
@@ -1294,28 +1327,50 @@ class ProfileProvisioningService:
 
     def _recover_completed_local_provisioning(self) -> None:
         """Finish cleanup if a restart interrupted a confirmed local install."""
-        for operation in self.store.completed_local_provisioning_staging():
+        database_activity = (
+            self.database_activity()
+            if callable(self.database_activity)
+            else nullcontext()
+        )
+        with database_activity:
+            operations = self.store.completed_local_provisioning_staging()
+        for operation in operations:
             operation_id = str(operation["id"])
             profile = str(operation["profile"])
-            info = self.store.provisioning(operation_id) or {}
+            database_activity = (
+                self.database_activity()
+                if callable(self.database_activity)
+                else nullcontext()
+            )
+            with database_activity:
+                info = self.store.provisioning(operation_id) or {}
             for item in info.get("workers", []):
                 if str(item.get("status") or "") != "ready":
                     continue
+                worker = str(item.get("worker") or "")
+                if worker not in self._eligible_worker_names([worker]):
+                    continue
                 try:
                     self.dispatcher.commit_profile_bundle(
-                        str(item["worker"]), profile, operation_id
+                        worker, profile, operation_id
                     )
                 except Exception:
                     pass
+            database_activity = (
+                self.database_activity()
+                if callable(self.database_activity)
+                else nullcontext()
+            )
             try:
-                self._register_local_profile(
-                    profile,
-                    int(operation["telegram_user_id"]),
-                    str(info.get("bootstrap_worker") or ""),
-                )
+                with database_activity:
+                    self._register_local_profile(
+                        profile,
+                        int(operation["telegram_user_id"]),
+                        str(info.get("bootstrap_worker") or ""),
+                    )
+                    self.store.discard_local_provisioning_bundle(profile, operation_id)
             except Exception:
                 continue
-            self.store.discard_local_provisioning_bundle(profile, operation_id)
 
     def _register_local_profile(self, profile: str, user_id: int, worker: str) -> None:
         """Register identity and default routing for a one-worker profile."""
@@ -1504,6 +1559,9 @@ class ProfileProvisioningService:
         self._recover_completed_local_provisioning()
         for operation in self.store.pending_operations():
             if operation["status"] == "validating":
+                bootstrap_worker = str(operation.get("bootstrap_worker") or "")
+                if bootstrap_worker not in self._eligible_worker_names([bootstrap_worker]):
+                    continue
                 try:
                     if str(operation.get("source") or "") == "adoption":
                         self._complete_adoption(str(operation["id"]))
@@ -1513,6 +1571,8 @@ class ProfileProvisioningService:
                     # A later background pass retries worker and TDL outages.
                     pass
         for profile, worker, operation_id in self.store.waiting_distributions():
+            if worker not in self._eligible_worker_names([worker]):
+                continue
             profile_registry = getattr(self.profile_manager, "profile_registry", None)
             deleting = getattr(profile_registry, "local_deletion_active", None)
             if callable(deleting) and deleting(profile, worker):
@@ -1810,9 +1870,13 @@ class ProfileProvisioningService:
         worker = self.worker_registry.get(bootstrap_worker)
         if worker is None:
             raise KeyError(bootstrap_worker)
+        if bootstrap_worker not in self._eligible_worker_names([bootstrap_worker]):
+            raise ValueError(
+                "Pilih worker remote; gateway Lite tidak menjalankan atau mengalihkan operasi profil ke worker lokal."
+            )
         if local_only and not profile_transfer_is_secure(str(worker.get("url") or "")):
             raise ValueError("Worker remote harus memakai URL HTTPS untuk menerima sesi.")
-        if not self.worker_registry.names():
+        if not self._eligible_worker_names():
             raise RuntimeError("Belum ada worker terdaftar untuk menyiapkan profil.")
         return profile
 
@@ -1845,7 +1909,7 @@ class ProfileProvisioningService:
                 self._ensure_local_profile_absent(profile, worker)
             if self.profile_manager.profile_registry.profile_for_user(user_id) is not None:
                 raise ValueError("Akun Telegram tersebut sudah terdaftar pada profil lain.")
-            targets = [worker] if local_only else self.worker_registry.names()
+            targets = [worker] if local_only else self._eligible_worker_names()
             if not targets:
                 raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
             source = "local_upload" if local_only else "upload"
@@ -1878,7 +1942,7 @@ class ProfileProvisioningService:
             profile = self._validate_new(profile, worker, local_only=local_only)
             if local_only:
                 self._ensure_local_profile_absent(profile, worker)
-            targets = [worker] if local_only else self.worker_registry.names()
+            targets = [worker] if local_only else self._eligible_worker_names()
             if not targets:
                 raise RuntimeError("Belum ada worker terdaftar untuk menyimpan profil.")
             source = "local_login" if local_only else "login"
@@ -1888,6 +1952,7 @@ class ProfileProvisioningService:
         except Exception:
             self.store.cancel(operation_id)
             raise
+        self._wake.set()
         return operation_id
 
     def login_state(self, operation_id: str) -> dict[str, Any]:
@@ -1935,9 +2000,11 @@ class ProfileProvisioningService:
             raise PermissionError("Provisioning ini dimiliki actor lain.")
         if info["status"] != "authenticating":
             raise ValueError("Provisioning tidak sedang menunggu input login.")
-        return self.dispatcher.profile_login_input(
+        result = self.dispatcher.profile_login_input(
             info["bootstrap_worker"], operation_id, field_name, value
         )
+        self._wake.set()
+        return result
 
     def adopt(self, profile: str, worker: str, actor_user_id: int) -> str:
         profile = normalize_profile_name(profile)
@@ -1949,6 +2016,10 @@ class ProfileProvisioningService:
             raise FileExistsError("Profil sudah tersimpan di vault.")
         if self.worker_registry.get(worker) is None:
             raise KeyError(worker)
+        if worker not in self._eligible_worker_names([worker]):
+            raise ValueError(
+                "Pilih worker remote; gateway Lite tidak menjalankan atau mengalihkan operasi profil ke worker lokal."
+            )
         with self._lock:
             if self.store.bundle(profile) is not None:
                 raise FileExistsError("Profil sudah tersimpan di vault.")
@@ -2072,6 +2143,7 @@ class ProfileProvisioningService:
                     self.dispatcher.remove_profile_bundle(worker, info["profile"], operation_id)
                 except Exception:
                     pass
+        self._wake.set()
         return {"cancelled": True, "profile": info["profile"]}
 
     def retry(self, operation_id: str, actor_user_id: int, source_worker: str | None = None) -> None:

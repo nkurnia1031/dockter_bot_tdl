@@ -18,6 +18,7 @@ from urllib.parse import unquote, urlparse
 
 from tme3bot.application.ports import JobRepository, WorkerDispatcher
 from tme3bot.application.job_scheduler import build_execution_plan
+from tme3bot.background_schedule import run_event_driven_loop
 from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus, utc_now
 from tme3bot.domain.worker_contract import (
     CAP_QUICKMODE_STAGING,
@@ -43,6 +44,7 @@ from tme3bot.utility import (
     validate_rclone_destination,
 )
 from tme3bot.safelink import normalize_shortlink_url
+from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
 
 _DURABLE_JOB_KINDS = frozenset({
     "export", "leave", "download", "utility", "storage_upload", "storage_download", "tts",
@@ -76,6 +78,9 @@ class ControlPlane:
         tdl_access_target_resolver=None,
         job_stall_timeout_seconds: int = 600,
         job_cancel_grace_seconds: int = 30,
+        gateway_mode: str = "full",
+        worker_health_cache=None,
+        scheduler_recovery_seconds: float = 2.0,
     ) -> None:
         self.jobs = jobs
         self.dispatcher = dispatcher
@@ -94,10 +99,15 @@ class ControlPlane:
         self.export_cursor_service = export_cursor_service
         self.tdl_access_store = tdl_access_store
         self.tdl_access_target_resolver = tdl_access_target_resolver
+        self.gateway_mode = str(gateway_mode or "full").strip().lower()
+        self.worker_health_cache = worker_health_cache
+        self.scheduler_recovery_seconds = max(0.1, float(scheduler_recovery_seconds))
+        self._clock = utc_now
         self.job_stall_timeout_seconds = max(0, int(job_stall_timeout_seconds))
         self.job_cancel_grace_seconds = max(0, int(job_cancel_grace_seconds))
         self._event_observers: list[Callable[[JobEvent], None]] = []
         self._scheduler_stop = threading.Event()
+        self._scheduler_wake = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._stale_cancel_requested: dict[str, Any] = {}
         self._stale_job_lock = threading.RLock()
@@ -135,6 +145,31 @@ class ControlPlane:
                 status_code=403,
             )
         return Actor(int(telegram_user_id), profile)
+
+    def _worker_names_for_mode(self, selected=None) -> list[str]:
+        registry = self.worker_registry
+        if registry is None:
+            return []
+        list_workers = getattr(registry, "list", None)
+        records = list_workers() if callable(list_workers) else None
+        names = list(records) if isinstance(records, dict) else list(registry.names())
+        if selected is not None:
+            selected_names = {str(name) for name in selected}
+            names = [name for name in names if name in selected_names]
+        if not isinstance(records, dict):
+            records = {}
+            for name in names:
+                record = registry.get(name)
+                if isinstance(record, dict):
+                    records[name] = record
+        else:
+            records = {name: records[name] for name in names if name in records}
+        config = getattr(self.profile_manager, "base_config", None)
+        return worker_names_for_mode(
+            records,
+            self.gateway_mode,
+            local_urls=worker_local_urls(config),
+        )
 
     def require_profile(self, actor: Actor, profile: str | None) -> str:
         selected = profile or actor.profile
@@ -192,10 +227,19 @@ class ControlPlane:
             and str(item.get("name") or "").strip()
         })
 
+    def _require_lite_explicit_worker(self, requested_worker: str | None) -> None:
+        if self.gateway_mode == "lite" and not str(requested_worker or "").strip():
+            raise DomainError(
+                "LITE_REMOTE_WORKER_REQUIRED",
+                "Pilih worker remote secara eksplisit; Lite tidak memakai route local.",
+                status_code=422,
+            )
+
     def resolve_target(
         self, actor: Actor, *, profile: str | None = None, worker: str | None = None,
         allow_disabled_worker: bool = False,
     ) -> tuple[str, str]:
+        self._require_lite_explicit_worker(worker)
         selected_profile = self.require_profile(actor, profile)
         # Profile catalogs and stored scan evidence may help choose a target;
         # the selected worker's actual command is the source of truth.
@@ -225,7 +269,188 @@ class ControlPlane:
                     "Worker sedang dinonaktifkan dan tidak menerima job baru.",
                     status_code=409,
                 )
+        self._require_lite_remote_worker(selected_worker, requested_worker=worker)
         return selected_profile, selected_worker
+
+    def _require_lite_remote_worker(
+        self, selected_worker: str, *, requested_worker: str | None
+    ) -> None:
+        if self.gateway_mode != "lite":
+            return
+        self._require_lite_explicit_worker(requested_worker)
+        worker_name = str(selected_worker or "").strip().lower()
+        local_names = {"local"}
+        configured_local_name = str(
+            getattr(self.profile_manager, "worker_name", "") or ""
+        ).strip().lower()
+        if configured_local_name:
+            local_names.add(configured_local_name)
+        config = getattr(self.profile_manager, "base_config", None)
+        if not worker_name or worker_name in local_names:
+            raise DomainError(
+                "LITE_REMOTE_WORKER_REQUIRED",
+                "Pilih worker remote; Lite tidak menjalankan atau mengalihkan job ke worker-local.",
+                status_code=409,
+            )
+        registry = self.worker_registry
+        get_worker = getattr(registry, "get", None)
+        record = get_worker(worker_name) if callable(get_worker) else None
+        if record is None:
+            raise DomainError(
+                "WORKER_NOT_FOUND",
+                "Worker remote tidak terdaftar. Pilih worker yang terdaftar dan aktif.",
+                status_code=404,
+            )
+        if not worker_names_for_mode(
+            {worker_name: record},
+            "lite",
+            local_urls=worker_local_urls(config),
+        ):
+            raise DomainError(
+                "LITE_REMOTE_WORKER_REQUIRED",
+                "Pilih worker remote; Lite tidak menjalankan atau mengalihkan job ke worker-local.",
+                status_code=409,
+            )
+        if not bool(record.get("enabled", True)):
+            raise DomainError(
+                "WORKER_DISABLED",
+                "Worker remote sedang dinonaktifkan dan tidak menerima job baru.",
+                status_code=409,
+            )
+        snapshotter = getattr(self.worker_health_cache, "snapshot", None)
+        snapshot = snapshotter(worker_name) if callable(snapshotter) else None
+        status = str(snapshot.get("status") or "unknown") if isinstance(snapshot, dict) else "unknown"
+        if status == "unknown":
+            raise DomainError(
+                "WORKER_HEALTH_UNKNOWN",
+                "Status worker belum tersedia. Tunggu pemeriksaan health berikutnya lalu coba lagi.",
+                status_code=503,
+                details={"worker": worker_name, "health": status},
+            )
+        if status == "stale":
+            raise DomainError(
+                "WORKER_HEALTH_STALE",
+                "Status health worker sudah kedaluwarsa. Tunggu pemeriksaan berikutnya lalu coba lagi.",
+                status_code=503,
+                details={"worker": worker_name, "health": status},
+            )
+        if status != "ready":
+            raise DomainError(
+                "WORKER_OFFLINE",
+                "Worker remote sedang offline dan tidak dapat menerima job baru.",
+                status_code=503,
+                details={"worker": worker_name, "health": status},
+            )
+
+    def _worker_ack_wait_timed_out(self, stored: dict[str, Any]) -> bool:
+        if self.gateway_mode != "lite":
+            return False
+        raw = str(stored.get("worker_ack_wait_started_at") or "").strip()
+        if not raw:
+            return False
+        try:
+            started = datetime.fromisoformat(raw)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return True
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return (now - started).total_seconds() >= 600
+
+    def _expire_worker_ack_wait(self, job: Job) -> dict[str, str]:
+        self._fail_queued_job(
+            job,
+            "WORKER_ACK_TIMEOUT",
+            "Worker tidak mengakui job dalam 10 menit; job dihentikan tanpa dialihkan ke worker lain.",
+        )
+        return {"status": "terminal", "reason": "worker_ack_timeout"}
+
+    def _wait_for_worker_ack(self, job: Job, stored: dict[str, Any]) -> bool:
+        """Persist Lite's connectivity-only acknowledgement deadline."""
+        if self.gateway_mode != "lite":
+            return False
+        now = self._clock()
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        updater = getattr(self.jobs, "update_command_payload_fields", None)
+        if callable(updater):
+            current = updater(
+                job.id,
+                set_if_missing={"worker_ack_wait_started_at": now.isoformat()},
+            ) or {}
+        else:
+            current = self.jobs.command_payload(job.id)
+            if not isinstance(current, dict):
+                current = dict(stored)
+            if not current.get("worker_ack_wait_started_at"):
+                current["worker_ack_wait_started_at"] = now.isoformat()
+                self.jobs.update_command_payload(job.id, current)
+        if self._worker_ack_wait_timed_out(current):
+            self._expire_worker_ack_wait(job)
+            return True
+        return False
+
+    def _clear_worker_ack_wait(self, job_id: str, stored: dict[str, Any]) -> None:
+        if self.gateway_mode != "lite":
+            return
+        updater = getattr(self.jobs, "update_command_payload_fields", None)
+        if callable(updater):
+            updater(job_id, remove=("worker_ack_wait_started_at",))
+            return
+        if "worker_ack_wait_started_at" not in stored:
+            return
+        current = self.jobs.command_payload(job_id)
+        if not isinstance(current, dict):
+            current = dict(stored)
+        current.pop("worker_ack_wait_started_at", None)
+        self.jobs.update_command_payload(job_id, current)
+
+    @staticmethod
+    def _is_worker_connectivity_error(exc: Exception) -> bool:
+        kind = str(getattr(exc, "kind", "") or "").strip().lower()
+        if kind in {"network", "timeout", "no_ack"}:
+            return True
+        status = getattr(exc, "status", None)
+        if status is not None:
+            try:
+                # A worker HTTP 5xx means the command was not accepted. Keep
+                # it queued under Lite's acknowledgement deadline; 4xx is an
+                # explicit rejection and must fail immediately.
+                response_status = int(status)
+                return 500 <= response_status < 600 or response_status in {408, 425, 429}
+            except (TypeError, ValueError):
+                return False
+        if kind:
+            return False
+        return isinstance(exc, (TimeoutError, ConnectionError, OSError))
+
+    @staticmethod
+    def _worker_rejection_status(exc: Exception) -> int | None:
+        try:
+            status = int(getattr(exc, "status", 0))
+        except (TypeError, ValueError):
+            return None
+        return status if 400 <= status < 500 and status not in {408, 425, 429} else None
+
+    def _handle_worker_dispatch_exception(
+        self, job: Job, stored: dict[str, Any], exc: Exception
+    ) -> dict[str, str]:
+        if self._is_worker_connectivity_error(exc):
+            if self._wait_for_worker_ack(job, stored):
+                return {"status": "terminal", "reason": "worker_ack_timeout"}
+            return {"status": "wait", "reason": "not_ready"}
+        self._clear_worker_ack_wait(job.id, stored)
+        rejection_status = self._worker_rejection_status(exc)
+        if rejection_status is not None:
+            self._fail_queued_job(
+                job,
+                "WORKER_REJECTED_COMMAND",
+                f"Worker menolak command (HTTP {rejection_status}); periksa endpoint dan kredensial worker.",
+            )
+            return {"status": "terminal", "reason": "worker_rejected"}
+        return {"status": "wait", "reason": "not_ready"}
 
     def _assert_profile_admission(
         self,
@@ -251,10 +476,16 @@ class ControlPlane:
         candidates = [profile]
         if rclone_storage:
             candidates = []
+        elif values.get("_tdl_sender_profiles_use_worker_inventory") is True:
+            candidates = []
         elif kind in {"storage_upload", "storage_download", "storage_reconcile", "storage_sync", "tts", "chat_send"}:
             candidates = values.get("_tdl_sender_profiles") or candidates
         elif kind == "tdl_access_verify":
-            candidates = values.get("candidate_profiles") or candidates
+            candidates = (
+                values.get("candidate_profiles") or []
+                if "candidate_profiles" in values
+                else candidates
+            )
         elif kind == "backup_node":
             list_profiles = getattr(self.profile_manager, "list_profiles", None)
             candidates = list_profiles() if callable(list_profiles) else candidates
@@ -279,6 +510,13 @@ class ControlPlane:
         job_id: str | None = None,
         private_job_values: dict[str, str] | None = None,
     ) -> Job:
+        if self.gateway_mode == "lite" and kind == "backup_node":
+            raise DomainError(
+                "LITE_BACKUP_ARCHIVE_JOB_DISABLED",
+                "Pembuatan arsip backup worker tidak tersedia pada mode Lite.",
+                status_code=409,
+            )
+        self._require_lite_explicit_worker(worker)
         owner_profile = (
             actor.profile
             if kind in {"leave", "tts", "storage_upload"}
@@ -299,10 +537,25 @@ class ControlPlane:
             if not target_chat:
                 raise DomainError("TTS_CHAT_UNAVAILABLE", "Chat tujuan TTS belum dikonfigurasi.", status_code=503)
             selected_worker = self._select_tts_worker(worker, destination=target_chat)
-            sender_profiles = self._worker_profile_candidates(selected_worker, "tts")
-            execution_profile = self._select_tts_sender_profile(
-                selected_worker, sender_profiles or [owner_profile]
+            self._require_lite_remote_worker(
+                selected_worker, requested_worker=worker
             )
+            if self.gateway_mode == "lite":
+                # Lite submit must not wait on a worker RPC to discover its
+                # sender inventory. Let the worker try its current local
+                # profiles when it executes the durable command.
+                sender_profiles = []
+                execution_profile = owner_profile
+                internal_payload["_tdl_sender_profiles_use_worker_inventory"] = True
+            else:
+                # This worker-inventory mode is an execution policy reserved
+                # for Lite. Never let caller-supplied internal payload values
+                # override Full mode's capability-derived sender snapshot.
+                internal_payload.pop("_tdl_sender_profiles_use_worker_inventory", None)
+                sender_profiles = self._worker_profile_candidates(selected_worker, "tts")
+                execution_profile = self._select_tts_sender_profile(
+                    selected_worker, sender_profiles or [owner_profile]
+                )
             internal_payload.update(
                 _tdl_sender_profile=execution_profile,
                 _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
@@ -383,6 +636,16 @@ class ControlPlane:
                     _tdl_sender_profiles=[execution_profile, *[item for item in sender_profiles if item != execution_profile]],
                 )
             if provider == "telegram":
+                if self.gateway_mode == "lite":
+                    # New and retried Storage jobs rotate through the worker's
+                    # current local profiles. Carry that fact so cancellation
+                    # interrupts whichever Upload lane is active, including a
+                    # profile that was not visible to this gateway.
+                    internal_payload["_tdl_sender_profiles_use_worker_inventory"] = True
+                else:
+                    # This marker is internal and must never be accepted from
+                    # an operator-controlled payload in Full mode.
+                    internal_payload.pop("_tdl_sender_profiles_use_worker_inventory", None)
                 list_targets = getattr(self.storage_catalog, "upload_target_paths", None)
                 if callable(list_targets):
                     internal_payload["_existing_storage_target_paths"] = list_targets(
@@ -496,12 +759,21 @@ class ControlPlane:
                     if str(item).strip()
                 ]
                 internal_payload["_storage_reconcile_provider"] = "telegram"
-                internal_payload["_tdl_sender_profiles"] = list(dict.fromkeys(sender_profiles))
-                internal_payload["_tdl_sender_profile"] = (
-                    internal_payload["_tdl_sender_profiles"][0]
-                    if internal_payload["_tdl_sender_profiles"]
-                    else owner_profile
-                )
+                if self.gateway_mode == "lite":
+                    # The worker owns its live profile inventory. Do not
+                    # synchronously probe capabilities or pin this job to a
+                    # stale profile recorded by the original upload.
+                    internal_payload["_tdl_sender_profiles_use_worker_inventory"] = True
+                    internal_payload["_tdl_sender_profiles"] = []
+                    internal_payload.pop("_tdl_sender_profile", None)
+                else:
+                    internal_payload.pop("_tdl_sender_profiles_use_worker_inventory", None)
+                    internal_payload["_tdl_sender_profiles"] = list(dict.fromkeys(sender_profiles))
+                    internal_payload["_tdl_sender_profile"] = (
+                        internal_payload["_tdl_sender_profiles"][0]
+                        if internal_payload["_tdl_sender_profiles"]
+                        else owner_profile
+                    )
                 if not private_values.get("tdl_storage_chat_ref"):
                     raise DomainError(
                         "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
@@ -518,6 +790,10 @@ class ControlPlane:
                 worker=worker,
             )
             execution_profile = owner_profile
+        if kind == "tts":
+            self._require_lite_remote_worker(
+                selected_worker, requested_worker=worker
+            )
         if kind == "utility":
             submitted_utility_settings = internal_payload.get("settings")
             internal_payload = self._prepare_durable_payload(
@@ -667,6 +943,7 @@ class ControlPlane:
                 execution_plan=execution.as_dict(),
                 command_payload=internal_payload,
             )
+        self.wake_scheduler()
         command["payload"] = self._worker_payload(job.id, kind, internal_payload)
         admission = self.jobs.try_acquire_execution(job.id)
         current_job = self.jobs.get(job.id)
@@ -723,6 +1000,7 @@ class ControlPlane:
             raise DomainError("JOB_PAYLOAD_INVALID", "Payload job harus berupa object.", status_code=422)
         if set(target) - {"profile", "worker"}:
             raise DomainError("OPERATION_TARGET_INVALID", "Target hanya boleh berisi profile dan worker.", status_code=422)
+        self._require_lite_explicit_worker(target.get("worker"))
         owner_profile = (
             actor.profile
             if kind in {"leave", "tts", "storage_upload", "tdl_access_verify", "chat_send"}
@@ -741,10 +1019,18 @@ class ControlPlane:
             )
             if not target_chat:
                 raise DomainError("TTS_CHAT_UNAVAILABLE", "Chat tujuan TTS belum dikonfigurasi.", status_code=503)
-            sender_profiles = self._worker_profile_candidates(selected_worker, "tts")
-            execution_profile = self._select_tts_sender_profile(
-                selected_worker, sender_profiles or [owner_profile]
+            self._require_lite_remote_worker(
+                selected_worker,
+                requested_worker=str(target.get("worker") or "").strip() or None,
             )
+            if self.gateway_mode == "lite":
+                sender_profiles = []
+                execution_profile = owner_profile
+            else:
+                sender_profiles = self._worker_profile_candidates(selected_worker, "tts")
+                execution_profile = self._select_tts_sender_profile(
+                    selected_worker, sender_profiles or [owner_profile]
+                )
         elif kind == "tdl_access_verify":
             if not str(target.get("worker") or "").strip():
                 raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih untuk verifikasi akses TDL.", status_code=422)
@@ -762,9 +1048,24 @@ class ControlPlane:
                 } else None,
                 worker=str(target.get("worker")),
             )
+        if kind in {"tts", "safelink_resolve"}:
+            self._require_lite_remote_worker(
+                selected_worker,
+                requested_worker=str(target.get("worker") or "").strip() or None,
+            )
         payload = self._prepare_durable_payload(
             actor, kind, payload, owner_profile, selected_worker
         )
+        if kind == "tts" and self.gateway_mode == "lite":
+            payload["_tdl_sender_profiles_use_worker_inventory"] = True
+        if kind == "storage_upload" and str(payload.get("provider") or "telegram").strip().lower() == "telegram":
+            if self.gateway_mode == "lite":
+                # The worker must use its current profile inventory for durable
+                # Operations submissions just as it does for direct Storage
+                # submits and retries.
+                payload["_tdl_sender_profiles_use_worker_inventory"] = True
+            else:
+                payload.pop("_tdl_sender_profiles_use_worker_inventory", None)
         if kind == "chat_send":
             execution_profile = payload["_tdl_sender_profiles"][0]
         quick_storage_snapshot = None
@@ -795,11 +1096,12 @@ class ControlPlane:
                         f"Tujuan TDL {purpose} belum dikonfigurasi.",
                         status_code=503,
                     )
-                sender_profiles = self._worker_profile_candidates(selected_worker, "storage")
-                if not sender_profiles:
-                    sender_profiles = [owner_profile]
-                execution_profile = self._select_tts_sender_profile(
-                    selected_worker, sender_profiles or [owner_profile]
+                execution_profile, sender_profiles, _session_fingerprints = (
+                    self._storage_sender_snapshot(
+                        selected_worker,
+                        destination=destination,
+                        fallback_profile=owner_profile,
+                    )
                 )
                 payload.update(
                     _tdl_sender_profile=execution_profile,
@@ -808,8 +1110,12 @@ class ControlPlane:
         elif kind == "tdl_access_verify":
             purpose = str(payload.get("purpose") or "")
             destination = self._tdl_access_target(purpose)
-            profiles_for_lock = self._worker_profile_candidates(
-                selected_worker, "storage" if purpose == "storage" else "tts"
+            profiles_for_lock = (
+                []
+                if self.gateway_mode == "lite"
+                else self._worker_profile_candidates(
+                    selected_worker, "storage" if purpose == "storage" else "tts"
+                )
             )
             payload["candidate_profiles"] = sorted(
                 {str(item).strip().lower() for item in profiles_for_lock if str(item).strip()}
@@ -1785,9 +2091,14 @@ class ControlPlane:
                 "Tujuan TDL Storage belum dikonfigurasi.",
                 status_code=503,
             )
-        profiles = self._worker_profile_candidates(worker, "storage")
+        fallback = str(fallback_profile or "").strip().lower()
+        if self.gateway_mode == "lite":
+            # The worker enumerates its own local sessions during execution;
+            # do not hold a submit request open for a capabilities RPC.
+            profiles = [fallback] if fallback else []
+        else:
+            profiles = self._worker_profile_candidates(worker, "storage")
         if not profiles:
-            fallback = str(fallback_profile or "").strip().lower()
             profiles = [fallback] if fallback else []
         if not profiles:
             raise DomainError("PROFILE_REQUIRED", "Pilih profil untuk mencoba upload TDL.", status_code=422)
@@ -1840,8 +2151,12 @@ class ControlPlane:
                 "Tujuan TDL Storage belum dikonfigurasi.",
                 status_code=503,
             )
-        del profile, quick_settings
-        profiles = self._worker_profile_candidates(worker, "storage")
+        del quick_settings
+        profiles = (
+            [str(profile or "").strip().lower()]
+            if self.gateway_mode == "lite" and str(profile or "").strip()
+            else self._worker_profile_candidates(worker, "storage")
+        )
         return destination, profiles
 
     def _tdl_access_inventory(
@@ -1870,13 +2185,27 @@ class ControlPlane:
         target = self._tdl_access_target(purpose)
         if not target or self.tdl_access_store is None:
             raise DomainError("TDL_ACCESS_TARGET_UNAVAILABLE", f"Tujuan TDL {purpose} belum dikonfigurasi.", status_code=503)
-        checker = getattr(self.dispatcher, "capabilities", None)
-        try:
-            capabilities = checker(worker) if callable(checker) else {}
-        except Exception as exc:
-            raise DomainError("WORKER_OFFLINE", f"Worker {worker} tidak dapat diperiksa.", status_code=503) from exc
-        capabilities = capabilities if isinstance(capabilities, dict) else {}
-        profiles, session_fingerprints = self._tdl_access_inventory(capabilities, purpose)
+        if self.gateway_mode == "lite":
+            self._require_lite_explicit_worker(worker)
+            if worker not in self._worker_names_for_mode():
+                raise DomainError(
+                    "LITE_REMOTE_WORKER_REQUIRED",
+                    "Status verifikasi Lite hanya tersedia untuk worker remote.",
+                    status_code=409,
+                )
+            # This is a saved-proof view in Lite. Never probe a worker (or
+            # reveal a local target) from a status GET; an explicit scan/job
+            # updates the inventory and proof snapshots.
+            profiles = self.verified_profiles_for_worker(worker) or []
+            session_fingerprints = None
+        else:
+            checker = getattr(self.dispatcher, "capabilities", None)
+            try:
+                capabilities = checker(worker) if callable(checker) else {}
+            except Exception as exc:
+                raise DomainError("WORKER_OFFLINE", f"Worker {worker} tidak dapat diperiksa.", status_code=503) from exc
+            capabilities = capabilities if isinstance(capabilities, dict) else {}
+            profiles, session_fingerprints = self._tdl_access_inventory(capabilities, purpose)
         destination_hash = self.tdl_access_store.destination_fingerprint(target)
         # Saved canary lookup is informational. Do not bind current results to
         # a session-generation fingerprint that changes after deployment.
@@ -1974,6 +2303,7 @@ class ControlPlane:
                 "cancel_after_dispatch": False,
                 "cancel_after_dispatch_accepted": False,
             }
+            retry_payload.pop("worker_ack_wait_started_at", None)
             retry_payload.pop("cancel_before_dispatch_attempt", None)
             retry_payload.pop("cancel_after_dispatch_attempt", None)
             retry_event = JobEvent(
@@ -2009,6 +2339,7 @@ class ControlPlane:
                 "dispatch_token": secrets.token_urlsafe(32),
                 "dispatch_started": False,
             }
+            updated.pop("worker_ack_wait_started_at", None)
             advancer = getattr(self.jobs, "advance_durable_attempt", None)
             if callable(advancer):
                 advance_state = advancer(job.id, attempt, updated)
@@ -2070,6 +2401,7 @@ class ControlPlane:
         if self.worker_registry is not None:
             record = self.worker_registry.get(job.worker)
             if record is None or not bool(record.get("enabled", True)):
+                self._clear_worker_ack_wait(job.id, stored)
                 return {"status": "wait", "reason": "not_ready"}
         capabilities = getattr(self.dispatcher, "capabilities", None)
         dispatch_command = getattr(self.dispatcher, "dispatch_command", None)
@@ -2102,18 +2434,30 @@ class ControlPlane:
                 worker_capabilities, job.worker, required_capabilities=required
             )
         except DomainError as exc:
+            # Capability-contract failures are deterministic and not evidence
+            # that the worker is offline. They must not consume the
+            # connectivity acknowledgement window.
+            self._clear_worker_ack_wait(job.id, stored)
             if job.kind in {"backup_verify", "storage_download"} and exc.code == "WORKER_INCOMPATIBLE":
                 self._fail_queued_job(job, exc.code, exc.message)
                 return {"status": "terminal", "reason": "worker_incompatible"}
             return {"status": "wait", "reason": "not_ready"}
-        except Exception:
-            return {"status": "wait", "reason": "not_ready"}
+        except Exception as exc:
+            return self._handle_worker_dispatch_exception(job, stored, exc)
+
+        # A healthy capability probe clears a timer only before a command was
+        # ever sent. Once dispatch_started is persisted, the stable command may
+        # already be in the worker journal and the acknowledgement deadline
+        # must span retries until its receipt is confirmed.
+        if not bool(stored.get("dispatch_started")):
+            self._clear_worker_ack_wait(job.id, stored)
 
         admission = self.jobs.try_acquire_execution(job.id)
         self.jobs.set_queue_info(
             job.id, int(admission.get("position", 1)), admission.get("blocked_reason")
         )
         if not admission.get("admitted"):
+            self._clear_worker_ack_wait(job.id, stored)
             return {"status": "wait", "reason": "not_ready"}
         latest = job.progress_sequence
         envelope = {
@@ -2192,12 +2536,14 @@ class ControlPlane:
             return {"status": "terminal", "reason": "dispatch_aborted"}
         try:
             receipt = dispatch_command(job.worker, envelope)
-        except Exception:
+        except Exception as exc:
             # The stable command ID lets the next queue attempt query the
             # worker journal before resending an acceptance that may be lost.
-            return {"status": "wait", "reason": "not_ready"}
+            return self._handle_worker_dispatch_exception(job, stored, exc)
         if not isinstance(receipt, dict) or receipt.get("accepted") is not True:
+            self._clear_worker_ack_wait(job.id, stored)
             return {"status": "wait", "reason": "not_ready"}
+        self._clear_worker_ack_wait(job.id, stored)
         latest_payload = self.jobs.command_payload(job.id)
         latest_payload = latest_payload if isinstance(latest_payload, dict) else {}
         if (
@@ -2466,7 +2812,7 @@ class ControlPlane:
                         for status in statuses
                     ),
                 }
-                for name in registry.names()
+                for name in self._worker_names_for_mode()
                 if (record := registry.get(name)) is not None
                 and bool(record.get("enabled", True))
             ],
@@ -2481,7 +2827,7 @@ class ControlPlane:
         result: list[dict[str, Any]] = []
         target = str(destination or self._tdl_access_target("tts") or "").strip()
         gate_store = getattr(self.runtime_readiness_gate, "store", None)
-        for name in registry.names():
+        for name in self._worker_names_for_mode():
             record = registry.get(name)
             if record is None:
                 continue
@@ -2579,7 +2925,7 @@ class ControlPlane:
         checker = getattr(self.dispatcher, "capabilities", None)
         if registry is None or not callable(checker):
             return []
-        candidates = [worker] if worker else list(registry.names())
+        candidates = self._worker_names_for_mode([worker] if worker else None)
         target_chat = str(destination or self._tdl_access_target("tts")).strip()
         statuses = ("queued", "dispatched", "running", "paused")
         result: list[dict[str, Any]] = []
@@ -2745,7 +3091,7 @@ class ControlPlane:
         registry = self.worker_registry
         if registry is None:
             return []
-        names = registry.names()
+        names = self._worker_names_for_mode()
         statuses = ("queued", "dispatched", "running", "paused")
         result: list[dict[str, Any]] = []
         gate_store = getattr(self.runtime_readiness_gate, "store", None)
@@ -2995,13 +3341,19 @@ class ControlPlane:
             daemon=True,
             name="backend-job-dispatcher",
         )
+        if self.gateway_mode == "lite":
+            self._scheduler_wake.set()
         self._scheduler_thread.start()
 
     def stop_scheduler(self) -> None:
         self._scheduler_stop.set()
+        self._scheduler_wake.set()
+
+    def wake_scheduler(self) -> None:
+        self._scheduler_wake.set()
 
     def _scheduler_loop(self) -> None:
-        while not self._scheduler_stop.wait(2.0):
+        def recover_and_dispatch() -> None:
             try:
                 self._recover_stale_jobs()
                 self._retry_dispatch_cancel_requests()
@@ -3012,6 +3364,13 @@ class ControlPlane:
                 import logging
 
                 logging.getLogger(__name__).exception("Pending job dispatch failed")
+
+        run_event_driven_loop(
+            self._scheduler_stop,
+            self._scheduler_wake,
+            recovery_seconds=self.scheduler_recovery_seconds,
+            callback=recover_and_dispatch,
+        )
 
     def _recover_stale_jobs(self, *, now=None) -> None:
         """Request cancellation for stale work and fail only after a grace period.
@@ -3460,6 +3819,8 @@ class ControlPlane:
         # Side effects are idempotent and intentionally replayed when a worker
         # retries an already persisted event after a transient API failure.
         self._apply_event_side_effects(job, event)
+        if inserted:
+            self.wake_scheduler()
         if event.status.terminal and self.export_cursor_service is not None:
             lease = self.export_cursor_service.lease_for_job(job.id)
             if lease is not None:
@@ -4978,6 +5339,7 @@ class ControlPlane:
                 "Tidak ada file ambigu yang menunggu rekonsiliasi.",
                 status_code=409,
             )
+        final_reconciliation = item_index is None or len(ambiguous) == 1
         if item_index is not None:
             selected_item = next(
                 (item for item in ambiguous if item["index"] == item_index), None
@@ -5029,6 +5391,8 @@ class ControlPlane:
             "end_timestamp": end_timestamp,
             "_storage_reconcile_items": ambiguous,
         }
+        if final_reconciliation:
+            payload["_storage_reconcile_final_for_source"] = True
         if item_index is not None:
             payload["item_index"] = item_index
         if provider == "rclone":
@@ -5053,13 +5417,16 @@ class ControlPlane:
             target_chat = str(
                 self.private_job_value(original.id, "tdl_storage_chat_ref") or ""
             ).strip()
-            profiles = list(dict.fromkeys(
-                [*profiles, *self._worker_profile_candidates(original.worker, "storage")]
-            ))
-            if not profiles:
-                profiles = [str(original.profile or "").strip().lower()]
-            profiles = [profile for profile in profiles if profile]
-            if not target_chat or not profiles:
+            if self.gateway_mode == "lite":
+                profiles = []
+            else:
+                profiles = list(dict.fromkeys(
+                    [*profiles, *self._worker_profile_candidates(original.worker, "storage")]
+                ))
+                if not profiles:
+                    profiles = [str(original.profile or "").strip().lower()]
+                profiles = [profile for profile in profiles if profile]
+            if not target_chat or (self.gateway_mode != "lite" and not profiles):
                 raise DomainError(
                     "STORAGE_RECONCILIATION_SNAPSHOT_UNAVAILABLE",
                     "Snapshot tujuan Storage untuk rekonsiliasi tidak tersedia.",
@@ -5067,9 +5434,12 @@ class ControlPlane:
                 )
             payload.update(
                 _storage_reconcile_provider="telegram",
-                _tdl_sender_profile=profiles[0],
                 _tdl_sender_profiles=profiles,
             )
+            if self.gateway_mode == "lite":
+                payload["_tdl_sender_profiles_use_worker_inventory"] = True
+            else:
+                payload["_tdl_sender_profile"] = profiles[0]
             private_values = {"tdl_storage_chat_ref": target_chat}
         return self.submit_job(
             actor,

@@ -7,6 +7,7 @@ import threading
 import tempfile
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -188,6 +189,102 @@ class MutableWorkerRegistry(FakeWorkerRegistry):
 
 
 class ProfileProvisioningTests(unittest.TestCase):
+    def test_repeated_local_staging_recovery_holds_compaction_activity_lease(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            operation = store.begin(
+                profile="novel", actor_user_id=7, bootstrap_worker="local",
+                source="local_upload", target_workers=["local"],
+            )
+            store.store_bundle(
+                operation,
+                987654,
+                build_profile_bundle({"data/default": b"session"}, 987654),
+            )
+            store.update_distribution("novel", "local", "ready", provisioning_id=operation)
+            store.mark_active(operation)
+
+            active = {"count": 0}
+            guarded_calls = []
+
+            @contextmanager
+            def database_activity():
+                active["count"] += 1
+                try:
+                    yield
+                finally:
+                    active["count"] -= 1
+
+            for method_name in (
+                "completed_local_provisioning_staging",
+                "provisioning",
+                "discard_local_provisioning_bundle",
+            ):
+                original = getattr(store, method_name)
+
+                def guarded(*args, _original=original, _name=method_name, **kwargs):
+                    guarded_calls.append((_name, active["count"]))
+                    return _original(*args, **kwargs)
+
+                setattr(store, method_name, guarded)
+
+            manager = FakeProfileManager(root)
+            service = ProfileProvisioningService(
+                store,
+                manager,
+                FakeWorkerRegistry(),
+                FakeProfileDispatcher(),
+                database_activity=database_activity,
+            )
+
+            service._recover_completed_local_provisioning()
+
+            self.assertEqual(
+                [name for name, _count in guarded_calls],
+                [
+                    "completed_local_provisioning_staging",
+                    "provisioning",
+                    "discard_local_provisioning_bundle",
+                ],
+            )
+            self.assertTrue(all(count > 0 for _name, count in guarded_calls))
+            self.assertEqual(store.completed_local_provisioning_staging(), [])
+            self.assertEqual(manager.profile_registry.profile_for_user(987654), "novel")
+
+    def test_lite_rejects_local_endpoint_alias_and_only_targets_remote_worker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manager = FakeProfileManager(root)
+            workers = MutableWorkerRegistry()
+            workers.add("local-alias", url="http://worker-local:8080/")
+            workers.add("remote-1", url="https://worker1.example")
+            dispatcher = FakeProfileDispatcher()
+            store = ProfileProvisioningStore(root / "storage.db", root / "vault")
+            service = ProfileProvisioningService(
+                store,
+                manager,
+                workers,
+                dispatcher,
+                gateway_mode="lite",
+                local_worker_urls=["http://worker-local:8080"],
+            )
+
+            with self.assertRaisesRegex(ValueError, "Pilih worker remote"):
+                service.upload(
+                    "alias-profile", "local-alias", single_session_zip(), 42,
+                    local_only=True,
+                )
+
+            operation_id = service.upload(
+                "remote-profile", "remote-1", single_session_zip(), 42,
+                local_only=True,
+            )
+            self.assertEqual(
+                [item["worker"] for item in store.provisioning(operation_id)["workers"]],
+                ["remote-1"],
+            )
+
     def test_local_profile_upload_installs_only_on_selected_worker_and_discards_vault_staging(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

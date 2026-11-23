@@ -178,9 +178,23 @@ class TtsExecutorTests(unittest.TestCase):
             self.assertTrue(no_profile["tts"])
             self.assertEqual(no_profile["tts_profiles"], [])
 
-    def test_tts_uploads_each_part_with_active_profile_tdl_session(self):
+    def test_tts_uses_worker_inventory_when_actor_profile_is_not_installed(self):
         with tempfile.TemporaryDirectory() as directory:
             executor = _Executor(directory)
+            archive_tdl = _FakeTdl()
+            executor.tdl_by_profile["archive"] = archive_tdl
+            runtime_calls = []
+
+            def runtime(profile):
+                runtime_calls.append(profile)
+                return SimpleNamespace(
+                    name=profile,
+                    export_tdl_client=executor.tdl_by_profile.get(profile, executor.tdl),
+                    export_operation_lock=threading.RLock(),
+                )
+
+            executor.profile_manager.runtime = runtime
+            executor.profile_manager.list_profiles = lambda: ["archive"]
             responses = iter([
                 {"registered_parts": 1, "chat_ref": "+1123456789"},
                 {"items": [{
@@ -207,9 +221,12 @@ class TtsExecutorTests(unittest.TestCase):
             command = {
                 "job_id": "job-tts",
                 "kind": "tts",
-                "profile": "default",
+                "profile": "gateway-owner-profile",
                 "worker": "local",
-                "payload": {"title": "Bab 1", "text": "Isi"},
+                "payload": {
+                    "title": "Bab 1", "text": "Isi",
+                    "_tdl_sender_profiles_use_worker_inventory": True,
+                },
             }
             with patch.object(executor, "_tts_pipeline", return_value=_FakePipeline()), patch(
                 "tme3bot.worker.executor_tts.request_json", side_effect=request
@@ -217,8 +234,10 @@ class TtsExecutorTests(unittest.TestCase):
                 result = executor._tts(command)
 
             self.assertEqual(result["delivered_parts"], 1)
-            self.assertEqual(len(executor.tdl.uploads), 1)
-            path, chat_ref, caption = executor.tdl.uploads[0]
+            self.assertEqual(len(executor.tdl.uploads), 0)
+            self.assertEqual(len(archive_tdl.uploads), 1)
+            self.assertNotIn("gateway-owner-profile", runtime_calls)
+            path, chat_ref, caption = archive_tdl.uploads[0]
             self.assertEqual(chat_ref, "+1123456789")
             self.assertEqual(caption, "Bab 1")
             self.assertEqual(path.name, "Bab 1.mp3")
@@ -235,6 +254,7 @@ class TtsExecutorTests(unittest.TestCase):
                 "default": default_tdl,
                 "archive": archive_tdl,
             })
+            executor.profile_manager.list_profiles = lambda: ["default", "archive"]
             request_index = {"value": 0}
 
             def request(*args, **kwargs):
@@ -269,7 +289,7 @@ class TtsExecutorTests(unittest.TestCase):
                 "payload": {
                     "title": "Bab 2",
                     "text": "Isi",
-                    "_tdl_sender_profiles": ["default", "archive"],
+                    "_tdl_sender_profiles_use_worker_inventory": True,
                 },
             }
             with patch.object(executor, "_tts_pipeline", return_value=_FakePipeline()), patch(

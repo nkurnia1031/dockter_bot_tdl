@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 from tme3bot.api.backend import job_dict
 from tme3bot.application.control_plane import ControlPlane
@@ -368,6 +369,181 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(set(payload["_tdl_sender_profiles"]), {"archive", "default", "other"})
         self.assertNotIn("_tdl_sender_session_fingerprints", payload)
         self.assertNotIn("tdl_sender_session_fingerprints", str(job.payload))
+
+    def test_lite_storage_upload_marks_worker_inventory_for_cancel_and_runtime_use(self):
+        self.control.gateway_mode = "lite"
+        self.control.worker_registry = WorkerRegistry(
+            Path(self.temp.name) / "lite-storage-upload-workers.json",
+            {"remote-1": "https://remote-1.example.test"},
+            {"remote-1": "worker-token"},
+        )
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        self.authorize_quick_mode_storage(workers=("remote-1",))
+
+        job = self.control.submit_job(
+            self.actor,
+            "storage_upload",
+            {"folder_path": "/workspace/biasa", "batch_id": "lite-storage-upload"},
+            worker="remote-1",
+        )
+
+        self.assertEqual(job.worker, "remote-1")
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertTrue(payload["_tdl_sender_profiles_use_worker_inventory"])
+        self.assertEqual(payload["_tdl_sender_profiles"], ["default"])
+        self.assertNotIn("_tdl_sender_profiles_use_worker_inventory", job.payload)
+
+        from tme3bot.worker.executor import WorkerJobExecutor
+
+        interrupt_calls = {"default": [], "archive": []}
+
+        class UploadClient:
+            def __init__(self, profile):
+                self.profile = profile
+
+            def interrupt_current(self, owner_job_id=None):
+                interrupt_calls[self.profile].append(owner_job_id)
+                return self.profile == "archive"
+
+        runtimes = {
+            profile: SimpleNamespace(upload_tdl_client=UploadClient(profile))
+            for profile in interrupt_calls
+        }
+        worker = object.__new__(WorkerJobExecutor)
+        worker._durable_admission_lock = threading.RLock()
+        worker.command_store = SimpleNamespace(
+            request_cancel_by_job=lambda job_id, **_kwargs: {
+                "command_id": "lite-storage-command",
+                "status": "cancelling",
+            }
+        )
+        worker._lock = threading.RLock()
+        worker._active = {job.id: (job.profile, job.kind)}
+        worker._active_commands = {job.id: self.dispatcher.commands[-1]}
+        worker._finalizing = set()
+        worker._cancel_requested = set()
+        worker._utility_runners = {}
+        worker._rclone_runners = {}
+        worker._quick_export_clients = {}
+        worker._quick_download_clients = {}
+        worker._quick_active = set()
+        worker._quick_thumbnail_builders = {}
+        worker._backup_services = {}
+        worker._pause_events = {}
+        worker._paused_pending_ids = set()
+        worker._jobs = SimpleNamespace(cancel_pending=lambda _job_id: False)
+        worker.publisher = SimpleNamespace(emit=lambda *_args, **_kwargs: None)
+        worker.profile_manager = SimpleNamespace(
+            list_profiles=lambda: ["default", "archive"],
+            runtime=lambda profile: runtimes[profile],
+        )
+        worker._write_quick_log_line = lambda *_args: None
+
+        self.assertTrue(worker.cancel(job.id))
+        self.assertEqual(
+            interrupt_calls,
+            {"default": [job.id], "archive": [job.id]},
+        )
+
+    def test_lite_durable_storage_upload_uses_worker_inventory_without_capability_rpc(self):
+        self.control.gateway_mode = "lite"
+        self.control.worker_registry = WorkerRegistry(
+            Path(self.temp.name) / "lite-durable-storage-workers.json",
+            {"remote-1": "https://remote-1.example.test"},
+            {"remote-1": "worker-token"},
+        )
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        self.control.storage_catalog = SimpleNamespace(folder_path=lambda _folder_id: "")
+        self.control.tdl_access_target_resolver = lambda _purpose: "-100123"
+        self.control.runtime_settings_store = FakeJobSecretStore()
+        self.dispatcher.capabilities = lambda _worker: self.fail(
+            "Lite durable Storage submit must not probe worker inventory"
+        )
+
+        prepared = self.control.prepare_durable_job(
+            self.actor,
+            {"worker": "remote-1"},
+            {
+                "job_kind": "storage_upload",
+                "payload": {"folder_path": "/workspace/source", "provider": "telegram"},
+            },
+        )
+
+        payload = prepared.command_payload["payload"]
+        self.assertTrue(payload["_tdl_sender_profiles_use_worker_inventory"])
+        self.assertNotIn(
+            "_tdl_sender_profiles_use_worker_inventory", prepared.job.payload
+        )
+
+    def test_lite_storage_item_and_batch_retry_payloads_keep_worker_inventory_marker(self):
+        self.control.gateway_mode = "lite"
+        self.control.worker_registry = WorkerRegistry(
+            Path(self.temp.name) / "lite-storage-retry-workers.json",
+            {"remote-1": "https://remote-1.example.test"},
+            {"remote-1": "worker-token"},
+        )
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        self.authorize_quick_mode_storage(workers=("remote-1",))
+
+        def source_job(job_id, item_status, retryable):
+            source = Job(
+                id=job_id,
+                kind="storage_upload",
+                profile="default",
+                actor_user_id=42,
+                worker="remote-1",
+                status=JobStatus.FAILED,
+                payload={"folder_path": "/workspace/storage", "provider": "telegram"},
+                result={"value": {"items": [{
+                    "path": "retry.txt",
+                    "name": "retry.txt",
+                    "status": item_status,
+                    "attempt": 1,
+                    "retryable": retryable,
+                }]}},
+            )
+            self.jobs.create_with_private_values(
+                source, {"tdl_storage_chat_ref": b"-100123"}
+            )
+            return source
+
+        batch_source = source_job("lite-batch-retry-source", "failed", True)
+        batch_retry = self.control.retry_job(self.actor, batch_source.id)
+        batch_payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(batch_retry.worker, "remote-1")
+        self.assertTrue(batch_payload["_tdl_sender_profiles_use_worker_inventory"])
+        self.assertNotIn(
+            "_tdl_sender_profiles_use_worker_inventory", batch_retry.payload
+        )
+
+        item_source = source_job(
+            "lite-item-retry-source", "needs_reconciliation", False
+        )
+        self._attach_confirmed_missing_storage_item(item_source, 0)
+        item_retry = self.control.retry_job(
+            self.actor, item_source.id, storage_item_index=0
+        )
+        item_payload = self.dispatcher.commands[-1]["payload"]
+        self.assertEqual(item_retry.worker, "remote-1")
+        self.assertTrue(item_payload["_tdl_sender_profiles_use_worker_inventory"])
+        self.assertNotIn(
+            "_tdl_sender_profiles_use_worker_inventory", item_retry.payload
+        )
 
     def test_telegram_upload_dispatch_includes_catalog_paths_for_the_selected_folder(self):
         self.authorize_quick_mode_storage()
@@ -1311,6 +1487,36 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(job.status, JobStatus.DISPATCHED)
         self.assertEqual(self.jobs.count(kind="tts"), 1)
 
+    def test_full_tts_submission_does_not_trust_worker_inventory_marker(self):
+        registry = WorkerRegistry(
+            Path(self.temp.name) / "full-tts-inventory-marker.json",
+            {"local": "http://worker"},
+            {"local": "token"},
+        )
+        dispatcher = FakeDispatcher()
+        dispatcher.capabilities = lambda _worker: {
+            "tts": True,
+            "export_profiles": ["default", "archive"],
+            "profiles": ["default", "archive"],
+        }
+        control = ControlPlane(self.jobs, dispatcher, self.profiles, worker_registry=registry)
+        self.configure_tdl_access(control, dispatcher, registry)
+
+        job = control.submit_job(
+            self.actor,
+            "tts",
+            {
+                "title": "A",
+                "text": "private text",
+                "_tdl_sender_profiles_use_worker_inventory": True,
+            },
+        )
+
+        self.assertEqual(job.status, JobStatus.DISPATCHED)
+        payload = dispatcher.commands[-1]["payload"]
+        self.assertEqual(set(payload["_tdl_sender_profiles"]), {"default", "archive"})
+        self.assertNotIn("_tdl_sender_profiles_use_worker_inventory", payload)
+
     def test_tts_helper_failure_invalidates_worker_runtime_not_profile_canaries(self):
         registry = WorkerRegistry(
             Path(self.temp.name) / "tts-execution-profile.json",
@@ -2037,6 +2243,21 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertIn("worker:local:quick-stage:stage-1", retry_plan.resource_keys)
         self.assertNotIn("profile:default:worker:local:tdl:export", retry_plan.resource_keys)
+
+    def test_empty_tdl_access_candidates_do_not_fall_back_to_gateway_profiles(self):
+        plan = build_execution_plan(
+            "tdl_access_verify",
+            "default",
+            "remote-1",
+            {"purpose": "storage", "candidate_profiles": []},
+            profiles=["gateway-local-profile"],
+        )
+
+        self.assertIn("worker:remote-1:kind:tdl_access_verify", plan.resource_keys)
+        self.assertNotIn(
+            "profile:gateway-local-profile:worker:remote-1:tdl:upload",
+            plan.resource_keys,
+        )
 
     def test_rclone_storage_reconciliation_uses_rclone_and_move_workspace_locks(self):
         plan = build_execution_plan(
@@ -3078,7 +3299,7 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(resumed_payload["quick_retry"]["resume_phase"], "auto")
         self.assertEqual(len(self.dispatcher.commands), 4)
 
-    def _create_ambiguous_storage_upload(self):
+    def _create_ambiguous_storage_upload(self, *, worker="local"):
         self.authorize_quick_mode_storage()
         self.attach_storage_readiness()
         source = Job(
@@ -3086,7 +3307,7 @@ class ControlPlaneTests(unittest.TestCase):
             kind="storage_upload",
             profile="default",
             actor_user_id=42,
-            worker="local",
+            worker=worker,
             status=JobStatus.FAILED,
             payload={"folder_path": "/workspace/storage", "keywords": "backup"},
             result={"value": {"items": [
@@ -3227,6 +3448,41 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertFalse(updated_items[0]["retryable"])
         self.assertEqual(updated_items[1]["status"], "failed")
         self.assertTrue(updated_items[1]["retryable"])
+
+    def test_lite_storage_reconciliation_uses_worker_inventory_without_capability_rpc(self):
+        source = self._create_ambiguous_storage_upload(worker="remote-1")
+        self.control.gateway_mode = "lite"
+        self.control.worker_registry = WorkerRegistry(
+            Path(self.temp.name) / "lite-storage-workers.json"
+        )
+        self.control.worker_registry.upsert(
+            "remote-1", "https://remote-1.example.test", "worker-token"
+        )
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        capability_calls = []
+
+        def capabilities(worker):
+            capability_calls.append(worker)
+            raise AssertionError("Lite reconciliation must not probe worker inventory")
+
+        self.dispatcher.capabilities = capabilities
+
+        reconciliation = self.control.reconcile_storage_upload(self.actor, source.id)
+
+        self.assertEqual(reconciliation.worker, "remote-1")
+        self.assertEqual(capability_calls, [])
+        payload = self.dispatcher.commands[-1]["payload"]
+        self.assertTrue(payload["_tdl_sender_profiles_use_worker_inventory"])
+        self.assertEqual(payload["_tdl_sender_profiles"], [])
+        resource_keys = self.dispatcher.commands[-1]["execution"]["resource_keys"]
+        self.assertNotIn(
+            "profile:default:worker:remote-1:tdl:upload", resource_keys
+        )
 
     def test_storage_item_retry_submits_only_selected_confirmed_missing_file(self):
         self.authorize_quick_mode_storage()

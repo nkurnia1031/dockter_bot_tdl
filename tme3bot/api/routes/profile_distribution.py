@@ -6,6 +6,7 @@ from typing import Any
 from fastapi import Depends, Header, Request
 
 from tme3bot.domain.models import DomainError
+from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
 
 
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -57,10 +58,15 @@ def register_profile_distribution(
         if provisioner.store.bundle_for_revision(normalized, int(revision["revision"])) is None:
             raise DomainError("PROFILE_REVISION_UNAVAILABLE", "Revision Vault tidak tersedia.", status_code=409)
         registry = getattr(context, "worker_registry", None)
-        workers = sorted(set(registry.names())) if registry is not None else []
+        config = getattr(context, "config", None)
+        registered_workers = registry.list() if registry is not None else {}
+        workers = sorted(set(worker_names_for_mode(
+            registered_workers,
+            getattr(config, "gateway_mode", "full"),
+            local_urls=worker_local_urls(config),
+        )))
         if not workers:
             raise DomainError("WORKERS_UNAVAILABLE", "Tidak ada worker terdaftar untuk distribusi.", status_code=409)
-        config = getattr(context, "config", None)
         if (
             int(getattr(config, "backup_channel_id", 0) or 0) == 0
             or not str(getattr(config, "backup_channel_ref", "") or "").strip()
@@ -168,4 +174,12 @@ def register_profile_distribution(
         if worker not in operation["target_workers"]:
             raise DomainError("WORKER_NOT_IN_SNAPSHOT", "Worker bukan bagian dari snapshot operasi.", status_code=403)
         accepted = store().event(operation_id, worker, phase, status, code, sequence=sequence)
+        if accepted:
+            service = getattr(context, "profile_distribution_service", None)
+            if service is not None:
+                service.wake()
+            provisioner = getattr(context, "profile_provisioner", None)
+            wake_provisioner = getattr(provisioner, "wake", None)
+            if callable(wake_provisioner):
+                wake_provisioner()
         return {"accepted": True, "duplicate": not accepted}

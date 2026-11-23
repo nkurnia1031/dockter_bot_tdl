@@ -122,9 +122,17 @@ def request_json(
             if isinstance(body.get("error"), dict)
             else body.get("detail")
         ) or str(exc)
-        raise JsonHttpError(exc.code, str(message), body) from exc
-    except (urllib.error.URLError, json.JSONDecodeError) as exc:
-        raise JsonHttpError(503, f"API tidak dapat dihubungi: {exc}") from exc
+        raise JsonHttpError(exc.code, str(message), body, kind="response") from exc
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+            raise JsonHttpError(
+                504, "API tidak dapat dihubungi.", kind="timeout"
+            ) from exc
+        raise JsonHttpError(503, "API tidak dapat dihubungi.", kind="network") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise JsonHttpError(504, "API tidak dapat dihubungi.", kind="timeout") from exc
+    except json.JSONDecodeError as exc:
+        raise JsonHttpError(502, "Worker mengembalikan respons tidak valid.", kind="response") from exc
 
 
 class WorkerHttpDispatcher:
@@ -492,7 +500,8 @@ class WorkerHttpDispatcher:
             raise
         if not accepted(receipt):
             raise JsonHttpError(
-                503, "Worker belum mengonfirmasi penerimaan command."
+                503, "Worker belum mengonfirmasi penerimaan command.",
+                kind="no_ack",
             )
         return {**receipt, "accepted": True}
 

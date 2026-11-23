@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import DownloadsPage from './DownloadsPage.svelte';
 import { session } from '$lib/session.svelte';
+import { setGatewayMode } from '$lib/gateway-mode.svelte';
 
 describe('DownloadsPage profile filter', () => {
   afterEach(() => {
@@ -12,6 +13,12 @@ describe('DownloadsPage profile filter', () => {
 
   async function flushPromises() {
     for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  }
+
+  async function restoreFullSession() {
+    await session.restore();
+    setGatewayMode('full');
+    await session.refreshProfileCatalog();
   }
 
   it('keeps artifact and profile catalogs manual while idle', async () => {
@@ -34,7 +41,7 @@ describe('DownloadsPage profile filter', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
-    await session.restore();
+    await restoreFullSession();
     render(DownloadsPage);
     await flushPromises();
     const profileInitial = requests.filter((url) => url.endsWith('/profiles/local')).length;
@@ -73,7 +80,7 @@ describe('DownloadsPage profile filter', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
-    await session.restore();
+    await restoreFullSession();
     render(DownloadsPage);
     const profilePicker = await screen.findByLabelText('Profile') as HTMLSelectElement;
     await fireEvent.change(profilePicker, { target: { value: 'archive' } });
@@ -141,7 +148,7 @@ describe('DownloadsPage profile filter', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
-    await session.restore();
+    await restoreFullSession();
     render(DownloadsPage);
 
     expect(await screen.findByText('restore-me.json')).toBeTruthy();
@@ -170,7 +177,7 @@ describe('DownloadsPage profile filter', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
-    await session.restore();
+    await restoreFullSession();
     render(DownloadsPage);
 
     const profilePicker = await screen.findByLabelText('Profile') as HTMLSelectElement;
@@ -212,7 +219,7 @@ describe('DownloadsPage profile filter', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
-    await session.restore();
+    await restoreFullSession();
     render(DownloadsPage);
 
     expect(await screen.findByText('Scan terakhir: belum siap')).toBeTruthy();

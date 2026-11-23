@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
 from tme3bot.api.schemas import JobResponse, TtsJobRequest
+from tme3bot.api.activity import track_activity_jobs
 from tme3bot.domain.models import DomainError
 
 _ARTIFACT_REF = re.compile(r"^[a-f0-9]{48}$")
@@ -41,7 +42,7 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
         return {"items": provisioner.store.diagnostic_logs(actor.telegram_user_id, "tts", limit)}
 
     @app.post("/api/v1/tts/jobs", response_model=JobResponse)
-    def submit_tts(body: TtsJobRequest, actor=Depends(current_actor)):
+    def submit_tts(body: TtsJobRequest, request: Request, actor=Depends(current_actor)):
         title = body.title.strip()
         text = body.text.strip()
         if not title:
@@ -63,6 +64,7 @@ def register_tts(app, context, *, current_actor, job_dict, require_internal, req
             worker=body.worker,
             private_job_values={"telegram_tts_chat_id": chat_ref},
         )
+        track_activity_jobs(request, job)
         return job_dict(job)
 
     @app.post("/api/v1/tts/jobs/{job_id}/retry", response_model=JobResponse)

@@ -245,7 +245,24 @@ class TtsExecutorMixin:
                 for item in raw_sender_profiles
                 if str(item).strip()
             ] if isinstance(raw_sender_profiles, list) else []
-            if selected_profile not in sender_profiles:
+            use_worker_inventory = payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+            if use_worker_inventory:
+                list_profiles = getattr(self.profile_manager, "list_profiles", None)
+                local_profiles = list_profiles() if callable(list_profiles) else []
+                sender_profiles = [
+                    str(item).strip().lower()
+                    for item in local_profiles
+                    if str(item).strip()
+                ]
+                sender_profiles = list(dict.fromkeys(sender_profiles))
+                if not sender_profiles:
+                    raise TtsError(
+                        "Worker tidak menemukan profil lokal untuk mengirim TTS melalui TDL.",
+                        code="TTS_PROFILE_UNAVAILABLE",
+                    )
+                if selected_profile not in sender_profiles:
+                    selected_profile = sender_profiles[0]
+            elif selected_profile not in sender_profiles:
                 sender_profiles.insert(0, selected_profile)
             sender_profiles = list(dict.fromkeys(sender_profiles))
             reconcile_delivery = bool(payload.get("_tts_reconcile_delivery"))

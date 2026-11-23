@@ -14,6 +14,7 @@ vi.mock('$lib/api', () => ({
 }));
 
 import BackupsPage from './BackupsPage.svelte';
+import { setGatewayMode } from '$lib/gateway-mode.svelte';
 
 const diagnostic = {
   worker: 'remote-2',
@@ -31,6 +32,7 @@ const diagnostic = {
 describe('BackupsPage TDL diagnosis', () => {
   afterEach(() => {
     cleanup();
+    setGatewayMode('full');
     vi.unstubAllGlobals();
   });
 
@@ -167,5 +169,15 @@ describe('BackupsPage TDL diagnosis', () => {
 
     expect(await screen.findByText(/Job selesai dijalankan, tetapi ekstraksi atau pengujian isi gagal/)).toBeTruthy();
     expect(screen.getAllByText(/BACKUP_ARCHIVE_EXTRACTION_FAILED/).length).toBeGreaterThan(0);
+  });
+
+  it('keeps manual backup and verification visible in Lite while hiding worker archive jobs', async () => {
+    setGatewayMode('lite');
+    render(BackupsPage);
+
+    expect(await screen.findByRole('button', { name: 'Backup sekarang' })).toBeTruthy();
+    expect(screen.getByText(/Jadwal backup otomatis dimatikan pada mode Lite/)).toBeTruthy();
+    await waitFor(() => expect(apiMock.mock.calls.some(([path]) => String(path).includes('kind=backup_verify'))).toBe(true));
+    expect(apiMock.mock.calls.some(([path]) => String(path).includes('kind=backup_node'))).toBe(false);
   });
 });

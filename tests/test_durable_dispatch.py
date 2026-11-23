@@ -1,7 +1,9 @@
 import hashlib
+import sqlite3
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tme3bot.application.control_plane import ControlPlane
@@ -396,6 +398,414 @@ class DurableDispatchTests(unittest.TestCase):
         self.assertEqual(operation.status.value, "queued")
         self.assertEqual(result["status"], "accepted")
         self.assertEqual(len(self.dispatcher.commands), 1)
+
+    def test_lite_requires_an_explicit_enabled_remote_worker_with_fresh_health(self):
+        class Health:
+            def __init__(self, status):
+                self.status = status
+                self.calls = 0
+
+            def snapshot(self, worker):
+                self.calls += 1
+                return {"worker": worker, "status": self.status, "healthy": self.status == "ready"}
+
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health("ready")
+
+        with self.assertRaises(DomainError) as implicit:
+            self.operations.submit(
+                self.actor,
+                kind="job.submit",
+                target={"profile": "default"},
+                input_data={"job_kind": "export", "payload": {"url": "https://t.me/c/100/2"}},
+                idempotency_key="lite-no-explicit-worker",
+            )
+        self.assertEqual(implicit.exception.code, "LITE_REMOTE_WORKER_REQUIRED")
+
+        with self.assertRaises(DomainError) as local:
+            self.submit("export", worker="local")
+        self.assertEqual(local.exception.code, "LITE_REMOTE_WORKER_REQUIRED")
+
+        operation = self.submit("export", worker="remote-2")
+        job = self.jobs.get(operation.job_id)
+        self.assertEqual(job.worker, "remote-2")
+        self.assertEqual(self.control.worker_health_cache.calls, 1)
+        self.assertEqual(self.dispatcher.commands, [])
+
+    def test_lite_rejects_worker_archive_creation_jobs(self):
+        self.control.gateway_mode = "lite"
+
+        with self.assertRaises(DomainError) as raised:
+            self.control.submit_job(
+                self.actor,
+                "backup_node",
+                {"node_name": "remote-2"},
+                profile="default",
+                worker="remote-2",
+            )
+
+        self.assertEqual(raised.exception.code, "LITE_BACKUP_ARCHIVE_JOB_DISABLED")
+        self.assertEqual(self.jobs.count(), 0)
+        self.assertEqual(self.dispatcher.commands, [])
+
+    def test_lite_rejects_unknown_offline_or_stale_worker_health_without_probing(self):
+        class Health:
+            def __init__(self, status):
+                self.status = status
+                self.probes = 0
+
+            def snapshot(self, worker):
+                return {"worker": worker, "status": self.status, "healthy": False}
+
+        self.control.gateway_mode = "lite"
+        for status, expected in (
+            ("unknown", "WORKER_HEALTH_UNKNOWN"),
+            ("stale", "WORKER_HEALTH_STALE"),
+            ("offline", "WORKER_OFFLINE"),
+        ):
+            with self.subTest(status=status):
+                health = Health(status)
+                self.control.worker_health_cache = health
+                with self.assertRaises(DomainError) as raised:
+                    self.submit("export", worker="remote-2")
+                self.assertEqual(raised.exception.code, expected)
+                self.assertEqual(health.probes, 0)
+                self.assertEqual(self.dispatcher.commands, [])
+
+    def test_lite_worker_ack_timeout_counts_only_wait_for_dispatch_ack(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [
+            OSError("unreachable"), OSError("still unreachable"),
+            OSError("still unreachable at deadline"),
+        ]
+
+        first = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(first, {"status": "wait", "reason": "not_ready"})
+        command = self.jobs.command_payload(operation.job_id)
+        self.assertEqual(command["worker_ack_wait_started_at"], now[0].isoformat())
+
+        now[0] += timedelta(seconds=599)
+        self.assertEqual(
+            self.control.advance_durable_job(self.queue_command(operation))["status"],
+            "wait",
+        )
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+
+        now[0] += timedelta(seconds=1)
+        final = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(final, {"status": "terminal", "reason": "worker_ack_timeout"})
+        job = self.jobs.get(operation.job_id)
+        self.assertEqual(job.status, JobStatus.FAILED)
+        event = self.jobs.events(job.id)[-1]
+        self.assertEqual(event.error["code"], "WORKER_ACK_TIMEOUT")
+
+    def test_lite_retries_same_command_if_worker_recovers_at_ack_deadline(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [OSError("unreachable")]
+
+        self.assertEqual(
+            self.control.advance_durable_job(self.queue_command(operation))["status"],
+            "wait",
+        )
+        original_command_id = self.jobs.command_payload(operation.job_id)["command_id"]
+        now[0] += timedelta(seconds=600)
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result["status"], "accepted")
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.DISPATCHED)
+        self.assertEqual(self.dispatcher.commands[-1][1]["command_id"], original_command_id)
+        self.assertNotIn(
+            "worker_ack_wait_started_at", self.jobs.command_payload(operation.job_id)
+        )
+
+    def test_lite_worker_contract_mismatch_does_not_consume_ack_timeout(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [OSError("unreachable")]
+        self.control.advance_durable_job(self.queue_command(operation))
+        now[0] += timedelta(minutes=11)
+        self.dispatcher.capabilities = lambda _worker: {
+            "contract_version": WORKER_API_CONTRACT_VERSION,
+            "capabilities": [],
+        }
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result, {"status": "wait", "reason": "not_ready"})
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+        self.assertNotIn(
+            "worker_ack_wait_started_at", self.jobs.command_payload(operation.job_id)
+        )
+
+    def test_lite_worker_http_rejection_fails_without_connectivity_timeout(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [
+            JsonHttpError(401, "unauthorized", kind="response")
+        ]
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result, {"status": "terminal", "reason": "worker_rejected"})
+        job = self.jobs.get(operation.job_id)
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(self.jobs.events(job.id)[-1].error["code"], "WORKER_REJECTED_COMMAND")
+        self.assertNotIn("worker_ack_wait_started_at", self.jobs.command_payload(job.id))
+
+    def test_lite_worker_5xx_response_starts_ack_timeout(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        now = datetime(2026, 11, 22, tzinfo=timezone.utc)
+        self.control._clock = lambda: now
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [
+            JsonHttpError(503, "worker responded unavailable", kind="response")
+        ]
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result, {"status": "wait", "reason": "not_ready"})
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+        self.assertEqual(
+            self.jobs.command_payload(operation.job_id)["worker_ack_wait_started_at"],
+            self.control._clock().isoformat(),
+        )
+
+    def _assert_lite_transient_http_response_starts_ack_timeout(self, status_code):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [
+            JsonHttpError(status_code, "temporary worker response", kind="response")
+        ]
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(result, {"status": "wait", "reason": "not_ready"})
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+        self.assertTrue(
+            self.jobs.command_payload(operation.job_id).get("worker_ack_wait_started_at")
+        )
+
+    def test_lite_http_408_starts_ack_timeout(self):
+        self._assert_lite_transient_http_response_starts_ack_timeout(408)
+
+    def test_lite_http_425_starts_ack_timeout(self):
+        self._assert_lite_transient_http_response_starts_ack_timeout(425)
+
+    def test_lite_http_429_starts_ack_timeout(self):
+        self._assert_lite_transient_http_response_starts_ack_timeout(429)
+
+    def test_lite_tts_prepare_does_not_probe_capabilities_for_sender_inventory(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        capability_calls = []
+        original_capabilities = self.dispatcher.capabilities
+        self.dispatcher.capabilities = lambda worker: capability_calls.append(worker) or original_capabilities(worker)
+
+        operation = self.submit("tts", {"title": "Narasi", "text": "teks privat"}, worker="remote-2")
+
+        self.assertEqual(operation.status.value, "queued")
+        self.assertEqual(capability_calls, [])
+        command = self.jobs.command_payload(operation.job_id)
+        self.assertEqual(command["payload"]["_tdl_sender_profiles"], ["default"])
+        self.assertTrue(command["payload"]["_tdl_sender_profiles_use_worker_inventory"])
+
+    def test_lite_worker_5xx_ack_timeout_does_not_reroute(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        error = JsonHttpError(503, "worker unavailable", kind="response")
+        self.dispatcher.dispatch_results = [error, error]
+
+        first = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(first, {"status": "wait", "reason": "not_ready"})
+        now[0] += timedelta(minutes=10)
+        final = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(final, {"status": "terminal", "reason": "worker_ack_timeout"})
+        self.assertEqual(self.jobs.get(operation.job_id).worker, "remote-2")
+
+    def test_lite_unacknowledged_worker_response_starts_ack_timeout(self):
+        from tme3bot.infrastructure.http_client import JsonHttpError
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        unacknowledged = JsonHttpError(
+            503, "Worker belum mengonfirmasi penerimaan command.", kind="no_ack"
+        )
+        self.dispatcher.dispatch_results = [unacknowledged, unacknowledged]
+
+        first = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(first, {"status": "wait", "reason": "not_ready"})
+        self.assertEqual(
+            self.jobs.command_payload(operation.job_id)["worker_ack_wait_started_at"],
+            now[0].isoformat(),
+        )
+
+        now[0] += timedelta(minutes=10)
+        final = self.control.advance_durable_job(self.queue_command(operation))
+
+        self.assertEqual(final, {"status": "terminal", "reason": "worker_ack_timeout"})
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.FAILED)
+        self.assertEqual(
+            self.jobs.events(operation.job_id)[-1].error["code"], "WORKER_ACK_TIMEOUT"
+        )
+
+    def test_lite_retry_resets_prior_worker_ack_deadline(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        self.dispatcher.dispatch_results = [OSError("offline")]
+        self.control.advance_durable_job(self.queue_command(operation))
+        old_started_at = self.jobs.command_payload(operation.job_id)["worker_ack_wait_started_at"]
+        now[0] += timedelta(minutes=10)
+        self.control._expire_worker_ack_wait(self.jobs.get(operation.job_id))
+        retried, _created = self.operations.retry(self.actor, operation.id, "retry-after-ack-timeout")
+        self.dispatcher.dispatch_results = [OSError("offline again")]
+
+        result = self.control.advance_durable_job(self.queue_command(retried))
+
+        self.assertEqual(result, {"status": "wait", "reason": "not_ready"})
+        new_started_at = self.jobs.command_payload(operation.job_id)["worker_ack_wait_started_at"]
+        self.assertNotEqual(new_started_at, old_started_at)
+        self.assertEqual(new_started_at, now[0].isoformat())
+
+    def test_worker_ack_marker_updates_preserve_concurrent_command_flags(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        job = self.jobs.get(operation.job_id)
+        stale_payload = self.jobs.command_payload(job.id)
+        self.jobs.update_command_payload_fields(
+            job.id, set_values={"cancel_before_dispatch": True}
+        )
+
+        self.assertFalse(self.control._wait_for_worker_ack(job, stale_payload))
+        current = self.jobs.command_payload(job.id)
+        self.assertTrue(current["cancel_before_dispatch"])
+        self.control._clear_worker_ack_wait(job.id, stale_payload)
+        current = self.jobs.command_payload(job.id)
+        self.assertTrue(current["cancel_before_dispatch"])
+        self.assertNotIn("worker_ack_wait_started_at", current)
+
+    def test_command_payload_field_update_skips_unchanged_sqlite_write(self):
+        operation = self.submit("export", worker="remote-2")
+        with sqlite3.connect(self.db_file) as db:
+            db.execute("CREATE TABLE command_payload_update_audit (job_id TEXT)")
+            db.execute(
+                """CREATE TRIGGER audit_command_payload_update
+                   AFTER UPDATE OF payload ON job_commands
+                   BEGIN INSERT INTO command_payload_update_audit VALUES (NEW.job_id); END"""
+            )
+
+        self.jobs.update_command_payload_fields(
+            operation.job_id, remove=("worker_ack_wait_started_at",)
+        )
+        with sqlite3.connect(self.db_file) as db:
+            self.assertEqual(
+                db.execute("SELECT COUNT(*) FROM command_payload_update_audit").fetchone()[0],
+                0,
+            )
+
+    def test_lite_lane_queue_wait_does_not_start_worker_ack_timer(self):
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        now = [datetime(2026, 11, 22, tzinfo=timezone.utc)]
+        self.control.gateway_mode = "lite"
+        self.control.worker_health_cache = Health()
+        self.control._clock = lambda: now[0]
+        operation = self.submit("export", worker="remote-2")
+        acquire = self.jobs.try_acquire_execution
+        self.jobs.try_acquire_execution = lambda _job: {
+            "admitted": False, "position": 2, "blocked_reason": "busy"
+        }
+
+        result = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(result, {"status": "wait", "reason": "not_ready"})
+        self.assertNotIn("worker_ack_wait_started_at", self.jobs.command_payload(operation.job_id))
+
+        now[0] += timedelta(minutes=11)
+        result = self.control.advance_durable_job(self.queue_command(operation))
+        self.assertEqual(result["status"], "wait")
+        self.assertEqual(self.jobs.get(operation.job_id).status, JobStatus.QUEUED)
+        self.jobs.try_acquire_execution = acquire
 
     def test_storage_download_dispatch_requires_worker_feature_capabilities(self):
         destination = "googledrive:backup"

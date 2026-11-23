@@ -3,13 +3,15 @@
   import { fade, fly } from 'svelte/transition';
   import { page } from '$app/state';
   import { session } from '$lib/session.svelte';
+  import { api } from '$lib/api';
+  import { gatewayMode, setGatewayMode } from '$lib/gateway-mode.svelte';
   import { profileOptionLabel } from '$lib/profile-catalog';
   import Login from './Login.svelte';
   import RequestIndicator from './RequestIndicator.svelte';
   import {
     Activity, Archive, Boxes, ChevronLeft, ChevronRight, Code2, Download, FileDown,
     HardDrive, KeyRound, LayoutDashboard, LogOut, Menu, MessageCircle, Moon,
-    Monitor, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, X, Zap
+    Monitor, RefreshCw, Server, Settings, Sun, UserRoundPlus, Users, Volume2, Wrench, X, Zap
   } from '@lucide/svelte';
 
   let { children } = $props();
@@ -54,6 +56,33 @@
   let themeMenuElement: HTMLDivElement | null = $state(null);
   let accountMenuElement: HTMLDivElement | null = $state(null);
   let motionDuration = $state(220);
+  let gatewayModeRequested = false;
+  let gatewayModeLoading = $state(false);
+  let gatewayModeFailed = $state(false);
+
+  $effect(() => {
+    if (session.loading || !session.current.authenticated || $gatewayMode !== null) return;
+    void reloadGatewayMode();
+  });
+
+  async function reloadGatewayMode() {
+    if (gatewayModeRequested) return;
+    gatewayModeRequested = true;
+    gatewayModeLoading = true;
+    gatewayModeFailed = false;
+    try {
+      const response = await api<{ mode?: string }>('/runtime/mode');
+      if (response.mode !== 'full' && response.mode !== 'lite') throw new Error('Gateway mode response is invalid.');
+      setGatewayMode(response.mode);
+      if (response.mode === 'full') await session.refreshProfileCatalog();
+    } catch {
+      setGatewayMode(null);
+      gatewayModeFailed = true;
+    } finally {
+      gatewayModeLoading = false;
+      gatewayModeRequested = false;
+    }
+  }
 
   const active = (href: string) => href === '/' ? page.url.pathname === '/' : page.url.pathname === href || page.url.pathname.startsWith(href);
   const titleForPath = (pathname: string) => {
@@ -197,6 +226,16 @@
   </main>
 {:else if !session.current.authenticated}
   <Login />
+{:else if $gatewayMode === null}
+  <main class="boot-screen" id="main-content">
+    <section class="boot-card" role="alert">
+      <div class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></div>
+      <p class="eyebrow">TME3BOT · GATEWAY</p>
+      <h1>{gatewayModeLoading ? 'Memeriksa mode gateway' : 'Mode gateway belum terkonfirmasi'}</h1>
+      <p class="muted">{gatewayModeLoading ? 'Halaman operasi menunggu status gateway agar tidak memuat layanan yang keliru.' : gatewayModeFailed ? 'Status mode tidak dapat dimuat. Coba lagi untuk membuka konsol setelah gateway merespons.' : 'Menunggu status gateway sebelum memuat konsol.'}</p>
+      {#if !gatewayModeLoading}<button class="button secondary mt-4" type="button" onclick={reloadGatewayMode}><RefreshCw size={15}/>Coba lagi</button>{/if}
+    </section>
+  </main>
 {:else}
   <div class="application" class:sidebar-is-collapsed={collapsed}>
     <aside class="app-sidebar" aria-label="Navigasi utama">

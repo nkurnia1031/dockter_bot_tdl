@@ -1,0 +1,21 @@
+---
+status: accepted
+---
+
+# Mode Gateway Lite untuk host berkapasitas rendah
+
+`GATEWAY_MODE=full` menjadi default; `GATEWAY_MODE=lite` dipilih eksplisit lewat konfigurasi deploy dan perubahan mode memerlukan restart. Full mempertahankan stack gateway saat ini. Lite memakai bundle Svelte static yang sama dan membaca mode dari gateway; ia mempertahankan backend, Redis/RQ, dan penerima bot khusus persetujuan login Web, serta tidak menjalankan worker-local, Aria2, atau helper TTS lokal. Bot login Lite dan frontend Telegram penuh tidak boleh mem-poll token yang sama bersamaan; backend tetap memakai Telegram Bot API untuk operasi profil dan Storage.
+
+Lite mendukung operasi yang tersedia pada worker remote, tanpa fallback otomatis ke local atau worker lain. Probe health worker berjalan di background tiap 30 detik; submit menolak target offline, belum diketahui, atau snapshot lebih lama dari 60 detik. Jika job telah diterima gateway tetapi worker belum mengakui command setelah 10 menit menunggu worker, job gagal; timer berhenti setelah acknowledgement dan tidak membatasi job yang sudah diterima worker. Job tidak dialihkan otomatis.
+
+Submit Lite tidak melakukan RPC sinkron untuk mengambil inventaris profil TDL. TTS, upload/reconcile Storage, dan verifikasi akses TDL menyerahkan pemilihan/penemuan sesi ke worker saat command berjalan; rekonsiliasi memakai profil worker saat ini, bukan snapshot sender dari job lama. Readiness tetap berupa informasi UI dan bukan gate submit. GET status verifikasi TDL hanya membaca bukti dan inventaris scan yang tersimpan untuk worker remote, tanpa probe langsung.
+
+Pergantian `full` ke `lite` ditolak selama ada job local yang queued, running, atau perlu rekonsiliasi. Route profil tidak diubah otomatis; target remote harus dipilih secara eksplisit. Container worker-local berhenti, tetapi database, profil, sesi, dan data Workspace tetap tersedia untuk rollback. Worker lokal dan route local tidak ikut tampil sebagai target yang bisa dipakai di Lite.
+
+UI Lite menampilkan status queued/running/terminal dan report akhir per file, memperbarui status setiap 10 detik hanya saat ada job aktif dan halaman terlihat, lalu berhenti saat idle atau tersembunyi. Lite tidak memuat log mentah atau progress stream; Mode Normal mempertahankan antarmuka penuh. Loop internal Lite dibangunkan oleh job/perubahan dan tetap menjalankan recovery berkala sekitar 30 detik. Jadwal backup gateway otomatis dimatikan; backup gateway manual serta verifikasi dan diagnosis worker tetap tersedia.
+
+## Retensi riwayat job dan audit
+
+Mode Normal dan Lite mempertahankan 20 job terminal terbaru secara global, diurutkan menurut waktu terakhir job menjadi terminal. Job aktif, queued, dan yang masih memerlukan rekonsiliasi dikecualikan. Job yang keluar dari batas menghapus report, event, progres, dan detail command/per-file di worker setelah hasil terminal diterima gateway dan rekonsiliasi selesai. Worker mempertahankan tombstone command minimal untuk mencegah replay ganda. Katalog Storage, file Workspace, profil, sesi, dan data operasional lain tidak ikut terpangkas.
+
+Request API ditautkan ke job yang dibuat atau dioperasikan; audit hanya dipertahankan untuk job dalam batas retensi dan job aktif. Request umum seperti polling/list/auth yang tidak terkait job dibuang; aktivitas operasi disimpan sampai terminal. Setelah purge, database SQLite dikompak hanya ketika job dan writer idle serta ruang kosong melewati ambang, bukan pada jalur request atau penyelesaian setiap job.

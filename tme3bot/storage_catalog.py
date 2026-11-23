@@ -92,6 +92,7 @@ class StorageCatalog:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self._lock = threading.RLock()
+        self._caption_notifier = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -1307,6 +1308,13 @@ class StorageCatalog:
                updated_at=excluded.updated_at""",
             (item_id, caption, now, now),
         )
+        notifier = self._caption_notifier
+        if callable(notifier):
+            notifier()
+
+    def set_caption_notifier(self, notifier) -> None:
+        """Wake caption maintenance after a durable caption task is queued."""
+        self._caption_notifier = notifier if callable(notifier) else None
 
     def enqueue_caption(self, item_id: int, caption: str) -> None:
         with self._lock, self._db() as db:

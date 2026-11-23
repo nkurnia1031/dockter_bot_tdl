@@ -54,6 +54,248 @@ class WorkerCommandStoreTests(unittest.TestCase):
         self.assertNotIn("dispatch-secret", str(second))
         self.assertNotIn("payload-secret", str(second))
 
+    def _append_and_ack_terminal_command(
+        self, envelope, *, status="succeeded", result=None, progress=None
+    ):
+        job_id = envelope["job_id"]
+        command_id = envelope["command_id"]
+        self.store.set_status(command_id, "running", only_from=("accepted",))
+        sequence = self.store.append_event(
+            job_id,
+            {
+                "status": status,
+                "event_type": "command.completed",
+                "command_id": command_id,
+                "attempt": envelope["attempt"],
+                "dispatch_token": envelope["dispatch_token"],
+                "result": result,
+                "progress": progress or {},
+            },
+            transient=False,
+        )
+        event = self.store.claim_event()
+        self.assertEqual(event[2], sequence)
+        self.assertTrue(
+            self.store.acknowledge_event(event[0], event[4], accepted=True)
+        )
+
+    def test_acknowledged_terminal_job_compacts_details_but_keeps_replay_tombstone(self):
+        envelope = job_envelope("compact-command", "compact-job")
+        envelope["job"]["kind"] = "storage_upload"
+        self.store.accept(envelope)
+        self.store.record_storage_upload_item(
+            "compact-command", "done.bin", file_name="done.bin",
+            status="succeeded", attempt=1, message_id=77,
+            result_item={"path": "done.bin", "status": "succeeded"},
+        )
+
+        self._append_and_ack_terminal_command(
+            envelope,
+            result={"value": {"items": [{"path": "done.bin", "status": "succeeded"}]}},
+        )
+
+        status = self.store.get("compact-command")
+        self.assertEqual(status["status"], "succeeded")
+        self.assertEqual(status["phase"], "terminal_tombstone")
+        self.assertIsNone(status["checkpoint"])
+        self.assertIsNone(status["ack"])
+        self.assertEqual(self.store.storage_upload_items("compact-command"), [])
+        self.assertIsNone(self.store.storage_upload_items_for_job("compact-job"))
+        with self.store._db() as db:
+            self.assertIsNone(db.execute(
+                "SELECT 1 FROM worker_event_outbox "
+                "WHERE json_extract(event_json,'$.command_id')='compact-command'"
+            ).fetchone())
+
+        replay, replayed = self.store.accept(envelope)
+        self.assertTrue(replayed)
+        self.assertEqual(replay["status"], "succeeded")
+        self.assertIsNone(self.store.claim_next())
+        changed_payload = job_envelope("compact-command", "compact-job")
+        changed_payload["job"]["kind"] = "storage_upload"
+        changed_payload["job"]["payload"]["url"] = "https://t.me/c/1/99"
+        with self.assertRaises(DomainError) as conflict:
+            self.store.accept(changed_payload)
+        self.assertEqual(conflict.exception.code, "COMMAND_ID_CONFLICT")
+        conflicting_attempt = job_envelope("new-command-same-attempt", "compact-job")
+        with self.assertRaises(DomainError) as conflict:
+            self.store.accept(conflicting_attempt)
+        self.assertEqual(conflict.exception.code, "COMMAND_ATTEMPT_CONFLICT")
+
+    def test_storage_detail_survives_ambiguous_terminal_until_final_reconciliation_ack(self):
+        source = job_envelope("source-command", "source-job")
+        source["job"]["kind"] = "storage_upload"
+        self.store.accept(source)
+        self.store.record_storage_upload_item(
+            "source-command", "ambiguous.bin", file_name="ambiguous.bin",
+            status="needs_reconciliation", attempt=1, retryable=False,
+            result_item={"path": "ambiguous.bin", "status": "needs_reconciliation"},
+        )
+        self._append_and_ack_terminal_command(
+            source,
+            status="failed",
+            result={"value": {"items": [{"path": "ambiguous.bin", "status": "needs_reconciliation"}]}},
+            progress={"reconciliation_required": True},
+        )
+        self.assertIsNotNone(self.store.get("source-command"))
+        self.assertEqual(
+            self.store.storage_upload_items("source-command")[0]["status"],
+            "needs_reconciliation",
+        )
+
+        reconcile = job_envelope("reconcile-command", "reconcile-job", attempt=1)
+        reconcile["job"]["kind"] = "storage_reconcile"
+        reconcile["job"]["payload"] = {
+            "source_job_id": "source-job",
+            "_storage_reconcile_final_for_source": True,
+            "_storage_reconcile_items": [{"index": 0, "name": "ambiguous.bin"}],
+        }
+        self.store.accept(reconcile)
+        self._append_and_ack_terminal_command(
+            reconcile,
+            result={"value": {
+                "source_job_id": "source-job",
+                "items": [{
+                    "index": 0, "name": "ambiguous.bin", "status": "failed",
+                    "match_count": 0, "retryable": True,
+                }],
+            }},
+        )
+
+        self.assertEqual(self.store.get("source-command")["status"], "failed")
+        self.assertEqual(self.store.get("reconcile-command")["status"], "succeeded")
+        self.assertIsNone(self.store.storage_upload_items_for_job("source-job"))
+
+    def test_incomplete_final_reconciliation_keeps_source_details(self):
+        source = job_envelope("incomplete-source-command", "incomplete-source-job")
+        source["job"]["kind"] = "storage_upload"
+        self.store.accept(source)
+        self.store.record_storage_upload_item(
+            "incomplete-source-command", "still-ambiguous.bin",
+            file_name="still-ambiguous.bin", status="needs_reconciliation",
+            attempt=1, retryable=False,
+            result_item={"path": "still-ambiguous.bin", "status": "needs_reconciliation"},
+        )
+        self._append_and_ack_terminal_command(
+            source,
+            status="failed",
+            result={"value": {"items": [{"path": "still-ambiguous.bin", "status": "needs_reconciliation"}]}},
+            progress={"reconciliation_required": True},
+        )
+
+        reconcile = job_envelope("incomplete-reconcile-command", "incomplete-reconcile-job")
+        reconcile["job"]["kind"] = "storage_reconcile"
+        reconcile["job"]["payload"] = {
+            "source_job_id": "incomplete-source-job",
+            "_storage_reconcile_final_for_source": True,
+            "_storage_reconcile_items": [{"index": 0, "name": "still-ambiguous.bin"}],
+        }
+        self.store.accept(reconcile)
+        self._append_and_ack_terminal_command(
+            reconcile,
+            result={"value": {"source_job_id": "incomplete-source-job", "items": []}},
+        )
+
+        self.assertEqual(
+            self.store.storage_upload_items_for_job("incomplete-source-job")["items"][0]["status"],
+            "needs_reconciliation",
+        )
+
+    def test_final_reconciliation_rejects_mismatched_name_or_unsafe_absence(self):
+        cases = [
+            (
+                "wrong-name", "telegram", {"index": 0, "name": "expected.bin"},
+                {"index": 0, "name": "other.bin", "status": "failed", "match_count": 0, "retryable": True},
+            ),
+            (
+                "unsafe-absence", "telegram", {"index": 0, "name": "expected.bin"},
+                {"index": 0, "name": "expected.bin", "status": "failed", "match_count": 0, "retryable": False},
+            ),
+            (
+                "wrong-rclone-target", "rclone",
+                {"index": 0, "name": "expected.bin", "target_path": "remote/expected.bin"},
+                {"index": 0, "name": "expected.bin", "target_path": "remote/other.bin", "status": "succeeded", "match_count": 1, "retryable": False},
+            ),
+        ]
+        for suffix, provider, requested_item, evidence in cases:
+            with self.subTest(suffix=suffix):
+                source_job_id = f"{suffix}-source-job"
+                source = job_envelope(f"{suffix}-source-command", source_job_id)
+                source["operation_id"] = f"{suffix}-source-operation"
+                source["job"]["kind"] = "storage_upload"
+                source["job"]["payload"] = {"provider": provider}
+                self.store.accept(source)
+                uploaded_item = {
+                    "path": "expected.bin", "name": "expected.bin",
+                    "status": "needs_reconciliation", "provider": provider,
+                }
+                if provider == "rclone":
+                    uploaded_item.update(
+                        target_path="remote/expected.bin",
+                        source_identity={"device": 1, "inode": 2, "size": 3, "mtime_ns": 4},
+                    )
+                self.store.record_storage_upload_item(
+                    source["command_id"], "expected.bin", file_name="expected.bin",
+                    status="needs_reconciliation", attempt=1, retryable=False,
+                    result_item=uploaded_item,
+                )
+                self._append_and_ack_terminal_command(
+                    source,
+                    status="failed",
+                    result={"value": {"items": [uploaded_item]}},
+                    progress={"reconciliation_required": True},
+                )
+
+                reconcile = job_envelope(f"{suffix}-reconcile-command", f"{suffix}-reconcile-job")
+                reconcile["operation_id"] = f"{suffix}-reconcile-operation"
+                reconcile["job"]["kind"] = "storage_reconcile"
+                reconcile["job"]["payload"] = {
+                    "source_job_id": source_job_id,
+                    "_storage_reconcile_final_for_source": True,
+                    "_storage_reconcile_items": [requested_item],
+                }
+                self.store.accept(reconcile)
+                self._append_and_ack_terminal_command(
+                    reconcile,
+                    result={"value": {
+                        "source_job_id": source_job_id,
+                        "items": [evidence],
+                    }},
+                )
+
+                self.assertIsNotNone(self.store.storage_upload_items_for_job(source_job_id))
+
+    def test_rejected_terminal_event_ack_keeps_worker_details(self):
+        envelope = job_envelope("rejected-ack-command", "rejected-ack-job")
+        envelope["job"]["kind"] = "storage_upload"
+        self.store.accept(envelope)
+        self.store.record_storage_upload_item(
+            "rejected-ack-command", "unconfirmed.bin", file_name="unconfirmed.bin",
+            status="succeeded", attempt=1,
+            result_item={"path": "unconfirmed.bin", "status": "succeeded"},
+        )
+        self.store.set_status("rejected-ack-command", "running", only_from=("accepted",))
+        self.store.append_event(
+            "rejected-ack-job",
+            {
+                "status": "succeeded",
+                "event_type": "command.completed",
+                "command_id": "rejected-ack-command",
+                "attempt": 1,
+                "dispatch_token": "dispatch-secret",
+                "result": {"items": [{"path": "unconfirmed.bin", "status": "succeeded"}]},
+            },
+            transient=False,
+        )
+        event = self.store.claim_event()
+
+        self.assertTrue(
+            self.store.acknowledge_event(event[0], event[4], accepted=False, reason="gateway rejected")
+        )
+
+        self.assertEqual(self.store.get("rejected-ack-command")["status"], "running")
+        self.assertEqual(len(self.store.storage_upload_items("rejected-ack-command")), 1)
+
     def test_command_id_and_job_attempt_conflicts_are_rejected(self):
         self.store.accept(job_envelope())
         changed = job_envelope()

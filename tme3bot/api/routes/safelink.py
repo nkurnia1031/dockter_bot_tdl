@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import Depends, Header, Request, Response
 
+from tme3bot.api.activity import track_activity_operation
 from tme3bot.api.schemas import SafelinkJobRequest
 from tme3bot.domain.models import DomainError
 
@@ -52,7 +53,7 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
-        request.state.activity_operation_id = operation.id
+        track_activity_operation(request, operation)
         job = context.control_plane.jobs.get(str(operation.job_id or ""))
         if job is None:
             raise DomainError("JOB_NOT_FOUND", "Job resolver tidak ditemukan setelah diterima.", status_code=500)
@@ -64,6 +65,7 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
     @app.post("/api/v1/safelink/jobs/{job_id}/cancel", status_code=202)
     def cancel_safelink_job(
         job_id: str,
+        request: Request,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
     ):
@@ -77,12 +79,14 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
         operation = store.get_by_job_id(job.id) if callable(getattr(store, "get_by_job_id", None)) else None
         if operation is None or operations is None:
             raise DomainError("OPERATION_NOT_FOUND", "Operation resolver tidak tersedia untuk pembatalan.", status_code=409)
-        operations.cancel(actor, operation.id, idempotency_key)
+        cancelled, _ = operations.cancel(actor, operation.id, idempotency_key)
+        track_activity_operation(request, cancelled)
         return job_dict(context.control_plane.jobs.get(job.id) or job)
 
     @app.post("/api/v1/safelink/jobs/{job_id}/retry", status_code=202)
     def retry_safelink_job(
         job_id: str,
+        request: Request,
         response: Response,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
@@ -97,5 +101,6 @@ def register_safelink(app, context, *, current_actor, job_dict) -> None:
         if operation is None or operations is None:
             raise DomainError("OPERATION_NOT_FOUND", "Operation resolver tidak tersedia untuk retry.", status_code=409)
         retried, _ = operations.retry(actor, operation.id, idempotency_key)
+        track_activity_operation(request, retried)
         response.headers["X-Operation-ID"] = retried.id
         return job_dict(context.control_plane.jobs.get(job.id) or job)

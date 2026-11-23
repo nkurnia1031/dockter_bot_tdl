@@ -2,10 +2,24 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Request
+from tme3bot.api.activity import track_activity_jobs
 from tme3bot.api.schemas import JobEventListResponse, JobListResponse, JobResponse, ObjectResponse, WorkerEventRequest
 from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus, utc_now
+from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
+
+
+def _worker_names_for_context(context, selected=None):
+    registry = context.worker_registry
+    records = registry.list() if registry is not None else {}
+    if selected is not None:
+        requested = {str(name) for name in selected}
+        records = {name: item for name, item in records.items() if name in requested}
+    mode = getattr(context.control_plane, "gateway_mode", "full")
+    return worker_names_for_mode(
+        records, mode, local_urls=worker_local_urls(context.config)
+    )
 from typing import Any
 
 def register_jobs(app, context, *, _newest_first_log_response, _owned_job, current_actor, event_dict, job_dict, require_internal, require_service):
@@ -87,6 +101,7 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
         worker: str | None = None,
         actor=Depends(current_actor),
     ):
+        registry = getattr(context, "worker_registry", None)
         selected_profile = (
             context.control_plane.require_profile(actor, profile)
             if profile
@@ -94,8 +109,7 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
             if scope == "global"
             else context.control_plane.require_profile(actor, None)
         )
-        registry = context.worker_registry.list() if context.worker_registry is not None else {}
-        worker_names = sorted(registry)
+        worker_names = sorted(_worker_names_for_context(context))
         if worker:
             worker_names = [name for name in worker_names if name == worker]
         snapshot = context.control_plane.jobs.monitor_metrics(
@@ -122,7 +136,8 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
                     "last_seen_at": None,
                 },
             )
-            record = registry.get(name) or {}
+            record = registry.get(name) if registry is not None else None
+            record = record if isinstance(record, dict) else {}
             item["enabled"] = bool(record.get("enabled", True))
             active_count = int(item["dispatched_jobs"]) + int(item["running_jobs"])
             last_seen = item.get("last_seen_at")
@@ -210,7 +225,7 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
         items: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         dispatcher = context.worker_dispatcher
-        worker_names = context.worker_registry.names() if context.worker_registry is not None else []
+        worker_names = _worker_names_for_context(context)
         scanner = getattr(dispatcher, "quickmode_scan", None) if dispatcher is not None else None
         for worker in worker_names:
             try:
@@ -363,13 +378,13 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
     @app.get("/api/v1/quick-mode/limits", response_model=ObjectResponse)
     def quick_mode_limits(actor=Depends(current_actor)):
         del actor
-        workers = context.worker_registry.names() if context.worker_registry is not None else []
+        workers = _worker_names_for_context(context)
         return {"items": context.control_plane.jobs.quickmode_limits(workers)}
 
     @app.put("/api/v1/quick-mode/limits/{worker}", response_model=ObjectResponse)
     def update_quick_mode_limit(worker: str, body: dict[str, Any], actor=Depends(current_actor)):
         del actor
-        names = context.worker_registry.names() if context.worker_registry is not None else []
+        names = _worker_names_for_context(context)
         if worker not in names:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
         try:
@@ -382,7 +397,7 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
         return item
 
     @app.post("/api/v1/quick-mode/recover", response_model=ObjectResponse)
-    def recover_quick_mode(body: dict[str, Any], actor=Depends(current_actor)):
+    def recover_quick_mode(body: dict[str, Any], request: Request, actor=Depends(current_actor)):
         worker = str(body.get("worker") or "").strip().lower()
         stage_id = str(body.get("stage_job_id") or "").strip()
         resume_phase = str(body.get("resume_phase") or "").strip().lower() or None
@@ -422,17 +437,14 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
                     details={"job_id": linked.id, "message": f"Folder Quick Mode sedang diproses oleh job #{linked.id[:8]}."},
                     status_code=409,
                 )
-            return {
-                "job": job_dict(
-                    context.control_plane.retry_job(
-                        actor,
-                        linked.id,
-                        resume_phase=resume_phase,
-                        single_phase=bool(body.get("single_phase")),
-                    )
-                ),
-                "imported": False,
-            }
+            retried = context.control_plane.retry_job(
+                actor,
+                linked.id,
+                resume_phase=resume_phase,
+                single_phase=bool(body.get("single_phase")),
+            )
+            track_activity_jobs(request, retried)
+            return {"job": job_dict(retried), "imported": False}
 
         scanner = getattr(context.worker_dispatcher, "quickmode_scan", None)
         try:
@@ -494,6 +506,7 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
             profile=profile,
             worker=worker,
         )
+        track_activity_jobs(request, job)
         return {"job": job_dict(job), "imported": True}
 
     @app.post(
@@ -629,6 +642,7 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
 
     @app.post("/api/v1/jobs/terminate-active", response_model=ObjectResponse)
     def terminate_active_jobs(
+        request: Request,
         scope: str = Query("current", pattern="^(current|global)$"),
         profile: str | None = None,
         kind: str | None = None,
@@ -636,6 +650,23 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
         actor=Depends(current_actor),
     ):
         selected_profile = None if scope == "global" else profile
+        active_jobs = []
+        for status in (
+            JobStatus.QUEUED.value,
+            JobStatus.DISPATCHED.value,
+            JobStatus.RUNNING.value,
+            JobStatus.PAUSED.value,
+        ):
+            active_jobs.extend(context.control_plane.jobs.list(
+                profile=selected_profile,
+                kind=kind,
+                quick_mode=quick_mode,
+                status=status,
+                archived=False,
+                offset=0,
+                limit=200,
+            ))
+        track_activity_jobs(request, active_jobs)
         return context.control_plane.terminate_active_jobs(
             actor,
             profile=selected_profile,
@@ -729,4 +760,15 @@ def register_jobs(app, context, *, _newest_first_log_response, _owned_job, curre
             before = len(context.control_plane.jobs.events(job_id))
             job = context.control_plane.append_worker_event(event)
             accepted = len(context.control_plane.jobs.events(job_id)) > before
+        if (
+            accepted
+            and not body.transient
+            and context.storage_maintenance is not None
+            and current.kind in {"storage_upload", "storage_sync"}
+            and (
+                status.terminal
+                or body.event_type in {"storage.item_uploaded", "storage.recovery_batch"}
+            )
+        ):
+            context.storage_maintenance.wake()
         return {"ok": True, "accepted": bool(accepted), "job": job_dict(job)}

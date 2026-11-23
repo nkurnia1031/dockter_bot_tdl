@@ -243,3 +243,13 @@ _Avoid_: keluar dari root pilihan, menimpa file berbeda ukuran.
 **Job konversi media**:
 Job Utility untuk memproses video dan gambar dari folder Workspace terpilih. Activity merangkum jumlah video dan gambar yang berjalan, berhasil, atau gagal serta alasan file dilewati. Sumber dipertahankan jika estimasi penghematan video tidak melewati ambang atau hasil `_recode` sudah tersedia; selain itu sumber dihapus setelah hasil terverifikasi. Pembatalan mempertahankan sumber untuk file aktif dan belum diproses.
 _Avoid_: proses konversi shell yang tidak tercatat sebagai job aplikasi.
+
+## Gateway
+
+**Gateway Normal**:
+Mode operasional TME3Bot dengan pengalaman pengelolaan dan pemantauan penuh.
+_Avoid_: Gateway Lite.
+
+**Gateway Lite**:
+Mode operasional TME3Bot untuk host berkapasitas rendah yang berfokus menerima pekerjaan, mengarahkannya ke worker remote, dan menyajikan status serta hasil akhirnya.
+_Avoid_: Gateway Normal.

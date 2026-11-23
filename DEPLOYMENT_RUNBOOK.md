@@ -1,19 +1,28 @@
 # TME3Bot Deployment Runbook
 
-Versi: 4.2 - selective image release dan HTTP-only resolver
+Versi: 4.3 - mode Gateway Full/Lite
 
-Dokumen ini adalah urutan update resmi. Gateway menjalankan tiga container:
-`backend`, `telegram`, dan `worker-local`. Dashboard adalah file static dan
-tidak membutuhkan Node.js atau container web di VPS target.
+Dokumen ini adalah urutan update resmi. Gateway memakai `GATEWAY_MODE=full`
+secara default. Mode `lite` dipilih eksplisit di `.env` root project dan
+diterapkan melalui `python3 run.py deploy gateway`; jangan mengubah profil
+Compose dengan menjalankan `docker compose` langsung. Dashboard adalah file
+static dan tidak membutuhkan Node.js atau container web di VPS target.
 
 ## Topologi deployment
 
 | Node | Service | Cara update |
 |---|---|---|
 | GitHub Actions | Build dan publish base, gateway, serta worker ke GHCR | Push ke `main` |
-| VPS gateway | `backend`, `telegram`, `worker-local` | `python3 run.py deploy gateway --pull` |
+| VPS gateway Full | `backend`, `telegram`, `worker-local`, Aria2, helper TTS | `python3 run.py deploy gateway --pull` |
+| VPS gateway Lite | `backend`, Redis/RQ, bot persetujuan login Web | `python3 run.py deploy gateway --pull` |
 | Setiap VPS worker remote | `worker` | `python3 run.py deploy worker --pull` |
 | aaPanel UI | Svelte static di document root | `python3 run.py deploy web` |
+
+Full tetap menjalankan frontend Telegram lengkap. Lite menjalankan bot minimal
+yang hanya menyetujui challenge login Web; kedua poller memakai bot token yang
+sama dan tidak boleh berjalan bersamaan. Lite tidak menjalankan `worker-local`,
+Aria2 lokal, atau helper TTS lokal. Volume, profil, sesi, database, dan Workspace
+local tetap disimpan agar deployment dapat kembali ke Full.
 
 ## Build dan pull image bertahap
 

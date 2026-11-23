@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi import Depends, Header, Query, Request, Response
 
+from tme3bot.api.activity import track_activity_operation
 from tme3bot.api.schemas import OperationResponse, TdlAccessVerificationRequest
 from tme3bot.domain.models import DomainError
 
@@ -44,7 +45,7 @@ def register_tdl_access(app, context, *, current_actor, require_internal) -> Non
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
-        request.state.activity_operation_id = operation.id
+        track_activity_operation(request, operation)
         status_url = f"/api/v1/operations/{operation.id}"
         response.headers["Location"] = status_url
         return operation.to_public(status_url=status_url)

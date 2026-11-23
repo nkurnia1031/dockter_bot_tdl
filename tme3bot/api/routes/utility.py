@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import Depends
+from fastapi import Depends, Request
+from tme3bot.api.activity import track_activity_jobs
 from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, SettingRequest, UtilityFolderRequest, UtilityJobRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.utility import utility_setting_specs
@@ -65,10 +66,10 @@ def register_utility(app, context, *, _model_dict, current_actor, job_dict):
         }
 
     @app.post("/api/v1/utility/jobs", response_model=JobResponse)
-    def submit_utility(body: UtilityJobRequest, actor=Depends(current_actor)):
+    def submit_utility(body: UtilityJobRequest, request: Request, actor=Depends(current_actor)):
         payload = _model_dict(body)
-        return job_dict(
-            context.control_plane.submit_job(
-                actor, "utility", payload, profile=actor.profile, worker=payload.get("worker")
-            )
+        job = context.control_plane.submit_job(
+            actor, "utility", payload, profile=actor.profile, worker=payload.get("worker")
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)

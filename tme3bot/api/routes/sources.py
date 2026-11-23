@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.api.schemas import BatchSourcesRequest, ExportRequest, ItemListResponse, JobResponse, LabelRequest, ObjectResponse, SourceListResponse, SourceResponse, SourceUpdateRequest
+from tme3bot.api.activity import track_activity_jobs
 from tme3bot.domain.models import DomainError
 
 def register_sources(app, context, *, _model_dict, current_actor, job_dict, verify_target):
@@ -59,7 +60,7 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
         return {"deleted": deleted}
 
     @app.post("/api/v1/exports", response_model=JobResponse)
-    def submit_export(body: ExportRequest, actor=Depends(current_actor)):
+    def submit_export(body: ExportRequest, request: Request, actor=Depends(current_actor)):
         values = _model_dict(body)
         if not values.get("url") and not values.get("chat_ref"):
             raise DomainError(
@@ -103,11 +104,11 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
                 "Folder rclone per job hanya berlaku untuk Quick Mode.",
                 status_code=422,
             )
-        return job_dict(
-            context.control_plane.submit_job(
-                actor, "export", values, profile=values.get("profile"), worker=values.get("worker")
-            )
+        job = context.control_plane.submit_job(
+            actor, "export", values, profile=values.get("profile"), worker=values.get("worker")
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)
 
     @app.get("/api/v1/labels", response_model=ItemListResponse)
     def list_labels(actor=Depends(current_actor)):
@@ -133,13 +134,13 @@ def register_sources(app, context, *, _model_dict, current_actor, job_dict, veri
         return {"label": context.label_store.add(body.label)}
 
     @app.post("/api/v1/sources/leave", response_model=JobResponse)
-    def submit_leave(body: BatchSourcesRequest, actor=Depends(current_actor)):
+    def submit_leave(body: BatchSourcesRequest, request: Request, actor=Depends(current_actor)):
         try:
             chat_refs = sorted({normalize_tdl_chat_ref(item) for item in body.chat_refs})
         except ValueError as exc:
             raise DomainError("INVALID_CHAT_REF", str(exc), status_code=422) from exc
-        return job_dict(
-            context.control_plane.submit_job(
-                actor, "leave", {"chat_refs": chat_refs}, profile=actor.profile
-            )
+        job = context.control_plane.submit_job(
+            actor, "leave", {"chat_refs": chat_refs}, profile=actor.profile
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)

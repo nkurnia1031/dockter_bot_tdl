@@ -825,6 +825,35 @@ class WorkerJobLifecycleContractTests(unittest.TestCase):
         self.assertEqual(calls, {"default": ["job-1"], "ruth2": ["job-1"]})
         self.assertEqual(emitted[0][0][2], "cancel.requested")
 
+    def test_lite_storage_upload_cancel_targets_current_worker_inventory(self):
+        calls = {"default": [], "ruth2": []}
+
+        class TdlClient:
+            def __init__(self, profile):
+                self.profile = profile
+
+            def interrupt_current(self, owner_job_id=None):
+                calls[self.profile].append(owner_job_id)
+                return self.profile == "ruth2"
+
+        runtimes = {
+            profile: SimpleNamespace(upload_tdl_client=TdlClient(profile))
+            for profile in calls
+        }
+        executor, _requests, emitted = self._active_cancel_executor(
+            "storage_upload",
+            {
+                "_tdl_sender_profiles_use_worker_inventory": True,
+                "_tdl_sender_profiles": ["default"],
+            },
+            ["default", "ruth2"],
+            runtimes,
+        )
+
+        self.assertTrue(executor.cancel("job-1"))
+        self.assertEqual(calls, {"default": ["job-1"], "ruth2": ["job-1"]})
+        self.assertEqual(emitted[0][0][2], "cancel.requested")
+
     def test_non_cancellable_active_job_is_not_marked_cancelling(self):
         requested = []
         executor = object.__new__(WorkerJobExecutor)

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
+  import { gatewayMode } from '$lib/gateway-mode.svelte';
   import {
     ArrowUpRight, Clock3, Database, RefreshCw, Server, TriangleAlert
   } from '@lucide/svelte';
@@ -17,7 +18,7 @@
     finished_at?: string;
   };
   type WorkerMetric = { worker: string; status: string; active_jobs?: number; enabled?: boolean };
-  type WorkerReadiness = { name: string; status: 'success' | 'failed' | 'disabled'; checked_at?: string };
+  type WorkerReadiness = { name: string; status: 'success' | 'failed' | 'disabled' | 'unknown'; checked_at?: string; health_status?: string };
   type ReadinessCell = { worker: string; runtime: string; status: string; profile?: string | null };
 
   let loading = $state(false);
@@ -31,6 +32,8 @@
   let workerReadiness = $state<WorkerReadiness[]>([]);
   let readiness = $state<ReadinessCell[]>([]);
   let lastUpdated = $state<Date | null>(null);
+  let pageVisible = $state(true);
+  const isLite = $derived($gatewayMode === 'lite');
 
   const serviceLabels: Record<string, string> = {
     resolver: 'Resolver', tts_helper: 'TTS runtime', quick_mode_runtime: 'Quick Mode', rclone_storage: 'Rclone'
@@ -43,10 +46,13 @@
     for (const worker of workerReadiness) {
       if (!byName.has(worker.name)) byName.set(worker.name, { worker: worker.name, status: 'unknown' });
     }
-    return [...byName.values()];
+    return [...byName.values()].filter((worker) =>
+      !isLite || !['local', 'worker-local'].includes(worker.worker)
+    );
   });
 
   function jobTitle(job: Job): string {
+    if (isLite) return job.kind.replaceAll('_', ' ');
     const name = typeof job.progress?.active_file === 'string' ? job.progress.active_file : '';
     return name.split(/[\\/]/).filter(Boolean).at(-1) || job.kind.replaceAll('_', ' ');
   }
@@ -60,13 +66,16 @@
     if (worker.enabled === false) return 'Nonaktif';
     const snapshot = workerReadiness.find((item) => item.name === worker.worker);
     if (!snapshot) return 'Belum discan';
+    if (isLite) {
+      return ({ ready: 'Siap', offline: 'Offline', stale: 'Status usang', unknown: 'Status belum diketahui', disabled: 'Nonaktif' } as Record<string, string>)[snapshot.health_status || 'unknown'] || 'Status belum diketahui';
+    }
     if (snapshot.status === 'disabled') return 'Nonaktif';
     return snapshot.status === 'success' ? 'Siap' : 'Belum siap';
   }
 
   function workerReadinessClass(worker: WorkerMetric): string {
     const label = workerReadinessLabel(worker);
-    return label === 'Siap' ? 'status-ready' : label === 'Belum siap' ? 'status-failed' : 'status-neutral';
+    return label === 'Siap' ? 'status-ready' : ['Belum siap', 'Offline'].includes(label) ? 'status-failed' : label === 'Status usang' ? 'status-warning' : 'status-neutral';
   }
 
   function workerActivityLabel(worker: WorkerMetric): string {
@@ -98,21 +107,36 @@
     loading = true;
     error = '';
     partialWarning = '';
+    const readinessRequest = isLite
+      ? api<{ items?: Array<{ name: string; enabled?: boolean; health_status?: string; health_checked_at?: string }> }>('/workers')
+      : api<{ runtime_readiness?: { workers?: WorkerReadiness[]; cells?: ReadinessCell[] } }>('/profiles/local');
     const results = await Promise.allSettled([
       api<Record<string, unknown>>('/dashboard/summary'),
-      api<{ items: Job[] }>('/jobs?status=queued,dispatched,running,paused&limit=6'),
-      api<{ items: Job[] }>('/jobs?status=failed&limit=5'),
+      api<{ items: Job[] }>(`/jobs?status=queued,dispatched,running,paused&limit=${isLite ? 30 : 6}`),
+      api<{ items: Job[] }>(`/jobs?status=failed&limit=${isLite ? 30 : 5}`),
       api<{ workers: WorkerMetric[] }>('/jobs/metrics?scope=current'),
-      api<{ runtime_readiness?: { workers?: WorkerReadiness[]; cells?: ReadinessCell[] } }>('/profiles/local')
+      readinessRequest
     ] as const);
     const problems = results.flatMap((result, index) => result.status === 'rejected' ? [`Bagian ${index + 1} gagal dimuat`] : []);
     if (results[0].status === 'fulfilled') summary = results[0].value;
-    if (results[1].status === 'fulfilled') activeJobs = results[1].value.items || [];
-    if (results[2].status === 'fulfilled') failedJobs = results[2].value.items || [];
+    if (results[1].status === 'fulfilled') activeJobs = (results[1].value.items || []).filter((job) => !isLite || job.kind !== 'backup_node').slice(0, 6);
+    if (results[2].status === 'fulfilled') failedJobs = (results[2].value.items || []).filter((job) => !isLite || job.kind !== 'backup_node').slice(0, 5);
     if (results[3].status === 'fulfilled') workers = results[3].value.workers || [];
     if (results[4].status === 'fulfilled') {
-      workerReadiness = results[4].value.runtime_readiness?.workers || [];
-      readiness = results[4].value.runtime_readiness?.cells || [];
+      if (isLite) {
+        const items = (results[4].value as { items?: Array<{ name: string; enabled?: boolean; health_status?: string; health_checked_at?: string }> }).items || [];
+        workerReadiness = items.map((item) => ({
+          name: item.name,
+          status: item.enabled === false ? 'disabled' : item.health_status === 'ready' ? 'success' : item.health_status === 'offline' ? 'failed' : 'unknown',
+          health_status: item.enabled === false ? 'disabled' : item.health_status || 'unknown',
+          checked_at: item.health_checked_at || undefined,
+        }));
+        readiness = [];
+      } else {
+        const value = results[4].value as { runtime_readiness?: { workers?: WorkerReadiness[]; cells?: ReadinessCell[] } };
+        workerReadiness = value.runtime_readiness?.workers || [];
+        readiness = value.runtime_readiness?.cells || [];
+      }
     }
     error = problems.length === results.length ? 'Ringkasan belum dapat dimuat. Periksa koneksi backend, lalu muat ulang.' : '';
     if (problems.length > 0 && problems.length < results.length) partialWarning = `${problems.length} bagian ringkasan belum tersedia. Muat ulang untuk mencoba lagi.`;
@@ -121,7 +145,22 @@
     loading = false;
   }
 
-  onMount(() => { void refresh(); });
+  $effect(() => {
+    const shouldPoll = isLite && pageVisible && activeJobs.length > 0;
+    if (!shouldPoll) return;
+    const timer = window.setInterval(() => {
+      if (!loading) void refresh();
+    }, 10_000);
+    return () => window.clearInterval(timer);
+  });
+
+  onMount(() => {
+    const updateVisibility = () => { pageVisible = !document.hidden; };
+    updateVisibility();
+    document.addEventListener('visibilitychange', updateVisibility);
+    void refresh();
+    return () => document.removeEventListener('visibilitychange', updateVisibility);
+  });
 </script>
 
 <main class="overview-page">
@@ -129,7 +168,7 @@
     <div>
       <p class="eyebrow">MONITOR · CONTROL CENTER</p>
       <h1>Ringkasan operasional</h1>
-      <p class="muted">Status job, worker, layanan, dan kegagalan terbaru.</p>
+    <p class="muted">{isLite ? 'Status job remote dan konektivitas worker.' : 'Status job, worker, layanan, dan kegagalan terbaru.'}</p>
     </div>
     <div class="heading-actions">
       {#if lastUpdated}<span class="muted last-updated">Diperbarui {lastUpdated.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' })}</span>{/if}
@@ -147,7 +186,7 @@
     <article class="metric-card metric-accent"><span class="metric-label">Job aktif</span><strong class="metric-value">{jobCounts.active ?? '—'}</strong><span class="metric-foot">Menunggu atau sedang berjalan</span></article>
     <article class="metric-card metric-danger"><span class="metric-label">Gagal terbaru</span><strong class="metric-value">{jobCounts.failed ?? '—'}</strong><span class="metric-foot">Job gagal belum diarsipkan</span></article>
     <article class="metric-card"><span class="metric-label">Profil aktif</span><strong class="metric-value metric-name">{summaryProfile}</strong><span class="metric-foot">Target default control plane</span></article>
-    <article class="metric-card"><span class="metric-label">Worker target</span><strong class="metric-value metric-name">{summaryWorker}</strong><span class="metric-foot">Job baru mengikuti route profil</span></article>
+    <article class="metric-card"><span class="metric-label">Worker target</span><strong class="metric-value metric-name">{isLite ? 'Remote per job' : summaryWorker}</strong><span class="metric-foot">{isLite ? 'Pilih worker saat membuat job' : 'Job baru mengikuti route profil'}</span></article>
   </section>
 
   <section class="overview-columns">
@@ -168,7 +207,7 @@
     </article>
 
     <article class="panel">
-      <header class="panel-heading"><div><p class="eyebrow">INFRASTRUKTUR</p><h2>Worker & layanan</h2></div><span class="count-badge">{displayedWorkers.length}</span></header>
+      <header class="panel-heading"><div><p class="eyebrow">INFRASTRUKTUR</p><h2>{isLite ? 'Worker remote' : 'Worker & layanan'}</h2></div><span class="count-badge">{displayedWorkers.length}</span></header>
       {#if displayedWorkers.length}
         <div class="compact-list">
           {#each displayedWorkers as worker (worker.worker)}
@@ -178,12 +217,12 @@
               <span class="status-pill {workerReadinessClass(worker)}">{workerReadinessLabel(worker)}</span>
             </div>
           {/each}
-          <div class="service-list" aria-label="Status runtime">
+          {#if !isLite}<div class="service-list" aria-label="Status runtime">
             {#each readiness as cell (`${cell.worker}-${cell.runtime}-${cell.profile || ''}`)}
               <span class="service-chip {runtimeCellClass(cell.status)}"><i aria-hidden="true"></i>{cell.worker} · {cell.profile ? `${cell.profile} · ` : ''}{serviceLabels[cell.runtime] || cell.runtime} {runtimeStatusLabel(cell.status)}</span>
             {/each}
             {#if readiness.length === 0 && loaded}<span class="muted service-empty">Belum ada runtime dari scan terakhir.</span>{/if}
-          </div>
+          </div>{:else}<p class="muted px-3 pb-3 text-xs">Status koneksi menggunakan snapshot gateway.</p>{/if}
         </div>
       {:else}<div class="empty-state">{loaded ? 'Worker belum tersedia.' : 'Memuat status worker…'}</div>{/if}
     </article>
@@ -204,7 +243,7 @@
     {:else}<div class="empty-state">{loaded ? 'Tidak ada kegagalan terbaru.' : 'Memuat riwayat…'}</div>{/if}
   </section>
 
-  <footer class="overview-foot"><span><Clock3 size={13}/> Ringkasan diperbarui manual; tidak ada polling saat idle.</span><span><Database size={13}/> {loaded ? 'Status backend tersedia' : 'Memuat status backend'}</span></footer>
+  <footer class="overview-foot"><span><Clock3 size={13}/> {isLite ? 'Status diperbarui tiap 10 detik hanya saat job aktif dan tab terlihat.' : 'Ringkasan diperbarui manual; tidak ada polling saat idle.'}</span><span><Database size={13}/> {loaded ? 'Status backend tersedia' : 'Memuat status backend'}</span></footer>
 </main>
 
 <style>

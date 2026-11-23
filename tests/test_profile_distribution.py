@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,7 +32,13 @@ class FakeVault:
 
 class FakeRegistry:
     def __init__(self, names):
-        self.workers = {name: {"token": f"worker-token-{name}-long-enough"} for name in names}
+        self.workers = {
+            name: {
+                "token": f"worker-token-{name}-long-enough",
+                "url": "https://worker.example",
+            }
+            for name in names
+        }
 
     def get(self, name):
         return self.workers.get(name)
@@ -100,6 +107,33 @@ class ProfileDistributionTests(unittest.TestCase):
             FakeRegistry(self.workers),
             dispatcher,
         )
+
+    def test_start_wakes_pending_distribution_before_starting_recovery_loop(self):
+        self.create_operation(workers=["remote-1"])
+        self.assertEqual(len(self.store.pending_targets()), 1)
+        service = self.service(FakeDispatcher())
+        observed = {}
+
+        class StartObserverThread:
+            def __init__(self, *, target, daemon, name):
+                observed["target"] = target
+                observed["daemon"] = daemon
+                observed["name"] = name
+
+            def start(self):
+                observed["wake_set_before_start"] = service._wake.is_set()
+
+            def join(self, timeout=None):
+                observed["join_timeout"] = timeout
+
+        with patch("tme3bot.profile_distribution.threading.Thread", StartObserverThread):
+            service.start()
+
+        self.assertTrue(observed["wake_set_before_start"])
+        self.assertTrue(observed["daemon"])
+        self.assertEqual(observed["name"], "profile-distribution")
+        self.assertTrue(callable(observed["target"]))
+        service.stop()
 
     def test_distribution_ciphertext_is_worker_bound_and_idempotent(self):
         args = {
@@ -182,6 +216,33 @@ class ProfileDistributionTests(unittest.TestCase):
             ),
             self.bundle,
         )
+
+    def test_lite_keeps_local_distribution_waiting_and_processes_remote_only(self):
+        operation, _ = self.create_operation(workers=["worker-local", "remote-1"])
+        dispatcher = FakeDispatcher()
+        registry = FakeRegistry(["worker-local", "remote-1"])
+        registry.workers["worker-local"]["url"] = "http://worker-local:8080"
+        service = ProfileDistributionService(
+            SimpleNamespace(
+                backup_channel_id=-100123,
+                gateway_mode="lite",
+                worker_local_url="http://worker-local:8080",
+            ),
+            FakeBot(),
+            self.store,
+            self.vault,
+            registry,
+            dispatcher,
+            gateway_mode="lite",
+            local_worker_urls=["http://worker-local:8080"],
+        )
+
+        self.assertEqual(service.process_pending(), 1)
+        current = self.store.operation(operation["id"])
+        states = {item["worker"]: item["status"] for item in current["workers"]}
+        self.assertEqual(states["worker-local"], "queued")
+        self.assertEqual(states["remote-1"], "ready")
+        self.assertEqual([item[0] for item in dispatcher.calls], ["remote-1"])
 
     def test_backup_channel_export_failure_falls_back_to_worker_bound_ciphertext(self):
         operation, _ = self.create_operation(workers=["remote-2"])

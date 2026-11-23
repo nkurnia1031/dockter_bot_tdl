@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, post, put } from '$lib/api';
+  import { gatewayMode } from '$lib/gateway-mode.svelte';
   import { formatDate } from '$lib/presentation';
   import JobTable from './JobTable.svelte';
   import { tdlLaneLabel } from '$lib/tdl-lanes';
@@ -41,6 +42,7 @@
   let message = $state('');
   let pending = $state(false);
   let saving = $state(false);
+  const isLite = $derived($gatewayMode === 'lite');
   async function load() {
     try {
       data = await api('/backups/status');
@@ -234,11 +236,12 @@
 
 <header class="flex flex-wrap items-end justify-between gap-4"><div><p class="eyebrow">BACKUP</p><h1 class="mt-2 text-3xl font-black tracking-tight sm:text-4xl">Backup terenkripsi</h1><p class="muted mt-2">Backup gateway, riwayat arsip worker lama, jadwal, dan hasil upload channel.</p></div><div class="page-icon"><Archive size={23}/></div></header>
 <section class="card mt-7 p-5 sm:p-6">
-  <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Konfigurasi aktif</h2><p class="muted mt-1 text-sm">{data.schedule || '-'} · {data.timezone || '-'} · retensi {data.retention ?? '-'} · volume {data.volume_size || '-'}</p></div><div class="flex gap-2"><button class="button secondary" onclick={load}><RefreshCw size={15}/>Refresh</button><button class="button" onclick={run} disabled={pending || data.enabled === false}><Play size={15}/>{pending ? 'Memulai...' : 'Backup sekarang'}</button></div></div>
+  <div class="flex flex-wrap items-center justify-between gap-3"><div><h2 class="font-extrabold">Konfigurasi aktif</h2><p class="muted mt-1 text-sm">{data.schedule || '-'} · {data.timezone || '-'} · retensi {data.retention ?? '-'} · volume {data.volume_size || '-'}</p></div><div class="flex gap-2"><button class="button secondary" onclick={load}><RefreshCw size={15}/>Refresh</button><button class="button" onclick={run} disabled={pending || (!isLite && data.enabled === false)}><Play size={15}/>{pending ? 'Memulai...' : 'Backup sekarang'}</button></div></div>
+  {#if isLite}<p class="mt-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-200">Jadwal backup otomatis dimatikan pada mode Lite. Backup manual, verifikasi arsip, dan diagnosis worker tetap tersedia.</p>{/if}
   {#if message}<p class="mt-4 rounded-xl bg-[var(--brand-soft)] p-3 text-sm">{message}</p>{/if}
   <details class="mt-5 rounded-2xl border border-[var(--line)] p-4"><summary class="cursor-pointer font-bold">Ubah pengaturan backup dan operasi</summary>
     <div class="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-      <label class="flex items-center gap-2 text-sm font-bold"><input type="checkbox" bind:checked={draft.enabled}/>Jadwal backup aktif</label>
+      <label class="flex items-center gap-2 text-sm font-bold"><input type="checkbox" bind:checked={draft.enabled}/>{isLite ? 'Jadwal aktif saat mode Full' : 'Jadwal backup aktif'}</label>
       <label class="text-sm font-bold">Jadwal harian<input class="field mt-2" type="time" bind:value={draft.schedule}/></label>
       <label class="text-sm font-bold">Zona waktu<input class="field mt-2" bind:value={draft.timezone} placeholder="Asia/Jakarta"/></label>
       <label class="text-sm font-bold">Jumlah backup disimpan<input class="field mt-2" type="number" min="1" max="3650" bind:value={draft.retention}/></label>
@@ -309,5 +312,7 @@
   </section>
   <div class="responsive-card-table mt-5"><table class="mobile-card-table w-full min-w-[850px] text-left text-sm"><thead class="border-b border-[var(--line)] text-xs uppercase text-[var(--muted)]"><tr><th class="py-3">Node</th><th>Run ID lengkap</th><th>Status</th><th>Mulai</th><th>Selesai</th><th>Error</th></tr></thead><tbody class="divide-y border-[var(--line)]">{#each data.items || [] as item}<tr><td class="py-4 font-bold" data-label="Node">{item.node_name}</td><td data-label="Run ID"><code class="select-all break-all text-xs">{item.run_id || '-'}</code></td><td data-label="Status"><span class={`badge ${item.status}`}>{item.status}</span></td><td data-label="Mulai">{formatDate(item.started_at)}</td><td data-label="Selesai">{formatDate(item.completed_at)}</td><td class="max-w-72 truncate text-rose-600" data-label="Error">{item.error || '-'}</td></tr>{:else}<tr><td colspan="6" class="py-10 text-center muted empty-table-cell">Belum ada riwayat backup.</td></tr>{/each}</tbody></table></div>
 </section>
-<JobTable kind="backup_node" title="Job backup"/>
+{#if !isLite}
+  <JobTable kind="backup_node" title="Job backup"/>
+{/if}
 <JobTable kind="backup_verify" title="Job verifikasi arsip backup" view="history"/>

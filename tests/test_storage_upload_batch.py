@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tme3bot.application.job_scheduler import build_execution_plan
+from tme3bot.domain.models import DomainError
 from tme3bot.rclone import RcloneError
 from tme3bot.tdl import TDLTransferStalledError
 from tme3bot.worker.command_store import WorkerCommandStore
@@ -806,6 +807,68 @@ class StorageUploadBatchTests(unittest.TestCase):
             {"one.txt": "default", "three.txt": "archive", "two.txt": "default"},
         )
 
+    def test_durable_upload_holds_sender_session_against_profile_deletion_between_files(self):
+        self._add_files("one.txt", "two.txt")
+        uploader = _BatchUploader(self.workspace, self.store, parallel=False)
+        uploader.profile_manager.profile_operation_locks = lambda profile: (
+            uploader.runtimes[profile].export_operation_lock,
+            threading.RLock(),
+        )
+        uploader.profile_manager.profile_upload_operation_lock = lambda profile: (
+            uploader.runtimes[profile].upload_operation_lock
+        )
+        first_file_succeeded = threading.Event()
+        continue_upload = threading.Event()
+        original_record = self.store.record_storage_upload_item
+
+        def pause_after_first_success(command_id, relative_path, **kwargs):
+            original_record(command_id, relative_path, **kwargs)
+            if (
+                relative_path == "one.txt"
+                and kwargs.get("profile") == "archive"
+                and kwargs.get("status") == "succeeded"
+            ):
+                first_file_succeeded.set()
+                if not continue_upload.wait(timeout=3):
+                    raise TimeoutError("test did not release the upload lane")
+
+        self.store.record_storage_upload_item = pause_after_first_success
+        result_holder = {}
+
+        def run_upload():
+            command = uploader.command(self.workspace)
+            command["payload"]["_tdl_sender_profiles"] = ["archive"]
+            result_holder["result"] = uploader._storage_upload(command)
+
+        upload_thread = threading.Thread(target=run_upload, daemon=True)
+        upload_thread.start()
+        try:
+            self.assertTrue(first_file_succeeded.wait(timeout=3))
+            deleted_profiles = []
+            executor = object.__new__(WorkerJobExecutor)
+            executor.profile_manager = uploader.profile_manager
+            executor.config = SimpleNamespace(default_profile="default")
+            executor._profile_sessions = SimpleNamespace(
+                delete_local_profile=lambda profile: (
+                    deleted_profiles.append(profile) or {"deleted": True}
+                )
+            )
+            executor.upload_lane_preparer = SimpleNamespace(
+                reserve_profile_deletion=lambda _profile: True,
+                release_profile_deletion=lambda *_args, **_kwargs: None,
+            )
+            with self.assertRaises(DomainError) as busy:
+                executor.delete_local_profile("archive")
+            self.assertEqual(busy.exception.code, "PROFILE_SESSION_BUSY")
+            self.assertEqual(deleted_profiles, [])
+        finally:
+            continue_upload.set()
+            upload_thread.join(timeout=5)
+
+        self.assertFalse(upload_thread.is_alive())
+        self.assertEqual(result_holder["result"]["outcome"], "succeeded")
+        self.assertEqual(result_holder["result"]["succeeded"], 2)
+
     def test_durable_batch_falls_back_only_after_access_denial_and_removes_denied_sender(self):
         self._add_files("one.txt", "two.txt", "three.txt")
         uploader = _BatchUploader(
@@ -1342,6 +1405,37 @@ class StorageUploadBatchTests(unittest.TestCase):
         self.assertFalse(result["items"][0]["retryable"])
         self.assertNotIn("private runner failure detail", repr(result))
         self.assertNotIn(source_items[0]["caption"], repr(result))
+
+    def test_lite_reconciliation_uses_current_worker_inventory_not_stale_checkpoint(self):
+        uploader, _upload_result, _source_items, command, _store = self._prepare_reconcile(
+            ["one.txt"], []
+        )
+        command["payload"]["_tdl_sender_profiles_use_worker_inventory"] = True
+        command["payload"]["_tdl_sender_profiles"] = ["removed-profile"]
+        uploader.runtimes["archive"].upload_tdl_client.export_messages = [{
+            "id": 17,
+            "file_name": "one.txt",
+            "caption": "one.txt",
+        }]
+        default_client = uploader.runtimes["default"].upload_tdl_client
+
+        def denied_export(*args, **kwargs):
+            default_client.export_calls.append((
+                args[0], args[1], args[2], kwargs.get("with_content"), "messages.json"
+            ))
+            raise RuntimeError("default profile cannot access this worker lane")
+
+        default_client.export_messages_by_time = denied_export
+
+        result = uploader._storage_reconcile(command)
+
+        self.assertEqual(result["outcome"], "succeeded")
+        self.assertEqual(result["items"][0]["status"], "succeeded")
+        self.assertEqual(len(default_client.export_calls), 1)
+        self.assertEqual(
+            uploader.runtimes["archive"].upload_tdl_client.export_calls[0][:4],
+            ("-100123", 100, 200, True),
+        )
 
     def test_rclone_reconciliation_verifies_durable_target_without_uploading_again(self):
         with TemporaryDirectory() as temp:

@@ -69,8 +69,19 @@ class ContainerBuildTests(unittest.TestCase):
             gateway_services["backend"]["environment"]["SAFELINK_RESOLVER_ENABLED"],
             "false",
         )
+        self.assertEqual(
+            gateway_services["backend"]["environment"]["GATEWAY_MODE"],
+            "${GATEWAY_MODE:-full}",
+        )
         self.assertNotIn("web:", gateway)
         self.assertIn("telegram:", gateway)
+        self.assertEqual(gateway_services["telegram"]["profiles"], ["full"])
+        for name in ("worker-local", "aria2", "tts-1", "tts-2", "tts-3"):
+            self.assertEqual(gateway_services[name]["profiles"], ["full"])
+        login_bot = gateway_services["telegram-login"]
+        self.assertEqual(login_bot["profiles"], ["lite"])
+        self.assertEqual(login_bot["environment"]["APP_ROLE"], "telegram-login")
+        self.assertNotIn("volumes", login_bot)
         self.assertEqual(gateway.count("target: gateway"), 1)
         backend_publish = (
             '"${BACKEND_BIND_HOST:-0.0.0.0}:'
@@ -140,7 +151,10 @@ class ContainerBuildTests(unittest.TestCase):
             )
             for name in ("tts-1", "tts-2", "tts-3"):
                 self.assertIn(name, services)
-                self.assertNotIn("profiles", services[name])
+                if filename == "docker-compose.gateway.yml":
+                    self.assertEqual(services[name].get("profiles"), ["full"])
+                else:
+                    self.assertNotIn("profiles", services[name])
                 helper = services[name]
                 self.assertEqual(helper["expose"], ["8090", "8118"])
                 self.assertNotIn("ports", helper)

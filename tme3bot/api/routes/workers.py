@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -35,6 +36,7 @@ from tme3bot.profile_diagnostics import (
     PROFILE_UPLOAD_LANE_STATUSES,
 )
 from tme3bot.worker_registry import WORKER_NAME_RE
+from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
 
 _WORKER_RUNTIME_SCAN_TARGETS = {
     "resolver",
@@ -163,7 +165,28 @@ def _runtime_readiness_snapshot(context) -> dict:
     if not callable(public_snapshot):
         return {"checked_at": "", "workers": [], "cells": []}
     snapshot = public_snapshot()
-    return snapshot if isinstance(snapshot, dict) else {"checked_at": "", "workers": [], "cells": []}
+    if not isinstance(snapshot, dict):
+        return {"checked_at": "", "workers": [], "cells": []}
+    config = getattr(context, "config", None)
+    if str(getattr(config, "gateway_mode", "full") or "full").strip().lower() != "lite":
+        return snapshot
+    registry = getattr(context, "worker_registry", None)
+    records = registry.list() if callable(getattr(registry, "list", None)) else {}
+    allowed = set(worker_names_for_mode(
+        records if isinstance(records, dict) else {},
+        "lite",
+        local_urls=worker_local_urls(config),
+    ))
+    result = dict(snapshot)
+    result["workers"] = [
+        item for item in snapshot.get("workers", [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip().lower() in allowed
+    ]
+    result["cells"] = [
+        item for item in snapshot.get("cells", [])
+        if isinstance(item, dict) and str(item.get("worker") or "").strip().lower() in allowed
+    ]
+    return result
 
 
 def _tts_runtime_evidence(payload) -> tuple[bool, str, str]:
@@ -621,6 +644,28 @@ def _ensure_unique_worker_token(context, *, name: str, token: str) -> None:
 def register_workers(app, context, *, current_actor):
     profile_scan_operations = None
 
+    def _workers_available_in_mode() -> set[str]:
+        registry = getattr(context, "worker_registry", None)
+        records = registry.list() if callable(getattr(registry, "list", None)) else {}
+        config = getattr(context, "config", None)
+        return set(worker_names_for_mode(
+            records,
+            getattr(config, "gateway_mode", "full"),
+            local_urls=worker_local_urls(config),
+        ))
+
+    def _require_worker_available_in_mode(worker: str) -> str:
+        name = str(worker or "").strip().lower()
+        if name not in _workers_available_in_mode():
+            config = getattr(context, "config", None)
+            if str(getattr(config, "gateway_mode", "full") or "full").lower() == "lite":
+                raise DomainError(
+                    "LITE_REMOTE_WORKER_REQUIRED",
+                    "Mode Lite hanya mengizinkan worker remote.",
+                    status_code=409,
+                )
+        return name
+
     def _report_scan_worker(operation_id: str, worker: str, status: str, **details) -> None:
         if profile_scan_operations is not None:
             profile_scan_operations.report_worker(operation_id, worker, status, **details)
@@ -644,12 +689,17 @@ def register_workers(app, context, *, current_actor):
             return {"checked_at": "", "workers": [], "inventories": []}
         workers = []
         successful: set[str] = set()
+        allowed_workers = _workers_available_in_mode()
         for raw in raw_workers:
             if not isinstance(raw, dict):
                 continue
             name = str(raw.get("name") or "").strip().lower()
             status = str(raw.get("status") or "")
-            if not WORKER_NAME_RE.fullmatch(name) or status not in {"success", "failed", "disabled"}:
+            if (
+                not WORKER_NAME_RE.fullmatch(name)
+                or name not in allowed_workers
+                or status not in {"success", "failed", "disabled"}
+            ):
                 continue
             error_code = str(raw.get("error_code") or "")
             if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,79}", error_code):
@@ -698,6 +748,60 @@ def register_workers(app, context, *, current_actor):
             "profiles": profiles,
             "runtime_readiness": _runtime_readiness_snapshot(context),
         }
+
+    def _profile_scan_operation_for_mode(operation: dict | None) -> dict | None:
+        if not isinstance(operation, dict):
+            return None
+        if str(getattr(context.config, "gateway_mode", "full") or "full").lower() != "lite":
+            return operation
+        allowed_workers = _workers_available_in_mode()
+        target = operation.get("target")
+        if (
+            isinstance(target, dict)
+            and str(target.get("worker") or "").strip().lower() not in allowed_workers
+        ):
+            return None
+
+        safe = deepcopy(operation)
+        progress = safe.get("progress")
+        if not isinstance(progress, dict):
+            return safe
+        workers = [
+            item for item in progress.get("workers", [])
+            if isinstance(item, dict)
+            and str(item.get("name") or "").strip().lower() in allowed_workers
+        ]
+        progress["workers"] = workers
+        progress["total_workers"] = len(workers)
+        progress["completed_workers"] = sum(
+            1 for item in workers
+            if item.get("status") in {"succeeded", "success", "failed", "disabled"}
+        )
+        profiles = [
+            profile for worker in workers
+            for profile in worker.get("profiles", [])
+            if isinstance(profile, dict)
+        ]
+        progress["total_profiles"] = len(profiles)
+        progress["completed_profiles"] = sum(
+            1 for item in profiles if item.get("status") in {"succeeded", "failed"}
+        )
+        if safe.get("status") in {"succeeded", "failed"}:
+            if not workers:
+                return None
+            has_failure = any(
+                worker.get("status") == "failed"
+                or any(
+                    profile.get("status") == "failed"
+                    for profile in worker.get("profiles", [])
+                    if isinstance(profile, dict)
+                )
+                for worker in workers
+            )
+            safe["status"] = "failed" if has_failure else "succeeded"
+            if not has_failure:
+                safe["error_code"] = ""
+        return safe
 
     def _scan_profile_worker(
         name: str,
@@ -1145,11 +1249,17 @@ def register_workers(app, context, *, current_actor):
             if callable(target_resolver)
             else ""
         )
-        records = context.worker_registry.list()
+        all_records = context.worker_registry.list()
+        allowed_workers = _workers_available_in_mode()
+        records = {
+            name: record for name, record in all_records.items()
+            if name in allowed_workers
+        }
         workers = []
         scan_names = []
         if selected_worker is not None:
             name = str(selected_worker or "").strip().lower()
+            _require_worker_available_in_mode(name)
             record = records.get(name)
             if not WORKER_NAME_RE.fullmatch(name) or record is None:
                 raise DomainError(
@@ -2230,17 +2340,34 @@ def register_workers(app, context, *, current_actor):
 
     @app.get("/api/v1/workers", response_model=WorkerListResponse)
     def list_workers(actor=Depends(current_actor)):
+        monitor = getattr(context, "worker_health_monitor", None)
+        registered_workers = context.worker_registry.list()
+        gateway_mode = getattr(context.config, "gateway_mode", "full")
         return {
             "items": [
                 {
                     "name": name,
-                    "url": value["url"],
-                    "public_url": str(value.get("public_url") or ""),
-                    "enabled": bool(value.get("enabled", True)),
+                    "url": registered_workers[name]["url"],
+                    "public_url": str(registered_workers[name].get("public_url") or ""),
+                    "enabled": bool(registered_workers[name].get("enabled", True)),
                     "selected": name
                     == context.profile_manager.worker_route(actor.profile),
+                    "health_status": (
+                        monitor.snapshot(name).get("status", "unknown")
+                        if monitor is not None
+                        else "unknown"
+                    ),
+                    "health_checked_at": (
+                        monitor.snapshot(name).get("checked_at")
+                        if monitor is not None
+                        else None
+                    ),
                 }
-                for name, value in context.worker_registry.list().items()
+                for name in worker_names_for_mode(
+                    registered_workers,
+                    gateway_mode,
+                    local_urls=worker_local_urls(context.config),
+                )
             ]
         }
 
@@ -2265,7 +2392,9 @@ def register_workers(app, context, *, current_actor):
                 "Operation Scan Profil belum tersedia.",
                 status_code=503,
             )
-        return {"operation": profile_scan_operations.latest()}
+        return {
+            "operation": _profile_scan_operation_for_mode(profile_scan_operations.latest())
+        }
 
     @app.get("/api/v1/profiles/local/scan/{operation_id}")
     def get_profile_scan(operation_id: str, actor=Depends(current_actor)):
@@ -2276,7 +2405,9 @@ def register_workers(app, context, *, current_actor):
                 "Operation Scan Profil belum tersedia.",
                 status_code=503,
             )
-        operation = profile_scan_operations.get(operation_id)
+        operation = _profile_scan_operation_for_mode(
+            profile_scan_operations.get(operation_id)
+        )
         if operation is None:
             raise DomainError(
                 "PROFILE_SCAN_NOT_FOUND",
@@ -2306,6 +2437,7 @@ def register_workers(app, context, *, current_actor):
                 "Cursor log scan tidak valid.",
                 status_code=422,
             )
+        _require_worker_available_in_mode(worker)
         page = profile_scan_operations.get_logs(
             operation_id,
             worker=str(worker or "").strip().lower(),
@@ -2345,6 +2477,7 @@ def register_workers(app, context, *, current_actor):
             raise DomainError(
                 "WORKER_NAME_INVALID", "Nama worker tidak valid.", status_code=422
             )
+        _require_worker_available_in_mode(worker)
         record = context.worker_registry.get(worker)
         if record is None:
             raise DomainError(
@@ -2382,6 +2515,7 @@ def register_workers(app, context, *, current_actor):
                 "Target scan runtime worker tidak valid.",
                 status_code=422,
             )
+        _require_worker_available_in_mode(worker)
         record = context.worker_registry.get(worker)
         if record is None:
             raise DomainError(
@@ -2427,6 +2561,7 @@ def register_workers(app, context, *, current_actor):
                 "Target scan layanan profil tidak valid.",
                 status_code=422,
             )
+        _require_worker_available_in_mode(worker)
         record = context.worker_registry.get(worker)
         if record is None:
             raise DomainError(
@@ -2475,6 +2610,7 @@ def register_workers(app, context, *, current_actor):
         worker = str(name or "").strip().lower()
         if not WORKER_NAME_RE.fullmatch(worker):
             raise DomainError("WORKER_NAME_INVALID", "Nama worker tidak valid.", status_code=422)
+        _require_worker_available_in_mode(worker)
         if context.worker_registry.get(worker) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
         inventory = _read_profile_inventory(
@@ -2647,6 +2783,7 @@ def register_workers(app, context, *, current_actor):
 
     @app.get("/api/v1/workers/{name}/tts/health", response_model=WorkerTtsHealthResponse)
     def worker_tts_health(name: str, actor=Depends(current_actor)):
+        name = _require_worker_available_in_mode(name)
         if context.worker_registry.get(name) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
         diagnostics = context.control_plane.tts_worker_diagnostics(profile=actor.profile, worker=name)
@@ -2676,6 +2813,7 @@ def register_workers(app, context, *, current_actor):
     @app.get("/api/v1/workers/{name}/aria2/health")
     def worker_aria2_health(name: str, actor=Depends(current_actor)):
         del actor
+        name = _require_worker_available_in_mode(name)
         if context.worker_registry.get(name) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
         probe = getattr(context.worker_dispatcher, "aria2_health", None)
@@ -2738,6 +2876,7 @@ def register_workers(app, context, *, current_actor):
     @app.get("/api/v1/workers/{name}/aria2/recovery-settings")
     def aria2_recovery_settings(name: str, actor=Depends(current_actor)):
         del actor
+        name = _require_worker_available_in_mode(name)
         if context.worker_registry.get(name) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
         get_settings = getattr(context.worker_dispatcher, "aria2_recovery_settings", None)
@@ -2758,6 +2897,7 @@ def register_workers(app, context, *, current_actor):
     @app.put("/api/v1/workers/{name}/aria2/recovery-settings")
     def update_aria2_recovery_settings(name: str, body: dict, actor=Depends(current_actor)):
         del actor
+        name = _require_worker_available_in_mode(name)
         record = context.worker_registry.get(name)
         if record is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
@@ -2783,6 +2923,10 @@ def register_workers(app, context, *, current_actor):
     @app.post("/api/v1/aria2-rpc-{name}")
     def aria2_rpc_proxy(name: str, body: dict, actor=Depends(current_actor)):
         del actor
+        try:
+            name = _require_worker_available_in_mode(name)
+        except DomainError as exc:
+            return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": exc.message}}
         record = context.worker_registry.get(name)
         if record is None:
             return {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": -32000, "message": "Worker tidak ditemukan."}}
@@ -2824,6 +2968,10 @@ def register_workers(app, context, *, current_actor):
             await cookies.close()
         if not cookie_bytes or len(cookie_bytes) > _ARIA2_COOKIE_FILE_MAX_BYTES:
             return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "File cookies.txt kosong atau melebihi batas 2 MiB."}}
+        try:
+            name = _require_worker_available_in_mode(name)
+        except DomainError as exc:
+            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": exc.message}}
         record = context.worker_registry.get(name)
         if record is None:
             return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Worker tidak ditemukan."}}
@@ -2838,6 +2986,7 @@ def register_workers(app, context, *, current_actor):
             return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": "Worker Aria2 tidak dapat dihubungi."}}
 
     def aria2_links_dispatch(name: str, method_name: str, *args):
+        name = _require_worker_available_in_mode(name)
         record = context.worker_registry.get(name)
         if record is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
@@ -2904,6 +3053,7 @@ def register_workers(app, context, *, current_actor):
     @app.get("/api/v1/aria2-ui/{name}/{asset_path:path}")
     def aria2_ui_asset(name: str, asset_path: str, actor=Depends(current_actor)):
         del actor
+        name = _require_worker_available_in_mode(name)
         record = context.worker_registry.get(name)
         if record is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
@@ -2955,6 +3105,7 @@ def register_workers(app, context, *, current_actor):
         del actor
         if slot < 1 or slot > 3:
             raise DomainError("TTS_HELPER_SLOT_INVALID", "Slot helper TTS harus 1, 2, atau 3.", status_code=422)
+        name = _require_worker_available_in_mode(name)
         if context.worker_registry.get(name) is None:
             raise DomainError("WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404)
         recover = getattr(context.worker_dispatcher, "recover_tts_helper", None)
@@ -2969,6 +3120,7 @@ def register_workers(app, context, *, current_actor):
     @app.get("/api/v1/workers/{name}/settings", response_model=ObjectResponse)
     def worker_settings(name: str, actor=Depends(current_actor)):
         del actor
+        name = _require_worker_available_in_mode(name)
         if context.worker_registry.get(name) is None:
             raise DomainError(
                 "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404
@@ -3036,6 +3188,7 @@ def register_workers(app, context, *, current_actor):
     def update_worker_settings(
         name: str, body: WorkerRuntimeSettingsRequest, actor=Depends(current_actor)
     ):
+        name = _require_worker_available_in_mode(name)
         if context.worker_registry.get(name) is None:
             raise DomainError(
                 "WORKER_NOT_FOUND", "Worker tidak ditemukan.", status_code=404

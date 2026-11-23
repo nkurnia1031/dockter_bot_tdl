@@ -4,6 +4,7 @@
   import { modalMotion } from '$lib/motion';
   import { AlertTriangle, ClipboardList, Copy, Download, FileText, RefreshCw, SquareTerminal, XCircle } from '@lucide/svelte';
   import { api, post } from '$lib/api';
+  import { gatewayMode } from '$lib/gateway-mode.svelte';
   import { formatBytes, formatDate, jobMessage, resultEntries, textValue } from '$lib/presentation';
   import { formatDuration, isMediaUtilityJob, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
   import { operatorTdlLogText } from '$lib/tdl-lanes';
@@ -38,10 +39,12 @@
   let loadGeneration = 0;
   let pollTimer: ReturnType<typeof setTimeout> | undefined;
   let hasLoaded = false;
+  const isLite = $derived($gatewayMode === 'lite');
 
   const activeStates = ['queued', 'dispatched', 'running', 'paused'];
   const active = (job: Job) => activeStates.includes(job.status);
-  const activeJobs = $derived(jobs.filter(active).sort((left, right) => {
+  const visibleJobs = $derived(isLite ? jobs.filter((job) => job.kind !== 'backup_node') : jobs);
+  const activeJobs = $derived(visibleJobs.filter(active).sort((left, right) => {
     // Progress updates change updated_at, which must not move cards on each
     // poll. Keep active jobs in FIFO creation order with a deterministic tie-break.
     const leftCreatedAt = Date.parse(String(left.created_at || ''));
@@ -54,7 +57,11 @@
     }
     return String(left.id || '').localeCompare(String(right.id || ''));
   }));
-  const historyJobs = $derived(jobs.filter((job) => !active(job)));
+  const historyJobs = $derived(visibleJobs.filter((job) => !active(job)));
+  const liteStatusLabel = (status: string) => ({
+    queued: 'Menunggu', dispatched: 'Berjalan', running: 'Berjalan', paused: 'Dijeda',
+    succeeded: 'Berhasil', failed: 'Gagal', cancelled: 'Dibatalkan'
+  } as Record<string, string>)[status] || status;
   const newestFirst = (items: JobEvent[]) => [...items].sort((left, right) => Number(right.sequence || 0) - Number(left.sequence || 0));
   const operatorEvent = (event: JobEvent): JobEvent => {
     const result = event.result && typeof event.result === 'object'
@@ -185,11 +192,20 @@
   function reportResultEntries(job: Job): Array<[string, string]> {
     const result = job.result?.value || job.result;
     if (job.kind !== 'storage_download' || !result || typeof result !== 'object' || Array.isArray(result)) {
-      return resultEntries(result);
+      const entries = resultEntries(result);
+      return isLite ? entries.filter(([key]) => !/(log|output|command|progress|stdout|stderr)/i.test(key)) : entries;
     }
     const summary = { ...(result as Record<string, unknown>) };
     delete summary.items;
-    return resultEntries(summary);
+    const entries = resultEntries(summary);
+    return isLite ? entries.filter(([key]) => !/(log|output|command|progress|stdout|stderr)/i.test(key)) : entries;
+  }
+
+  function liteJobMessage(job: Job): string {
+    const result = job.result?.value || job.result || {};
+    if (active(job)) return job.status === 'queued' ? 'Menunggu worker' : job.status === 'paused' ? 'Job dijeda' : 'Job sedang berjalan';
+    const message = result.message || result.status || job.error?.message;
+    return message ? textValue(message).replaceAll('_', ' ') : 'Job selesai';
   }
 
   function stopPolling() {
@@ -202,9 +218,12 @@
     const reportHasActiveStorageAction = reportOpen
       && selected?.kind === 'storage_upload'
       && Boolean(activeStorageReconciliation(selected) || storageItemRetryInProgress(selected));
-    if (!mounted || (view === 'history' && !reportHasActiveStorageAction)) return;
+    const liteReportActive = isLite && reportOpen && Boolean(selected && active(selected));
+    if (!mounted || (view === 'history' && !reportHasActiveStorageAction && !liteReportActive)) return;
     if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
-    const delay = reportHasActiveStorageAction
+    const delay = isLite
+      ? activeJobs.length || liteReportActive ? 10_000 : undefined
+      : reportHasActiveStorageAction
       ? 2500
       : pollingMode === 'activity'
       ? activeJobs.length ? 2500 : 10_000
@@ -249,7 +268,7 @@
       const metricsParams = new URLSearchParams({ scope });
       if (profile) metricsParams.set('profile', profile);
       if (worker) metricsParams.set('worker', worker);
-      const shouldRefreshMetrics = view !== 'history' && (!scheduled || pollingMode === 'activity');
+      const shouldRefreshMetrics = !isLite && view !== 'history' && (!scheduled || pollingMode === 'activity');
       const [jobResponses, nextMetrics, selectedReport] = await Promise.all([
         Promise.all(jobRequests),
         !shouldRefreshMetrics
@@ -290,6 +309,14 @@
     const jobId = selected.id;
     loadingEvents = true;
     try {
+      if (isLite) {
+        const job = await api<Job>(`/jobs/${encodeURIComponent(jobId)}`);
+        if (selected?.id !== jobId) return;
+        selected = job;
+        events = [];
+        liveLog = null;
+        return;
+      }
       const [job, eventResponse, snapshot] = await Promise.all([
         api<Job>(`/jobs/${jobId}`),
         api<{items:JobEvent[]}>(`/jobs/${jobId}/events?after_sequence=0`),
@@ -503,7 +530,8 @@
       const reportActionActive = reportOpen
         && selected?.kind === 'storage_upload'
         && Boolean(activeStorageReconciliation(selected) || storageItemRetryInProgress(selected));
-      if (pollingMode === 'activity' || activeJobs.length || reportActionActive) void load();
+      const liteReportActive = isLite && reportOpen && Boolean(selected && active(selected));
+      if ((isLite && (activeJobs.length || liteReportActive)) || pollingMode === 'activity' || activeJobs.length || reportActionActive) void load();
     };
     window.addEventListener('tme3:data-mutated', refresh);
     window.addEventListener('tme3:context-changed', contextRefresh);
@@ -527,6 +555,10 @@
     <div class="flex flex-wrap items-center gap-2">
       {#if view === 'history'}
         <span class="muted text-xs">Refresh manual atau saat job selesai</span>
+      {:else if isLite && activeJobs.length}
+        <span class="badge running">Status Lite · 10 dtk saat aktif</span>
+      {:else if isLite}
+        <span class="muted text-xs">Lite · refresh manual saat idle</span>
       {:else if pollingMode === 'activity'}
         <span class="badge running">Live · 2,5 dtk aktif / 10 dtk idle</span>
       {:else if activeJobs.length}
@@ -568,7 +600,7 @@
       <div class="mb-3 flex items-center justify-between"><h3 class="font-extrabold">Sedang berjalan</h3><span class="badge running">{activeJobs.length} aktif / antre</span></div>
       <div class="space-y-2.5">
         {#each activeJobs as job (job.id)}
-          <JobProgressCard job={job} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)} onPauseToggle={(job.kind === 'tts' || (quickMode && job.payload?.quick_mode)) ? () => togglePause(job) : undefined} actionPending={Boolean(jobActionPending[job.id])}/>
+          <JobProgressCard job={job} liteMode={isLite} onReport={() => openReport(job)} onLog={() => openLog(job)} onTerminate={() => requestTerminate('one', job)} onPauseToggle={(job.kind === 'tts' || (quickMode && job.payload?.quick_mode)) ? () => togglePause(job) : undefined} actionPending={Boolean(jobActionPending[job.id])}/>
         {/each}
       </div>
     </div>
@@ -593,7 +625,7 @@
             {#if stageId}
               <span class="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-[11px] text-slate-600 dark:bg-slate-800 dark:text-slate-300" title="Staging folder: {stageId}">📁 {String(stageId).slice(0, 8)}</span>
             {/if}
-            <span class={`badge ${job.status}`}>{job.status}</span>
+            <span class={`badge ${job.status}`}>{isLite ? liteStatusLabel(job.status) : job.status}</span>
             <span class="muted text-xs">{job.worker || '-'}</span>
           </div>
           {#if job.kind === 'utility'}
@@ -606,7 +638,7 @@
             {/if}
             <p class="muted mt-1 truncate text-sm">{utilityHistorySummary(job)}</p>
           {:else}
-            <p class="muted mt-1 truncate text-sm">{jobMessage(job)}</p>
+            <p class="muted mt-1 truncate text-sm">{isLite ? liteJobMessage(job) : jobMessage(job)}</p>
           {/if}
           {#if mediaSummary?.scanComplete}
             <MediaProgressSummary media={mediaSummary}/>
@@ -615,7 +647,7 @@
         <div class="flex flex-wrap items-center gap-2">
           <small class="muted mr-auto whitespace-nowrap lg:mr-0">{formatDate(job.updated_at)}</small>
           <button class="button secondary" onclick={() => openReport(job)}><FileText size={15}/>Report</button>
-          <button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>
+          {#if !isLite}<button class="button secondary" onclick={() => openLog(job)}><SquareTerminal size={15}/>Log</button>{/if}
           {#if job.kind === 'storage_upload' && ['failed','cancelled'].includes(job.status) && hasAmbiguousStorageFiles(job)}
             {@const activeReconcile = activeStorageReconciliation(job)}
             <button class="button secondary" onclick={() => reconcile(job)} disabled={reconciling[job.id] || Boolean(activeReconcile)}><RefreshCw size={15} class={reconciling[job.id] || activeReconcile ? 'animate-spin' : ''}/>{activeReconcile ? 'Verifikasi berjalan' : 'Rekonsiliasi'}</button>
@@ -638,14 +670,14 @@
 
 <Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={reportOpen} title={selected ? `Detail ${selected.kind.replaceAll('_',' ')}` : 'Detail job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex max-h-[78dvh] min-h-0 flex-col">
-    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span>{#if selected.kind==='storage_upload'}<span class="badge">{selected.payload?.provider || 'telegram'}</span><span class="muted text-sm">{selected.payload?.provider==='rclone'?`Tujuan rclone: ${selected.payload?.rclone_destination || 'root'}${selected.payload?.rclone_path?`/${selected.payload.rclone_path}`:''}`:`Tujuan Telegram: ${selected.payload?.destination_folder_path || 'My Drive'}`}</span><span class="muted text-sm">{selected.payload?.transfer_mode || 'copy'}</span>{/if}</div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>{#if backupVerificationReport(selected)}<button class="button secondary" onclick={() => downloadBackupVerificationReport(selected!)}><Download size={15}/>Unduh JSON verifikasi</button>{/if}</div>
+    <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] bg-[var(--brand-soft)] px-4 py-3"><div><div class="flex flex-wrap gap-2"><span class={`badge ${selected.status}`}>{isLite ? liteStatusLabel(selected.status) : selected.status}</span><span class="muted text-sm">{selected.profile} · {selected.worker}</span>{#if selected.kind==='storage_upload'}<span class="badge">{selected.payload?.provider || 'telegram'}</span><span class="muted text-sm">{selected.payload?.provider==='rclone'?`Tujuan rclone: ${selected.payload?.rclone_destination || 'root'}${selected.payload?.rclone_path?`/${selected.payload.rclone_path}`:''}`:`Tujuan Telegram: ${selected.payload?.destination_folder_path || 'My Drive'}`}</span><span class="muted text-sm">{selected.payload?.transfer_mode || 'copy'}</span>{/if}</div><p class="mt-2 font-mono text-xs">{selected.id}</p></div>{#if backupVerificationReport(selected)}<button class="button secondary" onclick={() => downloadBackupVerificationReport(selected!)}><Download size={15}/>Unduh JSON verifikasi</button>{/if}</div>
     <div class="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5">
-      <div class="mb-4 flex gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">
+      {#if !isLite}<div class="mb-4 flex gap-1 overflow-x-auto rounded-xl bg-[var(--brand-soft)] p-1">
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'summary' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'summary'}>Ringkasan</button>
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'milestones' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'milestones'}>Milestone</button>
         <button class={`rounded-lg px-3 py-2 text-sm font-bold ${detailTab === 'raw' ? 'bg-[var(--panel-strong)] shadow-sm' : 'muted'}`} onclick={() => detailTab = 'raw'}>Raw JSON</button>
-      </div>
-      {#if detailTab === 'summary'}
+      </div>{/if}
+      {#if isLite || detailTab === 'summary'}
         {@const utilityResult = selected.result?.value || selected.result || {}}
         {#if selected.kind === 'utility'}
           {@const folders = utilityFolders(selected)}
@@ -867,7 +899,7 @@
             </div>
           </section>
         {/if}
-        {#if active(selected) && selectedProgress}
+        {#if !isLite && active(selected) && selectedProgress}
           <div class="mb-4 rounded-xl border border-[var(--line)] bg-[var(--surface-soft)] p-3.5 sm:p-4">
             <div class="mb-2 flex justify-between gap-2 text-xs">
               <b>Progress ({phaseLabel(selectedProgress.phase)})</b>
@@ -878,8 +910,8 @@
             </div>
           </div>
         {/if}
-        <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each reportResultEntries(selected) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
-      {:else if detailTab === 'milestones'}
+        <div class="grid gap-3 sm:grid-cols-2"><div class="record-card sm:col-span-2"><p class="muted text-xs font-bold uppercase">Pesan akhir</p><p class="mt-1 font-semibold">{isLite ? liteJobMessage(selected) : jobMessage(selected)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Mulai</p><p class="mt-1 break-words text-sm font-semibold">{formatDate(selected.started_at || selected.created_at)}</p></div><div class="record-card"><p class="muted text-xs font-bold uppercase">Selesai</p><p class="mt-1 break-words text-sm font-semibold">{selected.finished_at ? formatDate(selected.finished_at) : 'Masih berjalan'}</p></div>{#if selected.export_start_id || selected.export_end_id}<div class="record-card"><p class="muted text-xs font-bold uppercase">Rentang message ID</p><p class="mt-1 break-words text-sm font-semibold">{selected.export_start_id || '?'} – {selected.export_end_id || '?'}</p></div>{/if}{#if !isLite && selected.progress?.staging_path && !selected.progress?.staging_cleaned}<div class="record-card border-amber-200 bg-amber-50 sm:col-span-2 dark:border-amber-900 dark:bg-amber-950"><p class="muted text-xs font-bold uppercase">Staging untuk diagnosis/retry</p><p class="mt-1 break-all font-mono text-xs font-semibold">{selected.progress.staging_path}</p></div>{/if}{#each reportResultEntries(selected) as [key,value]}<div class="record-card"><p class="muted text-xs font-bold uppercase">{key.replaceAll('_',' ')}</p><p class="mt-1 break-words text-sm font-semibold">{value}</p></div>{/each}{#if selected.error}<div class="record-card border-rose-200 bg-rose-50 sm:col-span-2 dark:border-rose-900 dark:bg-rose-950"><b class="text-rose-600">Error</b><p class="mt-1 break-words text-sm">{textValue(selected.error?.message || selected.error)}</p></div>{/if}</div>
+      {:else if !isLite && detailTab === 'milestones'}
         <div class="space-y-2">{#each milestones as event}<article class="record-card"><div class="flex flex-wrap justify-between gap-2"><div><span class={`badge ${event.status}`}>{event.status}</span><b class="ml-2 text-sm">{event.event_type.replaceAll('_',' ')}</b></div><small class="muted">#{event.sequence} · {formatDate(event.created_at)}</small></div>{#if event.event_type === 'command.started' || event.event_type === 'command.completed'}<p class="mt-2 break-all font-mono text-xs">$ {(event.result?.command || []).join(' ')}</p>{#if event.event_type === 'command.started'}<p class="muted mt-2 text-sm">Command dikirim, menunggu hasil...</p>{:else}{#if event.result?.output_tail?.length}<pre class="terminal mt-2 max-h-48 overflow-auto whitespace-pre-wrap p-3 text-xs">{event.result.output_tail.join('\n')}</pre>{/if}<p class="muted mt-2 text-xs">exit {event.result?.returncode ?? '?'} · {event.result?.duration_seconds ?? 0}s{event.result?.output_truncated ? ' · output lama dipangkas' : ''}</p>{/if}{:else}<p class="muted mt-2 text-sm">{event.progress?.message || event.error?.message || event.result?.status || 'Milestone tercatat.'}</p>{/if}</article>{:else}<p class="muted py-8 text-center">Belum ada milestone.</p>{/each}</div>
       {:else}
         <div class="mb-2 flex justify-end"><button class="button secondary" onclick={() => copy(JSON.stringify({job:selected,events}, null, 2))}><Copy size={14}/>Salin</button></div><pre class="terminal max-h-[48dvh] overflow-auto p-4 text-xs">{JSON.stringify({job:selected,events}, null, 2)}</pre>
@@ -889,7 +921,7 @@
   </div>{/if}
 </Modal>
 
-<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={logOpen} title={selected ? `Log ${selected.id.slice(0,12)}` : 'Log job'} size="xl" classes={{body:'!p-0'}}>
+{#if !isLite}<Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={logOpen} title={selected ? `Log ${selected.id.slice(0,12)}` : 'Log job'} size="xl" classes={{body:'!p-0'}}>
   {#if selected}<div class="flex h-[78dvh] min-h-0 flex-col bg-[#080d19] text-slate-100">
     <div class="flex shrink-0 flex-wrap items-center justify-between gap-2 border-b border-slate-700 px-4 py-3"><div><b>{displayLogLines.length} baris</b>{#if liveLog?.log?.truncated || latestSnapshot?.result?.log?.truncated}<span class="ml-2 text-xs text-amber-300">log lama dipangkas · terbaru di atas</span>{/if}</div><div class="flex gap-2"><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={loadEvents} disabled={loadingEvents}><RefreshCw class={loadingEvents ? 'animate-spin' : ''} size={15}/>Refresh</button><button class="button secondary !border-slate-600 !bg-slate-800 !text-white" onclick={() => copy(displayLogLines.join('\n'))}><Copy size={15}/>Copy</button></div></div>
     {#if selectedProgress}<div class="grid shrink-0 gap-2 border-b border-slate-700 bg-slate-900/80 p-3 text-xs sm:grid-cols-4">
@@ -900,7 +932,7 @@
     </div>{/if}
     <pre class="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-6 text-emerald-200">{displayLogLines.join('\n') || 'Snapshot log belum tersedia. Tekan Refresh untuk mencoba lagi.'}</pre>
   </div>{/if}
-</Modal>
+</Modal>{/if}
 
 <Modal class="themed-modal" transition={modalMotion} transitionParams={{ y: 10, duration: 220 }} bind:open={confirmOpen} title={confirmTarget === 'all' ? 'Terminate semua job aktif?' : 'Terminate job ini?'} size="sm" permanent>
   <div class="flex gap-3"><AlertTriangle class="shrink-0 text-rose-600" size={23}/><p>Sinyal seperti Ctrl+C akan dikirim. Proses dapat membutuhkan beberapa saat untuk mengirim status terakhir.</p></div><div class="mt-5 flex justify-end gap-2"><button class="button secondary" onclick={() => confirmOpen = false}>Batal</button><button class="button danger" onclick={terminate}>Terminate</button></div>

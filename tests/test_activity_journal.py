@@ -32,6 +32,25 @@ class ActivityJournalTests(unittest.TestCase):
                         error_code TEXT NOT NULL DEFAULT ''
                     )"""
                 )
+                db.execute(
+                    """INSERT INTO api_activity(
+                        occurred_at,request_id,method,route,status_code,duration_ms,operation_id
+                    ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        datetime.now(timezone.utc).isoformat(), str(uuid.uuid4()), "GET",
+                        "/api/v1/operations/{operation_id}", 200, 1, str(uuid.uuid4()),
+                    ),
+                )
+                db.execute(
+                    """INSERT INTO api_activity(
+                        occurred_at,request_id,method,route,status_code,duration_ms,job_id
+                    ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        datetime.now(timezone.utc).isoformat(), str(uuid.uuid4()), "POST",
+                        "/api/v1/operations", 202, 2, str(uuid.uuid4()),
+                    ),
+                )
+                db.commit()
 
             store = ActivityJournalStore(path)
             with closing(sqlite3.connect(path)) as db:
@@ -40,6 +59,15 @@ class ActivityJournalTests(unittest.TestCase):
                 {"activity_type", "operation_kind", "operation_status", "event_key"}
                 <= columns
             )
+            with closing(sqlite3.connect(path)) as db:
+                rows = db.execute(
+                    "SELECT method, route, job_id, operation_id, activity_type FROM api_activity"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0][0:2], ("POST", "/api/v1/operations"))
+            self.assertTrue(rows[0][2])
+            self.assertEqual(rows[0][3], "")
+            self.assertEqual(rows[0][4], "request")
             store.record(
                 occurred_at=datetime.now(timezone.utc).isoformat(),
                 request_id=str(uuid.uuid4()),
@@ -56,6 +84,7 @@ class ActivityJournalTests(unittest.TestCase):
             first_id = str(uuid.uuid4())
             second_id = str(uuid.uuid4())
             operation_id = str(uuid.uuid4())
+            second_job_id = str(uuid.uuid4())
             store.record(
                 occurred_at=now.isoformat(),
                 request_id=first_id,
@@ -65,6 +94,7 @@ class ActivityJournalTests(unittest.TestCase):
                 duration_ms=12,
                 actor_user_id=42,
                 profile="default",
+                job_id=str(uuid.uuid4()),
             )
             now += timedelta(seconds=1)
             store.record(
@@ -78,6 +108,7 @@ class ActivityJournalTests(unittest.TestCase):
                 profile="default",
                 worker="local",
                 operation_id=operation_id,
+                job_id=second_job_id,
                 error_code="WORKER_UNAVAILABLE",
             )
 
@@ -117,6 +148,7 @@ class ActivityJournalTests(unittest.TestCase):
                 route="/api/v1/me",
                 status_code=200,
                 duration_ms=1,
+                operation_id=str(uuid.uuid4()),
             )
             now += timedelta(days=91)
             store.record(
@@ -126,11 +158,22 @@ class ActivityJournalTests(unittest.TestCase):
                 route="/api/v1/workers",
                 status_code=200,
                 duration_ms=1,
+                operation_id=str(uuid.uuid4()),
             )
 
             result = store.list_entries()
             self.assertEqual(len(result["items"]), 1)
             self.assertEqual(result["items"][0]["route"], "/api/v1/workers")
+
+    def test_unlinked_request_rows_are_not_retained(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = ActivityJournalStore(Path(temp) / "app.db")
+            store.record(
+                occurred_at=datetime.now(timezone.utc).isoformat(),
+                request_id=str(uuid.uuid4()), method="GET", route="/api/v1/jobs",
+                status_code=200, duration_ms=5,
+            )
+            self.assertEqual(store.list_entries()["items"], [])
 
     def test_operation_events_are_idempotent_metadata_and_filter_by_origin_request(self):
         with tempfile.TemporaryDirectory() as temp:

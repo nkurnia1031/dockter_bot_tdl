@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import StoragePage from './StoragePage.svelte';
 import { session } from '../session.svelte';
+import { setGatewayMode } from '$lib/gateway-mode.svelte';
 
 type TestDialogPrototype = { showModal?: () => void; close?: () => void };
 
@@ -22,6 +23,11 @@ function stubStorageFile() {
     if (url.pathname.endsWith('/storage/folders/tree')) return new Response(JSON.stringify({items:[]}), {status:200});
     return new Response(JSON.stringify({items:[]}), {status:200});
   }));
+}
+
+async function restoreFullSession() {
+  await session.restore();
+  setGatewayMode('full');
 }
 
 describe('Storage file manager', () => {
@@ -106,7 +112,7 @@ describe('Storage file manager', () => {
       }
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
     await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
 
@@ -152,7 +158,7 @@ describe('Storage file manager', () => {
       }
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
     await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
 
@@ -201,7 +207,7 @@ describe('Storage file manager', () => {
       }
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
     await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
     await fireEvent.click(await screen.findByLabelText('Pilih file report.zip'));
@@ -247,7 +253,7 @@ describe('Storage file manager', () => {
       if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({ path: '/workspace', items: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
 
     expect(await screen.findByText(/Storage siap/)).toBeTruthy();
@@ -295,7 +301,7 @@ describe('Storage file manager', () => {
       if (url.pathname.endsWith('/utility/tree')) return new Response(JSON.stringify({ path: '/workspace', items: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
 
     expect(await screen.findByText('Scan: tidak siap')).toBeTruthy();
@@ -344,7 +350,7 @@ describe('Storage file manager', () => {
       if (url.pathname.endsWith('/storage/downloads') && method==='POST') return new Response(JSON.stringify({id:'telegram-download-job'}),{status:200});
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
 
     await screen.findByText('report.pdf');
@@ -405,7 +411,7 @@ describe('Storage file manager', () => {
       if (url.pathname.includes('/storage/download-links/') && method==='POST') return new Response(JSON.stringify({cleanup_status:'deleted'}),{status:200});
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
 
     expect(await screen.findByText('old.zip')).toBeTruthy();
@@ -478,7 +484,7 @@ describe('Storage file manager', () => {
       if (url.pathname.endsWith('/jobs')) return new Response(JSON.stringify({items:[]}),{status:200});
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
 
     const workerPicker = await screen.findByLabelText('Worker target') as HTMLSelectElement;
@@ -540,7 +546,7 @@ describe('Storage file manager', () => {
       }),{status:200});
       return new Response(JSON.stringify({items:[]}),{status:200});
     }));
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
 
     const profileSelect = await screen.findByLabelText('Profil sumber') as HTMLSelectElement;
@@ -638,7 +644,7 @@ describe('Storage file manager', () => {
       return new Response(JSON.stringify({items:[]}),{status:200});
     });
     vi.stubGlobal('fetch',fetcher);
-    await session.restore();
+    await restoreFullSession();
     render(StoragePage);
     await fireEvent.click(await screen.findByRole('tab',{name:'Rclone'}));
     expect(await screen.findByText('Remote rclone')).toBeTruthy();

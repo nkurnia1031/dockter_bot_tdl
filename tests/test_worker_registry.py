@@ -2,10 +2,28 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tme3bot.worker_registry import WorkerRegistry
+from tme3bot.worker_registry import WorkerRegistry, worker_local_urls, worker_names_for_mode
 
 
 class WorkerRegistryTests(unittest.TestCase):
+    def test_lite_filters_worker_aliases_that_point_at_local_endpoint(self) -> None:
+        workers = {
+            "worker-alias": {"url": "http://worker-local:8080/", "enabled": True},
+            "remote-1": {"url": "https://worker1.example", "enabled": True},
+        }
+        config = type("Config", (), {
+            "worker_local_url": "http://worker-local:8080",
+            "worker_endpoints": {"worker-alias": "http://worker-local:8080/"},
+        })()
+
+        self.assertEqual(
+            worker_names_for_mode(
+                workers, "lite", local_urls=worker_local_urls(config)
+            ),
+            ["remote-1"],
+        )
+        self.assertEqual(worker_names_for_mode(workers, "full"), ["worker-alias", "remote-1"])
+
     def test_persists_workers_and_updates_without_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "workers.json"

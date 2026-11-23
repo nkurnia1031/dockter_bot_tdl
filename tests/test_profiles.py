@@ -73,6 +73,42 @@ class ProfileTests(unittest.TestCase):
             enabled = AppConfig.from_env()
         self.assertTrue(enabled.safelink_resolver_enabled)
 
+    def test_gateway_mode_defaults_to_full_and_rejects_unknown_values(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_ROLE": "worker"}, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            default_config = AppConfig.from_env()
+
+        self.assertEqual(default_config.gateway_mode, "full")
+
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ROLE": "worker", "GATEWAY_MODE": "minimal"},
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            with self.assertRaisesRegex(ValueError, "GATEWAY_MODE"):
+                AppConfig.from_env()
+
+    def test_telegram_login_role_requires_only_backend_client_credentials(self) -> None:
+        values = {
+            "APP_ROLE": "telegram-login",
+            "BOT_TOKEN": "fake-token",
+            "BACKEND_API_URL": "http://backend:8080",
+            "FRONTEND_SERVICE_TOKEN": "fake-frontend-token",
+        }
+        with (
+            patch.dict(os.environ, values, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            config = AppConfig.from_env()
+
+        config.validate_runtime()
+        self.assertEqual(config.app_role, "telegram-login")
+
     def test_legacy_tdl_user_environment_variables_are_ignored(self) -> None:
         with (
             patch.dict(
@@ -103,6 +139,25 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(config.storage_db_file, Path("/database/gateway/storage.db"))
         self.assertEqual(config.tts_data_root, Path("/data/tts"))
         self.assertEqual(config.tdl_export_storage, Path("/database/tdl/default/export/.tdl"))
+
+    def test_database_compaction_threshold_defaults_to_64_mib_and_is_configurable(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_ROLE": "worker"}, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            default_config = AppConfig.from_env()
+        self.assertEqual(default_config.database_compaction_min_free_bytes, 64 * 1024 * 1024)
+
+        with (
+            patch.dict(
+                os.environ,
+                {"APP_ROLE": "worker", "DATABASE_COMPACTION_MIN_FREE_BYTES": "1048576"},
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            configured = AppConfig.from_env()
+        self.assertEqual(configured.database_compaction_min_free_bytes, 1024 * 1024)
 
     def test_tts_artifacts_can_use_data_root_while_databases_use_database_root(self) -> None:
         with (

@@ -262,10 +262,19 @@ class StorageExecutorMixin:
             counters={"succeeded": 0, "retryable": 0, "ambiguous": len(submitted_items)},
             force=True,
         )
-        candidate_profiles = list(dict.fromkeys(
-            [item["profile"] for item in candidates]
-            + [str(item).strip().lower() for item in requested_profiles]
-        ))
+        if payload.get("_tdl_sender_profiles_use_worker_inventory") is True:
+            list_profiles = getattr(self.profile_manager, "list_profiles", None)
+            raw_profiles = list_profiles() if callable(list_profiles) else []
+            candidate_profiles = list(dict.fromkeys(
+                str(item).strip().lower()
+                for item in raw_profiles
+                if str(item).strip()
+            ))
+        else:
+            candidate_profiles = list(dict.fromkeys(
+                [item["profile"] for item in candidates]
+                + [str(item).strip().lower() for item in requested_profiles]
+            ))
         if provider == "rclone":
             return self._storage_reconcile_rclone(
                 command,
@@ -3456,8 +3465,17 @@ class StorageExecutorMixin:
             )
 
         def worker_for_lane(profile: str) -> None:
-            nonlocal in_flight, next_sender, priority_task
+            # A durable batch may use worker-local profiles discovered at
+            # execution time, so the gateway cannot reserve every sender lane
+            # in its static execution plan. Hold each selected profile's
+            # Upload session for this lane's full lifetime; profile deletion
+            # and session replacement then fail busy even between files.
             runtime = sender_runtimes[profile]
+            with runtime.upload_operation_lock:
+                worker_for_lane_locked(profile, runtime)
+
+        def worker_for_lane_locked(profile: str, runtime: Any) -> None:
+            nonlocal in_flight, next_sender, priority_task
             client = runtime.upload_tdl_client
             while True:
                 with lane_condition:

@@ -1,6 +1,26 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import ExportPage from './ExportPage.svelte';
+import { setGatewayMode } from '$lib/gateway-mode.svelte';
+import { session } from '$lib/session.svelte';
+
+async function restoreFullSessionForPage() {
+  const pageFetch = window.fetch.bind(window);
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+      authenticated: true,
+      actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+      profiles: ['default']
+    }), { status: 200 });
+    if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'full' }), { status: 200 });
+    if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+      { name: 'local', url: 'http://worker-local', enabled: true }
+    ] }), { status: 200 });
+    return pageFetch(input, init);
+  }));
+  await session.restore();
+}
 
 const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles: [
   { name: 'default', workers: ['local'], exclusive_worker: 'local' }
@@ -14,7 +34,8 @@ const localProfileCatalogResponse = () => new Response(JSON.stringify({ profiles
 } }), { status: 200 });
 
 describe('ExportPage labels', () => {
-  afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); sessionStorage.clear(); });
+  beforeEach(() => setGatewayMode('full'));
+  afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); sessionStorage.clear(); setGatewayMode(null); });
 
   it('renders label DTO text instead of object coercion', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: string) => {
@@ -23,6 +44,7 @@ describe('ExportPage labels', () => {
       if (input.includes('/labels')) return new Response(JSON.stringify({ items: [{ label: '1cans', updated_at: '2026-07-25T00:00:00Z' }] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     expect(await screen.findByRole('button', { name: '1cans' })).toBeTruthy();
     expect(screen.queryByText('[object Object]')).toBeNull();
@@ -36,6 +58,7 @@ describe('ExportPage labels', () => {
       if (input.includes('/sources') || input.includes('/labels')) return new Response(JSON.stringify({ items: [] }), { status: 200 });
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     await screen.findByText('Export baru');
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -61,6 +84,7 @@ describe('ExportPage labels', () => {
       return new Response(JSON.stringify({ items: [] }), { status: 200 });
     }));
 
+    await restoreFullSessionForPage();
     render(ExportPage);
     expect(await screen.findByText('Scan terakhir: Export belum siap')).toBeTruthy();
     await fireEvent.input(screen.getByLabelText('Referensi chat'), { target: { value: 'example' } });
@@ -91,6 +115,7 @@ describe('ExportPage labels', () => {
       }
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     await screen.findByText('Export baru');
     await screen.findByText(/Export siap/);
@@ -118,6 +143,7 @@ describe('ExportPage labels', () => {
       }
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     await screen.findByText(/Export siap/);
     const source=await screen.findByLabelText('Pilih source tersimpan');
@@ -153,6 +179,7 @@ describe('ExportPage labels', () => {
       }
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     await screen.findByText(/Export siap/);
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
@@ -189,6 +216,7 @@ describe('ExportPage labels', () => {
       }
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     await screen.findByText(/Export siap/);
     await fireEvent.input(screen.getByLabelText('Referensi chat'), {target:{value:'example'}});
@@ -211,6 +239,7 @@ describe('ExportPage labels', () => {
       }
       return new Response(JSON.stringify({items:[]}), {status:200});
     }));
+    await restoreFullSessionForPage();
     render(ExportPage);
     await screen.findByText('Export baru');
     await screen.findByText(/Export siap/);

@@ -72,6 +72,35 @@ class BackendRuntimeSettingsTests(unittest.TestCase):
             if scheduler._thread is not None:
                 scheduler._thread.join(timeout=1)
 
+    def test_lite_disables_scheduled_backup_loop_but_manual_coordinator_remains_available(self):
+        class Coordinator:
+            def __init__(self):
+                self.scheduled_checks = 0
+                self.manual_runs = 0
+
+            def next_run(self):
+                self.scheduled_checks += 1
+                return datetime.now(timezone.utc) + timedelta(days=1)
+
+            def start_now(self):
+                self.manual_runs += 1
+                return "manual-run"
+
+        coordinator = Coordinator()
+        scheduler = BackupScheduler(
+            SimpleNamespace(backup_enabled=True, backup_schedule="03:00", backup_timezone="UTC"),
+            coordinator,
+            scheduling_enabled=False,
+        )
+
+        scheduler.start()
+        scheduler.wake()
+
+        self.assertIsNone(scheduler._thread)
+        self.assertEqual(coordinator.scheduled_checks, 0)
+        self.assertEqual(coordinator.start_now(), "manual-run")
+        self.assertEqual(coordinator.manual_runs, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

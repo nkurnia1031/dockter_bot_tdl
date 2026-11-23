@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import JobTable from './JobTable.svelte';
+import { setGatewayMode } from '$lib/gateway-mode.svelte';
 
 describe('JobTable', () => {
   const dialogMethodDescriptors = Object.fromEntries(['showModal', 'close'].map((name) => [name, Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, name)]));
   const visibilityStateDescriptor = Object.getOwnPropertyDescriptor(document, 'visibilityState');
   afterEach(() => {
     cleanup();
+    setGatewayMode('full');
     vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -760,5 +762,111 @@ describe('JobTable', () => {
     document.dispatchEvent(new Event('visibilitychange'));
     await flushPromises();
     expect(jobRequests).toBe(2);
+  });
+
+  it('uses ten-second visible-only status refresh in Lite and stops when the job becomes terminal', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    setGatewayMode('lite');
+    let status = 'running';
+    let jobRequests = 0;
+    const fetchMock = vi.fn(async (input: string) => {
+      const url = String(input);
+      if (url.includes('/jobs?')) {
+        jobRequests += 1;
+        return new Response(JSON.stringify({ items: [{
+          id: 'lite-job', kind: 'utility', status,
+          progress: { message: 'stream-only message', item: { name: 'private-progress-name.mkv' } },
+        }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { kind: 'utility', title: 'Riwayat utility' });
+    await flushPromises();
+    expect(jobRequests).toBe(1);
+    expect(await screen.findByText('Status Lite · 10 dtk saat aktif')).toBeTruthy();
+    expect(screen.queryByText('stream-only message')).toBeNull();
+    expect(screen.queryByText('private-progress-name.mkv')).toBeNull();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/jobs/metrics?'))).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(9999);
+    expect(jobRequests).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await flushPromises();
+    expect(jobRequests).toBe(2);
+
+    status = 'succeeded';
+    await vi.advanceTimersByTimeAsync(10_000);
+    await flushPromises();
+    expect(jobRequests).toBe(3);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(jobRequests).toBe(3);
+  });
+
+  it('does not poll Lite status while hidden and refreshes once when visible again', async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    setGatewayMode('lite');
+    let jobRequests = 0;
+    const fetchMock = vi.fn(async (input: string) => {
+      if (String(input).includes('/jobs?')) {
+        jobRequests += 1;
+        return new Response(JSON.stringify({ items: [{ id: 'hidden-lite-job', kind: 'download', status: 'running' }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(JobTable, { title: 'Daftar aktivitas', pollingMode: 'activity' });
+    await flushPromises();
+    expect(jobRequests).toBe(1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(jobRequests).toBe(1);
+
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await flushPromises();
+    expect(jobRequests).toBe(2);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/jobs/metrics?'))).toBe(false);
+  });
+
+  it('keeps Lite reports per file while hiding raw logs and worker event requests', async () => {
+    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.setAttribute('open', ''); },
+    });
+    Object.defineProperty(HTMLDialogElement.prototype, 'close', {
+      configurable: true,
+      value(this: HTMLDialogElement) { this.removeAttribute('open'); },
+    });
+    setGatewayMode('lite');
+    const job = {
+      id: 'lite-storage-report', kind: 'storage_upload', status: 'failed', profile: 'default', worker: 'remote-1',
+      payload: { provider: 'telegram' }, result: { value: { items: [
+        { name: 'episode-7.zip', path: 'Series/episode-7.zip', status: 'failed', error: 'Upload ditolak' },
+      ] } },
+    };
+    const calls: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes('/jobs?')) {
+        const query = new URL(url, 'http://localhost').searchParams;
+        return new Response(JSON.stringify({ items: query.get('kind') === 'storage_upload' ? [job] : [] }), { status: 200 });
+      }
+      if (url.endsWith('/jobs/lite-storage-report')) return new Response(JSON.stringify(job), { status: 200 });
+      return new Response(JSON.stringify({ items: [] }), { status: 200 });
+    }));
+
+    render(JobTable, { kind: 'storage_upload', view: 'history' });
+    expect(await screen.findByRole('button', { name: 'Report' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Log' })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Report' }));
+    expect(await screen.findByText('episode-7.zip')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Milestone' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Raw JSON' })).toBeNull();
+    expect(calls.some((url) => url.includes('/events') || url.includes('/log-snapshot'))).toBe(false);
   });
 });

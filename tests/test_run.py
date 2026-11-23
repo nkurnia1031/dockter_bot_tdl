@@ -1,4 +1,5 @@
 import tempfile
+import sqlite3
 import unittest
 import subprocess
 from pathlib import Path
@@ -240,6 +241,356 @@ class RunScriptTests(unittest.TestCase):
             "docker", "compose", "-f", "docker-compose.gateway.yml",
             "ps"
         ])
+
+    def test_gateway_compose_profile_follows_explicit_mode_and_defaults_full(self) -> None:
+        full = run.compose_env({"COMPOSE_FILE": "docker-compose.gateway.yml"})
+        lite = run.compose_env(
+            {
+                "COMPOSE_FILE": "docker-compose.gateway.yml",
+                "GATEWAY_MODE": "lite",
+            }
+        )
+
+        self.assertEqual(full["GATEWAY_MODE"], "full")
+        self.assertEqual(full["COMPOSE_PROFILES"], "full")
+        self.assertEqual(lite["GATEWAY_MODE"], "lite")
+        self.assertEqual(lite["COMPOSE_PROFILES"], "lite")
+
+    def test_lite_gateway_start_stops_full_only_services_before_starting_login_bot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = {
+                "COMPOSE_FILE": "docker-compose.gateway.yml",
+                "COMPOSE_CMD": "docker compose",
+                "DATABASE_ROOT": temp_dir,
+                "GATEWAY_MODE": "lite",
+            }
+            ps_result = subprocess.CompletedProcess(
+                args=["docker", "compose", "ps"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+            with (
+                patch.object(run, "_compose_available", return_value=True),
+                patch.object(run, "active_gateway_mode", return_value=None),
+                patch.object(
+                    run.subprocess,
+                    "run",
+                    side_effect=[ps_result, None, ps_result, None, None],
+                ) as subprocess_run,
+                patch("builtins.print"),
+            ):
+                run.run_compose(["up", "-d"], env)
+
+            initial_ps, admission_stop_call, final_ps, stop_call, up_call = (
+                subprocess_run.call_args_list
+            )
+            self.assertEqual(initial_ps.args[0][-3:], ["ps", "--all", "--services"])
+            self.assertEqual(initial_ps.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
+            self.assertEqual(admission_stop_call.args[0][-2:], ["stop", "backend"])
+            self.assertEqual(
+                admission_stop_call.kwargs["env"]["COMPOSE_PROFILES"], "full,lite"
+            )
+            self.assertEqual(final_ps.args[0][-3:], ["ps", "--all", "--services"])
+            self.assertEqual(final_ps.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
+            self.assertEqual(
+                stop_call.args[0][-7:],
+                ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
+            )
+            self.assertEqual(stop_call.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
+            self.assertEqual(up_call.args[0][-2:], ["up", "-d"])
+            self.assertEqual(up_call.kwargs["env"]["COMPOSE_PROFILES"], "lite")
+
+    def test_lite_cutover_blocks_before_stop_when_local_job_is_running(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_root = Path(temp_dir)
+            database_file = database_root / "gateway" / "storage.db"
+            database_file.parent.mkdir(parents=True)
+            with sqlite3.connect(database_file) as database:
+                database.execute(
+                    "CREATE TABLE jobs (id TEXT, worker TEXT, status TEXT, result TEXT, progress TEXT, updated_at TEXT)"
+                )
+                database.execute(
+                    "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                    ("local-job-123", "local", "running", None, "{}", "2026-11-22T00:00:00Z"),
+                )
+
+            env = {
+                "COMPOSE_FILE": "docker-compose.gateway.yml",
+                "COMPOSE_CMD": "docker compose",
+                "DATABASE_ROOT": str(database_root),
+                "GATEWAY_MODE": "lite",
+            }
+            ps_result = subprocess.CompletedProcess(
+                args=["docker", "compose", "ps"],
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+            with (
+                patch.object(run, "_compose_available", return_value=True),
+                patch.object(run.subprocess, "run", return_value=ps_result) as subprocess_run,
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, r"local-job-123.*running"
+                ) as raised:
+                    run.run_compose(["up", "-d"], env)
+
+            self.assertNotIn("secret", str(raised.exception).lower())
+            subprocess_run.assert_not_called()
+
+    def test_lite_cutover_blocks_terminal_job_needing_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_root = Path(temp_dir)
+            database_file = database_root / "gateway" / "storage.db"
+            database_file.parent.mkdir(parents=True)
+            with sqlite3.connect(database_file) as database:
+                database.execute(
+                    "CREATE TABLE jobs (id TEXT, worker TEXT, status TEXT, result TEXT, progress TEXT, updated_at TEXT)"
+                )
+                database.execute(
+                    "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        "local-job-ambiguous",
+                        "local",
+                        "failed",
+                        '{"value":{"items":[{"status":"needs_reconciliation"}]}}',
+                        "{}",
+                        "2026-11-22T00:00:00Z",
+                    ),
+                )
+
+            blockers = run.local_jobs_blocking_lite_cutover(database_file)
+
+            self.assertEqual(
+                blockers,
+                [("local-job-ambiguous", "needs_reconciliation")],
+            )
+
+    def test_lite_cutover_blocks_each_terminal_progress_reconciliation_marker(self) -> None:
+        progress_markers = (
+            '{"reconciliation_required":true}',
+            '{"outcome_uncertain":true}',
+        )
+        for index, progress in enumerate(progress_markers):
+            with self.subTest(progress=progress), tempfile.TemporaryDirectory() as temp_dir:
+                database_file = Path(temp_dir) / "storage.db"
+                with sqlite3.connect(database_file) as database:
+                    database.execute(
+                        "CREATE TABLE jobs (id TEXT, worker TEXT, status TEXT, result TEXT, progress TEXT, updated_at TEXT)"
+                    )
+                    job_id = f"local-job-progress-ambiguous-{index}"
+                    database.execute(
+                        "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            job_id,
+                            "local",
+                            "failed",
+                            '{"value":{"outcome":"failed"}}',
+                            progress,
+                            "2026-11-22T00:00:00Z",
+                        ),
+                    )
+
+                blockers = run.local_jobs_blocking_lite_cutover(database_file)
+
+                self.assertEqual(blockers, [(job_id, "needs_reconciliation")])
+
+    def test_lite_cutover_fails_closed_when_database_cannot_be_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env = {
+                "COMPOSE_FILE": "docker-compose.gateway.yml",
+                "COMPOSE_CMD": "docker compose",
+                "DATABASE_ROOT": temp_dir,
+                "GATEWAY_MODE": "lite",
+            }
+            ps_result = subprocess.CompletedProcess(
+                args=["docker", "compose", "ps"],
+                returncode=0,
+                stdout="worker-local\n",
+                stderr="",
+            )
+            with (
+                patch.object(run, "_compose_available", return_value=True),
+                patch.object(run.subprocess, "run", return_value=ps_result) as subprocess_run,
+                patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "database gateway tidak ditemukan"):
+                    run.run_compose(["up", "-d"], env)
+
+            subprocess_run.assert_called_once()
+            self.assertEqual(
+                subprocess_run.call_args.args[0][-3:], ["ps", "--all", "--services"]
+            )
+
+    def test_lite_cutover_fails_closed_when_jobs_table_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_file = Path(temp_dir) / "storage.db"
+            with sqlite3.connect(database_file):
+                pass
+
+            with self.assertRaisesRegex(RuntimeError, "jobs tidak ditemukan"):
+                run.local_jobs_blocking_lite_cutover(database_file)
+
+    def test_lite_cutover_fails_closed_when_jobs_schema_has_no_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_file = Path(temp_dir) / "storage.db"
+            with sqlite3.connect(database_file) as database:
+                database.execute(
+                    "CREATE TABLE jobs (id TEXT, worker TEXT, status TEXT, result TEXT)"
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "skema jobs tidak dapat diverifikasi"):
+                run.local_jobs_blocking_lite_cutover(database_file)
+
+    def test_lite_cutover_proceeds_when_local_jobs_are_terminal_and_reconciled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_root = Path(temp_dir)
+            database_file = database_root / "gateway" / "storage.db"
+            database_file.parent.mkdir(parents=True)
+            with sqlite3.connect(database_file) as database:
+                database.execute(
+                    "CREATE TABLE jobs (id TEXT, worker TEXT, status TEXT, result TEXT, progress TEXT, updated_at TEXT)"
+                )
+                database.execute(
+                    "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                    ("local-job-done", "local", "succeeded", '{"outcome":"succeeded"}', "{}", "2026-11-22T00:00:00Z"),
+                )
+
+            env = {
+                "COMPOSE_FILE": "docker-compose.gateway.yml",
+                "COMPOSE_CMD": "docker compose",
+                "DATABASE_ROOT": str(database_root),
+                "GATEWAY_MODE": "lite",
+            }
+            with (
+                patch.object(run, "_compose_available", return_value=True),
+                patch.object(run, "active_gateway_mode", return_value=None),
+                patch.object(run.subprocess, "run", side_effect=[None, None, None]) as subprocess_run,
+                patch("builtins.print"),
+            ):
+                run.run_compose(["up", "-d"], env)
+
+            self.assertEqual(subprocess_run.call_count, 3)
+            self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
+            self.assertEqual(subprocess_run.call_args_list[1].args[0][-7], "stop")
+            self.assertEqual(subprocess_run.call_args_list[2].args[0][-2:], ["up", "-d"])
+            self.assertEqual(subprocess_run.call_args_list[2].kwargs["env"]["COMPOSE_PROFILES"], "lite")
+
+    def test_lite_cutover_rechecks_after_admission_stop_and_restores_previous_full_mode(self) -> None:
+        env = {
+            "COMPOSE_FILE": "docker-compose.gateway.yml",
+            "COMPOSE_CMD": "docker compose",
+            "GATEWAY_MODE": "lite",
+        }
+        with (
+            patch.object(run, "_compose_available", return_value=True),
+            patch.object(
+                run,
+                "guard_lite_gateway_cutover",
+                side_effect=[None, RuntimeError("late local job")],
+            ),
+            patch.object(run, "active_gateway_mode", return_value="full"),
+            patch.object(run.subprocess, "run", return_value=None) as subprocess_run,
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "late local job"):
+                run.run_compose(["up", "-d"], env)
+
+        self.assertEqual(subprocess_run.call_count, 3)
+        self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
+        inactive_stop, recovery = subprocess_run.call_args_list[1:]
+        self.assertEqual(inactive_stop.args[0][-2:], ["stop", "telegram-login"])
+        self.assertEqual(recovery.args[0][-2:], ["up", "-d"])
+        self.assertEqual(recovery.kwargs["env"]["GATEWAY_MODE"], "full")
+        self.assertEqual(recovery.kwargs["env"]["COMPOSE_PROFILES"], "full")
+
+    def test_failed_lite_restart_restores_lite_without_starting_full_services(self) -> None:
+        env = {
+            "COMPOSE_FILE": "docker-compose.gateway.yml",
+            "COMPOSE_CMD": "docker compose",
+            "GATEWAY_MODE": "lite",
+        }
+        with (
+            patch.object(run, "_compose_available", return_value=True),
+            patch.object(
+                run,
+                "guard_lite_gateway_cutover",
+                side_effect=[None, RuntimeError("late preflight failure")],
+            ),
+            patch.object(run, "active_gateway_mode", return_value="lite"),
+            patch.object(run.subprocess, "run", return_value=None) as subprocess_run,
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "late preflight failure"):
+                run.run_compose(["up", "-d"], env)
+
+        self.assertEqual(subprocess_run.call_count, 3)
+        self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
+        self.assertEqual(
+            subprocess_run.call_args_list[1].args[0][-7:],
+            ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
+        )
+        restore = subprocess_run.call_args_list[2]
+        self.assertEqual(restore.args[0][-2:], ["up", "-d"])
+        self.assertEqual(restore.kwargs["env"]["GATEWAY_MODE"], "lite")
+        self.assertEqual(restore.kwargs["env"]["COMPOSE_PROFILES"], "lite")
+
+    def test_failed_admission_stop_restores_previous_gateway_mode(self) -> None:
+        env = {
+            "COMPOSE_FILE": "docker-compose.gateway.yml",
+            "COMPOSE_CMD": "docker compose",
+            "GATEWAY_MODE": "lite",
+        }
+        with (
+            patch.object(run, "_compose_available", return_value=True),
+            patch.object(run, "guard_lite_gateway_cutover", return_value=None),
+            patch.object(run, "active_gateway_mode", return_value="full"),
+            patch.object(
+                run, "stop_gateway_admission", side_effect=RuntimeError("stop failed")
+            ) as stop_admission,
+            patch.object(run, "restore_gateway_after_aborted_lite_cutover") as restore,
+            patch("builtins.print"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stop failed"):
+                run.run_compose(["up", "-d"], env)
+
+        stop_admission.assert_called_once_with(env)
+        restore.assert_called_once_with(env, "full")
+
+    def test_full_gateway_start_stops_lite_login_poller(self) -> None:
+        env = {
+            "COMPOSE_FILE": "docker-compose.gateway.yml",
+            "COMPOSE_CMD": "docker compose",
+            "GATEWAY_MODE": "full",
+        }
+        with (
+            patch.object(run, "_compose_available", return_value=True),
+            patch.object(run.subprocess, "run") as subprocess_run,
+            patch("builtins.print"),
+        ):
+            run.run_compose(["up", "-d"], env)
+
+        stop_call, _up_call = subprocess_run.call_args_list
+        self.assertEqual(stop_call.args[0][-2:], ["stop", "telegram-login"])
+
+    def test_gateway_restart_reconciles_selected_compose_profile(self) -> None:
+        env = {
+            "COMPOSE_FILE": "docker-compose.gateway.yml",
+            "GATEWAY_MODE": "lite",
+        }
+        with (
+            patch.object(run, "load_env_file", return_value=env),
+            patch.object(run, "require_env_file"),
+            patch.object(run, "run_compose") as run_compose,
+            patch.object(run.sys, "argv", ["run.py", "restart"]),
+        ):
+            self.assertEqual(run.main(), 0)
+
+        run_compose.assert_called_once_with(
+            ["up", "-d", "--remove-orphans", "--force-recreate"], env
+        )
 
     def test_static_web_install_preserves_aapanel_files_and_replaces_managed_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -169,6 +169,8 @@ class WorkerResponse(ApiResponse):
     public_url: str = ""
     selected: bool = False
     enabled: bool = True
+    health_status: str = "unknown"
+    health_checked_at: str | None = None
 
 
 class WorkerListResponse(ApiResponse):
@@ -249,6 +251,10 @@ class ObjectResponse(ApiResponse):
     """Typed object envelope for small mutation/settings responses."""
 
     model_config = ConfigDict(extra="allow")
+
+
+class RuntimeModeResponse(ApiResponse):
+    mode: Literal["full", "lite"]
 
 
 class ChallengeTokenRequest(BaseModel):

@@ -99,7 +99,12 @@
     if (requireProfile && !profile) {
       profile = session.selectedTargetProfile || session.current.actor?.profile || session.current.profiles[0] || '';
     }
-    if (!worker) worker = session.workers.find((item) => item.enabled !== false)?.name || session.current.actor?.worker_route || 'local';
+    if (session.workers.length && !session.workers.some((item) => item.name === worker)) {
+      worker = session.workers.find((item) => item.name === session.current.actor?.worker_route && item.enabled !== false)?.name
+        || session.workers.find((item) => item.enabled !== false)?.name
+        || session.workers[0]?.name
+        || '';
+    }
   });
 
   function invalidate() {

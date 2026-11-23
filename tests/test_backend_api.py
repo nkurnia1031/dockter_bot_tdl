@@ -1,4 +1,5 @@
 import hashlib
+import asyncio
 import tempfile
 import unittest
 import base64
@@ -11,9 +12,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
+from fastapi import Request
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -27,6 +29,7 @@ from tme3bot.domain.models import Actor, DomainError, Job, JobEvent, JobStatus
 from tme3bot.export_catalog import ExportArtifactCatalog
 from tme3bot.infrastructure.auth import BotAuthService, SqliteAuthRepository
 from tme3bot.infrastructure.activity_journal import ActivityJournalStore
+from tme3bot.infrastructure.database_compaction import DatabaseCompactionService
 from tme3bot.infrastructure.decrypt_history_store import SqliteDecryptHistoryStore
 from tme3bot.infrastructure.device_auth import DeviceAuthService, challenge_payload
 from tme3bot.infrastructure.job_store import SqliteJobRepository
@@ -69,6 +72,22 @@ class FakeProfiles:
 
 
 class JobDictionaryTests(unittest.TestCase):
+    def test_public_job_payload_hides_worker_only_reconciliation_marker(self):
+        job = Job(
+            id="reconcile-job", kind="storage_reconcile", profile="default",
+            actor_user_id=42, worker="remote-1", status=JobStatus.QUEUED,
+            payload={
+                "source_job_id": "upload-job",
+                "provider": "telegram",
+                "_storage_reconcile_final_for_source": True,
+            },
+        )
+
+        public = job_dict(job)
+
+        self.assertEqual(public["payload"]["provider"], "telegram")
+        self.assertNotIn("_storage_reconcile_final_for_source", public["payload"])
+
     def test_public_storage_results_hide_worker_file_identity(self):
         job = Job(
             id="move-job", kind="storage_upload", profile="default", actor_user_id=42,
@@ -701,6 +720,354 @@ class BackendApiTests(unittest.TestCase):
         self.app = create_backend_app(context)
         self.client = TestClient(self.app)
 
+    def test_runtime_mode_is_public_and_reports_only_mode(self):
+        response = self.client.get("/api/v1/runtime/mode")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"mode": "full"})
+
+        self.context.config.gateway_mode = "lite"
+        lite_response = self.client.get("/api/v1/runtime/mode")
+
+        self.assertEqual(lite_response.json(), {"mode": "lite"})
+
+    def test_lite_worker_options_hide_local_targets_but_keep_remote_workers(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker-local:8080"
+        self.context.config.worker_endpoints = {"local-alias": "http://worker-local:8080/"}
+        self.profiles.base_config = type("Config", (), {
+            "worker_local_url": "http://worker-local:8080",
+            "worker_endpoints": {"local-alias": "http://worker-local:8080/"},
+        })()
+        self.workers.values["worker-local"] = {
+            "url": "http://worker-local:8080", "token": "secret", "enabled": True,
+            "public_url": "",
+        }
+        self.workers.values["local-alias"] = {
+            "url": "http://worker-local:8080/", "token": "secret", "enabled": True,
+            "public_url": "",
+        }
+        self.workers.values["remote-1"] = {
+            "url": "https://worker1.example.test", "token": "secret", "enabled": True,
+            "public_url": "",
+        }
+
+        worker_list = self.client.get("/api/v1/workers", headers=headers)
+        self.assertEqual(worker_list.status_code, 200, worker_list.text)
+        self.assertEqual([item["name"] for item in worker_list.json()["items"]], ["remote-1"])
+
+        rejected_local_alias = self.client.post(
+            "/api/v1/context/verify",
+            headers=headers,
+            json={"purpose": "export", "profile": "default", "worker": "local-alias"},
+        )
+        self.assertEqual(rejected_local_alias.status_code, 409)
+        self.assertEqual(
+            rejected_local_alias.json()["error"]["code"], "LITE_REMOTE_WORKER_REQUIRED"
+        )
+
+        self.context.profile_provisioner = FakeProfileProvisioner()
+        profile_management = self.client.get("/api/v1/profiles/management", headers=headers)
+        self.assertEqual(profile_management.status_code, 200, profile_management.text)
+        self.assertEqual(
+            [item["name"] for item in profile_management.json()["workers"]], ["remote-1"]
+        )
+
+        tts_workers = self.client.get("/api/v1/tts/workers", headers=headers)
+        self.assertEqual(tts_workers.status_code, 200, tts_workers.text)
+        self.assertEqual([item["name"] for item in tts_workers.json()["items"]], ["remote-1"])
+
+    def test_lite_rejects_direct_scan_and_worker_operations_for_local_aliases(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker-local:8080"
+        self.context.config.worker_endpoints = {"local-alias": "http://worker-local:8080/"}
+        self.workers.values["local-alias"] = {
+            "url": "http://worker-local:8080/", "token": "secret", "enabled": True,
+            "public_url": "",
+        }
+        scan_calls = []
+        self.dispatcher.scan_local_profiles = lambda worker: scan_calls.append(worker) or {"items": []}
+        self.dispatcher.profile_local_inventory = lambda worker: scan_calls.append(worker) or {"items": []}
+        auth = self.login(42)
+
+        for worker in ("local", "local-alias"):
+            with self.subTest(worker=worker):
+                targeted_scan = self.client.post(
+                    "/api/v1/profiles/local/scan/worker",
+                    headers=auth,
+                    json={"worker": worker},
+                )
+                self.assertEqual(targeted_scan.status_code, 409, targeted_scan.text)
+                self.assertEqual(
+                    targeted_scan.json()["error"]["code"], "LITE_REMOTE_WORKER_REQUIRED"
+                )
+
+                direct_scan = self.client.post(
+                    f"/api/v1/workers/{worker}/profiles/scan", headers=auth
+                )
+                self.assertEqual(direct_scan.status_code, 409, direct_scan.text)
+                inventory = self.client.get(
+                    f"/api/v1/workers/{worker}/profiles/local", headers=auth
+                )
+                self.assertEqual(inventory.status_code, 409, inventory.text)
+
+        aria2 = self.client.get("/api/v1/workers/local/aria2/health", headers=auth)
+        self.assertEqual(aria2.status_code, 409, aria2.text)
+        self.assertEqual(scan_calls, [])
+        self.assertEqual(self.dispatcher.aria2_health_calls, [])
+
+    def test_lite_hides_saved_local_profile_catalog_and_scan_results(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker"
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test", "token": "remote-secret",
+            "enabled": True, "public_url": "",
+        }
+        self.local_profile_catalog.replace_scan(
+            checked_at="2026-11-22T00:00:00Z",
+            workers=[
+                {"name": "local", "status": "success", "checked_at": "local-scan"},
+                {"name": "remote-1", "status": "success", "checked_at": "remote-scan"},
+            ],
+            inventories=[
+                {"worker": "local", "checked_at": "local-scan", "items": [{
+                    "name": "local-profile", "ready": True, "reason_codes": [], "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": True, "code": "OK"},
+                    ],
+                }]},
+                {"worker": "remote-1", "checked_at": "remote-scan", "items": [{
+                    "name": "remote-profile", "ready": True, "reason_codes": [], "checks": [
+                        {"name": "identity", "ready": True, "code": "OK"},
+                        {"name": "root_session", "ready": True, "code": "OK"},
+                        {"name": "user1_session", "ready": True, "code": "OK"},
+                    ],
+                }]},
+            ],
+        )
+        auth = self.login(42)
+
+        catalog = self.client.get("/api/v1/profiles/local", headers=auth)
+        self.assertEqual(catalog.status_code, 200, catalog.text)
+        self.assertEqual([item["name"] for item in catalog.json()["workers"]], ["remote-1"])
+        self.assertEqual([item["worker"] for item in catalog.json()["inventories"]], ["remote-1"])
+        self.assertNotIn("local-profile", catalog.text)
+
+        self.runtime_readiness_store.apply_export_scan(
+            checked_at="2026-11-22T00:01:00Z",
+            workers=[
+                {"worker": "local", "status": "success"},
+                {"worker": "remote-1", "status": "success"},
+            ],
+            profiles={
+                "local": [{"profile": "local-profile", "ready": True}],
+                "remote-1": [{"profile": "remote-profile", "ready": True}],
+            },
+        )
+        catalog = self.client.get("/api/v1/profiles/local", headers=auth)
+        readiness = catalog.json()["runtime_readiness"]
+        self.assertEqual([item["name"] for item in readiness["workers"]], ["remote-1"])
+        self.assertEqual([item["worker"] for item in readiness["cells"]], ["remote-1"])
+        self.assertNotIn("local-profile", catalog.text)
+
+        global_operation, _ = self.profile_scan_store.create(42)
+        self.profile_scan_store.report_worker(
+            global_operation["id"], "local", "succeeded", profiles=["local-profile"]
+        )
+        self.profile_scan_store.report_worker(
+            global_operation["id"], "remote-1", "succeeded", profiles=["remote-profile"]
+        )
+        self.profile_scan_store.set_status(global_operation["id"], "succeeded")
+        self.profile_scan_store.append_log(
+            global_operation["id"], worker="local", runtime="download", kind="output",
+            stream="stdout", text="local-only scan output",
+        )
+        self.profile_scan_store.append_log(
+            global_operation["id"], worker="remote-1", runtime="download", kind="output",
+            stream="stdout", text="remote scan output",
+        )
+
+        operation = self.client.get(
+            f"/api/v1/profiles/local/scan/{global_operation['id']}", headers=auth
+        )
+        self.assertEqual(operation.status_code, 200, operation.text)
+        self.assertEqual(
+            [item["name"] for item in operation.json()["progress"]["workers"]], ["remote-1"]
+        )
+        self.assertNotIn("local-profile", operation.text)
+        self.assertNotIn("local-only scan output", operation.text)
+        local_logs = self.client.get(
+            f"/api/v1/profiles/local/scan/{global_operation['id']}/logs?worker=local",
+            headers=auth,
+        )
+        self.assertEqual(local_logs.status_code, 409, local_logs.text)
+        remote_logs = self.client.get(
+            f"/api/v1/profiles/local/scan/{global_operation['id']}/logs?worker=remote-1",
+            headers=auth,
+        )
+        self.assertEqual(remote_logs.status_code, 200, remote_logs.text)
+        self.assertEqual([event["text"] for event in remote_logs.json()["events"]], ["remote scan output"])
+
+        local_operation, _ = self.profile_scan_store.create(
+            42, target={"kind": "worker", "worker": "local"}
+        )
+        local_target = self.client.get(
+            f"/api/v1/profiles/local/scan/{local_operation['id']}", headers=auth
+        )
+        self.assertEqual(local_target.status_code, 404, local_target.text)
+
+    def test_lite_tts_submit_uses_health_snapshot_before_capability_probe(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker"
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test", "token": "remote-secret",
+            "enabled": True, "public_url": "",
+        }
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "offline", "healthy": False}
+
+        self.control.worker_health_cache = Health()
+        capability_calls = []
+        original_capabilities = self.dispatcher.capabilities
+        self.dispatcher.capabilities = lambda worker: capability_calls.append(worker) or original_capabilities(worker)
+        response = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=self.login(42),
+            json={"worker": "remote-1", "title": "Bab", "text": "contoh"},
+        )
+
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertEqual(response.json()["error"]["code"], "WORKER_OFFLINE")
+        self.assertEqual(capability_calls, [])
+        self.assertEqual(self.jobs.count(), 0)
+
+    def test_lite_tts_submit_to_healthy_worker_does_not_probe_capabilities(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker"
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test", "token": "remote-secret",
+            "enabled": True, "public_url": "",
+        }
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        capability_calls = []
+        original_capabilities = self.dispatcher.capabilities
+        self.dispatcher.capabilities = lambda worker: capability_calls.append(worker) or original_capabilities(worker)
+        response = self.client.post(
+            "/api/v1/tts/jobs",
+            headers=self.login(42),
+            json={"worker": "remote-1", "title": "Bab", "text": "contoh"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(capability_calls, [])
+        self.assertEqual(self.jobs.count(), 1)
+        self.assertTrue(self.dispatcher.commands)
+        command = self.dispatcher.commands[-1][1]
+        self.assertTrue(command["payload"]["_tdl_sender_profiles_use_worker_inventory"])
+
+    def test_database_compaction_diagnostics_are_authenticated_and_hide_paths(self):
+        self.context.database_compaction_service = DatabaseCompactionService(
+            self.jobs, min_free_bytes=12345, interval_seconds=3600
+        )
+
+        denied = self.client.get("/api/v1/diagnostics/database-compaction")
+        allowed = self.client.get(
+            "/api/v1/diagnostics/database-compaction", headers=self.login()
+        )
+
+        self.assertEqual(denied.status_code, 401)
+        self.assertEqual(allowed.status_code, 200)
+        self.assertEqual(allowed.json()["threshold_bytes"], 12345)
+        self.assertEqual(allowed.json()["last_result"]["outcome"], "not_run")
+        self.assertNotIn(str(self.temp.name), allowed.text)
+        self.assertNotIn("database_path", allowed.json())
+
+    def test_internal_worker_event_interrupts_compaction_before_repository_write(self):
+        job_id = str(uuid.uuid4())
+        self.jobs.create(
+            Job(
+                id=job_id,
+                kind="export",
+                profile="default",
+                actor_user_id=42,
+                worker="local",
+                status=JobStatus.SUCCEEDED,
+                payload={},
+            )
+        )
+        with sqlite3.connect(str(self.jobs.path)) as db:
+            db.execute("CREATE TABLE disposable_payload (value BLOB)")
+            db.execute("INSERT INTO disposable_payload VALUES(?)", (b"x" * 16_000_000,))
+            db.execute("DELETE FROM disposable_payload")
+
+        request_seen = threading.Event()
+
+        class TrackingCompactionService(DatabaseCompactionService):
+            def begin_database_activity(inner_self):
+                super().begin_database_activity()
+                request_seen.set()
+
+        service = TrackingCompactionService(self.jobs, min_free_bytes=1)
+        self.context.database_compaction_service = service
+        compaction_preflight = threading.Event()
+        continue_compaction = threading.Event()
+        database_space = self.jobs._database_space
+
+        def wait_before_vacuum(connection):
+            stats = database_space(connection)
+            if not compaction_preflight.is_set():
+                compaction_preflight.set()
+                continue_compaction.wait(2)
+            return stats
+
+        self.jobs._database_space = wait_before_vacuum
+        results = []
+        thread = threading.Thread(target=lambda: results.append(service.tick()))
+        thread.start()
+        responses = []
+        try:
+            self.assertTrue(compaction_preflight.wait(2))
+            request_thread = threading.Thread(
+                target=lambda: responses.append(
+                    self.client.post(
+                        f"/internal/v1/jobs/{job_id}/events",
+                        headers={"Authorization": "Bearer internal"},
+                        json={
+                            "sequence": 1,
+                            "status": "succeeded",
+                            "event_type": "completed",
+                            "worker": "local",
+                        },
+                    )
+                )
+            )
+            request_thread.start()
+            self.assertTrue(request_seen.wait(2))
+            continue_compaction.set()
+            request_thread.join(timeout=2)
+        finally:
+            continue_compaction.set()
+            thread.join(timeout=2)
+
+        self.assertEqual(len(responses), 1)
+        self.assertEqual(responses[0].status_code, 200, responses[0].text)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0]["outcome"], "deferred_activity")
+
     def seed_tdl_access(self, worker="local", purpose="tts", profiles=None):
         capabilities = self.dispatcher.capabilities(worker)
         if purpose == "storage":
@@ -906,13 +1273,26 @@ class BackendApiTests(unittest.TestCase):
         self.assertNotIn("input", submitted.json())
         self.assertEqual(submitted.json()["status"], "queued")
         self.assertEqual(submitted.json()["revision"], 1)
+        poll_request_id = str(uuid.uuid4())
+        poll = self.client.get(
+            f"/api/v1/operations/{operation_id}",
+            headers={**auth, "X-Request-ID": poll_request_id},
+        )
+        self.assertEqual(poll.status_code, 200)
+        with sqlite3.connect(self.activity_journal.path) as db:
+            poll_rows = db.execute(
+                "SELECT COUNT(*) FROM api_activity WHERE request_id = ? "
+                "AND activity_type = 'request'",
+                (poll_request_id,),
+            ).fetchone()[0]
+        self.assertEqual(poll_rows, 0)
         correlated = self.client.get(
             f"/api/v1/activity?request_id={operation_request_id}", headers=auth
         )
         self.assertEqual(correlated.status_code, 200, correlated.text)
         correlated_items = correlated.json()["items"]
         self.assertEqual(
-            {item["activity_type"] for item in correlated_items}, {"request", "operation"}
+            {item["activity_type"] for item in correlated_items}, {"operation"}
         )
         lifecycle = next(
             item for item in correlated_items if item["activity_type"] == "operation"
@@ -964,10 +1344,15 @@ class BackendApiTests(unittest.TestCase):
         self.context.queue_command_service = object()
         client = TestClient(create_backend_app(self.context))
         auth = self.login(42)
+        request_id = str(uuid.uuid4())
 
         response = client.post(
             "/api/v1/operations",
-            headers={**auth, "Idempotency-Key": "background-job-1"},
+            headers={
+                **auth,
+                "Idempotency-Key": "background-job-1",
+                "X-Request-ID": request_id,
+            },
             json={
                 "kind": "job.submit",
                 "target": {"profile": "default", "worker": "local"},
@@ -987,6 +1372,32 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(job.status.value, "queued")
         self.assertEqual(job.worker, "local")
         self.assertEqual(self.jobs.command_payload(job.id)["dispatch_mode"], "durable")
+        with sqlite3.connect(self.activity_journal.path) as db:
+            audit = db.execute(
+                "SELECT job_id, operation_id FROM api_activity "
+                "WHERE request_id = ? AND activity_type = 'request'",
+                (request_id,),
+            ).fetchone()
+        self.assertEqual(audit, (job.id, operation.id))
+        self.jobs.append_event(JobEvent(
+            job_id=job.id,
+            sequence=1,
+            status=JobStatus.RUNNING,
+            event_type="started",
+        ))
+        self.jobs.append_event(JobEvent(
+            job_id=job.id,
+            sequence=2,
+            status=JobStatus.SUCCEEDED,
+            event_type="succeeded",
+        ))
+        self.jobs.prune_terminal_history(retain=0)
+        with sqlite3.connect(self.activity_journal.path) as db:
+            audit_count = db.execute(
+                "SELECT COUNT(*) FROM api_activity WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()[0]
+        self.assertEqual(audit_count, 0)
 
     def test_backup_verification_submit_accepts_private_archive_password_snapshot(self):
         self.catalog.start_backup_run("backup-run-1", "local")
@@ -3540,6 +3951,57 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(self.jobs.list(), [])
         self.assertEqual(self.dispatcher.commands, [])
 
+    def test_lite_keeps_manual_backup_and_worker_diagnostics_available(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.backup_scheduler = type("Scheduler", (), {"scheduling_enabled": False})()
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test",
+            "token": "remote-secret",
+            "enabled": True,
+        }
+        self.dispatcher.profile_tdl_diagnostic_result["worker"] = "remote-1"
+
+        class Health:
+            @staticmethod
+            def snapshot(worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        self.catalog.start_backup_run("manual-lite-run", "remote-1")
+        self.catalog.finish_backup_run("manual-lite-run", "remote-1")
+        self.control.utility_settings = self.context.utility_settings
+        self.context.queue_publisher = object()
+        self.context.queue_command_service = object()
+        client = TestClient(create_backend_app(self.context))
+
+        class ManualBackup:
+            def start_now(self):
+                return "manual-lite-run"
+
+        self.context.backup_coordinator = ManualBackup()
+        headers = self.login()
+
+        status = client.get("/api/v1/backups/status", headers=headers)
+        manual = client.post("/api/v1/backups", headers=headers)
+        diagnostic = client.post(
+            "/api/v1/backups/tdl-diagnostics",
+            headers=headers,
+            json={"worker": "remote-1", "profile": "default"},
+        )
+        verification = client.post(
+            "/api/v1/backups/verify",
+            headers={**headers, "Idempotency-Key": "manual-lite-verify"},
+            json={"worker": "remote-1", "profile": "default", "run_id": "manual-lite-run"},
+        )
+
+        self.assertFalse(status.json()["scheduled_enabled"])
+        self.assertEqual(manual.status_code, 200)
+        self.assertEqual(manual.json(), {"run_id": "manual-lite-run"})
+        self.assertEqual(diagnostic.status_code, 200, diagnostic.text)
+        self.assertEqual(verification.status_code, 202, verification.text)
+        self.assertEqual(self.jobs.get(verification.json()["id"]).kind, "backup_verify")
+
     def test_backup_tdl_diagnostics_requires_auth_and_returns_worker_profile_pair(self):
         denied = self.client.post(
             "/api/v1/backups/tdl-diagnostics",
@@ -4507,6 +4969,12 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(accepted.status_code, 200, accepted.text)
         self.assertEqual(accepted.json()["kind"], "utility")
         self.assertEqual(accepted.json()["status"], "dispatched")
+        with sqlite3.connect(self.activity_journal.path) as db:
+            audit = db.execute(
+                "SELECT job_id, profile, worker FROM api_activity "
+                "WHERE route='/api/v1/utility/jobs' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertEqual(audit, (accepted.json()["id"], "default", "local"))
         self.assertIsNone(self.runtime_readiness_store.cell("local", None, "utility"))
         self.assertEqual(checker_calls, [])
 
@@ -4924,7 +5392,7 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(payload["code"], "TOKEN_REQUIRED")
         self.assertTrue(payload["request_id"])
 
-    def test_activity_journal_captures_public_metadata_and_redacts_request_content(self):
+    def test_activity_journal_omits_unlinked_request_noise(self):
         async def echo_body(body: dict):
             return {"echo": body}
 
@@ -4985,14 +5453,7 @@ class BackendApiTests(unittest.TestCase):
         response = self.client.get("/api/v1/activity?limit=200", headers=headers)
         self.assertEqual(response.status_code, 200, response.text)
         entries = response.json()["items"]
-        by_route = {item["route"]: item for item in entries}
-        self.assertEqual(by_route["/api/v1/workers"]["status_code"], 200)
-        self.assertEqual(by_route["/api/v1/workers"]["actor_user_id"], 42)
-        self.assertEqual(by_route["/api/v1/workers"]["profile"], "default")
-        self.assertEqual(by_route["/api/v1/me"]["error_code"], "TOKEN_REQUIRED")
-        self.assertEqual(by_route["/api/v1/diagnostics/tts/logs"]["error_code"], "VALIDATION_ERROR")
-        self.assertEqual(by_route["/api/v1/test/activity-fail"]["error_code"], "ACTIVITY_TEST_FAILURE")
-        self.assertEqual(by_route["/api/v1/test/activity-echo"]["request_id"] != sentinels[4], True)
+        self.assertEqual(entries, [])
         self.assertEqual(response.json()["retention_days"], 90)
         self.assertFalse(any("/internal/v1/" in item["route"] for item in entries))
         self.assertFalse(any(item["route"] == "/healthz" for item in entries))
@@ -5004,13 +5465,13 @@ class BackendApiTests(unittest.TestCase):
 
         page = self.client.get("/api/v1/activity?limit=1&method=POST", headers=headers)
         self.assertEqual(page.status_code, 200)
-        self.assertTrue(page.json()["next_cursor"])
+        self.assertFalse(page.json()["next_cursor"])
         filtered = self.client.get(
             "/api/v1/activity?method=GET&status_code=401&route=%2Fapi%2Fv1%2Fme",
             headers=headers,
         )
         self.assertEqual(filtered.status_code, 200)
-        self.assertTrue(all(item["status_code"] == 401 for item in filtered.json()["items"]))
+        self.assertEqual(filtered.json()["items"], [])
 
         with sqlite3.connect(self.activity_journal.path) as db:
             stored = repr(db.execute("SELECT * FROM api_activity").fetchall())
@@ -5018,6 +5479,35 @@ class BackendApiTests(unittest.TestCase):
         journal_payload = activity_response.text + stored
         for sentinel in sentinels:
             self.assertNotIn(sentinel, journal_payload)
+
+    def test_cancelled_activity_journal_write_releases_compaction_lease(self):
+        service = DatabaseCompactionService(self.jobs, min_free_bytes=1)
+        self.context.database_compaction_service = service
+        job_id = str(uuid.uuid4())
+
+        async def linked_request(request: Request):
+            request.state.activity_jobs = [{
+                "job_id": job_id, "profile": "default", "worker": "remote-1"
+            }]
+            return {"accepted": True}
+
+        self.app.add_api_route(
+            "/api/v1/test/cancelled-audit",
+            linked_request,
+            methods=["POST"],
+            include_in_schema=False,
+        )
+
+        async def cancel_audit_write(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        with patch("tme3bot.api.backend.run_in_threadpool", new=cancel_audit_write):
+            try:
+                self.client.post("/api/v1/test/cancelled-audit", headers=self.login())
+            except BaseException:
+                pass
+
+        self.assertEqual(service.status()["active_database_activities"], 0)
 
     def test_utility_settings_explain_allowed_values_without_exposing_password(self):
         headers = self.login()
@@ -6326,6 +6816,89 @@ class BackendApiTests(unittest.TestCase):
         target = client.get(target_path, headers={"Authorization": "Bearer internal"})
         self.assertEqual(target.status_code, 200, target.text)
         self.assertEqual(target.json(), {"purpose": "storage", "target": "123"})
+
+    def test_lite_tdl_access_submit_does_not_probe_remote_profile_inventory(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker-local:8080"
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test", "token": "remote-secret",
+            "enabled": True, "public_url": "",
+        }
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+        capability_calls = []
+        self.dispatcher.capabilities = lambda worker: capability_calls.append(worker) or {}
+        prepared = self.control.prepare_durable_job(
+            self.control.actor(42),
+            {"profile": "default", "worker": "remote-1"},
+            {"job_kind": "tdl_access_verify", "payload": {"purpose": "storage"}},
+        )
+
+        self.assertEqual(capability_calls, [])
+        self.assertEqual(
+            prepared.command_payload["payload"]["candidate_profiles"], []
+        )
+        self.assertEqual(prepared.job.worker, "remote-1")
+
+    def test_lite_tdl_access_status_hides_local_and_uses_saved_remote_inventory(self):
+        self.context.config.gateway_mode = "lite"
+        self.control.gateway_mode = "lite"
+        self.context.config.worker_local_url = "http://worker-local:8080"
+        self.context.config.worker_endpoints = {
+            "local-alias": "http://worker-local:8080/"
+        }
+        self.profiles.base_config = type("Config", (), {
+            "worker_local_url": "http://worker-local:8080",
+            "worker_endpoints": {"local-alias": "http://worker-local:8080/"},
+        })()
+        self.control.local_profile_catalog = self.local_profile_catalog
+        self.workers.values["local-alias"] = {
+            "url": "http://worker-local:8080/", "token": "secret",
+            "enabled": True, "public_url": "",
+        }
+        self.workers.values["remote-1"] = {
+            "url": "https://remote-1.example.test", "token": "remote-secret",
+            "enabled": True, "public_url": "",
+        }
+        self.local_profile_catalog.replace_scan(
+            checked_at="2026-11-22T00:00:00Z",
+            workers=[{"name": "remote-1", "status": "success"}],
+            inventories=[{
+                "worker": "remote-1",
+                "items": [{"name": "remote-profile", "ready": True}],
+            }],
+        )
+        store = self.control.tdl_access_store
+        destination_hash = store.destination_fingerprint("123")
+        inventory_hash = store.inventory_fingerprint(["remote-profile"])
+        store.replace_results(
+            "remote-1", "storage", destination_hash, inventory_hash,
+            [{"profile": "remote-profile", "ready": True}],
+        )
+        capability_calls = []
+        self.dispatcher.capabilities = lambda worker: capability_calls.append(worker) or {}
+        headers = self.login(42)
+
+        local = self.client.get(
+            "/api/v1/tdl-access/verification?purpose=storage&worker=local-alias",
+            headers=headers,
+        )
+        remote = self.client.get(
+            "/api/v1/tdl-access/verification?purpose=storage&worker=remote-1",
+            headers=headers,
+        )
+
+        self.assertEqual(local.status_code, 409, local.text)
+        self.assertEqual(local.json()["error"]["code"], "LITE_REMOTE_WORKER_REQUIRED")
+        self.assertEqual(remote.status_code, 200, remote.text)
+        self.assertTrue(remote.json()["ready"])
+        self.assertEqual(remote.json()["verified_profiles"], ["remote-profile"])
+        self.assertEqual(capability_calls, [])
 
     def test_tdl_access_status_invalidates_when_worker_inventory_changes(self):
         self.dispatcher.tts_ready = True

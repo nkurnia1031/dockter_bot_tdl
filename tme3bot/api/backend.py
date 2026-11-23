@@ -44,6 +44,7 @@ from tme3bot.api.schemas import (
     LogoutResponse,
     ObjectResponse,
     RefreshRequest,
+    RuntimeModeResponse,
     ServiceExchangeRequest,
     SettingRequest,
     SourceListResponse,
@@ -77,6 +78,7 @@ from tme3bot.profile_provisioning import profile_transfer_is_secure
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
 from tme3bot.utility import utility_setting_specs
+from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -100,7 +102,9 @@ class BackendContext:
     backup_coordinator: Any = None
     bot: Any = None
     worker_dispatcher: Any = None
+    worker_health_monitor: Any = None
     storage_maintenance: Any = None
+    database_compaction_service: Any = None
     runtime_settings: Any = None
     runtime_settings_store: Any = None
     backup_scheduler: Any = None
@@ -182,6 +186,19 @@ def _hide_worker_file_identity(value: Any) -> Any:
     return value
 
 
+def _hide_internal_job_payload(value: Any) -> Any:
+    """Keep worker-only reconciliation markers out of the public job API."""
+    if isinstance(value, dict):
+        return {
+            key: _hide_internal_job_payload(item)
+            for key, item in value.items()
+            if str(key) != "_storage_reconcile_final_for_source"
+        }
+    if isinstance(value, list):
+        return [_hide_internal_job_payload(item) for item in value]
+    return value
+
+
 def job_dict(job: Job) -> dict[str, Any]:
     retry_meta = job.payload.get("quick_retry")
     if not isinstance(retry_meta, dict):
@@ -238,7 +255,7 @@ def job_dict(job: Job) -> dict[str, Any]:
         "worker": job.worker,
         "settings_version": job.settings_version,
         "status": job.status.value,
-        "payload": job.payload,
+        "payload": _hide_internal_job_payload(job.payload),
         "progress": job.progress,
         "result": _hide_worker_file_identity(job.result),
         "error": job.error,
@@ -289,6 +306,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
 
     @app.middleware("http")
     async def request_id_middleware(request: Request, call_next):
+        compaction = None
+        activity_started = False
+        if request.url.path.startswith(("/api/", "/internal/")):
+            compaction = getattr(context, "database_compaction_service", None)
+            begin_activity = getattr(compaction, "begin_database_activity", None)
+            if callable(begin_activity):
+                begin_activity()
+                activity_started = True
         supplied_request_id = request.headers.get("X-Request-ID", "")
         try:
             request_id = str(uuid.UUID(supplied_request_id))
@@ -314,6 +339,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             path = request.url.path
             should_record = (
                 path.startswith("/api/v1/")
+                and request.method not in {"GET", "HEAD", "OPTIONS"}
                 and path not in {
                     "/api/v1/openapi.json",
                     "/api/v1/docs",
@@ -355,35 +381,61 @@ def create_backend_app(context: BackendContext) -> FastAPI:
                     kind="worker",
                 )
                 operation_id = safe_target_value(
-                    path_params.get("operation_id") or query_params.get("operation_id"),
+                    path_params.get("operation_id"),
                     kind="uuid",
                 )
                 operation_id = operation_id or safe_target_value(
                     getattr(request.state, "activity_operation_id", ""),
                     kind="uuid",
                 )
-                job_id = safe_target_value(
-                    path_params.get("job_id") or query_params.get("job_id"),
+                route_job_id = safe_target_value(
+                    path_params.get("job_id"),
                     kind="uuid",
                 )
-                try:
-                    await run_in_threadpool(
-                        journal.record,
-                        occurred_at=occurred_at,
-                        request_id=request_id,
-                        method=request.method,
-                        route=str(route),
-                        status_code=status_code,
-                        duration_ms=int((time.perf_counter() - started) * 1000),
-                        actor_user_id=getattr(request.state, "activity_actor_user_id", None),
-                        profile=profile,
-                        worker=worker,
-                        operation_id=operation_id,
-                        job_id=job_id,
-                        error_code=getattr(request.state, "activity_error_code", ""),
-                    )
-                except Exception as exc:
-                    LOGGER.warning("Activity journal write failed (%s)", type(exc).__name__)
+                linked_jobs = getattr(request.state, "activity_jobs", ())
+                linked_jobs = linked_jobs if isinstance(linked_jobs, (list, tuple)) else ()
+                audit_targets: list[tuple[str, str, str]] = []
+                for item in linked_jobs:
+                    if not isinstance(item, dict):
+                        continue
+                    linked_id = safe_target_value(item.get("job_id"), kind="uuid")
+                    if linked_id and all(existing[0] != linked_id for existing in audit_targets):
+                        audit_targets.append((
+                            linked_id,
+                            safe_target_value(item.get("profile"), kind="profile") or profile,
+                            safe_target_value(item.get("worker"), kind="worker") or worker,
+                        ))
+                if route_job_id and all(existing[0] != route_job_id for existing in audit_targets):
+                    audit_targets.append((route_job_id, profile, worker))
+                if audit_targets:
+                    try:
+                        try:
+                            for audit_job_id, audit_profile, audit_worker in audit_targets:
+                                await run_in_threadpool(
+                                    journal.record,
+                                    occurred_at=occurred_at,
+                                    request_id=request_id,
+                                    method=request.method,
+                                    route=str(route),
+                                    status_code=status_code,
+                                    duration_ms=int((time.perf_counter() - started) * 1000),
+                                    actor_user_id=getattr(request.state, "activity_actor_user_id", None),
+                                    profile=audit_profile,
+                                    worker=audit_worker,
+                                    operation_id=operation_id,
+                                    job_id=audit_job_id,
+                                    error_code=getattr(request.state, "activity_error_code", ""),
+                                )
+                        finally:
+                            # Request cancellation during the journal write must
+                            # not keep idle compaction blocked indefinitely.
+                            if activity_started:
+                                compaction.end_database_activity()
+                                activity_started = False
+                    except Exception as exc:
+                        LOGGER.warning("Activity journal write failed (%s)", type(exc).__name__)
+            if activity_started:
+                compaction.end_database_activity()
 
     @app.exception_handler(DomainError)
     async def domain_error_handler(request: Request, exc: DomainError):
@@ -687,6 +739,18 @@ def create_backend_app(context: BackendContext) -> FastAPI:
     def healthz():
         return {"ok": True, "role": "backend"}
 
+    @app.get("/api/v1/runtime/mode", response_model=RuntimeModeResponse)
+    def runtime_mode():
+        return {"mode": getattr(context.config, "gateway_mode", "full")}
+
+    @app.get("/api/v1/diagnostics/database-compaction")
+    def database_compaction_status(actor=Depends(current_actor)):
+        del actor
+        service = getattr(context, "database_compaction_service", None)
+        if service is None or not callable(getattr(service, "status", None)):
+            return {"enabled": False, "last_result": {"outcome": "unavailable"}}
+        return service.status()
+
     @app.post(
         "/api/v1/auth/telegram/challenges",
         response_model=ChallengeResponse,
@@ -856,30 +920,53 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
         registered_workers = context.worker_registry.list()
-        checker = getattr(context.worker_dispatcher, "check_worker_fast", None)
-        if not callable(checker):
-            checker = getattr(context.worker_dispatcher, "check_worker", None)
-
-        def online_status(name: str) -> tuple[str, bool]:
-            try:
-                online = bool(checker(name).get("healthy", True)) if callable(checker) else False
-            except Exception:
-                online = False
-            return name, online
-
-        names = list(registered_workers)
+        names = worker_names_for_mode(
+            registered_workers,
+            getattr(context.config, "gateway_mode", "full"),
+            local_urls=worker_local_urls(context.config),
+        )
         online_by_name: dict[str, bool] = {}
-        if names:
-            with ThreadPoolExecutor(max_workers=min(8, len(names))) as executor:
-                online_by_name.update(executor.map(online_status, names))
+        health_by_name: dict[str, dict[str, Any]] = {}
+        monitor = getattr(context, "worker_health_monitor", None)
+        lite_mode = getattr(context.config, "gateway_mode", "full") == "lite"
+        if lite_mode:
+            health_by_name = (
+                {name: monitor.snapshot(name) for name in names}
+                if monitor is not None
+                else {name: {"status": "unknown"} for name in names}
+            )
+            online_by_name = {
+                name: item.get("status") == "ready"
+                for name, item in health_by_name.items()
+            }
+        else:
+            checker = getattr(context.worker_dispatcher, "check_worker_fast", None)
+            if not callable(checker):
+                checker = getattr(context.worker_dispatcher, "check_worker", None)
+
+            def online_status(name: str) -> tuple[str, bool]:
+                try:
+                    online = bool(checker(name).get("healthy", True)) if callable(checker) else False
+                except Exception:
+                    online = False
+                return name, online
+
+            if names:
+                with ThreadPoolExecutor(max_workers=min(8, len(names))) as executor:
+                    online_by_name.update(executor.map(online_status, names))
 
         workers = []
-        for name, item in registered_workers.items():
+        for name in names:
+            item = registered_workers[name]
             secure = profile_transfer_is_secure(str(item.get("url") or ""))
             workers.append({
                 "name": name,
                 "enabled": bool(item.get("enabled", True)),
                 "online": online_by_name.get(name, False),
+                "health_status": health_by_name.get(name, {}).get(
+                    "status", "ready" if online_by_name.get(name, False) else "offline"
+                ),
+                "health_checked_at": health_by_name.get(name, {}).get("checked_at"),
                 "secure": secure,
             })
         profile_items = provisioner.profiles(actor.telegram_user_id)
@@ -994,7 +1081,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if context.profile_provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
         try:
-            return context.profile_provisioner.login_input(
+            result = context.profile_provisioner.login_input(
                 operation_id, actor.telegram_user_id,
                 str(body.get("field") or ""), str(body.get("value") or ""),
             )
@@ -1006,6 +1093,7 @@ def create_backend_app(context: BackendContext) -> FastAPI:
             raise DomainError("PROFILE_LOGIN_INPUT_INVALID", str(exc), status_code=422) from exc
         except Exception as exc:
             raise DomainError("PROFILE_WORKER_UNAVAILABLE", "Worker login TDL tidak dapat dihubungi.", status_code=503) from exc
+        return result
 
     @app.post("/api/v1/profiles/provisionings/{operation_id}/retry")
     def retry_profile_provisioning(
@@ -1032,13 +1120,14 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if context.profile_provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
         try:
-            return context.profile_provisioner.cancel(operation_id, actor.telegram_user_id)
+            result = context.profile_provisioner.cancel(operation_id, actor.telegram_user_id)
         except KeyError as exc:
             raise DomainError("PROFILE_PROVISIONING_NOT_FOUND", "Provisioning tidak ditemukan.", status_code=404) from exc
         except PermissionError as exc:
             raise DomainError("PROFILE_PROVISIONING_FORBIDDEN", "Provisioning dimiliki actor lain.", status_code=403) from exc
         except ValueError as exc:
             raise DomainError("PROFILE_CANNOT_CANCEL", str(exc), status_code=409) from exc
+        return result
 
     @app.post("/api/v1/profiles/{profile}/adopt")
     def adopt_profile(profile: str, body: dict[str, Any], actor=Depends(current_actor)):
@@ -1848,6 +1937,10 @@ def _add_management_routes(
         return {
             "items": context.storage_catalog.backup_runs(limit=20),
             "enabled": context.config.backup_enabled,
+            "scheduled_enabled": bool(
+                getattr(context.backup_scheduler, "scheduling_enabled", True)
+                and context.config.backup_enabled
+            ),
             "schedule": context.config.backup_schedule,
             "timezone": context.config.backup_timezone,
         }

@@ -55,6 +55,15 @@ class OperationsService:
         self._handlers = dict(handlers or {})
         self._command_handlers: dict[str, Any] = {}
         self.activity_journal = activity_journal
+        self._change_notifier = None
+
+    def set_change_notifier(self, notifier) -> None:
+        self._change_notifier = notifier if callable(notifier) else None
+
+    def _notify_change(self) -> None:
+        notifier = self._change_notifier
+        if notifier is not None:
+            notifier()
 
     def flush_activity_events(self, *, limit: int = 100) -> int:
         """Deliver durable lifecycle events; the journal deduplicates retries."""
@@ -169,6 +178,8 @@ class OperationsService:
             private_job_values=prepared.private_job_values,
         )
         self.flush_activity_events()
+        if result[1]:
+            self._notify_change()
         return result
 
     @staticmethod
@@ -231,6 +242,7 @@ class OperationsService:
             topic="operation.cancel",
         )
         self.flush_activity_events()
+        self._notify_change()
         return result
 
     def retry(self, actor: Actor, operation_id: str, idempotency_key: str) -> tuple[Operation, bool]:
@@ -253,6 +265,7 @@ class OperationsService:
             topic="operation.retry", retry=True,
         )
         self.flush_activity_events()
+        self._notify_change()
         return result
 
     def set_visibility(
@@ -297,6 +310,8 @@ class OperationsService:
         except DomainError:
             # A late or out-of-order job event cannot move a cancelling or terminal operation backwards.
             pass
+        else:
+            self._notify_change()
         self.flush_activity_events()
 
     def mark_waiting_worker_for_job(self, job_id: str) -> None:
@@ -317,3 +332,4 @@ class OperationsService:
             )
         except DomainError:
             return
+        self._notify_change()

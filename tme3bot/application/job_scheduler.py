@@ -182,7 +182,11 @@ def build_execution_plan(
             keys.add(f"worker:{worker}:tdl:storage")
             if workspace_path:
                 keys.update(_workspace_resource_keys(worker, [workspace_path]))
-            sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+            sender_profiles = (
+                []
+                if payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+                else payload.get("_tdl_sender_profiles") or [profile]
+            )
             for sender_profile in sender_profiles:
                 keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
             lane = "tdl-storage-reconcile"
@@ -212,13 +216,21 @@ def build_execution_plan(
         # Keep one end-to-end TTS job per worker, including Telegram delivery.
         # Different workers remain independent and can each use three routes.
         keys = {f"worker:{worker}:kind:tts"}
-        sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+        sender_profiles = (
+            []
+            if payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+            else payload.get("_tdl_sender_profiles") or [profile]
+        )
         for sender_profile in sender_profiles:
             keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
         lane = "tts"
     elif kind == "tdl_access_verify":
         keys = {f"worker:{worker}:kind:tdl_access_verify"}
-        candidate_profiles = payload.get("candidate_profiles") or profiles
+        candidate_profiles = (
+            payload.get("candidate_profiles") or []
+            if "candidate_profiles" in payload
+            else profiles
+        )
         lane = "upload" if str(payload.get("purpose") or "") == "storage" else "export"
         for candidate_profile in candidate_profiles:
             keys.add(f"profile:{str(candidate_profile).lower()}:worker:{worker}:tdl:{lane}")

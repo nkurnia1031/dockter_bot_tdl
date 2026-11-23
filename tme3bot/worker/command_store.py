@@ -118,6 +118,17 @@ class WorkerCommandStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_worker_commands_ready
                     ON worker_commands(status, created_at);
+                CREATE TABLE IF NOT EXISTS worker_command_tombstones (
+                    command_id TEXT PRIMARY KEY,
+                    job_id TEXT,
+                    operation_id TEXT,
+                    attempt INTEGER NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(job_id, attempt),
+                    UNIQUE(operation_id, attempt)
+                );
                 CREATE TABLE IF NOT EXISTS worker_storage_upload_items (
                     command_id TEXT NOT NULL,
                     relative_path TEXT NOT NULL,
@@ -277,6 +288,23 @@ class WorkerCommandStore:
             "accepted": row["status"] != "needs_reconciliation",
         }
 
+    @staticmethod
+    def _public_tombstone(row: sqlite3.Row) -> dict[str, Any]:
+        updated_at = str(row["updated_at"])
+        return {
+            "command_id": row["command_id"],
+            "job_id": row["job_id"],
+            "operation_id": row["operation_id"],
+            "attempt": int(row["attempt"]),
+            "status": row["status"],
+            "phase": "terminal_tombstone",
+            "checkpoint": None,
+            "ack": None,
+            "created_at": updated_at,
+            "updated_at": updated_at,
+            "accepted": row["status"] != "needs_reconciliation",
+        }
+
     def accept(self, envelope: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         command_id, job_id, operation_id, attempt, dispatch_token = self._validate_envelope(envelope)
         serialized = _dump(envelope)
@@ -297,6 +325,20 @@ class WorkerCommandStore:
                     )
                 db.commit()
                 return self._public(existing), True
+            tombstone = db.execute(
+                "SELECT * FROM worker_command_tombstones WHERE command_id=?",
+                (command_id,),
+            ).fetchone()
+            if tombstone is not None:
+                if tombstone["payload_hash"] != digest:
+                    db.rollback()
+                    raise DomainError(
+                        "COMMAND_ID_CONFLICT",
+                        "Command ID sudah digunakan dengan payload berbeda.",
+                        status_code=409,
+                    )
+                db.commit()
+                return self._public_tombstone(tombstone), True
             if job_id is not None:
                 duplicate = db.execute(
                     "SELECT command_id FROM worker_commands WHERE job_id=? AND attempt=?",
@@ -309,12 +351,34 @@ class WorkerCommandStore:
                         "Job dan attempt sudah terikat ke command lain.",
                         status_code=409,
                     )
+                tombstone_duplicate = db.execute(
+                    "SELECT command_id FROM worker_command_tombstones WHERE job_id=? AND attempt=?",
+                    (job_id, attempt),
+                ).fetchone()
+                if tombstone_duplicate is not None:
+                    db.rollback()
+                    raise DomainError(
+                        "COMMAND_ATTEMPT_CONFLICT",
+                        "Job dan attempt sudah terikat ke command lain.",
+                        status_code=409,
+                    )
             elif operation_id is not None:
                 duplicate = db.execute(
                     "SELECT command_id FROM worker_commands WHERE operation_id=? AND attempt=?",
                     (operation_id, attempt),
                 ).fetchone()
                 if duplicate is not None:
+                    db.rollback()
+                    raise DomainError(
+                        "COMMAND_ATTEMPT_CONFLICT",
+                        "Operation dan attempt sudah terikat ke command lain.",
+                        status_code=409,
+                    )
+                tombstone_duplicate = db.execute(
+                    "SELECT command_id FROM worker_command_tombstones WHERE operation_id=? AND attempt=?",
+                    (operation_id, attempt),
+                ).fetchone()
+                if tombstone_duplicate is not None:
                     db.rollback()
                     raise DomainError(
                         "COMMAND_ATTEMPT_CONFLICT",
@@ -338,7 +402,13 @@ class WorkerCommandStore:
     def get(self, command_id: str) -> dict[str, Any] | None:
         with self._db() as db:
             row = db.execute("SELECT * FROM worker_commands WHERE command_id=?", (str(command_id),)).fetchone()
-        return self._public(row) if row is not None else None
+            tombstone = None if row is not None else db.execute(
+                "SELECT * FROM worker_command_tombstones WHERE command_id=?",
+                (str(command_id),),
+            ).fetchone()
+        if row is not None:
+            return self._public(row)
+        return self._public_tombstone(tombstone) if tombstone is not None else None
 
     def event_binding(self, command_id: str) -> dict[str, Any] | None:
         """Return worker-internal event fencing metadata for one command."""
@@ -421,6 +491,152 @@ class WorkerCommandStore:
             command_id, status, phase=status, ack=ack,
             only_from=("claimed", "queued", "running", "cancelling", "accepted"),
         )
+
+    @staticmethod
+    def _event_requires_reconciliation(value: Any) -> bool:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized_key = str(key).lower()
+                if normalized_key in {"status", "outcome", "phase"} and str(child).lower() in {
+                    "needs_reconciliation", "reconciliation_required"
+                }:
+                    return True
+                if normalized_key in {
+                    "needs_reconciliation", "reconciliation_required"
+                } and child is True:
+                    return True
+                if WorkerCommandStore._event_requires_reconciliation(child):
+                    return True
+        elif isinstance(value, list):
+            return any(WorkerCommandStore._event_requires_reconciliation(item) for item in value)
+        return False
+
+    @staticmethod
+    def _storage_reconciliation_event_complete(
+        event: dict[str, Any], payload: dict[str, Any]
+    ) -> bool:
+        """Confirm a final reconciliation returned one conclusive result per requested item."""
+        result = event.get("result")
+        if not isinstance(result, dict):
+            return False
+        while isinstance(result.get("value"), dict):
+            result = result["value"]
+        if str(result.get("source_job_id") or "") != str(payload.get("source_job_id") or ""):
+            return False
+        requested = payload.get("_storage_reconcile_items")
+        returned = result.get("items")
+        if not isinstance(requested, list) or not requested or not isinstance(returned, list):
+            return False
+        requested_indexes: set[int] = set()
+        requested_by_index: dict[int, dict[str, Any]] = {}
+        for item in requested:
+            if not isinstance(item, dict):
+                return False
+            try:
+                index = int(item.get("index"))
+            except (TypeError, ValueError):
+                return False
+            if index < 0 or index in requested_indexes:
+                return False
+            requested_indexes.add(index)
+            requested_by_index[index] = item
+
+        outcomes: dict[int, dict[str, Any]] = {}
+        for item in returned:
+            if not isinstance(item, dict):
+                return False
+            try:
+                index = int(item.get("index"))
+                match_count = int(item.get("match_count") or 0)
+            except (TypeError, ValueError):
+                return False
+            status = str(item.get("status") or "").lower()
+            if index in outcomes or match_count < 0:
+                return False
+            expected = requested_by_index.get(index)
+            if expected is None or str(item.get("name") or "") != str(expected.get("name") or ""):
+                return False
+            if "target_path" in expected and str(item.get("target_path") or "") != str(
+                expected.get("target_path") or ""
+            ):
+                return False
+            if status == "succeeded" and match_count > 0:
+                outcomes[index] = item
+            elif status == "failed" and match_count == 0 and item.get("retryable") is True:
+                outcomes[index] = item
+            else:
+                return False
+        return set(outcomes) == requested_indexes
+
+    @classmethod
+    def _compact_command_in_transaction(
+        cls,
+        db: sqlite3.Connection,
+        command_id: str,
+        *,
+        source_reconciliation_confirmed: bool = False,
+    ) -> bool:
+        row = db.execute(
+            "SELECT command_id,job_id,operation_id,attempt,payload_hash,status,created_at,updated_at "
+            "FROM worker_commands WHERE command_id=?",
+            (str(command_id),),
+        ).fetchone()
+        if row is None or not row["job_id"] or row["status"] not in {
+            "succeeded", "failed", "cancelled"
+        }:
+            return False
+        pending = db.execute(
+            "SELECT 1 FROM worker_event_outbox WHERE json_extract(event_json,'$.command_id')=? "
+            "AND status IN ('pending','sending') LIMIT 1",
+            (str(command_id),),
+        ).fetchone()
+        if pending is not None:
+            return False
+        terminal_ack = db.execute(
+            "SELECT event_json FROM worker_event_outbox WHERE json_extract(event_json,'$.command_id')=? "
+            "AND json_extract(event_json,'$.status') IN ('succeeded','failed','cancelled') "
+            "AND status='acked' ORDER BY id DESC LIMIT 1",
+            (str(command_id),),
+        ).fetchone()
+        if terminal_ack is None:
+            return False
+        if not source_reconciliation_confirmed and cls._event_requires_reconciliation(
+            json.loads(terminal_ack["event_json"])
+        ):
+            return False
+        db.execute(
+            "INSERT OR REPLACE INTO worker_command_tombstones("
+            "command_id,job_id,operation_id,attempt,payload_hash,status,updated_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                str(row["command_id"]), row["job_id"], row["operation_id"],
+                int(row["attempt"]), str(row["payload_hash"]), str(row["status"]),
+                str(row["updated_at"]),
+            ),
+        )
+        db.execute(
+            "DELETE FROM worker_event_outbox WHERE json_extract(event_json,'$.command_id')=?",
+            (str(command_id),),
+        )
+        db.execute("DELETE FROM worker_commands WHERE command_id=?", (str(command_id),))
+        return True
+
+    @classmethod
+    def _compact_reconciled_source_in_transaction(
+        cls, db: sqlite3.Connection, source_job_id: str
+    ) -> int:
+        rows = db.execute(
+            "SELECT command_id FROM worker_commands WHERE job_id=? "
+            "AND status IN ('succeeded','failed','cancelled')",
+            (str(source_job_id),),
+        ).fetchall()
+        compacted = 0
+        for row in rows:
+            if cls._compact_command_in_transaction(
+                db, str(row["command_id"]), source_reconciliation_confirmed=True
+            ):
+                compacted += 1
+        return compacted
 
     def record_storage_upload_item(
         self,
@@ -1175,6 +1391,39 @@ class WorkerCommandStore:
                         str(event.get("dispatch_token") or ""),
                     ),
                 )
+                if terminal:
+                    command = db.execute(
+                        "SELECT payload FROM worker_commands WHERE command_id=? "
+                        "AND job_id=? AND attempt=? AND dispatch_token=?",
+                        (
+                            command_id,
+                            str(row["job_id"]),
+                            int(event.get("attempt") or 0),
+                            str(event.get("dispatch_token") or ""),
+                        ),
+                    ).fetchone()
+                    if command is not None:
+                        envelope = json.loads(command["payload"])
+                        job = envelope.get("job") if isinstance(envelope, dict) else None
+                        payload = job.get("payload") if isinstance(job, dict) else None
+                        payload = payload if isinstance(payload, dict) else {}
+                        final_reconciliation = (
+                            accepted
+                            and event_status == "succeeded"
+                            and not self._event_requires_reconciliation(event)
+                            and isinstance(job, dict)
+                            and job.get("kind") == "storage_reconcile"
+                            and payload.get("_storage_reconcile_final_for_source") is True
+                            and self._storage_reconciliation_event_complete(event, payload)
+                        )
+                        if final_reconciliation:
+                            source_job_id = str(payload.get("source_job_id") or "").strip()
+                            if source_job_id:
+                                self._compact_reconciled_source_in_transaction(
+                                    db, source_job_id
+                                )
+                        if not self._event_requires_reconciliation(event):
+                            self._compact_command_in_transaction(db, command_id)
         return True
 
     def retry_event(self, event_id: int, lease_token: str, error_type: str) -> bool:

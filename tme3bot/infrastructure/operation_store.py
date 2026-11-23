@@ -534,7 +534,8 @@ class SqliteOperationStore:
         )
         db.execute(
             """UPDATE jobs SET status='queued', progress=?, result=NULL, error=NULL,
-                   progress_sequence=?, archived_at=NULL, updated_at=? WHERE id=?""",
+                   progress_sequence=?, archived_at=NULL, terminal_at=NULL,
+                   updated_at=? WHERE id=?""",
             (_dump({"phase": "queued", "operation_retry": True}), sequence, now, job_id),
         )
         db.execute("DELETE FROM job_resource_leases WHERE job_id=?", (job_id,))

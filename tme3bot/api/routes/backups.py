@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 
 from fastapi import Depends, Header, Request, Response
+from tme3bot.api.activity import track_activity_operation
 from tme3bot.api.schemas import BackupRuntimeSettingsRequest, BackupVerificationRequest, ItemListResponse, ObjectResponse
 from tme3bot.backend_runtime_settings import BackendRuntimeSettings
 from tme3bot.domain.models import DomainError
@@ -126,7 +127,7 @@ def register_backups(app, context, *, current_actor, job_dict):
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
-        request.state.activity_operation_id = operation.id
+        track_activity_operation(request, operation)
         job = context.control_plane.jobs.get(str(operation.job_id or ""))
         if job is None:
             raise DomainError("JOB_NOT_FOUND", "Job verifikasi backup tidak ditemukan setelah diterima.", status_code=500)
@@ -190,8 +191,13 @@ def register_backups(app, context, *, current_actor, job_dict):
     def backup_status(actor=Depends(current_actor)):
         del actor
         values = context.runtime_settings.get() if context.runtime_settings is not None else {}
+        scheduler = context.backup_scheduler
         return {
             "enabled": values.get("backup_enabled", context.config.backup_enabled),
+            "scheduled_enabled": bool(
+                getattr(scheduler, "scheduling_enabled", True)
+                and values.get("backup_enabled", context.config.backup_enabled)
+            ),
             "schedule": values.get("backup_schedule", context.config.backup_schedule),
             "timezone": values.get("backup_timezone", context.config.backup_timezone),
             "retention": values.get("backup_retention", context.config.backup_retention),
@@ -271,6 +277,10 @@ def register_backups(app, context, *, current_actor, job_dict):
             ) from exc
         return {
             "enabled": saved["backup_enabled"],
+            "scheduled_enabled": bool(
+                getattr(context.backup_scheduler, "scheduling_enabled", True)
+                and saved["backup_enabled"]
+            ),
             "schedule": saved["backup_schedule"],
             "timezone": saved["backup_timezone"],
             "retention": saved["backup_retention"],

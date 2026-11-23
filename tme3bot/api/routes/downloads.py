@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Request
+from tme3bot.api.activity import track_activity_jobs
 from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.api.schemas import DownloadBatchRequest, DownloadRequest, JobResponse, ObjectResponse
 from tme3bot.domain.models import DomainError
@@ -11,6 +12,7 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
 
     @app.post("/api/v1/downloads", response_model=JobResponse)
     def submit_download(
+        request: Request,
         body: DownloadRequest | None = None,
         retry_failed: bool = False,
         actor=Depends(current_actor),
@@ -61,23 +63,23 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
                     "status": str(artifact["status"]),
                 }
             )
-        return job_dict(
-            context.control_plane.submit_job(
-                actor,
-                "download",
-                {
-                    "retry_failed": retry_failed,
-                    "artifact_keys": artifact_keys,
-                    "artifacts": artifact_refs,
-                    "priority": values.get("priority", "normal"),
-                },
-                profile=selected_profile or actor.profile,
-                worker=worker,
-            )
+        job = context.control_plane.submit_job(
+            actor,
+            "download",
+            {
+                "retry_failed": retry_failed,
+                "artifact_keys": artifact_keys,
+                "artifacts": artifact_refs,
+                "priority": values.get("priority", "normal"),
+            },
+            profile=selected_profile or actor.profile,
+            worker=worker,
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)
 
     @app.post("/api/v1/downloads/batch", response_model=ObjectResponse)
-    def submit_download_batch(body: DownloadBatchRequest, actor=Depends(current_actor)):
+    def submit_download_batch(body: DownloadBatchRequest, request: Request, actor=Depends(current_actor)):
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for artifact_id in body.artifact_ids:
             artifact = context.export_catalog.get(str(artifact_id))
@@ -98,6 +100,7 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
             key = (str(artifact["profile"]), str(artifact["worker"]))
             groups.setdefault(key, []).append(artifact)
         jobs, response_groups = [], []
+        submitted_jobs = []
         for (profile, worker), items in groups.items():
             job = context.control_plane.submit_job(
                 actor,
@@ -111,8 +114,10 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
                 profile=profile,
                 worker=worker,
             )
+            submitted_jobs.append(job)
             jobs.append(job_dict(job))
             response_groups.append({"profile": profile, "worker": worker, "artifact_ids": [str(item["id"]) for item in items], "job_id": job.id})
+        track_activity_jobs(request, submitted_jobs)
         return {"jobs": jobs, "groups": response_groups}
 
     @app.get("/api/v1/downloads/artifacts", response_model=ObjectResponse)
@@ -152,6 +157,7 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
 
     @app.post("/api/v1/downloads/artifacts/reconcile", response_model=ObjectResponse)
     def reconcile_artifacts(
+        request: Request,
         scope: str = Query("current", pattern="^(current|global)$"),
         profile: str | None = None,
         worker: str | None = None,
@@ -171,16 +177,20 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
             _, selected_worker = context.control_plane.resolve_target(actor, profile=selected_profile, worker=worker)
             pairs = [(selected_profile, selected_worker)]
         jobs = []
+        submitted_jobs = []
         for selected_profile, selected_worker in pairs:
             inventory_id = str(uuid.uuid4())
-            jobs.append(job_dict(context.control_plane.submit_job(
+            job = context.control_plane.submit_job(
                 actor, "artifact_inventory", {"inventory_id": inventory_id},
                 profile=selected_profile, worker=selected_worker,
-            )))
+            )
+            submitted_jobs.append(job)
+            jobs.append(job_dict(job))
+        track_activity_jobs(request, submitted_jobs)
         return {"jobs": jobs, "items": jobs}
 
     @app.post("/api/v1/downloads/artifacts/{artifact_id}/delete-file", response_model=JobResponse)
-    def delete_artifact_file(artifact_id: str, actor=Depends(current_actor)):
+    def delete_artifact_file(artifact_id: str, request: Request, actor=Depends(current_actor)):
         artifact = _profile_artifact(context, actor, artifact_id)
         if artifact["status"] not in {"pending", "failed"}:
             raise DomainError(
@@ -188,18 +198,18 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
                 "Artifact aktif atau sudah selesai tidak dapat dihapus.",
                 status_code=409,
             )
-        return job_dict(
-            context.control_plane.submit_job(
-                actor,
-                "artifact_delete",
-                {"artifact_key": artifact["artifact_key"]},
-                profile=str(artifact["profile"]),
-                worker=str(artifact["worker"]),
-            )
+        job = context.control_plane.submit_job(
+            actor,
+            "artifact_delete",
+            {"artifact_key": artifact["artifact_key"]},
+            profile=str(artifact["profile"]),
+            worker=str(artifact["worker"]),
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)
 
     @app.post("/api/v1/downloads/artifacts/actions/delete", response_model=ObjectResponse)
-    def delete_artifacts_batch(body: DownloadBatchRequest, actor=Depends(current_actor)):
+    def delete_artifacts_batch(body: DownloadBatchRequest, request: Request, actor=Depends(current_actor)):
         groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
         for artifact_id in body.artifact_ids:
             artifact = context.export_catalog.get(str(artifact_id))
@@ -209,15 +219,18 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
             if artifact["status"] not in {"pending", "failed"}:
                 raise DomainError("ARTIFACT_ACTIVE", "Artifact aktif atau selesai tidak dapat dihapus sebagai file pending.", status_code=409)
             groups.setdefault((str(artifact["profile"]), str(artifact["worker"])), []).append(artifact)
-        jobs, requested = [], []
+        jobs, requested, submitted_jobs = [], [], []
         for (profile, worker), items in groups.items():
             for item in items:
                 requested.append(str(item["id"]))
-            jobs.append(job_dict(context.control_plane.submit_job(
+            job = context.control_plane.submit_job(
                 actor, "artifact_delete",
                 {"artifact_keys": [str(item["artifact_key"]) for item in items]},
                 profile=profile, worker=worker,
-            )))
+            )
+            submitted_jobs.append(job)
+            jobs.append(job_dict(job))
+        track_activity_jobs(request, submitted_jobs)
         return {"requested": requested, "jobs": jobs}
 
     @app.post("/api/v1/downloads/artifacts/{artifact_id}/archive", response_model=ObjectResponse)
@@ -261,6 +274,7 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
 
     @app.post("/api/v1/downloads/clear-failed", response_model=ObjectResponse)
     def clear_failed(
+        request: Request,
         scope: str = Query("current", pattern="^(current|global)$"),
         profile: str | None = None,
         worker: str | None = None,
@@ -280,13 +294,16 @@ def register_downloads(app, context, *, _model_dict, _profile_artifact, current_
                 )
                 for selected_profile, selected_worker in pairs
             ]
+            track_activity_jobs(request, jobs)
             return {"jobs": [job_dict(job) for job in jobs]}
         selected_profile, selected_worker = context.control_plane.resolve_target(
             actor, profile=profile, worker=worker
         )
-        return {"job": job_dict(context.control_plane.submit_job(
+        job = context.control_plane.submit_job(
             actor, "download_clear_failed", {}, profile=selected_profile, worker=selected_worker
-        ))}
+        )
+        track_activity_jobs(request, job)
+        return {"job": job_dict(job)}
 
     @app.put("/api/v1/downloads/mode/{mode}", response_model=ObjectResponse)
     def set_download_mode(mode: str, actor=Depends(current_actor)):

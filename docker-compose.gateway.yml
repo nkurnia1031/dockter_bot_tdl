@@ -10,6 +10,7 @@ services:
     env_file:
       - ${BACKEND_ENV_FILE:-.env.backend}
     environment:
+      GATEWAY_MODE: ${GATEWAY_MODE:-full}
       DURABLE_DISPATCH_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
       SAFELINK_RESOLVER_ENABLED: "false"
@@ -75,6 +76,7 @@ services:
       - queue-private
 
   telegram:
+    profiles: ["full"]
     image: ${GATEWAY_IMAGE_NAME:-tme3bot-gateway}:${IMAGE_TAG:-latest}
     env_file:
       - ${TELEGRAM_ENV_FILE:-.env.telegram}
@@ -83,7 +85,20 @@ services:
       backend:
         condition: service_healthy
 
+  telegram-login:
+    profiles: ["lite"]
+    image: ${GATEWAY_IMAGE_NAME:-tme3bot-gateway}:${IMAGE_TAG:-latest}
+    env_file:
+      - ${TELEGRAM_ENV_FILE:-.env.telegram}
+    environment:
+      APP_ROLE: telegram-login
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+
   worker-local:
+    profiles: ["full"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     build:
       context: .
@@ -112,6 +127,7 @@ services:
       TDL_DOWNLOAD_STORAGE: ""
 
   aria2:
+    profiles: ["full"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.aria2_runtime"]
     restart: unless-stopped
@@ -134,6 +150,7 @@ services:
       start_period: 10s
 
   tts-1:
+    profiles: ["full"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
@@ -156,6 +173,7 @@ services:
       start_period: 90s
 
   tts-2:
+    profiles: ["full"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
@@ -178,6 +196,7 @@ services:
       start_period: 90s
 
   tts-3:
+    profiles: ["full"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped

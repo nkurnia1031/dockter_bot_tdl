@@ -13,23 +13,28 @@ const mocks = vi.hoisted(() => ({
     logout: vi.fn()
   }
 }));
+const mockApi = vi.hoisted(() => vi.fn());
 
 vi.mock('$app/state', () => ({ page: { url: { pathname: '/' } } }));
 vi.mock('$lib/session.svelte', () => ({ session: mocks.session }));
+vi.mock('$lib/api', () => ({ api: mockApi }));
 vi.mock('./Login.svelte', () => ({ default: () => null }));
 vi.mock('./RequestIndicator.svelte', () => ({ default: () => null }));
 
 import Shell from './Shell.svelte';
+import { getGatewayMode, setGatewayMode } from '$lib/gateway-mode.svelte';
 
 describe('Shell operations layout', () => {
   beforeEach(() => {
     localStorage.clear();
+    setGatewayMode('full');
+    mockApi.mockReset().mockResolvedValue({ mode: 'full' });
     document.documentElement.classList.remove('dark');
     document.documentElement.removeAttribute('data-theme');
     mocks.session.restore.mockReset();
   });
 
-  afterEach(() => cleanup());
+  afterEach(() => { cleanup(); setGatewayMode('full'); });
 
   it('groups all primary destinations into the approved navigation sections', () => {
     render(Shell);
@@ -65,5 +70,30 @@ describe('Shell operations layout', () => {
     expect(screen.getByRole('dialog', { name: 'Navigasi mobile' })).toBeTruthy();
     await fireEvent.keyDown(screen.getByRole('dialog', { name: 'Navigasi mobile' }), { key: 'Escape' });
     await waitFor(() => expect(screen.getByRole('button', { name: 'Buka navigasi' }).getAttribute('aria-expanded')).toBe('false'));
+  });
+
+  it('loads the authenticated gateway mode from the runtime endpoint', async () => {
+    setGatewayMode(null);
+    mockApi.mockResolvedValue({ mode: 'lite' });
+    render(Shell);
+
+    await waitFor(() => expect(getGatewayMode()).toBe('lite'));
+    expect(mockApi).toHaveBeenCalledWith('/runtime/mode');
+  });
+
+  it('holds operation pages when gateway mode cannot be confirmed and allows retry', async () => {
+    setGatewayMode(null);
+    mockApi
+      .mockRejectedValueOnce(new Error('backend unavailable'))
+      .mockResolvedValueOnce({ mode: 'lite' });
+    render(Shell);
+
+    expect(await screen.findByRole('alert')).toBeTruthy();
+    expect(screen.queryByRole('link', { name: 'Storage' })).toBeNull();
+
+    await fireEvent.click(await screen.findByRole('button', { name: 'Coba lagi' }));
+
+    expect(await screen.findByRole('link', { name: 'Storage' })).toBeTruthy();
+    expect(getGatewayMode()).toBe('lite');
   });
 });

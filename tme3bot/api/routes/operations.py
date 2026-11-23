@@ -4,6 +4,7 @@ from typing import Any
 
 from fastapi import Depends, Header, Query, Request, Response
 
+from tme3bot.api.activity import track_activity_operation
 from tme3bot.api.schemas import (
     OperationListResponse,
     OperationResponse,
@@ -55,7 +56,7 @@ def register_operations(
             request_id=request.state.request_id,
             request_route=getattr(request.scope.get("route"), "path", ""),
         )
-        request.state.activity_operation_id = operation.id
+        track_activity_operation(request, operation)
         status_url = f"/api/v1/operations/{operation.id}"
         response.headers["Location"] = status_url
         return _public(operation, status_url=status_url)
@@ -78,6 +79,7 @@ def register_operations(
     @app.post("/api/v1/operations/{operation_id}/cancel", status_code=202, response_model=OperationResponse)
     def cancel_operation(
         operation_id: str,
+        request: Request,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
     ):
@@ -90,11 +92,13 @@ def register_operations(
                 status_code=409,
             )
         operation, _ = service.cancel(actor, operation_id, idempotency_key)
+        track_activity_operation(request, operation)
         return _public(operation, status_url=f"/api/v1/operations/{operation_id}")
 
     @app.post("/api/v1/operations/{operation_id}/retry", status_code=202, response_model=OperationResponse)
     def retry_operation(
         operation_id: str,
+        request: Request,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
     ):
@@ -103,16 +107,19 @@ def register_operations(
         if callable(retry_guard):
             retry_guard(current)
         operation, _ = service.retry(actor, operation_id, idempotency_key)
+        track_activity_operation(request, operation)
         return _public(operation, status_url=f"/api/v1/operations/{operation_id}")
 
     @app.put("/api/v1/operations/{operation_id}/visibility", response_model=OperationResponse)
     def set_operation_visibility(
         operation_id: str,
         body: OperationVisibilityRequest,
+        request: Request,
         actor=Depends(current_actor),
         idempotency_key: str = Header(..., alias="Idempotency-Key", min_length=1, max_length=200),
     ):
         operation, _ = _require_operations().set_visibility(
             actor, operation_id, body.dismissed, idempotency_key
         )
+        track_activity_operation(request, operation)
         return _public(operation)

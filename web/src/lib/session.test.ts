@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { session } from './session.svelte';
+import { getGatewayMode, setGatewayMode } from './gateway-mode.svelte';
 
 describe('browser profile and worker context', () => {
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(() => { vi.unstubAllGlobals(); setGatewayMode(null); });
 
   it('switches the active worker atomically and emits a context revision', async () => {
     const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -22,6 +23,7 @@ describe('browser profile and worker context', () => {
           ]
         }), { status: 200 });
       }
+      if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'full' }), { status: 200 });
       if (url.endsWith('/me/worker-route') && init?.method === 'PUT') {
         return new Response(JSON.stringify({ route: 'remote-1' }), { status: 200 });
       }
@@ -52,6 +54,7 @@ describe('browser profile and worker context', () => {
         actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
         profiles: ['default']
       }), { status: 200 });
+      if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'full' }), { status: 200 });
       if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
         { name: 'local', url: 'http://worker-local' }
       ] }), { status: 200 });
@@ -61,11 +64,38 @@ describe('browser profile and worker context', () => {
     await session.restore();
 
     expect(session.current.authenticated).toBe(true);
-    expect(calls.slice(0, 3).map((call) => [call.url.split('/api/v1')[1], call.method])).toEqual([
+    expect(calls.slice(0, 4).map((call) => [call.url.split('/api/v1')[1], call.method])).toEqual([
       ['/auth/browser/session', 'GET'],
       ['/auth/browser/refresh', 'POST'],
+      ['/runtime/mode', 'GET'],
       ['/workers', 'GET']
     ]);
+  });
+
+  it('loads mode before the local profile catalog and omits that catalog in Lite', async () => {
+    const calls: string[] = [];
+    setGatewayMode(null);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url.split('/api/v1')[1]);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'remote-1' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'lite' }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'remote-1', url: 'https://worker.example' }
+      ] }), { status: 200 });
+      return new Response('{}', { status: 404 });
+    }));
+
+    await session.restore();
+
+    expect(getGatewayMode()).toBe('lite');
+    expect(calls.indexOf('/runtime/mode')).toBeLessThan(calls.indexOf('/workers'));
+    expect(calls).not.toContain('/profiles/local');
+    expect(session.profileCatalog).toEqual([]);
   });
 
   it('sends the Remember me choice with the browser login challenge', async () => {
@@ -98,6 +128,7 @@ describe('browser profile and worker context', () => {
         actor: { telegram_user_id: 42, profile: 'identity-profile', worker_route: 'local' },
         profiles: ['identity-profile', 'stale-identity-profile']
       }), { status: 200 });
+      if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'full' }), { status: 200 });
       if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
         { name: 'local', url: 'http://worker-local' },
         { name: 'remote-1', url: 'https://worker.example' }

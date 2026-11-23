@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict
-from fastapi import Depends, Query
+from fastapi import Depends, Query, Request
+from tme3bot.api.activity import track_activity_jobs
 from tme3bot.api.schemas import ItemListResponse, JobResponse, ObjectResponse, RcloneStorageActionRequest, RcloneStorageManageRequest, StorageBulkActionRequest, StorageDeliveryRequest, StorageDownloadRequest, StorageFolderRequest, StorageFolderUpdateRequest, StorageItemListResponse, StorageItemResponse, StoragePublicLinkRevokeRequest, StorageSettingsResponse, StorageSyncRequest, StorageUpdateRequest, StorageUploadRequest, TelegramStorageDeliveryRequest
 from tme3bot.domain.models import DomainError
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
@@ -240,7 +241,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
 
     @app.post("/api/v1/storage/rclone/jobs", response_model=JobResponse)
     def submit_rclone_storage_job(
-        body: RcloneStorageManageRequest, actor=Depends(current_actor)
+        body: RcloneStorageManageRequest, request: Request, actor=Depends(current_actor)
     ):
         action = body.action
         if action == "purge" and body.confirmed is not True:
@@ -301,15 +302,15 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 settings.get("rclone_destination") or "googledrive:backup"
             ).strip(),
         }
-        return job_dict(
-            context.control_plane.submit_job(
-                actor,
-                "storage_rclone_manage",
-                payload,
-                profile=actor.profile,
-                worker=selected_worker,
-            )
+        job = context.control_plane.submit_job(
+            actor,
+            "storage_rclone_manage",
+            payload,
+            profile=actor.profile,
+            worker=selected_worker,
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)
 
     @app.get("/api/v1/storage/items", response_model=StorageItemListResponse)
     def search_storage(
@@ -465,7 +466,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         return storage_item_dict(_storage_item(context, item_id))
 
     @app.post("/api/v1/storage/uploads", response_model=JobResponse)
-    def submit_storage_upload(body: StorageUploadRequest, actor=Depends(current_actor)):
+    def submit_storage_upload(body: StorageUploadRequest, request: Request, actor=Depends(current_actor)):
         payload = _model_dict(body)
         provider = payload.get("provider", "telegram")
         if provider == "rclone":
@@ -507,14 +508,14 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 "owner_profile": actor.profile,
             }
         )
-        return job_dict(
-            context.control_plane.submit_job(
-                actor, "storage_upload", payload, profile=actor.profile, worker=selected_worker
-            )
+        job = context.control_plane.submit_job(
+            actor, "storage_upload", payload, profile=actor.profile, worker=selected_worker
         )
+        track_activity_jobs(request, job)
+        return job_dict(job)
 
     @app.post("/api/v1/storage/downloads", response_model=JobResponse)
-    def submit_storage_download(body: StorageDownloadRequest, actor=Depends(current_actor)):
+    def submit_storage_download(body: StorageDownloadRequest, request: Request, actor=Depends(current_actor)):
         payload = {
             "provider": body.provider,
             "item_ids": list(body.item_ids),
@@ -542,15 +543,15 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
                 actor, worker=body.worker
             )
         try:
-            return job_dict(
-                context.control_plane.submit_job(
-                    actor,
-                    "storage_download",
-                    payload,
-                    profile=selected_profile,
-                    worker=selected_worker,
-                )
+            job = context.control_plane.submit_job(
+                actor,
+                "storage_download",
+                payload,
+                profile=selected_profile,
+                worker=selected_worker,
             )
+            track_activity_jobs(request, job)
+            return job_dict(job)
         except ValueError as exc:
             raise DomainError("STORAGE_DOWNLOAD_SELECTION_INVALID", "Pilihan file atau folder tidak valid.", status_code=422) from exc
 
@@ -619,7 +620,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
         return {"worker": selected_worker, **result}
 
     @app.post("/api/v1/storage/sync", response_model=JobResponse)
-    def submit_storage_sync(body: StorageSyncRequest, actor=Depends(current_actor)):
+    def submit_storage_sync(body: StorageSyncRequest, request: Request, actor=Depends(current_actor)):
         channel_id = int(getattr(context.config, "storage_channel_id", 0) or 0)
         if channel_id == 0 or not str(getattr(context.config, "storage_channel_ref", "") or "").strip():
             raise DomainError(
@@ -634,6 +635,7 @@ def register_storage(app, context, *, _active_storage_item, _deliver_storage_tel
             profile=body.profile,
             worker=body.worker,
         )
+        track_activity_jobs(request, job)
         return job_dict(job)
 
     @app.patch(

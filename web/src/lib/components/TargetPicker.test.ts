@@ -81,4 +81,27 @@ describe('TargetPicker profile targets', () => {
     expect(workerPicker.value).toBe('remote-1');
     expect(await screen.findByText(/Worker nonaktif untuk job baru/)).toBeTruthy();
   });
+
+  it('replaces a local actor route with an available remote target in Lite', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith('/auth/browser/session')) return new Response(JSON.stringify({
+        authenticated: true,
+        actor: { telegram_user_id: 42, profile: 'default', worker_route: 'local' },
+        profiles: ['default']
+      }), { status: 200 });
+      if (url.endsWith('/runtime/mode')) return new Response(JSON.stringify({ mode: 'lite' }), { status: 200 });
+      if (url.endsWith('/workers')) return new Response(JSON.stringify({ items: [
+        { name: 'remote-1', url: 'https://worker.example', enabled: true }
+      ] }), { status: 200 });
+      return new Response('{}', { status: 404 });
+    }));
+
+    await session.restore();
+    render(TargetPicker, { props: { worker: 'local' } });
+
+    const workerPicker = await screen.findByLabelText('Worker target') as HTMLSelectElement;
+    expect([...workerPicker.options].map((option) => option.value)).toEqual(['', 'remote-1']);
+    expect(workerPicker.value).toBe('remote-1');
+  });
 });

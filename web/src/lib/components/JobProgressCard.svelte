@@ -4,8 +4,9 @@
   import { ChevronDown, Clock3, FileText, Gauge, Pause, Play, SquareTerminal, Timer, XCircle } from '@lucide/svelte';
   import MediaProgressSummary from './MediaProgressSummary.svelte';
 
-  let { job, onReport, onLog, onTerminate, onPauseToggle, actionPending = false }: {
+  let { job, liteMode = false, onReport, onLog, onTerminate, onPauseToggle, actionPending = false }: {
     job: Record<string, any>;
+    liteMode?: boolean;
     onReport: () => void;
     onLog: () => void;
     onTerminate: () => void;
@@ -49,9 +50,37 @@
       : []
   );
   const cancelRequest = $derived(job.progress?.cancel_request || null);
+  const liteStatus = $derived(({ queued: 'Menunggu', dispatched: 'Berjalan', running: 'Berjalan', paused: 'Dijeda' } as Record<string, string>)[job.status] || job.status);
+  const liteTitle = $derived(job.kind === 'tts'
+    ? job.payload?.title || 'TTS'
+    : job.kind === 'utility'
+      ? job.payload?.utility || 'Utility'
+      : job.kind === 'storage_upload'
+        ? `Upload ${job.payload?.provider || 'Storage'}`
+        : job.kind.replaceAll('_', ' '));
 </script>
 
 <article class="idm-row">
+  {#if liteMode}
+    <div class="flex flex-wrap items-center justify-between gap-3 p-3.5 sm:p-4">
+      <div class="flex min-w-0 items-center gap-2.5">
+        <span class={`badge ${job.status === 'paused' ? 'paused' : 'running'} shrink-0`}>{liteStatus}</span>
+        <div class="min-w-0">
+          <b class="block truncate text-sm font-extrabold text-[var(--ink)]">{liteTitle}</b>
+          <span class="muted text-xs">{job.profile || '—'} · {job.worker || '—'}</span>
+        </div>
+      </div>
+      <div class="flex items-center gap-2">
+        {#if onPauseToggle}
+          <button class="button secondary !py-1.5 !px-3 text-xs" onclick={onPauseToggle} disabled={actionPending || !['queued','dispatched','running','paused'].includes(job.status)} aria-label={job.status === 'paused' ? 'Lanjutkan job' : 'Jeda job'}>
+            {#if job.status === 'paused'}<Play size={14}/><span>Resume</span>{:else}<Pause size={14}/><span>Pause</span>{/if}
+          </button>
+        {/if}
+        <button class="button secondary !py-1.5 !px-3 text-xs" onclick={onReport}><FileText size={14}/><span>Report</span></button>
+        <button class="button danger !py-1.5 !px-3 text-xs" onclick={onTerminate} aria-label="Hentikan job"><XCircle size={14}/><span>Stop</span></button>
+      </div>
+    </div>
+  {:else}
   <div class="p-3.5 sm:p-4">
     <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
       <!-- Main Info & Progress Bar (IDM Style) -->
@@ -360,6 +389,7 @@
         </div>
       </div>
     </div>
+  {/if}
   {/if}
 </article>
 

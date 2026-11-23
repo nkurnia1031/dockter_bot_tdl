@@ -1718,6 +1718,12 @@ class WorkerJobExecutor(
                 if isinstance(active_payload, dict)
                 else None
             )
+            if (
+                isinstance(active_payload, dict)
+                and active_payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+            ):
+                list_profiles = getattr(self.profile_manager, "list_profiles", None)
+                requested_senders = list_profiles() if callable(list_profiles) else []
             sender_profiles = (
                 [str(item).strip().lower() for item in requested_senders if str(item).strip()]
                 if isinstance(requested_senders, list)
@@ -1766,6 +1772,12 @@ class WorkerJobExecutor(
             elif kind == "storage_upload":
                 active_payload = active_command.get("payload", {}) if isinstance(active_command, dict) else {}
                 requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
+                if (
+                    isinstance(active_payload, dict)
+                    and active_payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+                ):
+                    list_profiles = getattr(self.profile_manager, "list_profiles", None)
+                    requested_senders = list_profiles() if callable(list_profiles) else []
                 sender_profiles = [
                     str(item).strip().lower()
                     for item in requested_senders
@@ -1808,11 +1820,18 @@ class WorkerJobExecutor(
                         interrupt("storage rclone reconciliation", rclone_runner.cancel_current, owner_aware=True)
                 else:
                     requested_senders = active_payload.get("_tdl_sender_profiles") if isinstance(active_payload, dict) else None
-                    sender_profiles = (
-                        requested_senders
-                        if isinstance(requested_senders, list) and requested_senders
-                        else self.available_storage_profiles()
-                    )
+                    if (
+                        isinstance(active_payload, dict)
+                        and active_payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+                    ):
+                        list_profiles = getattr(self.profile_manager, "list_profiles", None)
+                        sender_profiles = list_profiles() if callable(list_profiles) else []
+                    else:
+                        sender_profiles = (
+                            requested_senders
+                            if isinstance(requested_senders, list) and requested_senders
+                            else self.available_storage_profiles()
+                        )
                     for sender_profile in sender_profiles:
                         try:
                             sender_runtime = self.profile_manager.runtime(str(sender_profile))
@@ -2495,7 +2514,11 @@ class WorkerJobExecutor(
                 keys.add(f"worker:{worker}:tdl:storage")
                 if workspace_path:
                     keys.update(self._workspace_resource_keys(worker, [workspace_path]))
-                sender_profiles = payload.get("_tdl_sender_profiles") or [profile]
+                sender_profiles = (
+                    []
+                    if payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+                    else payload.get("_tdl_sender_profiles") or [profile]
+                )
                 for sender_profile in sender_profiles:
                     keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:upload")
         elif kind == "storage_sync":
@@ -2507,7 +2530,12 @@ class WorkerJobExecutor(
         elif kind == "tts":
             # Lock every verified fallback profile because only explicit
             # pre-send permission denials may move this job to another one.
-            sender_profiles = (command.get("payload") or {}).get("_tdl_sender_profiles") or [profile]
+            payload = command.get("payload") or {}
+            sender_profiles = (
+                []
+                if payload.get("_tdl_sender_profiles_use_worker_inventory") is True
+                else payload.get("_tdl_sender_profiles") or [profile]
+            )
             for sender_profile in sender_profiles:
                 keys.add(f"profile:{str(sender_profile).lower()}:worker:{worker}:tdl:export")
         elif kind == "tdl_access_verify":

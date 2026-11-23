@@ -77,4 +77,7 @@ def register_profile_install_events(app, context, *, require_internal) -> None:
             code=code,
             details=details,
         )
+        wake = getattr(provisioner, "wake", None)
+        if row_id is not None and callable(wake):
+            wake()
         return {"accepted": True, "duplicate": row_id is None}

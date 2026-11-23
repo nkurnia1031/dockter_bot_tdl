@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from tme3bot.background_schedule import run_event_driven_loop
 
 LOGGER = logging.getLogger(__name__)
 QUEUE_NAME = "tme3bot-operations"
@@ -252,6 +253,7 @@ class QueueOutboxPublisher:
         self.reconcile_seconds = max(self.interval_seconds, float(reconcile_seconds))
         self.batch_size = max(1, min(int(batch_size), 500))
         self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._queue_lock = threading.Lock()
         self._next_reconcile = 0.0
@@ -377,22 +379,34 @@ class QueueOutboxPublisher:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
+        self._wake_event.set()
         self._thread = threading.Thread(
             target=self._run, name="operation-outbox-publisher", daemon=True
         )
         self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop_event.is_set():
+        def publish_and_reconcile() -> None:
             try:
                 self.run_once()
             except Exception as exc:
                 # Redis URLs can contain credentials; log only the exception class.
                 LOGGER.warning("Queue outbox cycle failed (%s).", type(exc).__name__)
-            self._stop_event.wait(self.interval_seconds)
+
+        run_event_driven_loop(
+            self._stop_event,
+            self._wake_event,
+            recovery_seconds=self.interval_seconds,
+            callback=publish_and_reconcile,
+        )
+
+    def wake(self) -> None:
+        """Publish new outbox work immediately instead of waiting for recovery."""
+        self._wake_event.set()
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
+        self._wake_event.set()
         if self._thread:
             self._thread.join(timeout=max(0.1, float(timeout)))
         if self._connection is not None:

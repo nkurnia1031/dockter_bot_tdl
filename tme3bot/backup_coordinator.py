@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,10 +16,11 @@ LOGGER = logging.getLogger(__name__)
 
 
 class BackupCoordinator:
-    def __init__(self, config, bot, catalog) -> None:
+    def __init__(self, config, bot, catalog, database_activity=None) -> None:
         self.config = config
         self.bot = bot
         self.catalog = catalog
+        self.database_activity = database_activity
         self.service = BackupService(config, catalog)
         self._lock = threading.RLock()
         self._active_run: str | None = None
@@ -47,15 +49,18 @@ class BackupCoordinator:
             self._run_gateway(run_id, password)
         except Exception as exc:
             LOGGER.exception("Gateway backup failed")
-            self.catalog.start_backup_run(run_id, self.config.backup_node_name)
-            self.catalog.finish_backup_run(run_id, self.config.backup_node_name, "failed", str(exc))
+            with self._database_activity():
+                self.catalog.start_backup_run(run_id, self.config.backup_node_name)
+            with self._database_activity():
+                self.catalog.finish_backup_run(run_id, self.config.backup_node_name, "failed", str(exc))
         finally:
             with self._lock:
                 self._active_run = None
 
     def _run_gateway(self, run_id: str, password: str) -> None:
         node_name = self.config.backup_node_name
-        self.catalog.start_backup_run(run_id, node_name)
+        with self._database_activity():
+            self.catalog.start_backup_run(run_id, node_name)
         archive = self.service.create_archive(run_id, node_name, password=password, volume_size=self.config.backup_volume_size)
         try:
             for part in archive.parts:
@@ -67,13 +72,15 @@ class BackupCoordinator:
                         filename=part.name,
                         caption=f"#backup #node_{node_name} #run_{run_id[:12]}\nPart: {part.name}",
                     )
-                self.catalog.upsert_backup_part(
-                    run_id=run_id, node_name=node_name, part_name=part.name,
-                    channel_id=self.config.backup_channel_id,
-                    channel_message_id=int(message.message_id), file_size=size,
-                    sha256=digest, status="active",
-                )
-            self.catalog.finish_backup_run(run_id, node_name, "complete")
+                with self._database_activity():
+                    self.catalog.upsert_backup_part(
+                        run_id=run_id, node_name=node_name, part_name=part.name,
+                        channel_id=self.config.backup_channel_id,
+                        channel_message_id=int(message.message_id), file_size=size,
+                        sha256=digest, status="active",
+                    )
+            with self._database_activity():
+                self.catalog.finish_backup_run(run_id, node_name, "complete")
             self.prune_node(node_name)
         finally:
             for part in archive.parts:
@@ -93,16 +100,19 @@ class BackupCoordinator:
             missing = sorted(required - set(payload))
             if missing:
                 raise ValueError(f"Field callback backup kurang: {', '.join(missing)}")
-            self.catalog.upsert_backup_part(
-                run_id=run_id, node_name=node_name, part_name=str(payload["part_name"]),
-                channel_id=int(payload["channel_id"]), channel_message_id=int(payload["channel_message_id"]),
-                file_size=int(payload["file_size"]), sha256=str(payload["sha256"]), status="active",
-            )
+            with self._database_activity():
+                self.catalog.upsert_backup_part(
+                    run_id=run_id, node_name=node_name, part_name=str(payload["part_name"]),
+                    channel_id=int(payload["channel_id"]), channel_message_id=int(payload["channel_message_id"]),
+                    file_size=int(payload["file_size"]), sha256=str(payload["sha256"]), status="active",
+                )
         if status == "complete":
-            self.catalog.finish_backup_run(run_id, node_name, "complete")
+            with self._database_activity():
+                self.catalog.finish_backup_run(run_id, node_name, "complete")
             self.prune_node(node_name)
         elif status == "failed":
-            self.catalog.finish_backup_run(run_id, node_name, "failed", str(payload.get("error", "backup gagal")))
+            with self._database_activity():
+                self.catalog.finish_backup_run(run_id, node_name, "failed", str(payload.get("error", "backup gagal")))
 
     def prune_node(self, node_name: str) -> None:
         for run in self.catalog.backup_retention_candidates(node_name, self.config.backup_retention):
@@ -118,9 +128,15 @@ class BackupCoordinator:
                     cleanup_failed = True
                     LOGGER.warning("Backup cleanup gagal untuk %s: %s", part["part_name"], exc)
             if cleanup_failed:
-                self.catalog.finish_backup_run(str(run["run_id"]), node_name, "cleanup_failed", "Gagal menghapus sebagian backup lama.")
+                with self._database_activity():
+                    self.catalog.finish_backup_run(str(run["run_id"]), node_name, "cleanup_failed", "Gagal menghapus sebagian backup lama.")
             else:
-                self.catalog.delete_backup_run(str(run["run_id"]), node_name)
+                with self._database_activity():
+                    self.catalog.delete_backup_run(str(run["run_id"]), node_name)
+
+    def _database_activity(self):
+        factory = self.database_activity
+        return factory() if callable(factory) else nullcontext()
 
     def status(self) -> list[dict[str, object]]:
         return self.catalog.backup_runs(limit=100)
@@ -134,15 +150,18 @@ class BackupCoordinator:
 
 
 class BackupScheduler:
-    def __init__(self, config, coordinator: BackupCoordinator) -> None:
+    def __init__(
+        self, config, coordinator: BackupCoordinator, *, scheduling_enabled: bool = True
+    ) -> None:
         self.config = config
         self.coordinator = coordinator
+        self.scheduling_enabled = bool(scheduling_enabled)
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread is not None:
+        if not self.scheduling_enabled or self._thread is not None:
             return
         self._thread = threading.Thread(target=self._loop, daemon=True, name="tme3-backup-scheduler")
         self._thread.start()
@@ -153,6 +172,8 @@ class BackupScheduler:
 
     def wake(self) -> None:
         """Recheck enabled state or the schedule after a Web update."""
+        if not self.scheduling_enabled:
+            return
         self._wake.set()
 
     def _loop(self) -> None:

@@ -35,9 +35,8 @@ def main() -> None:
 
         run_worker(config)
         return
-    if config.app_role == "telegram":
+    if config.app_role in {"telegram", "telegram-login"}:
         from tme3bot.frontend.client import BackendApiClient
-        from tme3bot.frontend.telegram import TelegramFrontendApp
 
         client = BackendApiClient(
             config.backend_api_url, config.frontend_service_token
@@ -59,6 +58,13 @@ def main() -> None:
             logging.getLogger(__name__).warning(
                 "Telegram runtime settings unavailable; using environment bootstrap"
             )
-        TelegramFrontendApp(config, client).start()
+        if config.app_role == "telegram-login":
+            from tme3bot.frontend.telegram_login import TelegramLoginApp
+
+            TelegramLoginApp(config, client).start()
+        else:
+            from tme3bot.frontend.telegram import TelegramFrontendApp
+
+            TelegramFrontendApp(config, client).start()
         return
     raise RuntimeError(f"APP_ROLE tidak didukung: {config.app_role}")

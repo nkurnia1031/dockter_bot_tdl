@@ -1,4 +1,5 @@
 import { api, post, put } from './api';
+import { getGatewayMode, setGatewayMode } from './gateway-mode.svelte';
 import {
   normalizeLocalProfileCatalog,
   normalizeRuntimeReadiness,
@@ -48,6 +49,23 @@ async function loadProfileCatalog(): Promise<ProfileCatalogLoad> {
     };
   }
 }
+
+async function loadGatewayMode(): Promise<'full' | 'lite' | null> {
+  try {
+    const response = await api<{ mode?: string }>('/runtime/mode');
+    const mode = response.mode === 'full' || response.mode === 'lite' ? response.mode : null;
+    setGatewayMode(mode);
+    return mode;
+  } catch {
+    setGatewayMode(null);
+    return null;
+  }
+}
+
+const emptyProfileCatalog = (): ProfileCatalogLoad => ({
+  profiles: [],
+  runtimeReadiness: { checked_at: '', workers: [], cells: [] }
+});
 
 function setTargetProfile(profile: string) {
   if (!profileCatalog.some((item) => item.name === profile) || profile === selectedTargetProfile) return;
@@ -99,12 +117,14 @@ export const session = {
         if ((cause as { status?: number })?.status !== 401) throw cause;
         restored = await api<Session>('/auth/browser/refresh', { method: 'POST' });
       }
+      const mode = restored.authenticated ? await loadGatewayMode() : null;
+      if (!restored.authenticated) setGatewayMode(null);
       const [restoredWorkers, restoredCatalog] = restored.authenticated
         ? await Promise.all([
             loadWorkers(restored.actor?.worker_route),
-            loadProfileCatalog()
+            mode === 'full' ? loadProfileCatalog() : Promise.resolve(emptyProfileCatalog())
           ])
-        : [[], { profiles: [], runtimeReadiness: { checked_at: '', workers: [], cells: [] } }] as [SessionWorker[], ProfileCatalogLoad];
+        : [[], emptyProfileCatalog()] as [SessionWorker[], ProfileCatalogLoad];
       if (request !== generation) return;
       current = restored;
       workers = restoredWorkers;
@@ -116,6 +136,7 @@ export const session = {
     } catch {
       if (request !== generation) return;
       current = { authenticated: false, profiles: [] };
+      setGatewayMode(null);
       workers = [];
       profileCatalog = [];
       runtimeReadiness = { checked_at: '', workers: [], cells: [] };
@@ -129,18 +150,21 @@ export const session = {
   },
   async pollLogin() {
     const next = await api<Session>('/auth/browser/challenge');
-    current = next;
-    if (current.authenticated) {
+    if (next.authenticated) {
+      const mode = await loadGatewayMode();
       const [nextWorkers, nextCatalog] = await Promise.all([
-        loadWorkers(current.actor?.worker_route),
-        loadProfileCatalog()
+        loadWorkers(next.actor?.worker_route),
+        mode === 'full' ? loadProfileCatalog() : Promise.resolve(emptyProfileCatalog())
       ]);
+      current = next;
       workers = nextWorkers;
       profileCatalog = nextCatalog.profiles;
       runtimeReadiness = nextCatalog.runtimeReadiness;
       selectedTargetProfile = fallbackTargetProfile(current.actor?.profile);
       challenge = null;
       contextChanged();
+    } else {
+      current = next;
     }
     return current;
   },
@@ -162,6 +186,12 @@ export const session = {
     setTargetProfile(profile);
   },
   async refreshProfileCatalog() {
+    if (getGatewayMode() !== 'full') {
+      profileCatalog = [];
+      runtimeReadiness = emptyProfileCatalog().runtimeReadiness;
+      selectedTargetProfile = '';
+      return profileCatalog;
+    }
     const next = await loadProfileCatalog();
     profileCatalog = next.profiles;
     runtimeReadiness = next.runtimeReadiness;
@@ -189,6 +219,7 @@ export const session = {
   },
   async logout() {
     await post('/auth/browser/logout');
+    setGatewayMode(null);
     current = { authenticated: false, profiles: [] };
     workers = [];
     profileCatalog = [];

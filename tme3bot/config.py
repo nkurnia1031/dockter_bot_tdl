@@ -66,6 +66,7 @@ class AppConfig:
     tdl_upload_progress_stall_timeout_seconds: int = 60
     database_root: Path = Path("/database")
     app_role: str = "backend"
+    gateway_mode: str = "full"
     leave_helper_binary: str = "/usr/local/bin/tdl-leave"
     utility_workspace_root: Path = Path("/workspace")
     rclone_config_path: Path = Path("/data/.config/rclone.conf")
@@ -78,6 +79,9 @@ class AppConfig:
     storage_channel_username: str = ""
     storage_channel: str = ""
     storage_db_file: Path = Path("/database/gateway/storage.db")
+    database_compaction_min_free_bytes: int = 64 * 1024 * 1024
+    gateway_lite_recovery_interval_seconds: int = 30
+    gateway_lite_trash_interval_seconds: int = 3600
     storage_trash_retention_days: int = 30
     backup_enabled: bool = True
     backup_channel_ref: str = ""
@@ -145,7 +149,7 @@ class AppConfig:
                 )
             if self.durable_dispatch_enabled and not self.redis_url:
                 required["REDIS_URL"] = self.redis_url
-        elif self.app_role == "telegram":
+        elif self.app_role in {"telegram", "telegram-login"}:
             required = {
                 "BACKEND_API_URL": self.backend_api_url,
                 "FRONTEND_SERVICE_TOKEN": self.frontend_service_token,
@@ -174,12 +178,21 @@ class AppConfig:
         load_dotenv(override=False)
 
         app_role = os.getenv("APP_ROLE", "backend").strip().lower() or "backend"
-        if app_role not in {"backend", "backend-queue", "telegram", "worker"}:
+        if app_role not in {
+            "backend",
+            "backend-queue",
+            "telegram",
+            "telegram-login",
+            "worker",
+        }:
             raise ValueError(
-                "APP_ROLE harus backend, backend-queue, telegram, atau worker."
+                "APP_ROLE harus backend, backend-queue, telegram, telegram-login, atau worker."
             )
+        gateway_mode = os.getenv("GATEWAY_MODE", "full").strip().lower() or "full"
+        if gateway_mode not in {"full", "lite"}:
+            raise ValueError("GATEWAY_MODE harus full atau lite.")
         bot_token = os.getenv("BOT_TOKEN", "").strip()
-        if app_role in {"backend", "telegram"} and not bot_token:
+        if app_role in {"backend", "telegram", "telegram-login"} and not bot_token:
             raise ValueError("BOT_TOKEN is required.")
 
         # PROFILE_ROOT is the host path used by Compose. The application sees
@@ -268,6 +281,33 @@ class AppConfig:
             database_root,
             "STORAGE_DB_FILE",
         )
+        try:
+            database_compaction_min_free_bytes = max(
+                0, int(os.getenv("DATABASE_COMPACTION_MIN_FREE_BYTES", str(64 * 1024 * 1024)))
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "DATABASE_COMPACTION_MIN_FREE_BYTES harus berupa bilangan bulat non-negatif."
+            ) from exc
+        try:
+            gateway_lite_recovery_interval_seconds = int(
+                os.getenv("GATEWAY_LITE_RECOVERY_INTERVAL_SECONDS", "30")
+            )
+            gateway_lite_trash_interval_seconds = int(
+                os.getenv("GATEWAY_LITE_TRASH_INTERVAL_SECONDS", "3600")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "Interval maintenance Lite harus berupa bilangan bulat positif."
+            ) from exc
+        if gateway_lite_recovery_interval_seconds < 10:
+            raise ValueError(
+                "GATEWAY_LITE_RECOVERY_INTERVAL_SECONDS minimal 10 detik."
+            )
+        if gateway_lite_trash_interval_seconds < gateway_lite_recovery_interval_seconds:
+            raise ValueError(
+                "GATEWAY_LITE_TRASH_INTERVAL_SECONDS tidak boleh lebih cepat daripada recovery."
+            )
         storage_trash_retention_days = max(
             1, int(os.getenv("STORAGE_TRASH_RETENTION_DAYS", "30"))
         )
@@ -309,6 +349,7 @@ class AppConfig:
         return cls(
             bot_token=bot_token,
             app_role=app_role,
+            gateway_mode=gateway_mode,
             profile_root=profile_root,
             profiles_root=profiles_root,
             default_profile=default_profile,
@@ -345,6 +386,9 @@ class AppConfig:
             storage_channel_username=storage_channel_username,
             storage_channel=storage_channel,
             storage_db_file=storage_db_file,
+            database_compaction_min_free_bytes=database_compaction_min_free_bytes,
+            gateway_lite_recovery_interval_seconds=gateway_lite_recovery_interval_seconds,
+            gateway_lite_trash_interval_seconds=gateway_lite_trash_interval_seconds,
             storage_trash_retention_days=storage_trash_retention_days,
             backup_enabled=backup_enabled,
             backup_channel_ref=backup_channel_ref,

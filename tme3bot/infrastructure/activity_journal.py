@@ -166,6 +166,10 @@ class ActivityJournalStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS api_activity_event_key "
                 "ON api_activity(event_key) WHERE event_key <> ''"
             )
+            db.execute(
+                "DELETE FROM api_activity WHERE activity_type='request' "
+                "AND job_id=''"
+            )
             db.commit()
 
     def _cutoff(self) -> str:
@@ -260,6 +264,12 @@ class ActivityJournalStore:
         safe_result = str(result_code or "").upper()
         if not re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}\Z", safe_result):
             safe_result = "SUCCESS" if safe_status < 400 else "ERROR"
+
+        # Keep API metadata only when it can be tied back to a durable job or
+        # operation. List, polling, auth, and other ambient request traffic is
+        # deliberately not part of the operator activity history.
+        if safe_activity_type == "request" and not safe_job and not safe_operation:
+            return
 
         with self._lock, closing(self._connect()) as db:
             db.execute("DELETE FROM api_activity WHERE occurred_at < ?", (self._cutoff(),))
