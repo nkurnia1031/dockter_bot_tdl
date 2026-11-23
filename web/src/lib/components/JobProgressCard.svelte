@@ -59,6 +59,23 @@
       : job.kind === 'storage_upload'
         ? `Upload ${job.payload?.provider || 'Storage'}`
         : job.kind.replaceAll('_', ' '));
+
+  function liteUnitLabel(value: unknown): string {
+    const labels: Record<string, string> = {
+      archives: 'arsip', bytes: 'byte', files: 'file', folders: 'folder',
+      items: 'item', json: 'JSON', messages: 'pesan',
+    };
+    const unit = String(value || '');
+    return labels[unit] || unit;
+  }
+
+  function liteProcessedSummary(summary: Record<string, any>): string {
+    const processed = String(summary.processed);
+    if (summary.processed_from_counters === true) return `${processed} hasil diproses`;
+    const total = typeof summary.total === 'number' ? `/${summary.total}` : '';
+    const unit = summary.unit ? ` ${liteUnitLabel(summary.unit)}` : '';
+    return `${processed}${total}${unit} diproses`;
+  }
 </script>
 
 <article class="idm-row">
@@ -92,7 +109,17 @@
         </div>
         {#if liteWorkerRefresh.active_file}<p class="mt-2 truncate text-sm font-semibold" title={liteWorkerRefresh.active_file}>File: {liteWorkerRefresh.active_file}</p>{/if}
         <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs font-semibold text-[var(--muted)]">
-          {#if typeof liteWorkerRefresh.completed === 'number' && typeof liteWorkerRefresh.total === 'number'}<span>{liteWorkerRefresh.completed}/{liteWorkerRefresh.total} selesai</span>{/if}
+          {#if typeof liteWorkerRefresh.processed === 'number'}
+            <span>{liteProcessedSummary(liteWorkerRefresh)}</span>
+          {:else if typeof liteWorkerRefresh.completed === 'number' && typeof liteWorkerRefresh.total === 'number'}
+            <span>{liteWorkerRefresh.completed}/{liteWorkerRefresh.total} selesai</span>
+          {/if}
+          {#if typeof liteWorkerRefresh.succeeded === 'number'}<span>{liteWorkerRefresh.succeeded} berhasil</span>{/if}
+          {#if typeof liteWorkerRefresh.failed === 'number'}<span>{liteWorkerRefresh.failed} gagal</span>{/if}
+          {#if typeof liteWorkerRefresh.skipped === 'number'}<span>{liteWorkerRefresh.skipped} dilewati</span>{/if}
+          {#if typeof liteWorkerRefresh.ambiguous === 'number' && liteWorkerRefresh.ambiguous > 0}<span>{liteWorkerRefresh.ambiguous} ambigu</span>{/if}
+          {#if typeof liteWorkerRefresh.cancelled === 'number' && liteWorkerRefresh.cancelled > 0}<span>{liteWorkerRefresh.cancelled} dibatalkan</span>{/if}
+          {#if typeof liteWorkerRefresh.retryable === 'number' && liteWorkerRefresh.retryable > 0}<span>{liteWorkerRefresh.retryable} bisa diulang</span>{/if}
           {#if typeof liteWorkerRefresh.percent === 'number'}<span>{Math.round(liteWorkerRefresh.percent)}%</span>{/if}
         </div>
       </div>

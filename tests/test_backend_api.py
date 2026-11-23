@@ -751,10 +751,23 @@ class BackendApiTests(unittest.TestCase):
             worker="remote-1", status=JobStatus.RUNNING,
             payload={"utility": "extract"}, progress={"retained": "gateway-metadata"},
         ))
+        fallback_job = self.jobs.create(Job(
+            id="refresh-fallback", kind="utility", profile="default", actor_user_id=42,
+            worker="remote-1", status=JobStatus.RUNNING,
+            payload={"utility": "extract"}, progress={},
+        ))
         stale_job = self.jobs.create(Job(
             id="refresh-stale", kind="storage_upload", profile="default", actor_user_id=42,
             worker="remote-2", status=JobStatus.RUNNING,
-            payload={"provider": "telegram"}, progress={"phase": "uploading"},
+            payload={"provider": "telegram"}, progress={
+                "phase": "uploading",
+                "lite_worker_refresh": {
+                    "state": "fresh", "processed": 4, "total": 6,
+                    "processed_from_counters": True,
+                    "succeeded": 2, "failed": 1, "skipped": 1,
+                    "ambiguous": 0, "cancelled": 0, "retryable": 2,
+                },
+            },
         ))
         queued_job = self.jobs.create(Job(
             id="refresh-queued", kind="export", profile="default", actor_user_id=42,
@@ -775,10 +788,20 @@ class BackendApiTests(unittest.TestCase):
                 "progress": {
                     "phase": "extracting",
                     "item": {"name": "episode.rar", "index": 2, "total": 5, "percent": 40},
-                    "overall": {"current": 1, "total": 3, "percent": 33.3},
+                    "overall": {"current": 0.4, "total": 1, "unit": "folders", "percent": 40},
+                    "counters": {"succeeded": 1, "failed": 1, "skipped": 1},
                     "message": "private raw worker message must not be copied",
                 },
-            }
+            },
+            fallback_job.id: {
+                "job_id": fallback_job.id,
+                "status": "running",
+                "phase": "processing",
+                "updated_at": now.isoformat(),
+                "progress": {
+                    "overall": {"current": 2, "total": 4, "unit": "files", "percent": 50},
+                },
+            },
         }
         self.dispatcher.progress_snapshot_errors["remote-2"] = RuntimeError("worker offline")
 
@@ -786,29 +809,46 @@ class BackendApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         items = {item["id"]: item for item in response.json()["items"]}
-        self.assertEqual(set(items), {fresh_job.id, stale_job.id, queued_job.id})
+        self.assertEqual(set(items), {fresh_job.id, fallback_job.id, stale_job.id, queued_job.id})
         fresh = items[fresh_job.id]
         self.assertEqual(fresh["status"], "running")
         self.assertEqual(fresh["progress"]["retained"], "gateway-metadata")
         self.assertEqual(fresh["progress"]["lite_worker_refresh"]["state"], "fresh")
         self.assertEqual(fresh["progress"]["lite_worker_refresh"]["active_file"], "episode.rar")
         self.assertEqual(fresh["progress"]["lite_worker_refresh"]["stage"], "extracting")
-        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["completed"], 1)
-        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["total"], 3)
-        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["percent"], 33.3)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["completed"], 0)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["processed"], 3)
+        self.assertTrue(fresh["progress"]["lite_worker_refresh"]["processed_from_counters"])
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["total"], 1)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["unit"], "folders")
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["succeeded"], 1)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["failed"], 1)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["skipped"], 1)
+        self.assertEqual(fresh["progress"]["lite_worker_refresh"]["percent"], 40)
         self.assertNotIn("private raw worker message", str(fresh["progress"]["lite_worker_refresh"]))
+
+        fallback = items[fallback_job.id]["progress"]["lite_worker_refresh"]
+        self.assertEqual(fallback["completed"], 2)
+        self.assertEqual(fallback["processed"], 2)
+        self.assertFalse(fallback["processed_from_counters"])
+        self.assertEqual(fallback["percent"], 50)
 
         stale = items[stale_job.id]
         self.assertEqual(stale["status"], "running")
         self.assertTrue(stale["progress"]["lite_worker_refresh"]["stale"])
         self.assertEqual(stale["progress"]["lite_worker_refresh"]["state"], "stale")
         self.assertEqual(stale["progress"]["phase"], "uploading")
+        self.assertEqual(stale["progress"]["lite_worker_refresh"]["processed"], 4)
+        self.assertTrue(stale["progress"]["lite_worker_refresh"]["processed_from_counters"])
+        self.assertEqual(stale["progress"]["lite_worker_refresh"]["failed"], 1)
+        self.assertEqual(stale["progress"]["lite_worker_refresh"]["skipped"], 1)
+        self.assertEqual(stale["progress"]["lite_worker_refresh"]["retryable"], 2)
         self.assertEqual(items[queued_job.id]["status"], "queued")
         self.assertEqual(items[queued_job.id]["progress"]["lite_worker_refresh"]["state"], "waiting_worker")
         calls_by_worker = dict(self.dispatcher.progress_snapshot_calls)
-        self.assertEqual(calls_by_worker, {
-            "remote-1": [fresh_job.id],
-            "remote-2": [stale_job.id],
+        self.assertEqual({worker: set(job_ids) for worker, job_ids in calls_by_worker.items()}, {
+            "remote-1": {fresh_job.id, fallback_job.id},
+            "remote-2": {stale_job.id},
         })
         self.assertEqual(self.jobs.get(terminal_job.id).status, JobStatus.SUCCEEDED)
 

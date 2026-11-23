@@ -56,6 +56,17 @@ _STORAGE_DURABLE_DISPATCH_KEY = "_storage_durable_dispatch"
 _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS = 2_000.0
 _WORKER_UNRESPONSIVE_CANCEL_TIMEOUT_SECONDS = 2.5
 _WORKER_HEALTH_UNSET = object()
+_LITE_PROGRESS_COUNTER_FIELDS = (
+    "succeeded", "failed", "skipped", "ambiguous", "cancelled", "retryable",
+)
+_LITE_PROGRESS_OUTCOME_COUNTER_FIELDS = (
+    "succeeded", "failed", "skipped", "ambiguous", "cancelled",
+)
+_LITE_PROGRESS_SUMMARY_FIELDS = (
+    "active_file", "stage", "status", "completed", "processed",
+    "processed_from_counters", "total", "unit", "percent",
+    *_LITE_PROGRESS_COUNTER_FIELDS,
+)
 _ACTIVE_PROGRESS_REFRESH_STATUSES = (
     JobStatus.QUEUED.value,
     JobStatus.DISPATCHED.value,
@@ -199,6 +210,8 @@ class ControlPlane:
 
         completed_value = overall.get("files_current", overall.get("current"))
         total_value = overall.get("files_total", overall.get("total"))
+        unit = overall.get("unit")
+        unit = str(unit)[:32] if isinstance(unit, str) and unit else None
         if completed_value is None:
             completed_value = merged.get("current_json_index")
         if total_value is None:
@@ -210,11 +223,34 @@ class ControlPlane:
 
         completed = count_value(completed_value)
         total = count_value(total_value)
+        raw_counters = merged.get("counters")
+        raw_counters = raw_counters if isinstance(raw_counters, dict) else {}
+        counters = {
+            counter_name: count_value(raw_counters.get(counter_name))
+            for counter_name in _LITE_PROGRESS_COUNTER_FIELDS
+        }
+        outcome_counters_available = any(
+            counters[counter_name] is not None
+            for counter_name in _LITE_PROGRESS_OUTCOME_COUNTER_FIELDS
+        )
+        if outcome_counters_available:
+            for counter_name in ("succeeded", "failed", "skipped"):
+                counters[counter_name] = (
+                    counters[counter_name] if counters[counter_name] is not None else 0
+                )
+        processed_from_counters = outcome_counters_available
+        processed = completed
+        if processed_from_counters:
+            processed = sum(
+                counters[counter_name] or 0
+                for counter_name in _LITE_PROGRESS_OUTCOME_COUNTER_FIELDS
+            )
         percent_value = cls._progress_number(
             overall.get("percent", item.get("percent", merged.get("tdl_percent")))
         )
-        if percent_value is None and completed is not None and total:
-            percent_value = completed * 100 / total
+        percent_progress = completed if completed is not None else processed
+        if percent_value is None and percent_progress is not None and total:
+            percent_value = percent_progress * 100 / total
         percent = (
             round(min(100.0, max(0.0, percent_value)), 1)
             if percent_value is not None
@@ -227,8 +263,12 @@ class ControlPlane:
             "stage": str(stage)[:80] if stage else None,
             "status": str(status)[:80] if status else None,
             "completed": completed,
+            "processed": processed,
+            "processed_from_counters": processed_from_counters,
             "total": total,
+            "unit": unit,
             "percent": percent,
+            **counters,
         }
 
     @classmethod
@@ -239,9 +279,7 @@ class ControlPlane:
         if isinstance(previous, dict):
             summary = {
                 key: previous.get(key)
-                for key in (
-                    "active_file", "stage", "status", "completed", "total", "percent"
-                )
+                for key in _LITE_PROGRESS_SUMMARY_FIELDS
             }
             refreshed_at = previous.get("refreshed_at")
         else:

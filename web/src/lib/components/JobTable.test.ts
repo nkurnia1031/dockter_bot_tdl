@@ -913,7 +913,8 @@ describe('JobTable', () => {
         phase: 'old-gateway-phase',
         lite_worker_refresh: {
           state: 'fresh', stale: false, active_file: 'episode.rar', stage: 'extracting', status: 'running',
-          completed: 2, total: 5, percent: 40, refreshed_at: '2026-11-23T09:02:00Z',
+          completed: 0, processed: 3, processed_from_counters: true, total: 1, unit: 'folders',
+          succeeded: 1, failed: 1, skipped: 1, percent: 40, refreshed_at: '2026-11-23T09:02:00Z',
         },
       } : {},
     });
@@ -947,7 +948,10 @@ describe('JobTable', () => {
     expect(refreshCalls).toBe(1);
     expect(listCalls).toBe(2);
     expect(screen.getByText('Tahap: Mengekstrak')).toBeTruthy();
-    expect(screen.getByText('2/5 selesai')).toBeTruthy();
+    expect(screen.getByText('3 hasil diproses')).toBeTruthy();
+    expect(screen.getByText('1 berhasil')).toBeTruthy();
+    expect(screen.getByText('1 gagal')).toBeTruthy();
+    expect(screen.getByText('1 dilewati')).toBeTruthy();
     expect(screen.getByText('40%')).toBeTruthy();
 
     await new Promise((resolve) => setTimeout(resolve, 25));
