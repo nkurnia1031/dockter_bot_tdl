@@ -306,6 +306,11 @@ Recovery `/start`, `/menu`, `/panel`, unknown command, serta teks persis
 
 ## Operasional
 
+Rencana restart worker dari Web yang memakai supervisor host terpisah dicatat
+di `docs/agents/worker-restart-supervisor-plan.md`. Baca hanya saat merancang
+atau melanjutkan fitur restart worker dari UI; dokumen itu rencana saja dan
+bukan izin implementasi.
+
 ### Workflow Git agent
 
 Semua pekerjaan agent dilakukan langsung pada branch `main`. Pastikan
