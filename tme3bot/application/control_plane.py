@@ -125,6 +125,7 @@ class ControlPlane:
         self._scheduler_wake = threading.Event()
         self._scheduler_thread: threading.Thread | None = None
         self._stale_cancel_requested: dict[str, Any] = {}
+        self._stale_worker_probe_results: dict[str, tuple[Any, bool]] = {}
         self._stale_job_lock = threading.RLock()
         self._high_latency_cancel_attempts: dict[str, dict[str, Any]] = {}
         self._unresponsive_workers: dict[str, str] = {}
@@ -267,10 +268,23 @@ class ControlPlane:
         )
 
     @staticmethod
+    def _job_unresponsive_reason(job: Job) -> str:
+        progress = job.progress if isinstance(job.progress, dict) else {}
+        return str(
+            progress.get("worker_unresponsive_reason")
+            or "event_backlog_cancel_unconfirmed"
+        )[:96]
+
+    @staticmethod
     def _persisted_high_latency_cancel_request(job: Job) -> dict[str, Any] | None:
         progress = job.progress if isinstance(job.progress, dict) else {}
         request = progress.get("backend_cancel_request")
         if not isinstance(request, dict):
+            return None
+        # Only an operator Stop may survive into the recovery loop. Older
+        # versions also wrote this marker automatically when telemetry was
+        # delayed, so untagged markers must not trigger another cancellation.
+        if request.get("source") != "operator_stop":
             return None
         status = str(request.get("signal_status") or "")
         if status not in {"pending", "accepted"}:
@@ -283,6 +297,7 @@ class ControlPlane:
             "requested_at": request.get("requested_at"),
             "signal_status": status,
             "latency_ms": max(0.0, latency_ms),
+            "source": "operator_stop",
             "in_flight": False,
         }
 
@@ -353,6 +368,7 @@ class ControlPlane:
             ),
             "signal_status": str(request.get("signal_status") or "pending"),
             "latency_ms": round(float(request.get("latency_ms") or 0.0), 3),
+            "source": str(request.get("source") or "operator_stop"),
         }
         updated, _ = self.jobs.update_progress_metadata(
             current.id,
@@ -398,7 +414,7 @@ class ControlPlane:
             worker = str(job.worker or "").strip().lower()
             if not worker:
                 continue
-            reason = "event_backlog_cancel_unconfirmed"
+            reason = self._job_unresponsive_reason(job)
             self._unresponsive_workers[worker] = reason
             if callable(marker):
                 marker(worker, reason=reason)
@@ -418,6 +434,7 @@ class ControlPlane:
         name = str(worker or "").strip().lower()
         with self._stale_job_lock:
             self._unresponsive_workers.pop(name, None)
+            self._stale_worker_probe_results.pop(name, None)
         clearer = getattr(self.worker_health_cache, "clear_unresponsive", None)
         if callable(clearer):
             clearer(name)
@@ -486,7 +503,7 @@ class ControlPlane:
             self._clear_worker_unresponsive(normalized)
         else:
             self._mark_worker_unresponsive(
-                normalized, reason="event_backlog_cancel_unconfirmed"
+                normalized, reason=self._job_unresponsive_reason(remaining)
             )
 
     @contextmanager
@@ -3898,18 +3915,63 @@ class ControlPlane:
             callback=recover_and_dispatch,
         )
 
-    def _recover_stale_jobs(self, *, now=None) -> None:
-        """Request cancellation for stale work and fail only after a grace period.
+    def _stale_worker_responds(self, worker: str, *, now) -> bool | None:
+        """Check a stale job's worker once, reusing Lite's cached health probe.
 
-        A backend timeout is not proof that the worker or its external process
-        stopped. The terminal record therefore stays failed/uncertain and its
-        execution lease remains held until a worker terminal event confirms it
-        has stopped.
+        The normal path is a read from WorkerHealthMonitor's existing snapshot.
+        A targeted HTTP probe is only used when that snapshot cannot confirm the
+        worker is responding, and is rate-limited per worker rather than per
+        job. A response proves the worker API is reachable even if its health
+        payload reports a degraded service.
+        """
+        name = str(worker or "").strip().lower()
+        if not name:
+            return None
+
+        snapshotter = getattr(self.worker_health_cache, "snapshot", None)
+        if callable(snapshotter):
+            try:
+                snapshot = snapshotter(name)
+            except Exception:
+                snapshot = None
+            if isinstance(snapshot, dict):
+                status = str(snapshot.get("status") or "").strip().lower()
+                if status == "ready" and snapshot.get("healthy") is True:
+                    return True
+
+        cooldown_seconds = max(30.0, self.scheduler_recovery_seconds)
+        with self._stale_job_lock:
+            previous = self._stale_worker_probe_results.get(name)
+            if previous is not None:
+                checked_at, responds = previous
+                if (now - checked_at).total_seconds() < cooldown_seconds:
+                    return responds
+
+        checker = getattr(self.dispatcher, "check_worker_fast", None)
+        if not callable(checker):
+            return None
+        try:
+            checker(name)
+        except Exception:
+            responds = False
+        else:
+            responds = True
+        with self._stale_job_lock:
+            self._stale_worker_probe_results[name] = (now, responds)
+        return responds
+
+    def _recover_stale_jobs(self, *, now=None) -> None:
+        """Mark stale jobs cancelled only when their worker fails a health probe.
+
+        Event delivery latency is telemetry, not proof that the worker stopped
+        responding. Lite reuses its background health snapshot; only an unknown
+        or stale snapshot causes one bounded probe per worker cooldown window.
         """
         current_time = now or utc_now()
         active_statuses = (JobStatus.DISPATCHED.value, JobStatus.RUNNING.value)
         active_ids: set[str] = set()
         forced = False
+        worker_probe_results: dict[str, bool | None] = {}
         for status in active_statuses:
             for job in self.jobs.list(
                 status=status,
@@ -3939,6 +4001,8 @@ class ControlPlane:
                                 latest.id
                             ]
 
+                # This marker is now written only for an explicit operator
+                # Stop. Untagged legacy telemetry-triggered markers are ignored.
                 if high_latency_request is not None:
                     signal_status = str(
                         high_latency_request.get("signal_status") or "pending"
@@ -3989,18 +4053,8 @@ class ControlPlane:
                             )
                             forced = forced or latest.status == JobStatus.CANCELLED
                     continue
-                if (
-                    latency_ms is not None
-                    and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
-                ):
-                    latest = self._cancel_high_latency_job(latest, latency_ms)
-                    forced = forced or latest.status == JobStatus.CANCELLED
-                    continue
                 if self.job_stall_timeout_seconds <= 0:
                     continue
-                should_signal = False
-                should_fail = False
-                requested_at = None
                 with self._stale_job_lock:
                     latest = self.jobs.get(job.id)
                     if latest is None or latest.status.terminal:
@@ -4011,46 +4065,38 @@ class ControlPlane:
                     if age <= self.job_stall_timeout_seconds:
                         self._stale_cancel_requested.pop(job.id, None)
                         continue
-
-                    requested_at = self._stale_cancel_requested.get(job.id)
-                    if requested_at is None:
-                        requested_at = {
-                            "id": uuid.uuid4().hex,
-                            "at": current_time,
-                            "signal_status": "pending",
-                        }
-                        self._stale_cancel_requested[job.id] = requested_at
-                        should_signal = True
-                    else:
-                        requested_time = (
-                            requested_at.get("at")
-                            if isinstance(requested_at, dict)
-                            else requested_at
-                        )
-                        grace_age = (current_time - requested_time).total_seconds()
-                        should_fail = grace_age >= self.job_cancel_grace_seconds
-
-                if should_signal:
-                    signal_status = "accepted"
-                    try:
-                        signalled = self._cancel_worker_attempt(job)
-                    except Exception:
-                        logging.getLogger(__name__).exception(
-                            "Stale job cancellation failed for %s", job.id
-                        )
-                        signalled = False
-                        signal_status = "unavailable"
-                    if not signalled:
-                        signal_status = "not_confirmed"
-                    with self._stale_job_lock:
-                        if self._stale_cancel_requested.get(job.id) is requested_at:
-                            requested_at["signal_status"] = signal_status
+                worker = str(latest.worker or "").strip().lower()
+                if worker not in worker_probe_results:
+                    worker_probe_results[worker] = self._stale_worker_responds(
+                        worker, now=current_time
+                    )
+                if worker_probe_results[worker] is not False:
+                    # A responsive worker may be running a slow command or
+                    # delivering telemetry late. Keep the job and its lease.
+                    self._stale_cancel_requested.pop(job.id, None)
                     continue
 
-                if should_fail and self._fail_stale_job(
-                    job, requested_at=requested_at, now=current_time
-                ):
-                    forced = True
+                # Recheck under the same lock used by progress updates. Do not
+                # terminalize a job if fresh worker progress arrived while the
+                # single worker-level probe was in flight.
+                with self._stale_job_lock:
+                    latest = self.jobs.get(job.id)
+                    if latest is None or latest.status.terminal:
+                        self._stale_cancel_requested.pop(job.id, None)
+                        continue
+                    age = (
+                        current_time - (latest.updated_at or latest.created_at)
+                    ).total_seconds()
+                    if age <= self.job_stall_timeout_seconds:
+                        self._stale_cancel_requested.pop(job.id, None)
+                        continue
+                    latest = self._force_cancel_unresponsive_job(
+                        latest,
+                        latency_ms=None,
+                        signal_status=None,
+                        reason="stale_worker_probe_unavailable",
+                    )
+                    forced = forced or latest.status == JobStatus.CANCELLED
 
         with self._stale_job_lock:
             for job_id in tuple(self._stale_cancel_requested):
@@ -4496,13 +4542,6 @@ class ControlPlane:
                 self._dispatch_pending_jobs()
             elif dispatch_pending and event.status == JobStatus.PAUSED:
                 self._dispatch_pending_jobs()
-            if job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING}:
-                latency_ms = self._job_event_latency_ms(job)
-                if (
-                    latency_ms is not None
-                    and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
-                ):
-                    job = self._cancel_high_latency_job(job, latency_ms)
         return job
 
     def _persisted_worker_event(
@@ -4888,13 +4927,6 @@ class ControlPlane:
                 self._stale_cancel_requested.pop(event.job_id, None)
         if not updated or job.status.terminal:
             return job, updated
-        latency_ms = self._job_event_latency_ms(job)
-        if (
-            job.status in {JobStatus.DISPATCHED, JobStatus.RUNNING}
-            and latency_ms is not None
-            and latency_ms >= _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS
-        ):
-            job = self._cancel_high_latency_job(job, latency_ms)
         return job, updated
 
     def _next_job_event_sequence(self, job_id: str, *, fallback: Job | None = None) -> int:
@@ -4917,10 +4949,11 @@ class ControlPlane:
         if (
             event.event_type == "backend_cancel_requested_unresponsive"
             and isinstance(incoming_cancel_request, dict)
+            and incoming_cancel_request.get("source") == "operator_stop"
         ):
             progress["backend_cancel_request"] = dict(incoming_cancel_request)
         elif (
-            isinstance(cancel_request, dict)
+            ControlPlane._persisted_high_latency_cancel_request(job) is not None
             and not event.status.terminal
             and event.event_type != "retry_started"
         ):
@@ -5883,6 +5916,7 @@ class ControlPlane:
                     "requested_at": utc_now().isoformat(),
                     "signal_status": "pending",
                     "latency_ms": round(float(latency_ms), 3),
+                    "source": "operator_stop",
                 }
             request_state["in_flight"] = True
             current = self._persist_high_latency_cancel_request(
@@ -5936,14 +5970,19 @@ class ControlPlane:
         )
 
     def _force_cancel_unresponsive_job(
-        self, job: Job, *, latency_ms: float, signal_status: str
+        self,
+        job: Job,
+        *,
+        latency_ms: float | None,
+        signal_status: str | None,
+        reason: str = "operator_stop_cancel_unconfirmed",
     ) -> Job:
         with self._stale_job_lock:
             current = self.jobs.get(job.id)
             if current is None or current.status.terminal:
                 return current or job
             self._mark_worker_unresponsive(
-                current.worker, reason="event_backlog_cancel_unconfirmed"
+                current.worker, reason=reason
             )
             self._stale_cancel_requested.pop(current.id, None)
             progress = (
@@ -5958,13 +5997,27 @@ class ControlPlane:
                     "terminal_phase": "cancelled",
                     "finished_at": utc_now().isoformat(),
                     "worker_confirmation": "not_received",
-                    "worker_cancel_signal": signal_status,
                     "worker_unresponsive": True,
-                    "event_latency_ms": round(float(latency_ms), 3),
+                    "worker_unresponsive_reason": reason,
                     "outcome_uncertain": True,
                     "reconciliation_required": True,
                 }
             )
+            if signal_status is not None:
+                progress["worker_cancel_signal"] = signal_status
+            if latency_ms is not None:
+                progress["event_latency_ms"] = round(float(latency_ms), 3)
+            if reason == "stale_worker_probe_unavailable":
+                message = (
+                    "Job tidak mengirim pembaruan melewati batas stale dan worker "
+                    "tidak merespons pemeriksaan ringan. Job ditandai cancelled di "
+                    "gateway; status proses fisik belum terkonfirmasi."
+                )
+            else:
+                message = (
+                    "Worker tidak mengonfirmasi permintaan Stop. Job ditandai "
+                    "cancelled di gateway; status proses fisik belum terkonfirmasi."
+                )
             terminal = self.append_worker_event(
                 JobEvent(
                     job_id=current.id,
@@ -5976,11 +6029,7 @@ class ControlPlane:
                     progress=progress,
                     error={
                         "code": "WORKER_UNRESPONSIVE",
-                        "message": (
-                            "Worker tidak mengonfirmasi pembatalan setelah latensi event "
-                            f"{round(float(latency_ms))} ms. Job ditandai cancelled di gateway; "
-                            "hasil proses fisik belum terkonfirmasi. Job baru pada worker ini ditahan."
-                        ),
+                        "message": message,
                     },
                 ),
                 dispatch_pending=False,
@@ -6030,6 +6079,7 @@ class ControlPlane:
             "requested_at": utc_now().isoformat(),
             "signal_status": "pending",
             "latency_ms": round(float(latency_ms or 0.0), 3),
+            "source": "operator_stop",
             "in_flight": True,
         }
         with self._stale_job_lock:

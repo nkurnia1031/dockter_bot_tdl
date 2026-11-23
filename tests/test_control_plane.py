@@ -52,6 +52,9 @@ class FakeDispatcher:
         self.cancelled_jobs = []
         self.cancel_result = True
         self.resume_result = False
+        self.health_checks = []
+        self.health_result = {"healthy": True}
+        self.health_error = None
 
     def dispatch(self, worker, command):
         self.commands.append(command)
@@ -75,6 +78,13 @@ class FakeDispatcher:
     def cancel(self, worker, job_id):
         self.cancelled_jobs.append((worker, job_id))
         return self.cancel_result
+
+    def check_worker_fast(self, worker, *, timeout=2.5):
+        del timeout
+        self.health_checks.append(worker)
+        if self.health_error is not None:
+            raise self.health_error
+        return dict(self.health_result)
 
     def cancel_with_timeout(self, worker, job_id, *, timeout_seconds):
         del timeout_seconds
@@ -2589,7 +2599,7 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertEqual(completed.status, JobStatus.SUCCEEDED)
 
-    def test_high_latency_progress_cancels_job_when_worker_does_not_accept_signal(self):
+    def test_high_latency_progress_does_not_cancel_job_when_worker_responds(self):
         class Health:
             def __init__(self):
                 self.unresponsive = []
@@ -2624,7 +2634,6 @@ class ControlPlaneTests(unittest.TestCase):
         )
         received_at = utc_now()
         sent_at = received_at - timedelta(milliseconds=335_611)
-        self.dispatcher.cancel_result = False
         self.control.update_worker_progress(
             JobEvent(
                 job_id=job.id,
@@ -2642,42 +2651,90 @@ class ControlPlaneTests(unittest.TestCase):
                 created_at=received_at,
             )
         )
-        cancelled = self.jobs.get(job.id)
 
-        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
-        terminal = self.jobs.events(job.id)[-1]
-        self.assertEqual(terminal.event_type, "backend_cancelled_unresponsive")
-        self.assertTrue(terminal.progress["outcome_uncertain"])
-        self.assertEqual(self.dispatcher.cancelled_jobs, [("local", job.id)])
-        self.assertEqual(
-            self.control.worker_health_cache.unresponsive,
-            [("local", "event_backlog_cancel_unconfirmed")],
-        )
-        with self.assertRaises(DomainError) as raised:
-            self.control.resolve_target(self.actor, worker="local")
-        self.assertEqual(raised.exception.code, "WORKER_UNRESPONSIVE")
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertEqual(self.jobs.get(job.id).progress.get("backend_cancel_request"), None)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+        self.assertEqual(self.dispatcher.health_checks, [])
+        self.assertEqual(self.control.worker_health_cache.unresponsive, [])
 
-        restored_health = Health()
-        restored = ControlPlane(
-            self.jobs,
-            self.dispatcher,
-            self.profiles,
-            worker_health_cache=restored_health,
-        )
-        self.assertEqual(
-            restored._worker_unresponsive_reason("local"),
-            "event_backlog_cancel_unconfirmed",
-        )
-        late_terminal = self.control.append_worker_event(
+        self.control.append_worker_event(
             JobEvent(
                 job_id=job.id,
                 sequence=3,
-                status=JobStatus.CANCELLED,
-                event_type="cancelled",
+                status=JobStatus.RUNNING,
+                event_type="progress.snapshot",
+                progress={
+                    "backend_telemetry": {
+                        "worker_sent_at": sent_at.isoformat(),
+                        "backend_received_at": received_at.isoformat(),
+                        "event_latency_ms": 335_611,
+                    },
+                },
+                created_at=received_at,
             )
         )
-        self.assertEqual(late_terminal.status, JobStatus.CANCELLED)
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+        self.assertEqual(self.dispatcher.health_checks, [])
+
+    def _create_stale_running_job(self, job_id, *, worker="local", now=None):
+        created_at = (now or utc_now()) - timedelta(
+            seconds=self.control.job_stall_timeout_seconds + 1
+        )
+        job = Job(
+            id=job_id,
+            kind="utility",
+            profile="default",
+            actor_user_id=42,
+            worker=worker,
+            status=JobStatus.RUNNING,
+            payload={"utility": "flatten", "folders": ["/workspace/test"]},
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        self.jobs.create_with_private_values(job, {})
+        return job
+
+    def test_stale_jobs_share_one_probe_per_worker_and_remain_active_if_worker_responds(self):
+        now = utc_now()
+        first = self._create_stale_running_job("stale-utility-1", now=now)
+        second = self._create_stale_running_job("stale-utility-2", now=now)
+        self.dispatcher.health_result = {"healthy": False}
+
+        self.control._recover_stale_jobs(now=now)
+
+        self.assertEqual(self.dispatcher.health_checks, ["local"])
+        self.assertEqual(self.jobs.get(first.id).status, JobStatus.RUNNING)
+        self.assertEqual(self.jobs.get(second.id).status, JobStatus.RUNNING)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
         self.assertIsNone(self.control._worker_unresponsive_reason("local"))
+
+    def test_stale_job_is_cancelled_and_worker_marked_unresponsive_if_probe_fails(self):
+        now = utc_now()
+        job = self._create_stale_running_job("stale-utility-offline", now=now)
+        self.dispatcher.health_error = TimeoutError("worker health probe timed out")
+
+        self.control._recover_stale_jobs(now=now)
+
+        cancelled = self.jobs.get(job.id)
+        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
+        self.assertEqual(cancelled.error["code"], "WORKER_UNRESPONSIVE")
+        self.assertNotIn("event_latency_ms", cancelled.progress)
+        self.assertEqual(self.dispatcher.health_checks, ["local"])
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+        self.assertIsNotNone(self.control._worker_unresponsive_reason("local"))
+
+    def test_non_stale_job_does_not_probe_worker(self):
+        now = utc_now()
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+
+        self.control._recover_stale_jobs(now=now)
+
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.DISPATCHED)
+        self.assertEqual(self.dispatcher.health_checks, [])
 
     def test_high_latency_below_threshold_does_not_force_cancel(self):
         job = self.control.submit_job(
@@ -2924,21 +2981,60 @@ class ControlPlaneTests(unittest.TestCase):
         )
         observed = control._with_observability(self.jobs.get(job.id), event)
         self.jobs.update_progress_snapshot(observed)
-        self.dispatcher.cancel_result = False
-
         control._recover_stale_jobs(now=received_at)
 
-        cancelled = self.jobs.get(job.id)
-        self.assertEqual(cancelled.status, JobStatus.CANCELLED)
-        self.assertEqual(cancelled.error["code"], "WORKER_UNRESPONSIVE")
+        current = self.jobs.get(job.id)
+        self.assertEqual(current.status, JobStatus.RUNNING)
+        self.assertEqual(current.progress.get("backend_cancel_request"), None)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+        self.assertEqual(self.dispatcher.health_checks, [])
 
-    def test_backend_force_cancels_stalled_job_after_worker_grace(self):
+    def test_recovery_ignores_untagged_legacy_latency_cancel_marker(self):
+        job = self.control.submit_job(
+            self.actor, "export", {"url": "https://t.me/c/1/2"}
+        )
+        self.jobs.update_progress_metadata(
+            job.id,
+            {
+                "backend_cancel_request": {
+                    "requested_at": (utc_now() - timedelta(minutes=2)).isoformat(),
+                    "signal_status": "accepted",
+                    "latency_ms": 335_611,
+                }
+            },
+        )
+
+        self.control._recover_stale_jobs(now=utc_now() + timedelta(minutes=2))
+
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.DISPATCHED)
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+
+        self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=2,
+                status=JobStatus.RUNNING,
+                event_type="started",
+            )
+        )
+        completed = self.control.append_worker_event(
+            JobEvent(
+                job_id=job.id,
+                sequence=3,
+                status=JobStatus.SUCCEEDED,
+                event_type="completed",
+                result={"value": {"exported_count": 1}},
+            )
+        )
+        self.assertEqual(completed.status, JobStatus.SUCCEEDED)
+
+    def test_stale_job_is_kept_while_worker_responds_then_cancelled_if_probe_fails(self):
         control = ControlPlane(
             self.jobs,
             self.dispatcher,
             self.profiles,
             job_stall_timeout_seconds=10,
-            job_cancel_grace_seconds=5,
+            scheduler_recovery_seconds=5,
         )
         job = control.submit_job(
             self.actor, "export", {"url": "https://t.me/c/1/2"}
@@ -2956,7 +3052,8 @@ class ControlPlaneTests(unittest.TestCase):
 
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=11))
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
-        self.assertTrue(self.dispatcher.cancel_result)
+        self.assertEqual(self.dispatcher.health_checks, ["local"])
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
 
         # Worker output can arrive just after the first watchdog tick.  It is
         # proof of liveness and must prevent the grace timer from force
@@ -2975,15 +3072,22 @@ class ControlPlaneTests(unittest.TestCase):
 
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=17))
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
+        self.assertEqual(self.dispatcher.health_checks, ["local"])
 
-        # If the worker goes silent again, the normal watchdog path still
-        # waits for the grace period even when cancellation is not confirmed.
-        self.dispatcher.cancel_result = False
         control._recover_stale_jobs(now=stale_at + timedelta(seconds=30))
         self.assertEqual(self.jobs.get(job.id).status, JobStatus.RUNNING)
-        control._recover_stale_jobs(now=stale_at + timedelta(seconds=36))
-        self.assertEqual(self.jobs.get(job.id).status, JobStatus.FAILED)
-        self.assertEqual(self.jobs.get(job.id).error["code"], "JOB_STALLED")
+        self.assertEqual(self.dispatcher.health_checks, ["local"])
+
+        self.dispatcher.health_error = TimeoutError("worker health probe timed out")
+        control._recover_stale_jobs(now=stale_at + timedelta(seconds=42))
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
+        self.assertEqual(self.jobs.get(job.id).error["code"], "WORKER_UNRESPONSIVE")
+        self.assertEqual(self.dispatcher.health_checks, ["local", "local"])
+        self.assertEqual(self.dispatcher.cancelled_jobs, [])
+        self.assertEqual(
+            control._worker_unresponsive_reason("local"),
+            "stale_worker_probe_unavailable",
+        )
         self.assertTrue(self.jobs.get(job.id).progress["outcome_uncertain"])
         self.assertFalse(self.jobs.has_active("default"))
 
@@ -2995,7 +3099,7 @@ class ControlPlaneTests(unittest.TestCase):
                 event_type="late_running",
             )
         )
-        self.assertEqual(late.status, JobStatus.FAILED)
+        self.assertEqual(late.status, JobStatus.CANCELLED)
 
         # A terminal worker event finally confirms the process is gone and
         # releases the resource fence, but does not erase the uncertain failure.
@@ -3008,7 +3112,7 @@ class ControlPlaneTests(unittest.TestCase):
             )
         )
         self.assertFalse(self.jobs.has_active("default"))
-        self.assertEqual(self.jobs.get(job.id).status, JobStatus.FAILED)
+        self.assertEqual(self.jobs.get(job.id).status, JobStatus.CANCELLED)
         self.assertEqual(
             self.jobs.get(job.id).result["late_worker_terminal"]["status"],
             "cancelled",
