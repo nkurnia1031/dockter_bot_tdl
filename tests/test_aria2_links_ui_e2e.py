@@ -94,7 +94,9 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                 "csrf": headers.get("x-csrf-token", ""),
             })
 
-            if path == "/auth/browser/session":
+            if path == "/runtime/mode":
+                payload = {"mode": "full"}
+            elif path == "/auth/browser/session":
                 payload = {
                     "authenticated": True,
                     "actor": {"telegram_user_id": 42, "profile": "default", "worker_route": "local"},
@@ -263,7 +265,9 @@ class Aria2LinksBrowserE2ETests(unittest.TestCase):
                     "jsonrpc": "2.0", "id": cookie_request.get("id"), "result": "cookie-gid",
                 }))
                 return
-            if path == "/auth/browser/session":
+            if path == "/runtime/mode":
+                payload = {"mode": "full"}
+            elif path == "/auth/browser/session":
                 payload = {
                     "authenticated": True,
                     "actor": {"telegram_user_id": 42, "profile": "default", "worker_route": "local"},
