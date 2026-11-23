@@ -55,6 +55,7 @@ _DURABLE_JOB_KINDS = frozenset({
 _STORAGE_DURABLE_DISPATCH_KEY = "_storage_durable_dispatch"
 _WORKER_UNRESPONSIVE_EVENT_LATENCY_MS = 2_000.0
 _WORKER_UNRESPONSIVE_CANCEL_TIMEOUT_SECONDS = 2.5
+_WORKER_HEALTH_UNSET = object()
 _ACTIVE_PROGRESS_REFRESH_STATUSES = (
     JobStatus.QUEUED.value,
     JobStatus.DISPATCHED.value,
@@ -421,20 +422,30 @@ class ControlPlane:
         if callable(clearer):
             clearer(name)
 
-    def _worker_unresponsive_reason(self, worker: str) -> str | None:
+    def _worker_unresponsive_reason(
+        self, worker: str, *, health_snapshot: Any = _WORKER_HEALTH_UNSET
+    ) -> str | None:
         name = str(worker or "").strip().lower()
         with self._stale_job_lock:
             reason = self._unresponsive_workers.get(name)
         if reason:
             return reason
-        snapshotter = getattr(self.worker_health_cache, "snapshot", None)
-        snapshot = snapshotter(name) if callable(snapshotter) else None
-        if isinstance(snapshot, dict) and snapshot.get("status") == "unresponsive":
-            return str(snapshot.get("reason") or "worker_unresponsive")
+        if health_snapshot is _WORKER_HEALTH_UNSET:
+            snapshotter = getattr(self.worker_health_cache, "snapshot", None)
+            health_snapshot = snapshotter(name) if callable(snapshotter) else None
+        if (
+            isinstance(health_snapshot, dict)
+            and health_snapshot.get("status") == "unresponsive"
+        ):
+            return str(health_snapshot.get("reason") or "worker_unresponsive")
         return None
 
-    def _require_worker_responsive(self, worker: str) -> None:
-        reason = self._worker_unresponsive_reason(worker)
+    def _require_worker_responsive(
+        self, worker: str, *, health_snapshot: Any = _WORKER_HEALTH_UNSET
+    ) -> None:
+        reason = self._worker_unresponsive_reason(
+            worker, health_snapshot=health_snapshot
+        )
         if reason:
             raise DomainError(
                 "WORKER_UNRESPONSIVE",
@@ -732,7 +743,6 @@ class ControlPlane:
             selected_worker = routed
         if not selected_worker:
             raise DomainError("WORKER_REQUIRED", "Worker target wajib dipilih.", status_code=422)
-        self._require_worker_responsive(selected_worker)
         if self.worker_registry is not None:
             names = self.worker_registry.names()
             if names and selected_worker not in names:
@@ -749,7 +759,12 @@ class ControlPlane:
                     "Worker sedang dinonaktifkan dan tidak menerima job baru.",
                     status_code=409,
                 )
-        self._require_lite_remote_worker(selected_worker, requested_worker=worker)
+        if self.gateway_mode == "lite":
+            self._require_lite_remote_worker(
+                selected_worker, requested_worker=worker
+            )
+        else:
+            self._require_worker_responsive(selected_worker)
         return selected_profile, selected_worker
 
     def _require_lite_remote_worker(
@@ -795,6 +810,7 @@ class ControlPlane:
         snapshotter = getattr(self.worker_health_cache, "snapshot", None)
         snapshot = snapshotter(worker_name) if callable(snapshotter) else None
         status = str(snapshot.get("status") or "unknown") if isinstance(snapshot, dict) else "unknown"
+        self._require_worker_responsive(worker_name, health_snapshot=snapshot)
         if status == "unknown":
             raise DomainError(
                 "WORKER_HEALTH_UNKNOWN",
@@ -1012,9 +1028,6 @@ class ControlPlane:
             if not target_chat:
                 raise DomainError("TTS_CHAT_UNAVAILABLE", "Chat tujuan TTS belum dikonfigurasi.", status_code=503)
             selected_worker = self._select_tts_worker(worker, destination=target_chat)
-            self._require_lite_remote_worker(
-                selected_worker, requested_worker=worker
-            )
             if self.gateway_mode == "lite":
                 # Lite submit must not wait on a worker RPC to discover its
                 # sender inventory. Let the worker try its current local
@@ -1266,10 +1279,12 @@ class ControlPlane:
             )
             execution_profile = owner_profile
         if kind == "tts":
-            self._require_lite_remote_worker(
-                selected_worker, requested_worker=worker
-            )
-        self._require_worker_responsive(selected_worker)
+            if self.gateway_mode == "lite":
+                self._require_lite_remote_worker(
+                    selected_worker, requested_worker=worker
+                )
+            else:
+                self._require_worker_responsive(selected_worker)
         if kind == "utility":
             submitted_utility_settings = internal_payload.get("settings")
             internal_payload = self._prepare_durable_payload(
@@ -1495,10 +1510,6 @@ class ControlPlane:
             )
             if not target_chat:
                 raise DomainError("TTS_CHAT_UNAVAILABLE", "Chat tujuan TTS belum dikonfigurasi.", status_code=503)
-            self._require_lite_remote_worker(
-                selected_worker,
-                requested_worker=str(target.get("worker") or "").strip() or None,
-            )
             if self.gateway_mode == "lite":
                 sender_profiles = []
                 execution_profile = owner_profile
@@ -1525,11 +1536,13 @@ class ControlPlane:
                 worker=str(target.get("worker")),
             )
         if kind in {"tts", "safelink_resolve"}:
-            self._require_lite_remote_worker(
-                selected_worker,
-                requested_worker=str(target.get("worker") or "").strip() or None,
-            )
-        self._require_worker_responsive(selected_worker)
+            if self.gateway_mode == "lite":
+                self._require_lite_remote_worker(
+                    selected_worker,
+                    requested_worker=str(target.get("worker") or "").strip() or None,
+                )
+            else:
+                self._require_worker_responsive(selected_worker)
         payload = self._prepare_durable_payload(
             actor, kind, payload, owner_profile, selected_worker
         )
