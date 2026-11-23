@@ -250,56 +250,154 @@ class RunScriptTests(unittest.TestCase):
                 "GATEWAY_MODE": "lite",
             }
         )
+        lite_without_local = run.compose_env(
+            {
+                "COMPOSE_FILE": "docker-compose.gateway.yml",
+                "GATEWAY_MODE": "lite",
+                "GATEWAY_LITE_LOCAL_STACK": "off",
+            }
+        )
 
         self.assertEqual(full["GATEWAY_MODE"], "full")
         self.assertEqual(full["COMPOSE_PROFILES"], "full")
         self.assertEqual(lite["GATEWAY_MODE"], "lite")
-        self.assertEqual(lite["COMPOSE_PROFILES"], "lite")
+        self.assertEqual(lite["COMPOSE_PROFILES"], "lite,lite-local")
+        self.assertEqual(lite["GATEWAY_LITE_LOCAL_STACK"], "true")
+        self.assertEqual(lite_without_local["COMPOSE_PROFILES"], "lite")
+        self.assertEqual(lite_without_local["GATEWAY_LITE_LOCAL_STACK"], "false")
+
+    def test_lite_local_package_boolean_values_are_shared_with_runtime_config(self) -> None:
+        from tme3bot.config import AppConfig
+
+        values = {
+            "1": True,
+            "true": True,
+            "yes": True,
+            "on": True,
+            "enabled": True,
+            "0": False,
+            "false": False,
+            "no": False,
+            "off": False,
+            "disabled": False,
+        }
+        for raw_value, expected in values.items():
+            with self.subTest(value=raw_value):
+                with (
+                    patch.dict(
+                        run.os.environ,
+                        {
+                            "APP_ROLE": "worker",
+                            "GATEWAY_LITE_LOCAL_STACK": raw_value,
+                        },
+                        clear=True,
+                    ),
+                    patch("tme3bot.config.load_dotenv"),
+                ):
+                    runtime_value = (
+                        AppConfig.from_env().gateway_lite_local_stack_enabled
+                    )
+                deploy_value = run.gateway_lite_local_stack_for_compose(
+                    {
+                        "COMPOSE_FILE": "docker-compose.gateway.yml",
+                        "GATEWAY_MODE": "lite",
+                        "GATEWAY_LITE_LOCAL_STACK": raw_value,
+                    }
+                )
+                self.assertEqual(runtime_value, expected)
+                self.assertEqual(deploy_value, expected)
+
+        with (
+            patch.dict(
+                run.os.environ,
+                {
+                    "APP_ROLE": "worker",
+                    "GATEWAY_LITE_LOCAL_STACK": "sometimes",
+                },
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            with self.assertRaisesRegex(ValueError, "GATEWAY_LITE_LOCAL_STACK"):
+                AppConfig.from_env()
+
+        with self.assertRaisesRegex(RuntimeError, "GATEWAY_LITE_LOCAL_STACK"):
+            run.gateway_lite_local_stack_for_compose(
+                {
+                    "COMPOSE_FILE": "docker-compose.gateway.yml",
+                    "GATEWAY_MODE": "lite",
+                    "GATEWAY_LITE_LOCAL_STACK": "sometimes",
+                }
+            )
+
+    def test_existing_lite_local_package_does_not_identify_a_full_gateway(self) -> None:
+        result = subprocess.CompletedProcess(
+            args=["docker", "compose", "ps"],
+            returncode=0,
+            stdout="backend\nworker-local\naria2\ntts-1\ntts-2\ntts-3\ntelegram-login\n",
+            stderr="",
+        )
+        with (
+            patch.object(run, "compose_base_command", return_value=["docker", "compose"]),
+            patch.object(run.subprocess, "run", return_value=result),
+            patch("builtins.print"),
+        ):
+            self.assertEqual(
+                run.existing_full_gateway_services(
+                    {"COMPOSE_FILE": "docker-compose.gateway.yml", "GATEWAY_MODE": "lite"}
+                ),
+                set(),
+            )
 
     def test_lite_gateway_start_stops_full_only_services_before_starting_login_bot(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
+            database_root = Path(temp_dir)
+            database_file = database_root / "gateway" / "storage.db"
+            database_file.parent.mkdir(parents=True)
+            with sqlite3.connect(database_file) as database:
+                database.execute(
+                    "CREATE TABLE jobs (id TEXT, worker TEXT, status TEXT, result TEXT, progress TEXT, updated_at TEXT)"
+                )
+                database.execute(
+                    "INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                    ("local-job-running", "local", "running", None, "{}", "2026-11-22T00:00:00Z"),
+                )
             env = {
                 "COMPOSE_FILE": "docker-compose.gateway.yml",
                 "COMPOSE_CMD": "docker compose",
                 "DATABASE_ROOT": temp_dir,
                 "GATEWAY_MODE": "lite",
             }
-            ps_result = subprocess.CompletedProcess(
-                args=["docker", "compose", "ps"],
-                returncode=0,
-                stdout="",
-                stderr="",
-            )
             with (
                 patch.object(run, "_compose_available", return_value=True),
                 patch.object(run, "active_gateway_mode", return_value=None),
                 patch.object(
                     run.subprocess,
                     "run",
-                    side_effect=[ps_result, None, ps_result, None, None],
+                    side_effect=[None, None, None],
                 ) as subprocess_run,
                 patch("builtins.print"),
             ):
                 run.run_compose(["up", "-d"], env)
 
-            initial_ps, admission_stop_call, final_ps, stop_call, up_call = (
-                subprocess_run.call_args_list
-            )
-            self.assertEqual(initial_ps.args[0][-3:], ["ps", "--all", "--services"])
-            self.assertEqual(initial_ps.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
+            admission_stop_call, stop_call, up_call = subprocess_run.call_args_list
             self.assertEqual(admission_stop_call.args[0][-2:], ["stop", "backend"])
             self.assertEqual(
-                admission_stop_call.kwargs["env"]["COMPOSE_PROFILES"], "full,lite"
+                admission_stop_call.kwargs["env"]["COMPOSE_PROFILES"],
+                "full,lite,lite-local",
             )
-            self.assertEqual(final_ps.args[0][-3:], ["ps", "--all", "--services"])
-            self.assertEqual(final_ps.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
             self.assertEqual(
-                stop_call.args[0][-3:],
-                ["stop", "telegram", "aria2"],
+                stop_call.args[0][-2:],
+                ["stop", "telegram"],
             )
-            self.assertEqual(stop_call.kwargs["env"]["COMPOSE_PROFILES"], "full,lite")
+            self.assertEqual(
+                stop_call.kwargs["env"]["COMPOSE_PROFILES"],
+                "full,lite,lite-local",
+            )
             self.assertEqual(up_call.args[0][-2:], ["up", "-d"])
-            self.assertEqual(up_call.kwargs["env"]["COMPOSE_PROFILES"], "lite")
+            self.assertEqual(
+                up_call.kwargs["env"]["COMPOSE_PROFILES"], "lite,lite-local"
+            )
 
     def test_lite_cutover_blocks_before_stop_when_local_job_is_running(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -320,6 +418,7 @@ class RunScriptTests(unittest.TestCase):
                 "COMPOSE_CMD": "docker compose",
                 "DATABASE_ROOT": str(database_root),
                 "GATEWAY_MODE": "lite",
+                "GATEWAY_LITE_LOCAL_STACK": "off",
             }
             ps_result = subprocess.CompletedProcess(
                 args=["docker", "compose", "ps"],
@@ -404,6 +503,7 @@ class RunScriptTests(unittest.TestCase):
                 "COMPOSE_CMD": "docker compose",
                 "DATABASE_ROOT": temp_dir,
                 "GATEWAY_MODE": "lite",
+                "GATEWAY_LITE_LOCAL_STACK": "off",
             }
             ps_result = subprocess.CompletedProcess(
                 args=["docker", "compose", "ps"],
@@ -444,7 +544,7 @@ class RunScriptTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "skema jobs tidak dapat diverifikasi"):
                 run.local_jobs_blocking_lite_cutover(database_file)
 
-    def test_lite_cutover_proceeds_when_local_jobs_are_terminal_and_reconciled(self) -> None:
+    def test_lite_without_local_stack_proceeds_after_local_jobs_are_terminal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_root = Path(temp_dir)
             database_file = database_root / "gateway" / "storage.db"
@@ -463,6 +563,7 @@ class RunScriptTests(unittest.TestCase):
                 "COMPOSE_CMD": "docker compose",
                 "DATABASE_ROOT": str(database_root),
                 "GATEWAY_MODE": "lite",
+                "GATEWAY_LITE_LOCAL_STACK": "off",
             }
             with (
                 patch.object(run, "_compose_available", return_value=True),
@@ -475,8 +576,8 @@ class RunScriptTests(unittest.TestCase):
             self.assertEqual(subprocess_run.call_count, 3)
             self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
             self.assertEqual(
-                subprocess_run.call_args_list[1].args[0][-3:],
-                ["stop", "telegram", "aria2"],
+                subprocess_run.call_args_list[1].args[0][-7:],
+                ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
             )
             self.assertEqual(subprocess_run.call_args_list[2].args[0][-2:], ["up", "-d"])
             self.assertEqual(subprocess_run.call_args_list[2].kwargs["env"]["COMPOSE_PROFILES"], "lite")
@@ -486,6 +587,7 @@ class RunScriptTests(unittest.TestCase):
             "COMPOSE_FILE": "docker-compose.gateway.yml",
             "COMPOSE_CMD": "docker compose",
             "GATEWAY_MODE": "lite",
+            "GATEWAY_LITE_LOCAL_STACK": "off",
         }
         with (
             patch.object(run, "_compose_available", return_value=True),
@@ -514,6 +616,7 @@ class RunScriptTests(unittest.TestCase):
             "COMPOSE_FILE": "docker-compose.gateway.yml",
             "COMPOSE_CMD": "docker compose",
             "GATEWAY_MODE": "lite",
+            "GATEWAY_LITE_LOCAL_STACK": "off",
         }
         with (
             patch.object(run, "_compose_available", return_value=True),
@@ -532,8 +635,8 @@ class RunScriptTests(unittest.TestCase):
         self.assertEqual(subprocess_run.call_count, 3)
         self.assertEqual(subprocess_run.call_args_list[0].args[0][-2:], ["stop", "backend"])
         self.assertEqual(
-            subprocess_run.call_args_list[1].args[0][-3:],
-            ["stop", "telegram", "aria2"],
+            subprocess_run.call_args_list[1].args[0][-7:],
+            ["stop", "telegram", "worker-local", "aria2", "tts-1", "tts-2", "tts-3"],
         )
         restore = subprocess_run.call_args_list[2]
         self.assertEqual(restore.args[0][-2:], ["up", "-d"])

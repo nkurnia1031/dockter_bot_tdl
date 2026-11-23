@@ -36,7 +36,7 @@ from tme3bot.profile_diagnostics import (
     PROFILE_UPLOAD_LANE_STATUSES,
 )
 from tme3bot.worker_registry import WORKER_NAME_RE
-from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
+from tme3bot.worker_registry import worker_names_for_config
 
 _WORKER_RUNTIME_SCAN_TARGETS = {
     "resolver",
@@ -172,10 +172,10 @@ def _runtime_readiness_snapshot(context) -> dict:
         return snapshot
     registry = getattr(context, "worker_registry", None)
     records = registry.list() if callable(getattr(registry, "list", None)) else {}
-    allowed = set(worker_names_for_mode(
+    allowed = set(worker_names_for_config(
         records if isinstance(records, dict) else {},
-        "lite",
-        local_urls=worker_local_urls(config),
+        config,
+        gateway_mode="lite",
     ))
     result = dict(snapshot)
     result["workers"] = [
@@ -648,10 +648,9 @@ def register_workers(app, context, *, current_actor):
         registry = getattr(context, "worker_registry", None)
         records = registry.list() if callable(getattr(registry, "list", None)) else {}
         config = getattr(context, "config", None)
-        return set(worker_names_for_mode(
+        return set(worker_names_for_config(
             records,
-            getattr(config, "gateway_mode", "full"),
-            local_urls=worker_local_urls(config),
+            config,
         ))
 
     def _require_worker_available_in_mode(worker: str) -> str:
@@ -661,7 +660,7 @@ def register_workers(app, context, *, current_actor):
             if str(getattr(config, "gateway_mode", "full") or "full").lower() == "lite":
                 raise DomainError(
                     "LITE_REMOTE_WORKER_REQUIRED",
-                    "Mode Lite hanya mengizinkan worker remote.",
+                    "Worker ini tidak tersedia pada konfigurasi Lite saat ini.",
                     status_code=409,
                 )
         return name
@@ -2363,10 +2362,10 @@ def register_workers(app, context, *, current_actor):
                         else None
                     ),
                 }
-                for name in worker_names_for_mode(
+                for name in worker_names_for_config(
                     registered_workers,
-                    gateway_mode,
-                    local_urls=worker_local_urls(context.config),
+                    context.config,
+                    gateway_mode=gateway_mode,
                 )
             ]
         }

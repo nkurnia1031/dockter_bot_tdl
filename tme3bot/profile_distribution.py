@@ -27,6 +27,7 @@ class ProfileDistributionService:
         self, config, bot, store, vault_store, worker_registry, dispatcher,
         *, recovery_interval_seconds: float = 3,
         gateway_mode: str | None = None, local_worker_urls=(),
+        include_local_in_lite: bool = False,
     ) -> None:
         self.config = config
         self.bot = bot
@@ -38,6 +39,7 @@ class ProfileDistributionService:
             gateway_mode if gateway_mode is not None else getattr(config, "gateway_mode", "full")
         ).strip().lower()
         self.local_worker_urls = tuple(local_worker_urls)
+        self.include_local_in_lite = bool(include_local_in_lite)
         self.recovery_interval_seconds = max(0.1, float(recovery_interval_seconds))
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -92,6 +94,7 @@ class ProfileDistributionService:
                     {worker: record or {}},
                     self.gateway_mode,
                     local_urls=self.local_worker_urls,
+                    include_local_in_lite=self.include_local_in_lite,
                 ):
                     continue
                 self._process_target(target)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from tme3bot.channel_ref import channel_chat_id, channel_tdl_ref, compact_channel_ref
 from tme3bot.database_paths import DatabasePaths
+from tme3bot.env_values import parse_bool_setting
 
 try:
     from dotenv import load_dotenv
@@ -67,6 +68,7 @@ class AppConfig:
     database_root: Path = Path("/database")
     app_role: str = "backend"
     gateway_mode: str = "full"
+    gateway_lite_local_stack_enabled: bool = True
     leave_helper_binary: str = "/usr/local/bin/tdl-leave"
     utility_workspace_root: Path = Path("/workspace")
     rclone_config_path: Path = Path("/data/.config/rclone.conf")
@@ -191,6 +193,11 @@ class AppConfig:
         gateway_mode = os.getenv("GATEWAY_MODE", "full").strip().lower() or "full"
         if gateway_mode not in {"full", "lite"}:
             raise ValueError("GATEWAY_MODE harus full atau lite.")
+        gateway_lite_local_stack_enabled = parse_bool_setting(
+            os.getenv("GATEWAY_LITE_LOCAL_STACK"),
+            name="GATEWAY_LITE_LOCAL_STACK",
+            default=True,
+        )
         bot_token = os.getenv("BOT_TOKEN", "").strip()
         if app_role in {"backend", "telegram", "telegram-login"} and not bot_token:
             raise ValueError("BOT_TOKEN is required.")
@@ -350,6 +357,7 @@ class AppConfig:
             bot_token=bot_token,
             app_role=app_role,
             gateway_mode=gateway_mode,
+            gateway_lite_local_stack_enabled=gateway_lite_local_stack_enabled,
             profile_root=profile_root,
             profiles_root=profiles_root,
             default_profile=default_profile,

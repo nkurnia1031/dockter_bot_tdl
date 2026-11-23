@@ -34,7 +34,27 @@ def worker_local_urls(config) -> frozenset[str]:
     return frozenset(urls)
 
 
-def worker_names_for_mode(workers, gateway_mode: str, *, local_urls=()) -> list[str]:
+def worker_names_for_config(workers, config, *, gateway_mode: str | None = None) -> list[str]:
+    mode = gateway_mode
+    if mode is None:
+        mode = getattr(config, "gateway_mode", "full")
+    return worker_names_for_mode(
+        workers,
+        mode,
+        local_urls=worker_local_urls(config),
+        include_local_in_lite=bool(
+            getattr(config, "gateway_lite_local_stack_enabled", False)
+        ),
+    )
+
+
+def worker_names_for_mode(
+    workers,
+    gateway_mode: str,
+    *,
+    local_urls=(),
+    include_local_in_lite: bool = False,
+) -> list[str]:
     """Return worker targets usable in this mode, including endpoint aliases."""
     normalized_mode = str(gateway_mode or "full").strip().lower()
     records = workers if isinstance(workers, Mapping) else None
@@ -54,7 +74,7 @@ def worker_names_for_mode(workers, gateway_mode: str, *, local_urls=()) -> list[
     return [
         str(name)
         for name in names
-        if normalized_mode != "lite" or (
+        if normalized_mode != "lite" or include_local_in_lite or (
             normalize_worker_name(str(name)) not in _GATEWAY_LOCAL_WORKER_NAMES
             and not targets_local_endpoint(name)
         )

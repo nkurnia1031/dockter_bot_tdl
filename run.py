@@ -26,14 +26,19 @@ except ModuleNotFoundError:  # First-run bootstrap before Python dependencies ex
     normalize_profile_name = None  # type: ignore[assignment]
 
 from tme3bot.database_paths import DatabasePaths, filesystem_identity, validate_database_root
+from tme3bot.env_values import parse_bool_setting
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 ENV_FILE = PROJECT_DIR / ".env"
 LEGACY_ENV_FILE = PROJECT_DIR / "env"
-FULL_ONLY_GATEWAY_SERVICES = (
-    "telegram",
+FULL_ONLY_GATEWAY_SERVICES = ("telegram",)
+GATEWAY_LITE_LOCAL_SERVICES = (
+    "worker-local",
     "aria2",
+    "tts-1",
+    "tts-2",
+    "tts-3",
 )
 USAGE = """Usage: python3 run.py <command>
 
@@ -1068,12 +1073,36 @@ def gateway_mode_for_compose(dotenv: dict[str, str]) -> str | None:
     return gateway_mode
 
 
+def gateway_lite_local_stack_for_compose(dotenv: dict[str, str]) -> bool | None:
+    """Return whether Lite's local worker package is selected for this deploy."""
+    if gateway_mode_for_compose(dotenv) is None:
+        return None
+    merged = dict(os.environ)
+    merged.update(dotenv)
+    try:
+        return parse_bool_setting(
+            merged.get("GATEWAY_LITE_LOCAL_STACK"),
+            name="GATEWAY_LITE_LOCAL_STACK",
+            default=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+
 def compose_env(dotenv: dict[str, str]) -> dict[str, str]:
     merged = dict(os.environ)
     merged.update(dotenv)
     if gateway_mode := gateway_mode_for_compose(dotenv):
+        lite_local_stack = gateway_lite_local_stack_for_compose(dotenv)
         merged["GATEWAY_MODE"] = gateway_mode
-        merged["COMPOSE_PROFILES"] = gateway_mode
+        merged["GATEWAY_LITE_LOCAL_STACK"] = (
+            "true" if lite_local_stack else "false"
+        )
+        merged["COMPOSE_PROFILES"] = (
+            "lite,lite-local"
+            if gateway_mode == "lite" and lite_local_stack
+            else gateway_mode
+        )
     return merged
 
 
@@ -1173,7 +1202,7 @@ def local_jobs_blocking_lite_cutover(database_file: Path) -> list[tuple[str, str
 def existing_full_gateway_services(dotenv: dict[str, str]) -> set[str]:
     command = compose_base_command(dotenv) + ["ps", "--all", "--services"]
     environment = compose_env(dotenv)
-    environment["COMPOSE_PROFILES"] = "full,lite"
+    environment["COMPOSE_PROFILES"] = "full,lite,lite-local"
     print("$ " + shlex.join(command))
     completed = subprocess.run(
         command,
@@ -1191,7 +1220,7 @@ def active_gateway_mode(dotenv: dict[str, str]) -> str | None:
     """Infer the currently running gateway profile before a mode transition."""
     command = compose_base_command(dotenv) + ["ps", "--services", "--status", "running"]
     environment = compose_env(dotenv)
-    environment["COMPOSE_PROFILES"] = "full,lite"
+    environment["COMPOSE_PROFILES"] = "full,lite,lite-local"
     print("$ " + shlex.join(command))
     completed = subprocess.run(
         command,
@@ -1211,6 +1240,10 @@ def active_gateway_mode(dotenv: dict[str, str]) -> str | None:
 
 def guard_lite_gateway_cutover(dotenv: dict[str, str]) -> None:
     if gateway_mode_for_compose(dotenv) != "lite":
+        return
+    # The worker package remains running and local remains a valid explicit
+    # target, so its in-flight jobs and reconciliation records need no drain.
+    if gateway_lite_local_stack_for_compose(dotenv):
         return
     database_file = gateway_local_jobs_database(dotenv)
     if database_file.is_file():
@@ -1245,16 +1278,17 @@ def stop_inactive_gateway_services(dotenv: dict[str, str]) -> None:
     gateway_mode = gateway_mode_for_compose(dotenv)
     if gateway_mode is None:
         return
-    inactive_services = (
-        ["telegram-login"]
-        if gateway_mode == "full"
-        else list(FULL_ONLY_GATEWAY_SERVICES)
-    )
+    if gateway_mode == "full":
+        inactive_services = ["telegram-login"]
+    else:
+        inactive_services = list(FULL_ONLY_GATEWAY_SERVICES)
+        if gateway_lite_local_stack_for_compose(dotenv) is False:
+            inactive_services.extend(GATEWAY_LITE_LOCAL_SERVICES)
     command = compose_base_command(dotenv) + ["stop", *inactive_services]
     environment = compose_env(dotenv)
-    # Include both profiles only for this stop command so Compose can see a
-    # previously running poller even though the active mode excludes it.
-    environment["COMPOSE_PROFILES"] = "full,lite"
+    # Include all gateway profiles for this stop command so Compose can see
+    # services that ran under the previously active mode.
+    environment["COMPOSE_PROFILES"] = "full,lite,lite-local"
     print("$ " + shlex.join(command))
     subprocess.run(command, cwd=PROJECT_DIR, env=environment, check=True)
 
@@ -1263,7 +1297,7 @@ def stop_gateway_admission(dotenv: dict[str, str]) -> None:
     """Stop API admission before the final local-job check for a Lite cutover."""
     command = compose_base_command(dotenv) + ["stop", "backend"]
     environment = compose_env(dotenv)
-    environment["COMPOSE_PROFILES"] = "full,lite"
+    environment["COMPOSE_PROFILES"] = "full,lite,lite-local"
     print("$ " + shlex.join(command))
     subprocess.run(command, cwd=PROJECT_DIR, env=environment, check=True)
 

@@ -11,6 +11,7 @@ services:
       - ${BACKEND_ENV_FILE:-.env.backend}
     environment:
       GATEWAY_MODE: ${GATEWAY_MODE:-full}
+      GATEWAY_LITE_LOCAL_STACK: ${GATEWAY_LITE_LOCAL_STACK:-true}
       DURABLE_DISPATCH_ENABLED: "true"
       REDIS_URL: redis://redis:6379/0
       SAFELINK_RESOLVER_ENABLED: "false"
@@ -98,7 +99,7 @@ services:
         condition: service_healthy
 
   worker-local:
-    profiles: ["full", "lite"]
+    profiles: ["full", "lite-local"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     build:
       context: .
@@ -127,7 +128,7 @@ services:
       TDL_DOWNLOAD_STORAGE: ""
 
   aria2:
-    profiles: ["full"]
+    profiles: ["full", "lite-local"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.aria2_runtime"]
     restart: unless-stopped
@@ -150,7 +151,7 @@ services:
       start_period: 10s
 
   tts-1:
-    profiles: ["full", "lite"]
+    profiles: ["full", "lite-local"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
@@ -173,7 +174,7 @@ services:
       start_period: 90s
 
   tts-2:
-    profiles: ["full", "lite"]
+    profiles: ["full", "lite-local"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped
@@ -196,7 +197,7 @@ services:
       start_period: 90s
 
   tts-3:
-    profiles: ["full", "lite"]
+    profiles: ["full", "lite-local"]
     image: ${WORKER_IMAGE_NAME:-tme3bot-worker}:${IMAGE_TAG:-latest}
     command: ["python3", "-m", "tme3bot.worker.tts_helper"]
     restart: unless-stopped

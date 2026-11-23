@@ -779,6 +779,39 @@ class BackendApiTests(unittest.TestCase):
         self.assertEqual(tts_workers.status_code, 200, tts_workers.text)
         self.assertEqual([item["name"] for item in tts_workers.json()["items"]], ["remote-1"])
 
+    def test_lite_local_package_exposes_local_worker_as_explicit_target(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = True
+        self.context.config.worker_local_url = "http://worker"
+        self.context.config.worker_endpoints = {"local": "http://worker"}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = True
+        self.profiles.base_config = self.context.config
+        self.workers.values["remote-1"] = {
+            "url": "https://worker1.example.test", "token": "secret",
+            "enabled": True, "public_url": "",
+        }
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+
+        response = self.client.get("/api/v1/workers", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            [item["name"] for item in response.json()["items"]],
+            ["local", "remote-1"],
+        )
+        self.assertEqual(
+            self.control.resolve_target(
+                Actor(42, "default"), profile="default", worker="local"
+            ),
+            ("default", "local"),
+        )
+
     def test_lite_rejects_direct_scan_and_worker_operations_for_local_aliases(self):
         self.context.config.gateway_mode = "lite"
         self.control.gateway_mode = "lite"

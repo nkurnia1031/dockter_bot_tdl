@@ -203,6 +203,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         dispatcher,
         recovery_interval_seconds=background_schedule.profile_provisioning_seconds,
         gateway_mode=config.gateway_mode,
+        include_local_in_lite=config.gateway_lite_local_stack_enabled,
         local_worker_urls=worker_local_urls(config),
         database_activity=database_compaction_service.database_activity,
     )
@@ -244,6 +245,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         job_stall_timeout_seconds=config.job_stall_timeout_seconds,
         job_cancel_grace_seconds=config.job_cancel_grace_seconds,
         gateway_mode=config.gateway_mode,
+        gateway_lite_local_stack_enabled=config.gateway_lite_local_stack_enabled,
         worker_health_cache=worker_health_monitor,
         scheduler_recovery_seconds=background_schedule.job_recovery_seconds,
     )
@@ -331,6 +333,7 @@ def build_backend_context(config: AppConfig) -> tuple[BackendContext, BackupSche
         dispatcher,
         recovery_interval_seconds=background_schedule.profile_distribution_seconds,
         gateway_mode=config.gateway_mode,
+        include_local_in_lite=config.gateway_lite_local_stack_enabled,
         local_worker_urls=worker_local_urls(config),
     )
     context = BackendContext(

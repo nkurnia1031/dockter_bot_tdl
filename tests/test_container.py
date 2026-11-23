@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import build
 import yaml
+from run import GATEWAY_LITE_LOCAL_SERVICES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,13 +74,25 @@ class ContainerBuildTests(unittest.TestCase):
             gateway_services["backend"]["environment"]["GATEWAY_MODE"],
             "${GATEWAY_MODE:-full}",
         )
+        self.assertEqual(
+            gateway_services["backend"]["environment"]["GATEWAY_LITE_LOCAL_STACK"],
+            "${GATEWAY_LITE_LOCAL_STACK:-true}",
+        )
         self.assertNotIn("web:", gateway)
         self.assertIn("telegram:", gateway)
         self.assertEqual(gateway_services["telegram"]["profiles"], ["full"])
-        self.assertEqual(gateway_services["worker-local"]["profiles"], ["full", "lite"])
-        self.assertEqual(gateway_services["aria2"]["profiles"], ["full"])
+        self.assertEqual(gateway_services["worker-local"]["profiles"], ["full", "lite-local"])
+        self.assertEqual(gateway_services["aria2"]["profiles"], ["full", "lite-local"])
         for name in ("tts-1", "tts-2", "tts-3"):
-            self.assertEqual(gateway_services[name]["profiles"], ["full", "lite"])
+            self.assertEqual(gateway_services[name]["profiles"], ["full", "lite-local"])
+        self.assertEqual(
+            {
+                name
+                for name, service in gateway_services.items()
+                if "lite-local" in service.get("profiles", [])
+            },
+            set(GATEWAY_LITE_LOCAL_SERVICES),
+        )
         login_bot = gateway_services["telegram-login"]
         self.assertEqual(login_bot["profiles"], ["lite"])
         self.assertEqual(login_bot["environment"]["APP_ROLE"], "telegram-login")
@@ -154,7 +167,9 @@ class ContainerBuildTests(unittest.TestCase):
             for name in ("tts-1", "tts-2", "tts-3"):
                 self.assertIn(name, services)
                 if filename == "docker-compose.gateway.yml":
-                    self.assertEqual(services[name].get("profiles"), ["full", "lite"])
+                    self.assertEqual(
+                        services[name].get("profiles"), ["full", "lite-local"]
+                    )
                 else:
                     self.assertNotIn("profiles", services[name])
                 helper = services[name]

@@ -6,7 +6,7 @@ from typing import Any
 from fastapi import Depends, Header, Request
 
 from tme3bot.domain.models import DomainError
-from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
+from tme3bot.worker_registry import worker_names_for_config
 
 
 _PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -60,10 +60,9 @@ def register_profile_distribution(
         registry = getattr(context, "worker_registry", None)
         config = getattr(context, "config", None)
         registered_workers = registry.list() if registry is not None else {}
-        workers = sorted(set(worker_names_for_mode(
+        workers = sorted(set(worker_names_for_config(
             registered_workers,
-            getattr(config, "gateway_mode", "full"),
-            local_urls=worker_local_urls(config),
+            config,
         )))
         if not workers:
             raise DomainError("WORKERS_UNAVAILABLE", "Tidak ada worker terdaftar untuk distribusi.", status_code=409)

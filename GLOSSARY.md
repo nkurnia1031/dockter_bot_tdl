@@ -251,5 +251,5 @@ Mode operasional TME3Bot dengan pengalaman pengelolaan dan pemantauan penuh.
 _Avoid_: Gateway Lite.
 
 **Gateway Lite**:
-Mode operasional TME3Bot untuk host berkapasitas rendah yang berfokus menerima pekerjaan, mengarahkannya ke worker remote, dan menyajikan status serta hasil akhirnya.
+Mode operasional TME3Bot untuk host berkapasitas rendah yang berfokus menerima pekerjaan, mengarahkannya ke worker, dan menyajikan status serta hasil akhirnya. Paket `worker-local`, Aria2, dan tiga helper TTS aktif sebagai satu unit secara default dan dapat dimatikan bersama saat deploy; worker remote tetap dikelola terpisah.
 _Avoid_: Gateway Normal.

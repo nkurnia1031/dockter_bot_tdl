@@ -7,7 +7,7 @@ from tme3bot.api.activity import track_activity_jobs
 from tme3bot.api.schemas import JobEventListResponse, JobListResponse, JobResponse, ObjectResponse, WorkerEventRequest
 from tme3bot.chat_refs import normalize_tdl_chat_ref
 from tme3bot.domain.models import DomainError, Job, JobEvent, JobStatus, utc_now
-from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
+from tme3bot.worker_registry import worker_names_for_config
 
 
 def _worker_names_for_context(context, selected=None):
@@ -17,9 +17,7 @@ def _worker_names_for_context(context, selected=None):
         requested = {str(name) for name in selected}
         records = {name: item for name, item in records.items() if name in requested}
     mode = getattr(context.control_plane, "gateway_mode", "full")
-    return worker_names_for_mode(
-        records, mode, local_urls=worker_local_urls(context.config)
-    )
+    return worker_names_for_config(records, context.config, gateway_mode=mode)
 from typing import Any
 
 def register_jobs(app, context, *, _newest_first_log_response, _owned_job, current_actor, event_dict, job_dict, require_internal, require_service):

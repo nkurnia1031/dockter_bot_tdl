@@ -1252,6 +1252,7 @@ class ProfileProvisioningService:
         self, store: ProfileProvisioningStore, profile_manager, worker_registry,
         dispatcher, *, recovery_interval_seconds: float = 10,
         gateway_mode: str = "full", local_worker_urls=(), database_activity=None,
+        include_local_in_lite: bool = False,
     ) -> None:
         self.store = store
         self.profile_manager = profile_manager
@@ -1259,6 +1260,7 @@ class ProfileProvisioningService:
         self.dispatcher = dispatcher
         self.gateway_mode = str(gateway_mode or "full").strip().lower()
         self.local_worker_urls = tuple(local_worker_urls)
+        self.include_local_in_lite = bool(include_local_in_lite)
         self.database_activity = database_activity
         self.recovery_interval_seconds = max(0.1, float(recovery_interval_seconds))
         self._stop = threading.Event()
@@ -1283,7 +1285,10 @@ class ProfileProvisioningService:
         else:
             records = {name: records[name] for name in names if name in records}
         return worker_names_for_mode(
-            records, self.gateway_mode, local_urls=self.local_worker_urls
+            records,
+            self.gateway_mode,
+            local_urls=self.local_worker_urls,
+            include_local_in_lite=self.include_local_in_lite,
         )
 
     def start(self) -> None:
@@ -1872,7 +1877,7 @@ class ProfileProvisioningService:
             raise KeyError(bootstrap_worker)
         if bootstrap_worker not in self._eligible_worker_names([bootstrap_worker]):
             raise ValueError(
-                "Pilih worker remote; gateway Lite tidak menjalankan atau mengalihkan operasi profil ke worker lokal."
+                "Pilih worker yang tersedia; gateway Lite tidak mengalihkan operasi profil ke worker lain."
             )
         if local_only and not profile_transfer_is_secure(str(worker.get("url") or "")):
             raise ValueError("Worker remote harus memakai URL HTTPS untuk menerima sesi.")
@@ -2018,7 +2023,7 @@ class ProfileProvisioningService:
             raise KeyError(worker)
         if worker not in self._eligible_worker_names([worker]):
             raise ValueError(
-                "Pilih worker remote; gateway Lite tidak menjalankan atau mengalihkan operasi profil ke worker lokal."
+                "Pilih worker yang tersedia; gateway Lite tidak mengalihkan operasi profil ke worker lain."
             )
         with self._lock:
             if self.store.bundle(profile) is not None:

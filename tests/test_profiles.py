@@ -93,6 +93,28 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "GATEWAY_MODE"):
                 AppConfig.from_env()
 
+    def test_lite_local_stack_defaults_on_and_accepts_explicit_off(self) -> None:
+        with (
+            patch.dict(os.environ, {"APP_ROLE": "worker"}, clear=True),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            default_config = AppConfig.from_env()
+        self.assertTrue(default_config.gateway_lite_local_stack_enabled)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "APP_ROLE": "worker",
+                    "GATEWAY_LITE_LOCAL_STACK": "off",
+                },
+                clear=True,
+            ),
+            patch("tme3bot.config.load_dotenv"),
+        ):
+            disabled_config = AppConfig.from_env()
+        self.assertFalse(disabled_config.gateway_lite_local_stack_enabled)
+
     def test_telegram_login_role_requires_only_backend_client_credentials(self) -> None:
         values = {
             "APP_ROLE": "telegram-login",

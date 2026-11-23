@@ -24,6 +24,29 @@ class WorkerRegistryTests(unittest.TestCase):
         )
         self.assertEqual(worker_names_for_mode(workers, "full"), ["worker-alias", "remote-1"])
 
+    def test_lite_local_package_controls_local_worker_visibility(self) -> None:
+        workers = {
+            "local": {"url": "http://worker-local:8080", "enabled": True},
+            "worker-alias": {"url": "http://worker-local:8080/", "enabled": True},
+            "remote-1": {"url": "https://worker1.example", "enabled": True},
+        }
+        local_urls = {"http://worker-local:8080"}
+
+        self.assertEqual(
+            worker_names_for_mode(
+                workers, "lite", local_urls=local_urls,
+                include_local_in_lite=True,
+            ),
+            ["local", "worker-alias", "remote-1"],
+        )
+        self.assertEqual(
+            worker_names_for_mode(
+                workers, "lite", local_urls=local_urls,
+                include_local_in_lite=False,
+            ),
+            ["remote-1"],
+        )
+
     def test_persists_workers_and_updates_without_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "workers.json"

@@ -78,7 +78,7 @@ from tme3bot.profile_provisioning import profile_transfer_is_secure
 from tme3bot.storage_catalog import build_storage_caption, storage_item_dict
 from tme3bot.storage_links import sign_storage_item, verify_storage_item
 from tme3bot.utility import utility_setting_specs
-from tme3bot.worker_registry import worker_local_urls, worker_names_for_mode
+from tme3bot.worker_registry import worker_names_for_config
 
 LOGGER = logging.getLogger(__name__)
 bearer = HTTPBearer(auto_error=False)
@@ -920,10 +920,9 @@ def create_backend_app(context: BackendContext) -> FastAPI:
         if provisioner is None:
             raise DomainError("PROFILE_PROVISIONING_UNAVAILABLE", "Provisioning profil belum aktif.", status_code=503)
         registered_workers = context.worker_registry.list()
-        names = worker_names_for_mode(
+        names = worker_names_for_config(
             registered_workers,
-            getattr(context.config, "gateway_mode", "full"),
-            local_urls=worker_local_urls(context.config),
+            context.config,
         )
         online_by_name: dict[str, bool] = {}
         health_by_name: dict[str, dict[str, Any]] = {}

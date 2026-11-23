@@ -270,7 +270,7 @@ class ProfileProvisioningTests(unittest.TestCase):
                 local_worker_urls=["http://worker-local:8080"],
             )
 
-            with self.assertRaisesRegex(ValueError, "Pilih worker remote"):
+            with self.assertRaisesRegex(ValueError, "Pilih worker yang tersedia"):
                 service.upload(
                     "alias-profile", "local-alias", single_session_zip(), 42,
                     local_only=True,

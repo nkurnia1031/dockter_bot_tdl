@@ -79,6 +79,7 @@ class ControlPlane:
         job_stall_timeout_seconds: int = 600,
         job_cancel_grace_seconds: int = 30,
         gateway_mode: str = "full",
+        gateway_lite_local_stack_enabled: bool = False,
         worker_health_cache=None,
         scheduler_recovery_seconds: float = 2.0,
     ) -> None:
@@ -100,6 +101,9 @@ class ControlPlane:
         self.tdl_access_store = tdl_access_store
         self.tdl_access_target_resolver = tdl_access_target_resolver
         self.gateway_mode = str(gateway_mode or "full").strip().lower()
+        self.gateway_lite_local_stack_enabled = bool(
+            gateway_lite_local_stack_enabled
+        )
         self.worker_health_cache = worker_health_cache
         self.scheduler_recovery_seconds = max(0.1, float(scheduler_recovery_seconds))
         self._clock = utc_now
@@ -169,6 +173,7 @@ class ControlPlane:
             records,
             self.gateway_mode,
             local_urls=worker_local_urls(config),
+            include_local_in_lite=self.gateway_lite_local_stack_enabled,
         )
 
     def require_profile(self, actor: Actor, profile: str | None) -> str:
@@ -231,7 +236,7 @@ class ControlPlane:
         if self.gateway_mode == "lite" and not str(requested_worker or "").strip():
             raise DomainError(
                 "LITE_REMOTE_WORKER_REQUIRED",
-                "Pilih worker remote secara eksplisit; Lite tidak memakai route local.",
+                "Pilih worker secara eksplisit; Lite tidak memakai route otomatis.",
                 status_code=422,
             )
 
@@ -279,17 +284,11 @@ class ControlPlane:
             return
         self._require_lite_explicit_worker(requested_worker)
         worker_name = str(selected_worker or "").strip().lower()
-        local_names = {"local"}
-        configured_local_name = str(
-            getattr(self.profile_manager, "worker_name", "") or ""
-        ).strip().lower()
-        if configured_local_name:
-            local_names.add(configured_local_name)
         config = getattr(self.profile_manager, "base_config", None)
-        if not worker_name or worker_name in local_names:
+        if not worker_name:
             raise DomainError(
                 "LITE_REMOTE_WORKER_REQUIRED",
-                "Pilih worker remote; Lite tidak menjalankan atau mengalihkan job ke worker-local.",
+                "Pilih worker yang terdaftar dan aktif secara eksplisit.",
                 status_code=409,
             )
         registry = self.worker_registry
@@ -298,23 +297,24 @@ class ControlPlane:
         if record is None:
             raise DomainError(
                 "WORKER_NOT_FOUND",
-                "Worker remote tidak terdaftar. Pilih worker yang terdaftar dan aktif.",
+                "Worker tidak terdaftar. Pilih worker yang tersedia dan aktif.",
                 status_code=404,
             )
         if not worker_names_for_mode(
             {worker_name: record},
             "lite",
             local_urls=worker_local_urls(config),
+            include_local_in_lite=self.gateway_lite_local_stack_enabled,
         ):
             raise DomainError(
                 "LITE_REMOTE_WORKER_REQUIRED",
-                "Pilih worker remote; Lite tidak menjalankan atau mengalihkan job ke worker-local.",
+                "Worker ini tidak tersedia pada konfigurasi Lite saat ini.",
                 status_code=409,
             )
         if not bool(record.get("enabled", True)):
             raise DomainError(
                 "WORKER_DISABLED",
-                "Worker remote sedang dinonaktifkan dan tidak menerima job baru.",
+                "Worker sedang dinonaktifkan dan tidak menerima job baru.",
                 status_code=409,
             )
         snapshotter = getattr(self.worker_health_cache, "snapshot", None)
@@ -337,7 +337,7 @@ class ControlPlane:
         if status != "ready":
             raise DomainError(
                 "WORKER_OFFLINE",
-                "Worker remote sedang offline dan tidak dapat menerima job baru.",
+                "Worker sedang offline dan tidak dapat menerima job baru.",
                 status_code=503,
                 details={"worker": worker_name, "health": status},
             )
@@ -2190,7 +2190,7 @@ class ControlPlane:
             if worker not in self._worker_names_for_mode():
                 raise DomainError(
                     "LITE_REMOTE_WORKER_REQUIRED",
-                    "Status verifikasi Lite hanya tersedia untuk worker remote.",
+                    "Status verifikasi Lite hanya tersedia untuk worker yang aktif pada konfigurasi ini.",
                     status_code=409,
                 )
             # This is a saved-proof view in Lite. Never probe a worker (or
