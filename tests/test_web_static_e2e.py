@@ -83,6 +83,8 @@ class StaticWebPrerenderArtifactTests(unittest.TestCase):
 
 
 def api_payload(path: str, authenticated: bool) -> dict[str, object]:
+    if path == "/runtime/mode":
+        return {"mode": "full"}
     if path == "/auth/browser/session":
         if not authenticated:
             return {"authenticated": False, "profiles": []}
