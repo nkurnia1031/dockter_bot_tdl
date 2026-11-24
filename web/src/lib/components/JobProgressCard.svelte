@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatBytes } from '$lib/presentation';
+  import { formatBytes, formatDate } from '$lib/presentation';
   import { formatDuration, isMediaUtilityJob, normalizeJobProgress, phaseLabel } from '$lib/job-progress';
   import { ChevronDown, Clock3, FileText, Gauge, Pause, Play, SquareTerminal, Timer, XCircle } from '@lucide/svelte';
   import MediaProgressSummary from './MediaProgressSummary.svelte';
@@ -51,6 +51,8 @@
   );
   const cancelRequest = $derived(job.progress?.cancel_request || null);
   const liteWorkerRefresh = $derived(job.progress?.lite_worker_refresh || null);
+  const liteOverallSummary = $derived(liteWorkerRefresh ? formatLiteOverallSummary(liteWorkerRefresh) : null);
+  const liteProgressUpdatedAt = $derived(liteWorkerRefresh?.worker_updated_at || liteWorkerRefresh?.progress_updated_at);
   const liteStatus = $derived(({ queued: 'Menunggu', dispatched: 'Berjalan', running: 'Berjalan', paused: 'Dijeda' } as Record<string, string>)[job.status] || job.status);
   const liteTitle = $derived(job.kind === 'tts'
     ? job.payload?.title || 'TTS'
@@ -69,12 +71,14 @@
     return labels[unit] || unit;
   }
 
-  function liteProcessedSummary(summary: Record<string, any>): string {
-    const processed = String(summary.processed);
-    if (summary.processed_from_counters === true) return `${processed} hasil diproses`;
-    const total = typeof summary.total === 'number' ? `/${summary.total}` : '';
+  function formatLiteOverallSummary(summary: Record<string, any>): string | null {
+    const completed = typeof summary.completed === 'number' ? String(summary.completed) : null;
+    const total = typeof summary.total === 'number' ? String(summary.total) : null;
     const unit = summary.unit ? ` ${liteUnitLabel(summary.unit)}` : '';
-    return `${processed}${total}${unit} diproses`;
+    if (completed !== null && total !== null) return `${completed}/${total}${unit} diproses`;
+    if (completed !== null) return `${completed}${unit} diproses`;
+    if (typeof summary.processed === 'number') return `${summary.processed} hasil diproses`;
+    return null;
   }
 </script>
 
@@ -106,14 +110,11 @@
           </span>
           {#if liteWorkerRefresh.stage}<span class="muted text-xs">Tahap: {phaseLabel(String(liteWorkerRefresh.stage))}</span>{/if}
           {#if liteWorkerRefresh.status}<span class="muted text-xs">Status: {liteWorkerRefresh.status}</span>{/if}
+          {#if liteProgressUpdatedAt}<span class="muted text-xs">Progres terakhir: {formatDate(liteProgressUpdatedAt)}</span>{/if}
         </div>
         {#if liteWorkerRefresh.active_file}<p class="mt-2 truncate text-sm font-semibold" title={liteWorkerRefresh.active_file}>File: {liteWorkerRefresh.active_file}</p>{/if}
         <div class="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs font-semibold text-[var(--muted)]">
-          {#if typeof liteWorkerRefresh.processed === 'number'}
-            <span>{liteProcessedSummary(liteWorkerRefresh)}</span>
-          {:else if typeof liteWorkerRefresh.completed === 'number' && typeof liteWorkerRefresh.total === 'number'}
-            <span>{liteWorkerRefresh.completed}/{liteWorkerRefresh.total} selesai</span>
-          {/if}
+          {#if liteOverallSummary}<span>{liteOverallSummary}</span>{/if}
           {#if typeof liteWorkerRefresh.succeeded === 'number'}<span>{liteWorkerRefresh.succeeded} berhasil</span>{/if}
           {#if typeof liteWorkerRefresh.failed === 'number'}<span>{liteWorkerRefresh.failed} gagal</span>{/if}
           {#if typeof liteWorkerRefresh.skipped === 'number'}<span>{liteWorkerRefresh.skipped} dilewati</span>{/if}

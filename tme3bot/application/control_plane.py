@@ -65,7 +65,7 @@ _LITE_PROGRESS_OUTCOME_COUNTER_FIELDS = (
 _LITE_PROGRESS_SUMMARY_FIELDS = (
     "active_file", "stage", "status", "completed", "processed",
     "processed_from_counters", "total", "unit", "percent",
-    *_LITE_PROGRESS_COUNTER_FIELDS,
+    "progress_updated_at", "worker_updated_at", *_LITE_PROGRESS_COUNTER_FIELDS,
 )
 _ACTIVE_PROGRESS_REFRESH_STATUSES = (
     JobStatus.QUEUED.value,
@@ -212,6 +212,8 @@ class ControlPlane:
         total_value = overall.get("files_total", overall.get("total"))
         unit = overall.get("unit")
         unit = str(unit)[:32] if isinstance(unit, str) and unit else None
+        if unit is None and any(key in overall for key in ("files_current", "files_total")):
+            unit = "files"
         if completed_value is None:
             completed_value = merged.get("current_json_index")
         if total_value is None:
@@ -258,6 +260,12 @@ class ControlPlane:
         )
         stage = merged.get("phase") or snapshot.get("phase")
         status = item.get("status") or active_item.get("status") or snapshot.get("status")
+        progress_updated_at = merged.get("updated_at")
+        progress_updated_at = (
+            progress_updated_at[:64]
+            if isinstance(progress_updated_at, str) and progress_updated_at
+            else None
+        )
         return {
             "active_file": name,
             "stage": str(stage)[:80] if stage else None,
@@ -268,6 +276,7 @@ class ControlPlane:
             "total": total,
             "unit": unit,
             "percent": percent,
+            "progress_updated_at": progress_updated_at,
             **counters,
         }
 
@@ -276,14 +285,13 @@ class ControlPlane:
         cls, job: Job, checked_at: str, reason_code: str
     ) -> dict[str, Any]:
         previous = job.progress.get("lite_worker_refresh")
+        summary = cls._compact_worker_progress(job.progress)
         if isinstance(previous, dict):
-            summary = {
-                key: previous.get(key)
-                for key in _LITE_PROGRESS_SUMMARY_FIELDS
-            }
+            for key in _LITE_PROGRESS_SUMMARY_FIELDS:
+                if summary.get(key) is None and previous.get(key) is not None:
+                    summary[key] = previous[key]
             refreshed_at = previous.get("refreshed_at")
         else:
-            summary = cls._compact_worker_progress(job.progress)
             refreshed_at = None
         return {
             **summary,
