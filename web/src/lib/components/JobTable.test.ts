@@ -948,7 +948,7 @@ describe('JobTable', () => {
     expect(refreshCalls).toBe(1);
     expect(listCalls).toBe(2);
     expect(screen.getByText('Tahap: Mengekstrak')).toBeTruthy();
-    expect(screen.getByText('3 hasil diproses')).toBeTruthy();
+    expect(screen.getByText('0/1 folder diproses')).toBeTruthy();
     expect(screen.getByText('1 berhasil')).toBeTruthy();
     expect(screen.getByText('1 gagal')).toBeTruthy();
     expect(screen.getByText('1 dilewati')).toBeTruthy();

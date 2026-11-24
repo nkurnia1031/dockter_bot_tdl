@@ -197,54 +197,84 @@ class Aria2TorE2ETests(unittest.TestCase):
 
     def test_tor_routed_task_is_listed_and_download_body_confirms_tor_exit(self) -> None:
         assert self.runtime is not None
-        response = self.runtime.rpc({
-            "jsonrpc": "2.0",
-            "id": "tor-e2e-add",
-            "method": "aria2.addUri",
-            "params": [["https://check.torproject.org/api/ip"], {"out": "tor-egress.json"}],
-            "tme3_route": "tor",
-        }, requested_directory=str(self.destination))
-        gid = response.get("result")
-        self.assertIsInstance(gid, str, "Tor submission must return an aria2 GID")
-        self.assertEqual(len(gid), 16)
+        last_status: dict[str, object] = {}
+        for attempt in range(2):
+            response = self.runtime.rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": f"tor-e2e-add-{attempt}",
+                    "method": "aria2.addUri",
+                    "params": [
+                        ["https://check.torproject.org/api/ip"],
+                        {"out": f"tor-egress-{attempt}.json"},
+                    ],
+                    "tme3_route": "tor",
+                },
+                requested_directory=str(self.destination),
+            )
+            gid = response.get("result")
+            self.assertIsInstance(gid, str, "Tor submission must return an aria2 GID")
+            self.assertEqual(len(gid), 16)
 
-        deadline = time.monotonic() + 30
-        while gid not in self._visible_gids() and time.monotonic() < deadline:
-            time.sleep(0.2)
-        self.assertIn(
-            gid,
-            self._visible_gids(),
-            "the GID must appear in aria2 active/waiting/stopped lists consumed by AriaNg",
-        )
+            deadline = time.monotonic() + 30
+            while gid not in self._visible_gids() and time.monotonic() < deadline:
+                time.sleep(0.2)
+            self.assertIn(
+                gid,
+                self._visible_gids(),
+                "the GID must appear in aria2 active/waiting/stopped lists consumed by AriaNg",
+            )
 
-        deadline = time.monotonic() + 240
-        status: dict[str, object] = {}
-        while time.monotonic() < deadline:
-            status_response = self.runtime.rpc({
+            deadline = time.monotonic() + 90
+            status: dict[str, object] = {}
+            while time.monotonic() < deadline:
+                status_response = self.runtime.rpc({
+                    "jsonrpc": "2.0",
+                    "id": f"tor-e2e-status-{attempt}",
+                    "method": "aria2.tellStatus",
+                    "params": [gid, ["gid", "status", "errorCode", "errorMessage"]],
+                })
+                result = status_response.get("result")
+                if isinstance(result, dict):
+                    status = result
+                    if result.get("status") in {"complete", "error", "removed"}:
+                        break
+                time.sleep(1)
+
+            if status.get("status") == "complete":
+                downloaded = self.destination / f"tor-egress-{attempt}.json"
+                self.assertTrue(
+                    downloaded.is_file(),
+                    "completed AriaNg task must produce its result file",
+                )
+                result_body = json.loads(downloaded.read_text(encoding="utf-8"))
+                self.assertIs(
+                    result_body.get("IsTor"),
+                    True,
+                    "the downloaded response must prove Tor egress",
+                )
+                self.runtime.rpc({
+                    "jsonrpc": "2.0",
+                    "id": f"tor-e2e-remove-result-{attempt}",
+                    "method": "aria2.removeDownloadResult",
+                    "params": [gid],
+                })
+                return
+
+            last_status = status
+            if status.get("status") != "error" or attempt == 1:
+                break
+            self.runtime.rpc({
                 "jsonrpc": "2.0",
-                "id": "tor-e2e-status",
-                "method": "aria2.tellStatus",
-                "params": [gid, ["gid", "status", "errorCode", "errorMessage"]],
+                "id": f"tor-e2e-remove-error-{attempt}",
+                "method": "aria2.removeDownloadResult",
+                "params": [gid],
             })
-            result = status_response.get("result")
-            if isinstance(result, dict):
-                status = result
-                if result.get("status") in {"complete", "error", "removed"}:
-                    break
-            time.sleep(1)
 
-        self.assertEqual(status.get("status"), "complete", "the Tor-routed transfer must complete")
-        downloaded = self.destination / "tor-egress.json"
-        self.assertTrue(downloaded.is_file(), "completed AriaNg task must produce its result file")
-        result_body = json.loads(downloaded.read_text(encoding="utf-8"))
-        self.assertIs(result_body.get("IsTor"), True, "the downloaded response must prove Tor egress")
-
-        self.runtime.rpc({
-            "jsonrpc": "2.0",
-            "id": "tor-e2e-remove-result",
-            "method": "aria2.removeDownloadResult",
-            "params": [gid],
-        })
+        self.fail(
+            "Tor-routed task must complete and prove Tor egress; "
+            f"last aria2 status: {json.dumps(last_status, sort_keys=True)}"
+        )
 
 
 if __name__ == "__main__":

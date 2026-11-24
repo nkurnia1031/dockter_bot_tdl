@@ -288,8 +288,17 @@ class ControlPlane:
         summary = cls._compact_worker_progress(job.progress)
         if isinstance(previous, dict):
             for key in _LITE_PROGRESS_SUMMARY_FIELDS:
-                if summary.get(key) is None and previous.get(key) is not None:
-                    summary[key] = previous[key]
+                current_value = summary.get(key)
+                previous_value = previous.get(key)
+                if previous_value is not None and (
+                    current_value is None
+                    or (
+                        key == "processed_from_counters"
+                        and current_value is False
+                        and previous_value is True
+                    )
+                ):
+                    summary[key] = previous_value
             refreshed_at = previous.get("refreshed_at")
         else:
             refreshed_at = None
