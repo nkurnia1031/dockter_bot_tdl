@@ -2,6 +2,16 @@
 
 Istilah ini menjelaskan profil Telegram lokal dan vault yang dipakai aplikasi serta worker.
 
+## Gateway dan Worker
+
+**Paket lokal Gateway**:
+Kumpulan service yang ditempatkan bersama gateway: `worker-local`, Aria2, dan helper TTS. Paket ini dapat dimatikan tanpa menghapus atau memindahkan data worker.
+_Avoid_: worker bernama `local`, semua worker lokal.
+
+**Worker eksternal `local`**:
+Record registry bernama `local` yang menunjuk ke worker API pada host terpisah dari gateway. Nama tersebut adalah identitas target operasional dan tidak menyatakan bahwa containernya berada pada host gateway.
+_Avoid_: paket lokal Gateway, worker embedded.
+
 ## Pemantauan
 
 **Pembaruan manual**:

@@ -51,7 +51,14 @@ class FakeWorkerRegistry:
         return ["local", "remote-2"]
 
     def get(self, name):
-        return {"enabled": True} if name in self.names() else None
+        if name not in self.names():
+            return None
+        url = (
+            "http://worker-local:8080"
+            if name == "local"
+            else "https://bot.worker2.example.test"
+        )
+        return {"enabled": True, "url": url}
 
 
 class FakeArtifactCatalog:

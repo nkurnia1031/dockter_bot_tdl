@@ -11,11 +11,24 @@ from tme3bot.persistence import write_json_atomic_private
 
 
 WORKER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
-_GATEWAY_LOCAL_WORKER_NAMES = frozenset({"local", "worker-local"})
+_GATEWAY_LOCAL_ENDPOINT_HOSTS = frozenset({
+    "worker-local", "local", "localhost", "127.0.0.1", "::1",
+})
 
 
 def normalize_worker_name(value: str) -> str:
     return value.strip().lower()
+
+
+def _endpoint_host(value: str) -> str:
+    try:
+        return str(urlsplit(value).hostname or "").strip().lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def _is_gateway_local_endpoint(value: str) -> bool:
+    return _endpoint_host(value) in _GATEWAY_LOCAL_ENDPOINT_HOSTS
 
 
 def worker_local_urls(config) -> frozenset[str]:
@@ -27,10 +40,14 @@ def worker_local_urls(config) -> frozenset[str]:
     endpoints = getattr(config, "worker_endpoints", None)
     if isinstance(endpoints, Mapping):
         for name, url in endpoints.items():
-            if normalize_worker_name(str(name)) in _GATEWAY_LOCAL_WORKER_NAMES:
-                value = str(url or "").strip().rstrip("/")
-                if value:
-                    urls.add(value.lower())
+            normalized_name = normalize_worker_name(str(name))
+            value = str(url or "").strip().rstrip("/")
+            if not value:
+                continue
+            if normalized_name == "worker-local" or (
+                normalized_name == "local" and _is_gateway_local_endpoint(value)
+            ):
+                urls.add(value.lower())
     return frozenset(urls)
 
 
@@ -64,18 +81,36 @@ def worker_names_for_mode(
         for url in local_urls
         if str(url or "").strip()
     }
+
     def targets_local_endpoint(name: object) -> bool:
         if records is None:
             return False
         record = records[name]
-        endpoint = str(record.get("url") or "").strip().rstrip("/") if isinstance(record, Mapping) else ""
-        return endpoint.lower() in normalized_local_urls
+        endpoint = (
+            str(record.get("url") or "").strip().rstrip("/")
+            if isinstance(record, Mapping)
+            else ""
+        )
+        return (
+            endpoint.lower() in normalized_local_urls
+            or _is_gateway_local_endpoint(endpoint)
+        )
+
+    def is_gateway_local_worker(name: object) -> bool:
+        normalized_name = normalize_worker_name(str(name))
+        if normalized_name == "worker-local":
+            return True
+        if normalized_name == "local":
+            # `local` is a conventional external worker identity too. Only
+            # hide it when its endpoint actually points back into this gateway.
+            return records is None or targets_local_endpoint(name)
+        return False
 
     return [
         str(name)
         for name in names
         if normalized_mode != "lite" or include_local_in_lite or (
-            normalize_worker_name(str(name)) not in _GATEWAY_LOCAL_WORKER_NAMES
+            not is_gateway_local_worker(name)
             and not targets_local_endpoint(name)
         )
     ]

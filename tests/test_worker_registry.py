@@ -47,6 +47,31 @@ class WorkerRegistryTests(unittest.TestCase):
             ["remote-1"],
         )
 
+    def test_lite_keeps_external_worker_named_local_when_package_is_disabled(self) -> None:
+        workers = {
+            "local": {"url": "https://bot.utama.naufix.space", "enabled": True},
+            "worker-local": {"url": "http://worker-local:8080", "enabled": True},
+            "remote-1": {"url": "https://worker1.example", "enabled": True},
+        }
+
+        self.assertEqual(
+            worker_names_for_mode(
+                workers,
+                "lite",
+                local_urls={"http://worker-local:8080"},
+                include_local_in_lite=False,
+            ),
+            ["local", "remote-1"],
+        )
+
+    def test_external_local_endpoint_in_worker_endpoints_is_not_gateway_local(self) -> None:
+        config = type("Config", (), {
+            "worker_local_url": "",
+            "worker_endpoints": {"local": "https://bot.utama.naufix.space"},
+        })()
+
+        self.assertEqual(worker_local_urls(config), frozenset())
+
     def test_persists_workers_and_updates_without_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "workers.json"

@@ -2250,7 +2250,10 @@ class SqliteJobRepository:
                 if (
                     cancel_event is not None
                     and cancel_event.is_set()
-                    and "interrupt" in message
+                    and (
+                        "interrupt" in message
+                        or "unable to open database" in message
+                    )
                 ):
                     return {
                         **base,

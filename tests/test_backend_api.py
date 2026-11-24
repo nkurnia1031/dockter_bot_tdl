@@ -862,6 +862,7 @@ class BackendApiTests(unittest.TestCase):
             "worker_local_url": "http://worker-local:8080",
             "worker_endpoints": {"local-alias": "http://worker-local:8080/"},
         })()
+        self.workers.values["local"]["url"] = "http://worker-local:8080"
         self.workers.values["worker-local"] = {
             "url": "http://worker-local:8080", "token": "secret", "enabled": True,
             "public_url": "",
@@ -899,6 +900,62 @@ class BackendApiTests(unittest.TestCase):
         tts_workers = self.client.get("/api/v1/tts/workers", headers=headers)
         self.assertEqual(tts_workers.status_code, 200, tts_workers.text)
         self.assertEqual([item["name"] for item in tts_workers.json()["items"]], ["remote-1"])
+
+    def test_lite_exposes_and_accepts_external_worker_named_local(self):
+        headers = self.login(42)
+        self.context.config.gateway_mode = "lite"
+        self.context.config.gateway_lite_local_stack_enabled = False
+        self.context.config.worker_local_url = ""
+        self.context.config.worker_endpoints = {}
+        self.control.gateway_mode = "lite"
+        self.control.gateway_lite_local_stack_enabled = False
+        self.profiles.base_config = self.context.config
+        self.workers.values["local"] = {
+            "url": "https://bot.utama.naufix.space", "token": "secret",
+            "enabled": True, "public_url": "",
+        }
+        self.workers.values["remote-1"] = {
+            "url": "https://worker1.example.test", "token": "secret",
+            "enabled": True, "public_url": "",
+        }
+
+        class Health:
+            def snapshot(self, worker):
+                return {"worker": worker, "status": "ready", "healthy": True}
+
+        self.control.worker_health_cache = Health()
+
+        worker_list = self.client.get("/api/v1/workers", headers=headers)
+        self.assertEqual(worker_list.status_code, 200, worker_list.text)
+        self.assertEqual(
+            [item["name"] for item in worker_list.json()["items"]],
+            ["local", "remote-1"],
+        )
+
+        tts_workers = self.client.get("/api/v1/tts/workers", headers=headers)
+        self.assertEqual(tts_workers.status_code, 200, tts_workers.text)
+        self.assertEqual(
+            [item["name"] for item in tts_workers.json()["items"]],
+            ["local", "remote-1"],
+        )
+
+        self.context.profile_provisioner = FakeProfileProvisioner()
+        profile_management = self.client.get(
+            "/api/v1/profiles/management", headers=headers
+        )
+        self.assertEqual(profile_management.status_code, 200, profile_management.text)
+        self.assertEqual(
+            [item["name"] for item in profile_management.json()["workers"]],
+            ["local", "remote-1"],
+        )
+
+        verified = self.client.post(
+            "/api/v1/context/verify",
+            headers=headers,
+            json={"purpose": "utility", "worker": "local"},
+        )
+        self.assertEqual(verified.status_code, 200, verified.text)
+        self.assertEqual(verified.json()["worker"], "local")
 
     def test_lite_local_package_exposes_local_worker_as_explicit_target(self):
         headers = self.login(42)
@@ -938,6 +995,7 @@ class BackendApiTests(unittest.TestCase):
         self.control.gateway_mode = "lite"
         self.context.config.worker_local_url = "http://worker-local:8080"
         self.context.config.worker_endpoints = {"local-alias": "http://worker-local:8080/"}
+        self.workers.values["local"]["url"] = "http://worker-local:8080"
         self.workers.values["local-alias"] = {
             "url": "http://worker-local:8080/", "token": "secret", "enabled": True,
             "public_url": "",
